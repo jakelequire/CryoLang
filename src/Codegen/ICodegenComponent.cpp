@@ -409,8 +409,8 @@ namespace Cryo::Codegen
             }
         }
 
-        // Create extern declarations for known stdlib generic type methods
-        // This handles cross-module calls where the method exists in another compilation unit
+        // Create extern declarations for cross-module method calls
+        // Uses TemplateRegistry to dynamically look up the type's defining namespace
         {
             std::string base_type = type_name;
             size_t angle_pos = type_name.find('<');
@@ -419,21 +419,32 @@ namespace Cryo::Codegen
                 base_type = type_name.substr(0, angle_pos);
             }
 
-            // Known stdlib generic types and their defining namespaces
-            static const std::unordered_map<std::string, std::string> stdlib_type_namespaces = {
-                {"Option", "std::core::option"},
-                {"Result", "std::core::result"},
-                {"Array", "std::core::collections"},
-                {"Vector", "std::core::collections"},
-                {"HashMap", "std::core::collections"},
-                {"String", "std::core::string"}};
-
-            auto ns_it = stdlib_type_namespaces.find(base_type);
-            if (ns_it != stdlib_type_namespaces.end())
+            // Try to get namespace from TemplateRegistry (dynamic lookup)
+            std::string type_namespace;
+            Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+            if (template_registry)
             {
-                std::string full_method_name = ns_it->second + "::" + base_type + "::" + method_name;
+                const Cryo::TemplateRegistry::TemplateInfo *template_info = template_registry->find_template(base_type);
+                if (template_info)
+                {
+                    type_namespace = template_info->module_namespace;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found template '{}' in namespace '{}'",
+                              base_type, type_namespace);
+                }
+            }
+
+            // Also check the type namespace map (for locally defined types)
+            if (type_namespace.empty())
+            {
+                type_namespace = ctx().get_type_namespace(base_type);
+            }
+
+            if (!type_namespace.empty())
+            {
+                std::string full_method_name = type_namespace + "::" + base_type + "::" + method_name;
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "resolve_method_by_name: Creating extern declaration for stdlib method '{}'", full_method_name);
+                          "resolve_method_by_name: Trying dynamically resolved method '{}'", full_method_name);
 
                 // Check if it already exists
                 if (llvm::Function *existing = module()->getFunction(full_method_name))
@@ -443,33 +454,84 @@ namespace Cryo::Codegen
                     return existing;
                 }
 
-                // Determine return type based on known method signatures
+                // Check function registry
+                if (llvm::Function *existing = ctx().get_function(full_method_name))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found in registry '{}'", full_method_name);
+                    return existing;
+                }
+
+                // Method exists in template but not yet compiled - create extern declaration
+                // Get method signature from the template if possible
                 llvm::Type *return_type = nullptr;
                 std::vector<llvm::Type *> param_types;
 
-                // Add 'this' parameter (pointer to the enum/struct)
+                // Add 'this' parameter (pointer to the type)
                 param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
 
-                if (method_name == "is_some" || method_name == "is_none" || method_name == "is_ok" || method_name == "is_err")
+                // Try to get return type from template methods
+                if (template_registry)
                 {
-                    // Boolean methods
-                    return_type = llvm::Type::getInt1Ty(llvm_ctx());
+                    const Cryo::TemplateRegistry::TemplateInfo *template_info = template_registry->find_template(base_type);
+                    if (template_info && template_info->enum_template)
+                    {
+                        // Look for the method in the enum's impl blocks
+                        for (const auto &method : template_info->enum_template->methods())
+                        {
+                            if (method->name() == method_name)
+                            {
+                                // Found the method - try to get its return type
+                                Cryo::Type *method_return = method->return_type();
+                                if (method_return)
+                                {
+                                    return_type = types().get_type(method_return);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_method_by_name: Got return type from template method: {}",
+                                              method_return->to_string());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    else if (template_info && template_info->struct_template)
+                    {
+                        for (const auto &method : template_info->struct_template->methods())
+                        {
+                            if (method->name() == method_name)
+                            {
+                                Cryo::Type *method_return = method->return_type();
+                                if (method_return)
+                                {
+                                    return_type = types().get_type(method_return);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    else if (template_info && template_info->class_template)
+                    {
+                        for (const auto &method : template_info->class_template->methods())
+                        {
+                            if (method->name() == method_name)
+                            {
+                                Cryo::Type *method_return = method->return_type();
+                                if (method_return)
+                                {
+                                    return_type = types().get_type(method_return);
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
-                else if (method_name == "unwrap" || method_name == "unwrap_or" || method_name == "expect")
+
+                // Default return type if not found
+                if (!return_type)
                 {
-                    // These return the inner type - for now use a generic pointer
-                    // The actual type will be determined at link time
-                    return_type = llvm::PointerType::get(llvm_ctx(), 0);
-                }
-                else if (method_name == "map" || method_name == "and_then" || method_name == "or_else")
-                {
-                    // Combinator methods return Option/Result
-                    return_type = llvm::PointerType::get(llvm_ctx(), 0);
-                }
-                else
-                {
-                    // Default to void for unknown methods
                     return_type = llvm::Type::getVoidTy(llvm_ctx());
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Using default void return type for '{}'", full_method_name);
                 }
 
                 // Create function type and declaration
@@ -484,8 +546,7 @@ namespace Cryo::Codegen
                 ctx().register_function(full_method_name, fn);
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "resolve_method_by_name: Created extern declaration for '{}' returning {}",
-                          full_method_name, return_type->isVoidTy() ? "void" : (return_type->isIntegerTy(1) ? "bool" : "ptr"));
+                          "resolve_method_by_name: Created extern declaration for '{}'", full_method_name);
 
                 return fn;
             }
