@@ -1217,10 +1217,10 @@ namespace Cryo
                     // Create the substituted enum pattern
                     auto substituted_pattern = std::make_unique<EnumPatternNode>(arm_location, substituted_enum_name, enum_pattern->variant_name());
 
-                    // Copy bound variables if any
-                    for (const auto &var : enum_pattern->bound_variables())
+                    // Copy pattern elements (bindings, wildcards, literals)
+                    for (const auto &elem : enum_pattern->pattern_elements())
                     {
-                        substituted_pattern->add_bound_variable(var);
+                        substituted_pattern->add_pattern_element(elem);
                     }
 
                     cloned_pattern = std::move(substituted_pattern);

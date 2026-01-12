@@ -954,14 +954,15 @@ namespace Cryo
         _output << get_node_color(node.kind()) << "EnumPattern "
                 << node.enum_name() << "::" << node.variant_name();
 
-        if (!node.bound_variables().empty())
+        const auto &elements = node.pattern_elements();
+        if (!elements.empty())
         {
             _output << " (";
-            for (size_t i = 0; i < node.bound_variables().size(); ++i)
+            for (size_t i = 0; i < elements.size(); ++i)
             {
                 if (i > 0)
                     _output << ", ";
-                _output << node.bound_variables()[i];
+                _output << elements[i].to_string();
             }
             _output << ")";
         }
