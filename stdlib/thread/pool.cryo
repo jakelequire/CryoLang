@@ -36,30 +36,29 @@ type struct ThreadPool {
     active_count: AtomicU64;
 
     /// Creates a new thread pool with the default number of threads.
-    ThreadPool() -> ThreadPool {
-        const num_threads: u64 = available_parallelism();
-        return ThreadPool::ThreadPool(num_threads);
+    static new() -> ThreadPool {
+        const num_cpus: u64 = thread::available_parallelism();
+        return ThreadPool::ThreadPool(num_cpus);
     }
 
     /// Creates a thread pool with the specified number of threads.
-    ThreadPool(num_threads: u64) -> ThreadPool {
+    static new(num_threads: u64) -> ThreadPool {
+        if (num_threads == 0) {
+            intrinsics::panic("ThreadPool must have at least one thread", FILE, LINE);
+        }
+
         mut pool: ThreadPool = ThreadPool {
-            workers: Array::with_capacity(num_threads),
-            queue: Deque::new(),
+            workers: Array<Worker>::new(),
+            queue: Deque<Task>::new(),
             queue_mutex: PThreadMutex::new(),
             queue_cond: PThreadCond::new(),
             shutdown: AtomicBool::new(false),
             active_count: AtomicU64::new(0)
         };
 
-        pthread_mutex_init(&pool.queue_mutex, null);
-        pthread_cond_init(&pool.queue_cond, null);
-
-        // Spawn worker threads
         mut i: u64 = 0;
         while (i < num_threads) {
-            const worker: Worker = Worker::Worker(&pool);
-            pool.workers.push(worker);
+            pool.workers.push_back(Worker::Worker(&pool));
             i = i + 1;
         }
 
@@ -152,15 +151,11 @@ type struct Worker {
     handle: pthread_t;
 
     /// Creates a new worker.
-    Worker(pool: ThreadPool*) -> Worker {
-        mut handle: PThread;
-
+    static new(pool: ThreadPool*) -> Worker {
         const data: WorkerData* = malloc(sizeof(WorkerData));
-        if (data == null) {
-            panic("allocation failed", FILE, LINE);
-        }
-        data.pool = pool;
+        *data = WorkerData { pool: pool };
 
+        mut handle: pthread_t;
         pthread_create(&handle, null, worker_thread, data);
 
         return Worker { handle: handle };
@@ -221,9 +216,9 @@ type struct ScopedThreadPool {
     pool: ThreadPool;
 
     /// Creates a new scoped pool.
-    ScopedThreadPool(num_threads: u64) -> ScopedThreadPool {
+    static new() -> ScopedThreadPool {
         return ScopedThreadPool {
-            pool: ThreadPool::ThreadPool(num_threads)
+            pool: ThreadPool::new()
         };
     }
 
@@ -244,16 +239,3 @@ type struct ScopedThreadPool {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Creates a new thread pool with the default number of threads.
-function thread_pool() -> ThreadPool {
-    return ThreadPool::ThreadPool();
-}
-
-/// Creates a thread pool with the specified number of threads.
-function thread_pool_with(num_threads: u64) -> ThreadPool {
-    return ThreadPool::ThreadPool(num_threads);
-}
