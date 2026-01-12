@@ -6401,29 +6401,140 @@ namespace Cryo
             const TemplateRegistry::TemplateInfo *template_info = _template_registry->find_template(lookup_type_name);
             if (template_info)
             {
-                // Check struct template methods
-                if (template_info->struct_template)
+                // SAFETY CHECK: In stdlib compilation mode, template AST pointers may become dangling
+                // after the source module finishes compiling. Use persistent method metadata from
+                // TemplateRegistry instead of accessing AST directly.
+                if (_stdlib_compilation_mode)
                 {
-                    const auto &methods = template_info->struct_template->methods();
-                    for (const auto &method : methods)
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Using persistent template metadata in stdlib mode for '{}' - AST may be invalid", lookup_type_name);
+
+                    // PROPER SOLUTION: Use persistent method metadata from TemplateRegistry
+                    const TemplateRegistry::MethodMetadata *method_meta = _template_registry->find_template_method(lookup_type_name, member_name);
+                    if (method_meta)
                     {
-                        if (method && method->name() == member_name)
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found persistent method metadata for '{}::{}' -> '{}'",
+                                  lookup_type_name, member_name, method_meta->return_type_annotation);
+
+                        // Resolve the return type from the annotation
+                        Type *return_type = resolve_type_with_generic_context(method_meta->return_type_annotation);
+                        if (!return_type)
                         {
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Found method '{}' in TemplateRegistry struct '{}'", member_name, lookup_type_name);
+                            return_type = _type_context.get_unknown_type();
+                        }
 
-                            // Build the function type from the method signature
-                            std::string return_type_str = method->return_type_annotation();
-                            Type *return_type = resolve_type_with_generic_context(return_type_str);
-                            if (!return_type)
+                        // Resolve parameter types
+                        std::vector<Type *> param_types;
+                        for (const auto &param_type_str : method_meta->parameter_type_annotations)
+                        {
+                            Type *param_type = resolve_type_with_generic_context(param_type_str);
+                            if (!param_type)
                             {
-                                return_type = _type_context.get_unknown_type();
+                                param_type = _type_context.get_unknown_type();
                             }
+                            param_types.push_back(param_type);
+                        }
 
-                            std::vector<Type *> param_types;
-                            const auto &parameters = method->parameters();
-                            for (const auto &param : parameters)
+                        // Create a function type for this method
+                        Type *method_type = _type_context.create_function_type(return_type, param_types, false);
+                        node.set_resolved_type(method_type);
+
+                        // Cache the method for future lookups
+                        _struct_methods[lookup_type_name][member_name] = method_type;
+
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved method '{}' from persistent metadata with return type '{}'",
+                                  member_name, return_type->to_string());
+                        return;
+                    }
+
+                    // FALLBACK: Try to find method return type from the cached registry
+                    std::string qualified_method = template_info->module_namespace + "::" + lookup_type_name + "::" + member_name;
+                    auto return_type_it = _struct_method_return_types.find(qualified_method);
+                    if (return_type_it != _struct_method_return_types.end())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found cached method return type for '{}'", qualified_method);
+                        // Create a function type with the return type (parameters unknown from cache)
+                        Type *return_type = return_type_it->second;
+                        Type *method_type = _type_context.create_function_type(return_type, {}, false);
+                        node.set_resolved_type(method_type);
+                        _struct_methods[lookup_type_name][member_name] = method_type;
+                        return;
+                    }
+                    // Fall through to error reporting if not found
+                }
+                else
+                {
+                    // Non-stdlib mode: safe to access template AST directly
+                    // Check struct template methods
+                    if (template_info->struct_template)
+                    {
+                        const auto &methods = template_info->struct_template->methods();
+                        for (const auto &method : methods)
+                        {
+                            if (method && method->name() == member_name)
                             {
-                                if (param)
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Found method '{}' in TemplateRegistry struct '{}'", member_name, lookup_type_name);
+
+                                // Build the function type from the method signature
+                                std::string return_type_str = method->return_type_annotation();
+                                Type *return_type = resolve_type_with_generic_context(return_type_str);
+                                if (!return_type)
+                                {
+                                    return_type = _type_context.get_unknown_type();
+                                }
+
+                                std::vector<Type *> param_types;
+                                const auto &parameters = method->parameters();
+                                for (const auto &param : parameters)
+                                {
+                                    if (param)
+                                    {
+                                        std::string param_type_str = param->type_annotation();
+                                        Type *param_type = resolve_type_with_generic_context(param_type_str);
+                                        if (!param_type)
+                                        {
+                                            param_type = _type_context.get_unknown_type();
+                                        }
+                                        param_types.push_back(param_type);
+                                    }
+                                }
+
+                                // Create a function type for this method
+                                Type *method_type = _type_context.create_function_type(return_type, param_types, false);
+                                node.set_resolved_type(method_type);
+
+                                // Cache the method for future lookups
+                                _struct_methods[lookup_type_name][member_name] = method_type;
+
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved TemplateRegistry method '{}' with return type '{}'",
+                                          member_name, return_type->to_string());
+                                return;
+                            }
+                        }
+                    }
+
+                    // Check class template methods
+                    if (template_info->class_template)
+                    {
+                        const auto &methods = template_info->class_template->methods();
+                        for (const auto &method : methods)
+                        {
+                            if (method && method->name() == member_name)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Found method '{}' in TemplateRegistry class '{}'", member_name, lookup_type_name);
+
+                                // Build the function type from the method signature
+                                std::string return_type_str = method->return_type_annotation();
+                                Type *return_type = resolve_type_with_generic_context(return_type_str);
+                                if (!return_type)
+                                {
+                                    return_type = _type_context.get_unknown_type();
+                                }
+
+                                std::vector<Type *> param_types;
+                                const auto &parameters = method->parameters();
+                                for (const auto &param : parameters)
+                                {
+                                    if (param)
                                 {
                                     std::string param_type_str = param->type_annotation();
                                     Type *param_type = resolve_type_with_generic_context(param_type_str);
@@ -6448,54 +6559,7 @@ namespace Cryo
                         }
                     }
                 }
-
-                // Check class template methods
-                if (template_info->class_template)
-                {
-                    const auto &methods = template_info->class_template->methods();
-                    for (const auto &method : methods)
-                    {
-                        if (method && method->name() == member_name)
-                        {
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Found method '{}' in TemplateRegistry class '{}'", member_name, lookup_type_name);
-
-                            // Build the function type from the method signature
-                            std::string return_type_str = method->return_type_annotation();
-                            Type *return_type = resolve_type_with_generic_context(return_type_str);
-                            if (!return_type)
-                            {
-                                return_type = _type_context.get_unknown_type();
-                            }
-
-                            std::vector<Type *> param_types;
-                            const auto &parameters = method->parameters();
-                            for (const auto &param : parameters)
-                            {
-                                if (param)
-                                {
-                                    std::string param_type_str = param->type_annotation();
-                                    Type *param_type = resolve_type_with_generic_context(param_type_str);
-                                    if (!param_type)
-                                    {
-                                        param_type = _type_context.get_unknown_type();
-                                    }
-                                    param_types.push_back(param_type);
-                                }
-                            }
-
-                            // Create a function type for this method
-                            Type *method_type = _type_context.create_function_type(return_type, param_types, false);
-                            node.set_resolved_type(method_type);
-
-                            // Cache the method for future lookups
-                            _struct_methods[lookup_type_name][member_name] = method_type;
-
-                            LOG_DEBUG(Cryo::LogComponent::AST, "Resolved TemplateRegistry method '{}' with return type '{}'",
-                                      member_name, return_type->to_string());
-                            return;
-                        }
-                    }
-                }
+                } // Close the else block for non-stdlib mode
             }
         }
 
