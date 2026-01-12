@@ -8779,6 +8779,25 @@ namespace Cryo
                 return _type_context.get_i64_type();
             }
 
+            // Check for hexadecimal, binary, or octal literals - these are always integers
+            if (value.starts_with("0x") || value.starts_with("0X") ||
+                value.starts_with("0b") || value.starts_with("0B") ||
+                value.starts_with("0o") || value.starts_with("0O"))
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker: Processing hex/binary/octal literal: '{}'", value);
+                // Check if we have an expected type context for integer literals
+                if (_current_expected_type && is_integer_type(_current_expected_type))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Using expected type '{}' for hex/binary/octal literal '{}'",
+                              _current_expected_type->name(), value);
+                    return _current_expected_type;
+                }
+                Type *int_type = _type_context.get_int_type();
+                LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker: Returning int type '{}' for hex literal '{}'", 
+                          int_type ? int_type->name() : "null", value);
+                return int_type;
+            }
+
             // No suffix - use contextual typing if available, otherwise fall back to default heuristic
             if (value.find('.') != std::string::npos)
             {
