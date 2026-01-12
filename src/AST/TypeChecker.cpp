@@ -6446,15 +6446,14 @@ namespace Cryo
                         return;
                     }
 
-                    // FALLBACK: Try to find method return type from the cached registry
+                    // FALLBACK: Try to find method return type from TemplateRegistry's cached return types
                     std::string qualified_method = template_info->module_namespace + "::" + lookup_type_name + "::" + member_name;
-                    auto return_type_it = _struct_method_return_types.find(qualified_method);
-                    if (return_type_it != _struct_method_return_types.end())
+                    Type *cached_return_type = _template_registry->get_method_return_type(qualified_method);
+                    if (cached_return_type)
                     {
                         LOG_DEBUG(Cryo::LogComponent::AST, "Found cached method return type for '{}'", qualified_method);
                         // Create a function type with the return type (parameters unknown from cache)
-                        Type *return_type = return_type_it->second;
-                        Type *method_type = _type_context.create_function_type(return_type, {}, false);
+                        Type *method_type = _type_context.create_function_type(cached_return_type, {}, false);
                         node.set_resolved_type(method_type);
                         _struct_methods[lookup_type_name][member_name] = method_type;
                         return;
