@@ -983,23 +983,20 @@ namespace Cryo::Codegen
     void CodegenVisitor::visit(Cryo::BinaryExpressionNode &node)
     {
         NodeTracker tracker(*_ctx, &node);
-        LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                  "=== BINARY EXPR DEBUG: Visiting BinaryExpressionNode, operator: {}",
-                  static_cast<int>(node.operator_token().kind()));
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting BinaryExpressionNode");
 
         llvm::Value *result = _operators->generate_binary(&node);
         if (result)
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                      "=== BINARY EXPR DEBUG: Generated binary result successfully");
             _ctx->set_result(result);
             _ctx->register_value(&node, result);
         }
         else
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                      "=== BINARY EXPR DEBUG: Binary generation returned null!");
+                      "Binary generation returned null! File: {}, Line: {} : {}, Operator: {}",
+                      node.source_file(), node.location().line(), node.location().column(),
+                        node.operator_token().text());
         }
     }
 
