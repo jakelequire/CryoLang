@@ -760,6 +760,28 @@ namespace Cryo::Codegen
 
                 if (value->getType()->isIntegerTy() && pattern_val->getType()->isIntegerTy())
                 {
+                    // Ensure both operands have the same integer type for ICmp
+                    llvm::Type *value_type = value->getType();
+                    llvm::Type *pattern_type = pattern_val->getType();
+
+                    if (value_type != pattern_type)
+                    {
+                        unsigned value_bits = value_type->getIntegerBitWidth();
+                        unsigned pattern_bits = pattern_type->getIntegerBitWidth();
+
+                        if (pattern_bits > value_bits)
+                        {
+                            // Truncate pattern to match value's smaller type
+                            pattern_val = builder().CreateTrunc(pattern_val, value_type, "pattern.trunc");
+                        }
+                        else
+                        {
+                            // Extend pattern to match value's larger type
+                            // Use ZExt for unsigned comparison (most common in match)
+                            pattern_val = builder().CreateZExt(pattern_val, value_type, "pattern.zext");
+                        }
+                    }
+
                     return builder().CreateICmpEQ(value, pattern_val, "pattern.match");
                 }
                 else if (value->getType()->isFloatingPointTy() && pattern_val->getType()->isFloatingPointTy())
