@@ -38,7 +38,7 @@ type struct PoolBlock {
     next: PoolBlock*;
 
     /// Creates a new pool block.
-    PoolBlock(size: u64) {
+    static new(size: u64) -> PoolBlock* {
         const block: PoolBlock* = malloc(sizeof(PoolBlock));
         if (block == null) {
             return null;
@@ -84,17 +84,17 @@ type struct Pool {
     allocated_slots: u64;
 
     /// Creates a new pool for objects of the given size.
-    Pool(slot_size: u64) {
-        return Pool::Pool(slot_size, 8, 64);
+    static new(slot_size: u64) -> Pool {
+        return Pool::with_config(slot_size, 8, 64);
     }
 
     /// Creates a new pool with specified alignment.
-    Pool(slot_size: u64, align: u64) {
-        return Pool::Pool(slot_size, align, 64);
+    static new(slot_size: u64, align: u64) -> Pool {
+        return Pool::with_config(slot_size, align, 64);
     }
 
     /// Creates a new pool with specified capacity.
-    Pool(slot_size: u64, align: u64, slots_per_block: u64) {
+    static with_config(slot_size: u64, align: u64, slots_per_block: u64) -> Pool {
         // Ensure slot size is at least the size of a free node
         mut actual_size: u64 = slot_size;
         if (actual_size < sizeof(FreeNode)) {
@@ -104,13 +104,15 @@ type struct Pool {
         // Align the slot size
         actual_size = mem::align_up(actual_size, align);
 
-        this.slot_size = actual_size;
-        this.slot_align = align;
-        this.slots_per_block = slots_per_block;
-        this.first_block = null;
-        this.free_list = null;
-        this.total_slots = 0;
-        this.allocated_slots = 0;
+        return Pool {
+            slot_size: actual_size,
+            slot_align: align,
+            slots_per_block: slots_per_block,
+            first_block: null,
+            free_list: null,
+            total_slots: 0,
+            allocated_slots: 0
+        };
     }
 
     /// Allocates a slot from the pool.
@@ -155,7 +157,7 @@ type struct Pool {
     /// Grows the pool by allocating a new block.
     grow(mut &this) -> boolean {
         const block_size: u64 = this.slot_size * this.slots_per_block;
-        const block: PoolBlock* = new PoolBlock(block_size);
+        const block: PoolBlock* = PoolBlock::new(block_size);
         if (block == null) {
             return false;
         }
@@ -253,13 +255,17 @@ type struct TypedPool<T> {
     pool: Pool;
 
     /// Creates a new typed pool.
-    TypedPool() {
-        this.pool = new Pool(sizeof(T), alignof(T));
+    static new() -> TypedPool<T> {
+        return TypedPool {
+            pool: Pool::new(sizeof(T), alignof(T))
+        };
     }
 
     /// Creates a typed pool with capacity for n elements.
-    TypedPool(n: u64) {
-        this.pool = new Pool(sizeof(T), alignof(T), n);
+    static new(n: u64) -> TypedPool<T> {
+        return TypedPool {
+            pool: Pool::with_config(sizeof(T), alignof(T), n)
+        };
     }
 
     /// Allocates an uninitialized value.
@@ -315,15 +321,15 @@ type struct TypedPool<T> {
 type struct Generation {
     value: u32;
 
-    Generation();
+    static new() -> Generation;
     increment(mut &this) -> void;
     matches(&this, other: Generation) -> boolean;
 }
 
 implement struct Generation {
     /// Creates a new generation.
-    Generation() {
-        this.value = 0;
+    static new() -> Generation {
+        return Generation { value: 0 };
     }
 
     /// Increments the generation.
@@ -342,21 +348,23 @@ type struct Handle {
     index: u32;
     generation: Generation;
 
-    Handle(index: u32, generation: Generation);
-    invalid() -> Handle;
+    static new(index: u32, generation: Generation) -> Handle;
+    static invalid() -> Handle;
     is_valid(&this) -> boolean;
 }
 
 implement struct Handle {
     /// Creates a new handle.
-    Handle(index: u32, generation: Generation) {
-        this.index = index;
-        this.generation = generation;
+    static new(index: u32, generation: Generation) -> Handle {
+        return Handle {
+            index: index,
+            generation: generation
+        };
     }
 
     /// Returns an invalid handle.
-    invalid() -> Handle {
-        return Handle { index: 0xFFFFFFFF, generation: new Generation() };
+    static invalid() -> Handle {
+        return Handle { index: 0xFFFFFFFF, generation: Generation::new() };
     }
 
     /// Checks if the handle is valid (not the invalid sentinel).
@@ -389,7 +397,7 @@ type struct HandlePool<T> {
     free_head: u32;
 
     /// Creates a new handle pool with the given capacity.
-    HandlePool(capacity: u64) {
+    static new(capacity: u64) -> HandlePool<T> {
         const entries: HandlePoolEntry<T>* = calloc(capacity, sizeof(HandlePoolEntry<T>));
         if (entries == null) {
             panic("allocation failed", FILE, LINE);
@@ -398,16 +406,18 @@ type struct HandlePool<T> {
         // Initialize free list
         mut i: u64 = 0;
         while (i < capacity) {
-            entries[i].generation = new Generation();
+            entries[i].generation = Generation::new();
             entries[i].active = false;
             entries[i].next_free = i + 1;
             i = i + 1;
         }
 
-        this.entries = entries;
-        this.capacity = capacity;
-        this.count = 0;
-        this.free_head = 0;
+        return HandlePool {
+            entries: entries,
+            capacity: capacity,
+            count: 0,
+            free_head: 0
+        };
     }
 
     /// Allocates a new entry with the given value.
@@ -424,7 +434,7 @@ type struct HandlePool<T> {
         entry.active = true;
         this.count = this.count + 1;
 
-        return Option::Some(new Handle(index, entry.generation));
+        return Option::Some(Handle::new(index, entry.generation));
     }
 
     /// Gets a reference to the value at the handle.
