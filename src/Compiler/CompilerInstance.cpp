@@ -9,6 +9,7 @@
 #include <iostream>
 #include <fstream>
 #include <filesystem>
+#include <algorithm>
 
 namespace Cryo
 {
@@ -2125,55 +2126,154 @@ namespace Cryo
         // Sort files to ensure consistent compilation order
         std::sort(source_files.begin(), source_files.end());
         
-        // For stdlib compilation, we need to compile all files together into one module
-        // This is different from individual file compilation
-        bool success = true;
+        // Extract output directory from output_path
+        std::string output_dir;
+        try {
+            std::filesystem::path path(output_path);
+            output_dir = path.parent_path().string();
+        } catch (const std::exception& e) {
+            LOG_ERROR(LogComponent::GENERAL, "Failed to extract output directory from path '{}': {}", output_path, e.what());
+            return false;
+        }
         
-        // Initialize the compilation context for multi-file compilation
-        reset_state();
+        if (output_dir.empty()) {
+            LOG_ERROR(LogComponent::GENERAL, "Invalid output path '{}' - cannot determine output directory", output_path);
+            return false;
+        }
         
-        // Set compilation mode to stdlib
-        set_stdlib_compilation_mode(true);
+        // Ensure output directory exists
+        try {
+            std::filesystem::create_directories(output_dir);
+        } catch (const std::exception& e) {
+            LOG_ERROR(LogComponent::GENERAL, "Failed to create output directory '{}': {}", output_dir, e.what());
+            return false;
+        }
         
-        // For now, compile each file individually and collect bitcode
-        // TODO: Implement proper multi-module compilation when needed
+        LOG_INFO(LogComponent::GENERAL, "Output directory: {}", output_dir);
+        
+        // Compile each file individually and generate output files
+        bool overall_success = true;
         std::vector<std::string> compiled_modules;
+        std::vector<std::string> generated_object_files;
         
         for (const auto& source_file : source_files) {
-            LOG_DEBUG(LogComponent::GENERAL, "Compiling stdlib module: {}", source_file);
+            std::cout << "Compiling stdlib module: " << source_file << std::endl;
+            LOG_INFO(LogComponent::GENERAL, "Compiling stdlib module: {}", source_file);
             
             // Reset state for each file while maintaining stdlib mode
             reset_state();
             set_stdlib_compilation_mode(true);
             
+            // Generate module-specific output file names preserving directory structure
+            std::filesystem::path source_path(source_file);
+            std::string relative_path = std::filesystem::relative(source_path, source_dir).string();
+            
+            // Remove .cryo extension
+            std::string module_path = relative_path;
+            if (module_path.size() > 5 && module_path.substr(module_path.size() - 5) == ".cryo") {
+                module_path = module_path.substr(0, module_path.size() - 5);
+            }
+            
+            // Create full output paths preserving directory structure
+            std::filesystem::path module_output_dir = std::filesystem::path(output_dir) / std::filesystem::path(module_path).parent_path();
+            std::string module_name = std::filesystem::path(module_path).filename().string();
+            
+            // Ensure the module's output directory exists
+            if (!module_output_dir.empty()) {
+                try {
+                    std::filesystem::create_directories(module_output_dir);
+                } catch (const std::exception& e) {
+                    LOG_ERROR(LogComponent::GENERAL, "Failed to create module output directory '{}': {}", module_output_dir.string(), e.what());
+                    overall_success = false;
+                    continue;
+                }
+            }
+            
+            std::string bc_output = (module_output_dir / (module_name + ".bc")).string();
+            std::string ll_output = (module_output_dir / (module_name + ".ll")).string();
+            std::string obj_output = (module_output_dir / (module_name + ".o")).string();
+            
+            bool module_success = true;
+            
+            // Compile the module
             if (!compile_file(source_file)) {
                 LOG_ERROR(LogComponent::GENERAL, "Failed to compile stdlib module: {}", source_file);
-                // Continue with other files instead of failing completely
-                success = false;
-                continue;
+                overall_success = false;
+                module_success = false;
+            } else {
+                LOG_DEBUG(LogComponent::GENERAL, "Successfully compiled stdlib module: {}", source_file);
             }
             
-            // Generate LLVM IR for this module
-            if (!generate_ir()) {
+            // Generate LLVM IR for this module (even if compile_file failed, we might have partial IR)
+            if (module_success && !generate_ir()) {
                 LOG_ERROR(LogComponent::GENERAL, "Failed to generate IR for stdlib module: {}", source_file);
-                success = false;
-                continue;
+                overall_success = false;
+                module_success = false;
             }
             
-            compiled_modules.push_back(source_file);
+            // Always try to emit LLVM IR file (for debugging purposes)
+            if (_codegen) {
+                LOG_DEBUG(LogComponent::GENERAL, "Emitting LLVM IR for module '{}' to: {}", module_name, bc_output);
+                if (_codegen->emit_llvm_ir(bc_output)) {
+                    std::cout << "  ✓ Generated LLVM bitcode: " << bc_output << std::endl;
+                    std::cout << "  ✓ Generated LLVM IR: " << ll_output << std::endl;
+                    LOG_INFO(LogComponent::GENERAL, "✓ Generated LLVM IR: {}", ll_output);
+                } else {
+                    std::cout << "  ⚠ Failed to emit LLVM IR for module: " << module_name << std::endl;
+                    LOG_WARN(LogComponent::GENERAL, "⚠ Failed to emit LLVM IR for module: {}", module_name);
+                }
+            } else {
+                std::cout << "  ⚠ No codegen available for module: " << module_name << std::endl;
+            }
+            
+            // Generate object file only if compilation was successful
+            if (module_success && _codegen && _linker) {
+                // Get the LLVM module from the code generator
+                llvm::Module *module = _codegen->get_module();
+                if (module) {
+                    LOG_DEBUG(LogComponent::GENERAL, "Emitting object file for module '{}' to: {}", module_name, obj_output);
+                    if (_linker->generate_object_file(module, obj_output)) {
+                        std::cout << "  ✓ Generated object file: " << obj_output << std::endl;
+                        LOG_INFO(LogComponent::GENERAL, "✓ Generated object file: {}", obj_output);
+                        compiled_modules.push_back(source_file);
+                        generated_object_files.push_back(obj_output);
+                    } else {
+                        std::cout << "  ✗ Failed to emit object file for module: " << module_name << std::endl;
+                        // Get the linker's last error if available
+                        std::cout << "    Linker error: " << _linker->get_last_error() << std::endl;
+                        LOG_ERROR(LogComponent::GENERAL, "Failed to emit object file for module '{}': {}", module_name, _linker->get_last_error());
+                        overall_success = false;
+                    }
+                } else {
+                    std::cout << "  ✗ No LLVM module available for object file generation: " << module_name << std::endl;
+                    LOG_ERROR(LogComponent::GENERAL, "No LLVM module available for object file generation: {}", module_name);
+                }
+            } else if (!module_success) {
+                std::cout << "  ✗ Skipping object file generation due to compilation errors" << std::endl;
+            } else if (!_linker) {
+                std::cout << "  ✗ No linker available for object file generation" << std::endl;
+            }
         }
         
         if (compiled_modules.empty()) {
+            std::cout << "✗ No stdlib modules compiled successfully" << std::endl;
             LOG_ERROR(LogComponent::GENERAL, "No stdlib modules compiled successfully");
             return false;
         }
         
+        std::cout << "Stdlib compilation summary:" << std::endl;
+        std::cout << "  Successfully compiled: " << compiled_modules.size() << "/" << source_files.size() << " modules" << std::endl;
+        std::cout << "  Generated object files: " << generated_object_files.size() << std::endl;
+        std::cout << "  Output directory: " << output_dir << std::endl;
+        
         LOG_INFO(LogComponent::GENERAL, "Successfully compiled {}/{} stdlib modules", 
                  compiled_modules.size(), source_files.size());
+        LOG_INFO(LogComponent::GENERAL, "Generated {} object files", generated_object_files.size());
         
-        // For now, we'll rely on external linking to combine modules
-        // The output_path parameter can be used in the future for direct library generation
-        return success;
+        // TODO: Combine object files into final library (.a file) if desired
+        // For now, individual object files are sufficient for testing
+        
+        return overall_success;
     }
 
     std::unique_ptr<CompilerInstance> create_compiler_instance()
