@@ -8,6 +8,7 @@
 #include <optional>
 #include <algorithm>
 #include <unordered_map>
+#include <variant>
 
 namespace Cryo
 {
@@ -35,6 +36,97 @@ namespace Cryo
 
         TraitBound(std::string type_param, std::string trait, SourceLocation loc)
             : type_parameter(std::move(type_param)), trait_name(std::move(trait)), location(loc) {}
+    };
+
+    // Pattern element for enum patterns (e.g., the 'x' in Result::Ok(x), or '0' in Result::Ok(0))
+    struct PatternElement
+    {
+        enum class Kind
+        {
+            Binding,  // Variable binding like "value"
+            Wildcard, // Underscore "_" - match anything, don't bind
+            Literal   // Literal value like 0, true, "hello"
+        };
+
+        Kind kind = Kind::Binding;
+        std::string binding_name;                                                    // For Kind::Binding
+        std::variant<std::monostate, int64_t, double, bool, std::string> lit_value;  // For Kind::Literal
+
+        // Factory methods
+        static PatternElement make_binding(const std::string &name)
+        {
+            PatternElement pe;
+            pe.kind = Kind::Binding;
+            pe.binding_name = name;
+            return pe;
+        }
+
+        static PatternElement make_wildcard()
+        {
+            PatternElement pe;
+            pe.kind = Kind::Wildcard;
+            return pe;
+        }
+
+        static PatternElement make_literal_int(int64_t value)
+        {
+            PatternElement pe;
+            pe.kind = Kind::Literal;
+            pe.lit_value = value;
+            return pe;
+        }
+
+        static PatternElement make_literal_bool(bool value)
+        {
+            PatternElement pe;
+            pe.kind = Kind::Literal;
+            pe.lit_value = value;
+            return pe;
+        }
+
+        static PatternElement make_literal_float(double value)
+        {
+            PatternElement pe;
+            pe.kind = Kind::Literal;
+            pe.lit_value = value;
+            return pe;
+        }
+
+        static PatternElement make_literal_string(const std::string &value)
+        {
+            PatternElement pe;
+            pe.kind = Kind::Literal;
+            pe.lit_value = value;
+            return pe;
+        }
+
+        bool is_binding() const { return kind == Kind::Binding; }
+        bool is_wildcard() const { return kind == Kind::Wildcard; }
+        bool is_literal() const { return kind == Kind::Literal; }
+
+        // Get string representation for debugging/printing
+        std::string to_string() const
+        {
+            switch (kind)
+            {
+            case Kind::Binding:
+                return binding_name;
+            case Kind::Wildcard:
+                return "_";
+            case Kind::Literal:
+                if (std::holds_alternative<int64_t>(lit_value))
+                    return std::to_string(std::get<int64_t>(lit_value));
+                if (std::holds_alternative<double>(lit_value))
+                    return std::to_string(std::get<double>(lit_value));
+                if (std::holds_alternative<bool>(lit_value))
+                    return std::get<bool>(lit_value) ? "true" : "false";
+                if (std::holds_alternative<std::string>(lit_value))
+                    return "\"" + std::get<std::string>(lit_value) + "\"";
+                return "<unknown>";
+            default:
+                return "<invalid>";
+            }
+        }
     };
 
     // Forward declarations for switch statements
@@ -2370,38 +2462,61 @@ namespace Cryo
         void accept(ASTVisitor &visitor) override;
     };
 
-    // Enum pattern (e.g., Shape::Circle(radius))
+    // Enum pattern (e.g., Shape::Circle(radius), Shape::Circle(_), Shape::Circle(0))
     class EnumPatternNode : public PatternNode
     {
     private:
         std::string _enum_name;
         std::string _variant_name;
-        std::vector<std::string> _bound_variables;
+        std::vector<PatternElement> _pattern_elements;
 
     public:
         EnumPatternNode(SourceLocation loc, const std::string &enum_name, const std::string &variant_name)
             : PatternNode(NodeKind::EnumPattern, loc), _enum_name(enum_name), _variant_name(variant_name) {}
 
+        // Add a pattern element (binding, wildcard, or literal)
+        void add_pattern_element(const PatternElement &element)
+        {
+            _pattern_elements.push_back(element);
+        }
+
+        // Backwards compatibility: add a variable binding by name
         void add_bound_variable(const std::string &var_name)
         {
-            _bound_variables.push_back(var_name);
+            _pattern_elements.push_back(PatternElement::make_binding(var_name));
         }
 
         const std::string &enum_name() const { return _enum_name; }
         const std::string &variant_name() const { return _variant_name; }
-        const std::vector<std::string> &bound_variables() const { return _bound_variables; }
+        const std::vector<PatternElement> &pattern_elements() const { return _pattern_elements; }
+
+        // Backwards compatibility: get binding names only (for code that expects strings)
+        std::vector<std::string> bound_variables() const
+        {
+            std::vector<std::string> result;
+            for (const auto &elem : _pattern_elements)
+            {
+                if (elem.is_binding())
+                    result.push_back(elem.binding_name);
+                else if (elem.is_wildcard())
+                    result.push_back("_");  // Include wildcard marker
+                else
+                    result.push_back("");   // Placeholder for literals
+            }
+            return result;
+        }
 
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "EnumPattern " << _enum_name << "::" << _variant_name;
-            if (!_bound_variables.empty())
+            if (!_pattern_elements.empty())
             {
                 os << " (";
-                for (size_t i = 0; i < _bound_variables.size(); ++i)
+                for (size_t i = 0; i < _pattern_elements.size(); ++i)
                 {
                     if (i > 0)
                         os << ", ";
-                    os << _bound_variables[i];
+                    os << _pattern_elements[i].to_string();
                 }
                 os << ")";
             }
