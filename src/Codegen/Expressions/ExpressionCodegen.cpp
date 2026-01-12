@@ -190,10 +190,35 @@ namespace Cryo::Codegen
             // Try to parse as integer first, then float
             try
             {
-                // Check if it contains a decimal point or 'e'/'E'
-                if (value_str.find('.') != std::string::npos ||
-                    value_str.find('e') != std::string::npos ||
-                    value_str.find('E') != std::string::npos)
+                // Check for hexadecimal, binary, or octal literals first - these are always integers
+                if (value_str.starts_with("0x") || value_str.starts_with("0X") ||
+                    value_str.starts_with("0b") || value_str.starts_with("0B") ||
+                    value_str.starts_with("0o") || value_str.starts_with("0O"))
+                {
+                    // Parse as integer - check if type is unsigned
+                    Cryo::Type *resolved_type = node->get_resolved_type();
+                    bool is_unsigned = false;
+                    if (resolved_type)
+                    {
+                        std::string type_name = resolved_type->to_string();
+                        is_unsigned = (type_name.length() > 0 && type_name[0] == 'u');
+                    }
+
+                    if (is_unsigned)
+                    {
+                        uint64_t uint_value = std::stoull(value_str, nullptr, 0);
+                        return generate_unsigned_integer_literal(uint_value, resolved_type);
+                    }
+                    else
+                    {
+                        int64_t int_value = std::stoll(value_str, nullptr, 0);
+                        return generate_integer_literal(int_value, resolved_type);
+                    }
+                }
+                // Check if it contains a decimal point or scientific notation 'e'/'E' (but not hex 'E')
+                else if (value_str.find('.') != std::string::npos ||
+                        (value_str.find('e') != std::string::npos && !value_str.starts_with("0x") && !value_str.starts_with("0X")) ||
+                        (value_str.find('E') != std::string::npos && !value_str.starts_with("0x") && !value_str.starts_with("0X")))
                 {
                     // Parse as float
                     double float_value = std::stod(value_str);
