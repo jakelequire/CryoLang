@@ -10502,7 +10502,8 @@ namespace Cryo
         for (size_t i = 0; i < bound_vars.size(); ++i)
         {
             const std::string &var_name = bound_vars[i];
-            if (var_name.empty())
+            // Skip empty strings (literals) and wildcards
+            if (var_name.empty() || var_name == "_")
                 continue;
 
             // Try to infer type from the match expression type
