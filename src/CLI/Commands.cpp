@@ -1014,7 +1014,21 @@ namespace Cryo::CLI::Commands
             return 1;
         }
 
-        // Handle --emit-llvm flag from CLI args or config file
+        // For stdlib compilation, individual files are already generated,
+        // so skip the additional LLVM emission and linking steps
+        if (is_stdlib)
+        {
+            if (compilation_success) {
+                std::cout << "✓ Stdlib compilation completed successfully" << std::endl;
+                std::cout << "  Individual module files generated in: " << config.output_dir << std::endl;
+            } else {
+                std::cout << "⚠ Stdlib compilation completed with errors" << std::endl;
+                std::cout << "  Partial results available in: " << config.output_dir << std::endl;
+            }
+            return compilation_success ? 0 : 1;
+        }
+
+        // Handle --emit-llvm flag from CLI args or config file (non-stdlib builds only)
         bool emit_llvm = args.get_flag("emit-llvm");
 
         // Check if --emit-llvm is specified in config args
