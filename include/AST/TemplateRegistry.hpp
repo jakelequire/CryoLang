@@ -63,6 +63,34 @@ namespace Cryo
             std::vector<Type *> field_types;
         };
 
+        // Method metadata extracted from AST at registration time
+        // This persists after AST cleanup and is used for cross-module type checking
+        struct MethodMetadata
+        {
+            std::string name;
+            std::string return_type_annotation;
+            std::vector<std::string> parameter_type_annotations;
+            std::vector<std::string> parameter_names;
+            bool is_static = false;
+
+            MethodMetadata() = default;
+            MethodMetadata(const std::string &n, const std::string &ret,
+                           const std::vector<std::string> &param_types,
+                           const std::vector<std::string> &param_names,
+                           bool is_static_method = false)
+                : name(n), return_type_annotation(ret),
+                  parameter_type_annotations(param_types), parameter_names(param_names),
+                  is_static(is_static_method) {}
+        };
+
+        // Template method metadata: template_name -> list of methods
+        // This stores method signatures extracted at registration time
+        struct TemplateMethodInfo
+        {
+            std::string module_namespace;
+            std::vector<MethodMetadata> methods;
+        };
+
     private:
         // Map from template base name to template info
         std::unordered_map<std::string, TemplateInfo> _templates;
@@ -73,6 +101,10 @@ namespace Cryo
 
         // Struct field types registry: qualified struct name -> StructFieldInfo
         std::unordered_map<std::string, StructFieldInfo> _struct_field_types;
+
+        // Template method metadata registry: template_name -> TemplateMethodInfo
+        // Stores method signatures extracted at registration time, persists after AST cleanup
+        std::unordered_map<std::string, TemplateMethodInfo> _template_method_info;
 
     public:
         TemplateRegistry() = default;
@@ -195,5 +227,32 @@ namespace Cryo
          * @return true if registered
          */
         bool has_struct_field_types(const std::string &qualified_struct_name) const;
+
+        //===================================================================
+        // Template Method Metadata Registry (for cross-module type checking)
+        //===================================================================
+
+        /**
+         * @brief Get template method info (metadata persists after AST cleanup)
+         * @param template_name The template base name
+         * @return Pointer to TemplateMethodInfo, or nullptr if not registered
+         */
+        const TemplateMethodInfo *get_template_method_info(const std::string &template_name) const;
+
+        /**
+         * @brief Find a specific method by name in template method metadata
+         * @param template_name The template base name
+         * @param method_name The method name to find
+         * @return Pointer to MethodMetadata, or nullptr if not found
+         */
+        const MethodMetadata *find_template_method(const std::string &template_name,
+                                                   const std::string &method_name) const;
+
+        /**
+         * @brief Check if template method info is registered
+         * @param template_name The template base name
+         * @return true if registered
+         */
+        bool has_template_method_info(const std::string &template_name) const;
     };
 }

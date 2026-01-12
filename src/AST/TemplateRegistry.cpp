@@ -36,6 +36,41 @@ namespace Cryo
         info.metadata = TemplateMetadata(base_name, param_names, module_namespace, source_file);
 
         _templates[base_name] = info;
+
+        // Extract and store method metadata (persists after AST cleanup)
+        TemplateMethodInfo method_info;
+        method_info.module_namespace = module_namespace;
+
+        const auto &methods = template_node->methods();
+        for (const auto &method : methods)
+        {
+            if (!method)
+                continue;
+
+            MethodMetadata mm;
+            mm.name = method->name();
+            mm.return_type_annotation = method->return_type_annotation();
+            mm.is_static = method->is_static();
+
+            // Extract parameter info
+            const auto &params = method->parameters();
+            for (const auto &param : params)
+            {
+                if (param)
+                {
+                    mm.parameter_names.push_back(param->name());
+                    mm.parameter_type_annotations.push_back(param->type_annotation());
+                }
+            }
+
+            method_info.methods.push_back(std::move(mm));
+            LOG_TRACE(Cryo::LogComponent::AST, "Extracted method metadata: {}::{} -> {}",
+                      base_name, mm.name, mm.return_type_annotation);
+        }
+
+        _template_method_info[base_name] = std::move(method_info);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Stored {} method(s) metadata for class template '{}'",
+                  _template_method_info[base_name].methods.size(), base_name);
     }
 
     void TemplateRegistry::register_struct_template(const std::string &base_name,
@@ -67,6 +102,41 @@ namespace Cryo
         info.metadata = TemplateMetadata(base_name, param_names, module_namespace, source_file);
 
         _templates[base_name] = info;
+
+        // Extract and store method metadata (persists after AST cleanup)
+        TemplateMethodInfo method_info;
+        method_info.module_namespace = module_namespace;
+
+        const auto &methods = template_node->methods();
+        for (const auto &method : methods)
+        {
+            if (!method)
+                continue;
+
+            MethodMetadata mm;
+            mm.name = method->name();
+            mm.return_type_annotation = method->return_type_annotation();
+            mm.is_static = method->is_static();
+
+            // Extract parameter info
+            const auto &params = method->parameters();
+            for (const auto &param : params)
+            {
+                if (param)
+                {
+                    mm.parameter_names.push_back(param->name());
+                    mm.parameter_type_annotations.push_back(param->type_annotation());
+                }
+            }
+
+            method_info.methods.push_back(std::move(mm));
+            LOG_TRACE(Cryo::LogComponent::AST, "Extracted method metadata: {}::{} -> {}",
+                      base_name, mm.name, mm.return_type_annotation);
+        }
+
+        _template_method_info[base_name] = std::move(method_info);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Stored {} method(s) metadata for template '{}'",
+                  _template_method_info[base_name].methods.size(), base_name);
     }
 
     void TemplateRegistry::register_enum_template(const std::string &base_name,
@@ -260,5 +330,48 @@ namespace Cryo
     bool TemplateRegistry::has_struct_field_types(const std::string &qualified_struct_name) const
     {
         return _struct_field_types.find(qualified_struct_name) != _struct_field_types.end();
+    }
+
+    //===================================================================
+    // Template Method Metadata Registry Implementation
+    //===================================================================
+
+    const TemplateRegistry::TemplateMethodInfo *TemplateRegistry::get_template_method_info(
+        const std::string &template_name) const
+    {
+        auto it = _template_method_info.find(template_name);
+        if (it != _template_method_info.end())
+        {
+            LOG_TRACE(Cryo::LogComponent::AST,
+                      "Found template method info: {} with {} methods",
+                      template_name, it->second.methods.size());
+            return &it->second;
+        }
+        return nullptr;
+    }
+
+    const TemplateRegistry::MethodMetadata *TemplateRegistry::find_template_method(
+        const std::string &template_name, const std::string &method_name) const
+    {
+        auto it = _template_method_info.find(template_name);
+        if (it != _template_method_info.end())
+        {
+            for (const auto &method : it->second.methods)
+            {
+                if (method.name == method_name)
+                {
+                    LOG_TRACE(Cryo::LogComponent::AST,
+                              "Found method metadata: {}::{} -> {}",
+                              template_name, method_name, method.return_type_annotation);
+                    return &method;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    bool TemplateRegistry::has_template_method_info(const std::string &template_name) const
+    {
+        return _template_method_info.find(template_name) != _template_method_info.end();
     }
 }
