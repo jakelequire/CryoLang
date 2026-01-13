@@ -2055,16 +2055,6 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "Processing {} imported modules for AST node updates", imported_asts.size());
         auto all_symbols = _symbol_table->get_symbols();
 
-        // DEBUG: Check current state of _struct_methods before processing imports
-        std::cout << "[DEBUG] === STATE OF _struct_methods BEFORE IMPORT PROCESSING ===" << std::endl;
-        for (const auto &[struct_name, methods] : _struct_methods) {
-            std::cout << "[DEBUG] Struct '" << struct_name << "' has methods:" << std::endl;
-            for (const auto &[method_name, method_info] : methods) {
-                std::cout << "[DEBUG]   - " << method_name << std::endl;
-            }
-        }
-        std::cout << "[DEBUG] =================================================================" << std::endl;
-
         // Store the original source file to restore later
         std::string original_source_file = _source_file;
 
@@ -2152,8 +2142,6 @@ namespace Cryo
                         break;
                     }
 
-                    // std::cout << "[DEBUG] Found " << node_type << " in imported module " << module_name << std::endl;
-
                     // For function declarations, we need to check with qualified names
                     if (stmt->kind() == NodeKind::FunctionDeclaration)
                     {
@@ -2202,23 +2190,11 @@ namespace Cryo
                     else
                     {
                         // For non-function statements, use normal visitor
-                        std::cout << "[DEBUG] Processing " << node_type << " from module " << module_name << std::endl;
                         stmt->accept(*this);
-                        std::cout << "[DEBUG] Finished processing " << node_type << " from module " << module_name << std::endl;
                     }
                 }
             }
         }
-
-        // DEBUG: Check final state of _struct_methods after processing imports
-        std::cout << "[DEBUG] === STATE OF _struct_methods AFTER IMPORT PROCESSING ===" << std::endl;
-        for (const auto &[struct_name, methods] : _struct_methods) {
-            std::cout << "[DEBUG] Struct '" << struct_name << "' has methods:" << std::endl;
-            for (const auto &[method_name, method_info] : methods) {
-                std::cout << "[DEBUG]   - " << method_name << std::endl;
-            }
-        }
-        std::cout << "[DEBUG] =================================================================" << std::endl;
 
         // Restore the original source file context
         set_source_file(original_source_file);
@@ -8224,8 +8200,6 @@ namespace Cryo
         {
             if (method)
             {
-                // std::cout << "[DEBUG] Checking method: " << method->name() << " for type " << target_type_name << std::endl;
-
                 // Skip method validation for stdlib files - stdlib implementations
                 // are allowed to extend functionality without requiring explicit declarations
                 bool is_stdlib_file = (_stdlib_compilation_mode ||
@@ -8265,12 +8239,6 @@ namespace Cryo
 
                 LOG_DEBUG(Cryo::LogComponent::AST, "Processing method: {} for type {} (source: {})", method->name(), target_type_name, _source_file);
 
-                // Special debug for BTreeMap methods
-                if (target_type_name.find("BTreeMap") != std::string::npos) 
-                {
-                    std::cout << "[DEBUG] === PROCESSING BTREEMAP METHOD: " << method->name() << " for type " << target_type_name << " (registration key: " << registration_type_name << ") ===" << std::endl;
-                }
-
                 // Special debug for string methods
                 if (target_type_name == "string")
                 {
@@ -8293,28 +8261,6 @@ namespace Cryo
                         _template_registry->register_method_return_type(qualified_method_name, return_type);
                         LOG_DEBUG(Cryo::LogComponent::AST, "Registered method return type in TemplateRegistry: {} -> {}",
                                   qualified_method_name, return_type->to_string());
-                    }
-                }
-
-                // Verify registration for BTreeMap methods
-                if (target_type_name.find("BTreeMap") != std::string::npos) 
-                {
-                    auto it = _struct_methods.find(registration_type_name);
-                    if (it != _struct_methods.end())
-                    {
-                        auto method_it = it->second.find(method->name());
-                        if (method_it != it->second.end())
-                        {
-                            std::cout << "[DEBUG] === CONFIRMED: BTreeMap method '" << method->name() << "' is registered for type '" << registration_type_name << "' ===" << std::endl;
-                        }
-                        else
-                        {
-                            std::cout << "[DEBUG] === ERROR: BTreeMap method '" << method->name() << "' NOT found for type '" << registration_type_name << "' ===" << std::endl;
-                        }
-                    }
-                    else
-                    {
-                        std::cout << "[DEBUG] === ERROR: No '" << registration_type_name << "' key found in _struct_methods ===" << std::endl;
                     }
                 }
 
@@ -8789,11 +8735,31 @@ namespace Cryo
                     {
                         node.set_resolved_return_type(return_type);
                     }
+                    else
+                    {
+                        // For generic methods, if we can't resolve the return type, check if it contains
+                        // unresolved generic parameters and create a placeholder type
+                        if (return_type_annotation.find('<') != std::string::npos && is_in_generic_context())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Creating placeholder generic type for unresolved return type: {}", return_type_annotation);
+                            // Create a generic type as placeholder that can be resolved during monomorphization
+                            return_type = _type_context.get_generic_type(return_type_annotation);
+                            node.set_resolved_return_type(return_type);
+                        }
+                    }
                 }
 
                 if (!return_type)
                 {
-                    _diagnostic_builder->create_undefined_symbol_error(return_type_str, NodeKind::Declaration, node.location());
+                    // Only create error if we're not in a generic context or stdlib mode
+                    if (!is_in_generic_context() && !_stdlib_compilation_mode)
+                    {
+                        _diagnostic_builder->create_undefined_symbol_error(return_type_str, NodeKind::Declaration, node.location());
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Using unknown type for generic context return type: {}", return_type_annotation);
+                    }
                     return_type = _type_context.get_unknown_type();
                 }
             }

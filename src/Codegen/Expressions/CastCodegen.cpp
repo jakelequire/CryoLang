@@ -407,7 +407,19 @@ namespace Cryo::Codegen
         }
 
         // Generate overflow check
-        llvm::Function *fn = builder().GetInsertBlock()->getParent();
+        llvm::BasicBlock *current_block = builder().GetInsertBlock();
+        if (!current_block)
+        {
+            // No overflow handler - just do unchecked truncation
+            return truncate(value, target_type);
+        }
+
+        llvm::Function *fn = current_block->getParent();
+        if (!fn)
+        {
+            // No overflow handler - just do unchecked truncation
+            return truncate(value, target_type);
+        }
         llvm::BasicBlock *no_overflow_block = llvm::BasicBlock::Create(llvm_ctx(), "no_overflow", fn);
 
         // Check if value fits in target type

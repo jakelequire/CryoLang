@@ -22,7 +22,15 @@ namespace Cryo::Codegen
         if (!node)
             return;
 
-        llvm::Function *function = builder().GetInsertBlock()->getParent();
+        // Check for valid insertion context
+        llvm::BasicBlock *current_block = builder().GetInsertBlock();
+        if (!current_block)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current basic block for if statement");
+            return;
+        }
+
+        llvm::Function *function = current_block->getParent();
         if (!function)
         {
             report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for if statement");
@@ -159,7 +167,15 @@ namespace Cryo::Codegen
         if (!node)
             return;
 
-        llvm::Function *function = builder().GetInsertBlock()->getParent();
+        // Check for valid insertion context
+        llvm::BasicBlock *while_block = builder().GetInsertBlock();
+        if (!while_block)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current basic block for while loop");
+            return;
+        }
+
+        llvm::Function *function = while_block->getParent();
         if (!function)
         {
             report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for while loop");
@@ -219,7 +235,15 @@ namespace Cryo::Codegen
         if (!node)
             return;
 
-        llvm::Function *function = builder().GetInsertBlock()->getParent();
+        // Check for valid insertion context
+        llvm::BasicBlock *for_block = builder().GetInsertBlock();
+        if (!for_block)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current basic block for for loop");
+            return;
+        }
+
+        llvm::Function *function = for_block->getParent();
         if (!function)
         {
             report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for for loop");
@@ -306,7 +330,15 @@ namespace Cryo::Codegen
         if (!node)
             return;
 
-        llvm::Function *function = builder().GetInsertBlock()->getParent();
+        // Check for valid insertion context
+        llvm::BasicBlock *do_while_block = builder().GetInsertBlock();
+        if (!do_while_block)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current basic block for do-while loop");
+            return;
+        }
+
+        llvm::Function *function = do_while_block->getParent();
         if (!function)
         {
             report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for do-while loop");
@@ -370,7 +402,15 @@ namespace Cryo::Codegen
         if (!node)
             return;
 
-        llvm::Function *function = builder().GetInsertBlock()->getParent();
+        // Check for valid insertion context
+        llvm::BasicBlock *switch_block = builder().GetInsertBlock();
+        if (!switch_block)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current basic block for switch statement");
+            return;
+        }
+
+        llvm::Function *function = switch_block->getParent();
         if (!function)
         {
             report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for switch statement");
@@ -422,7 +462,20 @@ namespace Cryo::Codegen
                                                       llvm::Value *switch_value,
                                                       llvm::BasicBlock *end_block)
     {
-        llvm::Function *function = builder().GetInsertBlock()->getParent();
+        // Check for valid insertion context
+        llvm::BasicBlock *int_switch_block = builder().GetInsertBlock();
+        if (!int_switch_block)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current basic block for integer switch");
+            return;
+        }
+
+        llvm::Function *function = int_switch_block->getParent();
+        if (!function)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for integer switch");
+            return;
+        }
 
         // Create default block
         llvm::BasicBlock *default_block = create_block("switch.default", function);
@@ -550,7 +603,20 @@ namespace Cryo::Codegen
                                                      llvm::Value *switch_value,
                                                      llvm::BasicBlock *end_block)
     {
-        llvm::Function *function = builder().GetInsertBlock()->getParent();
+        // Check for valid insertion context
+        llvm::BasicBlock *str_switch_block = builder().GetInsertBlock();
+        if (!str_switch_block)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current basic block for string switch");
+            return;
+        }
+
+        llvm::Function *function = str_switch_block->getParent();
+        if (!function)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for string switch");
+            return;
+        }
 
         // String switch is implemented as if-else chain with strcmp
         // Get or create strcmp function
@@ -658,7 +724,15 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: Generating match statement");
 
-        llvm::Function *function = builder().GetInsertBlock()->getParent();
+        // Check for valid insertion context
+        llvm::BasicBlock *match_block = builder().GetInsertBlock();
+        if (!match_block)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current basic block for match statement");
+            return;
+        }
+
+        llvm::Function *function = match_block->getParent();
         if (!function)
         {
             report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for match statement");
@@ -886,19 +960,38 @@ namespace Cryo::Codegen
                 // Cast return value to match function return type if needed
                 if (expected_ret_type && ret_val->getType() != expected_ret_type)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                             "Return type mismatch: expected {}, got {}. Attempting cast.",
-                             expected_ret_type->isVoidTy() ? "void" : "non-void",
-                             ret_val->getType()->isStructTy() ? "struct" : "non-struct");
-                    
-                    ret_val = cast_if_needed(ret_val, expected_ret_type);
-                    
-                    // If cast failed and returned null, use a default value instead
-                    if (!ret_val)
+                    // Special case: if function expects void but we have a struct, just return void
+                    if (expected_ret_type->isVoidTy() && ret_val->getType()->isStructTy())
                     {
                         LOG_WARN(Cryo::LogComponent::CODEGEN,
-                                "Cast failed in return statement, using default return value");
+                                "Return type mismatch: expected void but got struct. Using void return.");
+                        builder().CreateRetVoid();
+                        return;
+                    }
+                    
+                    // Special case: if function expects struct but we have void, create null value
+                    if (expected_ret_type->isStructTy() && ret_val->getType()->isVoidTy())
+                    {
+                        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                "Return type mismatch: expected struct but got void. Using null struct.");
                         ret_val = llvm::Constant::getNullValue(expected_ret_type);
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                 "Return type mismatch: expected {}, got {}. Attempting cast.",
+                                 expected_ret_type->isVoidTy() ? "void" : "non-void",
+                                 ret_val->getType()->isStructTy() ? "struct" : "non-struct");
+                        
+                        ret_val = cast_if_needed(ret_val, expected_ret_type);
+                        
+                        // If cast failed and returned null, use a default value instead
+                        if (!ret_val)
+                        {
+                            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                    "Cast failed in return statement, using default return value");
+                            ret_val = llvm::Constant::getNullValue(expected_ret_type);
+                        }
                     }
                 }
                 if (ret_val)
