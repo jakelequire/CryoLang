@@ -246,6 +246,7 @@ namespace Cryo
         void exit_generic_context();
         bool is_in_generic_context() const;
         bool is_generic_parameter(const std::string &name) const;
+        bool is_resolvable_concrete_type(const std::string &type_name) const;
         std::string get_current_generic_type() const;
         const std::vector<std::string> get_current_generic_parameters() const;
 
