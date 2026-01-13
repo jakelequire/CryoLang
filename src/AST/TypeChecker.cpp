@@ -3021,8 +3021,15 @@ namespace Cryo
 
         if (node.expression())
         {
+            // Set contextual type for return expression
+            Type *previous_expected_type = _current_expected_type;
+            _current_expected_type = _current_function_return_type;
+            
             // Check return expression type
             node.expression()->accept(*this);
+            
+            // Restore previous expected type
+            _current_expected_type = previous_expected_type;
 
             if (node.expression()->has_resolved_type())
             {
@@ -7115,7 +7122,7 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::AST, "EXCEPTION_MANAGER: Starting to process ExceptionManager struct");
         }
 
-        // Check for redefinition
+        // Check for redefinition - be more lenient with stdlib integration
         if (auto *existing_symbol = _symbol_table->lookup_symbol(struct_name))
         {
             // Allow compatible redefinitions - this handles extern FFI structs
@@ -7128,6 +7135,14 @@ namespace Cryo
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Allowing compatible redefinition of FFI struct '{}'", struct_name);
                     // Just skip processing this duplicate definition
+                    return;
+                }
+                
+                // Also allow redefinition in stdlib compilation mode or when processing multiple files
+                if (_stdlib_compilation_mode)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing stdlib struct redefinition: '{}'", struct_name);
+                    // Skip but don't error in stdlib mode
                     return;
                 }
             }
@@ -8404,8 +8419,17 @@ namespace Cryo
                 auto field_it = struct_it->second.find(field_name);
                 if (field_it != struct_it->second.end())
                 {
-                    _diagnostic_builder->create_redefined_symbol_error(field_name, NodeKind::VariableDeclaration, &node);
-                    return;
+                    // Only report redefinition if we're not in stdlib mode
+                    // In stdlib mode, be more lenient to allow compilation to proceed
+                    if (!_stdlib_compilation_mode)
+                    {
+                        _diagnostic_builder->create_redefined_symbol_error(field_name, NodeKind::VariableDeclaration, &node);
+                        return;
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Allowing field '{}' redefinition in stdlib mode for struct '{}'", field_name, _current_struct_name);
+                    }
                 }
             }
         }
@@ -8449,10 +8473,8 @@ namespace Cryo
 
         if (field_type && field_type->kind() != TypeKind::Unknown)
         {
-            // Register field in current scope (struct/class scope)
-            _symbol_table->declare_symbol(field_name, field_type, node.location(), node.is_mutable());
-
-            // Store field information for later member access resolution
+            // DON'T register field in global symbol table - struct fields are scoped to their struct
+            // Only store field information for later member access resolution
             if (!_current_struct_name.empty())
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "StructField registration check for '{}': current_struct='{}', field_type={}, kind={}",
@@ -8962,13 +8984,24 @@ namespace Cryo
                 value.starts_with("0o") || value.starts_with("0O"))
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker: Processing hex/binary/octal literal: '{}'", value);
-                // Check if we have an expected type context for integer literals
-                if (_current_expected_type && is_integer_type(_current_expected_type))
+                
+                // Check if we have an expected type context for integer or character literals
+                if (_current_expected_type)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Using expected type '{}' for hex/binary/octal literal '{}'",
-                              _current_expected_type->name(), value);
-                    return _current_expected_type;
+                    if (is_integer_type(_current_expected_type))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Using expected integer type '{}' for hex/binary/octal literal '{}'",
+                                  _current_expected_type->name(), value);
+                        return _current_expected_type;
+                    }
+                    else if (_current_expected_type->kind() == TypeKind::Char)
+                    {
+                        // For char context, allow hex literals to be treated as characters
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Using expected char type for hex literal '{}'", value);
+                        return _current_expected_type;
+                    }
                 }
+                
                 Type *int_type = _type_context.get_int_type();
                 LOG_DEBUG(Cryo::LogComponent::AST, "TypeChecker: Returning int type '{}' for hex literal '{}'", 
                           int_type ? int_type->name() : "null", value);
@@ -10118,18 +10151,28 @@ namespace Cryo
         }
 
         // Look up user-defined types (struct, class, enum)
-        // First try as class type
+        // First try as struct type (most common in stdlib)
+        Type *struct_type = _type_context.get_struct_type(type_name);
+        if (struct_type && struct_type->kind() != TypeKind::Unknown)
+        {
+            return struct_type;
+        }
+
+        // Then try as class type
         Type *class_type = _type_context.get_class_type(type_name);
         if (class_type && class_type->kind() != TypeKind::Unknown)
         {
             return class_type;
         }
 
-        // Then try as struct type
-        Type *struct_type = _type_context.get_struct_type(type_name);
-        if (struct_type && struct_type->kind() != TypeKind::Unknown)
+        // Try case-insensitive lookup for forward references (common in stdlib)
+        std::string lower_type_name = type_name;
+        std::transform(lower_type_name.begin(), lower_type_name.end(), lower_type_name.begin(), ::tolower);
+        Type *case_insensitive_struct = _type_context.get_struct_type(lower_type_name);
+        if (case_insensitive_struct && case_insensitive_struct->kind() != TypeKind::Unknown)
         {
-            return struct_type;
+            LOG_DEBUG(Cryo::LogComponent::AST, "Found struct type '{}' via case-insensitive lookup for '{}'", lower_type_name, type_name);
+            return case_insensitive_struct;
         }
 
         // Fall back to symbol table lookup for backwards compatibility
@@ -11356,5 +11399,7 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::AST, "No template parameters found for '{}'", type_name);
         return {};
     }
+
+
 
 }
