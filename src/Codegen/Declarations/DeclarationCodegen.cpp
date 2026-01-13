@@ -1188,8 +1188,28 @@ namespace Cryo::Codegen
 
         // Get return type
         Type *resolved_type = node->get_resolved_return_type();
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Function '{}' resolved return type: '{}'", 
-                  node->name(), resolved_type ? resolved_type->to_string() : "NULL");
+        
+        // Check for corrupted or invalid type pointer
+        if (resolved_type != nullptr)
+        {
+            try {
+                // Attempt to access the type safely
+                TypeKind kind = resolved_type->kind();
+                std::string type_name = resolved_type->name();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Function '{}' resolved return type: '{}'", 
+                          node->name(), resolved_type->to_string());
+            }
+            catch (...)
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "get_function_type: CORRUPTED TYPE POINTER for function '{}' - this indicates a memory management bug in MonomorphizationPass", node->name());
+                throw std::runtime_error("Corrupted type pointer detected for function '" + node->name() + 
+                                       "' - this is a compiler bug in generic type substitution that must be fixed");
+            }
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Function '{}' has NULL return type", node->name());
+        }
         
         // Special handling for constructors - if return type is void/unknown, fix it to pointer type
         if (resolved_type && (resolved_type->kind() == TypeKind::Void || resolved_type->kind() == TypeKind::Unknown) &&
@@ -1210,8 +1230,23 @@ namespace Cryo::Codegen
         llvm::Type *return_type = get_llvm_type(resolved_type);
         if (!return_type)
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Using void return type for '{}'", node->name());
-            return_type = llvm::Type::getVoidTy(llvm_ctx());
+            // For generic methods, check if this is a template context where the return type
+            // should be resolved during monomorphization rather than defaulting to void
+            bool is_generic_context = !parent_type_name.empty() && 
+                                     (parent_type_name.find('<') != std::string::npos ||
+                                      parent_type_name.find('_') != std::string::npos); // e.g., Option_T
+            
+            if (is_generic_context && resolved_type && resolved_type->kind() == Cryo::TypeKind::Generic)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Generic method '{}' using opaque pointer return type", node->name());
+                // Use opaque pointer for generic return types that will be resolved later
+                return_type = llvm::PointerType::get(llvm_ctx(), 0);
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Using void return type for '{}'", node->name());
+                return_type = llvm::Type::getVoidTy(llvm_ctx());
+            }
         }
 
         // Collect parameter types

@@ -29,7 +29,6 @@ CRYO_TEST_DESC(TypeChecker, BasicStringLiteral, "Tests type checking of string l
 
         std::string source = R"(const test_str_)" + std::to_string(rand()) + R"(: string = "Hello, World!";)";
         
-        // Debug: print the source we're testing
         std::cout << "\n[DEBUG] Testing source: " << source << std::endl;
         
         bool success = helper.parse_and_type_check(source);

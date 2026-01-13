@@ -803,9 +803,18 @@ namespace Cryo::Codegen
     llvm::Value *ICodegenComponent::cast_if_needed(llvm::Value *value, llvm::Type *target_type)
     {
         if (!value || !target_type)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "cast_if_needed called with null value or target_type");
             return value;
+        }
 
         llvm::Type *source_type = value->getType();
+        if (!source_type)
+        {
+            LOG_WARN(Cryo::LogComponent::CODEGEN, "cast_if_needed: value has null type");
+            return llvm::Constant::getNullValue(target_type);
+        }
+
         if (source_type == target_type)
             return value;
 
