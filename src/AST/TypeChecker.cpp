@@ -732,6 +732,55 @@ namespace Cryo
         return false;
     }
 
+    bool TypeChecker::is_resolvable_concrete_type(const std::string &type_name) const
+    {
+        // Check for primitive types
+        static const std::unordered_set<std::string> primitives = {
+            "void", "bool", "boolean", "int", "i8", "i16", "i32", "i64", "i128",
+            "u8", "u16", "u32", "u64", "u128", "f32", "f64", "float", "double",
+            "char", "string", "auto"
+        };
+
+        if (primitives.count(type_name) > 0)
+        {
+            return true;
+        }
+
+        // Check if it's a known struct type
+        if (_type_context.lookup_struct_type(type_name) != nullptr)
+        {
+            return true;
+        }
+
+        // Check if it's a known class type
+        if (_type_context.lookup_class_type(type_name) != nullptr)
+        {
+            return true;
+        }
+
+        // Check if it's a known enum type
+        if (_type_context.lookup_enum_type(type_name) != nullptr)
+        {
+            return true;
+        }
+
+        // Check if it's a known trait type
+        if (_type_context.lookup_trait_type(type_name) != nullptr)
+        {
+            return true;
+        }
+
+        // Check symbol table for type definitions
+        TypedSymbol *symbol = _symbol_table->lookup_symbol(type_name);
+        if (symbol && symbol->type)
+        {
+            return true;
+        }
+
+        // Type cannot be resolved - likely a generic parameter
+        return false;
+    }
+
     std::string TypeChecker::get_current_generic_type() const
     {
         if (_generic_context_stack.empty())
@@ -1492,9 +1541,19 @@ namespace Cryo
             // Check if this is a generic parameter in the current context
             if (is_generic_parameter(clean_type))
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Skipping instantiation '{}' - contains unresolved generic parameter '{}'",
+                LOG_DEBUG(Cryo::LogComponent::AST, "Skipping instantiation '{}' - contains unresolved generic parameter '{}' (in generic context)",
                           instantiated_name, clean_type);
                 return; // Don't track instantiations with unresolved generic parameters
+            }
+
+            // Additional check: if the type cannot be resolved to any known type,
+            // it's likely an unresolved generic parameter even if we're not in a generic context
+            // This catches cases where generic templates reference their own type parameters
+            if (!is_resolvable_concrete_type(clean_type))
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Skipping instantiation '{}' - type '{}' cannot be resolved to a concrete type",
+                          instantiated_name, clean_type);
+                return; // Don't track instantiations with unresolvable type names
             }
         }
 
