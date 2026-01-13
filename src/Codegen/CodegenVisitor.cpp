@@ -898,11 +898,7 @@ namespace Cryo::Codegen
         // Generate expression for side effects
         if (node.expression())
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "=== EXPR STMT DEBUG: Processing expression in statement");
             node.expression()->accept(*this);
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "=== EXPR STMT DEBUG: Finished processing expression");
 
             // Clear the result - expression statements discard their value
             // This prevents lingering results from affecting subsequent operations

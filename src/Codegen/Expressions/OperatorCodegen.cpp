@@ -1389,7 +1389,20 @@ namespace Cryo::Codegen
             return nullptr;
 
         llvm::IRBuilder<> &b = builder();
-        llvm::Function *fn = b.GetInsertBlock()->getParent();
+        
+        llvm::BasicBlock *and_block = b.GetInsertBlock();
+        if (!and_block)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current basic block for logical AND");
+            return nullptr;
+        }
+
+        llvm::Function *fn = and_block->getParent();
+        if (!fn)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for logical AND");
+            return nullptr;
+        }
 
         // Create blocks for short-circuit evaluation
         llvm::BasicBlock *rhs_block = llvm::BasicBlock::Create(llvm_ctx(), "and.rhs", fn);
@@ -1440,7 +1453,20 @@ namespace Cryo::Codegen
             return nullptr;
 
         llvm::IRBuilder<> &b = builder();
-        llvm::Function *fn = b.GetInsertBlock()->getParent();
+        
+        llvm::BasicBlock *or_block = b.GetInsertBlock();
+        if (!or_block)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current basic block for logical OR");
+            return nullptr;
+        }
+
+        llvm::Function *fn = or_block->getParent();
+        if (!fn)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for logical OR");
+            return nullptr;
+        }
 
         // Create blocks for short-circuit evaluation
         llvm::BasicBlock *rhs_block = llvm::BasicBlock::Create(llvm_ctx(), "or.rhs", fn);

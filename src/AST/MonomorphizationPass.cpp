@@ -1710,12 +1710,39 @@ namespace Cryo
         Type *original_return_type = original_method.get_resolved_return_type();
         auto type_substitutions_map = convert_to_type_substitutions(type_substitutions);
         std::shared_ptr<Type> substituted_return_type = substitute_type(original_return_type, type_substitutions_map);
+        
+        // Handle type substitution carefully to avoid dangling pointers
+        Type *persistent_return_type = original_return_type; // Default fallback
+        
+        if (substituted_return_type)
+        {
+            // Check if this is a newly created type that won't persist
+            bool is_new_parameterized_type = (substituted_return_type->kind() == TypeKind::Parameterized && 
+                                             substituted_return_type.get() != original_return_type);
+            
+            if (is_new_parameterized_type)
+            {
+                // This is a newly created ParameterizedType from substitution
+                // For now, we cannot safely use it as it will become a dangling pointer
+                // TODO: Implement proper type registration with TypeContext
+                LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Cannot safely use substituted parameterized type for method '{}' - type system needs improvement", original_method.name());
+                
+                // As a temporary measure, keep the original type and log the issue
+                // This prevents crashes but may cause type checking issues later
+                persistent_return_type = original_return_type;
+            }
+            else
+            {
+                // This is an existing type with no-op deleter, safe to use
+                persistent_return_type = substituted_return_type.get();
+            }
+        }
 
         // Create the specialized method with the concrete return type
         auto specialized_method = std::make_unique<StructMethodNode>(
             original_method.location(),
             original_method.name(),
-            substituted_return_type.get(),
+            persistent_return_type,
             original_method.visibility(),
             original_method.is_constructor(),
             original_method.is_destructor(),
@@ -1731,10 +1758,32 @@ namespace Cryo
             Type *original_param_type = param->get_resolved_type();
             std::shared_ptr<Type> substituted_param_type = substitute_type(original_param_type, type_substitutions_map);
 
+            // Handle parameter type substitution safely
+            Type *persistent_param_type = original_param_type; // Default fallback
+            
+            if (substituted_param_type)
+            {
+                // Check if this is a newly created type that won't persist
+                bool is_new_parameterized_type = (substituted_param_type->kind() == TypeKind::Parameterized && 
+                                                 substituted_param_type.get() != original_param_type);
+                
+                if (is_new_parameterized_type)
+                {
+                    // This is a newly created ParameterizedType from substitution
+                    LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Cannot safely use substituted parameterized type for parameter '{}' in method '{}' - keeping original type", param->name(), original_method.name());
+                    persistent_param_type = original_param_type;
+                }
+                else
+                {
+                    // This is an existing type with no-op deleter, safe to use
+                    persistent_param_type = substituted_param_type.get();
+                }
+            }
+
             auto specialized_param = std::make_unique<VariableDeclarationNode>(
                 param->location(),
                 param->name(),
-                substituted_param_type.get(),
+                persistent_param_type,
                 nullptr, // initializer
                 param->is_mutable());
             specialized_method->add_parameter(std::move(specialized_param));
