@@ -1965,14 +1965,10 @@ namespace Cryo
         // First pass: Discover generic types from the AST
         discover_generic_types_from_ast(program);
 
-        // Visit all top-level declarations and statements
-        for (const auto &stmt : program.statements())
-        {
-            if (stmt)
-            {
-                stmt->accept(*this);
-            }
-        }
+        // Use the three-pass processing via the ProgramNode visitor
+        // This ensures proper struct type registration, method signature registration,
+        // and method body processing in the correct order
+        visit(program);
     }
 
     void TypeChecker::check_imported_modules(const std::unordered_map<std::string, std::unique_ptr<ProgramNode>> &imported_asts)
@@ -7315,8 +7311,14 @@ namespace Cryo
 
         LOG_DEBUG(Cryo::LogComponent::AST, "STRUCT_BODIES: Processing method bodies for struct '{}'", struct_name);
 
-        // Retrieve the already-registered struct type
-        Type *struct_type = _symbol_table->lookup_symbol(struct_name)->type;
+        // Retrieve the already-registered struct type with null safety
+        TypedSymbol *symbol = _symbol_table->lookup_symbol(struct_name);
+        if (!symbol || !symbol->type)
+        {
+            LOG_ERROR(Cryo::LogComponent::AST, "STRUCT_BODIES: Struct type '{}' not found in symbol table - skipping method body processing", struct_name);
+            return;
+        }
+        Type *struct_type = symbol->type;
 
         // Set current struct context
         Type *previous_struct_type = _current_struct_type;
@@ -7448,8 +7450,75 @@ namespace Cryo
     // Helper method to process only class method bodies (Pass 2)
     void TypeChecker::process_class_method_bodies(ClassDeclarationNode &node)
     {
-        // Classes already process method bodies in a controlled way, so nothing extra needed
-        // The existing ClassDeclarationNode visitor already handles this correctly
+        std::string class_name = node.name();
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "CLASS_BODIES: Processing method bodies for class '{}'", class_name);
+
+        // Retrieve the already-registered class type with null safety
+        TypedSymbol *symbol = _symbol_table->lookup_symbol(class_name);
+        if (!symbol || !symbol->type)
+        {
+            LOG_ERROR(Cryo::LogComponent::AST, "CLASS_BODIES: Class type '{}' not found in symbol table - skipping method body processing", class_name);
+            return;
+        }
+        Type *class_type = symbol->type;
+
+        // Set current class context
+        Type *previous_struct_type = _current_struct_type;
+        _current_struct_type = class_type;
+
+        std::string previous_struct_name = _current_struct_name;
+        _current_struct_name = class_name;
+
+        // Enter class scope
+        enter_scope();
+
+        // Re-register fields for this scope
+        for (const auto &field : node.fields())
+        {
+            if (field)
+            {
+                field->accept(*this);
+            }
+        }
+
+        // Handle generic context if needed
+        bool entered_generic_context = false;
+        if (!node.generic_parameters().empty())
+        {
+            std::vector<std::string> param_names;
+            for (const auto &generic_param : node.generic_parameters())
+            {
+                if (generic_param)
+                {
+                    param_names.push_back(generic_param->name());
+                }
+            }
+            enter_generic_context(class_name, param_names, node.location());
+            entered_generic_context = true;
+        }
+
+        // NOW process method bodies with all signatures available
+        for (const auto &method : node.methods())
+        {
+            if (method)
+            {
+                method->accept(*this);
+            }
+        }
+
+        // Exit generic context if we entered one
+        if (entered_generic_context)
+        {
+            exit_generic_context();
+        }
+
+        // Exit class scope
+        exit_scope();
+
+        // Restore previous class type and class name
+        _current_struct_type = previous_struct_type;
+        _current_struct_name = previous_struct_name;
     }
 
     void TypeChecker::visit(ClassDeclarationNode &node)
