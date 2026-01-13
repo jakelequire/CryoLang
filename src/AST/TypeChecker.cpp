@@ -1478,6 +1478,26 @@ namespace Cryo
             }
         }
 
+        // Validate that none of the "concrete" types are actually generic parameters
+        // This prevents tracking invalid instantiations like Option<T> where T is unresolved
+        for (const auto &type_str : concrete_types)
+        {
+            // Strip pointer/reference modifiers for the check
+            std::string clean_type = type_str;
+            while (!clean_type.empty() && (clean_type.back() == '*' || clean_type.back() == '&'))
+            {
+                clean_type.pop_back();
+            }
+
+            // Check if this is a generic parameter in the current context
+            if (is_generic_parameter(clean_type))
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Skipping instantiation '{}' - contains unresolved generic parameter '{}'",
+                          instantiated_name, clean_type);
+                return; // Don't track instantiations with unresolved generic parameters
+            }
+        }
+
         LOG_DEBUG(Cryo::LogComponent::AST, "Tracking instantiation '{}' (base: {})", instantiated_name, base_name);
 
         _required_instantiations.emplace_back(base_name, concrete_types, instantiated_name, location);

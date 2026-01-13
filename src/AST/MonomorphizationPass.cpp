@@ -17,6 +17,8 @@ namespace Cryo
     {
         // Store TypeChecker reference for type resolution
         _type_checker = &type_checker;
+        // Store TemplateRegistry reference for accessing generic parameter names
+        _template_registry = &template_registry;
 
         LOG_INFO(Cryo::LogComponent::AST, "MonomorphizationPass: Starting monomorphization with {} required instantiations", required_instantiations.size());
 
@@ -1612,23 +1614,37 @@ namespace Cryo
     {
         LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Creating specialized implementation block for: {}", instantiation.instantiated_name);
 
+        // Get the actual generic parameter names from the template registry
+        std::vector<std::string> generic_param_names;
+        if (_template_registry)
+        {
+            const auto *template_info = _template_registry->find_template(instantiation.base_name);
+            if (template_info && !template_info->metadata.generic_parameter_names.empty())
+            {
+                generic_param_names = template_info->metadata.generic_parameter_names;
+                LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Got {} generic parameter names from template registry for '{}'",
+                          generic_param_names.size(), instantiation.base_name);
+            }
+        }
+
+        // Validate parameter count
+        if (generic_param_names.size() != instantiation.concrete_types.size())
+        {
+            LOG_ERROR(Cryo::LogComponent::AST, "MonomorphizationPass: Parameter count mismatch for '{}': template has {} params but instantiation has {} concrete types",
+                      instantiation.base_name, generic_param_names.size(), instantiation.concrete_types.size());
+            return nullptr;
+        }
+
         // Find the original generic implementation block
         ImplementationBlockNode *original_impl = nullptr;
         std::string generic_target_type = instantiation.base_name + "<";
 
-        // Build the generic type pattern to match (e.g., "MyResult<T,E>")
-        for (size_t i = 0; i < instantiation.concrete_types.size(); ++i)
+        // Build the generic type pattern to match (e.g., "MyResult<T,E>") using ACTUAL parameter names
+        for (size_t i = 0; i < generic_param_names.size(); ++i)
         {
             if (i > 0)
                 generic_target_type += ",";
-            // Use generic parameter names (we need to find these from the original template)
-            // For now, use common generic parameter names
-            if (i == 0)
-                generic_target_type += "T";
-            else if (i == 1)
-                generic_target_type += "E";
-            else
-                generic_target_type += "T" + std::to_string(i);
+            generic_target_type += generic_param_names[i];
         }
         generic_target_type += ">";
 
@@ -1654,20 +1670,13 @@ namespace Cryo
             return nullptr;
         }
 
-        // Create type substitution map
+        // Create type substitution map using ACTUAL parameter names
         std::unordered_map<std::string, std::string> type_substitutions;
-        for (size_t i = 0; i < instantiation.concrete_types.size(); ++i)
+        for (size_t i = 0; i < generic_param_names.size(); ++i)
         {
-            std::string param_name;
-            if (i == 0)
-                param_name = "T";
-            else if (i == 1)
-                param_name = "E";
-            else
-                param_name = "T" + std::to_string(i);
-
-            type_substitutions[param_name] = instantiation.concrete_types[i];
-            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Implementation substitution: {} -> {}", param_name, instantiation.concrete_types[i]);
+            type_substitutions[generic_param_names[i]] = instantiation.concrete_types[i];
+            LOG_DEBUG(Cryo::LogComponent::AST, "MonomorphizationPass: Implementation substitution: {} -> {}",
+                      generic_param_names[i], instantiation.concrete_types[i]);
         }
 
         // Create the specialized implementation block with the mangled target type name

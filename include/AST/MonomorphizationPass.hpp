@@ -247,5 +247,8 @@ namespace Cryo
 
         // TypeChecker reference for type resolution (set during monomorphize call)
         TypeChecker *_type_checker = nullptr;
+
+        // TemplateRegistry reference for accessing generic parameter names
+        const TemplateRegistry *_template_registry = nullptr;
     };
 }
