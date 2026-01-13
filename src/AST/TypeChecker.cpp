@@ -2453,17 +2453,18 @@ namespace Cryo
         }
         else
         {
+            // Instead of falling back to unknown type, throw a proper compilation error
             if (_diagnostic_builder)
             {
                 _diagnostic_builder->create_undefined_symbol_error(var_name, NodeKind::Declaration, node.location());
             }
             else
             {
-                Type *expected = _type_context.get_void_type(); // Placeholder for "inferred type"
-                Type *found = _type_context.get_unknown_type();
-                _diagnostic_builder->create_assignment_type_error(expected, found, node.location());
+                report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
+                           "Cannot determine type for variable '" + var_name + "' - no type annotation and no initializer", &node);
             }
-            final_type = _type_context.get_unknown_type();
+            // Don't set unknown type - let compilation fail properly
+            return;
         }
 
         // Declare the variable in symbol table
@@ -2641,7 +2642,8 @@ namespace Cryo
         if (!return_type)
         {
             _diagnostic_builder->create_undefined_symbol_error(return_type_str, NodeKind::Declaration, node.location());
-            return_type = _type_context.get_unknown_type();
+            LOG_ERROR(Cryo::LogComponent::AST, "Function '{}': Cannot resolve return type '{}' - compilation failed", func_name, return_type_str);
+            return;
         }
 
         // Collect parameter types (exclude variadic parameters from param_types)
@@ -2655,7 +2657,8 @@ namespace Cryo
                 if (!param_type)
                 {
                     _diagnostic_builder->create_undefined_symbol_error(param_type_str, NodeKind::Declaration, param->location());
-                    param_type = _type_context.get_unknown_type();
+                    LOG_ERROR(Cryo::LogComponent::AST, "Function '{}': Cannot resolve parameter type '{}' - compilation failed", func_name, param_type_str);
+                    return;
                 }
 
                 // Skip variadic parameters - they're handled by the is_variadic flag
@@ -2873,7 +2876,9 @@ namespace Cryo
                 else
                 {
                     _diagnostic_builder->create_undefined_symbol_error(param_type_str, NodeKind::Declaration, param->location());
-                    param_types.push_back(_type_context.get_unknown_type());
+                    LOG_ERROR(Cryo::LogComponent::AST, "IntrinsicDeclarationNode '{}': Cannot resolve parameter type '{}' - compilation failed", 
+                              node.name(), param_type_str);
+                    return;
                 }
             }
         }
@@ -2887,7 +2892,9 @@ namespace Cryo
             if (!return_type)
             {
                 _diagnostic_builder->create_undefined_symbol_error(return_type_str, NodeKind::Declaration, node.location());
-                return_type = _type_context.get_unknown_type();
+                LOG_ERROR(Cryo::LogComponent::AST, "IntrinsicDeclarationNode '{}': Cannot resolve return type '{}' - compilation failed", 
+                          node.name(), return_type_str);
+                return;
             }
             node.set_resolved_return_type(return_type);
         }
@@ -3505,14 +3512,16 @@ namespace Cryo
             if (_in_call_expression)
             {
                 // Don't report error here if in call context - let CallExpressionNode handle it
-                node.set_resolved_type(_type_context.get_unknown_type());
+                // But still don't set unknown type - return early to fail compilation
+                return;
             }
             else
             {
                 // Only report the error if none of the fallback mechanisms worked
                 // Use node-based reporting for proper source context
                 report_undefined_symbol(&node, name);
-                node.set_resolved_type(_type_context.get_unknown_type());
+                // Don't set unknown type - let compilation fail properly
+                return;
             }
         }
         else
@@ -3729,7 +3738,8 @@ namespace Cryo
                                 report_error(TypeError::ErrorKind::InvalidOperation, node.location(),
                                              "Cannot apply arithmetic operation to types '" + left_name + "' and '" + right_name + "'", &node);
                             }
-                            node.set_resolved_type(_type_context.get_unknown_type());
+                            // Don't set unknown type - let compilation fail properly
+                            return;
                         }
                     }
                     // Bit shift operations
@@ -3745,7 +3755,8 @@ namespace Cryo
                         {
                             std::string op_str = (op == TokenKind::TK_LESSLESS) ? "<<" : ">>";
                             _diagnostic_builder->create_invalid_operation_error(op_str, left_type, right_type, &node);
-                            node.set_resolved_type(_type_context.get_unknown_type());
+                            // Don't set unknown type - let compilation fail properly
+                            return;
                         }
                     }
                     // Comparison operations
@@ -3805,6 +3816,46 @@ namespace Cryo
                         else
                         {
                             _diagnostic_builder->create_invalid_operation_error("comparison", left_type, right_type, &node);
+                        }
+                    }
+                    // Bitwise operations (AND, OR, XOR)
+                    else if (op == TokenKind::TK_AMP || op == TokenKind::TK_PIPE || op == TokenKind::TK_CARET)
+                    {
+                        // Bitwise operations require integral types
+                        if (left_type->is_integral() && right_type->is_integral())
+                        {
+                            // Handle mixed integer types - promote to the larger type
+                            if (left_type->name() == right_type->name())
+                            {
+                                result_type = left_type; // Same types
+                            }
+                            else
+                            {
+                                // Mixed integer types - use the larger width
+                                auto get_int_width = [](const std::string &name) -> int {
+                                    if (name == "i8" || name == "u8") return 8;
+                                    if (name == "i16" || name == "u16") return 16;
+                                    if (name == "i32" || name == "u32" || name == "int") return 32;
+                                    if (name == "i64" || name == "u64") return 64;
+                                    if (name == "i128" || name == "u128") return 128;
+                                    if (name == "char") return 8;
+                                    return 32; // default
+                                };
+                                int left_width = get_int_width(left_type->name());
+                                int right_width = get_int_width(right_type->name());
+                                result_type = (left_width >= right_width) ? left_type : right_type;
+                                const char* op_str = (op == TokenKind::TK_AMP ? "&" :
+                                                     (op == TokenKind::TK_PIPE ? "|" : "^"));
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Bitwise operation: {} {} {} = {}",
+                                          left_type->to_string(), op_str, right_type->to_string(), result_type->to_string());
+                            }
+                        }
+                        else
+                        {
+                            std::string op_str = (op == TokenKind::TK_AMP ? "&" :
+                                                 (op == TokenKind::TK_PIPE ? "|" : "^"));
+                            _diagnostic_builder->create_invalid_operation_error(op_str, left_type, right_type, &node);
+                            return;
                         }
                     }
 
@@ -3889,7 +3940,8 @@ namespace Cryo
                         LOG_DEBUG(Cryo::LogComponent::AST, "ERROR: Cannot dereference non-pointer type '{}' (kind={})",
                                   operand_type->to_string(), TypeKindToString(operand_type->kind()));
                         _diagnostic_builder->create_invalid_operation_error("dereference", operand_type, nullptr, &node);
-                        node.set_resolved_type(_type_context.get_unknown_type());
+                        // Don't set unknown type - let compilation fail properly
+                        return;
                     }
                 }
                 else if (op == TokenKind::TK_MINUS) // Unary minus
@@ -3901,7 +3953,8 @@ namespace Cryo
                     else
                     {
                         _diagnostic_builder->create_invalid_operation_error("unary minus", operand_type, nullptr, &node);
-                        node.set_resolved_type(_type_context.get_unknown_type());
+                        // Don't set unknown type - let compilation fail properly
+                        return;
                     }
                 }
                 else if (op == TokenKind::TK_EXCLAIM) // Logical NOT
@@ -3949,7 +4002,8 @@ namespace Cryo
                     else
                     {
                         _diagnostic_builder->create_invalid_operation_error("bitwise NOT", operand_type, nullptr, &node);
-                        node.set_resolved_type(_type_context.get_unknown_type());
+                        // Don't set unknown type - let compilation fail properly
+                        return;
                     }
                 }
                 else
@@ -3999,7 +4053,8 @@ namespace Cryo
                 }
                 else
                 {
-                    arg_types.push_back(_type_context.get_unknown_type());
+                    LOG_ERROR(Cryo::LogComponent::AST, "CallExpression: Argument has no resolved type - compilation failed");
+                    return;
                 }
             }
         }
@@ -4309,25 +4364,29 @@ namespace Cryo
                     }
                     else
                     {
-                        LOG_WARN(Cryo::LogComponent::AST, "CallExpression: Function return type is null, using unknown type");
-                        node.set_resolved_type(_type_context.get_unknown_type());
+                        LOG_ERROR(Cryo::LogComponent::AST, "CallExpression: Function return type is null - cannot determine return type");
+                        _diagnostic_builder->create_invalid_operation_error("function call", callee_type, nullptr, &node);
+                        return;
                     }
                 }
                 else
                 {
-                    node.set_resolved_type(_type_context.get_unknown_type());
+                    LOG_ERROR(Cryo::LogComponent::AST, "CallExpression: Callee type is not a function type: {}", callee_type ? callee_type->to_string() : "null");
+                    _diagnostic_builder->create_invalid_operation_error("function call", callee_type, nullptr, &node);
+                    return;
                 }
                 return;
             }
 
             // Not callable
             _diagnostic_builder->create_non_callable_error(callee_type, node.location(), &node);
-            node.set_resolved_type(_type_context.get_unknown_type());
+            return;
         }
         else
         {
-            LOG_DEBUG(Cryo::LogComponent::AST, "CallExpression callee does not have resolved type, setting to unknown");
-            node.set_resolved_type(_type_context.get_unknown_type());
+            LOG_ERROR(Cryo::LogComponent::AST, "CallExpression callee does not have resolved type - cannot determine call result");
+            _diagnostic_builder->create_invalid_operation_error("function call", nullptr, nullptr, &node);
+            return;
         }
     }
 
@@ -6358,7 +6417,9 @@ namespace Cryo
                                 Type *return_type = resolve_type_with_generic_context(return_type_str);
                                 if (!return_type)
                                 {
-                                    return_type = _type_context.get_unknown_type();
+                                    LOG_ERROR(Cryo::LogComponent::AST, "MemberAccessNode: Cannot resolve return type '{}' for struct method '{}' - compilation failed", 
+                                              return_type_str, member_name);
+                                    return;
                                 }
 
                                 std::vector<Type *> param_types;
@@ -6406,7 +6467,9 @@ namespace Cryo
                                 Type *return_type = resolve_type_with_generic_context(return_type_str);
                                 if (!return_type)
                                 {
-                                    return_type = _type_context.get_unknown_type();
+                                    LOG_ERROR(Cryo::LogComponent::AST, "MemberAccessNode: Cannot resolve return type '{}' for method '{}' - compilation failed", 
+                                              return_type_str, member_name);
+                                    return;
                                 }
 
                                 std::vector<Type *> param_types;
