@@ -8280,11 +8280,43 @@ namespace Cryo
                     return;
                 }
 
-                // Verify it's a struct, class, enum, or trait type
-                if (target_type->kind() != TypeKind::Struct &&
-                    target_type->kind() != TypeKind::Class &&
-                    target_type->kind() != TypeKind::Enum &&
-                    target_type->kind() != TypeKind::Trait)
+                // Verify it's a struct, class, enum, trait, or parameterized enum type
+                bool is_valid_impl_target = (target_type->kind() == TypeKind::Struct ||
+                                             target_type->kind() == TypeKind::Class ||
+                                             target_type->kind() == TypeKind::Enum ||
+                                             target_type->kind() == TypeKind::Trait);
+
+                // Check for parameterized enum types (Option<T>, Result<T,E>, IoResult<T>, etc.)
+                if (!is_valid_impl_target && target_type->kind() == TypeKind::Parameterized)
+                {
+                    // Check if it's a ParameterizedEnumType
+                    ParameterizedEnumType *param_enum = dynamic_cast<ParameterizedEnumType *>(target_type);
+                    if (param_enum)
+                    {
+                        is_valid_impl_target = true;
+                    }
+                    else
+                    {
+                        // Check if base name is registered as a parameterized enum template
+                        ParameterizedType *registered_template = _type_registry->get_template(base_type_name);
+                        if (registered_template)
+                        {
+                            ParameterizedEnumType *registered_enum = dynamic_cast<ParameterizedEnumType *>(registered_template);
+                            if (registered_enum)
+                            {
+                                is_valid_impl_target = true;
+                            }
+                        }
+                    }
+                }
+
+                // Also check for built-in parameterized enum types (OptionType, ResultType)
+                if (!is_valid_impl_target && ParameterizedType::is_enum_pattern_type(target_type->kind()))
+                {
+                    is_valid_impl_target = true;
+                }
+
+                if (!is_valid_impl_target)
                 {
                     _diagnostic_builder->create_invalid_operation_error("implementation block", target_type, nullptr, &node);
                     return;
