@@ -8278,6 +8278,12 @@ namespace Cryo
                 {
                     // Check template registry for parameterized types (Option<T>, Result<T,E>, IoResult<T>, etc.)
                     ParameterizedType *template_type = _type_registry->get_template(base_type_name);
+                    if (!template_type)
+                    {
+                        // Try syncing from TemplateRegistry (cross-module templates)
+                        sync_template_from_registry(base_type_name);
+                        template_type = _type_registry->get_template(base_type_name);
+                    }
                     if (template_type)
                     {
                         target_type = template_type;
