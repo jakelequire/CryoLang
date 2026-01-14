@@ -6356,6 +6356,37 @@ namespace Cryo
                     LOG_DEBUG(Cryo::LogComponent::AST, "Type '{}' not found in _struct_methods", primitive_type_name);
                 }
 
+                // FALLBACK: Try to find method return type from TemplateRegistry's cached return types
+                // This handles cross-module method lookups for primitive types like String
+                if (_template_registry)
+                {
+                    // Try various qualified method name formats for primitive types
+                    std::vector<std::string> qualified_names = {
+                        primitive_type_name + "::" + member_name,
+                        "Std::String::" + primitive_type_name + "::" + member_name,
+                        "string::" + member_name,
+                        "Std::String::string::" + member_name
+                    };
+
+                    for (const std::string &qualified_method : qualified_names)
+                    {
+                        Type *cached_return_type = _template_registry->get_method_return_type(qualified_method);
+                        if (cached_return_type)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Found cached method return type for '{}' -> '{}'",
+                                      qualified_method, cached_return_type->to_string());
+                            // Create a function type with the return type
+                            Type *method_type = _type_context.create_function_type(cached_return_type, {}, false);
+                            node.set_resolved_type(method_type);
+                            // Cache for future lookups
+                            _struct_methods[primitive_type_name][member_name] = method_type;
+                            return;
+                        }
+                    }
+                    LOG_DEBUG(Cryo::LogComponent::AST, "No cached method return type found for primitive method '{}.{}'",
+                              primitive_type_name, member_name);
+                }
+
                 // No method found in registry - reject member access on primitive types
                 std::string type_name = effective_type ? effective_type->to_string() : "unknown";
                 report_error(TypeError::ErrorKind::UndefinedVariable, node.location(),
