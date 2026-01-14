@@ -2925,28 +2925,6 @@ namespace Cryo
             }
         }
 
-        // CRITICAL: Also register intrinsic in the main symbol table for cross-module access
-        // This ensures intrinsic functions can be found when called from other modules
-        if (_main_symbol_table)
-        {
-            // Register with just the function name (for direct lookup)
-            Symbol *existing_main = _main_symbol_table->lookup_symbol(func_name);
-            if (!existing_main)
-            {
-                _main_symbol_table->declare_symbol(func_name, SymbolKind::Intrinsic, node.location(), func_type, "Global");
-                LOG_DEBUG(Cryo::LogComponent::AST, "Registered intrinsic '{}' in main symbol table", func_name);
-            }
-
-            // Also register with std::Intrinsics namespace qualification for namespace lookups
-            std::string qualified_name = "std::Intrinsics::" + func_name;
-            Symbol *existing_qualified = _main_symbol_table->lookup_symbol(qualified_name);
-            if (!existing_qualified)
-            {
-                _main_symbol_table->declare_symbol(qualified_name, SymbolKind::Intrinsic, node.location(), func_type, "std::Intrinsics");
-                LOG_DEBUG(Cryo::LogComponent::AST, "Registered intrinsic '{}' with qualified name in main symbol table", qualified_name);
-            }
-        }
-
         LOG_DEBUG(Cryo::LogComponent::AST, "Registered intrinsic function: {} with type: {}", func_name, func_type->to_string());
     }
 
