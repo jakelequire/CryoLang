@@ -3523,8 +3523,22 @@ namespace Cryo
                     "sync"
                 };
 
+                // Debug: Log what we're searching for and where
+                LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': Searching for intrinsic in {} namespaces, main_symbol_table={}, current_namespace='{}'",
+                          name, intrinsic_namespaces.size(), static_cast<const void *>(_main_symbol_table), _current_namespace);
+
+                // Dump all registered namespaces for debugging
+                const auto &registered_namespaces = _main_symbol_table->get_namespaces();
+                LOG_DEBUG(Cryo::LogComponent::AST, "  Registered namespaces in symbol table ({}):", registered_namespaces.size());
+                for (const auto &[ns_name, ns_symbols] : registered_namespaces)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "    - '{}' with {} symbols", ns_name, ns_symbols.size());
+                }
+
                 for (const auto &ns : intrinsic_namespaces)
                 {
+                    bool has_ns = _main_symbol_table->has_namespace(ns);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "  Checking namespace '{}': exists={}", ns, has_ns);
                     Symbol *intrinsic_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context(ns, name, _current_namespace);
                     if (intrinsic_symbol && intrinsic_symbol->data_type)
                     {
