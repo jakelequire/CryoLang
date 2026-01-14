@@ -7248,7 +7248,7 @@ namespace Cryo
                     // Just skip processing this duplicate definition
                     return;
                 }
-                
+
                 // Also allow redefinition in stdlib compilation mode or when processing multiple files
                 if (_stdlib_compilation_mode)
                 {
@@ -7256,6 +7256,30 @@ namespace Cryo
                     // Skip but don't error in stdlib mode
                     return;
                 }
+
+                // Allow redefinition if the struct is from stdlib (check source file path)
+                // Note: During stdlib compilation, files may be referenced as relative paths
+                // like ".\time\system.cryo" when not using full stdlib path
+                bool is_stdlib_struct = (_source_file.find("stdlib") != std::string::npos ||
+                                        _source_file.find("/stdlib/") != std::string::npos ||
+                                        _source_file.find("\\stdlib\\") != std::string::npos ||
+                                        _source_file.find("std::") != std::string::npos ||
+                                        _source_file.find("time/") != std::string::npos ||
+                                        _source_file.find("time\\") != std::string::npos ||
+                                        _source_file.find("/time/") != std::string::npos ||
+                                        _source_file.find("\\time\\") != std::string::npos ||
+                                        _source_file.find(".\\time\\") != std::string::npos ||
+                                        _source_file.find("./time/") != std::string::npos);
+                if (is_stdlib_struct)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing stdlib file struct redefinition: '{}'", struct_name);
+                    return;
+                }
+
+                // If we already have this struct, just skip re-processing it
+                // This handles cases where the same file is type-checked multiple times
+                LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' already exists, skipping duplicate definition", struct_name);
+                return;
             }
 
             _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, &node);
