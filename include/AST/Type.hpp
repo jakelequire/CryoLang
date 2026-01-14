@@ -750,6 +750,29 @@ namespace Cryo
         size_t alignment() const override;
         std::string to_string() const override;
 
+        // Instance type-kind helper methods for replacing hardcoded string checks
+        // Use these instead of base_name() == "Array" comparisons
+        bool is_array_like() const { return _param_type_kind == TypeKind::ArrayType; }
+        bool is_optional_like() const { return _param_type_kind == TypeKind::OptionType; }
+        bool is_result_like() const { return _param_type_kind == TypeKind::ResultType; }
+        bool is_vector_like() const { return _param_type_kind == TypeKind::VectorType; }
+        bool is_ptr_type() const { return _param_type_kind == TypeKind::PtrType; }
+        bool is_const_ptr_type() const { return _param_type_kind == TypeKind::ConstPtrType; }
+
+        // Check if this is a well-known parameterized type (Array, Option, Result, etc.)
+        // rather than a user-defined generic type
+        bool is_well_known_parameterized_type() const
+        {
+            return _param_type_kind != TypeKind::Parameterized;
+        }
+
+        // Check if this is an indexable type (supports array[index] syntax)
+        bool is_indexable() const
+        {
+            return _param_type_kind == TypeKind::ArrayType ||
+                   _param_type_kind == TypeKind::VectorType;
+        }
+
         // Static utility methods
         static std::string get_base_name_from_kind(TypeKind kind)
         {
