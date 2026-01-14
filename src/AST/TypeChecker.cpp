@@ -9586,6 +9586,20 @@ namespace Cryo
             return true;
         }
 
+        // Check if LHS is void* and RHS is string type (FFI compatible - string is pointer to char data)
+        if (lhs_str == "void*" && (rhs_str == "string" || rhs_str == "String"))
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from {} to void* (FFI string conversion)", rhs_str);
+            return true;
+        }
+
+        // Check if RHS is void* and LHS is string type (FFI compatible)
+        if (rhs_str == "void*" && (lhs_str == "string" || lhs_str == "String"))
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from void* to {} (FFI string conversion)", lhs_str);
+            return true;
+        }
+
         // Special case: For variable initialization, check if we're dealing with generic types without proper pointer notation
         if (rhs_str == "void*" && (lhs_str.find("ListNode<") == 0 || lhs_str.find("Node<") == 0))
         {
@@ -9708,12 +9722,11 @@ namespace Cryo
             {
                 // Special handling for types that should probably be pointers
                 std::string rhs_name = rhs_type->to_string();
-                if (rhs_name.find("ListNode<") == 0 || rhs_name.find("Node<") == 0 || 
-                    rhs_type->kind() == TypeKind::Parameterized || rhs_type->kind() == TypeKind::Struct || 
-                    rhs_type->kind() == TypeKind::Class)
+                if (rhs_name.find("ListNode<") == 0 || rhs_name.find("Node<") == 0 ||
+                    rhs_type->kind() == TypeKind::Parameterized || rhs_type->kind() == TypeKind::Struct ||
+                    rhs_type->kind() == TypeKind::Class || rhs_type->kind() == TypeKind::String)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "WARNING: Found {} type being passed to void* - this may indicate missing pointer in type resolution", rhs_name);
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing conversion from {} to void* assuming it's actually a pointer", rhs_name);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing conversion from {} to void* (FFI compatible type)", rhs_name);
                     return true;
                 }
             }
@@ -9729,12 +9742,11 @@ namespace Cryo
             {
                 // Special handling for types that should probably be pointers
                 std::string lhs_name = lhs_type->to_string();
-                if (lhs_name.find("ListNode<") == 0 || lhs_name.find("Node<") == 0 || 
-                    lhs_type->kind() == TypeKind::Parameterized || lhs_type->kind() == TypeKind::Struct || 
-                    lhs_type->kind() == TypeKind::Class)
+                if (lhs_name.find("ListNode<") == 0 || lhs_name.find("Node<") == 0 ||
+                    lhs_type->kind() == TypeKind::Parameterized || lhs_type->kind() == TypeKind::Struct ||
+                    lhs_type->kind() == TypeKind::Class || lhs_type->kind() == TypeKind::String)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "WARNING: Found {} type receiving void* - this may indicate missing pointer in type resolution", lhs_name);
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing conversion from void* to {} assuming it should be a pointer type", lhs_name);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing conversion from void* to {} (FFI compatible type)", lhs_name);
                     return true;
                 }
             }
