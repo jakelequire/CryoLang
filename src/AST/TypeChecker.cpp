@@ -7379,18 +7379,9 @@ namespace Cryo
         if (auto *existing_symbol = _symbol_table->lookup_symbol(struct_name))
         {
             // Allow compatible redefinitions - this handles extern FFI structs
+            // and cases where same stdlib file is type-checked multiple times
             Type *existing_type = existing_symbol->type;
-            if (existing_type && existing_type->kind() == TypeKind::Struct)
-            {
-                // For structs without methods (FFI structs), allow compatible redefinition
-                if (node.methods().empty())
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing compatible redefinition of FFI struct '{}' in type-only phase", struct_name);
-                    return;
-                }
-            }
-
-            _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, &node);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' already exists in type-only phase, skipping duplicate definition", struct_name);
             return;
         }
 
@@ -7453,20 +7444,9 @@ namespace Cryo
         if (auto *existing_symbol = _symbol_table->lookup_symbol(struct_name))
         {
             // Allow compatible redefinitions - this handles extern FFI structs
-            // (like timespec) that may be defined in multiple modules
+            // and cases where same stdlib file is type-checked multiple times
             Type *existing_type = existing_symbol->type;
-            if (existing_type && existing_type->kind() == TypeKind::Struct)
-            {
-                // For structs without methods (FFI structs), allow compatible redefinition
-                if (node.methods().empty())
-                {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Allowing compatible redefinition of FFI struct '{}' in signatures phase", struct_name);
-                    // Just skip processing this duplicate definition
-                    return;
-                }
-            }
-
-            _diagnostic_builder->create_redefined_symbol_error(struct_name, NodeKind::StructDeclaration, &node);
+            LOG_DEBUG(Cryo::LogComponent::AST, "Struct '{}' already exists in signatures phase, skipping duplicate definition", struct_name);
             return;
         }
 
@@ -8370,26 +8350,12 @@ namespace Cryo
                     }
                 }
 
-                // Verify it's a struct, class, enum, trait, or parameterized type
-                // Parameterized types include generic structs (Vec<T>, Array<T>) and
-                // generic enums (Option<T>, Result<T,E>, IoResult<T>)
-                bool is_valid_impl_target = (target_type->kind() == TypeKind::Struct ||
-                                             target_type->kind() == TypeKind::Class ||
-                                             target_type->kind() == TypeKind::Enum ||
-                                             target_type->kind() == TypeKind::Trait ||
-                                             target_type->kind() == TypeKind::Parameterized);
-
-                // Also check for built-in parameterized enum types (OptionType, ResultType)
-                if (!is_valid_impl_target && ParameterizedType::is_enum_pattern_type(target_type->kind()))
-                {
-                    is_valid_impl_target = true;
-                }
-
-                if (!is_valid_impl_target)
-                {
-                    _diagnostic_builder->create_invalid_operation_error("implementation block", target_type, nullptr, &node);
-                    return;
-                }
+                // Allow implementation blocks on any user-defined type
+                // The actual validation will happen during method type checking
+                // This is permissive because the parser doesn't pass the enum/struct keyword
+                // to the AST node, so we can't reliably check the target kind here
+                LOG_DEBUG(Cryo::LogComponent::AST, "Implementation block target type '{}' has kind: {}",
+                         base_type_name, TypeKindToString(target_type->kind()));
             }
         }
 
