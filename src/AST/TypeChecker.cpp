@@ -4554,7 +4554,7 @@ namespace Cryo
                 if (!template_type)
                 {
                     // Try syncing from TemplateRegistry
-                    sync_template_from_registry(base_struct_name);
+                    try_resolve_from_template_registry(base_struct_name);
                     template_type = _type_registry->get_template(base_struct_name);
                 }
                 if (template_type)
@@ -8384,7 +8384,7 @@ namespace Cryo
                     if (!template_type)
                     {
                         // Try syncing from TemplateRegistry (cross-module templates)
-                        sync_template_from_registry(base_type_name);
+                        try_resolve_from_template_registry(base_type_name);
                         template_type = _type_registry->get_template(base_type_name);
                     }
                     if (template_type)
@@ -10401,7 +10401,7 @@ namespace Cryo
         if (!template_type)
         {
             // Try syncing from TemplateRegistry
-            sync_template_from_registry(base_name);
+            try_resolve_from_template_registry(base_name);
             template_type = _type_registry->get_template(base_name);
         }
         if (template_type)
