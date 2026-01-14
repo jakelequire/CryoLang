@@ -3574,6 +3574,16 @@ namespace Cryo
                     node.set_resolved_type(main_symbol->data_type);
                     return;
                 }
+
+                // Ultimate fallback: search through ALL registered namespaces
+                // This catches intrinsics registered under non-standard namespace paths
+                Symbol *any_ns_symbol = _main_symbol_table->lookup_symbol_in_any_namespace(name);
+                if (any_ns_symbol && any_ns_symbol->data_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "IdentifierNode '{}': found via lookup_symbol_in_any_namespace (kind={})", name, static_cast<int>(any_ns_symbol->kind));
+                    node.set_resolved_type(any_ns_symbol->data_type);
+                    return;
+                }
             }
 
             // Check if we're in call context before reporting error
