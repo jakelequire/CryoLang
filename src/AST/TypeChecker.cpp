@@ -6987,11 +6987,9 @@ namespace Cryo
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Scope symbol '{}' not found", base_scope_name);
 
-            // Use SRM helper to generate standardized qualified name
-            std::vector<std::string> scope_parts = {scope_name};
-            auto member_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
-                scope_parts, member_name, Cryo::SymbolKind::Type);
-            std::string qualified_name = generate_qualified_name(member_id->to_string(), Cryo::SymbolKind::Type);
+            // For error messages, use the original scope-qualified name as written by the user
+            // Don't prepend the current namespace - that's confusing and incorrect
+            std::string qualified_name = scope_name + "::" + member_name;
             _diagnostic_builder->create_undefined_symbol_error(qualified_name, NodeKind::Declaration, node.location());
             node.set_resolved_type(_type_context.get_unknown_type());
             return;
