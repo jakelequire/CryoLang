@@ -7061,6 +7061,36 @@ namespace Cryo
 
         if (!scope_symbol)
         {
+            // Try to sync from main template registry for cross-module types
+            try_resolve_from_template_registry(base_scope_name);
+            ParameterizedType *synced_template = _type_registry->get_template(base_scope_name);
+            if (synced_template)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found type '{}' via template registry sync for scope resolution", base_scope_name);
+                // For static method calls like Vec::new(), we need to look up the method
+                // First check if the method is a constructor pattern
+                if (member_name == "new" || member_name == "default" || member_name == "from_secs" ||
+                    member_name == "from_millis" || member_name == "from_nanos" || member_name == "zero" ||
+                    member_name == "now" || member_name == "from_unix" || member_name == "from_system_time" ||
+                    member_name == "today" || member_name == "midnight" || member_name == "noon" ||
+                    member_name == "from_secs_since_midnight" || member_name == "from_cstr" ||
+                    member_name == "from_bytes" || member_name == "from_str" || member_name == "with_capacity" ||
+                    member_name == "from_raw_parts" || member_name == "empty" || member_name == "create" ||
+                    member_name == "init" || member_name == "alloc" || member_name == "from")
+                {
+                    // Constructor-like methods return the type itself
+                    node.set_resolved_type(synced_template);
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Resolved constructor-like static method {}::{} via template registry",
+                              base_scope_name, member_name);
+                    return;
+                }
+                // For other methods, allow them with the template type
+                node.set_resolved_type(synced_template);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved static method {}::{} via template registry",
+                          base_scope_name, member_name);
+                return;
+            }
+
             LOG_DEBUG(Cryo::LogComponent::AST, "Scope symbol '{}' not found", base_scope_name);
 
             // For error messages, use the original scope-qualified name as written by the user
