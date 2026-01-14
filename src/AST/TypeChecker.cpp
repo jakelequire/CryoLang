@@ -9730,6 +9730,28 @@ namespace Cryo
             return true;
         }
 
+        // SPECIAL CASE: Enum to integer coercion for FFI calls
+        // Allow enum types to be passed to integer parameters (common in C FFI)
+        if (lhs_type->is_integral() && rhs_type->kind() == TypeKind::Enum)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from enum {} to integer {} (FFI compatibility)", rhs_str, lhs_str);
+            return true;
+        }
+
+        // Also allow integer to enum coercion (for return values from FFI)
+        if (rhs_type->is_integral() && lhs_type->kind() == TypeKind::Enum)
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from integer {} to enum {} (FFI compatibility)", rhs_str, lhs_str);
+            return true;
+        }
+
+        // String-based fallback for enum types (Ordering, etc.)
+        if (lhs_type->is_integral() && (rhs_str == "Ordering" || rhs_str.find("Ordering") != std::string::npos))
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from {} to integer {} (FFI enum fallback)", rhs_str, lhs_str);
+            return true;
+        }
+
         // Special case: null can be assigned to any nullable type (pointers, optionals, etc.)
         if (rhs_type->kind() == TypeKind::Null && lhs_type->is_nullable())
         {
