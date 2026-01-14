@@ -576,8 +576,18 @@ namespace Cryo
                 {
                     // Create intrinsic symbol with proper type information (same as regular functions)
                     Type *intrinsic_type = create_function_type_from_declaration(intrinsic_decl, type_context);
-                    Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_decl->location(), intrinsic_type, module_name);
-                    symbol_map[intrinsic_decl->name()] = symbol;
+                    if (intrinsic_type)
+                    {
+                        Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_decl->location(), intrinsic_type, module_name);
+                        symbol_map[intrinsic_decl->name()] = symbol;
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added intrinsic '{}' to symbol map with type '{}'",
+                                  intrinsic_decl->name(), intrinsic_type->to_string());
+                    }
+                    else
+                    {
+                        LOG_WARNING(LogComponent::GENERAL, "ModuleLoader: Skipping intrinsic '{}' - failed to create function type",
+                                    intrinsic_decl->name());
+                    }
                 }
                 else if (auto module_decl = dynamic_cast<ModuleDeclarationNode *>(decl))
                 {
@@ -677,14 +687,22 @@ namespace Cryo
             return nullptr;
         }
 
+        const std::string &intrinsic_name = intrinsic_decl->name();
+        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Creating function type for intrinsic '{}'", intrinsic_name);
+
         // Get return type
         Type *return_type = nullptr;
         return_type = intrinsic_decl->get_resolved_return_type();
         const std::string &return_type_str = return_type ? return_type->to_string() : "void";
+
+        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Intrinsic '{}' has_resolved_return_type={}, return_type_str='{}'",
+                  intrinsic_name, intrinsic_decl->has_resolved_return_type(), return_type_str);
+
         if (!return_type || return_type_str == "void")
         {
             // Default to void for intrinsics without explicit return type or explicit void
             return_type = type_context->get_void_type();
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Intrinsic '{}' using void return type", intrinsic_name);
         }
 
         // Get parameter types
@@ -695,18 +713,29 @@ namespace Cryo
             if (param_type)
             {
                 parameter_types.push_back(param_type);
+                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Intrinsic '{}' param '{}' resolved to '{}'",
+                          intrinsic_name, param->name(), param_type->to_string());
             }
             else
             {
-                const std::string &param_type_str = param_type ? param_type->to_string() : "unknown";
-                std::cerr << "Warning: Failed to get resolved type for parameter '" << param->name()
-                          << "' (type: " << param_type_str << ") in intrinsic '" << intrinsic_decl->name() << "'" << std::endl;
+                LOG_WARNING(LogComponent::GENERAL, "ModuleLoader: Failed to get resolved type for parameter '{}' in intrinsic '{}' - intrinsic will not be available",
+                            param->name(), intrinsic_name);
                 return nullptr;
             }
         }
 
         // Create FunctionType
-        return type_context->create_function_type(return_type, parameter_types);
+        Type *func_type = type_context->create_function_type(return_type, parameter_types);
+        if (func_type)
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Successfully created function type for intrinsic '{}': {}",
+                      intrinsic_name, func_type->to_string());
+        }
+        else
+        {
+            LOG_WARNING(LogComponent::GENERAL, "ModuleLoader: Failed to create function type for intrinsic '{}'", intrinsic_name);
+        }
+        return func_type;
     }
 
     ModuleLoader::ImportResult ModuleLoader::filter_specific_imports(ImportResult result, const std::vector<std::string> &specific_imports)
