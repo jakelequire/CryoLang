@@ -6925,6 +6925,42 @@ namespace Cryo
                 node.set_type(symbol->data_type->to_string());
                 return;
             }
+
+            // Try looking up the fully qualified name directly (e.g., "mem::align_up")
+            std::string qualified_name = scope_name + "::" + member_name;
+            symbol = _main_symbol_table->lookup_symbol(qualified_name);
+            if (symbol && symbol->data_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "Found fully qualified function '{}' in main symbol table", qualified_name);
+                node.set_type(symbol->data_type->to_string());
+                if (symbol->data_type->kind() == TypeKind::Function)
+                {
+                    node.set_resolved_type(symbol->data_type);
+                }
+                return;
+            }
+
+            // Also try with namespace prefix variations
+            std::vector<std::string> namespace_variations = {
+                "Std::" + scope_name + "::" + member_name,
+                "Std::Mem::" + member_name,
+                scope_name + "::" + member_name
+            };
+
+            for (const std::string &variation : namespace_variations)
+            {
+                symbol = _main_symbol_table->lookup_symbol(variation);
+                if (symbol && symbol->data_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found function '{}' via namespace variation '{}'", member_name, variation);
+                    node.set_type(symbol->data_type->to_string());
+                    if (symbol->data_type->kind() == TypeKind::Function)
+                    {
+                        node.set_resolved_type(symbol->data_type);
+                    }
+                    return;
+                }
+            }
         }
 
         // Check if this is a generic type parameter with trait bounds (e.g., T::get_default where T: Default)
