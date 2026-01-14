@@ -68,9 +68,13 @@ namespace Cryo
             return true;
         }
 
-        // Unknown type is assignable from anything (for error recovery)
+        // Unknown type should NOT silently accept everything - this masks real type errors
+        // Unknown is only compatible with Unknown itself
         if (_kind == TypeKind::Unknown || other._kind == TypeKind::Unknown)
-            return true;
+        {
+            // Both must be Unknown for compatibility, otherwise it's a type error
+            return _kind == TypeKind::Unknown && other._kind == TypeKind::Unknown;
+        }
 
         // Auto type needs special handling
         if (_kind == TypeKind::Auto)
