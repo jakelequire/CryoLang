@@ -8276,8 +8276,17 @@ namespace Cryo
                 target_type = lookup_variable_type(base_type_name);
                 if (!target_type)
                 {
-                    _diagnostic_builder->create_undefined_symbol_error(base_type_name, NodeKind::Declaration, node.location());
-                    return;
+                    // Check template registry for parameterized types (Option<T>, Result<T,E>, IoResult<T>, etc.)
+                    ParameterizedType *template_type = _type_registry->get_template(base_type_name);
+                    if (template_type)
+                    {
+                        target_type = template_type;
+                    }
+                    else
+                    {
+                        _diagnostic_builder->create_undefined_symbol_error(base_type_name, NodeKind::Declaration, node.location());
+                        return;
+                    }
                 }
 
                 // Verify it's a struct, class, enum, trait, or parameterized enum type
