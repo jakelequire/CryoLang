@@ -2925,6 +2925,28 @@ namespace Cryo
             }
         }
 
+        // CRITICAL: Also register intrinsic in the main symbol table for cross-module access
+        // This ensures intrinsic functions can be found when called from other modules
+        if (_main_symbol_table)
+        {
+            // Register with just the function name (for direct lookup)
+            Symbol *existing_main = _main_symbol_table->lookup_symbol(func_name);
+            if (!existing_main)
+            {
+                _main_symbol_table->declare_symbol(func_name, SymbolKind::Intrinsic, node.location(), func_type, "Global");
+                LOG_DEBUG(Cryo::LogComponent::AST, "Registered intrinsic '{}' in main symbol table", func_name);
+            }
+
+            // Also register with std::Intrinsics namespace qualification for namespace lookups
+            std::string qualified_name = "std::Intrinsics::" + func_name;
+            Symbol *existing_qualified = _main_symbol_table->lookup_symbol(qualified_name);
+            if (!existing_qualified)
+            {
+                _main_symbol_table->declare_symbol(qualified_name, SymbolKind::Intrinsic, node.location(), func_type, "std::Intrinsics");
+                LOG_DEBUG(Cryo::LogComponent::AST, "Registered intrinsic '{}' with qualified name in main symbol table", qualified_name);
+            }
+        }
+
         LOG_DEBUG(Cryo::LogComponent::AST, "Registered intrinsic function: {} with type: {}", func_name, func_type->to_string());
     }
 
@@ -7210,26 +7232,61 @@ namespace Cryo
             if (synced_template)
             {
                 LOG_DEBUG(Cryo::LogComponent::AST, "Found type '{}' via template registry sync for scope resolution", base_scope_name);
-                // For static method calls like Vec::new(), we need to look up the method
-                // First check if the method is a constructor pattern
-                if (member_name == "new" || member_name == "default" || member_name == "from_secs" ||
-                    member_name == "from_millis" || member_name == "from_nanos" || member_name == "zero" ||
-                    member_name == "now" || member_name == "from_unix" || member_name == "from_system_time" ||
-                    member_name == "today" || member_name == "midnight" || member_name == "noon" ||
-                    member_name == "from_secs_since_midnight" || member_name == "from_cstr" ||
-                    member_name == "from_bytes" || member_name == "from_str" || member_name == "with_capacity" ||
-                    member_name == "from_raw_parts" || member_name == "empty" || member_name == "create" ||
-                    member_name == "init" || member_name == "alloc" || member_name == "from")
+
+                // DYNAMIC APPROACH: Check if this is an enum variant using metadata
+                // This avoids hardcoding specific variant names and works for ANY parameterized enum
+                ParameterizedEnumType *param_enum = dynamic_cast<ParameterizedEnumType *>(synced_template);
+                if (param_enum && param_enum->get_base_enum_type())
                 {
-                    // Constructor-like methods return the type itself
-                    node.set_resolved_type(synced_template);
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Resolved constructor-like static method {}::{} via template registry",
-                              base_scope_name, member_name);
-                    return;
+                    // This is a parameterized enum - check if member_name is a variant
+                    const EnumVariant *variant_info = param_enum->get_base_enum_type()->get_variant_info(member_name);
+                    if (variant_info)
+                    {
+                        // Found a variant - this is an enum constructor/value
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved enum variant {}::{} dynamically (has_data={})",
+                                  base_scope_name, member_name, variant_info->has_data);
+                        node.set_resolved_type(synced_template);
+                        return;
+                    }
                 }
-                // For other methods, allow them with the template type
+
+                // Also check if the base enum type is stored in TypeContext
+                Type *enum_type = _type_context.lookup_enum_type(base_scope_name);
+                if (enum_type && enum_type->kind() == TypeKind::Enum)
+                {
+                    EnumType *base_enum = static_cast<EnumType *>(enum_type);
+                    const EnumVariant *variant_info = base_enum->get_variant_info(member_name);
+                    if (variant_info)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved enum variant {}::{} via TypeContext enum lookup",
+                                  base_scope_name, member_name);
+                        node.set_resolved_type(synced_template);
+                        return;
+                    }
+                }
+
+                // Check method metadata from TemplateRegistry for static methods
+                if (_template_registry)
+                {
+                    const TemplateRegistry::MethodMetadata *method_meta = _template_registry->find_template_method(base_scope_name, member_name);
+                    if (method_meta)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Resolved static method {}::{} via TemplateRegistry metadata",
+                                  base_scope_name, member_name);
+                        // Resolve the return type from the annotation
+                        Type *return_type = resolve_type_with_generic_context(method_meta->return_type_annotation);
+                        if (return_type && return_type->kind() != TypeKind::Unknown)
+                        {
+                            node.set_resolved_type(return_type);
+                            return;
+                        }
+                    }
+                }
+
+                // Fallback: use the template type for any unresolved member access
+                // This allows the call to proceed and be validated elsewhere
                 node.set_resolved_type(synced_template);
-                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved static method {}::{} via template registry",
+                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved {}::{} with template type fallback",
                           base_scope_name, member_name);
                 return;
             }
@@ -7273,30 +7330,24 @@ namespace Cryo
                 }
             }
 
-            // FALLBACK: For constructor-like methods on unknown types, try to create a deferred type
+            // FALLBACK: Check if a struct/class/enum type exists with this name
             // This handles forward references and cross-module types that aren't yet loaded
-            if (member_name == "new" || member_name == "default" || member_name == "from_str" ||
-                member_name == "from_cstr" || member_name == "with_capacity" || member_name == "empty" ||
-                member_name == "create" || member_name == "init" || member_name == "from")
+            // More dynamic than hardcoding constructor names - if the type exists, any static method might be valid
+            Type *deferred_type = _type_context.get_struct_type(base_scope_name);
+            if (!deferred_type)
             {
-                // Create a deferred struct type for the constructor return
-                Type *struct_type = _type_context.get_struct_type(base_scope_name);
-                if (!struct_type)
-                {
-                    struct_type = _type_context.get_class_type(base_scope_name);
-                }
-                if (!struct_type)
-                {
-                    // Create a new struct type for forward references
-                    struct_type = _type_context.get_struct_type(base_scope_name);
-                }
-                if (struct_type)
-                {
-                    node.set_resolved_type(struct_type);
-                    LOG_DEBUG(Cryo::LogComponent::AST, "Resolved constructor-like static method {}::{} with deferred type",
-                              base_scope_name, member_name);
-                    return;
-                }
+                deferred_type = _type_context.get_class_type(base_scope_name);
+            }
+            if (!deferred_type)
+            {
+                deferred_type = _type_context.lookup_enum_type(base_scope_name);
+            }
+            if (deferred_type)
+            {
+                node.set_resolved_type(deferred_type);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Resolved static method {}::{} with deferred type lookup",
+                          base_scope_name, member_name);
+                return;
             }
 
             LOG_DEBUG(Cryo::LogComponent::AST, "Scope symbol '{}' not found", base_scope_name);
@@ -7362,26 +7413,29 @@ namespace Cryo
                 }
             }
 
-            // Method not found yet - it might be defined later or in another module
-            // For common patterns like constructors (new), allow them to proceed with the struct type as return
-            if (member_name == "new" || member_name == "default" || member_name == "from_secs" ||
-                member_name == "from_millis" || member_name == "from_nanos" || member_name == "zero" ||
-                member_name == "now" || member_name == "from_unix" || member_name == "from_system_time" ||
-                member_name == "today" || member_name == "midnight" || member_name == "noon" ||
-                member_name == "from_secs_since_midnight" || member_name == "from_cstr" ||
-                member_name == "from_bytes" || member_name == "from_str" || member_name == "with_capacity" ||
-                member_name == "from_raw_parts" || member_name == "empty" || member_name == "create" ||
-                member_name == "init" || member_name == "alloc" || member_name == "from")
+            // Method not found in local maps - try TemplateRegistry for cross-module methods
+            if (_template_registry)
             {
-                // These are likely factory/constructor methods that return the struct type
-                node.set_resolved_type(scope_type);
-                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing constructor-like static method {}::{} -> {}",
-                          base_scope_name, member_name, scope_type->name());
-                return;
+                const TemplateRegistry::MethodMetadata *method_meta = _template_registry->find_template_method(base_scope_name, member_name);
+                if (method_meta)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found method {}::{} via TemplateRegistry metadata",
+                              base_scope_name, member_name);
+                    Type *return_type = resolve_type_with_generic_context(method_meta->return_type_annotation);
+                    if (return_type && return_type->kind() != TypeKind::Unknown)
+                    {
+                        node.set_resolved_type(return_type);
+                        return;
+                    }
+                    // Metadata found but return type couldn't be resolved - use scope type as fallback
+                    node.set_resolved_type(scope_type);
+                    return;
+                }
             }
 
-            // For other methods, allow them to proceed with unknown type (might be resolved later)
-            LOG_DEBUG(Cryo::LogComponent::AST, "Static method {}::{} not found in struct_methods, allowing with scope type",
+            // Method not found - fallback to using the scope type
+            // This handles forward references and methods defined later
+            LOG_DEBUG(Cryo::LogComponent::AST, "Static method {}::{} not found, using scope type as fallback",
                       base_scope_name, member_name);
             node.set_resolved_type(scope_type);
             return;
@@ -11288,66 +11342,83 @@ namespace Cryo
                     LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Parameterized type {} with {} params",
                               base_name, type_params.size());
 
-                    // For Result<T, E>: Ok holds T (index 0), Err holds E (index 1)
-                    if (base_name == "Result" && type_params.size() >= 2)
+                    // DYNAMIC APPROACH: Try to use enum variant metadata to determine the bound variable type
+                    // This works for ANY parameterized enum, not just hardcoded ones
+                    bool found_via_metadata = false;
+
+                    // Try to get the base enum type from the parameterized type
+                    ParameterizedEnumType *param_enum = dynamic_cast<ParameterizedEnumType *>(param_type);
+                    if (param_enum && param_enum->get_base_enum_type())
                     {
-                        if (variant_name == "Ok" && type_params[0])
+                        const EnumVariant *variant_info = param_enum->get_base_enum_type()->get_variant_info(variant_name);
+                        if (variant_info && variant_info->has_data && !variant_info->field_types.empty())
                         {
-                            var_type = type_params[0].get();
-                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Result::Ok binds to type {}",
-                                      var_type->to_string());
-                        }
-                        else if (variant_name == "Err" && type_params[1])
-                        {
-                            var_type = type_params[1].get();
-                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Result::Err binds to type {}",
-                                      var_type->to_string());
-                        }
-                    }
-                    // For Option<T>: Some holds T (index 0)
-                    else if (base_name == "Option" && type_params.size() >= 1)
-                    {
-                        if (variant_name == "Some" && type_params[0])
-                        {
-                            var_type = type_params[0].get();
-                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Option::Some binds to type {}",
-                                      var_type->to_string());
-                        }
-                    }
-                    // For IoResult<T>: Ok holds T (index 0), Err holds IoError
-                    else if (base_name == "IoResult" && type_params.size() >= 1)
-                    {
-                        if (variant_name == "Ok" && type_params[0])
-                        {
-                            var_type = type_params[0].get();
-                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: IoResult::Ok binds to type {}",
-                                      var_type->to_string());
-                        }
-                        else if (variant_name == "Err")
-                        {
-                            // IoResult::Err always holds IoError
-                            var_type = _type_context.lookup_struct_type("IoError");
-                            if (!var_type)
+                            // Get the variant's field type
+                            Type *field_type = variant_info->field_types[i < variant_info->field_types.size() ? i : 0].get();
+                            if (field_type)
                             {
-                                // Try to find IoError in the main symbol table
-                                if (_main_symbol_table)
+                                // Check if the field type is a generic parameter that needs substitution
+                                std::string field_type_name = field_type->name();
+                                const auto &enum_params = param_enum->get_base_enum_type()->get_type_parameters();
+
+                                for (size_t pi = 0; pi < enum_params.size() && pi < type_params.size(); ++pi)
                                 {
-                                    Symbol *err_symbol = _main_symbol_table->lookup_symbol("IoError");
-                                    if (err_symbol && err_symbol->data_type)
+                                    if (field_type_name == enum_params[pi] && type_params[pi])
                                     {
-                                        var_type = err_symbol->data_type;
+                                        var_type = type_params[pi].get();
+                                        found_via_metadata = true;
+                                        LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: {}::{} bound var {} -> {} via metadata",
+                                                  base_name, variant_name, var_name, var_type->to_string());
+                                        break;
+                                    }
+                                }
+
+                                // If field type is concrete (not a generic param), use it directly
+                                if (!found_via_metadata && field_type->kind() != TypeKind::Generic)
+                                {
+                                    var_type = field_type;
+                                    found_via_metadata = true;
+                                    LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: {}::{} uses concrete field type {}",
+                                              base_name, variant_name, var_type->to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    // Also try looking up the enum type directly from TypeContext
+                    if (!found_via_metadata)
+                    {
+                        Type *enum_type = _type_context.lookup_enum_type(base_name);
+                        if (enum_type && enum_type->kind() == TypeKind::Enum)
+                        {
+                            EnumType *base_enum = static_cast<EnumType *>(enum_type);
+                            const EnumVariant *variant_info = base_enum->get_variant_info(variant_name);
+                            if (variant_info && variant_info->has_data && !variant_info->field_types.empty())
+                            {
+                                Type *field_type = variant_info->field_types[i < variant_info->field_types.size() ? i : 0].get();
+                                if (field_type)
+                                {
+                                    std::string field_type_name = field_type->name();
+                                    const auto &enum_params = base_enum->get_type_parameters();
+
+                                    for (size_t pi = 0; pi < enum_params.size() && pi < type_params.size(); ++pi)
+                                    {
+                                        if (field_type_name == enum_params[pi] && type_params[pi])
+                                        {
+                                            var_type = type_params[pi].get();
+                                            found_via_metadata = true;
+                                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: {}::{} bound via TypeContext metadata",
+                                                      base_name, variant_name);
+                                            break;
+                                        }
                                     }
                                 }
                             }
-                            if (var_type)
-                            {
-                                LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: IoResult::Err binds to type {}",
-                                          var_type->to_string());
-                            }
                         }
                     }
-                    // Generic handling: use first type parameter for first bound variable
-                    else if (!type_params.empty() && i < type_params.size() && type_params[i])
+
+                    // Fallback for first bound variable: use the first type parameter
+                    if (!found_via_metadata && !type_params.empty() && i < type_params.size() && type_params[i])
                     {
                         var_type = type_params[i].get();
                         LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Generic enum binding to type {}",
