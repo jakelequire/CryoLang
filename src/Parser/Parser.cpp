@@ -5814,6 +5814,19 @@ namespace Cryo
             return _context.types().get_i16_type();
         if (type_str == "i64")
             return _context.types().get_i64_type();
+        if (type_str == "i128")
+            return _context.types().get_i128_type();
+        // Unsigned integer types
+        if (type_str == "u8")
+            return _context.types().get_u8_type();
+        if (type_str == "u16")
+            return _context.types().get_u16_type();
+        if (type_str == "u32")
+            return _context.types().get_u32_type();
+        if (type_str == "u64")
+            return _context.types().get_u64_type();
+        if (type_str == "u128")
+            return _context.types().get_u128_type();
         if (type_str == "f32")
             return _context.types().get_f32_type();
         if (type_str == "f64")
