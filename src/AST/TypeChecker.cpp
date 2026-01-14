@@ -6981,6 +6981,34 @@ namespace Cryo
                     return;
                 }
             }
+
+            // Try main symbol table for cross-module types (e.g., String, Vec, etc.)
+            if (!scope_symbol && _main_symbol_table)
+            {
+                Symbol *main_symbol = _main_symbol_table->lookup_symbol(base_scope_name);
+                if (main_symbol && main_symbol->data_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found type '{}' in main symbol table for scope resolution", base_scope_name);
+                    // Create a temporary TypedSymbol to use for method lookup
+                    static TypedSymbol temp_symbol;
+                    temp_symbol.name = main_symbol->name;
+                    temp_symbol.type = main_symbol->data_type;
+                    scope_symbol = &temp_symbol;
+                }
+                else
+                {
+                    // Also try namespaces in main symbol table
+                    main_symbol = _main_symbol_table->lookup_symbol_in_any_namespace(base_scope_name);
+                    if (main_symbol && main_symbol->data_type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found type '{}' in main symbol table namespace", base_scope_name);
+                        static TypedSymbol temp_symbol;
+                        temp_symbol.name = main_symbol->name;
+                        temp_symbol.type = main_symbol->data_type;
+                        scope_symbol = &temp_symbol;
+                    }
+                }
+            }
         }
 
         if (!scope_symbol)
@@ -7054,7 +7082,10 @@ namespace Cryo
                 member_name == "from_millis" || member_name == "from_nanos" || member_name == "zero" ||
                 member_name == "now" || member_name == "from_unix" || member_name == "from_system_time" ||
                 member_name == "today" || member_name == "midnight" || member_name == "noon" ||
-                member_name == "from_secs_since_midnight")
+                member_name == "from_secs_since_midnight" || member_name == "from_cstr" ||
+                member_name == "from_bytes" || member_name == "from_str" || member_name == "with_capacity" ||
+                member_name == "from_raw_parts" || member_name == "empty" || member_name == "create" ||
+                member_name == "init" || member_name == "alloc" || member_name == "from")
             {
                 // These are likely factory/constructor methods that return the struct type
                 node.set_resolved_type(scope_type);
