@@ -3504,6 +3504,37 @@ namespace Cryo
                     return;
                 }
 
+                // Try alternative intrinsic namespace lookups for cross-module resolution
+                // Functions like atomic_fetch_add_64 may be stored under different namespace paths
+                static const std::vector<std::string> intrinsic_namespaces = {
+                    "std::core::Intrinsics",
+                    "core::Intrinsics",
+                    "Intrinsics",
+                    "std::sync",
+                    "sync"
+                };
+
+                for (const auto &ns : intrinsic_namespaces)
+                {
+                    Symbol *intrinsic_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context(ns, name, _current_namespace);
+                    if (intrinsic_symbol && intrinsic_symbol->data_type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found intrinsic '{}' in namespace '{}'", name, ns);
+                        node.set_resolved_type(intrinsic_symbol->data_type);
+                        return;
+                    }
+                }
+
+                // Try direct qualified name lookup (e.g., "std::Intrinsics::atomic_fetch_add_64")
+                std::string qualified_intrinsic = "std::Intrinsics::" + name;
+                Symbol *qualified_symbol = _main_symbol_table->lookup_symbol(qualified_intrinsic);
+                if (qualified_symbol && qualified_symbol->data_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "Found intrinsic via qualified name '{}'", qualified_intrinsic);
+                    node.set_resolved_type(qualified_symbol->data_type);
+                    return;
+                }
+
                 // Try to find the symbol in the main symbol table as a final fallback
                 // This handles variables that were declared but not properly loaded into current scope
                 Symbol *main_symbol = _main_symbol_table->lookup_symbol(name);
@@ -11177,15 +11208,53 @@ namespace Cryo
 
         // Look up the enum type
         TypedSymbol *enum_symbol = _symbol_table->lookup_symbol(enum_name);
+        if (!enum_symbol && _main_symbol_table)
+        {
+            // Try main symbol table for cross-module enum types
+            Symbol *main_symbol = _main_symbol_table->lookup_symbol(enum_name);
+            if (main_symbol && main_symbol->data_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Found '{}' in main symbol table", enum_name);
+                // Create a temporary typed symbol wrapper
+                static thread_local TypedSymbol temp_symbol;
+                temp_symbol.type = main_symbol->data_type;
+                temp_symbol.is_mutable = false;
+                enum_symbol = &temp_symbol;
+            }
+        }
         if (!enum_symbol)
         {
-            _diagnostic_builder->create_undefined_symbol_error(enum_name, NodeKind::EnumDeclaration, node.location());
-            return;
+            // For parameterized enum patterns, we may not need the enum symbol
+            // if we can infer types from _current_match_expr_type
+            // Don't error out for known generic enum patterns
+            if (_current_match_expr_type && _current_match_expr_type->kind() == TypeKind::Parameterized)
+            {
+                auto *param_type = static_cast<ParameterizedType *>(_current_match_expr_type);
+                const std::string &base_name = param_type->base_name();
+                if (base_name == "Result" || base_name == "Option" || base_name == "IoResult" ||
+                    base_name.find("Result") != std::string::npos)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Skipping enum lookup for parameterized type {}", base_name);
+                    // Continue to handle bound variables below
+                }
+                else
+                {
+                    _diagnostic_builder->create_undefined_symbol_error(enum_name, NodeKind::EnumDeclaration, node.location());
+                    return;
+                }
+            }
+            else
+            {
+                _diagnostic_builder->create_undefined_symbol_error(enum_name, NodeKind::EnumDeclaration, node.location());
+                return;
+            }
         }
 
-        Type *enum_type = enum_symbol->type;
-        if (!enum_type || enum_type->kind() != TypeKind::Enum)
+        Type *enum_type = enum_symbol ? enum_symbol->type : nullptr;
+        if (enum_type && enum_type->kind() != TypeKind::Enum)
         {
+            // Only error if we have a type but it's not an enum
+            // For parameterized enums, enum_type may be null and that's okay
             _diagnostic_builder->create_assignment_type_error(_type_context.get_enum_type(enum_name, {}, false), enum_type, node.location());
             return;
         }
@@ -11243,6 +11312,38 @@ namespace Cryo
                             var_type = type_params[0].get();
                             LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Option::Some binds to type {}",
                                       var_type->to_string());
+                        }
+                    }
+                    // For IoResult<T>: Ok holds T (index 0), Err holds IoError
+                    else if (base_name == "IoResult" && type_params.size() >= 1)
+                    {
+                        if (variant_name == "Ok" && type_params[0])
+                        {
+                            var_type = type_params[0].get();
+                            LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: IoResult::Ok binds to type {}",
+                                      var_type->to_string());
+                        }
+                        else if (variant_name == "Err")
+                        {
+                            // IoResult::Err always holds IoError
+                            var_type = _type_context.lookup_struct_type("IoError");
+                            if (!var_type)
+                            {
+                                // Try to find IoError in the main symbol table
+                                if (_main_symbol_table)
+                                {
+                                    Symbol *err_symbol = _main_symbol_table->lookup_symbol("IoError");
+                                    if (err_symbol && err_symbol->data_type)
+                                    {
+                                        var_type = err_symbol->data_type;
+                                    }
+                                }
+                            }
+                            if (var_type)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: IoResult::Err binds to type {}",
+                                          var_type->to_string());
+                            }
                         }
                     }
                     // Generic handling: use first type parameter for first bound variable
