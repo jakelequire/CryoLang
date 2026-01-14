@@ -3825,8 +3825,39 @@ namespace Cryo
                             is_mixed_integer_comparison = true;
                         }
 
+                        // Special handling for pointer-to-enum comparison with enum value
+                        // This handles cases like: this == FileType::File where this is FileType*
+                        bool is_pointer_enum_comparison = false;
+                        if (left_type->kind() == TypeKind::Pointer && right_type->kind() == TypeKind::Enum)
+                        {
+                            auto ptr_type = static_cast<PointerType *>(left_type);
+                            if (ptr_type->pointee_type() && ptr_type->pointee_type()->kind() == TypeKind::Enum)
+                            {
+                                is_pointer_enum_comparison = true;
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing pointer-to-enum comparison: {} == {}",
+                                          left_str, right_str);
+                            }
+                        }
+                        if (right_type->kind() == TypeKind::Pointer && left_type->kind() == TypeKind::Enum)
+                        {
+                            auto ptr_type = static_cast<PointerType *>(right_type);
+                            if (ptr_type->pointee_type() && ptr_type->pointee_type()->kind() == TypeKind::Enum)
+                            {
+                                is_pointer_enum_comparison = true;
+                                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing enum-to-pointer comparison: {} == {}",
+                                          left_str, right_str);
+                            }
+                        }
+                        // String-based fallback for pointer-to-enum comparison
+                        if ((left_str.find("*") != std::string::npos && right_type->kind() == TypeKind::Enum) ||
+                            (right_str.find("*") != std::string::npos && left_type->kind() == TypeKind::Enum))
+                        {
+                            is_pointer_enum_comparison = true;
+                        }
+
                         if (is_null_comparison ||
                             is_mixed_integer_comparison ||
+                            is_pointer_enum_comparison ||
                             left_type->is_assignable_from(*right_type) ||
                             right_type->is_assignable_from(*left_type))
                         {
@@ -9749,6 +9780,27 @@ namespace Cryo
         if (lhs_type->is_integral() && (rhs_str == "Ordering" || rhs_str.find("Ordering") != std::string::npos))
         {
             LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from {} to integer {} (FFI enum fallback)", rhs_str, lhs_str);
+            return true;
+        }
+
+        // SPECIAL CASE: Pointer to integer coercion for atomic operations
+        // Allow T* to be assigned from u64 and vice versa (needed for atomic pointer operations)
+        if (lhs_type->kind() == TypeKind::Pointer && (rhs_str == "u64" || rhs_str == "i64"))
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from {} to pointer {} (atomic pointer operation)", rhs_str, lhs_str);
+            return true;
+        }
+        if (rhs_type->kind() == TypeKind::Pointer && (lhs_str == "u64" || lhs_str == "i64"))
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion from pointer {} to {} (atomic pointer operation)", rhs_str, lhs_str);
+            return true;
+        }
+
+        // Allow generic pointer types (T*) to be compatible with u64 for atomic operations
+        if ((lhs_str.find("*") != std::string::npos && rhs_type->is_integral()) ||
+            (rhs_str.find("*") != std::string::npos && lhs_type->is_integral()))
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Allowing implicit conversion between pointer and integer: {} <-> {}", lhs_str, rhs_str);
             return true;
         }
 
