@@ -5516,12 +5516,11 @@ namespace Cryo
                             auto &concrete_types = param_type->type_parameters();
                             
                             // Check if we have concrete types or just template parameters
-                            bool has_concrete_types = !concrete_types.empty() && 
-                                concrete_types[0] && 
+                            // A type is concrete if it's not Unknown and not a Generic type parameter
+                            bool has_concrete_types = !concrete_types.empty() &&
+                                concrete_types[0] &&
                                 concrete_types[0]->kind() != TypeKind::Unknown &&
-                                concrete_types[0]->name() != "K" &&
-                                concrete_types[0]->name() != "V" &&
-                                concrete_types[0]->name() != "T";
+                                concrete_types[0]->kind() != TypeKind::Generic;
                                 
                             if (has_concrete_types)
                             {
@@ -10165,16 +10164,6 @@ namespace Cryo
             return class_type;
         }
 
-        // Try case-insensitive lookup for forward references (common in stdlib)
-        std::string lower_type_name = type_name;
-        std::transform(lower_type_name.begin(), lower_type_name.end(), lower_type_name.begin(), ::tolower);
-        Type *case_insensitive_struct = _type_context.get_struct_type(lower_type_name);
-        if (case_insensitive_struct && case_insensitive_struct->kind() != TypeKind::Unknown)
-        {
-            LOG_DEBUG(Cryo::LogComponent::AST, "Found struct type '{}' via case-insensitive lookup for '{}'", lower_type_name, type_name);
-            return case_insensitive_struct;
-        }
-
         // Fall back to symbol table lookup for backwards compatibility
         Type *user_type = lookup_variable_type(type_name);
         if (user_type)
@@ -11096,11 +11085,25 @@ namespace Cryo
         return type;
     }
 
-    Type *TypeChecker::substitute_generic_parameters(Type *base_type, const std::vector<std::shared_ptr<Type>> &concrete_types)
+    Type *TypeChecker::substitute_generic_parameters(Type *base_type,
+                                                      const std::vector<std::string> &param_names,
+                                                      const std::vector<std::shared_ptr<Type>> &concrete_types)
     {
-        if (!base_type || concrete_types.empty())
+        if (!base_type || concrete_types.empty() || param_names.empty())
         {
             return base_type;
+        }
+
+        // Build a substitution map from parameter names to concrete types
+        std::unordered_map<std::string, std::shared_ptr<Type>> substitution_map;
+        size_t num_params = std::min(param_names.size(), concrete_types.size());
+        for (size_t i = 0; i < num_params; ++i)
+        {
+            if (concrete_types[i])
+            {
+                substitution_map[param_names[i]] = concrete_types[i];
+                LOG_DEBUG(Cryo::LogComponent::AST, "Generic substitution: {} -> {}", param_names[i], concrete_types[i]->name());
+            }
         }
 
         // Handle array types - recursively substitute element types
@@ -11108,30 +11111,123 @@ namespace Cryo
         {
             ArrayType *arr_type = static_cast<ArrayType *>(base_type);
             Type *element_type = arr_type->element_type().get();
-            
-            // Recursively substitute the element type
-            Type *substituted_element = substitute_generic_parameters(element_type, concrete_types);
-            
+
+            Type *substituted_element = substitute_generic_parameters(element_type, param_names, concrete_types);
+
             if (substituted_element != element_type)
             {
-                // Element type was substituted, create new array type
                 return _type_context.create_array_type(substituted_element, arr_type->array_size());
             }
             return base_type;
         }
-        
-        // Handle pointer types - recursively substitute pointee types  
+
+        // Handle pointer types - recursively substitute pointee types
         if (base_type->kind() == TypeKind::Pointer)
         {
             PointerType *ptr_type = static_cast<PointerType *>(base_type);
             Type *pointee_type = ptr_type->pointee_type().get();
-            
-            // Recursively substitute the pointee type
-            Type *substituted_pointee = substitute_generic_parameters(pointee_type, concrete_types);
-            
+
+            Type *substituted_pointee = substitute_generic_parameters(pointee_type, param_names, concrete_types);
+
             if (substituted_pointee != pointee_type)
             {
-                // Pointee type was substituted, create new pointer type
+                return _type_context.create_pointer_type(substituted_pointee);
+            }
+            return base_type;
+        }
+
+        // Handle parameterized types - substitute type arguments recursively
+        if (base_type->kind() == TypeKind::Parameterized)
+        {
+            ParameterizedType *param_type = static_cast<ParameterizedType *>(base_type);
+            std::string base_name = param_type->base_name();
+            auto &type_params = param_type->type_parameters();
+
+            // Substitute each type parameter
+            std::vector<std::shared_ptr<Type>> substituted_params;
+            bool any_substituted = false;
+            for (const auto &tp : type_params)
+            {
+                auto it = substitution_map.find(tp->name());
+                if (it != substitution_map.end())
+                {
+                    substituted_params.push_back(it->second);
+                    any_substituted = true;
+                }
+                else
+                {
+                    substituted_params.push_back(tp);
+                }
+            }
+
+            if (any_substituted)
+            {
+                return new ParameterizedType(base_name, substituted_params);
+            }
+            return base_type;
+        }
+
+        // Handle direct generic parameter substitution using the map
+        std::string type_name = base_type->name();
+        auto it = substitution_map.find(type_name);
+        if (it != substitution_map.end())
+        {
+            LOG_DEBUG(Cryo::LogComponent::AST, "Substituting generic param '{}' -> '{}'", type_name, it->second->name());
+            return it->second.get();
+        }
+
+        return base_type;
+    }
+
+    Type *TypeChecker::substitute_generic_parameters(Type *base_type, const std::vector<std::shared_ptr<Type>> &concrete_types)
+    {
+        if (!base_type || concrete_types.empty())
+        {
+            return base_type;
+        }
+
+        // Try to get parameter names from the current generic context
+        std::vector<std::string> param_names;
+
+        // First, check the generic context stack for parameter names
+        if (!_generic_context_stack.empty())
+        {
+            const auto &context = _generic_context_stack.back();
+            param_names.assign(context.parameters.begin(), context.parameters.end());
+            LOG_DEBUG(Cryo::LogComponent::AST, "Using generic context params for substitution: {} params", param_names.size());
+        }
+
+        // If we have parameter names from context, use the proper substitution
+        if (!param_names.empty() && param_names.size() == concrete_types.size())
+        {
+            return substitute_generic_parameters(base_type, param_names, concrete_types);
+        }
+
+        // Handle array types - recursively substitute element types
+        if (base_type->kind() == TypeKind::Array)
+        {
+            ArrayType *arr_type = static_cast<ArrayType *>(base_type);
+            Type *element_type = arr_type->element_type().get();
+
+            Type *substituted_element = substitute_generic_parameters(element_type, concrete_types);
+
+            if (substituted_element != element_type)
+            {
+                return _type_context.create_array_type(substituted_element, arr_type->array_size());
+            }
+            return base_type;
+        }
+
+        // Handle pointer types - recursively substitute pointee types
+        if (base_type->kind() == TypeKind::Pointer)
+        {
+            PointerType *ptr_type = static_cast<PointerType *>(base_type);
+            Type *pointee_type = ptr_type->pointee_type().get();
+
+            Type *substituted_pointee = substitute_generic_parameters(pointee_type, concrete_types);
+
+            if (substituted_pointee != pointee_type)
+            {
                 return _type_context.create_pointer_type(substituted_pointee);
             }
             return base_type;
@@ -11142,34 +11238,49 @@ namespace Cryo
         {
             ParameterizedType *param_type = static_cast<ParameterizedType *>(base_type);
             std::string base_name = param_type->base_name();
-            
+
             // For types like BTreeNode<K, V>, substitute with concrete types
-            // Create new ParameterizedType directly with concrete types
             ParameterizedType *substituted = new ParameterizedType(base_name, concrete_types);
             return substituted;
         }
-        
+
         // Handle direct generic parameter substitution
-        // Use a more flexible approach that works with common parameter naming conventions
+        // Check if this type is a generic parameter that should be substituted
         std::string type_name = base_type->name();
-        
-        // Check for common generic parameter patterns
-        if (type_name.length() == 1 || 
-            (type_name.length() <= 5 && std::all_of(type_name.begin(), type_name.end(), ::isupper)))
+
+        // Check if this is a generic type (single uppercase letter or known pattern)
+        if (base_type->kind() == TypeKind::Generic ||
+            (type_name.length() == 1 && std::isupper(type_name[0])))
         {
-            // Common single-letter or short uppercase parameters: K, V, T, U, E, etc.
-            if ((type_name == "K" || type_name == "Key") && concrete_types.size() >= 1) 
+            // Try to find the parameter index based on position
+            // For single-param generics (T), use index 0
+            // For two-param generics, first param is index 0, second is index 1
+            if (concrete_types.size() >= 1)
+            {
+                // If we're in a generic context, try to find the parameter position
+                if (!_generic_context_stack.empty())
+                {
+                    const auto &context = _generic_context_stack.back();
+                    size_t index = 0;
+                    for (const auto &param : context.parameters)
+                    {
+                        if (param == type_name && index < concrete_types.size())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::AST, "Substituting generic '{}' at index {} -> '{}'",
+                                      type_name, index, concrete_types[index]->name());
+                            return concrete_types[index].get();
+                        }
+                        ++index;
+                    }
+                }
+
+                // Fallback: use first concrete type for any single-letter generic
+                LOG_DEBUG(Cryo::LogComponent::AST, "Fallback substitution for generic '{}' -> '{}'",
+                          type_name, concrete_types[0]->name());
                 return concrete_types[0].get();
-            else if ((type_name == "V" || type_name == "Value") && concrete_types.size() >= 2) 
-                return concrete_types[1].get();
-            else if (type_name == "T" && concrete_types.size() >= 1)
-                return concrete_types[0].get();
-            else if (type_name == "U" && concrete_types.size() >= 2)
-                return concrete_types[1].get();
-            else if (type_name == "E" && concrete_types.size() >= 2)
-                return concrete_types[1].get();
+            }
         }
-        
+
         return base_type;
     }
 

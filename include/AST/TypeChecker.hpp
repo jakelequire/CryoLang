@@ -591,6 +591,9 @@ namespace Cryo
         std::shared_ptr<Type> substitute_type_with_map(const std::shared_ptr<Type> &type,
                                                        const std::unordered_map<std::string, std::shared_ptr<Type>> &substitution_map);
         Type *substitute_generic_parameters(Type *base_type, const std::vector<std::shared_ptr<Type>> &concrete_types);
+        Type *substitute_generic_parameters(Type *base_type,
+                                            const std::vector<std::string> &param_names,
+                                            const std::vector<std::shared_ptr<Type>> &concrete_types);
 
         std::string format_type_error(const std::string &context, Type *expected, Type *actual);
     };
