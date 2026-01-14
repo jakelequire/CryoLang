@@ -5000,9 +5000,9 @@ namespace Cryo
         {
             // Parameterized Array<T> type
             ParameterizedType *param_type = static_cast<ParameterizedType *>(array_type);
-            std::string base_name = param_type->base_name();
 
-            if (base_name == "Array")
+            // Use type metadata instead of string comparison for robustness
+            if (param_type->is_indexable())
             {
                 // Get the first type parameter (T in Array<T>)
                 const auto &type_params = param_type->type_parameters();
@@ -5422,8 +5422,8 @@ namespace Cryo
             ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
             std::string base_name = param_type->base_name();
 
-            // Special handling for Array<T> size/length
-            if (base_name == "Array")
+            // Special handling for Array<T>/Vector<T> size/length using type metadata
+            if (param_type->is_indexable())
             {
                 if (member_name == "length" || member_name == "size")
                 {
@@ -6039,10 +6039,9 @@ namespace Cryo
             {
                 ParameterizedType *param_type = static_cast<ParameterizedType *>(effective_type);
                 auto &concrete_types = param_type->type_parameters();
-                std::string base_name = param_type->base_name();
 
-                // Fallback method resolution for Array<T>
-                if ((base_name == "Array" || lookup_type_name == "Array") && concrete_types.size() >= 1)
+                // Fallback method resolution for Array<T>/Vector<T> using type metadata
+                if (param_type->is_indexable() && concrete_types.size() >= 1)
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Using fallback method resolution for Array type");
                     Type *element_type = concrete_types[0].get();
@@ -6694,19 +6693,39 @@ namespace Cryo
                     Type *return_type = resolve_type_with_generic_context(method_meta->return_type_annotation);
                     if (!return_type)
                     {
+                        // Log a warning instead of silently falling back to unknown type
+                        // This helps diagnose cross-module type resolution issues
+                        LOG_WARNING(Cryo::LogComponent::AST,
+                                    "Cross-module type resolution: Failed to resolve return type '{}' for method '{}::{}'. "
+                                    "This may indicate a missing import or unresolved generic parameter.",
+                                    method_meta->return_type_annotation, lookup_type_name, member_name);
                         return_type = _type_context.get_unknown_type();
                     }
 
                     // Resolve parameter types
                     std::vector<Type *> param_types;
+                    bool has_unresolved_params = false;
                     for (const auto &param_type_str : method_meta->parameter_type_annotations)
                     {
                         Type *param_type = resolve_type_with_generic_context(param_type_str);
                         if (!param_type)
                         {
+                            // Log warning for unresolved parameter types
+                            LOG_WARNING(Cryo::LogComponent::AST,
+                                        "Cross-module type resolution: Failed to resolve parameter type '{}' for method '{}::{}'. "
+                                        "This may indicate a missing import or unresolved generic parameter.",
+                                        param_type_str, lookup_type_name, member_name);
                             param_type = _type_context.get_unknown_type();
+                            has_unresolved_params = true;
                         }
                         param_types.push_back(param_type);
+                    }
+
+                    if (has_unresolved_params)
+                    {
+                        LOG_WARNING(Cryo::LogComponent::AST,
+                                    "Method '{}::{}' has unresolved parameter types. Type checking may be incomplete.",
+                                    lookup_type_name, member_name);
                     }
 
                     // Create a function type for this method
@@ -6753,6 +6772,10 @@ namespace Cryo
                                 Type *return_type = resolve_type_with_generic_context(return_type_str);
                                 if (!return_type)
                                 {
+                                    LOG_WARNING(Cryo::LogComponent::AST,
+                                                "AST fallback (struct): Failed to resolve return type '{}' for method '{}::{}'. "
+                                                "This may indicate a missing import or unresolved generic parameter.",
+                                                return_type_str, lookup_type_name, member_name);
                                     return_type = _type_context.get_unknown_type();
                                 }
 
@@ -6766,6 +6789,10 @@ namespace Cryo
                                         Type *param_type = resolve_type_with_generic_context(param_type_str);
                                         if (!param_type)
                                         {
+                                            LOG_WARNING(Cryo::LogComponent::AST,
+                                                        "AST fallback (struct): Failed to resolve parameter type '{}' for method '{}::{}'. "
+                                                        "This may indicate a missing import or unresolved generic parameter.",
+                                                        param_type_str, lookup_type_name, member_name);
                                             param_type = _type_context.get_unknown_type();
                                         }
                                         param_types.push_back(param_type);
@@ -6801,6 +6828,10 @@ namespace Cryo
                                 Type *return_type = resolve_type_with_generic_context(return_type_str);
                                 if (!return_type)
                                 {
+                                    LOG_WARNING(Cryo::LogComponent::AST,
+                                                "AST fallback (class): Failed to resolve return type '{}' for method '{}::{}'. "
+                                                "This may indicate a missing import or unresolved generic parameter.",
+                                                return_type_str, lookup_type_name, member_name);
                                     return_type = _type_context.get_unknown_type();
                                 }
 
@@ -6814,6 +6845,10 @@ namespace Cryo
                                     Type *param_type = resolve_type_with_generic_context(param_type_str);
                                     if (!param_type)
                                     {
+                                        LOG_WARNING(Cryo::LogComponent::AST,
+                                                    "AST fallback (class): Failed to resolve parameter type '{}' for method '{}::{}'. "
+                                                    "This may indicate a missing import or unresolved generic parameter.",
+                                                    param_type_str, lookup_type_name, member_name);
                                         param_type = _type_context.get_unknown_type();
                                     }
                                     param_types.push_back(param_type);
@@ -7129,10 +7164,12 @@ namespace Cryo
             }
 
             // If still not found, this might be a forward reference within the same module
-            // For common types like Option, Result etc, allow them to be resolved
-            if (!scope_symbol && (base_scope_name == "Option" || base_scope_name == "Result" || base_scope_name == "Array"))
+            // For well-known parameterized types (Option, Result, Array, etc.), allow them to be resolved
+            // Use type metadata instead of hardcoded string checks
+            TypeKind param_kind = ParameterizedType::get_parameterized_type_kind_from_string(base_scope_name);
+            if (!scope_symbol && param_kind != TypeKind::Parameterized)
             {
-                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing forward reference for common generic type '{}'", base_scope_name);
+                LOG_DEBUG(Cryo::LogComponent::AST, "Allowing forward reference for well-known generic type '{}'", base_scope_name);
                 // Try to get or create a type for common generic types
                 ParameterizedType *common_type = _type_registry->get_template(base_scope_name);
                 if (common_type)
@@ -11262,11 +11299,22 @@ namespace Cryo
             if (_current_match_expr_type && _current_match_expr_type->kind() == TypeKind::Parameterized)
             {
                 auto *param_type = static_cast<ParameterizedType *>(_current_match_expr_type);
-                const std::string &base_name = param_type->base_name();
-                if (base_name == "Result" || base_name == "Option" || base_name == "IoResult" ||
-                    base_name.find("Result") != std::string::npos)
+
+                // Use type metadata instead of hardcoded string checks
+                // Check for well-known enum pattern types (Option, Result) or custom Result-like types
+                bool is_enum_pattern_type = param_type->is_result_like() || param_type->is_optional_like();
+
+                // Fallback: check for custom Result types (IoResult, AllocResult, etc.) by name
+                // This is a safety net for type aliases that may not have TypeKind::ResultType
+                if (!is_enum_pattern_type)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Skipping enum lookup for parameterized type {}", base_name);
+                    const std::string &base_name = param_type->base_name();
+                    is_enum_pattern_type = (base_name.find("Result") != std::string::npos);
+                }
+
+                if (is_enum_pattern_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::AST, "EnumPatternNode: Skipping enum lookup for parameterized enum type {}", param_type->base_name());
                     // Continue to handle bound variables below
                 }
                 else
