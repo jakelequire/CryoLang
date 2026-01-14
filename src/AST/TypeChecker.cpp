@@ -3804,6 +3804,18 @@ namespace Cryo
                             {
                                 is_null_comparison = true;
                             }
+                            // Allow string == null comparison (strings are nullable pointer types)
+                            if ((left_type->kind() == TypeKind::Null && right_type->kind() == TypeKind::String) ||
+                                (right_type->kind() == TypeKind::Null && left_type->kind() == TypeKind::String))
+                            {
+                                is_null_comparison = true;
+                            }
+                            // String-based fallback for string == null
+                            if ((left_str == "null" && (right_str == "string" || right_str == "String")) ||
+                                (right_str == "null" && (left_str == "string" || left_str == "String")))
+                            {
+                                is_null_comparison = true;
+                            }
                         }
 
                         // Special handling for mixed integer type comparisons
