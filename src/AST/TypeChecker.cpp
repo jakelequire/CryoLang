@@ -3486,15 +3486,20 @@ namespace Cryo
                     return;
                 }
 
-                // Try to find the symbol in std::Intrinsics namespace
+                // Try to find the symbol in std::intrinsics namespace (lowercase - matches stdlib/core/intrinsics.cryo)
                 // This allows intrinsic functions like __ptr_add__ to be used without qualification
-                Symbol *std_intrinsic_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context("std::Intrinsics", name, _current_namespace);
+                Symbol *std_intrinsic_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context("std::intrinsics", name, _current_namespace);
+                if (!std_intrinsic_symbol)
+                {
+                    // Try uppercase for backwards compatibility
+                    std_intrinsic_symbol = _main_symbol_table->lookup_namespaced_symbol_with_context("std::Intrinsics", name, _current_namespace);
+                }
                 if (std_intrinsic_symbol)
                 {
                     // Found intrinsic function - use the actual function type
                     if (std_intrinsic_symbol->data_type)
                     {
-                        LOG_DEBUG(Cryo::LogComponent::AST, "Found intrinsic '{}' in std::Intrinsics", name);
+                        LOG_DEBUG(Cryo::LogComponent::AST, "Found intrinsic '{}' in std::intrinsics", name);
                         node.set_resolved_type(std_intrinsic_symbol->data_type);
                     }
                     else
@@ -3506,7 +3511,11 @@ namespace Cryo
 
                 // Try alternative intrinsic namespace lookups for cross-module resolution
                 // Functions like atomic_fetch_add_64 may be stored under different namespace paths
+                // Note: Use lowercase 'intrinsics' to match actual namespace in stdlib/core/intrinsics.cryo
                 static const std::vector<std::string> intrinsic_namespaces = {
+                    "std::core::intrinsics",
+                    "core::intrinsics",
+                    "intrinsics",
                     "std::core::Intrinsics",
                     "core::Intrinsics",
                     "Intrinsics",
@@ -3525,9 +3534,16 @@ namespace Cryo
                     }
                 }
 
-                // Try direct qualified name lookup (e.g., "std::Intrinsics::atomic_fetch_add_64")
-                std::string qualified_intrinsic = "std::Intrinsics::" + name;
+                // Try direct qualified name lookup (e.g., "std::intrinsics::atomic_fetch_add_64")
+                // Try lowercase first to match stdlib/core/intrinsics.cryo namespace
+                std::string qualified_intrinsic = "std::intrinsics::" + name;
                 Symbol *qualified_symbol = _main_symbol_table->lookup_symbol(qualified_intrinsic);
+                if (!qualified_symbol)
+                {
+                    // Try uppercase for backwards compatibility
+                    qualified_intrinsic = "std::Intrinsics::" + name;
+                    qualified_symbol = _main_symbol_table->lookup_symbol(qualified_intrinsic);
+                }
                 if (qualified_symbol && qualified_symbol->data_type)
                 {
                     LOG_DEBUG(Cryo::LogComponent::AST, "Found intrinsic via qualified name '{}'", qualified_intrinsic);
