@@ -1004,9 +1004,7 @@ namespace Cryo
         // Truncate long messages and clean up formatting
         std::string label = message.substr(0, std::min(message.length(), size_t(60)));
 
-        // Convert to lowercase for consistency
-        std::transform(label.begin(), label.end(), label.begin(), ::tolower);
-
+        // Don't lowercase - preserve case for type/symbol names
         return label;
     }
 
