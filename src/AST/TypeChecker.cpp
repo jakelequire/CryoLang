@@ -7072,16 +7072,8 @@ namespace Cryo
             return;
         }
 
-        // Verify it's an enum type for enum variant access
-        if (scope_type->kind() != TypeKind::Enum)
-        {
-            _diagnostic_builder->create_invalid_operation_error("scope resolution", scope_type, nullptr, &node);
-            node.set_resolved_type(_type_context.get_unknown_type());
-            return;
-        }
-
-        // Special handling for template enum constructors
-        // Check if this is a template enum (like MyResult::Ok) by checking the type registry
+        // Special handling for template enum constructors BEFORE the enum type check
+        // Check if this is a template enum (like MyResult::Ok or IoResult::Err) by checking the type registry
         std::string template_base_name = scope_name;
         size_t template_generic_start = scope_name.find('<');
         if (template_generic_start != std::string::npos)
@@ -7096,6 +7088,49 @@ namespace Cryo
             // For template enum constructors, set a special type that indicates this is a template enum variant
             // We'll use the template type itself, which CallExpression can recognize
             node.set_resolved_type(template_type);
+            return;
+        }
+
+        // Verify it's an enum type for enum variant access
+        // Check for regular enums, parameterized enums (Option, Result), and ParameterizedEnumType
+        bool is_enum_type = (scope_type->kind() == TypeKind::Enum);
+
+        // Check for built-in parameterized enum types (OptionType, ResultType)
+        if (!is_enum_type && ParameterizedType::is_enum_pattern_type(scope_type->kind()))
+        {
+            is_enum_type = true;
+        }
+
+        // Check for ParameterizedEnumType (custom parameterized enums)
+        if (!is_enum_type && scope_type->kind() == TypeKind::Parameterized)
+        {
+            ParameterizedEnumType *param_enum = dynamic_cast<ParameterizedEnumType *>(scope_type);
+            if (param_enum)
+            {
+                is_enum_type = true;
+            }
+            else
+            {
+                // For other parameterized types, check if the base name is registered as an enum template
+                ParameterizedType *param_type = static_cast<ParameterizedType *>(scope_type);
+                std::string base_name = param_type->base_name();
+                // Check if this base type is registered as a parameterized enum
+                ParameterizedType *registered_template = _type_registry->get_template(base_name);
+                if (registered_template)
+                {
+                    ParameterizedEnumType *registered_enum = dynamic_cast<ParameterizedEnumType *>(registered_template);
+                    if (registered_enum)
+                    {
+                        is_enum_type = true;
+                    }
+                }
+            }
+        }
+
+        if (!is_enum_type)
+        {
+            _diagnostic_builder->create_invalid_operation_error("scope resolution", scope_type, nullptr, &node);
+            node.set_resolved_type(_type_context.get_unknown_type());
             return;
         }
 
