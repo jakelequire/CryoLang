@@ -445,6 +445,8 @@ namespace Cryo::Codegen
             return generate_atomic_exchange_32(args);
         else if (intrinsic_name == "atomic_exchange_64")
             return generate_atomic_exchange_64(args);
+        else if (intrinsic_name == "atomic_swap_64")
+            return generate_atomic_swap_64(args);
         else if (intrinsic_name == "atomic_compare_exchange_32")
             return generate_atomic_compare_exchange_32(args);
         else if (intrinsic_name == "atomic_compare_exchange_64")
@@ -521,6 +523,8 @@ namespace Cryo::Codegen
             return generate_atomic_exchange_32(args);
         else if (intrinsic_name == "atomic_exchange_64")
             return generate_atomic_exchange_64(args);
+        else if (intrinsic_name == "atomic_swap_64")
+            return generate_atomic_swap_64(args);
         else if (intrinsic_name == "atomic_compare_exchange_32")
             return generate_atomic_compare_exchange_32(args);
         else if (intrinsic_name == "atomic_compare_exchange_64")
@@ -547,6 +551,112 @@ namespace Cryo::Codegen
             return generate_atomic_fetch_xor_64(args);
         else if (intrinsic_name == "atomic_fence")
             return generate_atomic_fence(args);
+        
+        // Additional 8-bit atomic operations
+        else if (intrinsic_name == "atomic_swap_8")
+            return generate_atomic_swap_8(args);
+        else if (intrinsic_name == "atomic_exchange_8")
+            return generate_atomic_exchange_8(args);
+        else if (intrinsic_name == "atomic_compare_exchange_8")
+            return generate_atomic_compare_exchange_8(args);
+        else if (intrinsic_name == "atomic_fetch_and_8")
+            return generate_atomic_fetch_and_8(args);
+        else if (intrinsic_name == "atomic_fetch_or_8")
+            return generate_atomic_fetch_or_8(args);
+        else if (intrinsic_name == "atomic_fetch_xor_8")
+            return generate_atomic_fetch_xor_8(args);
+        else if (intrinsic_name == "atomic_fetch_nand_8")
+            return generate_atomic_fetch_nand_8(args);
+        
+        // Typed atomic load/store functions
+        else if (intrinsic_name == "atomic_load_u8")
+            return generate_atomic_load_u8(args);
+        else if (intrinsic_name == "atomic_store_u8")
+            return generate_atomic_store_u8(args);
+        else if (intrinsic_name == "atomic_swap_u8")
+            return generate_atomic_swap_u8(args);
+        else if (intrinsic_name == "atomic_cmpxchg_u8")
+            return generate_atomic_cmpxchg_u8(args);
+        else if (intrinsic_name == "atomic_fetch_and_u8")
+            return generate_atomic_fetch_and_u8(args);
+        else if (intrinsic_name == "atomic_fetch_or_u8")
+            return generate_atomic_fetch_or_u8(args);
+        else if (intrinsic_name == "atomic_fetch_xor_u8")
+            return generate_atomic_fetch_xor_u8(args);
+        else if (intrinsic_name == "atomic_fetch_nand_u8")
+            return generate_atomic_fetch_nand_u8(args);
+        
+        // Signed 32-bit atomic operations
+        else if (intrinsic_name == "atomic_load_i32")
+            return generate_atomic_load_i32(args);
+        else if (intrinsic_name == "atomic_store_i32")
+            return generate_atomic_store_i32(args);
+        else if (intrinsic_name == "atomic_swap_i32")
+            return generate_atomic_swap_i32(args);
+        else if (intrinsic_name == "atomic_cmpxchg_i32")
+            return generate_atomic_cmpxchg_i32(args);
+        else if (intrinsic_name == "atomic_fetch_add_i32")
+            return generate_atomic_fetch_add_i32(args);
+        else if (intrinsic_name == "atomic_fetch_sub_i32")
+            return generate_atomic_fetch_sub_i32(args);
+        else if (intrinsic_name == "atomic_fetch_and_i32")
+            return generate_atomic_fetch_and_i32(args);
+        else if (intrinsic_name == "atomic_fetch_or_i32")
+            return generate_atomic_fetch_or_i32(args);
+        else if (intrinsic_name == "atomic_fetch_xor_i32")
+            return generate_atomic_fetch_xor_i32(args);
+        else if (intrinsic_name == "atomic_fetch_max_i32")
+            return generate_atomic_fetch_max_i32(args);
+        else if (intrinsic_name == "atomic_fetch_min_i32")
+            return generate_atomic_fetch_min_i32(args);
+        
+        // Unsigned 32-bit atomic operations
+        else if (intrinsic_name == "atomic_load_u32")
+            return generate_atomic_load_u32(args);
+        else if (intrinsic_name == "atomic_store_u32")
+            return generate_atomic_store_u32(args);
+        else if (intrinsic_name == "atomic_swap_u32")
+            return generate_atomic_swap_u32(args);
+        else if (intrinsic_name == "atomic_cmpxchg_u32")
+            return generate_atomic_cmpxchg_u32(args);
+        else if (intrinsic_name == "atomic_fetch_add_u32")
+            return generate_atomic_fetch_add_u32(args);
+        else if (intrinsic_name == "atomic_fetch_sub_u32")
+            return generate_atomic_fetch_sub_u32(args);
+        else if (intrinsic_name == "atomic_fetch_and_u32")
+            return generate_atomic_fetch_and_u32(args);
+        else if (intrinsic_name == "atomic_fetch_or_u32")
+            return generate_atomic_fetch_or_u32(args);
+        else if (intrinsic_name == "atomic_fetch_xor_u32")
+            return generate_atomic_fetch_xor_u32(args);
+        
+        // Signed 64-bit atomic operations
+        else if (intrinsic_name == "atomic_load_i64")
+            return generate_atomic_load_i64(args);
+        else if (intrinsic_name == "atomic_store_i64")
+            return generate_atomic_store_i64(args);
+        else if (intrinsic_name == "atomic_swap_i64")
+            return generate_atomic_swap_i64(args);
+        else if (intrinsic_name == "atomic_cmpxchg_i64")
+            return generate_atomic_cmpxchg_i64(args);
+        else if (intrinsic_name == "atomic_fetch_add_i64")
+            return generate_atomic_fetch_add_i64(args);
+        else if (intrinsic_name == "atomic_fetch_sub_i64")
+            return generate_atomic_fetch_sub_i64(args);
+        
+        // Unsigned 64-bit atomic operations
+        else if (intrinsic_name == "atomic_load_u64")
+            return generate_atomic_load_u64(args);
+        else if (intrinsic_name == "atomic_store_u64")
+            return generate_atomic_store_u64(args);
+        else if (intrinsic_name == "atomic_swap_u64")
+            return generate_atomic_swap_u64(args);
+        else if (intrinsic_name == "atomic_cmpxchg_u64")
+            return generate_atomic_cmpxchg_u64(args);
+        else if (intrinsic_name == "atomic_fetch_add_u64")
+            return generate_atomic_fetch_add_u64(args);
+        else if (intrinsic_name == "atomic_fetch_sub_u64")
+            return generate_atomic_fetch_sub_u64(args);
         
         else
         {
@@ -5220,6 +5330,33 @@ namespace Cryo::Codegen
                                        llvm::MaybeAlign(8), llvm::AtomicOrdering::SequentiallyConsistent);
     }
 
+    llvm::Value *Intrinsics::generate_atomic_swap_64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_swap_64 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_swap_64: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *val_i64 = ensure_type(val, i64_type, "atomic_swap_64.val");
+
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_i64, 
+                                       llvm::MaybeAlign(8), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
     llvm::Value *Intrinsics::generate_atomic_compare_exchange_32(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 4)
@@ -5487,5 +5624,721 @@ namespace Cryo::Codegen
 
     // Note: sendto, recvfrom, shutdown, setsockopt, getsockopt, getsockname, getpeername, and poll
     // are implemented as stubs using DEFINE_NETWORK_STUB macro above
+
+    // ========================================
+    // Additional 8-bit Atomic Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_atomic_swap_8(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_swap_8 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_swap_8: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(context);
+        llvm::Value *val_typed = ensure_type(val, i8_type, "atomic_swap_8.val");
+
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_typed,
+                                       llvm::MaybeAlign(1), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_exchange_8(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_exchange_8 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_exchange_8: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(context);
+        llvm::Value *val_typed = ensure_type(val, i8_type, "atomic_exchange_8.val");
+
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_typed,
+                                       llvm::MaybeAlign(1), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_compare_exchange_8(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 4)
+        {
+            report_error("atomic_compare_exchange_8 requires exactly 4 arguments (ptr, expected, desired, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *expected = args[1];
+        llvm::Value *desired = args[2];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_compare_exchange_8: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(context);
+        llvm::Value *expected_val = builder.CreateLoad(i8_type, expected, "expected_val");
+        llvm::Value *desired_typed = ensure_type(desired, i8_type, "atomic_compare_exchange_8.desired");
+
+        llvm::Value *result = builder.CreateAtomicCmpXchg(
+            ptr, expected_val, desired_typed,
+            llvm::MaybeAlign(1),
+            llvm::AtomicOrdering::SequentiallyConsistent,
+            llvm::AtomicOrdering::SequentiallyConsistent);
+
+        // Extract the success flag (second element)
+        return builder.CreateExtractValue(result, 1, "cmpxchg.success");
+    }
+
+    // Define 8-bit atomic fetch operations
+    DEFINE_ATOMIC_FETCH_OP(and, llvm::AtomicRMWInst::And, 8)
+    DEFINE_ATOMIC_FETCH_OP(or, llvm::AtomicRMWInst::Or, 8)
+    DEFINE_ATOMIC_FETCH_OP(xor, llvm::AtomicRMWInst::Xor, 8)
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_nand_8(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_fetch_nand_8 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_fetch_nand_8: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(context);
+        llvm::Value *val_typed = ensure_type(val, i8_type, "atomic_fetch_nand_8.val");
+
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Nand, ptr, val_typed,
+                                       llvm::MaybeAlign(1), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
+    // ========================================
+    // Typed Atomic Load/Store Functions (u8)
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_atomic_load_u8(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("atomic_load_u8 requires exactly 2 arguments (ptr, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_load_u8: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(context);
+        llvm::LoadInst *load = builder.CreateLoad(i8_type, ptr);
+        load->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        load->setAlignment(llvm::Align(1));
+
+        return load;
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_store_u8(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_store_u8 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_store_u8: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(context);
+        llvm::Value *val_typed = ensure_type(val, i8_type, "atomic_store_u8.val");
+
+        llvm::StoreInst *store = builder.CreateStore(val_typed, ptr);
+        store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        store->setAlignment(llvm::Align(1));
+
+        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_swap_u8(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_swap_8(args);  // Same implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_cmpxchg_u8(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 5)
+        {
+            report_error("atomic_cmpxchg_u8 requires exactly 5 arguments (ptr, expected, desired, success_order, failure_order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *expected = args[1];
+        llvm::Value *desired = args[2];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_cmpxchg_u8: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(context);
+        llvm::Value *expected_val = builder.CreateLoad(i8_type, expected, "expected_val");
+        llvm::Value *desired_typed = ensure_type(desired, i8_type, "atomic_cmpxchg_u8.desired");
+
+        llvm::Value *result = builder.CreateAtomicCmpXchg(
+            ptr, expected_val, desired_typed,
+            llvm::MaybeAlign(1),
+            llvm::AtomicOrdering::SequentiallyConsistent,
+            llvm::AtomicOrdering::SequentiallyConsistent);
+
+        return builder.CreateExtractValue(result, 1, "cmpxchg.success");
+    }
+
+    // u8 variants that delegate to the 8-bit versions
+    llvm::Value *Intrinsics::generate_atomic_fetch_and_u8(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_and_8(args);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_or_u8(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_or_8(args);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_xor_u8(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_xor_8(args);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_nand_u8(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_nand_8(args);
+    }
+
+    // ========================================
+    // Signed 32-bit Atomic Operations
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_atomic_load_i32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("atomic_load_i32 requires exactly 2 arguments (ptr, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_load_i32: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::LoadInst *load = builder.CreateLoad(i32_type, ptr);
+        load->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        load->setAlignment(llvm::Align(4));
+
+        return load;
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_store_i32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_store_i32 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_store_i32: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *val_typed = ensure_type(val, i32_type, "atomic_store_i32.val");
+
+        llvm::StoreInst *store = builder.CreateStore(val_typed, ptr);
+        store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        store->setAlignment(llvm::Align(4));
+
+        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_swap_i32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_swap_i32 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_swap_i32: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *val_typed = ensure_type(val, i32_type, "atomic_swap_i32.val");
+
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_typed,
+                                       llvm::MaybeAlign(4), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_cmpxchg_i32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 5)
+        {
+            report_error("atomic_cmpxchg_i32 requires exactly 5 arguments (ptr, expected, desired, success_order, failure_order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *expected = args[1];
+        llvm::Value *desired = args[2];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_cmpxchg_i32: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *expected_val = builder.CreateLoad(i32_type, expected, "expected_val");
+        llvm::Value *desired_typed = ensure_type(desired, i32_type, "atomic_cmpxchg_i32.desired");
+
+        llvm::Value *result = builder.CreateAtomicCmpXchg(
+            ptr, expected_val, desired_typed,
+            llvm::MaybeAlign(4),
+            llvm::AtomicOrdering::SequentiallyConsistent,
+            llvm::AtomicOrdering::SequentiallyConsistent);
+
+        return builder.CreateExtractValue(result, 1, "cmpxchg.success");
+    }
+
+    // Define i32 atomic fetch operations
+    llvm::Value *Intrinsics::generate_atomic_fetch_add_i32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_add_32(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_sub_i32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_sub_32(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_and_i32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_and_32(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_or_i32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_or_32(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_xor_i32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_xor_32(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_max_i32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_fetch_max_i32 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_fetch_max_i32: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *val_typed = ensure_type(val, i32_type, "atomic_fetch_max_i32.val");
+
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Max, ptr, val_typed,
+                                       llvm::MaybeAlign(4), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_min_i32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_fetch_min_i32 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_fetch_min_i32: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *val_typed = ensure_type(val, i32_type, "atomic_fetch_min_i32.val");
+
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Min, ptr, val_typed,
+                                       llvm::MaybeAlign(4), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
+    // ========================================
+    // Unsigned 32-bit Atomic Operations
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_atomic_load_u32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_load_32(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_store_u32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_store_32(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_swap_u32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_swap_u32 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_swap_u32: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *val_typed = ensure_type(val, i32_type, "atomic_swap_u32.val");
+
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_typed,
+                                       llvm::MaybeAlign(4), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_cmpxchg_u32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 5)
+        {
+            report_error("atomic_cmpxchg_u32 requires exactly 5 arguments (ptr, expected, desired, success_order, failure_order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *expected = args[1];
+        llvm::Value *desired = args[2];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_cmpxchg_u32: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *expected_val = builder.CreateLoad(i32_type, expected, "expected_val");
+        llvm::Value *desired_typed = ensure_type(desired, i32_type, "atomic_cmpxchg_u32.desired");
+
+        llvm::Value *result = builder.CreateAtomicCmpXchg(
+            ptr, expected_val, desired_typed,
+            llvm::MaybeAlign(4),
+            llvm::AtomicOrdering::SequentiallyConsistent,
+            llvm::AtomicOrdering::SequentiallyConsistent);
+
+        return builder.CreateExtractValue(result, 1, "cmpxchg.success");
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_add_u32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_add_32(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_sub_u32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_sub_32(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_and_u32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_and_32(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_or_u32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_or_32(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_xor_u32(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_xor_32(args);  // Delegate to existing implementation
+    }
+
+    // ========================================
+    // Signed 64-bit Atomic Operations
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_atomic_load_i64(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_load_64(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_store_i64(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_store_64(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_swap_i64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_swap_i64 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_swap_i64: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *val_typed = ensure_type(val, i64_type, "atomic_swap_i64.val");
+
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_typed,
+                                       llvm::MaybeAlign(8), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_cmpxchg_i64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 5)
+        {
+            report_error("atomic_cmpxchg_i64 requires exactly 5 arguments (ptr, expected, desired, success_order, failure_order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *expected = args[1];
+        llvm::Value *desired = args[2];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_cmpxchg_i64: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *expected_val = builder.CreateLoad(i64_type, expected, "expected_val");
+        llvm::Value *desired_typed = ensure_type(desired, i64_type, "atomic_cmpxchg_i64.desired");
+
+        llvm::Value *result = builder.CreateAtomicCmpXchg(
+            ptr, expected_val, desired_typed,
+            llvm::MaybeAlign(8),
+            llvm::AtomicOrdering::SequentiallyConsistent,
+            llvm::AtomicOrdering::SequentiallyConsistent);
+
+        return builder.CreateExtractValue(result, 1, "cmpxchg.success");
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_add_i64(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_add_64(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_sub_i64(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_sub_64(args);  // Delegate to existing implementation
+    }
+
+    // ========================================
+    // Unsigned 64-bit Atomic Operations
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_atomic_load_u64(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_load_64(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_store_u64(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_store_64(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_swap_u64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("atomic_swap_u64 requires exactly 3 arguments (ptr, val, order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *val = args[1];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_swap_u64: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *val_typed = ensure_type(val, i64_type, "atomic_swap_u64.val");
+
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_typed,
+                                       llvm::MaybeAlign(8), llvm::AtomicOrdering::SequentiallyConsistent);
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_cmpxchg_u64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 5)
+        {
+            report_error("atomic_cmpxchg_u64 requires exactly 5 arguments (ptr, expected, desired, success_order, failure_order)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *ptr = args[0];
+        llvm::Value *expected = args[1];
+        llvm::Value *desired = args[2];
+
+        if (!ptr->getType()->isPointerTy())
+        {
+            report_error("atomic_cmpxchg_u64: first argument must be a pointer");
+            return nullptr;
+        }
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *expected_val = builder.CreateLoad(i64_type, expected, "expected_val");
+        llvm::Value *desired_typed = ensure_type(desired, i64_type, "atomic_cmpxchg_u64.desired");
+
+        llvm::Value *result = builder.CreateAtomicCmpXchg(
+            ptr, expected_val, desired_typed,
+            llvm::MaybeAlign(8),
+            llvm::AtomicOrdering::SequentiallyConsistent,
+            llvm::AtomicOrdering::SequentiallyConsistent);
+
+        return builder.CreateExtractValue(result, 1, "cmpxchg.success");
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_add_u64(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_add_64(args);  // Delegate to existing implementation
+    }
+
+    llvm::Value *Intrinsics::generate_atomic_fetch_sub_u64(const std::vector<llvm::Value *> &args)
+    {
+        return generate_atomic_fetch_sub_64(args);  // Delegate to existing implementation
+    }
 
 } // namespace Cryo::Codegen

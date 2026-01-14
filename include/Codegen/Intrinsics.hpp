@@ -261,6 +261,7 @@ namespace Cryo::Codegen
         llvm::Value* generate_atomic_store_64(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_atomic_exchange_32(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_atomic_exchange_64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_swap_64(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_atomic_compare_exchange_32(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_atomic_compare_exchange_64(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_atomic_fetch_add_32(const std::vector<llvm::Value*>& args);
@@ -274,6 +275,65 @@ namespace Cryo::Codegen
         llvm::Value* generate_atomic_fetch_xor_32(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_atomic_fetch_xor_64(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_atomic_fence(const std::vector<llvm::Value*>& args);
+
+        // Additional 8-bit atomic operations
+        llvm::Value* generate_atomic_swap_8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_exchange_8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_compare_exchange_8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_and_8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_or_8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_xor_8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_nand_8(const std::vector<llvm::Value*>& args);
+
+        // Typed atomic load/store functions
+        llvm::Value* generate_atomic_load_u8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_store_u8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_swap_u8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_cmpxchg_u8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_and_u8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_or_u8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_xor_u8(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_nand_u8(const std::vector<llvm::Value*>& args);
+
+        // Signed 32-bit atomic operations
+        llvm::Value* generate_atomic_load_i32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_store_i32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_swap_i32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_cmpxchg_i32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_add_i32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_sub_i32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_and_i32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_or_i32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_xor_i32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_max_i32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_min_i32(const std::vector<llvm::Value*>& args);
+
+        // Unsigned 32-bit atomic operations
+        llvm::Value* generate_atomic_load_u32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_store_u32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_swap_u32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_cmpxchg_u32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_add_u32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_sub_u32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_and_u32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_or_u32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_xor_u32(const std::vector<llvm::Value*>& args);
+
+        // Signed 64-bit atomic operations
+        llvm::Value* generate_atomic_load_i64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_store_i64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_swap_i64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_cmpxchg_i64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_add_i64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_sub_i64(const std::vector<llvm::Value*>& args);
+
+        // Unsigned 64-bit atomic operations
+        llvm::Value* generate_atomic_load_u64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_store_u64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_swap_u64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_cmpxchg_u64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_add_u64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_atomic_fetch_sub_u64(const std::vector<llvm::Value*>& args);
 
         // Threading intrinsics (stubs for now - not fully implemented)
         // pthread, atomic, etc. would require much more complex implementation
