@@ -4492,27 +4492,75 @@ namespace Cryo
     {
         // Look up the struct type in the symbol table
         const std::string &struct_name = node.struct_type();
-        
+
+        // Extract base name for generic types (e.g., "RawVecParts<T>" -> "RawVecParts")
+        std::string base_struct_name = struct_name;
+        size_t generic_start = struct_name.find('<');
+        if (generic_start != std::string::npos)
+        {
+            base_struct_name = struct_name.substr(0, generic_start);
+        }
+
         // CRITICAL: Check if this is a struct literal in a generic context
         // If we're inside a generic struct method and the literal matches the current struct,
         // use the current struct type with its generic parameters
         Type *resolved_type = nullptr;
-        
-        if (!_current_struct_name.empty() && struct_name == _current_struct_name && _current_struct_type)
+
+        if (!_current_struct_name.empty() && (struct_name == _current_struct_name || base_struct_name == _current_struct_name) && _current_struct_type)
         {
             // This is a literal for the current struct being processed - use the current struct type
             // This ensures that Box { ptr: ptr } inside Box<T> constructor gets type Box<T>
             resolved_type = _current_struct_type;
-            LOG_DEBUG(Cryo::LogComponent::AST, "StructLiteral: Using current struct type '{}' for literal '{}'", 
+            LOG_DEBUG(Cryo::LogComponent::AST, "StructLiteral: Using current struct type '{}' for literal '{}'",
                      resolved_type->to_string(), struct_name);
         }
         else
         {
             // Regular lookup for other struct types
             TypedSymbol *type_symbol = _symbol_table->lookup_symbol(struct_name);
+            if (!type_symbol)
+            {
+                // Try base name without generics
+                type_symbol = _symbol_table->lookup_symbol(base_struct_name);
+            }
+            if (!type_symbol)
+            {
+                // Try any namespace
+                type_symbol = _symbol_table->lookup_symbol_in_any_namespace(base_struct_name);
+            }
             if (type_symbol)
             {
                 resolved_type = type_symbol->type;
+            }
+
+            // Try main symbol table for cross-module types
+            if (!resolved_type && _main_symbol_table)
+            {
+                Symbol *main_symbol = _main_symbol_table->lookup_symbol(base_struct_name);
+                if (!main_symbol)
+                {
+                    main_symbol = _main_symbol_table->lookup_symbol_in_any_namespace(base_struct_name);
+                }
+                if (main_symbol && main_symbol->data_type)
+                {
+                    resolved_type = main_symbol->data_type;
+                }
+            }
+
+            // Try type registry for generic types
+            if (!resolved_type)
+            {
+                ParameterizedType *template_type = _type_registry->get_template(base_struct_name);
+                if (!template_type)
+                {
+                    // Try syncing from TemplateRegistry
+                    sync_template_from_registry(base_struct_name);
+                    template_type = _type_registry->get_template(base_struct_name);
+                }
+                if (template_type)
+                {
+                    resolved_type = template_type;
+                }
             }
         }
 
@@ -10294,6 +10342,47 @@ namespace Cryo
         if (alias_type)
         {
             return alias_type;
+        }
+
+        // Try main symbol table for cross-module types
+        if (_main_symbol_table)
+        {
+            // Extract base name for generic types
+            std::string base_name = type_name;
+            size_t generic_start = type_name.find('<');
+            if (generic_start != std::string::npos)
+            {
+                base_name = type_name.substr(0, generic_start);
+            }
+
+            Symbol *main_symbol = _main_symbol_table->lookup_symbol(base_name);
+            if (!main_symbol)
+            {
+                main_symbol = _main_symbol_table->lookup_symbol_in_any_namespace(base_name);
+            }
+            if (main_symbol && main_symbol->data_type)
+            {
+                return main_symbol->data_type;
+            }
+        }
+
+        // Try type registry for generic types
+        std::string base_name = type_name;
+        size_t generic_start = type_name.find('<');
+        if (generic_start != std::string::npos)
+        {
+            base_name = type_name.substr(0, generic_start);
+        }
+        ParameterizedType *template_type = _type_registry->get_template(base_name);
+        if (!template_type)
+        {
+            // Try syncing from TemplateRegistry
+            sync_template_from_registry(base_name);
+            template_type = _type_registry->get_template(base_name);
+        }
+        if (template_type)
+        {
+            return template_type;
         }
 
         // Fall back to unknown type
