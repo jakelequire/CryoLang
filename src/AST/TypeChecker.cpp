@@ -6695,7 +6695,7 @@ namespace Cryo
                     {
                         // Log a warning instead of silently falling back to unknown type
                         // This helps diagnose cross-module type resolution issues
-                        LOG_WARNING(Cryo::LogComponent::AST,
+                        LOG_WARN(Cryo::LogComponent::AST,
                                     "Cross-module type resolution: Failed to resolve return type '{}' for method '{}::{}'. "
                                     "This may indicate a missing import or unresolved generic parameter.",
                                     method_meta->return_type_annotation, lookup_type_name, member_name);
@@ -6711,7 +6711,7 @@ namespace Cryo
                         if (!param_type)
                         {
                             // Log warning for unresolved parameter types
-                            LOG_WARNING(Cryo::LogComponent::AST,
+                            LOG_WARN(Cryo::LogComponent::AST,
                                         "Cross-module type resolution: Failed to resolve parameter type '{}' for method '{}::{}'. "
                                         "This may indicate a missing import or unresolved generic parameter.",
                                         param_type_str, lookup_type_name, member_name);
@@ -6723,7 +6723,7 @@ namespace Cryo
 
                     if (has_unresolved_params)
                     {
-                        LOG_WARNING(Cryo::LogComponent::AST,
+                        LOG_WARN(Cryo::LogComponent::AST,
                                     "Method '{}::{}' has unresolved parameter types. Type checking may be incomplete.",
                                     lookup_type_name, member_name);
                     }
@@ -6772,7 +6772,7 @@ namespace Cryo
                                 Type *return_type = resolve_type_with_generic_context(return_type_str);
                                 if (!return_type)
                                 {
-                                    LOG_WARNING(Cryo::LogComponent::AST,
+                                    LOG_WARN(Cryo::LogComponent::AST,
                                                 "AST fallback (struct): Failed to resolve return type '{}' for method '{}::{}'. "
                                                 "This may indicate a missing import or unresolved generic parameter.",
                                                 return_type_str, lookup_type_name, member_name);
@@ -6789,7 +6789,7 @@ namespace Cryo
                                         Type *param_type = resolve_type_with_generic_context(param_type_str);
                                         if (!param_type)
                                         {
-                                            LOG_WARNING(Cryo::LogComponent::AST,
+                                            LOG_WARN(Cryo::LogComponent::AST,
                                                         "AST fallback (struct): Failed to resolve parameter type '{}' for method '{}::{}'. "
                                                         "This may indicate a missing import or unresolved generic parameter.",
                                                         param_type_str, lookup_type_name, member_name);
@@ -6828,7 +6828,7 @@ namespace Cryo
                                 Type *return_type = resolve_type_with_generic_context(return_type_str);
                                 if (!return_type)
                                 {
-                                    LOG_WARNING(Cryo::LogComponent::AST,
+                                    LOG_WARN(Cryo::LogComponent::AST,
                                                 "AST fallback (class): Failed to resolve return type '{}' for method '{}::{}'. "
                                                 "This may indicate a missing import or unresolved generic parameter.",
                                                 return_type_str, lookup_type_name, member_name);
@@ -6845,7 +6845,7 @@ namespace Cryo
                                     Type *param_type = resolve_type_with_generic_context(param_type_str);
                                     if (!param_type)
                                     {
-                                        LOG_WARNING(Cryo::LogComponent::AST,
+                                        LOG_WARN(Cryo::LogComponent::AST,
                                                     "AST fallback (class): Failed to resolve parameter type '{}' for method '{}::{}'. "
                                                     "This may indicate a missing import or unresolved generic parameter.",
                                                     param_type_str, lookup_type_name, member_name);
