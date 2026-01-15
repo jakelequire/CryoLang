@@ -3,6 +3,7 @@
 #include "Codegen/ICodegenComponent.hpp"
 #include "Codegen/CodegenContext.hpp"
 #include "AST/ASTNode.hpp"
+#include "AST/TypeChecker.hpp"
 
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Function.h>
@@ -10,11 +11,6 @@
 #include <string>
 #include <vector>
 #include <unordered_set>
-
-namespace Cryo
-{
-    class TypeChecker; // Forward declaration for import_specialized_methods
-}
 
 namespace Cryo::Codegen
 {

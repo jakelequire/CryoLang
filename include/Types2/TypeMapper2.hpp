@@ -80,6 +80,12 @@ namespace Cryo
         // Generic instantiation callback
         GenericInstantiationCallback _instantiation_callback;
 
+        // Type parameter resolver for generic instantiation
+        std::function<TypeRef(const std::string &)> _type_param_resolver;
+
+        // Generic instantiator callback
+        std::function<llvm::StructType *(const std::string &, const std::vector<TypeRef> &)> _generic_instantiator;
+
         // Error state
         bool _has_error = false;
         std::string _last_error;
@@ -111,6 +117,27 @@ namespace Cryo
             _instantiation_callback = std::move(cb);
         }
 
+        /**
+         * @brief Set callback for resolving type parameters during instantiation
+         */
+        using TypeParamResolver = std::function<TypeRef(const std::string &)>;
+        void set_type_param_resolver(TypeParamResolver resolver)
+        {
+            _type_param_resolver = std::move(resolver);
+        }
+        void clear_type_param_resolver() { _type_param_resolver = nullptr; }
+
+        /**
+         * @brief Set callback for generic instantiation
+         */
+        using GenericInstantiator = std::function<llvm::StructType *(
+            const std::string &name,
+            const std::vector<TypeRef> &type_args)>;
+        void set_generic_instantiator(GenericInstantiator instantiator)
+        {
+            _generic_instantiator = std::move(instantiator);
+        }
+
         // ====================================================================
         // Primary Interface
         // ====================================================================
@@ -121,6 +148,26 @@ namespace Cryo
          * @return LLVM type or nullptr on failure
          */
         llvm::Type *map(TypeRef type);
+
+        /**
+         * @brief Alias for map() for backward compatibility
+         */
+        llvm::Type *map_type(TypeRef type) { return map(type); }
+
+        /**
+         * @brief Get LLVM type by Cryo type (alias for map)
+         */
+        llvm::Type *get_type(TypeRef type) { return map(type); }
+
+        /**
+         * @brief Get LLVM type by name (looks up in struct cache)
+         */
+        llvm::Type *get_type(const std::string &name);
+
+        /**
+         * @brief Resolve type name to TypeRef and map to LLVM type
+         */
+        llvm::Type *resolve_and_map(const std::string &name);
 
         /**
          * @brief Map multiple types
