@@ -1,6 +1,7 @@
 #pragma once
 #include "Lexer/lexer.hpp"
 #include "AST/Type.hpp"
+#include "Types2/TypeAnnotation.hpp"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -700,12 +701,30 @@ namespace Cryo
         bool _is_auto = false;    // auto type inference
         bool _is_global = false;  // whether this variable is declared at global scope
 
-        // Core type system - NO STRING OPERATIONS
-        TypeRef _resolved_type; // Primary type storage
+        // Type annotation from parser (unresolved) - optional, may be null for auto
+        std::unique_ptr<TypeAnnotation> _type_annotation;
+
+        // Resolved type from TypeResolver phase
+        TypeRef _resolved_type;
 
     public:
+        // Constructor with TypeAnnotation (preferred - parser should use this)
         VariableDeclarationNode(SourceLocation loc, std::string name,
-                                TypeRef resolved_type = TypeRef{},
+                                std::unique_ptr<TypeAnnotation> type_annotation,
+                                std::unique_ptr<ExpressionNode> init = nullptr,
+                                bool is_mutable = false,
+                                bool is_global = false)
+            : DeclarationNode(NodeKind::VariableDeclaration, loc),
+              _name(std::move(name)), _initializer(std::move(init)),
+              _is_mutable(is_mutable), _is_global(is_global),
+              _type_annotation(std::move(type_annotation))
+        {
+            _is_auto = (_type_annotation == nullptr);
+        }
+
+        // Constructor with resolved TypeRef (for cases where type is already known)
+        VariableDeclarationNode(SourceLocation loc, std::string name,
+                                TypeRef resolved_type,
                                 std::unique_ptr<ExpressionNode> init = nullptr,
                                 bool is_mutable = false,
                                 bool is_global = false)
@@ -713,7 +732,7 @@ namespace Cryo
               _name(std::move(name)), _initializer(std::move(init)),
               _is_mutable(is_mutable), _is_global(is_global), _resolved_type(resolved_type)
         {
-            _is_auto = !resolved_type.is_valid(); // Auto if no type provided
+            _is_auto = !resolved_type.is_valid();
         }
 
         const std::string &name() const { return _name; }
@@ -723,7 +742,16 @@ namespace Cryo
         bool has_initializer() const { return _initializer != nullptr; }
         bool is_global() const { return _is_global; }
 
-        // Core type system access - PREFERRED
+        // Type annotation access (from parser)
+        const TypeAnnotation *type_annotation() const { return _type_annotation.get(); }
+        bool has_type_annotation() const { return _type_annotation != nullptr; }
+        void set_type_annotation(std::unique_ptr<TypeAnnotation> annotation)
+        {
+            _type_annotation = std::move(annotation);
+            _is_auto = (_type_annotation == nullptr);
+        }
+
+        // Resolved type access (from TypeResolver)
         TypeRef get_resolved_type() const { return _resolved_type; }
         void set_resolved_type(TypeRef type)
         {
@@ -731,20 +759,6 @@ namespace Cryo
             _is_auto = !type.is_valid();
         }
         bool has_resolved_type() const { return _resolved_type.is_valid(); }
-
-        // DEPRECATED: String-based type operations - REMOVE THESE
-        [[deprecated("Use get_resolved_type() instead - string operations being eliminated")]]
-        const std::string type_annotation() const
-        {
-            return _resolved_type ? _resolved_type.get()->display_name() : "auto";
-        }
-
-        [[deprecated("Use set_resolved_type() instead - string operations being eliminated")]]
-        void set_type_annotation(const std::string &type)
-        {
-            // This should not be used - parser must resolve to Type* directly
-            _is_auto = (type == "auto" || type.empty());
-        }
 
         // Scope setters
         void set_global(bool is_global) { _is_global = is_global; }
@@ -1034,12 +1048,25 @@ namespace Cryo
         bool _is_inline = false;
         bool _is_variadic = false; // Variadic function (...args)
 
-        // Core type system - NO STRING OPERATIONS
-        TypeRef _resolved_return_type; // Primary return type storage
+        // Type annotation from parser (unresolved) - stores what the user wrote
+        std::unique_ptr<TypeAnnotation> _return_type_annotation;
+
+        // Resolved type from TypeResolver phase
+        TypeRef _resolved_return_type;
 
     public:
+        // Constructor with TypeAnnotation (preferred - parser should use this)
         FunctionDeclarationNode(SourceLocation loc, std::string name,
-                                TypeRef return_type = TypeRef{},
+                                std::unique_ptr<TypeAnnotation> return_type_annotation,
+                                bool is_public = false)
+            : DeclarationNode(NodeKind::FunctionDeclaration, loc),
+              _name(std::move(name)),
+              _return_type_annotation(std::move(return_type_annotation)),
+              _is_public(is_public) {}
+
+        // Constructor with resolved TypeRef (for cases where type is already known)
+        FunctionDeclarationNode(SourceLocation loc, std::string name,
+                                TypeRef return_type,
                                 bool is_public = false)
             : DeclarationNode(NodeKind::FunctionDeclaration, loc),
               _name(std::move(name)), _resolved_return_type(return_type),
@@ -1056,47 +1083,19 @@ namespace Cryo
         bool is_inline() const { return _is_inline; }
         bool is_variadic() const { return _is_variadic; }
 
-        // Core type system access - PREFERRED
+        // Type annotation access (unresolved - from parser)
+        const TypeAnnotation *return_type_annotation() const { return _return_type_annotation.get(); }
+        bool has_return_type_annotation() const { return _return_type_annotation != nullptr; }
+        void set_return_type_annotation(std::unique_ptr<TypeAnnotation> annotation)
+        {
+            _return_type_annotation = std::move(annotation);
+        }
+
+        // Resolved type access (from TypeResolver phase)
         TypeRef get_resolved_return_type() const { return _resolved_return_type; }
         void set_resolved_return_type(TypeRef type) { _resolved_return_type = type; }
         bool has_resolved_return_type() const { return _resolved_return_type.is_valid(); }
 
-        // DEPRECATED: String-based type operations - REMOVE THESE
-        [[deprecated("Use get_resolved_return_type() instead - string operations being eliminated")]]
-        const std::string return_type_annotation() const
-        {
-            if (_resolved_return_type.is_valid())
-            {
-                // Apply defensive programming to avoid virtual function crashes
-                std::string type_str = "CORRUPTED_TYPE";
-                std::string type_name = "CORRUPTED_TYPE";
-
-                try
-                {
-                    type_str = _resolved_return_type.get()->display_name();
-                    type_name = type_str; // Use same display_name for both
-                }
-                catch (...)
-                {
-                    type_str = "void";
-                    type_name = "void";
-                }
-
-                // Safety check: if display_name() returns empty, fall back to default
-                if (type_str.empty())
-                {
-                    return "void";
-                }
-                // If both are empty, this means the type resolution failed during parsing
-                // Return a placeholder that the TypeChecker can properly resolve
-                if (type_str.empty())
-                {
-                    return "UNRESOLVED_TYPE";
-                }
-                return type_str;
-            }
-            return "void";
-        }
         size_t parameter_count() const { return _parameters.size(); }
 
         void add_parameter(std::unique_ptr<VariableDeclarationNode> param)
@@ -1117,12 +1116,6 @@ namespace Cryo
         void set_body(std::unique_ptr<BlockStatementNode> body)
         {
             _body = std::move(body);
-        }
-
-        [[deprecated("Use set_resolved_return_type() instead - string operations being eliminated")]]
-        void set_return_type(const std::string &return_type)
-        {
-            // This should not be used - parser must resolve to Type* directly
         }
 
         void set_visibility(bool is_public) { _is_public = is_public; }
@@ -1173,10 +1166,23 @@ namespace Cryo
         Visibility _visibility;
         std::unique_ptr<ExpressionNode> _default_value;
 
-        // Core type system - NO STRING OPERATIONS
-        TypeRef _resolved_type; // Primary type storage
+        // Type annotation from parser (unresolved)
+        std::unique_ptr<TypeAnnotation> _type_annotation;
+
+        // Resolved type from TypeResolver phase
+        TypeRef _resolved_type;
 
     public:
+        // Constructor with TypeAnnotation (preferred - parser should use this)
+        StructFieldNode(SourceLocation loc, std::string name,
+                        std::unique_ptr<TypeAnnotation> type_annotation,
+                        Visibility visibility = Visibility::Public)
+            : DeclarationNode(NodeKind::VariableDeclaration, loc),
+              _name(std::move(name)),
+              _type_annotation(std::move(type_annotation)),
+              _visibility(visibility) {}
+
+        // Constructor with resolved TypeRef (for cases where type is already known)
         StructFieldNode(SourceLocation loc, std::string name, TypeRef resolved_type,
                         Visibility visibility = Visibility::Public)
             : DeclarationNode(NodeKind::VariableDeclaration, loc),
@@ -1187,30 +1193,18 @@ namespace Cryo
         Visibility visibility() const { return _visibility; }
         ExpressionNode *default_value() const { return _default_value.get(); }
 
-        // Core type system access - PREFERRED
+        // Type annotation access (unresolved - from parser)
+        const TypeAnnotation *type_annotation() const { return _type_annotation.get(); }
+        bool has_type_annotation() const { return _type_annotation != nullptr; }
+        void set_type_annotation(std::unique_ptr<TypeAnnotation> annotation)
+        {
+            _type_annotation = std::move(annotation);
+        }
+
+        // Resolved type access (from TypeResolver phase)
         TypeRef get_resolved_type() const { return _resolved_type; }
         void set_resolved_type(TypeRef type) { _resolved_type = type; }
         bool has_resolved_type() const { return _resolved_type.is_valid(); }
-
-        // DEPRECATED: String-based type operations - REMOVE THESE
-        [[deprecated("Use get_resolved_type() instead - string operations being eliminated")]]
-        const std::string type_annotation() const
-        {
-            return _resolved_type ? _resolved_type.get()->display_name() : "unknown";
-        }
-
-        [[deprecated("Use get_resolved_type() instead - string operations being eliminated")]]
-        const std::string &field_type() const
-        {
-            static std::string temp = _resolved_type ? _resolved_type.get()->display_name() : "unknown";
-            return temp;
-        }
-
-        [[deprecated("Use set_resolved_type() instead - string operations being eliminated")]]
-        void set_type(const std::string &type)
-        {
-            // This should not be used - parser must resolve to Type* directly
-        }
 
         bool is_mutable() const { return _visibility != Visibility::Private; }
 
@@ -1226,7 +1220,13 @@ namespace Cryo
                 os << "private ";
             else if (_visibility == Visibility::Protected)
                 os << "protected ";
-            os << _name << ": " << (_resolved_type ? _resolved_type.get()->display_name() : "unknown");
+            os << _name << ": ";
+            if (_resolved_type.is_valid())
+                os << _resolved_type.get()->display_name();
+            else if (_type_annotation)
+                os << _type_annotation->to_string();
+            else
+                os << "unknown";
             if (_default_value)
             {
                 os << " = ";
@@ -1249,6 +1249,16 @@ namespace Cryo
         bool _is_default_destructor; // For ~TypeName() default; syntax
 
     public:
+        // Constructor with TypeAnnotation (preferred - parser should use this)
+        StructMethodNode(SourceLocation loc, std::string name,
+                         std::unique_ptr<TypeAnnotation> return_type_annotation,
+                         Visibility visibility = Visibility::Public, bool is_constructor = false,
+                         bool is_destructor = false, bool is_static = false, bool is_default_destructor = false)
+            : FunctionDeclarationNode(loc, std::move(name), std::move(return_type_annotation)),
+              _visibility(visibility), _is_constructor(is_constructor),
+              _is_destructor(is_destructor), _is_static(is_static), _is_default_destructor(is_default_destructor) {}
+
+        // Constructor with resolved TypeRef (for cases where type is already known)
         StructMethodNode(SourceLocation loc, std::string name, TypeRef return_type,
                          Visibility visibility = Visibility::Public, bool is_constructor = false,
                          bool is_destructor = false, bool is_static = false, bool is_default_destructor = false)
@@ -1995,20 +2005,49 @@ namespace Cryo
     {
     private:
         std::unique_ptr<ExpressionNode> _expression;
-        std::string _target_type_name;
+
+        // Type annotation from parser (unresolved)
+        std::unique_ptr<TypeAnnotation> _target_type_annotation;
+
+        // Resolved type from TypeResolver phase
+        TypeRef _resolved_target_type;
 
     public:
-        CastExpressionNode(SourceLocation loc, std::unique_ptr<ExpressionNode> expression, std::string target_type)
-            : ExpressionNode(NodeKind::CastExpression, loc), 
-              _expression(std::move(expression)), 
-              _target_type_name(std::move(target_type)) {}
+        // Constructor with TypeAnnotation (preferred - parser should use this)
+        CastExpressionNode(SourceLocation loc, std::unique_ptr<ExpressionNode> expression,
+                           std::unique_ptr<TypeAnnotation> target_type_annotation)
+            : ExpressionNode(NodeKind::CastExpression, loc),
+              _expression(std::move(expression)),
+              _target_type_annotation(std::move(target_type_annotation)) {}
+
+        // Constructor with resolved TypeRef (for cases where type is already known)
+        CastExpressionNode(SourceLocation loc, std::unique_ptr<ExpressionNode> expression,
+                           TypeRef resolved_target_type)
+            : ExpressionNode(NodeKind::CastExpression, loc),
+              _expression(std::move(expression)),
+              _resolved_target_type(resolved_target_type) {}
 
         ExpressionNode *expression() const { return _expression.get(); }
-        const std::string &target_type_name() const { return _target_type_name; }
+
+        // Type annotation access (unresolved - from parser)
+        const TypeAnnotation *target_type_annotation() const { return _target_type_annotation.get(); }
+        bool has_target_type_annotation() const { return _target_type_annotation != nullptr; }
+
+        // Resolved type access (from TypeResolver phase)
+        TypeRef get_resolved_target_type() const { return _resolved_target_type; }
+        void set_resolved_target_type(TypeRef type) { _resolved_target_type = type; }
+        bool has_resolved_target_type() const { return _resolved_target_type.is_valid(); }
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "CastExpression: " << _target_type_name << std::endl;
+            os << std::string(indent, ' ') << "CastExpression: ";
+            if (_resolved_target_type.is_valid())
+                os << _resolved_target_type.get()->display_name();
+            else if (_target_type_annotation)
+                os << _target_type_annotation->to_string();
+            else
+                os << "unknown";
+            os << std::endl;
             if (_expression)
                 _expression->print(os, indent + 2);
         }

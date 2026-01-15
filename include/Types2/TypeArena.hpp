@@ -336,16 +336,14 @@ namespace Cryo
                              std::vector<std::string> notes);
 
         // ====================================================================
-        // Interning (for backward compatibility with raw Type*)
+        // Interning (for converting raw Type* to TypeRef during migration)
         // ====================================================================
 
         /**
          * @brief Intern a raw Type* into a TypeRef
          *
          * If the type is already in the arena (same pointer), returns existing TypeRef.
-         * Otherwise, this is a compatibility method that searches for an equivalent type.
-         *
-         * WARNING: This is primarily for migration. New code should use TypeRef directly.
+         * Otherwise, creates an equivalent type in the arena.
          */
         TypeRef intern(const Type *type);
     };

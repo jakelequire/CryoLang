@@ -229,6 +229,55 @@ namespace Cryo
         return declare(sym);
     }
 
+    bool SymbolTable2::declare_intrinsic(const std::string &name,
+                                         TypeRef type,
+                                         SourceLocation loc)
+    {
+        Symbol2 sym;
+        sym.name = name;
+        sym.kind = SymbolKind2::Intrinsic;
+        sym.type = type;
+        sym.module = _current_module;
+        sym.location = loc;
+        sym.visibility = SymbolVisibility::Public;
+
+        return declare(sym);
+    }
+
+    bool SymbolTable2::declare_symbol(const std::string &name,
+                                      SymbolKind2 kind,
+                                      SourceLocation loc,
+                                      TypeRef type,
+                                      const std::string &scope_name)
+    {
+        Symbol2 sym;
+        sym.name = name;
+        sym.kind = kind;
+        sym.type = type;
+        sym.module = _current_module;
+        sym.location = loc;
+        sym.scope = scope_name;
+        sym.visibility = SymbolVisibility::Public;
+
+        return declare(sym);
+    }
+
+    void SymbolTable2::register_namespace(const std::string &namespace_name,
+                                          const std::unordered_map<std::string, Symbol2> &symbols)
+    {
+        ensure_global_scope();
+
+        // Register each symbol with the namespace prefix
+        for (const auto &[name, symbol] : symbols)
+        {
+            // Register with qualified name for qualified access (e.g., IO::println)
+            std::string qualified_name = namespace_name + "::" + name;
+            Symbol2 qualified_sym = symbol;
+            qualified_sym.name = qualified_name;
+            _current_scope->declare(qualified_name, qualified_sym);
+        }
+    }
+
     // ========================================================================
     // Symbol Lookup
     // ========================================================================
@@ -373,6 +422,36 @@ namespace Cryo
         // Then check module registry
         auto type = _modules.resolve_with_imports(name, _current_module, _active_imports);
         return type;
+    }
+
+    TypeRef SymbolTable2::lookup_struct_type(const std::string &name) const
+    {
+        auto type_opt = resolve_type(name);
+        if (type_opt && type_opt->is_valid() && type_opt->get()->kind() == TypeKind::Struct)
+        {
+            return *type_opt;
+        }
+        return TypeRef{}; // Invalid TypeRef
+    }
+
+    TypeRef SymbolTable2::lookup_class_type(const std::string &name) const
+    {
+        auto type_opt = resolve_type(name);
+        if (type_opt && type_opt->is_valid() && type_opt->get()->kind() == TypeKind::Class)
+        {
+            return *type_opt;
+        }
+        return TypeRef{}; // Invalid TypeRef
+    }
+
+    TypeRef SymbolTable2::lookup_enum_type(const std::string &name) const
+    {
+        auto type_opt = resolve_type(name);
+        if (type_opt && type_opt->is_valid() && type_opt->get()->kind() == TypeKind::Enum)
+        {
+            return *type_opt;
+        }
+        return TypeRef{}; // Invalid TypeRef
     }
 
     // ========================================================================

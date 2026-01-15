@@ -704,8 +704,15 @@ namespace Cryo
         if (_use_colors)
             _output << Colors::RESET;
         print_location(node.location());
-        _output << " target='" << node.target_type_name() << "'" << std::endl;
-        
+        _output << " target='";
+        if (node.has_resolved_target_type())
+            _output << node.get_resolved_target_type()->display_name();
+        else if (node.target_type_annotation())
+            _output << node.target_type_annotation()->to_string();
+        else
+            _output << "unknown";
+        _output << "'" << std::endl;
+
         // Dump the expression being cast
         if (node.expression()) {
             dump_child(node.expression(), true);

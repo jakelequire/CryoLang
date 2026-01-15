@@ -602,7 +602,7 @@ namespace Cryo::Codegen
         auto identifier = srm_context().create_qualified_identifier(name, kind);
         if (identifier)
         {
-            return identifier->display_name();
+            return identifier->to_string();
         }
 
         // Fallback: return original name

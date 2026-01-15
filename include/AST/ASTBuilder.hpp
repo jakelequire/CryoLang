@@ -32,21 +32,35 @@ namespace Cryo
         std::unique_ptr<ProgramNode> create_program_node(SourceLocation loc);
         std::unique_ptr<BlockStatementNode> create_block_statement(SourceLocation loc);
         std::unique_ptr<ReturnStatementNode> create_return_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> expr = nullptr);
+        // Variable declaration with resolved TypeRef
         std::unique_ptr<VariableDeclarationNode> create_variable_declaration(SourceLocation loc,
                                                                              std::string name,
                                                                              TypeRef resolved_type,
                                                                              std::unique_ptr<ExpressionNode> init = nullptr,
                                                                              bool is_mutable = false,
                                                                              bool is_global = false);
+        // Variable declaration with TypeAnnotation (preferred for parser)
+        std::unique_ptr<VariableDeclarationNode> create_variable_declaration(SourceLocation loc,
+                                                                             std::string name,
+                                                                             std::unique_ptr<TypeAnnotation> type_annotation,
+                                                                             std::unique_ptr<ExpressionNode> init,
+                                                                             bool is_mutable,
+                                                                             bool is_global);
+        // Function declaration with resolved TypeRef
         std::unique_ptr<FunctionDeclarationNode> create_function_declaration(SourceLocation loc,
                                                                              std::string name,
                                                                              TypeRef return_type,
                                                                              bool is_public = false);
+        // Function declaration with TypeAnnotation (preferred for parser)
+        std::unique_ptr<FunctionDeclarationNode> create_function_declaration(SourceLocation loc,
+                                                                             std::string name,
+                                                                             std::unique_ptr<TypeAnnotation> return_type_annotation,
+                                                                             bool is_public);
         std::unique_ptr<CallExpressionNode> create_call_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> callee);
         std::unique_ptr<NewExpressionNode> create_new_expression(SourceLocation loc, std::string type_name);
         std::unique_ptr<SizeofExpressionNode> create_sizeof_expression(SourceLocation loc, std::string type_name);
         std::unique_ptr<AlignofExpressionNode> create_alignof_expression(SourceLocation loc, std::string type_name);
-        std::unique_ptr<CastExpressionNode> create_cast_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> expression, std::string target_type);
+        std::unique_ptr<CastExpressionNode> create_cast_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> expression, std::unique_ptr<TypeAnnotation> target_type_annotation);
         std::unique_ptr<StructLiteralNode> create_struct_literal(SourceLocation loc, std::string struct_type);
         std::unique_ptr<ArrayLiteralNode> create_array_literal(SourceLocation loc);
         std::unique_ptr<ArrayAccessNode> create_array_access(SourceLocation loc, std::unique_ptr<ExpressionNode> array, std::unique_ptr<ExpressionNode> index);
@@ -64,8 +78,14 @@ namespace Cryo
 
         // Struct and Class creation methods
         std::unique_ptr<GenericParameterNode> create_generic_parameter(SourceLocation loc, std::string name);
+        // Struct field with resolved TypeRef
         std::unique_ptr<StructFieldNode> create_struct_field(SourceLocation loc, std::string name, TypeRef resolved_type, Visibility visibility = Visibility::Public);
+        // Struct field with TypeAnnotation (preferred for parser)
+        std::unique_ptr<StructFieldNode> create_struct_field(SourceLocation loc, std::string name, std::unique_ptr<TypeAnnotation> type_annotation, Visibility visibility = Visibility::Public);
+        // Struct method with resolved TypeRef
         std::unique_ptr<StructMethodNode> create_struct_method(SourceLocation loc, std::string name, TypeRef return_type, Visibility visibility = Visibility::Public, bool is_constructor = false, bool is_destructor = false, bool is_static = false, bool is_default_destructor = false);
+        // Struct method with TypeAnnotation (preferred for parser)
+        std::unique_ptr<StructMethodNode> create_struct_method(SourceLocation loc, std::string name, std::unique_ptr<TypeAnnotation> return_type_annotation, Visibility visibility, bool is_constructor, bool is_destructor, bool is_static, bool is_default_destructor);
         std::unique_ptr<StructDeclarationNode> create_struct_declaration(SourceLocation loc, std::string name);
         std::unique_ptr<ClassDeclarationNode> create_class_declaration(SourceLocation loc, std::string name);
         std::unique_ptr<TraitDeclarationNode> create_trait_declaration(SourceLocation loc, std::string name);

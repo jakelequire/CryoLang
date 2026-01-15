@@ -49,7 +49,7 @@ namespace Cryo
 
             MethodMetadata mm;
             mm.name = method->name();
-            mm.return_type_annotation = method->return_type_annotation();
+            mm.return_type_annotation = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "void";
             mm.is_static = method->is_static();
 
             // Extract parameter info
@@ -59,7 +59,7 @@ namespace Cryo
                 if (param)
                 {
                     mm.parameter_names.push_back(param->name());
-                    mm.parameter_type_annotations.push_back(param->type_annotation());
+                    mm.parameter_type_annotations.push_back(param->type_annotation() ? param->type_annotation()->to_string() : "unknown");
                 }
             }
 
@@ -115,7 +115,7 @@ namespace Cryo
 
             MethodMetadata mm;
             mm.name = method->name();
-            mm.return_type_annotation = method->return_type_annotation();
+            mm.return_type_annotation = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "void";
             mm.is_static = method->is_static();
 
             // Extract parameter info
@@ -125,7 +125,7 @@ namespace Cryo
                 if (param)
                 {
                     mm.parameter_names.push_back(param->name());
-                    mm.parameter_type_annotations.push_back(param->type_annotation());
+                    mm.parameter_type_annotations.push_back(param->type_annotation() ? param->type_annotation()->to_string() : "unknown");
                 }
             }
 

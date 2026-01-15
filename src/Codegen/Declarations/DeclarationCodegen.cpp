@@ -1216,7 +1216,7 @@ namespace Cryo::Codegen
             !parent_type_name.empty())
         {
             // This is a constructor with wrong return type - fix it to pointer to struct type
-            TypeRef struct_type = ctx().symbols().arena().lookup_struct_type(parent_type_name);
+            TypeRef struct_type = ctx().symbols().lookup_struct_type(parent_type_name);
             if (struct_type.is_valid())
             {
                 resolved_type = ctx().symbols().arena().get_pointer_to(struct_type);
@@ -1259,7 +1259,7 @@ namespace Cryo::Codegen
             bool is_simple_enum = false;
             if (!parent_type_name.empty())
             {
-                TypeRef parent_cryo_type = symbols().arena().lookup_enum_type(parent_type_name);
+                TypeRef parent_cryo_type = symbols().lookup_enum_type(parent_type_name);
                 if (parent_cryo_type.is_valid() && parent_cryo_type->kind() == Cryo::TypeKind::Enum)
                 {
                     auto *enum_type = static_cast<const Cryo::EnumType *>(parent_cryo_type.get());
@@ -1846,10 +1846,10 @@ namespace Cryo::Codegen
                 if (arg.getName() == "this")
                 {
                     // Get the Cryo type for the current struct/class
-                    TypeRef this_type = ctx().symbols().arena().lookup_struct_type(parent_type);
+                    TypeRef this_type = ctx().symbols().lookup_struct_type(parent_type);
                     if (!this_type.is_valid())
                     {
-                        this_type = ctx().symbols().arena().lookup_class_type(parent_type);
+                        this_type = ctx().symbols().lookup_class_type(parent_type);
                     }
                     if (this_type.is_valid())
                     {
@@ -2109,14 +2109,14 @@ namespace Cryo::Codegen
                         if (arg.getName() == "this")
                         {
                             // Get the Cryo type for the current struct/class/enum
-                            TypeRef this_type = ctx().symbols().arena().lookup_struct_type(type_name);
+                            TypeRef this_type = ctx().symbols().lookup_struct_type(type_name);
                             if (!this_type.is_valid())
                             {
-                                this_type = ctx().symbols().arena().lookup_class_type(type_name);
+                                this_type = ctx().symbols().lookup_class_type(type_name);
                             }
                             if (!this_type.is_valid())
                             {
-                                this_type = ctx().symbols().arena().lookup_enum_type(type_name);
+                                this_type = ctx().symbols().lookup_enum_type(type_name);
                             }
                             if (this_type.is_valid())
                             {

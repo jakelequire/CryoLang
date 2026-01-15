@@ -62,7 +62,10 @@ namespace Cryo
             _diagnostic_manager.get());
 
         // Create monomorphization pass
-        _monomorphization_pass = std::make_unique<MonomorphizationPass>();
+        _monomorphization_pass = std::make_unique<MonomorphizationPass>(
+            _ast_context->types(),
+            *_generic_registry,
+            _ast_context->modules());
 
         // Create template registry
         _template_registry = std::make_unique<TemplateRegistry>();
@@ -811,7 +814,8 @@ namespace Cryo
     {
         if (_symbol_table)
         {
-            _symbol_table->print_pretty(os);
+            // TODO: SymbolTable2 print method not yet implemented
+            os << "Symbol table has " << _symbol_table->scope_depth() << " scope(s)" << std::endl;
         }
         else
         {
@@ -990,7 +994,7 @@ namespace Cryo
             if (!return_type.is_valid())
             {
                 LOG_WARN(Cryo::LogComponent::GENERAL, "Function '{}' has null return type, defaulting to void", func_decl->name());
-                return_type = _ast_context->types().get_void_type(); // Safe fallback
+                return_type = _ast_context->types().get_void(); // Safe fallback
             }
 
             // Create function type
@@ -999,10 +1003,8 @@ namespace Cryo
             // Build enhanced signature including generic parameters
             std::string enhanced_signature = build_function_signature(func_decl);
 
-            // Add function to current (global) scope with enhanced display for generics
-            current_scope->declare_symbol(func_decl->name(), SymbolKind::Function,
-                                          func_decl->location(), function_type, scope_name,
-                                          func_decl->generic_parameters().empty() ? "" : enhanced_signature);
+            // Add function to symbol table
+            _symbol_table->declare_function(func_decl->name(), function_type, func_decl->location());
 
             LOG_TRACE(Cryo::LogComponent::GENERAL, "Pass 1: Registered function: {}", func_decl->name());
 
@@ -1040,7 +1042,7 @@ namespace Cryo
             if (!return_type.is_valid())
             {
                 LOG_WARN(Cryo::LogComponent::GENERAL, "Intrinsic '{}' has null return type, defaulting to void", intrinsic_decl->name());
-                return_type = _ast_context->types().get_void_type(); // Safe fallback
+                return_type = _ast_context->types().get_void(); // Safe fallback
             }
 
             // Create function type
@@ -1048,8 +1050,7 @@ namespace Cryo
 
             // Add intrinsic function to current (global) scope with Intrinsic symbol kind
             // Register intrinsics only in std::Intrinsics namespace for consistency
-            current_scope->declare_symbol(intrinsic_decl->name(), SymbolKind::Intrinsic,
-                                          intrinsic_decl->location(), function_type, "std::Intrinsics");
+            _symbol_table->declare_intrinsic(intrinsic_decl->name(), function_type, intrinsic_decl->location());
 
             LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered intrinsic function '{}' in namespace 'std::Intrinsics'",
                       intrinsic_decl->name());
@@ -1058,11 +1059,10 @@ namespace Cryo
         else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
         {
             // Get or create struct type
-            TypeRef struct_type = _ast_context->types().get_struct_type(struct_decl->name());
+            TypeRef struct_type = _ast_context->types().create_struct(QualifiedTypeName{ModuleID::invalid(), struct_decl->name()});
 
             // Add struct to symbol table as a Type symbol
-            current_scope->declare_symbol(struct_decl->name(), SymbolKind::Type,
-                                          struct_decl->location(), struct_type, scope_name);
+            _symbol_table->declare_type(struct_decl->name(), struct_type, struct_decl->location());
 
             // Register struct methods with fully qualified names
             for (const auto &method : struct_decl->methods())
@@ -1087,20 +1087,19 @@ namespace Cryo
                     {
                         if (method->is_constructor())
                         {
-                            return_type = _ast_context->types().get_void_type();
+                            return_type = _ast_context->types().get_void();
                         }
                         else
                         {
                             LOG_WARN(Cryo::LogComponent::GENERAL, "Struct method '{}' has null return type and is not a constructor", method_name);
-                            return_type = _ast_context->types().get_void_type(); // Safe fallback
+                            return_type = _ast_context->types().get_void(); // Safe fallback
                         }
                     }
 
                     TypeRef function_type = _ast_context->types().get_function(return_type, param_types);
 
                     // Register method in symbol table with fully qualified name
-                    current_scope->declare_symbol(method_name, SymbolKind::Function,
-                                                  method->location(), function_type, scope_name);
+                    _symbol_table->declare_function(method_name, function_type, method->location());
                 }
             }
 
@@ -1121,11 +1120,10 @@ namespace Cryo
         else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(node))
         {
             // Get or create class type
-            TypeRef class_type = _ast_context->types().get_class_type(class_decl->name());
+            TypeRef class_type = _ast_context->types().create_class(QualifiedTypeName{ModuleID::invalid(), class_decl->name()});
 
             // Add class to symbol table as a Type symbol
-            current_scope->declare_symbol(class_decl->name(), SymbolKind::Type,
-                                          class_decl->location(), class_type, scope_name);
+            _symbol_table->declare_type(class_decl->name(), class_type, class_decl->location());
 
             // Register class methods with fully qualified names
             for (const auto &method : class_decl->methods())
@@ -1150,20 +1148,19 @@ namespace Cryo
                     {
                         if (method->is_constructor())
                         {
-                            return_type = _ast_context->types().get_void_type();
+                            return_type = _ast_context->types().get_void();
                         }
                         else
                         {
                             LOG_WARN(Cryo::LogComponent::GENERAL, "Method '{}' has null return type and is not a constructor", method_name);
-                            return_type = _ast_context->types().get_void_type(); // Safe fallback
+                            return_type = _ast_context->types().get_void(); // Safe fallback
                         }
                     }
 
                     TypeRef function_type = _ast_context->types().get_function(return_type, param_types);
 
                     // Register method in symbol table with fully qualified name
-                    current_scope->declare_symbol(method_name, SymbolKind::Function,
-                                                  method->location(), function_type, scope_name);
+                    _symbol_table->declare_function(method_name, function_type, method->location());
                 }
             }
 
@@ -1202,9 +1199,8 @@ namespace Cryo
             }
 
             // Create enum type and register it
-            TypeRef enum_type = _ast_context->types().get_enum_type(enum_decl->name(), variant_names, is_simple_enum);
-            current_scope->declare_symbol(enum_decl->name(), SymbolKind::Type,
-                                          enum_decl->location(), enum_type, scope_name);
+            TypeRef enum_type = _ast_context->types().create_enum(QualifiedTypeName{ModuleID::invalid(), enum_decl->name()});
+            _symbol_table->declare_type(enum_decl->name(), enum_type, enum_decl->location());
 
             // IMMEDIATELY register enum variants in codegen context to prevent early reference issues
             // This ensures variants are available when struct constructors reference them during pre-registration
@@ -1250,9 +1246,9 @@ namespace Cryo
         // Handle trait declarations
         else if (auto trait_decl = dynamic_cast<TraitDeclarationNode *>(node))
         {
-            // Add trait to symbol table as a type
-            current_scope->declare_symbol(trait_decl->name(), SymbolKind::Type,
-                                          trait_decl->location(), nullptr, scope_name);
+            // Create trait type and add to symbol table as a type
+            TypeRef trait_type = _ast_context->types().create_trait(QualifiedTypeName{ModuleID::invalid(), trait_decl->name()});
+            _symbol_table->declare_type(trait_decl->name(), trait_type, trait_decl->location());
 
             // Register generic trait templates if this trait has generic parameters
             if (!trait_decl->generic_parameters().empty())
@@ -1295,7 +1291,7 @@ namespace Cryo
                         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing namespace alias '{}' for module '{}' with {} symbols",
                                   result.namespace_alias, result.module_name, result.symbol_map.size());
 
-                        current_scope->register_namespace(result.namespace_alias, result.symbol_map);
+                        _symbol_table->register_namespace(result.namespace_alias, result.symbol_map);
                         _imported_namespaces.push_back(result.namespace_alias); // Track for enhanced resolution
                         LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered namespace alias '{}' with {} symbols",
                                   result.namespace_alias, result.symbol_map.size());
@@ -1308,7 +1304,7 @@ namespace Cryo
                         for (const auto &[symbol_name, symbol] : result.symbol_map)
                         {
                             // Register each symbol directly in the current scope
-                            current_scope->declare_symbol(symbol_name, symbol.kind, symbol.declaration_location, symbol.data_type, scope_name);
+                            _symbol_table->declare_symbol(symbol_name, symbol.kind, symbol.location, symbol.type, scope_name);
                             LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered specific symbol: {}", symbol_name);
                         }
                     }
@@ -1321,7 +1317,7 @@ namespace Cryo
                     if (!result.symbol_map.empty())
                     {
                         // Register namespace for qualified access (e.g., IO::println)
-                        current_scope->register_namespace(namespace_name, result.symbol_map);
+                        _symbol_table->register_namespace(namespace_name, result.symbol_map);
                         _imported_namespaces.push_back(namespace_name); // Track for enhanced resolution
 
                         // Also register in SRM context for proper wildcard import resolution
@@ -1338,7 +1334,7 @@ namespace Cryo
                         for (const auto &[symbol_name, symbol] : result.symbol_map)
                         {
                             // Register each symbol directly in the current scope for unqualified access
-                            current_scope->declare_symbol(symbol_name, symbol.kind, symbol.declaration_location, symbol.data_type, scope_name);
+                            _symbol_table->declare_symbol(symbol_name, symbol.kind, symbol.location, symbol.type, scope_name);
                             LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered wildcard symbol for unqualified access: {}", symbol_name);
                         }
 
@@ -1385,8 +1381,7 @@ namespace Cryo
                 }
 
                 // Still register in symbol table for type checking
-                current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
-                                              var_decl->location(), var_decl->get_resolved_type(), scope_name);
+                _symbol_table->declare_variable(var_decl->name(), var_decl->get_resolved_type(), var_decl->location(), false);
             }
             // Skip other variable declarations - they will be properly handled by TypeChecker
         }
@@ -1542,10 +1537,12 @@ namespace Cryo
         {
             if (i > 0)
                 signature += ", ";
-            signature += params[i]->type_annotation();
+            auto *type_ann = params[i]->type_annotation();
+            signature += type_ann ? type_ann->to_string() : "unknown";
         }
 
-        signature += ") -> " + func_decl->return_type_annotation();
+        auto *return_type_ann = func_decl->return_type_annotation();
+        signature += ") -> " + (return_type_ann ? return_type_ann->to_string() : "void");
         return signature;
     }
 
@@ -1793,7 +1790,7 @@ namespace Cryo
             return;
         }
 
-        Codegen::TypeMapper *type_mapper = visitor->get_type_mapper();
+        TypeMapper *type_mapper = visitor->get_type_mapper();
         if (!type_mapper)
         {
             LOG_ERROR(Cryo::LogComponent::GENERAL, "Failed to get TypeMapper for AST node registration");
@@ -1808,7 +1805,7 @@ namespace Cryo
         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Completed AST node registration with TypeMapper");
     }
 
-    void CompilerInstance::register_ast_nodes_recursive(ASTNode *node, Codegen::TypeMapper *type_mapper)
+    void CompilerInstance::register_ast_nodes_recursive(ASTNode *node, TypeMapper *type_mapper)
     {
         if (!node || !type_mapper)
             return;

@@ -6,6 +6,7 @@
 #include "Types2/Monomorphizer2.hpp"
 #include "Types2/GenericTypes.hpp"
 #include "Types2/UserDefinedTypes.hpp"
+#include "Types2/ErrorType.hpp"
 
 #include <sstream>
 #include <algorithm>
