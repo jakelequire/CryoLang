@@ -144,7 +144,7 @@ namespace Cryo::Codegen
                         TypeRef nested_type = nested_member->get_resolved_type();
                         if (nested_type)
                         {
-                            std::string type_name = nested_type->to_string();
+                            std::string type_name = nested_type.get()->display_name();
                             // Check if it's a primitive type that stores a pointer value
                             static const std::unordered_set<std::string> primitive_ptr_types = {
                                 "string", "i8*", "u8*", "char*"};
@@ -1121,7 +1121,7 @@ namespace Cryo::Codegen
             TypeRef obj_type = callee->object()->get_resolved_type();
             if (obj_type)
             {
-                type_name = obj_type->to_string();
+                type_name = obj_type.get()->display_name();
                 // Strip pointer suffix if present
                 if (!type_name.empty() && type_name.back() == '*')
                 {
@@ -1131,9 +1131,9 @@ namespace Cryo::Codegen
                 if (obj_type->kind() == Cryo::TypeKind::Pointer)
                 {
                     auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
-                    if (ptr_type && ptr_type->pointee_type())
+                    if (ptr_type && ptr_type->pointee())
                     {
-                        type_name = ptr_type->pointee_type()->to_string();
+                        type_name = ptr_type->pointee().get()->display_name();
                     }
                 }
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1149,7 +1149,7 @@ namespace Cryo::Codegen
                     auto it = var_types.find(id->name());
                     if (it != var_types.end() && it->second)
                     {
-                        type_name = it->second->to_string();
+                        type_name = it->second.get()->display_name();
                         // Strip pointer suffix if present
                         if (!type_name.empty() && type_name.back() == '*')
                         {
@@ -1188,7 +1188,7 @@ namespace Cryo::Codegen
                         TypeRef call_return_type = call_expr->get_resolved_type();
                         if (call_return_type)
                         {
-                            type_name = call_return_type->to_string();
+                            type_name = call_return_type.get()->display_name();
                             // Strip pointer suffix if present
                             if (!type_name.empty() && type_name.back() == '*')
                             {
@@ -1220,7 +1220,7 @@ namespace Cryo::Codegen
                                     auto it = var_types.find(inner_id->name());
                                     if (it != var_types.end() && it->second)
                                     {
-                                        inner_receiver_type = it->second->to_string();
+                                        inner_receiver_type = it->second.get()->display_name();
                                         if (!inner_receiver_type.empty() && inner_receiver_type.back() == '*')
                                         {
                                             inner_receiver_type.pop_back();
@@ -1232,7 +1232,7 @@ namespace Cryo::Codegen
                                     TypeRef inner_obj_type = inner_callee->object()->get_resolved_type();
                                     if (inner_obj_type)
                                     {
-                                        inner_receiver_type = inner_obj_type->to_string();
+                                        inner_receiver_type = inner_obj_type.get()->display_name();
                                         if (!inner_receiver_type.empty() && inner_receiver_type.back() == '*')
                                         {
                                             inner_receiver_type.pop_back();
@@ -1241,9 +1241,9 @@ namespace Cryo::Codegen
                                         if (inner_obj_type->kind() == Cryo::TypeKind::Pointer)
                                         {
                                             auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(inner_obj_type.get());
-                                            if (ptr_type && ptr_type->pointee_type())
+                                            if (ptr_type && ptr_type->pointee())
                                             {
-                                                inner_receiver_type = ptr_type->pointee_type()->to_string();
+                                                inner_receiver_type = ptr_type->pointee().get()->display_name();
                                             }
                                         }
                                     }
@@ -1999,14 +1999,14 @@ namespace Cryo::Codegen
         TypeRef obj_type = node->object()->get_resolved_type();
         if (obj_type)
         {
-            type_name = obj_type->to_string();
+            type_name = obj_type.get()->display_name();
             // Handle pointer types - get the pointee type name
             if (obj_type->kind() == Cryo::TypeKind::Pointer)
             {
                 auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
-                if (ptr_type && ptr_type->pointee_type())
+                if (ptr_type && ptr_type->pointee())
                 {
-                    type_name = ptr_type->pointee_type()->to_string();
+                    type_name = ptr_type->pointee().get()->display_name();
                 }
             }
             else if (!type_name.empty() && type_name.back() == '*')
@@ -2026,7 +2026,7 @@ namespace Cryo::Codegen
                     auto it = var_types.find("this");
                     if (it != var_types.end() && it->second)
                     {
-                        type_name = it->second->to_string();
+                        type_name = it->second.get()->display_name();
                         if (!type_name.empty() && type_name.back() == '*')
                         {
                             type_name.pop_back();

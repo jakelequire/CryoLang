@@ -478,7 +478,7 @@ namespace Cryo::Codegen
         if (!type)
             return true; // Default to signed
 
-        std::string name = type->to_string();
+        std::string name = type.get()->display_name();
         // Unsigned types in Cryo start with 'u'
         return name.empty() || name[0] != 'u';
     }

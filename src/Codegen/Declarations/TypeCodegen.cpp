@@ -54,7 +54,7 @@ namespace Cryo::Codegen
                 cache_key += ",";
             if (type_args[i])
             {
-                cache_key += type_args[i]->to_string();
+                cache_key += type_args[i].get()->display_name();
             }
         }
         cache_key += ">";
@@ -554,7 +554,7 @@ namespace Cryo::Codegen
             return true; // Default to signed
 
         // Check type name for unsigned prefix
-        std::string name = cryo_type->to_string();
+        std::string name = cryo_type.get()->display_name();
         return name.empty() || name[0] != 'u';
     }
 
@@ -609,7 +609,7 @@ namespace Cryo::Codegen
             if (cryo_field_type)
             {
                 LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Mapping field '{}' of type '{}' ===",
-                         field->name(), cryo_field_type->to_string());
+                         field->name(), cryo_field_type.get()->display_name());
                 // Use the main type mapping method like the old implementation did
                 llvm::Type *field_type = types().map(cryo_field_type);
                 if (field_type)
@@ -717,7 +717,7 @@ namespace Cryo::Codegen
                     case Cryo::TypeKind::Class: type_kind_str = "Class"; break;
                     case Cryo::TypeKind::Pointer: type_kind_str = "Pointer"; break;
                     case Cryo::TypeKind::Struct: type_kind_str = "Struct"; break;
-                    case Cryo::TypeKind::Integer: type_kind_str = "Integer"; break;
+                    case Cryo::TypeKind::Int: type_kind_str = "Integer"; break;
                     default: type_kind_str = TypeKindToString(cryo_field_type->kind()); break;
                 }
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': type='{}', kind='{}'", 

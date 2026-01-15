@@ -163,7 +163,7 @@ namespace Cryo::Codegen
         llvm::Value *generate_arithmetic(TokenKind op,
                                          llvm::Value *lhs,
                                          llvm::Value *rhs,
-                                         TypeRef result_type = nullptr);
+                                         TypeRef result_type = TypeRef{});
 
         /**
          * @brief Generate integer arithmetic
@@ -216,7 +216,7 @@ namespace Cryo::Codegen
         llvm::Value *generate_comparison(TokenKind op,
                                          llvm::Value *lhs,
                                          llvm::Value *rhs,
-                                         TypeRef operand_type = nullptr);
+                                         TypeRef operand_type = TypeRef{});
 
         /**
          * @brief Generate integer comparison
@@ -324,7 +324,7 @@ namespace Cryo::Codegen
          * @param type Operand type
          * @return Negated value
          */
-        llvm::Value *generate_negation(llvm::Value *operand, TypeRef type = nullptr);
+        llvm::Value *generate_negation(llvm::Value *operand, TypeRef type = TypeRef{});
 
         /**
          * @brief Generate logical NOT (!)
@@ -353,7 +353,7 @@ namespace Cryo::Codegen
          * @param pointee_type Type being pointed to
          * @return Dereferenced value
          */
-        llvm::Value *generate_dereference(llvm::Value *ptr, TypeRef pointee_type = nullptr);
+        llvm::Value *generate_dereference(llvm::Value *ptr, TypeRef pointee_type = TypeRef{});
 
         /**
          * @brief Generate pre/post increment (++)

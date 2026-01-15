@@ -3,19 +3,25 @@
 #include <vector>
 #include <unordered_map>
 
-#include "AST/Type.hpp"       // For TypeContext alias
-#include "AST/SymbolTable.hpp" // For SymbolTable alias
+#include "Types2/TypeArena.hpp"
+#include "Types2/ModuleTypeRegistry.hpp"
+#include "Types2/SymbolTable2.hpp"
 
 namespace Cryo
 {
     class ASTNode;
 
+    // Type aliases for backward compatibility
+    using TypeContext = TypeArena;
+    using SymbolTable = SymbolTable2;
+
     class ASTContext
     {
     private:
         std::vector<std::unique_ptr<ASTNode>> _nodes;
-        std::unique_ptr<SymbolTable> _symbol_table;
-        std::unique_ptr<TypeContext> _type_context;
+        std::unique_ptr<TypeArena> _type_arena;
+        std::unique_ptr<ModuleTypeRegistry> _module_registry;
+        std::unique_ptr<SymbolTable2> _symbol_table;
 
     public:
         ASTContext();
@@ -32,9 +38,10 @@ namespace Cryo
             return ptr;
         }
 
-        // Global state
-        SymbolTable &symbols() { return *_symbol_table; }
-        TypeContext &types() { return *_type_context; }
+        // Global state - new API
+        TypeArena &types() { return *_type_arena; }
+        ModuleTypeRegistry &modules() { return *_module_registry; }
+        SymbolTable2 &symbols() { return *_symbol_table; }
 
         // Memory statistics
         size_t node_count() const { return _nodes.size(); }
