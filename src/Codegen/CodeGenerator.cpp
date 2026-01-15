@@ -3,7 +3,7 @@
 #include "Codegen/TargetConfig.hpp"
 #include "AST/ASTNode.hpp"
 #include "Utils/Logger.hpp"
-#include "GDM/GDM.hpp"
+#include "Diagnostics/Diag.hpp"
 #include <iostream>
 #include <memory>
 #include <system_error>
@@ -25,7 +25,7 @@ namespace Cryo::Codegen
         ASTContext &ast_context,
         SymbolTable &symbol_table,
         const std::string &namespace_name,
-        Cryo::DiagnosticManager *gdm) : _ast_context(ast_context), _symbol_table(symbol_table), _gdm(gdm),
+        Cryo::DiagEmitter *diagnostics) : _ast_context(ast_context), _symbol_table(symbol_table), _diagnostics(diagnostics),
                                         _has_errors(false), _debug_enabled(false), _stdlib_compilation_mode(false), _optimization_level(2),
                                         _functions_generated(0), _types_generated(0), _globals_generated(0),
                                         _module_name(namespace_name.empty() ? "cryo_program" : namespace_name)
@@ -71,7 +71,7 @@ namespace Cryo::Codegen
                 _visitor = std::make_unique<CodegenVisitor>(
                     *_context_manager,
                     _symbol_table,
-                    _gdm);
+                    _diagnostics);
 
                 // Apply stdlib compilation mode to the newly created visitor
                 if (_stdlib_compilation_mode)
@@ -132,7 +132,7 @@ namespace Cryo::Codegen
             _visitor = std::make_unique<CodegenVisitor>(
                 *_context_manager,
                 _symbol_table,
-                _gdm);
+                _diagnostics);
 
             // Apply stdlib compilation mode to the newly created visitor
             if (_stdlib_compilation_mode)
@@ -258,15 +258,14 @@ namespace Cryo::Codegen
 
         if (!_context_manager->verify_module_with_details("", verification_errors))
         {
-            // Try to get the current AST node from the visitor for better error location
-            SourceRange error_range(SourceLocation(1, 1), SourceLocation(1, 1));
+            // Build error message with context
+            std::string full_message = "Generated IR failed verification in module '" + _module_name + "'";
             std::string context_info = "";
+            ASTNode* current_node = nullptr;
 
             if (_visitor && _visitor->get_current_node())
             {
-                auto current_node = _visitor->get_current_node();
-                auto location = current_node->location();
-                error_range = SourceRange(location, location);
+                current_node = _visitor->get_current_node();
 
                 // Get additional context about what was being processed
                 switch (current_node->kind())
@@ -292,17 +291,21 @@ namespace Cryo::Codegen
                 }
             }
 
-            // Report the detailed LLVM verification error to the GDM
-            if (_gdm)
+            if (!context_info.empty())
             {
-                std::string full_message = "Generated IR failed verification in module '" + _module_name + "'";
-                if (!context_info.empty())
-                {
-                    full_message += " " + context_info;
-                }
-                full_message += ": " + verification_errors;
+                full_message += " " + context_info;
+            }
+            full_message += ": " + verification_errors;
 
-                _gdm->create_error(ErrorCode::E0601_LLVM_ERROR, error_range, "", full_message);
+            // Report the detailed LLVM verification error
+            if (_diagnostics)
+            {
+                auto diag = Diag::error(ErrorCode::E0601_LLVM_ERROR, full_message);
+                if (current_node)
+                {
+                    diag.at(current_node);
+                }
+                _diagnostics->emit(std::move(diag));
             }
 
             report_error("Generated IR failed verification");
@@ -508,12 +511,12 @@ namespace Cryo::Codegen
     }
 
     std::unique_ptr<CodeGenerator> create_default_codegen(ASTContext &ast_context, SymbolTable &symbol_table,
-                                                          const std::string &namespace_name, DiagnosticManager *gdm)
+                                                          const std::string &namespace_name, DiagEmitter *diagnostics)
     {
         // Create a default target config
         auto target_config = std::make_unique<TargetConfig>();
 
-        return std::make_unique<CodeGenerator>(std::move(target_config), ast_context, symbol_table, namespace_name, gdm);
+        return std::make_unique<CodeGenerator>(std::move(target_config), ast_context, symbol_table, namespace_name, diagnostics);
     }
 
 } // namespace Cryo::Codegen

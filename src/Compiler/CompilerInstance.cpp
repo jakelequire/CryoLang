@@ -22,7 +22,7 @@ namespace Cryo
     void CompilerInstance::initialize_components()
     {
         _ast_context = std::make_unique<ASTContext>();
-        _diagnostic_manager = std::make_unique<DiagnosticManager>();
+        _diagnostics = std::make_unique<DiagEmitter>();
 
         // Initialize Symbol Resolution Manager
         try
@@ -46,7 +46,7 @@ namespace Cryo
             _ast_context->types(),
             _ast_context->modules(),
             *_generic_registry,
-            _diagnostic_manager.get());
+            _diagnostics.get());
 
         // 3. SymbolTable (needs arena, modules)
         _symbol_table = std::make_unique<SymbolTable>(
@@ -59,7 +59,7 @@ namespace Cryo
             *_type_resolver,
             _ast_context->modules(),
             *_generic_registry,
-            _diagnostic_manager.get());
+            _diagnostics.get());
 
         // Create monomorphization pass
         _monomorphization_pass = std::make_unique<Monomorphizer>(
@@ -107,8 +107,12 @@ namespace Cryo
         // Create linker with symbol table reference
         _linker = std::make_unique<Cryo::Linker::CryoLinker>(*_symbol_table);
 
-        // Configure diagnostic manager
-        _diagnostic_manager->set_formatter_options(true, true, 2);
+        // Configure diagnostics
+        DiagEmitter::Config diag_config;
+        diag_config.colors = true;
+        diag_config.unicode = true;
+        diag_config.context_lines = 2;
+        _diagnostics->configure(diag_config);
 
         // Initialize standard library built-ins
         initialize_standard_library();
@@ -122,7 +126,7 @@ namespace Cryo
     {
         _source_file = file_path;
 
-        // Note: TypeChecker doesn't have set_source_file - diagnostics use DiagnosticManager
+        // Note: TypeChecker doesn't have set_source_file - diagnostics use DiagEmitter
     }
 
     void CompilerInstance::add_include_path(const std::string &path)
@@ -139,9 +143,11 @@ namespace Cryo
 
     void CompilerInstance::set_show_stdlib_diagnostics(bool enable)
     {
-        if (_diagnostic_manager)
+        if (_diagnostics)
         {
-            _diagnostic_manager->set_show_stdlib_diagnostics(enable);
+            auto config = _diagnostics->config();
+            config.show_stdlib_errors = enable;
+            _diagnostics->configure(config);
         }
     }
 
@@ -149,21 +155,19 @@ namespace Cryo
     {
         set_source_file(source_file);
 
-        // Note: TypeChecker doesn't have set_source_file - diagnostics use DiagnosticManager
-
         // Create a file object and load it
         auto file = make_file_from_path(source_file);
         if (!file)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0800_FILE_NOT_FOUND,
-                                              SourceRange{}, source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0800_FILE_NOT_FOUND,
+                                           "file not found: " + source_file));
             return false;
         }
 
         if (!file->load())
         {
-            _diagnostic_manager->create_error(ErrorCode::E0801_FILE_READ_ERROR,
-                                              SourceRange{}, source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0801_FILE_READ_ERROR,
+                                           "failed to read file: " + source_file));
             return false;
         }
 
@@ -176,7 +180,7 @@ namespace Cryo
         auto file = make_file_from_string("source", source_code);
         if (!file)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, "source");
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Failed to create in-memory file"));
             return false;
         }
 
@@ -193,42 +197,38 @@ namespace Cryo
             std::string file_path = file->path().empty() ? file->name() : file->path();
             std::string file_content = std::string(file->content());
 
-            // Create a shared file copy for the diagnostic manager
-            auto diagnostic_file = make_file_from_string(file->name(), file_content);
-            std::shared_ptr<File> shared_diagnostic_file(diagnostic_file.release());
-            _diagnostic_manager->add_source_file(file_path, shared_diagnostic_file);
+            // Add source for diagnostic rendering
+            _diagnostics->add_source_file(file_path);
 
             // Phase 1: Create lexer with the original file
             _lexer = std::make_unique<Lexer>(std::move(file));
 
             // Phase 2: Create parser with lexer and AST context
-            _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostic_manager.get(), file_path);
+            _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostics.get(), file_path);
             _parser->set_directive_registry(_directive_registry.get());
 
             // Phase 3: Parse the program
             if (!parse())
             {
-                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, file_path);
+                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Failed to parse source file"));
                 return false;
             }
 
             // Phase 4: Basic validation
             if (!_ast_root)
             {
-                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, file_path);
+                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Failed to create AST root"));
                 return false;
             }
 
             // Phase 5: Semantic analysis (including symbol table population)
             if (!analyze())
             {
-                // Errors are reported through DiagnosticManager
+                // Errors are reported through DiagEmitter
                 std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
-                size_t user_errors = _diagnostic_manager->user_error_count();
+                size_t user_errors = _diagnostics->error_count();
                 std::string error_message = "Module contains: " + std::to_string(user_errors) + " errors in namespace '" + namespace_name + "'";
-                _diagnostic_manager->create_error(ErrorCode::E0805_INTERNAL_ERROR,
-                                                  SourceRange{}, file_path,
-                                                  error_message);
+                _diagnostics->emit(Diag::error(ErrorCode::E0805_INTERNAL_ERROR, error_message));
                 return false;
             }
 
@@ -247,7 +247,7 @@ namespace Cryo
 
             if (!generate_ir())
             {
-                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, file_path);
+                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Failed to generate IR"));
                 return false;
             }
 
@@ -257,7 +257,7 @@ namespace Cryo
             }
 
             // Check if there were any errors during compilation
-            if (_diagnostic_manager->has_errors())
+            if (_diagnostics->has_errors())
             {
                 return false;
             }
@@ -266,8 +266,7 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                              SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, std::string("Exception during compilation: ") + e.what()));
             return false;
         }
     }
@@ -280,15 +279,13 @@ namespace Cryo
         auto file = make_file_from_path(source_file);
         if (!file)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0800_FILE_NOT_FOUND,
-                                              SourceRange{}, source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0800_FILE_NOT_FOUND, "File not found: " + source_file));
             return false;
         }
 
         if (!file->load())
         {
-            _diagnostic_manager->create_error(ErrorCode::E0801_FILE_READ_ERROR,
-                                              SourceRange{}, source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0801_FILE_READ_ERROR, "Failed to read file: " + source_file));
             return false;
         }
 
@@ -309,20 +306,20 @@ namespace Cryo
             _lexer = std::make_unique<Lexer>(std::move(file));
 
             // Phase 2: Create parser with lexer and AST context
-            _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostic_manager.get(), file_path);
+            _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostics.get(), file_path);
             _parser->set_directive_registry(_directive_registry.get());
 
             // Phase 3: Parse the program
             if (!parse())
             {
-                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, file_path);
+                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Failed to parse file"));
                 return false;
             }
 
             // Phase 4: Basic validation
             if (!_ast_root)
             {
-                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, file_path);
+                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Failed to create AST root"));
                 return false;
             }
 
@@ -330,8 +327,7 @@ namespace Cryo
             if (!analyze())
             {
                 std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
-                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                                  SourceRange{}, file_path);
+                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Analysis failed for namespace '" + namespace_name + "'"));
                 // For LSP, we continue even if analysis fails partially
                 // This allows hover to work even with some compilation errors
             }
@@ -343,8 +339,7 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                              SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, std::string("Exception: ") + e.what()));
             return false;
         }
     }
@@ -353,14 +348,14 @@ namespace Cryo
     {
         if (_source_file.empty())
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, "");
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "No source file specified"));
             return false;
         }
 
         auto file = make_file_from_path(_source_file);
         if (!file || !file->load())
         {
-            _diagnostic_manager->create_error(ErrorCode::E0801_FILE_READ_ERROR, SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0801_FILE_READ_ERROR, "Failed to read file: " + _source_file));
             return false;
         }
 
@@ -371,8 +366,7 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                              SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, std::string("Lexer error: ") + e.what()));
             return false;
         }
     }
@@ -381,7 +375,7 @@ namespace Cryo
     {
         if (!_parser)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Parser not initialized"));
             return false;
         }
 
@@ -404,7 +398,7 @@ namespace Cryo
 
             // Create CodeGenerator now that we have the namespace information
             std::string namespace_for_module = _current_namespace.empty() ? "cryo_program" : _current_namespace;
-            _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table, namespace_for_module, _diagnostic_manager.get());
+            _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table, namespace_for_module, _diagnostics.get());
 
             // Set source info immediately after creating CodeGenerator
             // This ensures namespace context is available for analyze() which may initialize the visitor
@@ -442,8 +436,7 @@ namespace Cryo
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                              SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, std::string("Parse exception: ") + e.what()));
             return false;
         }
     }
@@ -457,7 +450,7 @@ namespace Cryo
 
         if (!_ast_root)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "AST root is null"));
             return false;
         }
 
@@ -491,8 +484,8 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Phase 1: Symbol and type analysis completed via symbol table population");
             }
 
-            // Type errors are now reported through DiagnosticManager directly
-            if (_diagnostic_manager->has_errors())
+            // Type errors are now reported through DiagEmitter directly
+            if (_diagnostics->has_errors())
             {
                 if (_debug_mode)
                 {
@@ -571,15 +564,13 @@ namespace Cryo
         catch (const std::invalid_argument &e)
         {
             LOG_ERROR(Cryo::LogComponent::GENERAL, "Invalid argument in analyze(): {}", e.what());
-            _diagnostic_manager->create_error(ErrorCode::E0504_NAMESPACE_CONFLICT,
-                                              SourceRange{}, _source_file, e.what());
+            _diagnostics->emit(Diag::error(ErrorCode::E0504_NAMESPACE_CONFLICT, std::string("Namespace conflict: ") + e.what()));
             return false;
         }
         catch (const std::exception &e)
         {
             LOG_ERROR(Cryo::LogComponent::GENERAL, "Exception caught in analyze(): {}", e.what());
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                              SourceRange{}, _source_file, e.what());
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, std::string("Analysis exception: ") + e.what()));
             return false;
         }
     }
@@ -588,13 +579,13 @@ namespace Cryo
     {
         if (!_ast_root)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "AST root is null for IR generation"));
             return false;
         }
 
         if (!_codegen)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "CodeGenerator not initialized"));
             return false;
         }
 
@@ -625,16 +616,14 @@ namespace Cryo
             if (!success)
             {
                 LOG_ERROR(Cryo::LogComponent::GENERAL, "IR generation failed with error: {}", _codegen->get_last_error());
-                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                                  SourceRange{}, _source_file);
+                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "IR generation failed: " + _codegen->get_last_error()));
             }
 
             return success;
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                              SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, std::string("IR generation exception: ") + e.what()));
             return false;
         }
     }
@@ -653,7 +642,7 @@ namespace Cryo
 
         if (!_linker)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Linker not initialized"));
             return false;
         }
 
@@ -704,7 +693,7 @@ namespace Cryo
             llvm::Module *module = _codegen->get_module();
             if (!module)
             {
-                _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
+                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "No module generated for linking"));
                 return false;
             }
 
@@ -736,24 +725,21 @@ namespace Cryo
                     error_code = ErrorCode::E0702_DUPLICATE_SYMBOL_LINK;
                 }
 
-                _diagnostic_manager->create_error(error_code,
-                                                  SourceRange{}, _source_file,
-                                                  custom_message);
+                _diagnostics->emit(Diag::error(error_code, custom_message));
             }
 
             return success;
         }
         catch (const std::exception &e)
         {
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                              SourceRange{}, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, std::string("Link exception: ") + e.what()));
             return false;
         }
     }
 
     bool CompilerInstance::has_errors() const
     {
-        return _diagnostic_manager && _diagnostic_manager->has_errors();
+        return _diagnostics && _diagnostics->has_errors();
     }
 
     bool CompilerInstance::compile_for_lsp(const std::string &source_file)
@@ -814,8 +800,7 @@ namespace Cryo
             {
                 LOG_ERROR(Cryo::LogComponent::GENERAL, "LSP compilation exception: {}", e.what());
             }
-            _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN,
-                                              SourceRange{}, source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, std::string("LSP compilation exception: ") + e.what()));
             return false;
         }
     }
@@ -878,11 +863,11 @@ namespace Cryo
 
     void CompilerInstance::dump_type_errors(std::ostream &os) const
     {
-        // TypeChecker doesn't track errors internally - use DiagnosticManager
-        if (_diagnostic_manager && _diagnostic_manager->has_errors())
+        // TypeChecker doesn't track errors internally - use DiagEmitter
+        if (_diagnostics && _diagnostics->has_errors())
         {
             os << "=== Type Errors ===" << std::endl;
-            _diagnostic_manager->print_all(os);
+            _diagnostics->render_all(os);
             os << "=== End Type Errors ===" << std::endl;
         }
         else
@@ -911,26 +896,26 @@ namespace Cryo
 
     void CompilerInstance::print_diagnostics(std::ostream &os) const
     {
-        if (_diagnostic_manager)
+        if (_diagnostics)
         {
             // Debug: Show what diagnostics we have
-            const auto &diagnostics = _diagnostic_manager->diagnostics();
+            const auto &diagnostics = _diagnostics->diagnostics();
             if (_debug_mode)
             {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "DiagnosticManager has {} total diagnostics", diagnostics.size());
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "DiagEmitter has {} total diagnostics", diagnostics.size());
                 for (size_t i = 0; i < diagnostics.size(); ++i)
                 {
                     const auto &diag = diagnostics[i];
-                    bool is_stdlib = _diagnostic_manager->is_stdlib_diagnostic(diag);
-                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Diagnostic {}: severity={}, filename='{}', is_stdlib={}, message='{}'",
-                              i, static_cast<int>(diag.severity()), diag.filename(), is_stdlib, diag.message());
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Diagnostic {}: level={}, message='{}'",
+                              i, static_cast<int>(diag.level()), diag.message());
                 }
             }
 
-            if (_diagnostic_manager->total_count() > 0)
+            size_t total = _diagnostics->error_count() + _diagnostics->warning_count();
+            if (total > 0)
             {
-                _diagnostic_manager->print_all(os);
-                _diagnostic_manager->print_summary(os);
+                _diagnostics->render_all(os);
+                _diagnostics->print_summary(os);
             }
         }
     }
@@ -940,25 +925,25 @@ namespace Cryo
         reset_state();
         _source_file.clear();
         _include_paths.clear();
-        if (_diagnostic_manager)
+        if (_diagnostics)
         {
-            _diagnostic_manager->clear();
+            _diagnostics->clear();
         }
     }
 
     void CompilerInstance::reset_state()
     {
         _ast_root.reset();
-        if (_diagnostic_manager)
+        if (_diagnostics)
         {
-            _diagnostic_manager->clear();
+            _diagnostics->clear();
         }
         _lexer.reset();
         _parser.reset();
 
         // Note: TypeChecker doesn't have reset_state or set_stdlib_compilation_mode.
         // TypeChecker is stateless - it just provides type-checking utilities.
-        // State is managed by TypeArena, SymbolTable, and DiagnosticManager.
+        // State is managed by TypeArena, SymbolTable, and DiagEmitter.
     }
 
     void CompilerInstance::populate_symbol_table(ASTNode *node)

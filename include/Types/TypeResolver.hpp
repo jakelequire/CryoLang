@@ -30,7 +30,7 @@
 namespace Cryo
 {
     // Forward declarations
-    class DiagnosticManager;
+    class DiagEmitter;
 
     /**************************************************************************
      * @brief Resolution context for tracking state during type resolution
@@ -142,13 +142,13 @@ namespace Cryo
         TypeArena &_arena;
         ModuleTypeRegistry &_module_registry;
         GenericRegistry &_generic_registry;
-        DiagnosticManager *_diagnostics; // Optional diagnostic reporting
+        DiagEmitter *_diagnostics; // Optional diagnostic reporting
 
     public:
         TypeResolver(TypeArena &arena,
                      ModuleTypeRegistry &modules,
                      GenericRegistry &generics,
-                     DiagnosticManager *diag = nullptr);
+                     DiagEmitter *diag = nullptr);
 
         // ====================================================================
         // Main resolution interface

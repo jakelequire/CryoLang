@@ -11,7 +11,7 @@
 namespace Cryo
 {
     class CallExpressionNode;
-    class DiagnosticManager;  // Forward declaration
+    class DiagEmitter;  // Forward declaration
 }
 
 namespace Cryo::Codegen
@@ -27,7 +27,7 @@ namespace Cryo::Codegen
     class Intrinsics
     {
     public:
-        explicit Intrinsics(LLVMContextManager& context_manager, Cryo::DiagnosticManager* gdm = nullptr);
+        explicit Intrinsics(LLVMContextManager& context_manager, Cryo::DiagEmitter* diagnostics = nullptr);
         ~Intrinsics() = default;
 
         // Main entry point for intrinsic call generation
@@ -387,7 +387,7 @@ namespace Cryo::Codegen
 
     private:
         LLVMContextManager& _context_manager;
-        Cryo::DiagnosticManager* _gdm;
+        Cryo::DiagEmitter* _diagnostics;
         bool _has_errors;
         std::string _last_error;
 

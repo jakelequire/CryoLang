@@ -26,8 +26,8 @@ namespace Cryo::Codegen
     CodegenVisitor::CodegenVisitor(
         LLVMContextManager &context_manager,
         Cryo::SymbolTable &symbol_table,
-        Cryo::DiagnosticManager *gdm)
-        : _ctx(std::make_unique<CodegenContext>(context_manager, symbol_table, gdm))
+        Cryo::DiagEmitter *diagnostics)
+        : _ctx(std::make_unique<CodegenContext>(context_manager, symbol_table, diagnostics))
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Initializing new dispatcher-based visitor");
 

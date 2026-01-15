@@ -13,7 +13,7 @@
 #include "AST/DirectiveProcessors.hpp"
 #include "Types/GenericRegistry.hpp"
 #include "Types/TypeResolver.hpp"
-#include "GDM/GDM.hpp"
+#include "Diagnostics/Diag.hpp"
 #include "Codegen/CodeGenerator.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 #include "Linker/CryoLinker.hpp"
@@ -46,7 +46,7 @@ namespace Cryo
         std::unique_ptr<Lexer> _lexer;
         std::unique_ptr<Parser> _parser;
         std::unique_ptr<ASTContext> _ast_context;
-        std::unique_ptr<DiagnosticManager> _diagnostic_manager;
+        std::unique_ptr<DiagEmitter> _diagnostics;
         std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _symbol_resolution_manager;
         // Types components - GenericRegistry and TypeResolver must come before TypeChecker
         std::unique_ptr<GenericRegistry> _generic_registry;
@@ -116,7 +116,7 @@ namespace Cryo
         Parser *parser() const { return _parser.get(); }
         ASTContext *ast_context() const { return _ast_context.get(); }
         SymbolTable *symbol_table() const { return _symbol_table.get(); }
-        DiagnosticManager *diagnostic_manager() const { return _diagnostic_manager.get(); }
+        DiagEmitter *diagnostics() const { return _diagnostics.get(); }
         TypeChecker *type_checker() const { return _type_checker.get(); }
         Cryo::Codegen::CodeGenerator *codegen() const { return _codegen.get(); }
         Cryo::Linker::CryoLinker *linker() const { return _linker.get(); }

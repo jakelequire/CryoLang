@@ -260,13 +260,13 @@ namespace Cryo::CLI::Commands
                     std::cout << "\n[LSP] Compilation completed successfully" << std::endl;
 
                     // Show LSP diagnostics
-                    if (compiler->diagnostic_manager())
+                    if (compiler->diagnostics())
                     {
-                        auto lsp_diagnostics = compiler->diagnostic_manager()->get_lsp_diagnostics();
+                        auto lsp_diagnostics = compiler->diagnostics()->to_lsp();
                         std::cout << "[LSP] Found " << lsp_diagnostics.size() << " diagnostics" << std::endl;
                         for (const auto &diag : lsp_diagnostics)
                         {
-                            std::cout << "  " << diag.severity << " at " << diag.line << ":" << diag.column << ": " << diag.message << std::endl;
+                            std::cout << "  " << diag.severity << " at " << diag.start_line << ":" << diag.start_col << ": " << diag.message << std::endl;
                         }
                     }
 

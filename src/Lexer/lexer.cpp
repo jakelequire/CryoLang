@@ -1,7 +1,6 @@
 #include "Lexer/lexer.hpp"
 #include "Utils/File.hpp"
-#include "GDM/GDM.hpp"
-#include "GDM/DiagnosticBuilders.hpp"
+#include "Diagnostics/Diag.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -261,7 +260,7 @@ namespace Cryo
 
     Lexer::Lexer(std::unique_ptr<File> file)
         : _file(std::move(file)), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR),
-          _token_count(0), _diagnostic_manager(nullptr)
+          _token_count(0), _diagnostics(nullptr)
     {
 
         if (!_file || !_file->is_loaded())
@@ -285,9 +284,9 @@ namespace Cryo
         }
     }
 
-    Lexer::Lexer(std::unique_ptr<File> file, DiagnosticManager *diagnostic_manager, const std::string &source_file)
+    Lexer::Lexer(std::unique_ptr<File> file, DiagEmitter *diagnostics, const std::string &source_file)
         : _file(std::move(file)), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR),
-          _token_count(0), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
+          _token_count(0), _diagnostics(diagnostics), _source_file(source_file)
     {
 
         if (!_file || !_file->is_loaded())
@@ -313,7 +312,7 @@ namespace Cryo
 
     Lexer::Lexer(const std::string &content)
         : _file(nullptr), _spot_content(content), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR),
-          _token_count(0), _diagnostic_manager(nullptr)
+          _token_count(0), _diagnostics(nullptr)
     {
         // Set up buffer pointers to reference the spot content
         _buffer = std::string_view(_spot_content);
@@ -322,9 +321,9 @@ namespace Cryo
         _current = _buffer_start;
     }
 
-    Lexer::Lexer(const std::string &content, DiagnosticManager *diagnostic_manager, const std::string &source_file)
+    Lexer::Lexer(const std::string &content, DiagEmitter *diagnostics, const std::string &source_file)
         : _file(nullptr), _spot_content(content), _current_location(1, 1), _current_token(TokenKind::TK_ERROR), _previous_token(TokenKind::TK_ERROR),
-          _token_count(0), _diagnostic_manager(diagnostic_manager), _source_file(source_file)
+          _token_count(0), _diagnostics(diagnostics), _source_file(source_file)
     {
         // Set up buffer pointers to reference the spot content
         _buffer = std::string_view(_spot_content);
@@ -464,7 +463,7 @@ namespace Cryo
             return make_token(punct_kind, token_start);
         }
 
-        if (_diagnostic_manager)
+        if (_diagnostics)
         {
             report_lexer_error("unexpected character", _current_location);
         }
@@ -514,11 +513,12 @@ namespace Cryo
                 // Check if we actually consumed any hex digits
                 if (_current == hex_start)
                 {
-                    if (_diagnostic_manager)
+                    if (_diagnostics)
                     {
-                        LexerDiagnosticBuilder builder(_diagnostic_manager, _source_file);
                         std::string hex_text(start, _current - start);
-                        builder.create_invalid_hex_error(hex_text, _current_location);
+                        _diagnostics->emit(
+                            Diag::error(ErrorCode::E0004_INVALID_NUMBER, "Invalid hexadecimal number: " + hex_text)
+                                .at(Span::at(_current_location, _source_file)));
                     }
                     return make_error_token("Invalid hexadecimal number");
                 }
@@ -546,11 +546,12 @@ namespace Cryo
                 // Check if we actually consumed any binary digits
                 if (_current == bin_start)
                 {
-                    if (_diagnostic_manager)
+                    if (_diagnostics)
                     {
-                        LexerDiagnosticBuilder builder(_diagnostic_manager, _source_file);
                         std::string bin_text(start, _current - start);
-                        builder.create_invalid_binary_error(bin_text, _current_location);
+                        _diagnostics->emit(
+                            Diag::error(ErrorCode::E0004_INVALID_NUMBER, "Invalid binary number: " + bin_text)
+                                .at(Span::at(_current_location, _source_file)));
                     }
                     return make_error_token("Invalid binary number");
                 }
@@ -578,11 +579,12 @@ namespace Cryo
                 // Check if we actually consumed any octal digits
                 if (_current == oct_start)
                 {
-                    if (_diagnostic_manager)
+                    if (_diagnostics)
                     {
-                        LexerDiagnosticBuilder builder(_diagnostic_manager, _source_file);
                         std::string oct_text(start, _current - start);
-                        builder.create_invalid_octal_error(oct_text, _current_location);
+                        _diagnostics->emit(
+                            Diag::error(ErrorCode::E0004_INVALID_NUMBER, "Invalid octal number: " + oct_text)
+                                .at(Span::at(_current_location, _source_file)));
                     }
                     return make_error_token("Invalid octal number");
                 }
@@ -704,7 +706,7 @@ namespace Cryo
 
         if (at_end())
         {
-            if (_diagnostic_manager)
+            if (_diagnostics)
             {
                 report_lexer_error("unterminated string literal", _current_location);
             }
@@ -733,7 +735,7 @@ namespace Cryo
 
         if (at_end())
         {
-            if (_diagnostic_manager)
+            if (_diagnostics)
             {
                 report_lexer_error("unterminated character literal", _current_location);
             }
@@ -797,7 +799,7 @@ namespace Cryo
 
         if (at_end() || peek() != '\'')
         {
-            if (_diagnostic_manager)
+            if (_diagnostics)
             {
                 report_lexer_error("unterminated character literal", _current_location);
             }
@@ -1288,34 +1290,33 @@ namespace Cryo
 
     void Lexer::report_lexer_error(const std::string &message, const SourceLocation &location)
     {
-        if (!_diagnostic_manager)
+        if (!_diagnostics)
         {
             return;
         }
 
-        // Create enhanced lexer diagnostic builder
-        LexerDiagnosticBuilder builder(_diagnostic_manager, _source_file);
+        Span span = Span::at(location, _source_file);
 
-        // Use appropriate diagnostic method based on message content
+        // Use appropriate error code based on message content
         if (message.find("unexpected character") != std::string::npos)
         {
-            // Extract character from current position if possible
             char character = (_current > _buffer_start) ? *(_current - 1) : '?';
-            builder.create_unexpected_character_error(character, location);
+            std::string msg = "Unexpected character '";
+            msg += character;
+            msg += "'";
+            _diagnostics->emit(Diag::error(ErrorCode::E0001_UNEXPECTED_CHARACTER, msg).at(span));
         }
         else if (message.find("unterminated string") != std::string::npos)
         {
-            builder.create_unterminated_string_error(location);
+            _diagnostics->emit(Diag::error(ErrorCode::E0002_UNTERMINATED_STRING, "Unterminated string literal").at(span));
         }
         else if (message.find("unterminated character") != std::string::npos)
         {
-            builder.create_unterminated_char_error(location);
+            _diagnostics->emit(Diag::error(ErrorCode::E0003_UNTERMINATED_CHAR, "Unterminated character literal").at(span));
         }
         else
         {
-            // Fall back to basic error reporting for unrecognized messages
-            SourceRange range(location, location);
-            _diagnostic_manager->create_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, range, _source_file);
+            _diagnostics->emit(Diag::error(ErrorCode::E0001_UNEXPECTED_CHARACTER, message).at(span));
         }
     }
 

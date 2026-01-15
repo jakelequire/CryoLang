@@ -1,7 +1,7 @@
 #include "Codegen/Intrinsics.hpp"
 #include "Codegen/LLVMContext.hpp"
 #include "AST/ASTNode.hpp"
-#include "GDM/GDM.hpp"
+#include "Diagnostics/Diag.hpp"
 #include "Utils/Logger.hpp"
 
 #include <llvm/IR/InlineAsm.h>
@@ -15,8 +15,8 @@
 
 namespace Cryo::Codegen
 {
-    Intrinsics::Intrinsics(LLVMContextManager &context_manager, Cryo::DiagnosticManager *gdm)
-        : _context_manager(context_manager), _gdm(gdm), _has_errors(false)
+    Intrinsics::Intrinsics(LLVMContextManager &context_manager, Cryo::DiagEmitter *diagnostics)
+        : _context_manager(context_manager), _diagnostics(diagnostics), _has_errors(false)
     {
     }
 
@@ -1887,11 +1887,10 @@ namespace Cryo::Codegen
         _has_errors = true;
         _last_error = message;
 
-        // Report to GDM if available
-        if (_gdm)
+        // Report to DiagEmitter if available
+        if (_diagnostics)
         {
-            Cryo::SourceRange dummy_range; // Default constructed range
-            _gdm->create_error(Cryo::ErrorCode::E0600_CODEGEN_FAILED, dummy_range, "<intrinsics>");
+            _diagnostics->emit(Diag::error(Cryo::ErrorCode::E0600_CODEGEN_FAILED, message));
         }
 
         std::cerr << "[Intrinsics] Error: " << message << std::endl;
@@ -1902,28 +1901,17 @@ namespace Cryo::Codegen
         _has_errors = true;
         _last_error = "Unimplemented intrinsic: " + intrinsic_name;
 
-        // Report to GDM if available
-        if (_gdm)
+        // Report to DiagEmitter if available
+        if (_diagnostics)
         {
             std::string message = "Intrinsic function '" + intrinsic_name + "' is called but not implemented";
 
-            // Try to get source location if node is available
-            if (node && node->location().line() > 0)
+            auto diag = Diag::error(Cryo::ErrorCode::E0604_UNIMPLEMENTED_INTRINSIC, message);
+            if (node)
             {
-                // Convert from lexer SourceLocation to GDM SourceRange
-                const auto &loc = node->location();
-                Cryo::SourceRange range(loc); // Use explicit constructor
-
-                _gdm->create_error(Cryo::ErrorCode::E0604_UNIMPLEMENTED_INTRINSIC,
-                                   range, "<source_file>");
+                diag.at(node);
             }
-            else
-            {
-                // Fallback: report without location
-                Cryo::SourceRange dummy_range; // Default constructed range
-                _gdm->create_error(Cryo::ErrorCode::E0604_UNIMPLEMENTED_INTRINSIC,
-                                   dummy_range, "<unknown>");
-            }
+            _diagnostics->emit(std::move(diag));
         }
 
         // Still output to stderr as backup
