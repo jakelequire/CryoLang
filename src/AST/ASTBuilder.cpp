@@ -315,13 +315,9 @@ namespace Cryo
             return node;
         }
 
-        // Resolve the target type string to a Type* object using the TypeContext
+        // Resolve the target type string to a Type* object using the TypeArena
         TypeRef resolved_target_type = lookup_type_by_name(target_type_str);
-        if (!resolved_target_type)
-        {
-            // If lookup fails, use unknown type as fallback
-            resolved_target_type = _context.types().get_unknown_type();
-        }
+        // If lookup fails, resolved_target_type will be invalid - type checker handles this
 
         auto node = std::make_unique<TypeAliasDeclarationNode>(loc, std::move(alias_name), resolved_target_type, std::move(generic_params));
         node->set_source_file(_source_file);
@@ -404,45 +400,45 @@ namespace Cryo
 
         // Handle basic types using TypeContext specific methods
         if (type_name == "void")
-            return type_context.get_void_type();
+            return type_context.get_void();
         if (type_name == "boolean")
-            return type_context.get_boolean_type();
+            return type_context.get_bool();
         if (type_name == "char")
-            return type_context.get_char_type();
+            return type_context.get_char();
         if (type_name == "string")
-            return type_context.get_string_type();
+            return type_context.get_string();
 
         // Integer types
         if (type_name == "i8")
-            return type_context.get_i8_type();
+            return type_context.get_i8();
         if (type_name == "i16")
-            return type_context.get_i16_type();
+            return type_context.get_i16();
         if (type_name == "i32")
-            return type_context.get_i32_type();
+            return type_context.get_i32();
         if (type_name == "i64")
-            return type_context.get_i64_type();
+            return type_context.get_i64();
         if (type_name == "int")
-            return type_context.get_int_type();
+            return type_context.get_int();
 
         // Unsigned integer types
         if (type_name == "u8")
-            return type_context.get_u8_type();
+            return type_context.get_u8();
         if (type_name == "u16")
-            return type_context.get_u16_type();
+            return type_context.get_u16();
         if (type_name == "u32")
-            return type_context.get_u32_type();
+            return type_context.get_u32();
         if (type_name == "u64")
-            return type_context.get_u64_type();
+            return type_context.get_u64();
 
         // Float types
         if (type_name == "f32")
-            return type_context.get_f32_type();
+            return type_context.get_f32();
         if (type_name == "f64")
-            return type_context.get_f64_type();
+            return type_context.get_f64();
         if (type_name == "float")
             return type_context.get_default_float_type();
         if (type_name == "double")
-            return type_context.get_f64_type();
+            return type_context.get_f64();
 
         // Check for pointer types (ends with '*')
         if (type_name.back() == '*')

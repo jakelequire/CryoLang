@@ -76,7 +76,7 @@ namespace Cryo::Codegen
          * @param type Target type (determines bit width)
          * @return Constant integer value
          */
-        llvm::Value *generate_integer_literal(int64_t value, TypeRef type = nullptr);
+        llvm::Value *generate_integer_literal(int64_t value, TypeRef type = TypeRef{});
 
         /**
          * @brief Generate unsigned integer literal (for large unsigned values like U64_MAX)
@@ -84,7 +84,7 @@ namespace Cryo::Codegen
          * @param type Target type (determines bit width)
          * @return Constant unsigned integer value
          */
-        llvm::Value *generate_unsigned_integer_literal(uint64_t value, TypeRef type = nullptr);
+        llvm::Value *generate_unsigned_integer_literal(uint64_t value, TypeRef type = TypeRef{});
 
         /**
          * @brief Generate floating-point literal
@@ -120,7 +120,7 @@ namespace Cryo::Codegen
          * @param type Optional type for typed null
          * @return Null pointer constant
          */
-        llvm::Value *generate_null_literal(TypeRef type = nullptr);
+        llvm::Value *generate_null_literal(TypeRef type = TypeRef{});
 
         /**
          * @brief Generate literal from AST node

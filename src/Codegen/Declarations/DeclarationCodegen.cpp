@@ -45,21 +45,21 @@ namespace Cryo::Codegen
             if (param && param->get_resolved_type())
             {
                 TypeRef ptype = param->get_resolved_type();
-                if (ptype->kind() == TypeKind::Generic)
+                if (ptype->kind() == TypeKind::GenericParam)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping function declaration '{}' - param '{}' has generic type '{}'",
-                              node->name(), param->name(), ptype->to_string());
+                              node->name(), param->name(), ptype.get()->display_name());
                     return nullptr;
                 }
                 if (ptype->kind() == TypeKind::Struct || ptype->kind() == TypeKind::Class)
                 {
-                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype->to_string());
+                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype.get()->display_name());
                     if (!existing)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "DeclarationCodegen: Skipping function declaration '{}' - param '{}' has undefined type '{}'",
-                                  node->name(), param->name(), ptype->to_string());
+                                  node->name(), param->name(), ptype.get()->display_name());
                         return nullptr;
                     }
                 }
@@ -69,21 +69,21 @@ namespace Cryo::Codegen
         // Check 3: Detect uninstantiated return type
         if (TypeRef ret_type = node->get_resolved_return_type())
         {
-            if (ret_type->kind() == TypeKind::Generic)
+            if (ret_type->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Skipping function declaration '{}' - has generic return type '{}'",
-                          node->name(), ret_type->to_string());
+                          node->name(), ret_type.get()->display_name());
                 return nullptr;
             }
             if (ret_type->kind() == TypeKind::Struct || ret_type->kind() == TypeKind::Class)
             {
-                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ret_type->to_string());
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ret_type.get()->display_name());
                 if (!existing)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping function declaration '{}' - has undefined return type '{}'",
-                              node->name(), ret_type->to_string());
+                              node->name(), ret_type.get()->display_name());
                     return nullptr;
                 }
             }
@@ -175,22 +175,22 @@ namespace Cryo::Codegen
             {
                 TypeRef ptype = param->get_resolved_type();
                 // Check for Generic type kind
-                if (ptype->kind() == TypeKind::Generic)
+                if (ptype->kind() == TypeKind::GenericParam)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping function '{}' - param '{}' has generic type '{}'",
-                              node->name(), param->name(), ptype->to_string());
+                              node->name(), param->name(), ptype.get()->display_name());
                     return nullptr;
                 }
                 // Check if struct/class parameter type exists in LLVM context
                 if (ptype->kind() == TypeKind::Struct || ptype->kind() == TypeKind::Class)
                 {
-                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype->to_string());
+                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype.get()->display_name());
                     if (!existing)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "DeclarationCodegen: Skipping function '{}' - param '{}' has undefined type '{}'",
-                                  node->name(), param->name(), ptype->to_string());
+                                  node->name(), param->name(), ptype.get()->display_name());
                         return nullptr;
                     }
                 }
@@ -200,21 +200,21 @@ namespace Cryo::Codegen
         // Check 3: Detect uninstantiated return type
         if (TypeRef ret_type = node->get_resolved_return_type())
         {
-            if (ret_type->kind() == TypeKind::Generic)
+            if (ret_type->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Skipping function '{}' - has generic return type '{}'",
-                          node->name(), ret_type->to_string());
+                          node->name(), ret_type.get()->display_name());
                 return nullptr;
             }
             if (ret_type->kind() == TypeKind::Struct || ret_type->kind() == TypeKind::Class)
             {
-                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ret_type->to_string());
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ret_type.get()->display_name());
                 if (!existing)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping function '{}' - has undefined return type '{}'",
-                              node->name(), ret_type->to_string());
+                              node->name(), ret_type.get()->display_name());
                     return nullptr;
                 }
             }
@@ -308,22 +308,22 @@ namespace Cryo::Codegen
             {
                 TypeRef ptype = param->get_resolved_type();
                 // Check for Generic type kind or undefined struct/class types
-                if (ptype->kind() == TypeKind::Generic)
+                if (ptype->kind() == TypeKind::GenericParam)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping method '{}' - param '{}' has generic type '{}'",
-                              node->name(), param->name(), ptype->to_string());
+                              node->name(), param->name(), ptype.get()->display_name());
                     return nullptr;
                 }
                 if (ptype->kind() == TypeKind::Struct || ptype->kind() == TypeKind::Class)
                 {
                     // Check if this type exists in LLVM context - if not, it's likely a type parameter
-                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype->to_string());
+                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype.get()->display_name());
                     if (!existing)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "DeclarationCodegen: Skipping method '{}' - param '{}' has undefined type '{}'",
-                                  node->name(), param->name(), ptype->to_string());
+                                  node->name(), param->name(), ptype.get()->display_name());
                         return nullptr;
                     }
                 }
@@ -433,7 +433,7 @@ namespace Cryo::Codegen
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "DeclarationCodegen: Registered method return type for '{}': {}",
-                      llvm_fn_name, return_type->to_string());
+                      llvm_fn_name, return_type.get()->display_name());
         }
 
         return fn;
@@ -515,7 +515,7 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "DeclarationCodegen: Variable '{}' Cryo type: {}, LLVM type: {}, isStructTy: {}",
                       name,
-                      cryo_var_type ? cryo_var_type->to_string() : "null",
+                      cryo_var_type ? cryo_var_type.get()->display_name() : "null",
                       llvm_type_str,
                       var_type->isStructTy() ? "true" : "false");
         }
@@ -616,15 +616,15 @@ namespace Cryo::Codegen
             ctx().variable_types_map()[name] = resolved_type;
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "DeclarationCodegen: Registered local variable type: {} -> {} (kind: {})",
-                      name, resolved_type->to_string(),
+                      name, resolved_type.get()->display_name(),
                       static_cast<int>(resolved_type->kind()));
 
             // Special logging for potential Array<T> types
-            if (resolved_type->kind() == TypeKind::Array || resolved_type->to_string().find("[]") != std::string::npos)
+            if (resolved_type->kind() == TypeKind::Array || resolved_type.get()->display_name().find("[]") != std::string::npos)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: *** Registered Array<T> variable: {} with type: {}",
-                          name, resolved_type->to_string());
+                          name, resolved_type.get()->display_name());
             }
         }
         else
@@ -679,7 +679,7 @@ namespace Cryo::Codegen
         }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Global '{}' has Cryo type: {} (kind={})",
-                  name, cryo_type->to_string(), Cryo::TypeKindToString(cryo_type->kind()));
+                  name, cryo_type.get()->display_name(), Cryo::TypeKindToString(cryo_type->kind()));
 
         llvm::Type *var_type = get_llvm_type(cryo_type);
         if (!var_type)
@@ -695,7 +695,7 @@ namespace Cryo::Codegen
         // Classes are value types when declared as variables (the variable holds the struct inline),
         // not reference types (which would be a pointer to heap-allocated memory).
         bool is_class_or_generic = (cryo_type->kind() == Cryo::TypeKind::Class ||
-                                    cryo_type->kind() == Cryo::TypeKind::Generic);
+                                    cryo_type->kind() == Cryo::TypeKind::GenericParam);
         if (is_class_or_generic && var_type->isPointerTy())
         {
             LOG_WARN(Cryo::LogComponent::CODEGEN,
@@ -836,7 +836,7 @@ namespace Cryo::Codegen
             }
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "DeclarationCodegen: Registered global variable type: {} -> {}",
-                      name, cryo_type->to_string());
+                      name, cryo_type.get()->display_name());
         }
 
         return global;
@@ -1197,7 +1197,7 @@ namespace Cryo::Codegen
                 TypeKind kind = resolved_type->kind();
                 std::string type_name = resolved_type->name();
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Function '{}' resolved return type: '{}'", 
-                          node->name(), resolved_type->to_string());
+                          node->name(), resolved_type.get()->display_name());
             }
             catch (...)
             {
@@ -1222,8 +1222,8 @@ namespace Cryo::Codegen
                 resolved_type = ctx().symbols().get_type_context()->create_pointer_type(struct_type);
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Constructor '{}' return type fixed from {} to {}", 
                           node->name(), 
-                          node->get_resolved_return_type() ? node->get_resolved_return_type()->to_string() : "NULL",
-                          resolved_type ? resolved_type->to_string() : "NULL");
+                          node->get_resolved_return_type() ? node->get_resolved_return_type().get()->display_name() : "NULL",
+                          resolved_type ? resolved_type.get()->display_name() : "NULL");
             }
         }
         
@@ -1236,7 +1236,7 @@ namespace Cryo::Codegen
                                      (parent_type_name.find('<') != std::string::npos ||
                                       parent_type_name.find('_') != std::string::npos); // e.g., Option_T
             
-            if (is_generic_context && resolved_type && resolved_type->kind() == Cryo::TypeKind::Generic)
+            if (is_generic_context && resolved_type && resolved_type->kind() == Cryo::TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Generic method '{}' using opaque pointer return type", node->name());
                 // Use opaque pointer for generic return types that will be resolved later
@@ -1320,7 +1320,7 @@ namespace Cryo::Codegen
                     result += ",";
                 if (param_types[i])
                 {
-                    result += param_types[i]->to_string();
+                    result += param_types[i].get()->display_name();
                 }
             }
             result += ")";
@@ -1345,7 +1345,7 @@ namespace Cryo::Codegen
                     result += ",";
                 if (param_types[i])
                 {
-                    result += param_types[i]->to_string();
+                    result += param_types[i].get()->display_name();
                 }
             }
             result += ")";
@@ -1435,16 +1435,16 @@ namespace Cryo::Codegen
                     ctx().variable_types_map()[param_name] = param_type;
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Registered function parameter type: {} -> {} (kind: {})",
-                              param_name, param_type->to_string(),
+                              param_name, param_type.get()->display_name(),
                               static_cast<int>(param_type->kind()));
 
                     // Special logging for Array<T> parameters
                     if (param_type->kind() == TypeKind::Array ||
-                        param_type->to_string().find("[]") != std::string::npos)
+                        param_type.get()->display_name().find("[]") != std::string::npos)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "DeclarationCodegen: *** Registered Array<T> parameter: {} with type: {}",
-                                  param_name, param_type->to_string());
+                                  param_name, param_type.get()->display_name());
                     }
                 }
             }
@@ -1775,21 +1775,21 @@ namespace Cryo::Codegen
             if (param && param->get_resolved_type())
             {
                 TypeRef ptype = param->get_resolved_type();
-                if (ptype->kind() == TypeKind::Generic)
+                if (ptype->kind() == TypeKind::GenericParam)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping method '{}' - param has generic type '{}'",
-                              node->name(), ptype->to_string());
+                              node->name(), ptype.get()->display_name());
                     return;
                 }
                 if (ptype->kind() == TypeKind::Struct || ptype->kind() == TypeKind::Class)
                 {
-                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype->to_string());
+                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ptype.get()->display_name());
                     if (!existing)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "DeclarationCodegen: Skipping method '{}' - param has undefined type '{}'",
-                                  node->name(), ptype->to_string());
+                                  node->name(), ptype.get()->display_name());
                         return;
                     }
                 }
@@ -1856,7 +1856,7 @@ namespace Cryo::Codegen
                         ctx().variable_types_map()["this"] = this_type;
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Registered 'this' type for struct method: {} -> {}",
-                                  parent_type, this_type->to_string());
+                                  parent_type, this_type.get()->display_name());
                     }
                 }
             }
@@ -1895,16 +1895,16 @@ namespace Cryo::Codegen
                         ctx().variable_types_map()[param_name] = param_type;
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "DeclarationCodegen: Registered method parameter type: {} -> {} (kind: {})",
-                                  param_name, param_type->to_string(),
+                                  param_name, param_type.get()->display_name(),
                                   static_cast<int>(param_type->kind()));
 
                         // Special logging for Array<T> parameters
                         if (param_type->kind() == TypeKind::Array ||
-                            param_type->to_string().find("[]") != std::string::npos)
+                            param_type.get()->display_name().find("[]") != std::string::npos)
                         {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                       "DeclarationCodegen: *** Registered Array<T> method parameter: {} with type: {}",
-                                      param_name, param_type->to_string());
+                                      param_name, param_type.get()->display_name());
                         }
                     }
                 }
@@ -2018,7 +2018,7 @@ namespace Cryo::Codegen
                                     template_registry->register_method_return_type(qualified_method_name, return_type);
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                               "Registered generic method return type: {} -> {}",
-                                              qualified_method_name, return_type->to_string());
+                                              qualified_method_name, return_type.get()->display_name());
                                 }
                             }
                         }
@@ -2123,7 +2123,7 @@ namespace Cryo::Codegen
                                 ctx().variable_types_map()["this"] = this_type;
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                           "Registered 'this' type for method: {} -> {}",
-                                          type_name, this_type->to_string());
+                                          type_name, this_type.get()->display_name());
                             }
                         }
                     }

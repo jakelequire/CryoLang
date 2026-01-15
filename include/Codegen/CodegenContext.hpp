@@ -507,7 +507,7 @@ namespace Cryo::Codegen
         TypeRef get_method_return_type(const std::string &qualified_method_name) const
         {
             auto it = _method_return_types.find(qualified_method_name);
-            return it != _method_return_types.end() ? it->second : nullptr;
+            return it != _method_return_types.end() ? it->second : TypeRef{};
         }
 
         /**

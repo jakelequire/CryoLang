@@ -7,7 +7,4 @@ namespace Cryo
     // Minimal aliases for code that hasn't been migrated yet
     using BooleanType = BoolType;
     using IntegerType = IntType;
-
-    // TypeContext wraps TypeArena for legacy code
-    using TypeContext = TypeArena;
 }

@@ -29,12 +29,12 @@ namespace Cryo::Codegen
             if (!arg)
                 continue;
 
-            // TypeKind::Generic means it's an uninstantiated type parameter
-            if (arg->kind() == TypeKind::Generic)
+            // TypeKind::GenericParam means it's an uninstantiated type parameter
+            if (arg->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "GenericCodegen: Skipping instantiation of {} - type arg '{}' is a generic parameter",
-                          generic_name, arg->to_string());
+                          generic_name, arg.get()->display_name());
                 return nullptr;
             }
 
@@ -42,13 +42,13 @@ namespace Cryo::Codegen
             // This catches cases where type parameters are misclassified as Struct types
             if (arg->kind() == TypeKind::Struct || arg->kind() == TypeKind::Class)
             {
-                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), arg->to_string());
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), arg.get()->display_name());
                 if (!existing || existing->isOpaque())
                 {
                     // This is likely an uninstantiated type parameter masquerading as a struct
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "GenericCodegen: Skipping instantiation of {} - type arg '{}' is undefined/opaque",
-                              generic_name, arg->to_string());
+                              generic_name, arg.get()->display_name());
                     return nullptr;
                 }
             }
@@ -254,7 +254,7 @@ namespace Cryo::Codegen
             if (i > 0) instantiated_name += ", ";
             if (type_args[i])
             {
-                instantiated_name += type_args[i]->to_string();
+                instantiated_name += type_args[i].get()->display_name();
             }
         }
         instantiated_name += ">";
@@ -286,22 +286,22 @@ namespace Cryo::Codegen
             if (!arg)
                 continue;
 
-            if (arg->kind() == TypeKind::Generic)
+            if (arg->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "GenericCodegen: Skipping class instantiation of {} - type arg '{}' is a generic parameter",
-                          generic_name, arg->to_string());
+                          generic_name, arg.get()->display_name());
                 return nullptr;
             }
 
             if (arg->kind() == TypeKind::Struct || arg->kind() == TypeKind::Class)
             {
-                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), arg->to_string());
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), arg.get()->display_name());
                 if (!existing || existing->isOpaque())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "GenericCodegen: Skipping class instantiation of {} - type arg '{}' is undefined/opaque",
-                              generic_name, arg->to_string());
+                              generic_name, arg.get()->display_name());
                     return nullptr;
                 }
             }
@@ -503,7 +503,7 @@ namespace Cryo::Codegen
             if (i > 0) instantiated_name += ", ";
             if (type_args[i])
             {
-                instantiated_name += type_args[i]->to_string();
+                instantiated_name += type_args[i].get()->display_name();
             }
         }
         instantiated_name += ">";
@@ -566,22 +566,22 @@ namespace Cryo::Codegen
             if (!arg)
                 continue;
 
-            if (arg->kind() == TypeKind::Generic)
+            if (arg->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "GenericCodegen: Skipping function instantiation of {} - type arg '{}' is a generic parameter",
-                          generic_name, arg->to_string());
+                          generic_name, arg.get()->display_name());
                 return nullptr;
             }
 
             if (arg->kind() == TypeKind::Struct || arg->kind() == TypeKind::Class)
             {
-                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), arg->to_string());
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), arg.get()->display_name());
                 if (!existing || existing->isOpaque())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "GenericCodegen: Skipping function instantiation of {} - type arg '{}' is undefined/opaque",
-                              generic_name, arg->to_string());
+                              generic_name, arg.get()->display_name());
                     return nullptr;
                 }
             }
@@ -688,7 +688,7 @@ namespace Cryo::Codegen
         {
             scope.bindings[params[i]] = args[i];
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Binding {} -> {}",
-                      params[i], args[i] ? args[i]->to_string() : "null");
+                      params[i], args[i] ? args[i].get()->display_name() : "null");
         }
 
         _type_param_stack.push_back(std::move(scope));
@@ -733,7 +733,7 @@ namespace Cryo::Codegen
             return nullptr;
 
         // If type is a type parameter, resolve it
-        std::string type_name = type->to_string();
+        std::string type_name = type.get()->display_name();
         if (TypeRef resolved = resolve_type_param(type_name))
         {
             return resolved;
@@ -766,7 +766,7 @@ namespace Cryo::Codegen
 
             if (type_args[i])
             {
-                std::string arg_name = type_args[i]->to_string();
+                std::string arg_name = type_args[i].get()->display_name();
                 // Replace problematic characters
                 std::replace(arg_name.begin(), arg_name.end(), '<', '_');
                 std::replace(arg_name.begin(), arg_name.end(), '>', '_');
