@@ -321,7 +321,7 @@ namespace Cryo::Codegen
                 
                 switch (return_type_kind)
                 {
-                case TypeKind::Integer:
+                case TypeKind::Int:
                     metadata.category = FunctionCategory::IntegerFunction;
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Classified '{}' as IntegerFunction", function_name);
                     break;
@@ -333,7 +333,7 @@ namespace Cryo::Codegen
                     metadata.category = FunctionCategory::StringFunction;
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Classified '{}' as StringFunction", function_name);
                     break;
-                case TypeKind::Boolean:
+                case TypeKind::Bool:
                     metadata.category = FunctionCategory::BooleanFunction;
                     LOG_ERROR(Cryo::LogComponent::CODEGEN, "CRITICAL: Function '{}' classified as BooleanFunction with return type '{}'", function_name, return_type_name);
                     break;

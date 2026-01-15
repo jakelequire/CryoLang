@@ -1,13 +1,12 @@
 #include "AST/ASTContext.hpp"
 #include "AST/ASTNode.hpp"
-#include "AST/SymbolTable.hpp"
-#include "AST/Type.hpp"
 
 namespace Cryo
 {
     ASTContext::ASTContext()
-        : _symbol_table(std::make_unique<SymbolTable>()),
-          _type_context(std::make_unique<TypeContext>()) {}
+        : _type_arena(std::make_unique<TypeArena>()),
+          _module_registry(std::make_unique<ModuleTypeRegistry>()),
+          _symbol_table(std::make_unique<SymbolTable2>(*_type_arena, *_module_registry)) {}
 
     ASTContext::~ASTContext() = default;
 }
