@@ -51,8 +51,8 @@ namespace Cryo
             return;
         }
 
-        std::string expected_name = expected_type->to_string();
-        std::string actual_name = actual_type->to_string();
+        std::string expected_name = expected_type->display_name();
+        std::string actual_name = actual_type->display_name();
 
         // Check for common conversion patterns
         if (expected_name == "int" && actual_name == "string")
@@ -126,7 +126,7 @@ namespace Cryo
         }
 
         return "type mismatch in " + context + ": expected `" +
-               expected_type->to_string() + "`, found `" + actual_type->to_string() + "`";
+               expected_type->display_name() + "`, found `" + actual_type->display_name() + "`";
     }
 
     std::string ErrorAnalysis::TypeMismatchAnalysis::generate_inline_label() const
@@ -136,7 +136,7 @@ namespace Cryo
             return "type mismatch";
         }
 
-        return "expected `" + expected_type->to_string() + "`, found `" + actual_type->to_string() + "`";
+        return "expected `" + expected_type->display_name() + "`, found `" + actual_type->display_name() + "`";
     }
 
     // ================================================================
@@ -407,8 +407,8 @@ namespace Cryo
         if (!from || !to)
             return false;
 
-        std::string from_name = from->to_string();
-        std::string to_name = to->to_string();
+        std::string from_name = from->display_name();
+        std::string to_name = to->display_name();
 
         // Common conversions
         if ((from_name == "int" && to_name == "float") ||
@@ -436,8 +436,8 @@ namespace Cryo
         if (!type1 || !type2)
             return false;
 
-        std::string name1 = type1->to_string();
-        std::string name2 = type2->to_string();
+        std::string name1 = type1->display_name();
+        std::string name2 = type2->display_name();
 
         // Check for pointer vs value relationships
         if ((name1.find("*") != std::string::npos && name2.find("*") == std::string::npos) ||
@@ -489,8 +489,8 @@ namespace Cryo
 
         if (_analysis.can_convert && _expected_type && _actual_type)
         {
-            std::string expected_name = _expected_type->to_string();
-            std::string actual_name = _actual_type->to_string();
+            std::string expected_name = _expected_type->display_name();
+            std::string actual_name = _actual_type->display_name();
 
             if (expected_name == "int" && actual_name == "string")
             {
@@ -509,7 +509,7 @@ namespace Cryo
     bool TypeMismatchContext::can_suggest_parsing() const
     {
         return _analysis.can_convert && _expected_type && _actual_type &&
-               _expected_type->to_string() == "int" && _actual_type->to_string() == "string";
+               _expected_type->display_name() == "int" && _actual_type->display_name() == "string";
     }
 
     bool TypeMismatchContext::can_suggest_cast() const
@@ -522,8 +522,8 @@ namespace Cryo
         if (!_expected_type || !_actual_type)
             return false;
 
-        std::string expected_str = _expected_type->to_string();
-        std::string actual_str = _actual_type->to_string();
+        std::string expected_str = _expected_type->display_name();
+        std::string actual_str = _actual_type->display_name();
 
         // Check for related numeric types
         std::vector<std::string> numeric_types = {"int", "i32", "i64", "u32", "u64", "float", "f32", "f64", "double"};

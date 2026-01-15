@@ -724,13 +724,13 @@ namespace Cryo::Codegen
                 return found->second;
             }
         }
-        return nullptr;
+        return TypeRef{};
     }
 
     TypeRef GenericCodegen::substitute_type_params(TypeRef type)
     {
-        if (!type)
-            return nullptr;
+        if (!type.is_valid())
+            return TypeRef{};
 
         // If type is a type parameter, resolve it
         std::string type_name = type.get()->display_name();

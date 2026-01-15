@@ -714,7 +714,7 @@ namespace Cryo
             {
                 parameter_types.push_back(param_type);
                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Intrinsic '{}' param '{}' resolved to '{}'",
-                          intrinsic_name, param->name(), param_type->to_string());
+                          intrinsic_name, param->name(), param_type->display_name());
             }
             else
             {
@@ -975,7 +975,7 @@ namespace Cryo
                                     std::string qualified_method_name = qualified_type + "::" + method->name();
                                     _template_registry.register_method_return_type(qualified_method_name, return_type);
                                     LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered method return type: {} -> {}",
-                                              qualified_method_name, return_type->to_string());
+                                              qualified_method_name, return_type->display_name());
                                 }
                                 else
                                 {
