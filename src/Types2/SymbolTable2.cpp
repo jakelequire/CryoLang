@@ -445,7 +445,7 @@ namespace Cryo
                    << std::setw(20) << (symbol.type.is_valid()
                                              ? symbol.type.get()->display_name()
                                              : "<no type>")
-                   << symbol.location.line << ":" << symbol.location.column
+                   << symbol.location.line() << ":" << symbol.location.column()
                    << "\n";
             }
             os << "\n";

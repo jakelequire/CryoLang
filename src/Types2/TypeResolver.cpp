@@ -123,7 +123,6 @@ namespace Cryo
             {"void", [](TypeArena &a) { return a.get_void(); }},
 
             // Boolean
-            {"bool", [](TypeArena &a) { return a.get_bool(); }},
             {"boolean", [](TypeArena &a) { return a.get_bool(); }},
 
             // Signed integers

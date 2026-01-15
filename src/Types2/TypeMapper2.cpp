@@ -641,7 +641,7 @@ namespace Cryo
         if (!type)
             return nullptr;
 
-        std::string name = type->qualified_name().full_name();
+        std::string name = type->qualified_name().name;
 
         auto existing = lookup_struct(name);
         if (existing && !existing->isOpaque())
@@ -687,7 +687,7 @@ namespace Cryo
         if (!type)
             return nullptr;
 
-        std::string name = type->qualified_name().full_name();
+        std::string name = type->qualified_name().name;
 
         auto existing = lookup_struct(name);
         if (existing && !existing->isOpaque())
@@ -735,10 +735,10 @@ namespace Cryo
         if (!type)
             return nullptr;
 
-        std::string name = type->qualified_name().full_name();
+        std::string name = type->qualified_name().name;
 
         // Simple enum (no data) -> integer
-        if (type->is_simple())
+        if (type->is_simple_enum())
         {
             return i32_type();
         }
@@ -755,9 +755,9 @@ namespace Cryo
         for (const auto &variant : type->variants())
         {
             size_t variant_size = 0;
-            for (const auto &field : variant.fields)
+            for (const auto &field : variant.payload_types)
             {
-                llvm::Type *mapped = map(field.type);
+                llvm::Type *mapped = map(field);
                 if (mapped)
                 {
                     variant_size += size_of(mapped);
@@ -778,7 +778,7 @@ namespace Cryo
             return nullptr;
 
         // Traits are represented as vtable pointer + data pointer (fat pointer)
-        std::string name = "trait." + type->qualified_name().full_name();
+        std::string name = "trait." + type->qualified_name().name;
 
         auto existing = lookup_struct(name);
         if (existing && !existing->isOpaque())
@@ -953,7 +953,7 @@ namespace Cryo
         // Try primitive type names
         if (name == "void")
             return void_type();
-        if (name == "bool")
+        if (name == "boolean")
             return bool_type();
         if (name == "i8" || name == "u8")
             return i8_type();
