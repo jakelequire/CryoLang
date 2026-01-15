@@ -502,11 +502,48 @@ namespace Cryo
             }
 
             // Phase 2: Monomorphization - Generate specialized versions of generic types
-            // Note: TypeChecker doesn't have get_required_instantiations.
-            // Monomorphization needs to be triggered differently in the new architecture.
             if (_debug_mode)
             {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Monomorphization pass - skipped (requires reimplementation for Types)");
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Phase 2: Monomorphization pass...");
+            }
+
+            // Import all cached instantiations from type resolution phase
+            _monomorphization_pass->import_cached_instantiations();
+
+            if (_debug_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                          "Monomorphization: {} instantiations to process",
+                          _monomorphization_pass->pending_count());
+            }
+
+            // Process all monomorphization requests
+            if (_monomorphization_pass->has_pending())
+            {
+                if (!_monomorphization_pass->process_all())
+                {
+                    if (_debug_mode)
+                    {
+                        LOG_ERROR(Cryo::LogComponent::GENERAL, "Monomorphization pass failed");
+                    }
+                    // Note: Don't return false - monomorphization failures may be non-fatal
+                    // depending on whether the unprocessed instantiations are actually used
+                }
+
+                if (_debug_mode)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                              "Monomorphization: {} specializations created",
+                              _monomorphization_pass->specialization_count());
+                }
+            }
+            else
+            {
+                if (_debug_mode)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                              "Monomorphization: No generic instantiations to process");
+                }
             }
 
             // Phase 3: Future semantic analysis phases would go here
