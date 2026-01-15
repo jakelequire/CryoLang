@@ -1211,19 +1211,19 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Function '{}' has NULL return type", node->name());
         }
         
-        // Special handling for constructors - if return type is void/unknown, fix it to pointer type
-        if (resolved_type && (resolved_type->kind() == TypeKind::Void || resolved_type->kind() == TypeKind::Unknown) &&
+        // Special handling for constructors - if return type is void, fix it to pointer type
+        if (resolved_type.is_valid() && resolved_type->kind() == TypeKind::Void &&
             !parent_type_name.empty())
         {
             // This is a constructor with wrong return type - fix it to pointer to struct type
-            TypeRef struct_type = ctx().symbols().get_type_context()->get_struct_type(parent_type_name);
-            if (struct_type)
+            TypeRef struct_type = ctx().symbols().arena().lookup_struct_type(parent_type_name);
+            if (struct_type.is_valid())
             {
-                resolved_type = ctx().symbols().get_type_context()->create_pointer_type(struct_type);
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Constructor '{}' return type fixed from {} to {}", 
-                          node->name(), 
-                          node->get_resolved_return_type() ? node->get_resolved_return_type().get()->display_name() : "NULL",
-                          resolved_type ? resolved_type.get()->display_name() : "NULL");
+                resolved_type = ctx().symbols().arena().get_pointer_to(struct_type);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Constructor '{}' return type fixed from {} to {}",
+                          node->name(),
+                          node->get_resolved_return_type().is_valid() ? node->get_resolved_return_type()->display_name() : "NULL",
+                          resolved_type.is_valid() ? resolved_type->display_name() : "NULL");
             }
         }
         
@@ -1259,8 +1259,8 @@ namespace Cryo::Codegen
             bool is_simple_enum = false;
             if (!parent_type_name.empty())
             {
-                TypeRef parent_cryo_type = symbols().get_type_context()->lookup_enum_type(parent_type_name);
-                if (parent_cryo_type && parent_cryo_type->kind() == Cryo::TypeKind::Enum)
+                TypeRef parent_cryo_type = symbols().arena().lookup_enum_type(parent_type_name);
+                if (parent_cryo_type.is_valid() && parent_cryo_type->kind() == Cryo::TypeKind::Enum)
                 {
                     auto *enum_type = static_cast<const Cryo::EnumType *>(parent_cryo_type.get());
                     is_simple_enum = enum_type->is_simple_enum();
@@ -1846,17 +1846,17 @@ namespace Cryo::Codegen
                 if (arg.getName() == "this")
                 {
                     // Get the Cryo type for the current struct/class
-                    TypeRef this_type = ctx().symbols().get_type_context()->get_struct_type(parent_type);
-                    if (!this_type)
+                    TypeRef this_type = ctx().symbols().arena().lookup_struct_type(parent_type);
+                    if (!this_type.is_valid())
                     {
-                        this_type = ctx().symbols().get_type_context()->get_class_type(parent_type);
+                        this_type = ctx().symbols().arena().lookup_class_type(parent_type);
                     }
-                    if (this_type)
+                    if (this_type.is_valid())
                     {
                         ctx().variable_types_map()["this"] = this_type;
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Registered 'this' type for struct method: {} -> {}",
-                                  parent_type, this_type.get()->display_name());
+                                  parent_type, this_type->display_name());
                     }
                 }
             }
@@ -1889,22 +1889,22 @@ namespace Cryo::Codegen
                 if (ast_idx < ast_params.size())
                 {
                     TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
-                    if (param_type)
+                    if (param_type.is_valid())
                     {
                         std::string param_name = arg.getName().str();
                         ctx().variable_types_map()[param_name] = param_type;
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "DeclarationCodegen: Registered method parameter type: {} -> {} (kind: {})",
-                                  param_name, param_type.get()->display_name(),
+                                  param_name, param_type->display_name(),
                                   static_cast<int>(param_type->kind()));
 
                         // Special logging for Array<T> parameters
                         if (param_type->kind() == TypeKind::Array ||
-                            param_type.get()->display_name().find("[]") != std::string::npos)
+                            param_type->display_name().find("[]") != std::string::npos)
                         {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                       "DeclarationCodegen: *** Registered Array<T> method parameter: {} with type: {}",
-                                      param_name, param_type.get()->display_name());
+                                      param_name, param_type->display_name());
                         }
                     }
                 }
@@ -2109,21 +2109,21 @@ namespace Cryo::Codegen
                         if (arg.getName() == "this")
                         {
                             // Get the Cryo type for the current struct/class/enum
-                            TypeRef this_type = ctx().symbols().get_type_context()->get_struct_type(type_name);
-                            if (!this_type)
+                            TypeRef this_type = ctx().symbols().arena().lookup_struct_type(type_name);
+                            if (!this_type.is_valid())
                             {
-                                this_type = ctx().symbols().get_type_context()->get_class_type(type_name);
+                                this_type = ctx().symbols().arena().lookup_class_type(type_name);
                             }
-                            if (!this_type)
+                            if (!this_type.is_valid())
                             {
-                                this_type = ctx().symbols().get_type_context()->lookup_enum_type(type_name);
+                                this_type = ctx().symbols().arena().lookup_enum_type(type_name);
                             }
-                            if (this_type)
+                            if (this_type.is_valid())
                             {
                                 ctx().variable_types_map()["this"] = this_type;
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                           "Registered 'this' type for method: {} -> {}",
-                                          type_name, this_type.get()->display_name());
+                                          type_name, this_type->display_name());
                             }
                         }
                     }

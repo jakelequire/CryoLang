@@ -141,7 +141,7 @@ namespace Cryo::Codegen
             symbol = _symbol_table.lookup_symbol(function_name);
         }
 
-        if (symbol && symbol->type)
+        if (symbol && symbol->type.is_valid())
         {
             std::string type_name = symbol->type->display_name();
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry: Direct type mapping for '{}' with type '{}'", function_name, type_name);
@@ -250,14 +250,14 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Direct lookup for '{}': {}", function_name, symbol ? "FOUND" : "NOT FOUND");
         }
 
-        if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->type)
+        if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->type.is_valid())
         {
             // We found a function symbol with type information
             const FunctionType *func_type = dynamic_cast<const FunctionType *>(symbol->type.get());
             if (func_type)
             {
                 // Classify based on the return type
-                metadata.category = get_category_from_cryo_type(func_type->return_type().get());
+                metadata.category = get_category_from_cryo_type(func_type->return_type());
                 metadata.runtime_name = function_name;
                 metadata.namespace_scope = symbol->scope;
                 metadata.is_variadic = false; // TODO: Add variadic info to FunctionType if needed
@@ -307,11 +307,11 @@ namespace Cryo::Codegen
             symbol = _symbol_table.lookup_namespaced_symbol(resolved_namespace, function_name);
         }
 
-        if (symbol && symbol->type)
+        if (symbol && symbol->type.is_valid())
         {
             // Classify function based on actual return type from symbol table
             auto *function_type = dynamic_cast<const FunctionType *>(symbol->type.get());
-            if (function_type && function_type->return_type())
+            if (function_type && function_type->return_type().is_valid())
             {
                 auto return_type_kind = function_type->return_type()->kind();
                 std::string return_type_name = function_type->return_type()->display_name();
@@ -465,7 +465,7 @@ namespace Cryo::Codegen
 
     FunctionCategory FunctionRegistry::get_category_from_cryo_type(const TypeRef cryo_type) const
     {
-        if (!cryo_type)
+        if (!cryo_type.is_valid())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_category_from_cryo_type: NULL type, returning Unknown");
             return FunctionCategory::Unknown;

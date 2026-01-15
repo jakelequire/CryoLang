@@ -2418,33 +2418,33 @@ namespace Cryo::Codegen
                 return nullptr;
             }
 
-            // Convert string type arguments to Cryo::Type*
+            // Convert string type arguments to Cryo::TypeRef
             std::vector<TypeRef> type_args;
             for (const auto &type_arg_str : node->generic_args())
             {
-                TypeRef arg_type = symbols().get_type_context()->lookup_struct_type(type_arg_str);
-                if (!arg_type)
+                TypeRef arg_type = symbols().arena().lookup_struct_type(type_arg_str);
+                if (!arg_type.is_valid())
                 {
-                    arg_type = symbols().get_type_context()->lookup_class_type(type_arg_str);
+                    arg_type = symbols().arena().lookup_class_type(type_arg_str);
                 }
-                if (!arg_type)
+                if (!arg_type.is_valid())
                 {
                     // Try common primitive types
                     if (type_arg_str == "int" || type_arg_str == "i32")
-                        arg_type = symbols().get_type_context()->get_i32_type();
+                        arg_type = symbols().arena().get_i32();
                     else if (type_arg_str == "i64" || type_arg_str == "long")
-                        arg_type = symbols().get_type_context()->get_i64_type();
+                        arg_type = symbols().arena().get_i64();
                     else if (type_arg_str == "f32" || type_arg_str == "float")
-                        arg_type = symbols().get_type_context()->get_f32_type();
+                        arg_type = symbols().arena().get_f32();
                     else if (type_arg_str == "f64" || type_arg_str == "double")
-                        arg_type = symbols().get_type_context()->get_f64_type();
+                        arg_type = symbols().arena().get_f64();
                     else if (type_arg_str == "string")
-                        arg_type = symbols().get_type_context()->get_string_type();
+                        arg_type = symbols().arena().get_string();
                     else if (type_arg_str == "bool" || type_arg_str == "boolean")
-                        arg_type = symbols().get_type_context()->get_boolean_type();
+                        arg_type = symbols().arena().get_bool();
                 }
 
-                if (arg_type)
+                if (arg_type.is_valid())
                 {
                     type_args.push_back(arg_type);
                 }
