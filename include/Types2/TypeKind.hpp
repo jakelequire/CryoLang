@@ -49,6 +49,7 @@ namespace Cryo
         Enum,      // enum Foo { ... }
         Trait,     // trait Foo { ... }
         TypeAlias, // type Foo = Bar
+        Union,     // union Foo { ... }
 
         // ====================================================================
         // Generic Types
@@ -140,6 +141,8 @@ namespace Cryo
             return "Trait";
         case TypeKind::TypeAlias:
             return "TypeAlias";
+        case TypeKind::Union:
+            return "Union";
         case TypeKind::GenericParam:
             return "GenericParam";
         case TypeKind::BoundedParam:

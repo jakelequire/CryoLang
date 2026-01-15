@@ -105,6 +105,7 @@ namespace Cryo
 
         void set_module(llvm::Module *module) { _module = module; }
         void set_generic_registry(GenericRegistry *reg) { _generics = reg; }
+        void set_template_registry(class TemplateRegistry *) {} // Legacy compat - no-op
         void set_instantiation_callback(GenericInstantiationCallback cb)
         {
             _instantiation_callback = std::move(cb);
