@@ -50,7 +50,7 @@ namespace Cryo
         size_t size_bytes() const override { return 1; }
         size_t alignment() const override { return 1; }
 
-        std::string display_name() const override { return "bool"; }
+        std::string display_name() const override { return "boolean"; }
         std::string mangled_name() const override { return "b"; }
     };
 

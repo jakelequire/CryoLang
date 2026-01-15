@@ -536,7 +536,7 @@ namespace Cryo
             auto method = st->get_method(method_name);
             if (method)
             {
-                return check_function_call(method->type, arg_types);
+                return check_function_call(method->function_type, arg_types);
             }
         }
         else if (t->kind() == TypeKind::Class)
@@ -545,7 +545,7 @@ namespace Cryo
             auto method = cl->get_method(method_name);
             if (method)
             {
-                return check_function_call(method->type, arg_types);
+                return check_function_call(method->function_type, arg_types);
             }
         }
 
