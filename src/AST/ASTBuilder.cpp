@@ -106,11 +106,29 @@ namespace Cryo
                                                                                      bool is_mutable,
                                                                                      bool is_global)
     {
-        // Debug: Log variable declaration creation
-        LOG_DEBUG(Cryo::LogComponent::AST, "ASTBUILDER_DEBUG: Creating VariableDeclarationNode with name='{}', location={}:{}",
+        LOG_DEBUG(Cryo::LogComponent::AST, "ASTBUILDER_DEBUG: Creating VariableDeclarationNode with name='{}', resolved type, location={}:{}",
                   name, loc.line(), loc.column());
 
         auto node = std::make_unique<VariableDeclarationNode>(loc, std::move(name), resolved_type, std::move(init), is_mutable, is_global);
+        node->set_source_file(_source_file);
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "ASTBUILDER_DEBUG: Created VariableDeclarationNode node_ptr={}, stored_name='{}'",
+                  static_cast<void *>(node.get()), node->name());
+
+        return node;
+    }
+
+    std::unique_ptr<VariableDeclarationNode> ASTBuilder::create_variable_declaration(SourceLocation loc,
+                                                                                     std::string name,
+                                                                                     std::unique_ptr<TypeAnnotation> type_annotation,
+                                                                                     std::unique_ptr<ExpressionNode> init,
+                                                                                     bool is_mutable,
+                                                                                     bool is_global)
+    {
+        LOG_DEBUG(Cryo::LogComponent::AST, "ASTBUILDER_DEBUG: Creating VariableDeclarationNode with name='{}', type annotation, location={}:{}",
+                  name, loc.line(), loc.column());
+
+        auto node = std::make_unique<VariableDeclarationNode>(loc, std::move(name), std::move(type_annotation), std::move(init), is_mutable, is_global);
         node->set_source_file(_source_file);
 
         LOG_DEBUG(Cryo::LogComponent::AST, "ASTBUILDER_DEBUG: Created VariableDeclarationNode node_ptr={}, stored_name='{}'",
@@ -125,6 +143,16 @@ namespace Cryo
                                                                                      bool is_public)
     {
         auto node = std::make_unique<FunctionDeclarationNode>(loc, std::move(name), return_type, is_public);
+        node->set_source_file(_source_file);
+        return node;
+    }
+
+    std::unique_ptr<FunctionDeclarationNode> ASTBuilder::create_function_declaration(SourceLocation loc,
+                                                                                     std::string name,
+                                                                                     std::unique_ptr<TypeAnnotation> return_type_annotation,
+                                                                                     bool is_public)
+    {
+        auto node = std::make_unique<FunctionDeclarationNode>(loc, std::move(name), std::move(return_type_annotation), is_public);
         node->set_source_file(_source_file);
         return node;
     }
@@ -157,9 +185,9 @@ namespace Cryo
         return node;
     }
 
-    std::unique_ptr<CastExpressionNode> ASTBuilder::create_cast_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> expression, std::string target_type)
+    std::unique_ptr<CastExpressionNode> ASTBuilder::create_cast_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> expression, std::unique_ptr<TypeAnnotation> target_type_annotation)
     {
-        auto node = std::make_unique<CastExpressionNode>(loc, std::move(expression), std::move(target_type));
+        auto node = std::make_unique<CastExpressionNode>(loc, std::move(expression), std::move(target_type_annotation));
         node->set_source_file(_source_file);
         return node;
     }
@@ -277,9 +305,23 @@ namespace Cryo
         return node;
     }
 
+    std::unique_ptr<StructFieldNode> ASTBuilder::create_struct_field(SourceLocation loc, std::string name, std::unique_ptr<TypeAnnotation> type_annotation, Visibility visibility)
+    {
+        auto node = std::make_unique<StructFieldNode>(loc, std::move(name), std::move(type_annotation), visibility);
+        node->set_source_file(_source_file);
+        return node;
+    }
+
     std::unique_ptr<StructMethodNode> ASTBuilder::create_struct_method(SourceLocation loc, std::string name, TypeRef return_type, Visibility visibility, bool is_constructor, bool is_destructor, bool is_static, bool is_default_destructor)
     {
         auto node = std::make_unique<StructMethodNode>(loc, std::move(name), return_type, visibility, is_constructor, is_destructor, is_static, is_default_destructor);
+        node->set_source_file(_source_file);
+        return node;
+    }
+
+    std::unique_ptr<StructMethodNode> ASTBuilder::create_struct_method(SourceLocation loc, std::string name, std::unique_ptr<TypeAnnotation> return_type_annotation, Visibility visibility, bool is_constructor, bool is_destructor, bool is_static, bool is_default_destructor)
+    {
+        auto node = std::make_unique<StructMethodNode>(loc, std::move(name), std::move(return_type_annotation), visibility, is_constructor, is_destructor, is_static, is_default_destructor);
         node->set_source_file(_source_file);
         return node;
     }

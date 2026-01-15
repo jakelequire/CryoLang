@@ -1216,7 +1216,7 @@ namespace Cryo::Codegen
             if (resolved_type && resolved_type->kind() == TypeKind::Array)
             {
                 auto *cryo_array_type = static_cast<const Cryo::ArrayType *>(resolved_type.get());
-                std::string element_type_name = cryo_array_type->element()->name();
+                std::string element_type_name = cryo_array_type->element()->display_name();
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected Array<{}> address access for variable: {}", element_type_name, array_name);
 
@@ -1380,16 +1380,29 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // For now, handle string-based cast by looking up the type
-        // TODO: Use proper Type* resolution instead of string lookup
-        llvm::Type *llvm_target = types().get_type(node->target_type_name());
+        // Get the target type - prefer resolved type, fall back to annotation
+        llvm::Type *llvm_target = nullptr;
+        std::string target_type_name;
+
+        if (node->has_resolved_target_type())
+        {
+            TypeRef resolved = node->get_resolved_target_type();
+            llvm_target = get_llvm_type(resolved);
+            target_type_name = resolved->display_name();
+        }
+        else if (node->target_type_annotation())
+        {
+            target_type_name = node->target_type_annotation()->to_string();
+            llvm_target = types().get_type(target_type_name);
+        }
+
         if (!llvm_target)
         {
-            report_error(ErrorCode::E0626_CAST_OPERATION_ERROR, node, "Unknown cast target type: " + node->target_type_name());
+            report_error(ErrorCode::E0626_CAST_OPERATION_ERROR, node, "Unknown cast target type: " + target_type_name);
             return nullptr;
         }
 
-        // For now, cast directly using LLVM type - this needs proper Cryo::Type* conversion
+        // Cast using LLVM type
         return cast_if_needed(value, llvm_target);
     }
 
@@ -2422,10 +2435,10 @@ namespace Cryo::Codegen
             std::vector<TypeRef> type_args;
             for (const auto &type_arg_str : node->generic_args())
             {
-                TypeRef arg_type = symbols().arena().lookup_struct_type(type_arg_str);
+                TypeRef arg_type = symbols().lookup_struct_type(type_arg_str);
                 if (!arg_type.is_valid())
                 {
-                    arg_type = symbols().arena().lookup_class_type(type_arg_str);
+                    arg_type = symbols().lookup_class_type(type_arg_str);
                 }
                 if (!arg_type.is_valid())
                 {

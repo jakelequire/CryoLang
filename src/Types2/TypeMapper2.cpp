@@ -942,7 +942,7 @@ namespace Cryo
         // Try to look up in module if available
         if (_module)
         {
-            llvm::StructType *st = _module->getTypeByName(name);
+            llvm::StructType *st = llvm::StructType::getTypeByName(_module->getContext(), name);
             if (st)
             {
                 _struct_cache[name] = st;

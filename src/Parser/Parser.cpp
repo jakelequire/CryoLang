@@ -1215,7 +1215,7 @@ namespace Cryo
             TypeRef base_type = parse_type_annotation(); // recursive call
 
             // For now, create reference type (could be enhanced later for mut references)
-            return _context.types().create_reference_type(base_type);
+            return _context.types().get_reference_to(base_type);
         }
 
         // Use the new comprehensive token-based parsing system
@@ -1557,7 +1557,7 @@ namespace Cryo
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
         // Parse return type
-        TypeRef return_type = _context.types().get_void_type();
+        TypeRef return_type = _context.types().get_void();
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
@@ -1581,12 +1581,12 @@ namespace Cryo
         if (func_name == "_user_main_")
         {
             // Create argc: i32 parameter
-            TypeRef i32_type = _context.types().get_i32_type();
+            TypeRef i32_type = _context.types().get_i32();
             auto argc_param = _builder.create_variable_declaration(start_loc, "argc", i32_type);
             func_decl->add_parameter(std::move(argc_param));
 
             // Create argv: ptr parameter (pointer to string array)
-            TypeRef ptr_type = _context.types().create_pointer_type(_context.types().get_i8_type());
+            TypeRef ptr_type = _context.types().get_pointer_to(_context.types().get_i8());
             auto argv_param = _builder.create_variable_declaration(start_loc, "argv", ptr_type);
             func_decl->add_parameter(std::move(argv_param));
         }
@@ -1630,7 +1630,7 @@ namespace Cryo
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
         // Parse return type
-        TypeRef return_type = _context.types().get_void_type();
+        TypeRef return_type = _context.types().get_void();
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
@@ -1733,7 +1733,7 @@ namespace Cryo
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
         // Parse return type
-        TypeRef return_type = _context.types().get_void_type();
+        TypeRef return_type = _context.types().get_void();
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
@@ -2249,7 +2249,8 @@ namespace Cryo
                 error("Expected type name after 'as' in cast expression");
 
                 // Error recovery: create a cast to 'unknown' type to allow parsing to continue
-                expr = _builder.create_cast_expression(cast_loc, std::move(expr), "unknown");
+                auto unknown_annotation = std::make_unique<TypeAnnotation>(TypeAnnotation::named("unknown", cast_loc));
+                expr = _builder.create_cast_expression(cast_loc, std::move(expr), std::move(unknown_annotation));
                 break; // Exit the while loop to prevent further parsing issues
             }
 
@@ -2278,7 +2279,9 @@ namespace Cryo
                 advance();
             }
 
-            expr = _builder.create_cast_expression(cast_loc, std::move(expr), target_type);
+            // Create TypeAnnotation from the target type string
+            auto target_annotation = std::make_unique<TypeAnnotation>(TypeAnnotation::named(target_type, cast_loc));
+            expr = _builder.create_cast_expression(cast_loc, std::move(expr), std::move(target_annotation));
         }
 
         return expr;
@@ -2631,11 +2634,9 @@ namespace Cryo
                             if (_srm_manager)
                             {
                                 auto namespace_parts = get_current_namespace_parts();
-                                // Convert string generic args to Type* for TypeIdentifier
-                                // Note: This is a simplification - in practice we'd need proper type resolution
-                                std::vector<TypeRef> template_types; // Empty for now, proper resolution needed
+                                // Pass empty template params - proper resolution happens in TypeResolver phase
                                 auto type_id = std::make_unique<Cryo::SRM::TypeIdentifier>(
-                                    namespace_parts, type_name, Cryo::TypeKind::Struct, template_types);
+                                    namespace_parts, type_name, Cryo::TypeKind::Struct);
                                 generic_type_name = type_id->to_template_name();
                             }
                             else
@@ -3659,17 +3660,18 @@ namespace Cryo
         advance(); // consume 'this'
 
         // For now, create a simple type - we'll enhance this later
-        TypeRef this_type = nullptr;
+        // Use an error type as placeholder that will be resolved during type checking
+        TypeRef this_type;
+        TypeRef placeholder = _context.types().create_error("__this_placeholder__", start_loc);
         if (is_reference)
         {
             // Create a reference type to a placeholder type
-            TypeRef base_type = _context.types().get_auto_type(); // Use auto as placeholder
-            this_type = _context.types().create_reference_type(base_type);
+            this_type = _context.types().get_reference_to(placeholder);
         }
         else
         {
-            // By value - use auto as placeholder for now
-            this_type = _context.types().get_auto_type();
+            // By value - use placeholder for now
+            this_type = placeholder;
         }
 
         // Create a special parameter for 'this'
@@ -4454,7 +4456,7 @@ namespace Cryo
                     consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
                     // Parse return type
-                    TypeRef return_type = _context.types().get_void_type(); // Default to void
+                    TypeRef return_type = _context.types().get_void(); // Default to void
                     if (_current_token.is(TokenKind::TK_ARROW))
                     {
                         advance(); // consume '->'
@@ -4668,7 +4670,9 @@ namespace Cryo
         // Skip registration for generic enums (they'll be handled by template system)
         if (enum_decl->generic_parameters().empty())
         {
-            _context.types().get_enum_type(enum_name, variant_names, is_simple_enum);
+            QualifiedTypeName qname{ModuleID::invalid(), enum_name};
+            _context.types().create_enum(qname);
+            // TODO: Populate enum variants on the type - currently handled in TypeChecker
             LOG_DEBUG(LogComponent::PARSER, "Registered enum type: {} (simple={}, variants={})", enum_name, is_simple_enum, variant_names.size());
         }
 
@@ -5132,7 +5136,7 @@ namespace Cryo
         }
 
         // Parse return type (optional for constructors)
-        TypeRef return_type = _context.types().get_void_type(); // Default to void
+        TypeRef return_type = _context.types().get_void(); // Default to void
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
@@ -5144,21 +5148,17 @@ namespace Cryo
             // Use the struct name passed to this method
             if (!struct_name.empty())
             {
-                TypeRef struct_type = _context.types().get_struct_type(struct_name);
-                if (struct_type)
-                {
-                    return_type = _context.types().create_pointer_type(struct_type);
-                }
-                else
-                {
-                    // Fallback: create pointer to unknown type, TypeChecker will fix
-                    return_type = _context.types().create_pointer_type(_context.types().get_unknown_type());
-                }
+                // Create struct type for this constructor/destructor
+                // TypeChecker will resolve this properly later
+                QualifiedTypeName qname{ModuleID::invalid(), struct_name};
+                TypeRef struct_type = _context.types().create_struct(qname);
+                return_type = _context.types().get_pointer_to(struct_type);
             }
             else
             {
-                // No struct context - use unknown pointer type
-                return_type = _context.types().create_pointer_type(_context.types().get_unknown_type());
+                // No struct context - use placeholder error type
+                return_type = _context.types().get_pointer_to(
+                    _context.types().create_error("__unresolved_self__", start_loc));
             }
         }
 
@@ -5777,137 +5777,106 @@ namespace Cryo
                 }
             }
 
-            return _context.types().get_unknown_type();
+            return _context.types().create_error("invalid_type_annotation", error_location);
         }
 
-        // Use the token-based parsing system
-        size_t index = 0;
-        TypeRef parsed_type = _context.types().parse_type_from_token_stream(collected_tokens, index);
+        // Use string-based parsing
+        // Trim whitespace
+        type_string.erase(type_string.find_last_not_of(" \t\n\r\f\v") + 1);
+        TypeRef parsed_type = resolve_type_from_string(type_string);
 
-        if (!parsed_type)
+        if (!parsed_type.is_valid())
         {
-            // Fallback to string-based parsing if token parsing fails
-            LOG_DEBUG(LogComponent::PARSER, "Token-based parsing failed for '{}' (collected {} tokens), falling back to string parsing", type_string, collected_tokens.size());
-            if (!collected_tokens.empty())
-            {
-                LOG_DEBUG(LogComponent::PARSER, "First token: {} ({})", static_cast<int>(collected_tokens[0].kind()), std::string(collected_tokens[0].text()));
-            }
-
-            // Trim whitespace
-            type_string.erase(type_string.find_last_not_of(" \t\n\r\f\v") + 1);
-            parsed_type = resolve_type_from_string(type_string);
+            return _context.types().create_error("unresolved_type: " + type_string, SourceLocation{});
         }
 
-        return parsed_type ? parsed_type : _context.types().get_unknown_type();
+        return parsed_type;
     }
 
     TypeRef Parser::resolve_type_from_string(const std::string &type_str)
     {
         // Handle basic built-in types first
         if (type_str == "void")
-            return _context.types().get_void_type();
+            return _context.types().get_void();
         if (type_str == "int" || type_str == "i32")
-            return _context.types().get_i32_type();
+            return _context.types().get_i32();
         if (type_str == "i8")
-            return _context.types().get_i8_type();
+            return _context.types().get_i8();
         if (type_str == "i16")
-            return _context.types().get_i16_type();
+            return _context.types().get_i16();
         if (type_str == "i64")
-            return _context.types().get_i64_type();
+            return _context.types().get_i64();
         if (type_str == "i128")
-            return _context.types().get_i128_type();
+            return _context.types().get_i128();
         // Unsigned integer types
         if (type_str == "u8")
-            return _context.types().get_u8_type();
+            return _context.types().get_u8();
         if (type_str == "u16")
-            return _context.types().get_u16_type();
+            return _context.types().get_u16();
         if (type_str == "u32")
-            return _context.types().get_u32_type();
+            return _context.types().get_u32();
         if (type_str == "u64")
-            return _context.types().get_u64_type();
+            return _context.types().get_u64();
         if (type_str == "u128")
-            return _context.types().get_u128_type();
+            return _context.types().get_u128();
         if (type_str == "f32")
-            return _context.types().get_f32_type();
+            return _context.types().get_f32();
         if (type_str == "f64")
-            return _context.types().get_f64_type();
+            return _context.types().get_f64();
         if (type_str == "float")
-            return _context.types().get_f32_type();
+            return _context.types().get_f32();
         if (type_str == "double")
-            return _context.types().get_f64_type();
+            return _context.types().get_f64();
         if (type_str == "boolean")
-            return _context.types().get_boolean_type();
+            return _context.types().get_bool();
         if (type_str == "char")
-            return _context.types().get_char_type();
+            return _context.types().get_char();
         if (type_str == "string")
-            return _context.types().get_string_type();
+            return _context.types().get_string();
+        // For 'auto' and variadic types, these will be resolved during type inference
+        // Return void as placeholder for now - the type annotation will carry the info
         if (type_str == "auto")
-            return _context.types().get_auto_type(); // Auto type inference
+            return _context.types().get_void(); // Placeholder for auto type inference
         if (type_str == "...")
-            return _context.types().get_variadic_type(); // Variadic type
+            return _context.types().get_void(); // Placeholder for variadic type
 
-        // Check for generic types first (e.g., "Array<int>")
+        // For generic types (e.g., "Array<int>"), defer to type resolution phase
+        // The TypeAnnotation stored on the node will contain the full type info
         if (type_str.find('<') != std::string::npos && type_str.find('>') != std::string::npos)
         {
-            LOG_DEBUG(LogComponent::PARSER, "Parser detected generic type syntax: '{}'", type_str);
-            // Use TypeRegistry's parse_and_instantiate for proper generic type resolution
-            ParameterizedTypeRef generic_type = _context.types().get_type_registry()->parse_and_instantiate(type_str);
-            if (generic_type && generic_type->kind() != TypeKind::Unknown)
-            {
-                LOG_DEBUG(LogComponent::PARSER, "Successfully resolved generic type '{}' via TypeRegistry", type_str);
-                return generic_type;
-            }
-            else
-            {
-                LOG_DEBUG(LogComponent::PARSER, "Failed to resolve generic type '{}' via TypeRegistry", type_str);
-                // For generic types that fail to resolve, create a deferred ParameterizedType
-                // that can be resolved later when all templates are registered
-                auto [base_name, param_strs] = _context.types().get_type_registry()->parse_generic_syntax(type_str);
-                LOG_DEBUG(LogComponent::PARSER, "parse_generic_syntax('{}') returned base_name='{}', {} params", type_str, base_name, param_strs.size());
-                if (!param_strs.empty())
-                {
-                    LOG_DEBUG(LogComponent::PARSER, "Creating deferred ParameterizedType for '{}' with {} parameters", base_name, param_strs.size());
-                    return _context.types().create_parameterized_type(base_name, param_strs);
-                }
-            }
+            LOG_DEBUG(LogComponent::PARSER, "Parser detected generic type syntax: '{}' - deferring to type resolution", type_str);
+            // Return an error type with the type string - TypeResolver will handle it
+            return _context.types().create_error("unresolved generic: " + type_str, SourceLocation{});
         }
 
-        // Try to resolve as a struct/class type
-        TypeRef struct_type = _context.types().lookup_struct_type(type_str);
-        if (struct_type && struct_type->kind() != TypeKind::Unknown)
+        // Try to resolve as a struct type
+        TypeRef struct_type = _context.symbols().lookup_struct_type(type_str);
+        if (struct_type.is_valid())
         {
             return struct_type;
         }
 
-        // Try to resolve as a class type (lookup only, don't create)
-        TypeRef class_type = _context.types().lookup_class_type(type_str);
-        if (class_type && class_type->kind() != TypeKind::Unknown)
+        // Try to resolve as a class type
+        TypeRef class_type = _context.symbols().lookup_class_type(type_str);
+        if (class_type.is_valid())
         {
             return class_type;
         }
 
-        // Try to resolve as an enum type (lookup only, don't create)
-        TypeRef enum_type = _context.types().lookup_enum_type(type_str);
-        if (enum_type && enum_type->kind() != TypeKind::Unknown)
+        // Try to resolve as an enum type
+        TypeRef enum_type = _context.symbols().lookup_enum_type(type_str);
+        if (enum_type.is_valid())
         {
             return enum_type;
         }
 
-        // Could be a generic parameter
-        TypeRef generic_type = _context.types().get_generic_type(type_str);
-        if (generic_type)
-        {
-            return generic_type;
-        }
+        // For unresolved types that might be enums, structs, or generic parameters
+        // defined later in the file, create an error type with the type name
+        // The TypeResolver will resolve it properly during type resolution phase
+        LOG_DEBUG(LogComponent::PARSER, "Could not resolve '{}' during parsing, deferring to type resolution phase", type_str);
 
-        // For unresolved types that might be enums or structs defined later in the file,
-        // we'll return an unknown type and let the TypeChecker resolve it properly
-        // when all types are available during type checking phase
-        LOG_DEBUG(LogComponent::PARSER, "Could not resolve '{}' during parsing, deferring to type checker", type_str);
-
-        // Return unknown type - the TypeChecker will attempt to resolve it again during type checking
-        // when all enum and struct declarations have been processed
-        return _context.types().get_unknown_type();
+        // Return an error type - the TypeResolver will resolve the actual type from annotation
+        return _context.types().create_error("unresolved type: " + type_str, SourceLocation{});
     }
 
     //===----------------------------------------------------------------------===//
@@ -6040,7 +6009,7 @@ namespace Cryo
         auto qualified_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
             namespace_parts, namespace_name, Cryo::SymbolKind::Type);
 
-        return qualified_id->display_name();
+        return qualified_id->to_string();
     }
 
     std::string Parser::generate_qualified_type_name(const std::string &base_name, const std::string &member_name)
@@ -6056,7 +6025,7 @@ namespace Cryo
         auto type_id = std::make_unique<Cryo::SRM::TypeIdentifier>(
             namespace_parts, member_name, Cryo::TypeKind::Struct);
 
-        return type_id->display_name();
+        return type_id->to_string();
     }
 
     std::string Parser::generate_scope_resolution_name(const std::string &scope_name, const std::string &member_name)
@@ -6071,7 +6040,7 @@ namespace Cryo
         auto qualified_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
             parts, member_name, Cryo::SymbolKind::Variable);
 
-        return qualified_id->display_name();
+        return qualified_id->to_string();
     }
 
     std::vector<std::string> Parser::get_current_namespace_parts() const

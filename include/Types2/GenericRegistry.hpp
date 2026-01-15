@@ -15,10 +15,12 @@
 #include "Types2/TypeID.hpp"
 #include "Types2/Type.hpp"
 #include "Types2/GenericTypes.hpp"
+#include "Lexer/lexer.hpp"
 
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <optional>
 #include <functional>
 
