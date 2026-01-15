@@ -585,7 +585,7 @@ namespace Cryo
                     }
                     else
                     {
-                        LOG_WARNING(LogComponent::GENERAL, "ModuleLoader: Skipping intrinsic '{}' - failed to create function type",
+                        LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Skipping intrinsic '{}' - failed to create function type",
                                     intrinsic_decl->name());
                     }
                 }
@@ -718,7 +718,7 @@ namespace Cryo
             }
             else
             {
-                LOG_WARNING(LogComponent::GENERAL, "ModuleLoader: Failed to get resolved type for parameter '{}' in intrinsic '{}' - intrinsic will not be available",
+                LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Failed to get resolved type for parameter '{}' in intrinsic '{}' - intrinsic will not be available",
                             param->name(), intrinsic_name);
                 return nullptr;
             }
@@ -733,7 +733,7 @@ namespace Cryo
         }
         else
         {
-            LOG_WARNING(LogComponent::GENERAL, "ModuleLoader: Failed to create function type for intrinsic '{}'", intrinsic_name);
+            LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Failed to create function type for intrinsic '{}'", intrinsic_name);
         }
         return func_type;
     }
