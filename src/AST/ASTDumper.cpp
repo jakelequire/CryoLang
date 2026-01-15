@@ -462,10 +462,36 @@ namespace Cryo
         {
             if (i > 0)
                 _output << ", ";
-            _output << params[i]->type_annotation();
+            // Use resolved type if available, otherwise fall back to type annotation
+            if (params[i]->get_resolved_type().is_valid())
+            {
+                _output << params[i]->get_resolved_type()->display_name();
+            }
+            else if (params[i]->type_annotation())
+            {
+                _output << params[i]->type_annotation()->to_string();
+            }
+            else
+            {
+                _output << "<unresolved>";
+            }
         }
 
-        _output << ") -> " << node.return_type_annotation() << "'";
+        // Use resolved return type if available, otherwise fall back to type annotation
+        _output << ") -> ";
+        if (node.get_resolved_return_type().is_valid())
+        {
+            _output << node.get_resolved_return_type()->display_name();
+        }
+        else if (node.return_type_annotation())
+        {
+            _output << node.return_type_annotation()->to_string();
+        }
+        else
+        {
+            _output << "<unresolved>";
+        }
+        _output << "'";
         if (_use_colors)
             _output << Colors::RESET;
 
@@ -523,9 +549,22 @@ namespace Cryo
         {
             if (i > 0)
                 _output << ", ";
-            _output << params[i]->type_annotation();
+            // Use resolved type if available, otherwise fall back to type annotation
+            if (params[i]->get_resolved_type().is_valid())
+            {
+                _output << params[i]->get_resolved_type()->display_name();
+            }
+            else if (params[i]->type_annotation())
+            {
+                _output << params[i]->type_annotation()->to_string();
+            }
+            else
+            {
+                _output << "<unresolved>";
+            }
         }
 
+        // IntrinsicDeclarationNode::return_type_annotation() already returns a string
         _output << ") -> " << node.return_type_annotation() << "'";
         if (_use_colors)
             _output << Colors::RESET;
@@ -1077,10 +1116,36 @@ namespace Cryo
         {
             if (i > 0)
                 _output << ", ";
-            _output << params[i]->type_annotation();
+            // Use resolved type if available, otherwise fall back to type annotation
+            if (params[i]->get_resolved_type().is_valid())
+            {
+                _output << params[i]->get_resolved_type()->display_name();
+            }
+            else if (params[i]->type_annotation())
+            {
+                _output << params[i]->type_annotation()->to_string();
+            }
+            else
+            {
+                _output << "<unresolved>";
+            }
         }
 
-        _output << ") -> " << node.return_type_annotation() << "'";
+        // Use resolved return type if available, otherwise fall back to type annotation
+        _output << ") -> ";
+        if (node.get_resolved_return_type().is_valid())
+        {
+            _output << node.get_resolved_return_type()->display_name();
+        }
+        else if (node.return_type_annotation())
+        {
+            _output << node.return_type_annotation()->to_string();
+        }
+        else
+        {
+            _output << "<unresolved>";
+        }
+        _output << "'";
         if (_use_colors)
             _output << Colors::RESET;
 
