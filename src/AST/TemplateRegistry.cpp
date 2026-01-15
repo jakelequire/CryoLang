@@ -265,13 +265,13 @@ namespace Cryo
 
     void TemplateRegistry::register_method_return_type(const std::string &qualified_method_name, TypeRef return_type)
     {
-        if (qualified_method_name.empty() || !return_type)
+        if (qualified_method_name.empty() || !return_type.is_valid())
             return;
 
         _method_return_types[qualified_method_name] = return_type;
         LOG_DEBUG(Cryo::LogComponent::AST,
                   "Registered method return type: {} -> {}",
-                  qualified_method_name, return_type->to_string());
+                  qualified_method_name, return_type.get()->display_name());
     }
 
     TypeRef TemplateRegistry::get_method_return_type(const std::string &qualified_method_name) const
@@ -281,10 +281,10 @@ namespace Cryo
         {
             LOG_TRACE(Cryo::LogComponent::AST,
                       "Found method return type: {} -> {}",
-                      qualified_method_name, it->second->to_string());
+                      qualified_method_name, it->second.get()->display_name());
             return it->second;
         }
-        return nullptr;
+        return TypeRef{};
     }
 
     bool TemplateRegistry::has_method_return_type(const std::string &qualified_method_name) const

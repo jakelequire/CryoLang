@@ -558,7 +558,7 @@ namespace Cryo
         _output << " ";
         if (_use_colors)
             _output << Colors::TYPE;
-        _output << "'" << (node.get_resolved_type() ? node.get_resolved_type()->to_string() : "unknown") << "'";
+        _output << "'" << (node.get_resolved_type().is_valid() ? node.get_resolved_type().get()->display_name() : "unknown") << "'";
         if (_use_colors)
             _output << Colors::RESET;
 

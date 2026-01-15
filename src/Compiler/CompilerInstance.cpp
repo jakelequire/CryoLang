@@ -1609,7 +1609,7 @@ namespace Cryo
                 else if (_debug_mode)
                 {
                     LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added constant '{}' to scope '{}' with type '{}'",
-                              var_decl->name(), scope_name, var_type ? var_type->to_string() : "null");
+                              var_decl->name(), scope_name, var_type.is_valid() ? var_type.get()->display_name() : "null");
                 }
             }
             // Skip mutable variables - they will be handled by TypeChecker
