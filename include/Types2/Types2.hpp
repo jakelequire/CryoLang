@@ -28,3 +28,8 @@
 #include "Types2/UserDefinedTypes.hpp"
 #include "Types2/GenericTypes.hpp"
 #include "Types2/ErrorType.hpp"
+
+// Resolution infrastructure (Phase 2)
+#include "Types2/ModuleTypeRegistry.hpp"
+#include "Types2/GenericRegistry.hpp"
+#include "Types2/TypeResolver.hpp"
