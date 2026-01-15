@@ -373,37 +373,4 @@ namespace Cryo
         return oss.str();
     }
 
-    // ========================================================================
-    // Utility Functions
-    // ========================================================================
-
-    std::vector<MonomorphRequest> collect_instantiation_requests(
-        const ProgramNode &program,
-        const GenericRegistry &generics)
-    {
-        std::vector<MonomorphRequest> requests;
-
-        // Collect pending from registry
-        for (const auto &pending : generics.pending_instantiations())
-        {
-            MonomorphRequest req;
-            req.generic_type = pending.generic_type;
-            req.type_args = pending.type_args;
-            req.location = pending.location;
-            req.source_module = ModuleID::invalid();
-
-            requests.push_back(std::move(req));
-        }
-
-        // TODO: Also scan AST for instantiation sites
-        // This would involve traversing the AST and finding:
-        // - NewExpressionNode with generic types
-        // - Function calls with generic parameters
-        // - Variable declarations with generic types
-
-        (void)program; // Will be used when AST scanning is implemented
-
-        return requests;
-    }
-
 } // namespace Cryo
