@@ -2,7 +2,7 @@
 
 #include "LSPTypes.hpp"
 #include "Compiler/CompilerInstance.hpp"
-#include "GDM/GDM.hpp"
+#include "Diagnostics/Diag.hpp"
 #include <vector>
 #include <string>
 #include <memory>
@@ -37,14 +37,14 @@ namespace CryoLSP
         Cryo::CompilerInstance *_compiler;
 
         // Diagnostic conversion
-        std::vector<Diagnostic> convert_compiler_diagnostics(const std::vector<Cryo::DiagnosticManager::LSPDiagnostic> &compiler_diagnostics);
-        Diagnostic convert_single_diagnostic(const Cryo::DiagnosticManager::LSPDiagnostic &compiler_diag);
+        std::vector<Diagnostic> convert_compiler_diagnostics(const std::vector<Cryo::DiagEmitter::LspDiagnostic> &compiler_diagnostics);
+        Diagnostic convert_single_diagnostic(const Cryo::DiagEmitter::LspDiagnostic &compiler_diag);
 
         // Severity mapping
         DiagnosticSeverity map_compiler_severity(const std::string &severity);
 
         // Range calculation
-        Range calculate_diagnostic_range(const Cryo::DiagnosticManager::LSPDiagnostic &diag, const std::string &content);
+        Range calculate_diagnostic_range(const Cryo::DiagEmitter::LspDiagnostic &diag, const std::string &content);
         Position calculate_position_from_line_column(size_t line, size_t column);
 
         // Additional diagnostics

@@ -6,8 +6,7 @@
 #include "AST/ASTContext.hpp"
 #include "Types/Types.hpp"
 #include "AST/DirectiveSystem.hpp"
-#include "GDM/GDM.hpp"
-#include "GDM/DiagnosticBuilders.hpp"
+#include "Diagnostics/Diag.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 #include <memory>
 #include <vector>
@@ -35,9 +34,8 @@ namespace Cryo
         ASTBuilder _builder;
         Token _current_token;
         std::vector<ParseError> _errors;
-        DiagnosticManager *_diagnostic_manager;
+        DiagEmitter *_diagnostics;
         std::string _source_file;
-        std::unique_ptr<ParserDiagnosticBuilder> _diagnostic_builder;
 
         // Context tracking
         bool _in_implementation_block = false;
@@ -64,7 +62,7 @@ namespace Cryo
 
     public:
         Parser(std::unique_ptr<Lexer> lexer, ASTContext &context);
-        Parser(std::unique_ptr<Lexer> lexer, ASTContext &context, DiagnosticManager *diagnostic_manager, const std::string &source_file);
+        Parser(std::unique_ptr<Lexer> lexer, ASTContext &context, DiagEmitter *diagnostics, const std::string &source_file);
 
         // Main parsing entry point
         std::unique_ptr<ProgramNode> parse_program();
@@ -109,9 +107,9 @@ namespace Cryo
         void report_enhanced_token_error(TokenKind expected, const std::string &context_message);
         ErrorCode get_token_error_code(TokenKind expected);
         std::string get_token_name(TokenKind kind);
-        void add_token_mismatch_suggestions(Diagnostic &diagnostic, TokenKind expected, TokenKind actual, const std::string &context);
-        void add_context_spans(Diagnostic &diagnostic, TokenKind expected);
-        void add_generic_parsing_suggestions(Diagnostic &diagnostic, const std::string &message);
+        void add_token_mismatch_suggestions(Diag &diagnostic, TokenKind expected, TokenKind actual, const std::string &context);
+        void add_context_spans(Diag &diagnostic, TokenKind expected);
+        void add_generic_parsing_suggestions(Diag &diagnostic, const std::string &message);
 
         // Token management
         void advance();

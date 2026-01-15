@@ -7,7 +7,7 @@
 #include "Codegen/FunctionRegistry.hpp"
 #include "Types/SymbolTable.hpp"
 #include "AST/TemplateRegistry.hpp"
-#include "GDM/DiagnosticBuilders.hpp"
+#include "Diagnostics/Diag.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 
 #include <llvm/IR/Value.h>
@@ -120,7 +120,7 @@ namespace Cryo::Codegen
         CodegenContext(
             LLVMContextManager &llvm_ctx,
             Cryo::SymbolTable &symbols,
-            Cryo::DiagnosticManager *diagnostics);
+            Cryo::DiagEmitter *diagnostics);
 
         /**
          * @brief Set the visitor for AST traversal dispatch
@@ -208,11 +208,8 @@ namespace Cryo::Codegen
         // Error Reporting
         //===================================================================
 
-        /** @brief Get diagnostic manager (may be null) */
-        Cryo::DiagnosticManager *diagnostics() { return _diagnostics; }
-
-        /** @brief Get diagnostic builder (may be null) */
-        CodegenDiagnosticBuilder *diagnostic_builder() { return _diagnostic_builder.get(); }
+        /** @brief Get diagnostic emitter (may be null) */
+        Cryo::DiagEmitter *diagnostics() { return _diagnostics; }
 
         /** @brief Report an error with node context */
         void report_error(ErrorCode code, Cryo::ASTNode *node, const std::string &msg);
@@ -367,7 +364,7 @@ namespace Cryo::Codegen
 
         LLVMContextManager &_llvm;
         Cryo::SymbolTable &_symbols;
-        Cryo::DiagnosticManager *_diagnostics;
+        Cryo::DiagEmitter *_diagnostics;
         CodegenVisitor *_visitor = nullptr;
         Cryo::TemplateRegistry *_template_registry = nullptr;
 
@@ -379,7 +376,6 @@ namespace Cryo::Codegen
         std::unique_ptr<ValueContext> _value_context;
         std::unique_ptr<FunctionRegistry> _function_registry;
         std::unique_ptr<Intrinsics> _intrinsics;
-        std::unique_ptr<CodegenDiagnosticBuilder> _diagnostic_builder;
 
         // Symbol Resolution
         std::unique_ptr<Cryo::SRM::SymbolResolutionContext> _srm_context;

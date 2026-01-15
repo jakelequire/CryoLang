@@ -19,13 +19,13 @@ namespace CryoLSP
         }
 
         // Get diagnostics from compiler
-        auto diagnostic_manager = _compiler->diagnostic_manager();
-        if (!diagnostic_manager)
+        auto diag_emitter = _compiler->diagnostics();
+        if (!diag_emitter)
         {
             return diagnostics;
         }
 
-        auto lsp_diagnostics = diagnostic_manager->get_lsp_diagnostics();
+        auto lsp_diagnostics = diag_emitter->to_lsp();
         diagnostics = convert_compiler_diagnostics(lsp_diagnostics);
 
         return diagnostics;
@@ -38,10 +38,10 @@ namespace CryoLSP
             return;
         }
 
-        auto diagnostic_manager = _compiler->diagnostic_manager();
-        if (diagnostic_manager)
+        auto diag_emitter = _compiler->diagnostics();
+        if (diag_emitter)
         {
-            diagnostic_manager->clear_lsp_diagnostics();
+            diag_emitter->clear();
         }
     }
 
@@ -73,7 +73,7 @@ namespace CryoLSP
     }
 
     std::vector<Diagnostic> DiagnosticsProvider::convert_compiler_diagnostics(
-        const std::vector<Cryo::DiagnosticManager::LSPDiagnostic> &compiler_diagnostics)
+        const std::vector<Cryo::DiagEmitter::LspDiagnostic> &compiler_diagnostics)
     {
 
         std::vector<Diagnostic> diagnostics;
@@ -86,15 +86,15 @@ namespace CryoLSP
         return diagnostics;
     }
 
-    Diagnostic DiagnosticsProvider::convert_single_diagnostic(const Cryo::DiagnosticManager::LSPDiagnostic &compiler_diag)
+    Diagnostic DiagnosticsProvider::convert_single_diagnostic(const Cryo::DiagEmitter::LspDiagnostic &compiler_diag)
     {
         Diagnostic diagnostic;
 
         // Convert position information
-        diagnostic.range.start.line = static_cast<int>(compiler_diag.line) - 1; // Convert to 0-based
-        diagnostic.range.start.character = static_cast<int>(compiler_diag.column) - 1;
+        diagnostic.range.start.line = static_cast<int>(compiler_diag.start_line) - 1; // Convert to 0-based
+        diagnostic.range.start.character = static_cast<int>(compiler_diag.start_col) - 1;
         diagnostic.range.end.line = static_cast<int>(compiler_diag.end_line) - 1;
-        diagnostic.range.end.character = static_cast<int>(compiler_diag.end_column) - 1;
+        diagnostic.range.end.character = static_cast<int>(compiler_diag.end_col) - 1;
 
         // Convert severity
         diagnostic.severity = map_compiler_severity(compiler_diag.severity);
@@ -131,15 +131,15 @@ namespace CryoLSP
         }
     }
 
-    Range DiagnosticsProvider::calculate_diagnostic_range(const Cryo::DiagnosticManager::LSPDiagnostic &diag, const std::string &content)
+    Range DiagnosticsProvider::calculate_diagnostic_range(const Cryo::DiagEmitter::LspDiagnostic &diag, const std::string &content)
     {
         Range range;
 
         // Convert line/column to 0-based positions
-        range.start.line = static_cast<int>(diag.line) - 1;
-        range.start.character = static_cast<int>(diag.column) - 1;
+        range.start.line = static_cast<int>(diag.start_line) - 1;
+        range.start.character = static_cast<int>(diag.start_col) - 1;
         range.end.line = static_cast<int>(diag.end_line) - 1;
-        range.end.character = static_cast<int>(diag.end_column) - 1;
+        range.end.character = static_cast<int>(diag.end_col) - 1;
 
         // Validate ranges
         if (range.start.line < 0)

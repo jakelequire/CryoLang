@@ -8,8 +8,8 @@
 #include <optional>
 #include "AST/ASTNode.hpp"
 #include "Lexer/lexer.hpp"
-#include "GDM/ErrorCodes.hpp"
-#include "GDM/GDM.hpp"
+#include "Diagnostics/ErrorCodes.hpp"
+#include "Diagnostics/Diag.hpp"
 
 // Forward declarations
 namespace Cryo

@@ -19,7 +19,7 @@ namespace Cryo
                                TypeResolver &resolver,
                                ModuleTypeRegistry &modules,
                                GenericRegistry &generics,
-                               DiagnosticManager *diag)
+                               DiagEmitter *diag)
         : _arena(arena),
           _resolver(resolver),
           _modules(modules),
@@ -911,14 +911,14 @@ namespace Cryo
 
     void TypeChecker::report_error(const std::string &message, const SourceLocation &loc)
     {
-        // TODO: Integrate with DiagnosticManager when available
+        // TODO: Integrate with DiagEmitter when available
         (void)message;
         (void)loc;
     }
 
     void TypeChecker::report_warning(const std::string &message, const SourceLocation &loc)
     {
-        // TODO: Integrate with DiagnosticManager when available
+        // TODO: Integrate with DiagEmitter when available
         (void)message;
         (void)loc;
     }

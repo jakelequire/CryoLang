@@ -33,7 +33,7 @@
 namespace Cryo
 {
     // Forward declarations
-    class DiagnosticManager;
+    class DiagEmitter;
 
     /**************************************************************************
      * @brief Type compatibility result
@@ -128,7 +128,7 @@ namespace Cryo
         TypeResolver &_resolver;
         ModuleTypeRegistry &_modules;
         GenericRegistry &_generics;
-        DiagnosticManager *_diagnostics;
+        DiagEmitter *_diagnostics;
 
     public:
         // ====================================================================
@@ -139,7 +139,7 @@ namespace Cryo
                      TypeResolver &resolver,
                      ModuleTypeRegistry &modules,
                      GenericRegistry &generics,
-                     DiagnosticManager *diag = nullptr);
+                     DiagEmitter *diag = nullptr);
 
         ~TypeChecker() = default;
 

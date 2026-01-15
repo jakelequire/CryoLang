@@ -2,7 +2,7 @@
 
 #include "Compiler/CompilerInstance.hpp"
 #include "Types/TypeChecker.hpp"
-#include "GDM/GDM.hpp"
+#include "Diagnostics/Diag.hpp"
 #include "Utils/Logger.hpp"
 #include "LSPTypes.hpp"
 #include "DocumentManager.hpp"

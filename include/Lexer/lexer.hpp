@@ -19,8 +19,8 @@ namespace Cryo
     class Token;
     class SourceLocation;
     class Lexer;
-    class DiagnosticManager;
-    class Diagnostic;
+    class DiagEmitter;
+    class Diag;
     enum class ErrorCode : uint32_t;
 
     // ================================================================
@@ -107,6 +107,20 @@ namespace Cryo
     };
 
     // ================================================================
+    // Source Range
+    // ================================================================
+
+    struct SourceRange
+    {
+        SourceLocation start;
+        SourceLocation end;
+
+        SourceRange() = default;
+        SourceRange(const SourceLocation &loc) : start(loc), end(loc) {}
+        SourceRange(const SourceLocation &s, const SourceLocation &e) : start(s), end(e) {}
+    };
+
+    // ================================================================
     // Token Class
     // ================================================================
 
@@ -170,7 +184,7 @@ namespace Cryo
         std::optional<Token> _peeked_token;
 
         // Diagnostic reporting
-        DiagnosticManager *_diagnostic_manager;
+        DiagEmitter *_diagnostics;
         std::string _source_file;
 
         // String pool for processed string literals
@@ -182,11 +196,11 @@ namespace Cryo
     public:
         // Constructors
         explicit Lexer(std::unique_ptr<File> file);
-        Lexer(std::unique_ptr<File> file, DiagnosticManager *diagnostic_manager, const std::string &source_file);
+        Lexer(std::unique_ptr<File> file, DiagEmitter *diagnostic_manager, const std::string &source_file);
 
         // Constructor for spot lexing from string content
         explicit Lexer(const std::string &content);
-        Lexer(const std::string &content, DiagnosticManager *diagnostic_manager, const std::string &source_file);
+        Lexer(const std::string &content, DiagEmitter *diagnostic_manager, const std::string &source_file);
 
         // Destructor
         ~Lexer() = default;

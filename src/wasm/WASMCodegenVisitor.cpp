@@ -20,8 +20,8 @@ namespace Cryo::WASM
     WASMCodegenVisitor::WASMCodegenVisitor(
         Cryo::Codegen::LLVMContextManager& context_manager,
         Cryo::SymbolTable& symbol_table,
-        Cryo::DiagnosticManager* gdm)
-        : Cryo::Codegen::CodegenVisitor(context_manager, symbol_table, gdm)
+        Cryo::DiagEmitter* diagnostics)
+        : Cryo::Codegen::CodegenVisitor(context_manager, symbol_table, diagnostics)
     {
         initialize_wasm_types();
         setup_wasm_runtime_functions();
