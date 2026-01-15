@@ -3,11 +3,12 @@
 #include <vector>
 #include <unordered_map>
 
+#include "AST/Type.hpp"       // For TypeContext alias
+#include "AST/SymbolTable.hpp" // For SymbolTable alias
+
 namespace Cryo
 {
     class ASTNode;
-    class SymbolTable;
-    class TypeContext;
 
     class ASTContext
     {

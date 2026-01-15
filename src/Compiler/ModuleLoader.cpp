@@ -581,7 +581,7 @@ namespace Cryo
                         Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_decl->location(), intrinsic_type, module_name);
                         symbol_map[intrinsic_decl->name()] = symbol;
                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added intrinsic '{}' to symbol map with type '{}'",
-                                  intrinsic_decl->name(), intrinsic_type->to_string());
+                                  intrinsic_decl->name(), intrinsic_type.get()->display_name());
                     }
                     else
                     {
@@ -651,7 +651,7 @@ namespace Cryo
         // Get return type
         TypeRef return_type;
         return_type = func_decl->get_resolved_return_type();
-        const std::string &return_type_str = return_type ? return_type->to_string() : "void";
+        const std::string &return_type_str = return_type.is_valid() ? return_type.get()->display_name() : "void";
         if (!return_type || return_type_str == "void")
         {
             // Default to void for functions without explicit return type or explicit void
@@ -669,7 +669,7 @@ namespace Cryo
             }
             else
             {
-                const std::string &param_type_str = param_type ? param_type->to_string() : "unknown";
+                const std::string &param_type_str = param_type.is_valid() ? param_type.get()->display_name() : "unknown";
                 std::cerr << "Warning: Failed to get resolved type for parameter '" << param->name()
                           << "' (type: " << param_type_str << ") in function '" << func_decl->name() << "'" << std::endl;
                 return nullptr;
@@ -693,7 +693,7 @@ namespace Cryo
         // Get return type
         TypeRef return_type;
         return_type = intrinsic_decl->get_resolved_return_type();
-        const std::string &return_type_str = return_type ? return_type->to_string() : "void";
+        const std::string &return_type_str = return_type.is_valid() ? return_type.get()->display_name() : "void";
 
         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Intrinsic '{}' has_resolved_return_type={}, return_type_str='{}'",
                   intrinsic_name, intrinsic_decl->has_resolved_return_type(), return_type_str);
@@ -729,7 +729,7 @@ namespace Cryo
         if (func_type)
         {
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Successfully created function type for intrinsic '{}': {}",
-                      intrinsic_name, func_type->to_string());
+                      intrinsic_name, func_type.get()->display_name());
         }
         else
         {
@@ -867,7 +867,7 @@ namespace Cryo
                                 TypeRef field_type = field->get_resolved_type();
                                 if (field_type)
                                 {
-                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' has resolved type: {}", field->name(), field_type->to_string());
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' has resolved type: {}", field->name(), field_type.get()->display_name());
                                     field_types.push_back(field_type);
                                 }
                                 else
@@ -878,7 +878,7 @@ namespace Cryo
                                     field_type = resolve_primitive_type(type_str, _ast_context.types());
                                     if (field_type)
                                     {
-                                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' to primitive type: {}", type_str, field_type->to_string());
+                                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' to primitive type: {}", type_str, field_type.get()->display_name());
                                         field_types.push_back(field_type);
                                     }
                                     else
@@ -889,7 +889,7 @@ namespace Cryo
                                         // Note: get_struct_type auto-creates the struct type if it doesn't exist
                                         if (field_type)
                                         {
-                                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' from TypeContext: {}", type_str, field_type->to_string());
+                                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' from TypeContext: {}", type_str, field_type.get()->display_name());
                                         }
                                         else
                                         {

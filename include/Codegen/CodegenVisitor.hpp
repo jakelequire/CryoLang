@@ -14,10 +14,7 @@
 #include <vector>
 #include <unordered_map>
 
-namespace Cryo
-{
-    class TypeChecker;
-}
+// TypeChecker is included via AST/TypeChecker.hpp which is part of AST/ASTNode.hpp
 
 namespace Cryo::Codegen
 {

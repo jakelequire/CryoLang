@@ -713,7 +713,7 @@ namespace Cryo
               _name(std::move(name)), _initializer(std::move(init)),
               _is_mutable(is_mutable), _is_global(is_global), _resolved_type(resolved_type)
         {
-            _is_auto = (resolved_type == nullptr); // Auto if no type provided
+            _is_auto = !resolved_type.is_valid(); // Auto if no type provided
         }
 
         const std::string &name() const { return _name; }
@@ -728,7 +728,7 @@ namespace Cryo
         void set_resolved_type(TypeRef type)
         {
             _resolved_type = type;
-            _is_auto = (type == nullptr);
+            _is_auto = !type.is_valid();
         }
         bool has_resolved_type() const { return _resolved_type.is_valid(); }
 
@@ -822,9 +822,9 @@ namespace Cryo
                 if (i > 0)
                     os << ", ";
                 if (_parameters[i])
-                    os << (_parameters[i]->get_resolved_type() ? _parameters[i].get_resolved_type().get()->display_name() : "unknown") << " " << _parameters[i]->name();
+                    os << (_parameters[i]->get_resolved_type().is_valid() ? _parameters[i]->get_resolved_type().get()->display_name() : "unknown") << " " << _parameters[i]->name();
             }
-            os << ") -> " << (_resolved_return_type ? _resolved_return_type.get()->display_name() : "void") << std::endl;
+            os << ") -> " << (_resolved_return_type.is_valid() ? _resolved_return_type.get()->display_name() : "void") << std::endl;
 
             if (!_parameters.empty())
             {
@@ -1074,7 +1074,7 @@ namespace Cryo
                 try
                 {
                     type_str = _resolved_return_type.get()->display_name();
-                    type_name = _resolved_return_type->name();
+                    type_name = type_str; // Use same display_name for both
                 }
                 catch (...)
                 {
@@ -1082,10 +1082,10 @@ namespace Cryo
                     type_name = "void";
                 }
 
-                // Safety check: if to_string() returns empty, fall back to the name
-                if (type_str.empty() && !type_name.empty())
+                // Safety check: if display_name() returns empty, fall back to default
+                if (type_str.empty())
                 {
-                    return type_name;
+                    return "void";
                 }
                 // If both are empty, this means the type resolution failed during parsing
                 // Return a placeholder that the TypeChecker can properly resolve
@@ -1139,11 +1139,11 @@ namespace Cryo
                 if (i > 0)
                     os << ", ";
                 if (_parameters[i])
-                    os << (_parameters[i]->get_resolved_type() ? _parameters[i].get_resolved_type().get()->display_name() : "unknown") << " " << _parameters[i]->name();
+                    os << (_parameters[i]->get_resolved_type().is_valid() ? _parameters[i]->get_resolved_type().get()->display_name() : "unknown") << " " << _parameters[i]->name();
             }
             if (_is_variadic)
                 os << "...";
-            os << ") -> " << (_resolved_return_type ? _resolved_return_type.get()->display_name() : "void") << std::endl;
+            os << ") -> " << (_resolved_return_type.is_valid() ? _resolved_return_type.get()->display_name() : "void") << std::endl;
 
             if (!_parameters.empty())
             {

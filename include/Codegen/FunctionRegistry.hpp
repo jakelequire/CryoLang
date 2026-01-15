@@ -17,9 +17,7 @@ namespace llvm
 
 namespace Cryo
 {
-    class SymbolTable;
-    class TypeContext;
-    class Type;
+    // Type, SymbolTable, TypeContext are included via SymbolResolutionManager.hpp
     class FunctionType;
 }
 

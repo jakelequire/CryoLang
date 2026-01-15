@@ -8,6 +8,7 @@
 #include <functional>
 #include <optional>
 #include <string_view>
+#include <iostream>
 
 #include "AST/Type.hpp"
 #include "AST/SymbolTable.hpp"
