@@ -1,5 +1,4 @@
-#include "GDM/ErrorCodes.hpp"
-#include "GDM/GDM.hpp"
+#include "Diagnostics/ErrorCodes.hpp"
 #include <unordered_map>
 
 namespace Cryo

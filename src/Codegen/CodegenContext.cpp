@@ -1,4 +1,5 @@
 #include "Codegen/CodegenContext.hpp"
+#include "Diagnostics/Diag.hpp"
 #include "Utils/Logger.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 #include <sstream>
@@ -12,7 +13,7 @@ namespace Cryo::Codegen
     CodegenContext::CodegenContext(
         LLVMContextManager &llvm_ctx,
         Cryo::SymbolTable &symbols,
-        Cryo::DiagnosticManager *diagnostics)
+        Cryo::DiagEmitter *diagnostics)
         : _llvm(llvm_ctx),
           _symbols(symbols),
           _diagnostics(diagnostics),
@@ -20,7 +21,6 @@ namespace Cryo::Codegen
           _value_context(std::make_unique<ValueContext>()),
           _function_registry(std::make_unique<FunctionRegistry>(symbols, symbols.arena())),
           _intrinsics(std::make_unique<Intrinsics>(llvm_ctx, diagnostics)),
-          _diagnostic_builder(diagnostics ? std::make_unique<CodegenDiagnosticBuilder>(diagnostics, "") : nullptr),
           _srm_context(std::make_unique<Cryo::SRM::SymbolResolutionContext>(&symbols.arena())),
           _srm_manager(std::make_unique<Cryo::SRM::SymbolResolutionManager>(_srm_context.get())),
           _current_node(nullptr),
@@ -39,9 +39,14 @@ namespace Cryo::Codegen
         _has_errors = true;
         _last_error = msg;
 
-        if (_diagnostic_builder)
+        if (_diagnostics)
         {
-            _diagnostic_builder->report_error(code, node, msg);
+            auto diag = Diag::error(code, msg);
+            if (node)
+            {
+                diag.at(node);
+            }
+            _diagnostics->emit(std::move(diag));
         }
         else
         {
@@ -54,9 +59,9 @@ namespace Cryo::Codegen
         _has_errors = true;
         _last_error = msg;
 
-        if (_diagnostic_builder)
+        if (_diagnostics)
         {
-            _diagnostic_builder->report_error(code, msg);
+            _diagnostics->emit(Diag::error(code, msg));
         }
         else
         {
@@ -152,12 +157,6 @@ namespace Cryo::Codegen
     {
         _source_file = source_file;
         _namespace_context = namespace_ctx;
-
-        // Update diagnostic builder with new source file
-        if (_diagnostics)
-        {
-            _diagnostic_builder = std::make_unique<CodegenDiagnosticBuilder>(_diagnostics, source_file);
-        }
 
         // Sync SRM context with namespace
         // Parse namespace_ctx (e.g., "std::Runtime") and push to SRM stack

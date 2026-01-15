@@ -4,7 +4,7 @@
 #include "AST/ASTContext.hpp"
 #include "Types/SymbolTable.hpp"
 #include "Types/TypeChecker.hpp"
-#include "GDM/GDM.hpp"
+#include "Diagnostics/Diag.hpp"
 #include "Codegen/LLVMContext.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Codegen/TargetConfig.hpp"
@@ -62,7 +62,7 @@ namespace Cryo::Codegen
             Cryo::ASTContext &ast_context,
             Cryo::SymbolTable &symbol_table,
             const std::string &namespace_name = "",
-            Cryo::DiagnosticManager* gdm = nullptr);
+            Cryo::DiagEmitter* diagnostics = nullptr);
 
         ~CodeGenerator();
 
@@ -228,7 +228,7 @@ namespace Cryo::Codegen
         // Frontend context references
         Cryo::ASTContext &_ast_context;
         Cryo::SymbolTable &_symbol_table;
-        Cryo::DiagnosticManager* _gdm;
+        Cryo::DiagEmitter* _diagnostics;
 
         // Compilation state
         std::string _module_name;
@@ -303,14 +303,14 @@ namespace Cryo::Codegen
      * @param ast_context Reference to AST context
      * @param symbol_table Reference to symbol table  
      * @param namespace_name Module namespace name
-     * @param gdm Diagnostic manager for error reporting
+     * @param diagnostics Diagnostic manager for error reporting
      * @return Unique pointer to CodeGenerator instance
      */
     std::unique_ptr<CodeGenerator> create_default_codegen(
         Cryo::ASTContext &ast_context,
         Cryo::SymbolTable &symbol_table,
         const std::string &namespace_name,
-        Cryo::DiagnosticManager* gdm);
+        Cryo::DiagEmitter* diagnostics);
 
     /**
      * @brief Create a CodeGenerator for specific target

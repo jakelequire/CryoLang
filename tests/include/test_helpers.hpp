@@ -210,7 +210,7 @@ public:
     Cryo::CompilerInstance* get_compiler() const { return compiler.get(); }
     Cryo::ASTContext* get_ast_context() const { return compiler ? compiler->ast_context() : nullptr; }
     Cryo::SymbolTable* get_symbol_table() const { return compiler ? compiler->symbol_table() : nullptr; }
-    Cryo::DiagnosticManager* get_diagnostics() const { return compiler ? compiler->diagnostic_manager() : nullptr; }
+    Cryo::DiagEmitter* get_diagnostics() const { return compiler ? compiler->diagnostics() : nullptr; }
 };
 
 /**

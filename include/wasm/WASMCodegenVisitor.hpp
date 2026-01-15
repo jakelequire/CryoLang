@@ -27,7 +27,7 @@ namespace Cryo::WASM
         WASMCodegenVisitor(
             Cryo::Codegen::LLVMContextManager& context_manager,
             Cryo::SymbolTable& symbol_table,
-            Cryo::DiagnosticManager* gdm = nullptr
+            Cryo::DiagEmitter* diagnostics = nullptr
         );
 
         ~WASMCodegenVisitor() override = default;

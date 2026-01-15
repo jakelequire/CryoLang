@@ -6,7 +6,7 @@
 #include "Types/TypeChecker.hpp"
 #include "Codegen/LLVMContext.hpp"
 #include "Codegen/CodegenContext.hpp"
-#include "GDM/DiagnosticBuilders.hpp"
+#include "Diagnostics/Diag.hpp"
 
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Function.h>
@@ -56,7 +56,7 @@ namespace Cryo::Codegen
         CodegenVisitor(
             LLVMContextManager &context_manager,
             Cryo::SymbolTable &symbol_table,
-            Cryo::DiagnosticManager *gdm = nullptr);
+            Cryo::DiagEmitter *diagnostics = nullptr);
 
         ~CodegenVisitor();
 
