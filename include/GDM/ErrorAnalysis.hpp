@@ -49,14 +49,14 @@ namespace Cryo
             std::string current_function;
             std::string current_namespace;
             std::string current_class;
-            const Type *expected_return_type = nullptr;
+            TypeRef expected_return_type = nullptr;
             const SymbolTable *current_scope = nullptr;
             std::vector<std::string> available_symbols;
-            std::unordered_map<std::string, const Type *> available_types;
+            std::unordered_map<std::string, TypeRef> available_types;
 
             CompilerContext() = default;
 
-            void set_function_context(const std::string &function_name, const Type *return_type);
+            void set_function_context(const std::string &function_name, TypeRef return_type);
             void set_class_context(const std::string &class_name);
             void set_namespace_context(const std::string &namespace_name);
             void update_scope(const SymbolTable *scope);
@@ -71,8 +71,8 @@ namespace Cryo
          */
         struct TypeMismatchAnalysis
         {
-            const Type *expected_type;
-            const Type *actual_type;
+            TypeRef expected_type;
+            TypeRef actual_type;
             std::string context;
             std::vector<std::string> suggestions;
             std::vector<std::string> help_messages;
@@ -80,7 +80,7 @@ namespace Cryo
             bool can_cast;
             bool likely_typo;
 
-            TypeMismatchAnalysis(const Type *expected, const Type *actual, const std::string &ctx);
+            TypeMismatchAnalysis(TypeRef expected, TypeRef actual, const std::string &ctx);
 
             // Analyze and generate suggestions
             void analyze();
@@ -118,7 +118,7 @@ namespace Cryo
 
         // Context management
         void update_context(const CompilerContext &context);
-        void set_function_context(const std::string &function_name, const Type *return_type);
+        void set_function_context(const std::string &function_name, TypeRef return_type);
         void set_class_context(const std::string &class_name);
         void set_namespace_context(const std::string &namespace_name);
         void update_scope(const SymbolTable *scope);
@@ -126,8 +126,8 @@ namespace Cryo
         // Advanced diagnostic creation
         Diagnostic create_type_mismatch_diagnostic(
             const SourceSpan &error_span,
-            const Type *expected_type,
-            const Type *actual_type,
+            TypeRef expected_type,
+            TypeRef actual_type,
             const std::string &context);
 
         Diagnostic create_undefined_symbol_diagnostic(
@@ -138,24 +138,24 @@ namespace Cryo
         Diagnostic create_invalid_operation_diagnostic(
             const SourceSpan &error_span,
             const std::string &operation,
-            const Type *left_type,
-            const Type *right_type = nullptr);
+            TypeRef left_type,
+            TypeRef right_type = nullptr);
 
         Diagnostic create_field_access_diagnostic(
             const SourceSpan &error_span,
             const std::string &field_name,
-            const Type *struct_type);
+            TypeRef struct_type);
 
         Diagnostic create_function_call_diagnostic(
             const SourceSpan &error_span,
             const std::string &function_name,
-            const std::vector<const Type *> &provided_args,
-            const std::vector<const Type *> &expected_args);
+            const std::vector<TypeRef> &provided_args,
+            const std::vector<TypeRef> &expected_args);
 
         // Advanced analysis methods
         TypeMismatchAnalysis analyze_type_mismatch(
-            const Type *expected,
-            const Type *actual,
+            TypeRef expected,
+            TypeRef actual,
             const std::string &context);
 
         UndefinedSymbolAnalysis analyze_undefined_symbol(
@@ -172,9 +172,9 @@ namespace Cryo
             const std::string &target_type_name,
             size_t max_suggestions = 3);
 
-        bool can_suggest_conversion(const Type *from, const Type *to);
-        bool can_suggest_cast(const Type *from, const Type *to);
-        bool are_related_types(const Type *type1, const Type *type2);
+        bool can_suggest_conversion(TypeRef from, TypeRef to);
+        bool can_suggest_cast(TypeRef from, TypeRef to);
+        bool are_related_types(TypeRef type1, TypeRef type2);
 
         // String similarity for fuzzy matching
         static double calculate_similarity(const std::string &str1, const std::string &str2);
@@ -182,8 +182,8 @@ namespace Cryo
 
     private:
         // Helper methods for generating suggestions
-        std::vector<std::string> generate_conversion_suggestions(const Type *from, const Type *to);
-        std::vector<std::string> generate_cast_suggestions(const Type *from, const Type *to);
+        std::vector<std::string> generate_conversion_suggestions(TypeRef from, TypeRef to);
+        std::vector<std::string> generate_cast_suggestions(TypeRef from, TypeRef to);
         std::vector<std::string> generate_context_help(const std::string &context);
 
         // Caching for performance
@@ -201,17 +201,17 @@ namespace Cryo
     class TypeMismatchContext
     {
     private:
-        const Type *_expected_type;
-        const Type *_actual_type;
+        TypeRef _expected_type;
+        TypeRef _actual_type;
         std::string _context;
         ErrorAnalysis::TypeMismatchAnalysis _analysis;
 
     public:
-        TypeMismatchContext(const Type *expected, const Type *actual, const std::string &context);
+        TypeMismatchContext(TypeRef expected, TypeRef actual, const std::string &context);
 
         // Getters
-        const Type *expected_type() const { return _expected_type; }
-        const Type *actual_type() const { return _actual_type; }
+        TypeRef expected_type() const { return _expected_type; }
+        TypeRef actual_type() const { return _actual_type; }
         const std::string &context() const { return _context; }
         const ErrorAnalysis::TypeMismatchAnalysis &analysis() const { return _analysis; }
 

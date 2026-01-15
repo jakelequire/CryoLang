@@ -518,7 +518,7 @@ namespace Cryo
                 if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(decl))
                 {
                     // Create function symbol with proper type information
-                    Type *func_type = create_function_type_from_declaration(func_decl, type_context);
+                    TypeRef func_type = create_function_type_from_declaration(func_decl, type_context);
                     Symbol symbol(func_decl->name(), SymbolKind::Function, func_decl->location(), func_type, module_name);
                     symbol_map[func_decl->name()] = symbol;
                 }
@@ -542,7 +542,7 @@ namespace Cryo
                 }
                 else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(decl))
                 {
-                    Type *enum_type = nullptr;
+                    TypeRef enum_type = nullptr;
                     if (!enum_decl->generic_parameters().empty())
                     {
                         // For generic enums, try to get the parameterized enum template from TypeContext
@@ -575,7 +575,7 @@ namespace Cryo
                 else if (auto intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(decl))
                 {
                     // Create intrinsic symbol with proper type information (same as regular functions)
-                    Type *intrinsic_type = create_function_type_from_declaration(intrinsic_decl, type_context);
+                    TypeRef intrinsic_type = create_function_type_from_declaration(intrinsic_decl, type_context);
                     if (intrinsic_type)
                     {
                         Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_decl->location(), intrinsic_type, module_name);
@@ -641,7 +641,7 @@ namespace Cryo
         return _loading_modules.find(module_path) != _loading_modules.end();
     }
 
-    Type *ModuleLoader::create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeContext *type_context)
+    TypeRef ModuleLoader::create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeContext *type_context)
     {
         if (!func_decl || !type_context)
         {
@@ -649,7 +649,7 @@ namespace Cryo
         }
 
         // Get return type
-        Type *return_type = nullptr;
+        TypeRef return_type;
         return_type = func_decl->get_resolved_return_type();
         const std::string &return_type_str = return_type ? return_type->to_string() : "void";
         if (!return_type || return_type_str == "void")
@@ -662,7 +662,7 @@ namespace Cryo
         std::vector<Type *> parameter_types;
         for (const auto &param : func_decl->parameters())
         {
-            Type *param_type = param->get_resolved_type();
+            TypeRef param_type = param->get_resolved_type();
             if (param_type)
             {
                 parameter_types.push_back(param_type);
@@ -680,7 +680,7 @@ namespace Cryo
         return type_context->create_function_type(return_type, parameter_types);
     }
 
-    Type *ModuleLoader::create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeContext *type_context)
+    TypeRef ModuleLoader::create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeContext *type_context)
     {
         if (!intrinsic_decl || !type_context)
         {
@@ -691,7 +691,7 @@ namespace Cryo
         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Creating function type for intrinsic '{}'", intrinsic_name);
 
         // Get return type
-        Type *return_type = nullptr;
+        TypeRef return_type;
         return_type = intrinsic_decl->get_resolved_return_type();
         const std::string &return_type_str = return_type ? return_type->to_string() : "void";
 
@@ -709,7 +709,7 @@ namespace Cryo
         std::vector<Type *> parameter_types;
         for (const auto &param : intrinsic_decl->parameters())
         {
-            Type *param_type = param->get_resolved_type();
+            TypeRef param_type = param->get_resolved_type();
             if (param_type)
             {
                 parameter_types.push_back(param_type);
@@ -725,7 +725,7 @@ namespace Cryo
         }
 
         // Create FunctionType
-        Type *func_type = type_context->create_function_type(return_type, parameter_types);
+        TypeRef func_type = type_context->create_function_type(return_type, parameter_types);
         if (func_type)
         {
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Successfully created function type for intrinsic '{}': {}",
@@ -864,7 +864,7 @@ namespace Cryo
                             if (field)
                             {
                                 field_names.push_back(field->name());
-                                Type *field_type = field->get_resolved_type();
+                                TypeRef field_type = field->get_resolved_type();
                                 if (field_type)
                                 {
                                     LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' has resolved type: {}", field->name(), field_type->to_string());
@@ -969,7 +969,7 @@ namespace Cryo
                             {
                                 // Resolve the return type using TypeContext
                                 TypeContext &types = _ast_context.types();
-                                Type *return_type = resolve_primitive_type(return_type_str, types);
+                                TypeRef return_type = resolve_primitive_type(return_type_str, types);
                                 if (return_type)
                                 {
                                     std::string qualified_method_name = qualified_type + "::" + method->name();
@@ -993,13 +993,13 @@ namespace Cryo
     }
 
     // Helper to resolve primitive type annotations to Type objects
-    Type *ModuleLoader::resolve_primitive_type(const std::string &type_str, TypeContext &types)
+    TypeRef ModuleLoader::resolve_primitive_type(const std::string &type_str, TypeContext &types)
     {
         // Handle pointer types (e.g., "u8*", "i32*")
         if (type_str.size() > 1 && type_str.back() == '*')
         {
             std::string base_type_str = type_str.substr(0, type_str.size() - 1);
-            Type *base_type = resolve_primitive_type(base_type_str, types);
+            TypeRef base_type = resolve_primitive_type(base_type_str, types);
             if (base_type)
             {
                 return types.create_pointer_type(base_type);

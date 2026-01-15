@@ -60,7 +60,7 @@ namespace Cryo
         struct StructFieldInfo
         {
             std::vector<std::string> field_names;
-            std::vector<Type *> field_types;
+            std::vector<TypeRef> field_types;
         };
 
         // Method metadata extracted from AST at registration time
@@ -97,7 +97,7 @@ namespace Cryo
 
         // Method return type registry: fully qualified method name -> return type
         // Used for cross-module extern declarations when impl blocks aren't directly accessible
-        std::unordered_map<std::string, Type *> _method_return_types;
+        std::unordered_map<std::string, TypeRef> _method_return_types;
 
         // Struct field types registry: qualified struct name -> StructFieldInfo
         std::unordered_map<std::string, StructFieldInfo> _struct_field_types;
@@ -184,14 +184,14 @@ namespace Cryo
          * @param qualified_method_name Fully qualified method name (e.g., "std::core::option::Option::is_some")
          * @param return_type The method's return type
          */
-        void register_method_return_type(const std::string &qualified_method_name, Type *return_type);
+        void register_method_return_type(const std::string &qualified_method_name, TypeRef return_type);
 
         /**
          * @brief Get a method's return type for extern declaration creation
          * @param qualified_method_name Fully qualified method name
          * @return The return type, or nullptr if not registered
          */
-        Type *get_method_return_type(const std::string &qualified_method_name) const;
+        TypeRef get_method_return_type(const std::string &qualified_method_name) const;
 
         /**
          * @brief Check if a method's return type is registered
@@ -212,7 +212,7 @@ namespace Cryo
          */
         void register_struct_field_types(const std::string &qualified_struct_name,
                                          const std::vector<std::string> &field_names,
-                                         const std::vector<Type *> &field_types);
+                                         const std::vector<TypeRef> &field_types);
 
         /**
          * @brief Get a struct's field types for LLVM struct body definition

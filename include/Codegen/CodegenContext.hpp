@@ -307,7 +307,7 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::Value *> &enum_variants_map() { return _enum_variants; }
 
         /** @brief Get variable types map (Cryo types) */
-        std::unordered_map<std::string, Cryo::Type *> &variable_types_map() { return _variable_types; }
+        std::unordered_map<std::string, TypeRef> &variable_types_map() { return _variable_types; }
 
         //===================================================================
         // Source Context
@@ -412,7 +412,7 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::Type *> _global_types;
         std::unordered_map<std::string, llvm::Value *> _enum_variants;
         std::unordered_map<std::string, std::vector<std::string>> _enum_variant_fields;
-        std::unordered_map<std::string, Cryo::Type *> _variable_types;
+        std::unordered_map<std::string, TypeRef> _variable_types;
 
         // Struct field index mapping: type_name -> (field_name -> field_index)
         std::unordered_map<std::string, std::unordered_map<std::string, unsigned>> _struct_field_indices;
@@ -424,7 +424,7 @@ namespace Cryo::Codegen
         // Method signature storage for cross-module extern declarations
         // Key: fully qualified method name (e.g., "std::core::option::Option::is_some")
         // Value: return type as Cryo::Type*
-        std::unordered_map<std::string, Cryo::Type *> _method_return_types;
+        std::unordered_map<std::string, TypeRef> _method_return_types;
 
     public:
         //===================================================================
@@ -494,7 +494,7 @@ namespace Cryo::Codegen
          * @param qualified_method_name Fully qualified method name (e.g., "std::core::option::Option::is_some")
          * @param return_type The method's return type
          */
-        void register_method_return_type(const std::string &qualified_method_name, Cryo::Type *return_type)
+        void register_method_return_type(const std::string &qualified_method_name, TypeRef return_type)
         {
             _method_return_types[qualified_method_name] = return_type;
         }
@@ -504,7 +504,7 @@ namespace Cryo::Codegen
          * @param qualified_method_name Fully qualified method name
          * @return The return type, or nullptr if not registered
          */
-        Cryo::Type *get_method_return_type(const std::string &qualified_method_name) const
+        TypeRef get_method_return_type(const std::string &qualified_method_name) const
         {
             auto it = _method_return_types.find(qualified_method_name);
             return it != _method_return_types.end() ? it->second : nullptr;

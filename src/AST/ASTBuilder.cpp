@@ -100,7 +100,7 @@ namespace Cryo
 
     std::unique_ptr<VariableDeclarationNode> ASTBuilder::create_variable_declaration(SourceLocation loc,
                                                                                      std::string name,
-                                                                                     Cryo::Type *resolved_type,
+                                                                                     TypeRef resolved_type,
                                                                                      std::unique_ptr<ExpressionNode> init,
                                                                                      bool is_mutable,
                                                                                      bool is_global)
@@ -120,7 +120,7 @@ namespace Cryo
 
     std::unique_ptr<FunctionDeclarationNode> ASTBuilder::create_function_declaration(SourceLocation loc,
                                                                                      std::string name,
-                                                                                     Cryo::Type *return_type,
+                                                                                     TypeRef return_type,
                                                                                      bool is_public)
     {
         auto node = std::make_unique<FunctionDeclarationNode>(loc, std::move(name), return_type, is_public);
@@ -269,14 +269,14 @@ namespace Cryo
         return node;
     }
 
-    std::unique_ptr<StructFieldNode> ASTBuilder::create_struct_field(SourceLocation loc, std::string name, Cryo::Type *resolved_type, Visibility visibility)
+    std::unique_ptr<StructFieldNode> ASTBuilder::create_struct_field(SourceLocation loc, std::string name, TypeRef resolved_type, Visibility visibility)
     {
         auto node = std::make_unique<StructFieldNode>(loc, std::move(name), resolved_type, visibility);
         node->set_source_file(_source_file);
         return node;
     }
 
-    std::unique_ptr<StructMethodNode> ASTBuilder::create_struct_method(SourceLocation loc, std::string name, Cryo::Type *return_type, Visibility visibility, bool is_constructor, bool is_destructor, bool is_static, bool is_default_destructor)
+    std::unique_ptr<StructMethodNode> ASTBuilder::create_struct_method(SourceLocation loc, std::string name, TypeRef return_type, Visibility visibility, bool is_constructor, bool is_destructor, bool is_static, bool is_default_destructor)
     {
         auto node = std::make_unique<StructMethodNode>(loc, std::move(name), return_type, visibility, is_constructor, is_destructor, is_static, is_default_destructor);
         node->set_source_file(_source_file);
@@ -316,7 +316,7 @@ namespace Cryo
         }
 
         // Resolve the target type string to a Type* object using the TypeContext
-        Cryo::Type *resolved_target_type = lookup_type_by_name(target_type_str);
+        TypeRef resolved_target_type = lookup_type_by_name(target_type_str);
         if (!resolved_target_type)
         {
             // If lookup fails, use unknown type as fallback
@@ -398,7 +398,7 @@ namespace Cryo
         }
     }
 
-    Cryo::Type *ASTBuilder::lookup_type_by_name(const std::string &type_name)
+    TypeRef ASTBuilder::lookup_type_by_name(const std::string &type_name)
     {
         auto &type_context = _context.types();
 
@@ -448,7 +448,7 @@ namespace Cryo
         if (type_name.back() == '*')
         {
             std::string pointee_type = type_name.substr(0, type_name.length() - 1);
-            Cryo::Type *pointee = lookup_type_by_name(pointee_type);
+            TypeRef pointee = lookup_type_by_name(pointee_type);
             if (pointee)
             {
                 return type_context.create_pointer_type(pointee);
@@ -459,7 +459,7 @@ namespace Cryo
         if (type_name.back() == '&')
         {
             std::string referent_type = type_name.substr(0, type_name.length() - 1);
-            Cryo::Type *referent = lookup_type_by_name(referent_type);
+            TypeRef referent = lookup_type_by_name(referent_type);
             if (referent)
             {
                 return type_context.create_reference_type(referent);
@@ -467,28 +467,28 @@ namespace Cryo
         }
 
         // Try looking up as struct type
-        Cryo::Type *struct_type = type_context.get_struct_type(type_name);
+        TypeRef struct_type = type_context.get_struct_type(type_name);
         if (struct_type && struct_type->kind() != Cryo::TypeKind::Unknown)
         {
             return struct_type;
         }
 
         // Try looking up as class type
-        Cryo::Type *class_type = type_context.get_class_type(type_name);
+        TypeRef class_type = type_context.get_class_type(type_name);
         if (class_type && class_type->kind() != Cryo::TypeKind::Unknown)
         {
             return class_type;
         }
 
         // Try looking up as enum type
-        Cryo::Type *enum_type = type_context.lookup_enum_type(type_name);
+        TypeRef enum_type = type_context.lookup_enum_type(type_name);
         if (enum_type)
         {
             return enum_type;
         }
 
         // Try looking up as type alias
-        Cryo::Type *alias_type = type_context.lookup_type_alias(type_name);
+        TypeRef alias_type = type_context.lookup_type_alias(type_name);
         if (alias_type)
         {
             return alias_type;

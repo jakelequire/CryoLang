@@ -246,7 +246,7 @@ namespace Cryo::Codegen
          */
         std::string mangle_function_name(const std::string &name,
                                           const std::vector<std::string> &namespace_parts,
-                                          const std::vector<Cryo::Type *> &param_types = {});
+                                          const std::vector<TypeRef> &param_types = {});
 
         /**
          * @brief Generate method name (Type::method format)
@@ -257,7 +257,7 @@ namespace Cryo::Codegen
          */
         std::string generate_method_name(const std::string &type_name,
                                           const std::string &method_name,
-                                          const std::vector<Cryo::Type *> &param_types = {});
+                                          const std::vector<TypeRef> &param_types = {});
 
         /**
          * @brief Get or create a function with given signature

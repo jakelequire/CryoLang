@@ -1096,12 +1096,12 @@ namespace Cryo
             for (const auto &param : func_decl->parameters())
             {
                 // Use resolved parameter type directly
-                Type *param_type = param->get_resolved_type();
+                TypeRef param_type = param->get_resolved_type();
                 param_types.push_back(param_type);
             }
 
             // Use resolved return type directly
-            Type *return_type = func_decl->get_resolved_return_type();
+            TypeRef return_type = func_decl->get_resolved_return_type();
 
             // Handle functions that may not have resolved return types yet
             if (return_type == nullptr)
@@ -1111,7 +1111,7 @@ namespace Cryo
             }
 
             // Create function type
-            Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
+            TypeRef function_type = _ast_context->types().create_function_type(return_type, param_types);
 
             // Build enhanced signature including generic parameters
             std::string enhanced_signature = build_function_signature(func_decl);
@@ -1146,12 +1146,12 @@ namespace Cryo
             for (const auto &param : intrinsic_decl->parameters())
             {
                 // Use resolved parameter type directly
-                Type *param_type = param->get_resolved_type();
+                TypeRef param_type = param->get_resolved_type();
                 param_types.push_back(param_type);
             }
 
             // Use resolved return type directly
-            Type *return_type = intrinsic_decl->get_resolved_return_type();
+            TypeRef return_type = intrinsic_decl->get_resolved_return_type();
 
             // Handle intrinsics that may not have resolved return types yet
             if (return_type == nullptr)
@@ -1161,7 +1161,7 @@ namespace Cryo
             }
 
             // Create function type
-            Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
+            TypeRef function_type = _ast_context->types().create_function_type(return_type, param_types);
 
             // Add intrinsic function to current (global) scope with Intrinsic symbol kind
             // Register intrinsics only in std::Intrinsics namespace for consistency
@@ -1175,7 +1175,7 @@ namespace Cryo
         else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
         {
             // Get or create struct type
-            Type *struct_type = _ast_context->types().get_struct_type(struct_decl->name());
+            TypeRef struct_type = _ast_context->types().get_struct_type(struct_decl->name());
 
             // Add struct to symbol table as a Type symbol
             current_scope->declare_symbol(struct_decl->name(), SymbolKind::Type,
@@ -1193,11 +1193,11 @@ namespace Cryo
                     std::vector<Type *> param_types;
                     for (const auto &param : method->parameters())
                     {
-                        Type *param_type = param->get_resolved_type();
+                        TypeRef param_type = param->get_resolved_type();
                         param_types.push_back(param_type);
                     }
 
-                    Type *return_type = method->get_resolved_return_type();
+                    TypeRef return_type = method->get_resolved_return_type();
 
                     // Handle constructors that may not have resolved return types yet
                     if (return_type == nullptr)
@@ -1213,7 +1213,7 @@ namespace Cryo
                         }
                     }
 
-                    Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
+                    TypeRef function_type = _ast_context->types().create_function_type(return_type, param_types);
 
                     // Register method in symbol table with fully qualified name
                     current_scope->declare_symbol(method_name, SymbolKind::Function,
@@ -1238,7 +1238,7 @@ namespace Cryo
         else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(node))
         {
             // Get or create class type
-            Type *class_type = _ast_context->types().get_class_type(class_decl->name());
+            TypeRef class_type = _ast_context->types().get_class_type(class_decl->name());
 
             // Add class to symbol table as a Type symbol
             current_scope->declare_symbol(class_decl->name(), SymbolKind::Type,
@@ -1256,11 +1256,11 @@ namespace Cryo
                     std::vector<Type *> param_types;
                     for (const auto &param : method->parameters())
                     {
-                        Type *param_type = param->get_resolved_type();
+                        TypeRef param_type = param->get_resolved_type();
                         param_types.push_back(param_type);
                     }
 
-                    Type *return_type = method->get_resolved_return_type();
+                    TypeRef return_type = method->get_resolved_return_type();
 
                     // Handle constructors that may not have resolved return types yet
                     if (return_type == nullptr)
@@ -1276,7 +1276,7 @@ namespace Cryo
                         }
                     }
 
-                    Type *function_type = _ast_context->types().create_function_type(return_type, param_types);
+                    TypeRef function_type = _ast_context->types().create_function_type(return_type, param_types);
 
                     // Register method in symbol table with fully qualified name
                     current_scope->declare_symbol(method_name, SymbolKind::Function,
@@ -1319,7 +1319,7 @@ namespace Cryo
             }
 
             // Create enum type and register it
-            Type *enum_type = _ast_context->types().get_enum_type(enum_decl->name(), variant_names, is_simple_enum);
+            TypeRef enum_type = _ast_context->types().get_enum_type(enum_decl->name(), variant_names, is_simple_enum);
             current_scope->declare_symbol(enum_decl->name(), SymbolKind::Type,
                                           enum_decl->location(), enum_type, scope_name);
 
@@ -1595,7 +1595,7 @@ namespace Cryo
             if (!var_decl->is_mutable())
             {
                 // Use resolved type from AST node
-                Type *var_type = var_decl->get_resolved_type();
+                TypeRef var_type = var_decl->get_resolved_type();
 
                 // Add constant to current scope for global visibility
                 bool success = current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,

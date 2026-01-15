@@ -241,7 +241,7 @@ namespace Cryo::Codegen
          * @param cryo_type Cryo type to convert
          * @return Corresponding LLVM type
          */
-        llvm::Type *get_llvm_type(Cryo::Type *cryo_type);
+        llvm::Type *get_llvm_type(TypeRef cryo_type);
 
         /**
          * @brief Cast a value to a target type if necessary
