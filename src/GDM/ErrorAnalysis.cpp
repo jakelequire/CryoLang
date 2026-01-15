@@ -621,7 +621,7 @@ namespace Cryo
             catch (const std::bad_any_cast &)
             {
                 // Context not provided or wrong type - create minimal context
-                TypeMismatchContext *heap_context = new TypeMismatchContext(nullptr, nullptr, "");
+                TypeMismatchContext *heap_context = new TypeMismatchContext(TypeRef{}, TypeRef{}, "");
                 payload._data = std::unique_ptr<void, void (*)(void *)>(
                     heap_context,
                     [](void *ptr)

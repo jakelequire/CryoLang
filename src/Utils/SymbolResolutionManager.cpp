@@ -158,7 +158,7 @@ namespace Cryo::SRM {
         base += "(";
         for (size_t i = 0; i < parameter_types_.size(); ++i) {
             if (i > 0) base += ", ";
-            base += parameter_types_[i] ? parameter_types_[i]->name() : "unknown";
+            base += parameter_types_[i] ? parameter_types_[i]->display_name() : "unknown";
         }
         base += ")";
         return base;
@@ -172,7 +172,7 @@ namespace Cryo::SRM {
         std::string key = get_simple_name() + "(";
         for (size_t i = 0; i < parameter_types_.size(); ++i) {
             if (i > 0) key += ",";
-            key += parameter_types_[i] ? parameter_types_[i]->name() : "unknown";
+            key += parameter_types_[i] ? parameter_types_[i]->display_name() : "unknown";
         }
         key += ")";
         return key;
@@ -197,7 +197,7 @@ namespace Cryo::SRM {
         
         for (const auto* param : parameter_types_) {
             if (param) {
-                h1 ^= std::hash<std::string>{}(param->name()) + 0x9e3779b9 + (h1 << 6) + (h1 >> 2);
+                h1 ^= std::hash<std::string>{}(param->display_name()) + 0x9e3779b9 + (h1 << 6) + (h1 >> 2);
             }
         }
         
@@ -242,7 +242,7 @@ namespace Cryo::SRM {
             base += "<";
             for (size_t i = 0; i < template_parameters_.size(); ++i) {
                 if (i > 0) base += ", ";
-                base += template_parameters_[i] ? template_parameters_[i]->name() : "unknown";
+                base += template_parameters_[i] ? template_parameters_[i]->display_name() : "unknown";
             }
             base += ">";
         }
@@ -263,7 +263,7 @@ namespace Cryo::SRM {
         
         for (const auto* param : template_parameters_) {
             if (param) {
-                h1 ^= std::hash<std::string>{}(param->name()) + 0x9e3779b9 + (h1 << 6) + (h1 >> 2);
+                h1 ^= std::hash<std::string>{}(param->display_name()) + 0x9e3779b9 + (h1 << 6) + (h1 >> 2);
             }
         }
         
@@ -611,7 +611,7 @@ namespace Cryo::SRM {
         
         for (size_t i = 0; i < param_types.size(); ++i) {
             if (i > 0) constructor_name += ",";
-            constructor_name += param_types[i] ? param_types[i]->name() : "unknown";
+            constructor_name += param_types[i] ? param_types[i]->display_name() : "unknown";
         }
         constructor_name += ")";
         
@@ -630,7 +630,7 @@ namespace Cryo::SRM {
         
         for (const auto& candidate_ptr : candidates_ptr) {
             if (candidate_ptr) {
-                candidates.push_back(candidate_ptr->display_name());
+                candidates.push_back(candidate_ptr->to_string());
             }
         }
         
@@ -650,7 +650,7 @@ namespace Cryo::SRM {
         std::string overload_key = base_name + "(";
         for (size_t i = 0; i < param_types.size(); ++i) {
             if (i > 0) overload_key += ",";
-            overload_key += param_types[i] ? param_types[i]->name() : "unknown";
+            overload_key += param_types[i] ? param_types[i]->display_name() : "unknown";
         }
         overload_key += ")";
         candidates.push_back(overload_key);

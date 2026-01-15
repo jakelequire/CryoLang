@@ -287,6 +287,29 @@ namespace Cryo
                               TypeRef type,
                               SourceLocation loc);
 
+        /**
+         * @brief Declare an intrinsic function
+         */
+        bool declare_intrinsic(const std::string &name,
+                               TypeRef type,
+                               SourceLocation loc);
+
+        /**
+         * @brief Declare a symbol with custom kind (for flexibility)
+         */
+        bool declare_symbol(const std::string &name,
+                            SymbolKind2 kind,
+                            SourceLocation loc,
+                            TypeRef type,
+                            const std::string &scope_name = "");
+
+        /**
+         * @brief Register a namespace with its symbol map
+         * For import handling - maps namespace name to its symbols
+         */
+        void register_namespace(const std::string &namespace_name,
+                                const std::unordered_map<std::string, Symbol2> &symbols);
+
         // ====================================================================
         // Symbol Lookup
         // ====================================================================
@@ -339,6 +362,24 @@ namespace Cryo
          * @brief Resolve a type name to TypeRef
          */
         std::optional<TypeRef> resolve_type(const std::string &name) const;
+
+        /**
+         * @brief Look up a struct type by name
+         * @return TypeRef if found (and is a struct), invalid TypeRef otherwise
+         */
+        TypeRef lookup_struct_type(const std::string &name) const;
+
+        /**
+         * @brief Look up a class type by name
+         * @return TypeRef if found (and is a class), invalid TypeRef otherwise
+         */
+        TypeRef lookup_class_type(const std::string &name) const;
+
+        /**
+         * @brief Look up an enum type by name
+         * @return TypeRef if found (and is an enum), invalid TypeRef otherwise
+         */
+        TypeRef lookup_enum_type(const std::string &name) const;
 
         // ====================================================================
         // Iteration

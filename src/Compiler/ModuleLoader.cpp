@@ -565,7 +565,7 @@ namespace Cryo
                     else
                     {
                         // For non-generic enums, create a regular enum type
-                        QualifiedTypeName enum_qname{enum_decl->name()};
+                        QualifiedTypeName enum_qname{ModuleID::invalid(), enum_decl->name()};
                         enum_type = type_arena.create_enum(enum_qname);
 
                         // Build variants and set them on the enum type
@@ -892,7 +892,7 @@ namespace Cryo
                                 else
                                 {
                                     // Try to resolve from type annotation
-                                    std::string type_str = field->type_annotation();
+                                    std::string type_str = field->type_annotation() ? field->type_annotation()->to_string() : "unknown";
                                     LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' needs type resolution from annotation: '{}'", field->name(), type_str);
                                     field_type = resolve_primitive_type(type_str, _ast_context.types());
                                     if (field_type.is_valid())
@@ -982,7 +982,7 @@ namespace Cryo
                     {
                         if (method)
                         {
-                            std::string return_type_str = method->return_type_annotation();
+                            std::string return_type_str = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "";
                             if (!return_type_str.empty())
                             {
                                 // Resolve the return type using TypeArena

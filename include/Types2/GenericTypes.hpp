@@ -12,6 +12,7 @@
 #include "Types2/Type.hpp"
 #include "Types2/TypeID.hpp"
 #include "Types2/TypeKind.hpp"
+#include "Types2/CompoundTypes.hpp"
 
 #include <vector>
 #include <string>
