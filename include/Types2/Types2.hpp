@@ -39,3 +39,6 @@
 
 // Type checking (Phase 4)
 #include "Types2/TypeChecker2.hpp"
+
+// Symbol table (Phase 5)
+#include "Types2/SymbolTable2.hpp"
