@@ -1201,7 +1201,7 @@ namespace Cryo::Codegen
             }
             catch (...)
             {
-                LOG_ERROR(Cryo::LogComponent::CODEGEN, "get_function_type: CORRUPTED TYPE POINTER for function '{}' - this indicates a memory management bug in MonomorphizationPass", node->name());
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "get_function_type: CORRUPTED TYPE POINTER for function '{}' - this indicates a memory management bug in Monomorphizer", node->name());
                 throw std::runtime_error("Corrupted type pointer detected for function '" + node->name() + 
                                        "' - this is a compiler bug in generic type substitution that must be fixed");
             }

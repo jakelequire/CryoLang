@@ -1,10 +1,10 @@
 /******************************************************************************
- * @file TypeChecker2.cpp
- * @brief Implementation of TypeChecker2 for Cryo's new type system
+ * @file TypeChecker.cpp
+ * @brief Implementation of TypeChecker for Cryo's new type system
  ******************************************************************************/
 
-#include "Types2/TypeChecker2.hpp"
-#include "Types2/GenericTypes.hpp"
+#include "Types/TypeChecker.hpp"
+#include "Types/GenericTypes.hpp"
 
 #include <sstream>
 #include <algorithm>
@@ -12,10 +12,10 @@
 namespace Cryo
 {
     // ========================================================================
-    // TypeChecker2 Construction
+    // TypeChecker Construction
     // ========================================================================
 
-    TypeChecker2::TypeChecker2(TypeArena &arena,
+    TypeChecker::TypeChecker(TypeArena &arena,
                                TypeResolver &resolver,
                                ModuleTypeRegistry &modules,
                                GenericRegistry &generics,
@@ -32,7 +32,7 @@ namespace Cryo
     // Type Compatibility
     // ========================================================================
 
-    TypeCompatibility TypeChecker2::check_compatibility(TypeRef from, TypeRef to)
+    TypeCompatibility TypeChecker::check_compatibility(TypeRef from, TypeRef to)
     {
         if (!from.is_valid() || !to.is_valid())
         {
@@ -149,7 +149,7 @@ namespace Cryo
         return TypeCompatibility::Incompatible;
     }
 
-    bool TypeChecker2::can_assign(TypeRef from, TypeRef to)
+    bool TypeChecker::can_assign(TypeRef from, TypeRef to)
     {
         auto compat = check_compatibility(from, to);
         return compat == TypeCompatibility::Identical ||
@@ -157,20 +157,20 @@ namespace Cryo
                compat == TypeCompatibility::ImplicitConvert;
     }
 
-    bool TypeChecker2::can_implicit_convert(TypeRef from, TypeRef to)
+    bool TypeChecker::can_implicit_convert(TypeRef from, TypeRef to)
     {
         auto compat = check_compatibility(from, to);
         return compat != TypeCompatibility::Incompatible &&
                compat != TypeCompatibility::ExplicitCast;
     }
 
-    bool TypeChecker2::can_cast(TypeRef from, TypeRef to)
+    bool TypeChecker::can_cast(TypeRef from, TypeRef to)
     {
         auto compat = check_compatibility(from, to);
         return compat != TypeCompatibility::Incompatible;
     }
 
-    ConversionInfo TypeChecker2::get_conversion_info(TypeRef from, TypeRef to)
+    ConversionInfo TypeChecker::get_conversion_info(TypeRef from, TypeRef to)
     {
         ConversionInfo info;
         info.from_type = from;
@@ -232,7 +232,7 @@ namespace Cryo
     // Type Identity
     // ========================================================================
 
-    bool TypeChecker2::are_identical(TypeRef a, TypeRef b)
+    bool TypeChecker::are_identical(TypeRef a, TypeRef b)
     {
         // Fast path: same TypeID
         if (a.id() == b.id())
@@ -248,7 +248,7 @@ namespace Cryo
         return false; // Different IDs means different types
     }
 
-    bool TypeChecker2::are_equivalent(TypeRef a, TypeRef b)
+    bool TypeChecker::are_equivalent(TypeRef a, TypeRef b)
     {
         if (are_identical(a, b))
         {
@@ -278,7 +278,7 @@ namespace Cryo
         return false;
     }
 
-    bool TypeChecker2::is_subtype(TypeRef sub, TypeRef super)
+    bool TypeChecker::is_subtype(TypeRef sub, TypeRef super)
     {
         if (are_identical(sub, super))
         {
@@ -293,7 +293,7 @@ namespace Cryo
     // Binary Operations
     // ========================================================================
 
-    TypeCheckResult TypeChecker2::check_binary_op(int op, TypeRef lhs, TypeRef rhs)
+    TypeCheckResult TypeChecker::check_binary_op(int op, TypeRef lhs, TypeRef rhs)
     {
         if (!lhs.is_valid() || !rhs.is_valid())
         {
@@ -346,7 +346,7 @@ namespace Cryo
             " and " + rhs.get()->display_name());
     }
 
-    TypeRef TypeChecker2::get_common_type(TypeRef a, TypeRef b)
+    TypeRef TypeChecker::get_common_type(TypeRef a, TypeRef b)
     {
         if (!a.is_valid())
             return b;
@@ -414,7 +414,7 @@ namespace Cryo
     // Unary Operations
     // ========================================================================
 
-    TypeCheckResult TypeChecker2::check_unary_op(int op, TypeRef operand)
+    TypeCheckResult TypeChecker::check_unary_op(int op, TypeRef operand)
     {
         if (!operand.is_valid())
         {
@@ -462,7 +462,7 @@ namespace Cryo
     // Function Calls
     // ========================================================================
 
-    TypeCheckResult TypeChecker2::check_function_call(TypeRef func_type,
+    TypeCheckResult TypeChecker::check_function_call(TypeRef func_type,
                                                        const std::vector<TypeRef> &arg_types)
     {
         if (!func_type.is_valid())
@@ -518,7 +518,7 @@ namespace Cryo
         return TypeCheckResult::ok(fn->return_type());
     }
 
-    TypeCheckResult TypeChecker2::check_method_call(TypeRef receiver_type,
+    TypeCheckResult TypeChecker::check_method_call(TypeRef receiver_type,
                                                      const std::string &method_name,
                                                      const std::vector<TypeRef> &arg_types)
     {
@@ -557,7 +557,7 @@ namespace Cryo
     // Member Access
     // ========================================================================
 
-    TypeCheckResult TypeChecker2::check_field_access(TypeRef base_type,
+    TypeCheckResult TypeChecker::check_field_access(TypeRef base_type,
                                                       const std::string &field_name)
     {
         if (!base_type.is_valid())
@@ -621,7 +621,7 @@ namespace Cryo
             "no field '" + field_name + "' on type '" + t->display_name() + "'");
     }
 
-    TypeCheckResult TypeChecker2::check_index_access(TypeRef base_type,
+    TypeCheckResult TypeChecker::check_index_access(TypeRef base_type,
                                                       TypeRef index_type)
     {
         if (!base_type.is_valid())
@@ -661,26 +661,26 @@ namespace Cryo
     // Type Queries
     // ========================================================================
 
-    bool TypeChecker2::is_numeric(TypeRef type)
+    bool TypeChecker::is_numeric(TypeRef type)
     {
         return is_integer(type) || is_floating_point(type);
     }
 
-    bool TypeChecker2::is_integer(TypeRef type)
+    bool TypeChecker::is_integer(TypeRef type)
     {
         if (!type.is_valid())
             return false;
         return type.get()->kind() == TypeKind::Int;
     }
 
-    bool TypeChecker2::is_floating_point(TypeRef type)
+    bool TypeChecker::is_floating_point(TypeRef type)
     {
         if (!type.is_valid())
             return false;
         return type.get()->kind() == TypeKind::Float;
     }
 
-    bool TypeChecker2::is_signed_integer(TypeRef type)
+    bool TypeChecker::is_signed_integer(TypeRef type)
     {
         if (!is_integer(type))
             return false;
@@ -688,7 +688,7 @@ namespace Cryo
         return int_type->is_signed();
     }
 
-    bool TypeChecker2::is_unsigned_integer(TypeRef type)
+    bool TypeChecker::is_unsigned_integer(TypeRef type)
     {
         if (!is_integer(type))
             return false;
@@ -696,14 +696,14 @@ namespace Cryo
         return !int_type->is_signed();
     }
 
-    bool TypeChecker2::is_boolean(TypeRef type)
+    bool TypeChecker::is_boolean(TypeRef type)
     {
         if (!type.is_valid())
             return false;
         return type.get()->kind() == TypeKind::Bool;
     }
 
-    bool TypeChecker2::is_truthy(TypeRef type)
+    bool TypeChecker::is_truthy(TypeRef type)
     {
         if (!type.is_valid())
             return false;
@@ -715,21 +715,21 @@ namespace Cryo
                kind == TypeKind::Optional;
     }
 
-    bool TypeChecker2::is_pointer(TypeRef type)
+    bool TypeChecker::is_pointer(TypeRef type)
     {
         if (!type.is_valid())
             return false;
         return type.get()->kind() == TypeKind::Pointer;
     }
 
-    bool TypeChecker2::is_reference(TypeRef type)
+    bool TypeChecker::is_reference(TypeRef type)
     {
         if (!type.is_valid())
             return false;
         return type.get()->kind() == TypeKind::Reference;
     }
 
-    bool TypeChecker2::is_nullable(TypeRef type)
+    bool TypeChecker::is_nullable(TypeRef type)
     {
         if (!type.is_valid())
             return false;
@@ -739,7 +739,7 @@ namespace Cryo
                kind == TypeKind::Reference;
     }
 
-    bool TypeChecker2::is_user_defined(TypeRef type)
+    bool TypeChecker::is_user_defined(TypeRef type)
     {
         if (!type.is_valid())
             return false;
@@ -750,7 +750,7 @@ namespace Cryo
                kind == TypeKind::Trait;
     }
 
-    bool TypeChecker2::is_generic(TypeRef type)
+    bool TypeChecker::is_generic(TypeRef type)
     {
         if (!type.is_valid())
             return false;
@@ -760,7 +760,7 @@ namespace Cryo
                kind == TypeKind::InstantiatedType;
     }
 
-    unsigned TypeChecker2::get_integer_width(TypeRef type)
+    unsigned TypeChecker::get_integer_width(TypeRef type)
     {
         if (!is_integer(type))
             return 0;
@@ -768,7 +768,7 @@ namespace Cryo
         return int_type->bit_width();
     }
 
-    bool TypeChecker2::is_narrower_than(TypeRef a, TypeRef b)
+    bool TypeChecker::is_narrower_than(TypeRef a, TypeRef b)
     {
         return get_integer_width(a) < get_integer_width(b);
     }
@@ -777,7 +777,7 @@ namespace Cryo
     // Error Handling
     // ========================================================================
 
-    TypeRef TypeChecker2::make_error(const std::string &reason, const SourceLocation &loc)
+    TypeRef TypeChecker::make_error(const std::string &reason, const SourceLocation &loc)
     {
         return _arena.create_error(reason, loc);
     }
@@ -786,7 +786,7 @@ namespace Cryo
     // Internal Helpers
     // ========================================================================
 
-    TypeCompatibility TypeChecker2::check_numeric_compatibility(TypeRef from, TypeRef to)
+    TypeCompatibility TypeChecker::check_numeric_compatibility(TypeRef from, TypeRef to)
     {
         const Type *from_t = from.get();
         const Type *to_t = to.get();
@@ -842,7 +842,7 @@ namespace Cryo
         return TypeCompatibility::ExplicitCast;
     }
 
-    TypeRef TypeChecker2::get_arithmetic_result(TypeRef lhs, TypeRef rhs)
+    TypeRef TypeChecker::get_arithmetic_result(TypeRef lhs, TypeRef rhs)
     {
         if (is_numeric(lhs) && is_numeric(rhs))
         {
@@ -862,7 +862,7 @@ namespace Cryo
         return TypeRef{};
     }
 
-    TypeRef TypeChecker2::get_comparison_result(TypeRef lhs, TypeRef rhs)
+    TypeRef TypeChecker::get_comparison_result(TypeRef lhs, TypeRef rhs)
     {
         // Numeric comparison
         if (is_numeric(lhs) && is_numeric(rhs))
@@ -891,7 +891,7 @@ namespace Cryo
         return TypeRef{};
     }
 
-    TypeRef TypeChecker2::get_logical_result(TypeRef lhs, TypeRef rhs)
+    TypeRef TypeChecker::get_logical_result(TypeRef lhs, TypeRef rhs)
     {
         if (is_truthy(lhs) && is_truthy(rhs))
         {
@@ -900,7 +900,7 @@ namespace Cryo
         return TypeRef{};
     }
 
-    TypeRef TypeChecker2::get_bitwise_result(TypeRef lhs, TypeRef rhs)
+    TypeRef TypeChecker::get_bitwise_result(TypeRef lhs, TypeRef rhs)
     {
         if (is_integer(lhs) && is_integer(rhs))
         {
@@ -909,14 +909,14 @@ namespace Cryo
         return TypeRef{};
     }
 
-    void TypeChecker2::report_error(const std::string &message, const SourceLocation &loc)
+    void TypeChecker::report_error(const std::string &message, const SourceLocation &loc)
     {
         // TODO: Integrate with DiagnosticManager when available
         (void)message;
         (void)loc;
     }
 
-    void TypeChecker2::report_warning(const std::string &message, const SourceLocation &loc)
+    void TypeChecker::report_warning(const std::string &message, const SourceLocation &loc)
     {
         // TODO: Integrate with DiagnosticManager when available
         (void)message;
@@ -924,10 +924,10 @@ namespace Cryo
     }
 
     // ========================================================================
-    // TypeInference2 Implementation
+    // TypeInference Implementation
     // ========================================================================
 
-    TypeRef TypeInference2::infer_literal_type(int literal_kind, const std::string &value)
+    TypeRef TypeInference::infer_literal_type(int literal_kind, const std::string &value)
     {
         (void)value; // May be used later for value-dependent inference
 
@@ -950,7 +950,7 @@ namespace Cryo
         }
     }
 
-    TypeRef TypeInference2::promote_for_arithmetic(TypeRef a, TypeRef b)
+    TypeRef TypeInference::promote_for_arithmetic(TypeRef a, TypeRef b)
     {
         if (!a.is_valid())
             return b;
@@ -984,7 +984,7 @@ namespace Cryo
         return a;
     }
 
-    TypeRef TypeInference2::widen_for_value(TypeRef type, int64_t value)
+    TypeRef TypeInference::widen_for_value(TypeRef type, int64_t value)
     {
         if (!type.is_valid() || type.get()->kind() != TypeKind::Int)
         {

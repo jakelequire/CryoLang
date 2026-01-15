@@ -1,7 +1,7 @@
 #pragma once
 #include "Lexer/lexer.hpp"
-#include "AST/Type.hpp"
-#include "Types2/TypeAnnotation.hpp"
+#include "Types/Types.hpp"
+#include "Types/TypeAnnotation.hpp"
 #include <iostream>
 #include <string>
 #include <vector>

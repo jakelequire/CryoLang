@@ -6,7 +6,7 @@ namespace Cryo
     ASTContext::ASTContext()
         : _type_arena(std::make_unique<TypeArena>()),
           _module_registry(std::make_unique<ModuleTypeRegistry>()),
-          _symbol_table(std::make_unique<SymbolTable2>(*_type_arena, *_module_registry)) {}
+          _symbol_table(std::make_unique<SymbolTable>(*_type_arena, *_module_registry)) {}
 
     ASTContext::~ASTContext() = default;
 }

@@ -506,7 +506,7 @@ namespace Cryo
         }
 
         // For user-defined types (struct, class, enum, alias), lookup via symbol table
-        SymbolTable2 &symbols = _context.symbols();
+        SymbolTable &symbols = _context.symbols();
         auto resolved = symbols.resolve_type(type_name);
         if (resolved.has_value())
         {

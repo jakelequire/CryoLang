@@ -13,8 +13,8 @@
  * with invalid types.
  ******************************************************************************/
 
-#include "Types2/Type.hpp"
-#include "Types2/TypeKind.hpp"
+#include "Types/Type.hpp"
+#include "Types/TypeKind.hpp"
 #include "Lexer/lexer.hpp"
 
 #include <string>

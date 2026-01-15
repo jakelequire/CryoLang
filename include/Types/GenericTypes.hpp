@@ -9,10 +9,10 @@
  * - InstantiatedType: Concrete instantiation (Array<int>, Option<string>)
  ******************************************************************************/
 
-#include "Types2/Type.hpp"
-#include "Types2/TypeID.hpp"
-#include "Types2/TypeKind.hpp"
-#include "Types2/CompoundTypes.hpp"
+#include "Types/Type.hpp"
+#include "Types/TypeID.hpp"
+#include "Types/TypeKind.hpp"
+#include "Types/CompoundTypes.hpp"
 
 #include <vector>
 #include <string>

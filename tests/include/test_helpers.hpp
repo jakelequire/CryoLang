@@ -15,7 +15,7 @@
 
 #include "Compiler/CompilerInstance.hpp"
 #include "AST/ASTContext.hpp"
-#include "AST/TypeChecker.hpp"
+#include "Types/TypeChecker.hpp"
 #include "AST/ASTNode.hpp"
 #include "Parser/Parser.hpp"
 #include "Lexer/lexer.hpp"

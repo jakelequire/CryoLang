@@ -1,6 +1,6 @@
 #pragma once
 
-#include "AST/SymbolTable.hpp"
+#include "Types/SymbolTable.hpp"
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Module.h>
 #include <memory>

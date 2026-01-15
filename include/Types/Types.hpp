@@ -1,13 +1,13 @@
 #pragma once
 /******************************************************************************
- * @file Types2.hpp
+ * @file Types.hpp
  * @brief Main include file for Cryo's new type system
  *
  * This header provides a convenient single include for the entire new type
  * system. Include this file to get access to all type-related functionality.
  *
  * Usage:
- *   #include "Types2/Types2.hpp"
+ *   #include "Types/Types.hpp"
  *
  *   Cryo::TypeArena arena;
  *   Cryo::TypeRef int_type = arena.get_i32();
@@ -15,33 +15,33 @@
  ******************************************************************************/
 
 // Core type identity
-#include "Types2/TypeID.hpp"
-#include "Types2/TypeKind.hpp"
-#include "Types2/Type.hpp"
+#include "Types/TypeID.hpp"
+#include "Types/TypeKind.hpp"
+#include "Types/Type.hpp"
 
 // Type arena (ownership and factory)
-#include "Types2/TypeArena.hpp"
+#include "Types/TypeArena.hpp"
 
 // Concrete type classes
-#include "Types2/PrimitiveTypes.hpp"
-#include "Types2/CompoundTypes.hpp"
-#include "Types2/UserDefinedTypes.hpp"
-#include "Types2/GenericTypes.hpp"
-#include "Types2/ErrorType.hpp"
+#include "Types/PrimitiveTypes.hpp"
+#include "Types/CompoundTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
+#include "Types/GenericTypes.hpp"
+#include "Types/ErrorType.hpp"
 
 // Resolution infrastructure (Phase 2)
-#include "Types2/ModuleTypeRegistry.hpp"
-#include "Types2/GenericRegistry.hpp"
-#include "Types2/TypeResolver.hpp"
+#include "Types/ModuleTypeRegistry.hpp"
+#include "Types/GenericRegistry.hpp"
+#include "Types/TypeResolver.hpp"
 
 // Codegen bridge (Phase 3)
-#include "Types2/TypeMapper2.hpp"
+#include "Types/TypeMapper.hpp"
 
 // Type checking (Phase 4)
-#include "Types2/TypeChecker2.hpp"
+#include "Types/TypeChecker.hpp"
 
 // Symbol table (Phase 5)
-#include "Types2/SymbolTable2.hpp"
+#include "Types/SymbolTable.hpp"
 
 // Monomorphization (Phase 6)
-#include "Types2/Monomorphizer2.hpp"
+#include "Types/Monomorphizer.hpp"

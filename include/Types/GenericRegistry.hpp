@@ -12,9 +12,9 @@
  * with a unified, type-system-aware approach.
  ******************************************************************************/
 
-#include "Types2/TypeID.hpp"
-#include "Types2/Type.hpp"
-#include "Types2/GenericTypes.hpp"
+#include "Types/TypeID.hpp"
+#include "Types/Type.hpp"
+#include "Types/GenericTypes.hpp"
 #include "Lexer/lexer.hpp"
 
 #include <string>

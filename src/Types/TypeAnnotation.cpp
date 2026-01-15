@@ -3,7 +3,7 @@
  * @brief Implementation of TypeAnnotation structure
  ******************************************************************************/
 
-#include "Types2/TypeAnnotation.hpp"
+#include "Types/TypeAnnotation.hpp"
 #include <sstream>
 
 namespace Cryo

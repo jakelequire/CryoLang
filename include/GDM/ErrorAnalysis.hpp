@@ -1,9 +1,9 @@
 #pragma once
 
 #include "GDM/GDM.hpp"
-#include "AST/Type.hpp"
+#include "Types/Types.hpp"
 #include "AST/ASTNode.hpp"
-#include "AST/SymbolTable.hpp"
+#include "Types/SymbolTable.hpp"
 #include <string>
 #include <vector>
 #include <memory>

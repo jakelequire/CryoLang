@@ -3,16 +3,16 @@
 #include "Lexer/lexer.hpp"
 #include "Parser/Parser.hpp"
 #include "AST/ASTContext.hpp"
-#include "AST/SymbolTable.hpp"
+#include "Types/SymbolTable.hpp"
 #include "AST/ASTNode.hpp"
 #include "AST/ASTDumper.hpp"
-#include "AST/TypeChecker.hpp"
-#include "AST/MonomorphizationPass.hpp"
+#include "Types/TypeChecker.hpp"
+#include "Types/Monomorphizer.hpp"
 #include "AST/TemplateRegistry.hpp"
 #include "AST/DirectiveSystem.hpp"
 #include "AST/DirectiveProcessors.hpp"
-#include "Types2/GenericRegistry.hpp"
-#include "Types2/TypeResolver.hpp"
+#include "Types/GenericRegistry.hpp"
+#include "Types/TypeResolver.hpp"
 #include "GDM/GDM.hpp"
 #include "Codegen/CodeGenerator.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
@@ -30,7 +30,7 @@ namespace Cryo
     {
         class CodegenVisitor;
     }
-    class TypeMapper2;
+    class TypeMapper;
 
     /**
      * @brief Central orchestration class for the Cryo compiler
@@ -48,14 +48,14 @@ namespace Cryo
         std::unique_ptr<ASTContext> _ast_context;
         std::unique_ptr<DiagnosticManager> _diagnostic_manager;
         std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _symbol_resolution_manager;
-        // Types2 components - GenericRegistry and TypeResolver must come before TypeChecker2
+        // Types components - GenericRegistry and TypeResolver must come before TypeChecker
         std::unique_ptr<GenericRegistry> _generic_registry;
         std::unique_ptr<TypeResolver> _type_resolver;
-        // SymbolTable2 needs arena and modules from ASTContext
+        // SymbolTable needs arena and modules from ASTContext
         std::unique_ptr<SymbolTable> _symbol_table;
-        // TypeChecker2 needs arena, resolver, modules, generics
+        // TypeChecker needs arena, resolver, modules, generics
         std::unique_ptr<TypeChecker> _type_checker;
-        std::unique_ptr<MonomorphizationPass> _monomorphization_pass;
+        std::unique_ptr<Monomorphizer> _monomorphization_pass;
         std::unique_ptr<TemplateRegistry> _template_registry;
         std::unique_ptr<Cryo::Codegen::CodeGenerator> _codegen;
         std::unique_ptr<Cryo::Linker::CryoLinker> _linker;

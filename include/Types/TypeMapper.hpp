@@ -1,9 +1,9 @@
 #pragma once
 /******************************************************************************
- * @file TypeMapper2.hpp
- * @brief Maps new Types2 system types to LLVM IR types
+ * @file TypeMapper.hpp
+ * @brief Maps new Types system types to LLVM IR types
  *
- * TypeMapper2 is the codegen bridge for the new type system. It converts
+ * TypeMapper is the codegen bridge for the new type system. It converts
  * TypeRef handles to LLVM types for code generation.
  *
  * Key design principles:
@@ -14,14 +14,14 @@
  * - Integrates with GenericRegistry for instantiation
  ******************************************************************************/
 
-#include "Types2/TypeID.hpp"
-#include "Types2/Type.hpp"
-#include "Types2/TypeArena.hpp"
-#include "Types2/PrimitiveTypes.hpp"
-#include "Types2/CompoundTypes.hpp"
-#include "Types2/UserDefinedTypes.hpp"
-#include "Types2/GenericTypes.hpp"
-#include "Types2/ErrorType.hpp"
+#include "Types/TypeID.hpp"
+#include "Types/Type.hpp"
+#include "Types/TypeArena.hpp"
+#include "Types/PrimitiveTypes.hpp"
+#include "Types/CompoundTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
+#include "Types/GenericTypes.hpp"
+#include "Types/ErrorType.hpp"
 
 #include <llvm/IR/Type.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -52,18 +52,18 @@ namespace Cryo
         const std::vector<TypeRef> &type_args)>;
 
     /**************************************************************************
-     * @brief Maps Types2 TypeRefs to LLVM Types
+     * @brief Maps Types TypeRefs to LLVM Types
      *
      * Provides a clean mapping from the new type system to LLVM IR types.
      * Uses TypeID for efficient caching and supports all type kinds.
      *
      * Usage:
-     *   TypeMapper2 mapper(arena, llvm_ctx, llvm_module);
+     *   TypeMapper mapper(arena, llvm_ctx, llvm_module);
      *
      *   TypeRef int_type = arena.get_i32();
      *   llvm::Type* llvm_int = mapper.map(int_type);
      **************************************************************************/
-    class TypeMapper2
+    class TypeMapper
     {
     private:
         TypeArena &_arena;
@@ -95,15 +95,15 @@ namespace Cryo
         // Construction
         // ====================================================================
 
-        TypeMapper2(TypeArena &arena,
+        TypeMapper(TypeArena &arena,
                     llvm::LLVMContext &llvm_ctx,
                     llvm::Module *module = nullptr);
 
-        ~TypeMapper2() = default;
+        ~TypeMapper() = default;
 
         // Non-copyable
-        TypeMapper2(const TypeMapper2 &) = delete;
-        TypeMapper2 &operator=(const TypeMapper2 &) = delete;
+        TypeMapper(const TypeMapper &) = delete;
+        TypeMapper &operator=(const TypeMapper &) = delete;
 
         // ====================================================================
         // Configuration

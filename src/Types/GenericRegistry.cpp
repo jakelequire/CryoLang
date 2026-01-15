@@ -3,10 +3,10 @@
  * @brief Implementation of GenericRegistry for Cryo's new type system
  ******************************************************************************/
 
-#include "Types2/GenericRegistry.hpp"
-#include "Types2/TypeArena.hpp"
-#include "Types2/CompoundTypes.hpp"
-#include "Types2/UserDefinedTypes.hpp"
+#include "Types/GenericRegistry.hpp"
+#include "Types/TypeArena.hpp"
+#include "Types/CompoundTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
 
 #include <sstream>
 

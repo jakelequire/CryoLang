@@ -13,8 +13,8 @@
  * - NeverType: bottom type (functions that don't return)
  ******************************************************************************/
 
-#include "Types2/Type.hpp"
-#include "Types2/TypeKind.hpp"
+#include "Types/Type.hpp"
+#include "Types/TypeKind.hpp"
 
 namespace Cryo
 {
