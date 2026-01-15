@@ -42,3 +42,6 @@
 
 // Symbol table (Phase 5)
 #include "Types2/SymbolTable2.hpp"
+
+// Monomorphization (Phase 6)
+#include "Types2/Monomorphizer2.hpp"
