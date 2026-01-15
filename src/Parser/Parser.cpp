@@ -3913,7 +3913,7 @@ namespace Cryo
         consume(TokenKind::TK_L_PAREN, "Expected '(' after 'sizeof'");
 
         // Parse type annotation (handles pointer types, arrays, etc.)
-        std::string type_name = parse_type_annotation()->to_string();
+        std::string type_name = parse_type_annotation()->display_name();
         if (type_name.empty())
         {
             error("Expected type name in sizeof expression");
@@ -3933,7 +3933,7 @@ namespace Cryo
         consume(TokenKind::TK_L_PAREN, "Expected '(' after 'alignof'");
 
         // Parse type annotation (handles pointer types, arrays, etc.)
-        std::string type_name = parse_type_annotation()->to_string();
+        std::string type_name = parse_type_annotation()->display_name();
         if (type_name.empty())
         {
             error("Expected type name in alignof expression");
@@ -4174,7 +4174,7 @@ namespace Cryo
                     auto field = parse_struct_field(current_visibility);
                     LOG_DEBUG(LogComponent::PARSER, "[STRUCT_PARSE] {} :: Added field '{}' of type '{}' (total fields: {})",
                               struct_name, field ? field->name() : "null",
-                              field && field->get_resolved_type() ? field->get_resolved_type()->to_string() : "unknown",
+                              field && field->get_resolved_type() ? field->get_resolved_type()->display_name() : "unknown",
                               struct_decl->fields().size() + 1);
                     struct_decl->add_field(std::move(field));
                 }
@@ -4197,7 +4197,7 @@ namespace Cryo
         {
             LOG_DEBUG(LogComponent::PARSER, "[STRUCT_PARSE] {} :: Field summary: '{}' : '{}'",
                       struct_name, f->name(),
-                      f->get_resolved_type() ? f->get_resolved_type()->to_string() : "unknown");
+                      f->get_resolved_type() ? f->get_resolved_type()->display_name() : "unknown");
         }
 
         return struct_decl;
@@ -6040,7 +6040,7 @@ namespace Cryo
         auto qualified_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
             namespace_parts, namespace_name, Cryo::SymbolKind::Type);
 
-        return qualified_id->to_string();
+        return qualified_id->display_name();
     }
 
     std::string Parser::generate_qualified_type_name(const std::string &base_name, const std::string &member_name)
@@ -6056,7 +6056,7 @@ namespace Cryo
         auto type_id = std::make_unique<Cryo::SRM::TypeIdentifier>(
             namespace_parts, member_name, Cryo::TypeKind::Struct);
 
-        return type_id->to_string();
+        return type_id->display_name();
     }
 
     std::string Parser::generate_scope_resolution_name(const std::string &scope_name, const std::string &member_name)
@@ -6071,7 +6071,7 @@ namespace Cryo
         auto qualified_id = std::make_unique<Cryo::SRM::QualifiedIdentifier>(
             parts, member_name, Cryo::SymbolKind::Variable);
 
-        return qualified_id->to_string();
+        return qualified_id->display_name();
     }
 
     std::vector<std::string> Parser::get_current_namespace_parts() const

@@ -486,7 +486,7 @@ namespace Cryo::Codegen
                                     return_type = types().get_type(method_return);
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                               "resolve_method_by_name: Got return type from struct template method: {}",
-                                              method_return->to_string());
+                                              method_return->display_name());
                                 }
                                 break;
                             }
@@ -504,7 +504,7 @@ namespace Cryo::Codegen
                                     return_type = types().get_type(method_return);
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                               "resolve_method_by_name: Got return type from class template method: {}",
-                                              method_return->to_string());
+                                              method_return->display_name());
                                 }
                                 break;
                             }
@@ -530,7 +530,7 @@ namespace Cryo::Codegen
                         return_type = types().get_type(cryo_return_type);
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "resolve_method_by_name: Got return type from method registry for '{}': {}",
-                                  full_method_name, cryo_return_type->to_string());
+                                  full_method_name, cryo_return_type->display_name());
                     }
                 }
 
@@ -602,7 +602,7 @@ namespace Cryo::Codegen
         auto identifier = srm_context().create_qualified_identifier(name, kind);
         if (identifier)
         {
-            return identifier->to_string();
+            return identifier->display_name();
         }
 
         // Fallback: return original name

@@ -652,8 +652,8 @@ namespace Cryo
             return "type mismatch";
         }
 
-        std::string expected_str = expected_type->to_string();
-        std::string actual_str = actual_type->to_string();
+        std::string expected_str = expected_type->display_name();
+        std::string actual_str = actual_type->display_name();
 
         return "expected `" + expected_str + "`, found `" + actual_str + "`";
     }
@@ -668,8 +668,8 @@ namespace Cryo
             return help_messages;
         }
 
-        std::string expected_str = expected_type->to_string();
-        std::string actual_str = actual_type->to_string();
+        std::string expected_str = expected_type->display_name();
+        std::string actual_str = actual_type->display_name();
 
         // Context-specific suggestions based on type combination
         if (context_description.find("assignment") != std::string::npos ||
@@ -728,7 +728,7 @@ namespace Cryo
     {
         if (!expected_type || !actual_type)
             return false;
-        return (expected_type->to_string() == "int" && actual_type->to_string() == "string");
+        return (expected_type->display_name() == "int" && actual_type->display_name() == "string");
     }
 
     bool BasicTypeMismatchContext::can_suggest_cast() const
@@ -744,8 +744,8 @@ namespace Cryo
         if (!expected_type || !actual_type)
             return false;
 
-        std::string expected_str = expected_type->to_string();
-        std::string actual_str = actual_type->to_string();
+        std::string expected_str = expected_type->display_name();
+        std::string actual_str = actual_type->display_name();
 
         // Check for related numeric types
         std::vector<std::string> numeric_types = {"int", "i32", "i64", "u32", "u64", "float", "f32", "f64", "double"};
@@ -763,7 +763,7 @@ namespace Cryo
         }
 
         return "type mismatch in " + context_description + ": expected `" +
-               expected_type->to_string() + "`, found `" + actual_type->to_string() + "`";
+               expected_type->display_name() + "`, found `" + actual_type->display_name() + "`";
     }
 
     std::vector<std::string> BasicTypeMismatchContext::generate_suggestions() const
@@ -775,8 +775,8 @@ namespace Cryo
             return suggestions;
         }
 
-        std::string expected_name = expected_type->to_string();
-        std::string actual_name = actual_type->to_string();
+        std::string expected_name = expected_type->display_name();
+        std::string actual_name = actual_type->display_name();
 
         // Basic conversion suggestions
         if (expected_name == "int" && actual_name == "string")
@@ -814,8 +814,8 @@ namespace Cryo
             return suggestions;
         }
 
-        std::string expected_name = expected_type->to_string();
-        std::string actual_name = actual_type->to_string();
+        std::string expected_name = expected_type->display_name();
+        std::string actual_name = actual_type->display_name();
 
         if (expected_name == "int" && actual_name == "string")
         {

@@ -583,13 +583,13 @@ namespace Cryo::SRM {
         const auto& params = identifier.get_parameter_types();
         for (size_t i = 0; i < params.size(); ++i) {
             if (i > 0) oss << ",";
-            oss << (params[i] ? params[i]->to_string() : "unknown");
+            oss << (params[i] ? params[i]->display_name() : "unknown");
         }
         oss << ")";
         
         // Add return type if available
         if (identifier.get_return_type()) {
-            oss << "->" << identifier.get_return_type()->to_string();
+            oss << "->" << identifier.get_return_type()->display_name();
         }
         
         return oss.str();
@@ -630,7 +630,7 @@ namespace Cryo::SRM {
         
         for (const auto& candidate_ptr : candidates_ptr) {
             if (candidate_ptr) {
-                candidates.push_back(candidate_ptr->to_string());
+                candidates.push_back(candidate_ptr->display_name());
             }
         }
         

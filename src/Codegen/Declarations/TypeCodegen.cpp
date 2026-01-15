@@ -718,10 +718,10 @@ namespace Cryo::Codegen
                     case Cryo::TypeKind::Pointer: type_kind_str = "Pointer"; break;
                     case Cryo::TypeKind::Struct: type_kind_str = "Struct"; break;
                     case Cryo::TypeKind::Int: type_kind_str = "Integer"; break;
-                    default: type_kind_str = TypeKindToString(cryo_field_type->kind()); break;
+                    default: type_kind_str = type_kind_to_string(cryo_field_type->kind()); break;
                 }
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': type='{}', kind='{}'", 
-                         field->name(), cryo_field_type->name(), type_kind_str);
+                         field->name(), cryo_field_type->display_name(), type_kind_str);
                 
                 // Use the main type mapping method like the old implementation did
                 llvm::Type *field_type = types().map(cryo_field_type);
