@@ -1,11 +1,11 @@
 #pragma once
 
 #include "Codegen/LLVMContext.hpp"
-#include "Codegen/TypeMapper.hpp"
+#include "Types/TypeMapper.hpp"
 #include "Codegen/ValueContext.hpp"
 #include "Codegen/Intrinsics.hpp"
 #include "Codegen/FunctionRegistry.hpp"
-#include "AST/SymbolTable.hpp"
+#include "Types/SymbolTable.hpp"
 #include "AST/TemplateRegistry.hpp"
 #include "GDM/DiagnosticBuilders.hpp"
 #include "Utils/SymbolResolutionManager.hpp"

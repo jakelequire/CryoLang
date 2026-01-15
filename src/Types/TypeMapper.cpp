@@ -1,10 +1,10 @@
 /******************************************************************************
- * @file TypeMapper2.cpp
- * @brief Implementation of TypeMapper2 for Cryo's new type system
+ * @file TypeMapper.cpp
+ * @brief Implementation of TypeMapper for Cryo's new type system
  ******************************************************************************/
 
-#include "Types2/TypeMapper2.hpp"
-#include "Types2/GenericRegistry.hpp"
+#include "Types/TypeMapper.hpp"
+#include "Types/GenericRegistry.hpp"
 
 #include <sstream>
 
@@ -14,7 +14,7 @@ namespace Cryo
     // Construction
     // ========================================================================
 
-    TypeMapper2::TypeMapper2(TypeArena &arena,
+    TypeMapper::TypeMapper(TypeArena &arena,
                              llvm::LLVMContext &llvm_ctx,
                              llvm::Module *module)
         : _arena(arena),
@@ -28,7 +28,7 @@ namespace Cryo
     // Primary Interface
     // ========================================================================
 
-    llvm::Type *TypeMapper2::map(TypeRef type)
+    llvm::Type *TypeMapper::map(TypeRef type)
     {
         if (!type.is_valid())
         {
@@ -157,7 +157,7 @@ namespace Cryo
         return result;
     }
 
-    std::vector<llvm::Type *> TypeMapper2::map_all(const std::vector<TypeRef> &types)
+    std::vector<llvm::Type *> TypeMapper::map_all(const std::vector<TypeRef> &types)
     {
         std::vector<llvm::Type *> result;
         result.reserve(types.size());
@@ -170,7 +170,7 @@ namespace Cryo
         return result;
     }
 
-    llvm::FunctionType *TypeMapper2::map_function(TypeRef return_type,
+    llvm::FunctionType *TypeMapper::map_function(TypeRef return_type,
                                                    const std::vector<TypeRef> &param_types,
                                                    bool is_variadic)
     {
@@ -204,67 +204,67 @@ namespace Cryo
     // Primitive Type Accessors
     // ========================================================================
 
-    llvm::Type *TypeMapper2::void_type()
+    llvm::Type *TypeMapper::void_type()
     {
         return llvm::Type::getVoidTy(_llvm_ctx);
     }
 
-    llvm::IntegerType *TypeMapper2::bool_type()
+    llvm::IntegerType *TypeMapper::bool_type()
     {
         return llvm::Type::getInt1Ty(_llvm_ctx);
     }
 
-    llvm::IntegerType *TypeMapper2::char_type()
+    llvm::IntegerType *TypeMapper::char_type()
     {
         return llvm::Type::getInt8Ty(_llvm_ctx);
     }
 
-    llvm::IntegerType *TypeMapper2::i8_type()
+    llvm::IntegerType *TypeMapper::i8_type()
     {
         return llvm::Type::getInt8Ty(_llvm_ctx);
     }
 
-    llvm::IntegerType *TypeMapper2::i16_type()
+    llvm::IntegerType *TypeMapper::i16_type()
     {
         return llvm::Type::getInt16Ty(_llvm_ctx);
     }
 
-    llvm::IntegerType *TypeMapper2::i32_type()
+    llvm::IntegerType *TypeMapper::i32_type()
     {
         return llvm::Type::getInt32Ty(_llvm_ctx);
     }
 
-    llvm::IntegerType *TypeMapper2::i64_type()
+    llvm::IntegerType *TypeMapper::i64_type()
     {
         return llvm::Type::getInt64Ty(_llvm_ctx);
     }
 
-    llvm::IntegerType *TypeMapper2::i128_type()
+    llvm::IntegerType *TypeMapper::i128_type()
     {
         return llvm::Type::getInt128Ty(_llvm_ctx);
     }
 
-    llvm::IntegerType *TypeMapper2::int_type(unsigned bits)
+    llvm::IntegerType *TypeMapper::int_type(unsigned bits)
     {
         return llvm::Type::getIntNTy(_llvm_ctx, bits);
     }
 
-    llvm::Type *TypeMapper2::f32_type()
+    llvm::Type *TypeMapper::f32_type()
     {
         return llvm::Type::getFloatTy(_llvm_ctx);
     }
 
-    llvm::Type *TypeMapper2::f64_type()
+    llvm::Type *TypeMapper::f64_type()
     {
         return llvm::Type::getDoubleTy(_llvm_ctx);
     }
 
-    llvm::PointerType *TypeMapper2::string_type()
+    llvm::PointerType *TypeMapper::string_type()
     {
         return llvm::PointerType::get(i8_type(), 0);
     }
 
-    llvm::PointerType *TypeMapper2::ptr_type()
+    llvm::PointerType *TypeMapper::ptr_type()
     {
         return llvm::PointerType::getUnqual(_llvm_ctx);
     }
@@ -273,7 +273,7 @@ namespace Cryo
     // Type Utilities
     // ========================================================================
 
-    uint64_t TypeMapper2::size_of(llvm::Type *type)
+    uint64_t TypeMapper::size_of(llvm::Type *type)
     {
         if (!type || !_module)
             return 0;
@@ -287,7 +287,7 @@ namespace Cryo
         return layout.getTypeAllocSize(type);
     }
 
-    uint64_t TypeMapper2::align_of(llvm::Type *type)
+    uint64_t TypeMapper::align_of(llvm::Type *type)
     {
         if (!type || !_module)
             return 1;
@@ -301,14 +301,14 @@ namespace Cryo
         return layout.getABITypeAlign(type).value();
     }
 
-    llvm::Constant *TypeMapper2::null_value(llvm::Type *type)
+    llvm::Constant *TypeMapper::null_value(llvm::Type *type)
     {
         if (!type)
             return nullptr;
         return llvm::Constant::getNullValue(type);
     }
 
-    bool TypeMapper2::is_signed(TypeRef type)
+    bool TypeMapper::is_signed(TypeRef type)
     {
         if (!type.is_valid())
             return false;
@@ -321,7 +321,7 @@ namespace Cryo
         return int_type->is_signed();
     }
 
-    bool TypeMapper2::is_float(llvm::Type *type)
+    bool TypeMapper::is_float(llvm::Type *type)
     {
         return type && (type->isFloatTy() || type->isDoubleTy() ||
                         type->isHalfTy() || type->isFP128Ty());
@@ -331,7 +331,7 @@ namespace Cryo
     // Struct Type Management
     // ========================================================================
 
-    llvm::StructType *TypeMapper2::get_or_create_struct(const std::string &name)
+    llvm::StructType *TypeMapper::get_or_create_struct(const std::string &name)
     {
         auto it = _struct_cache.find(name);
         if (it != _struct_cache.end())
@@ -352,7 +352,7 @@ namespace Cryo
         return st;
     }
 
-    void TypeMapper2::register_struct(const std::string &name, llvm::StructType *type)
+    void TypeMapper::register_struct(const std::string &name, llvm::StructType *type)
     {
         if (type)
         {
@@ -360,18 +360,18 @@ namespace Cryo
         }
     }
 
-    llvm::StructType *TypeMapper2::lookup_struct(const std::string &name)
+    llvm::StructType *TypeMapper::lookup_struct(const std::string &name)
     {
         auto it = _struct_cache.find(name);
         return (it != _struct_cache.end()) ? it->second : nullptr;
     }
 
-    bool TypeMapper2::has_struct(const std::string &name)
+    bool TypeMapper::has_struct(const std::string &name)
     {
         return _struct_cache.find(name) != _struct_cache.end();
     }
 
-    void TypeMapper2::complete_struct(llvm::StructType *st,
+    void TypeMapper::complete_struct(llvm::StructType *st,
                                        const std::vector<llvm::Type *> &fields,
                                        bool packed)
     {
@@ -385,13 +385,13 @@ namespace Cryo
     // Cache Management
     // ========================================================================
 
-    void TypeMapper2::clear_cache()
+    void TypeMapper::clear_cache()
     {
         _type_cache.clear();
         _struct_cache.clear();
     }
 
-    void TypeMapper2::cache_type(TypeRef type, llvm::Type *llvm_type)
+    void TypeMapper::cache_type(TypeRef type, llvm::Type *llvm_type)
     {
         if (type.is_valid() && llvm_type)
         {
@@ -399,14 +399,14 @@ namespace Cryo
         }
     }
 
-    llvm::Type *TypeMapper2::lookup_cached(TypeRef type)
+    llvm::Type *TypeMapper::lookup_cached(TypeRef type)
     {
         if (!type.is_valid())
             return nullptr;
         return lookup_cached(type.id());
     }
 
-    llvm::Type *TypeMapper2::lookup_cached(TypeID id)
+    llvm::Type *TypeMapper::lookup_cached(TypeID id)
     {
         auto it = _type_cache.find(id);
         return (it != _type_cache.end()) ? it->second : nullptr;
@@ -416,17 +416,17 @@ namespace Cryo
     // Primitive Type Mapping
     // ========================================================================
 
-    llvm::Type *TypeMapper2::map_void(const VoidType *)
+    llvm::Type *TypeMapper::map_void(const VoidType *)
     {
         return void_type();
     }
 
-    llvm::Type *TypeMapper2::map_bool(const BoolType *)
+    llvm::Type *TypeMapper::map_bool(const BoolType *)
     {
         return bool_type();
     }
 
-    llvm::Type *TypeMapper2::map_int(const IntType *type)
+    llvm::Type *TypeMapper::map_int(const IntType *type)
     {
         if (!type)
             return nullptr;
@@ -458,7 +458,7 @@ namespace Cryo
         }
     }
 
-    llvm::Type *TypeMapper2::map_float(const FloatType *type)
+    llvm::Type *TypeMapper::map_float(const FloatType *type)
     {
         if (!type)
             return nullptr;
@@ -474,17 +474,17 @@ namespace Cryo
         }
     }
 
-    llvm::Type *TypeMapper2::map_char(const CharType *)
+    llvm::Type *TypeMapper::map_char(const CharType *)
     {
         return char_type();
     }
 
-    llvm::Type *TypeMapper2::map_string(const StringType *)
+    llvm::Type *TypeMapper::map_string(const StringType *)
     {
         return string_type();
     }
 
-    llvm::Type *TypeMapper2::map_never(const NeverType *)
+    llvm::Type *TypeMapper::map_never(const NeverType *)
     {
         // Never type doesn't have a runtime representation
         // Using void as placeholder - code paths should never reach here
@@ -495,19 +495,19 @@ namespace Cryo
     // Compound Type Mapping
     // ========================================================================
 
-    llvm::Type *TypeMapper2::map_pointer(const PointerType *)
+    llvm::Type *TypeMapper::map_pointer(const PointerType *)
     {
         // LLVM 15+ uses opaque pointers
         return ptr_type();
     }
 
-    llvm::Type *TypeMapper2::map_reference(const ReferenceType *)
+    llvm::Type *TypeMapper::map_reference(const ReferenceType *)
     {
         // References are represented as pointers
         return ptr_type();
     }
 
-    llvm::Type *TypeMapper2::map_array(const ArrayType *type)
+    llvm::Type *TypeMapper::map_array(const ArrayType *type)
     {
         if (!type)
             return nullptr;
@@ -542,7 +542,7 @@ namespace Cryo
         return array_struct;
     }
 
-    llvm::Type *TypeMapper2::map_function_type(const FunctionType *type)
+    llvm::Type *TypeMapper::map_function_type(const FunctionType *type)
     {
         if (!type)
             return nullptr;
@@ -567,7 +567,7 @@ namespace Cryo
         return llvm::PointerType::get(fn, 0);
     }
 
-    llvm::Type *TypeMapper2::map_tuple(const TupleType *type)
+    llvm::Type *TypeMapper::map_tuple(const TupleType *type)
     {
         if (!type)
             return nullptr;
@@ -612,7 +612,7 @@ namespace Cryo
         return tuple_struct;
     }
 
-    llvm::Type *TypeMapper2::map_optional(const OptionalType *type)
+    llvm::Type *TypeMapper::map_optional(const OptionalType *type)
     {
         if (!type)
             return nullptr;
@@ -636,7 +636,7 @@ namespace Cryo
     // User-Defined Type Mapping
     // ========================================================================
 
-    llvm::Type *TypeMapper2::map_struct(const StructType *type)
+    llvm::Type *TypeMapper::map_struct(const StructType *type)
     {
         if (!type)
             return nullptr;
@@ -682,7 +682,7 @@ namespace Cryo
         return st;
     }
 
-    llvm::Type *TypeMapper2::map_class(const ClassType *type)
+    llvm::Type *TypeMapper::map_class(const ClassType *type)
     {
         if (!type)
             return nullptr;
@@ -730,7 +730,7 @@ namespace Cryo
         return st;
     }
 
-    llvm::Type *TypeMapper2::map_enum(const EnumType *type)
+    llvm::Type *TypeMapper::map_enum(const EnumType *type)
     {
         if (!type)
             return nullptr;
@@ -772,7 +772,7 @@ namespace Cryo
         return create_tagged_union(name, 4, max_payload);
     }
 
-    llvm::Type *TypeMapper2::map_trait(const TraitType *type)
+    llvm::Type *TypeMapper::map_trait(const TraitType *type)
     {
         if (!type)
             return nullptr;
@@ -796,7 +796,7 @@ namespace Cryo
         return st;
     }
 
-    llvm::Type *TypeMapper2::map_type_alias(const TypeAliasType *type)
+    llvm::Type *TypeMapper::map_type_alias(const TypeAliasType *type)
     {
         if (!type)
             return nullptr;
@@ -815,7 +815,7 @@ namespace Cryo
     // Generic Type Mapping
     // ========================================================================
 
-    llvm::Type *TypeMapper2::map_generic_param(const GenericParamType *type)
+    llvm::Type *TypeMapper::map_generic_param(const GenericParamType *type)
     {
         if (!type)
             return nullptr;
@@ -826,7 +826,7 @@ namespace Cryo
         return ptr_type();
     }
 
-    llvm::Type *TypeMapper2::map_bounded_param(const BoundedParamType *type)
+    llvm::Type *TypeMapper::map_bounded_param(const BoundedParamType *type)
     {
         if (!type)
             return nullptr;
@@ -836,7 +836,7 @@ namespace Cryo
         return ptr_type();
     }
 
-    llvm::Type *TypeMapper2::map_instantiated(const InstantiatedType *type)
+    llvm::Type *TypeMapper::map_instantiated(const InstantiatedType *type)
     {
         if (!type)
             return nullptr;
@@ -869,7 +869,7 @@ namespace Cryo
         return st;
     }
 
-    llvm::Type *TypeMapper2::map_error(const ErrorType *type)
+    llvm::Type *TypeMapper::map_error(const ErrorType *type)
     {
         // Error types indicate compilation failure - use void as placeholder
         if (type)
@@ -883,7 +883,7 @@ namespace Cryo
     // Helpers
     // ========================================================================
 
-    llvm::StructType *TypeMapper2::create_tagged_union(const std::string &name,
+    llvm::StructType *TypeMapper::create_tagged_union(const std::string &name,
                                                         size_t discriminant_size,
                                                         size_t payload_size)
     {
@@ -920,7 +920,7 @@ namespace Cryo
         return st;
     }
 
-    void TypeMapper2::report_error(const std::string &msg)
+    void TypeMapper::report_error(const std::string &msg)
     {
         _has_error = true;
         _last_error = msg;
@@ -930,7 +930,7 @@ namespace Cryo
     // Backward Compatibility Methods
     // ========================================================================
 
-    llvm::Type *TypeMapper2::get_type(const std::string &name)
+    llvm::Type *TypeMapper::get_type(const std::string &name)
     {
         // First check struct cache
         auto it = _struct_cache.find(name);
@@ -973,7 +973,7 @@ namespace Cryo
         return nullptr;
     }
 
-    llvm::Type *TypeMapper2::resolve_and_map(const std::string &name)
+    llvm::Type *TypeMapper::resolve_and_map(const std::string &name)
     {
         // Try get_type first
         llvm::Type *result = get_type(name);

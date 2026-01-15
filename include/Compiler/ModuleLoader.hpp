@@ -8,7 +8,7 @@
 #include <functional>
 
 #include "AST/ASTNode.hpp"
-#include "AST/SymbolTable.hpp"
+#include "Types/SymbolTable.hpp"
 #include "AST/TemplateRegistry.hpp"
 
 namespace Cryo

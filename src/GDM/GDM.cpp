@@ -1,7 +1,7 @@
 #include "GDM/GDM.hpp"
 #include "GDM/DiagnosticFormatter.hpp"
 #include "GDM/ErrorAnalysis.hpp"
-#include "AST/Type.hpp"
+#include "Types/Types.hpp"
 #include <algorithm>
 #include <iomanip>
 #include <fstream>

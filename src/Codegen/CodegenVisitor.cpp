@@ -13,7 +13,7 @@
 #include "Codegen/Declarations/DeclarationCodegen.hpp"
 #include "Codegen/Declarations/TypeCodegen.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
-#include "AST/TypeChecker.hpp"
+#include "Types/TypeChecker.hpp"
 
 #include "Utils/Logger.hpp"
 
@@ -1205,14 +1205,14 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::import_specialized_methods(const Cryo::TypeChecker &type_checker)
     {
-        // TODO: Needs reimplementation for Types2 - specialized methods tracking not yet in TypeChecker2
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor::import_specialized_methods - stub (needs Types2 reimplementation)");
+        // TODO: Needs reimplementation for Types - specialized methods tracking not yet in TypeChecker
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor::import_specialized_methods - stub (needs Types reimplementation)");
     }
 
     void CodegenVisitor::import_namespace_aliases(const Cryo::TypeChecker &type_checker)
     {
-        // TODO: Needs reimplementation for Types2 - SRM context not yet integrated with TypeChecker2
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor::import_namespace_aliases - stub (needs Types2 reimplementation)");
+        // TODO: Needs reimplementation for Types - SRM context not yet integrated with TypeChecker
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor::import_namespace_aliases - stub (needs Types reimplementation)");
     }
 
     void CodegenVisitor::process_global_variables_recursively(ASTNode *node)

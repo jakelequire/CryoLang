@@ -1,9 +1,9 @@
 #pragma once
 /******************************************************************************
- * @file Monomorphizer2.hpp
- * @brief Monomorphization infrastructure using the new Types2 system
+ * @file Monomorphizer.hpp
+ * @brief Monomorphization infrastructure using the new Types system
  *
- * Monomorphizer2 handles generic type instantiation and specialization
+ * Monomorphizer handles generic type instantiation and specialization
  * using TypeRef-based types. Key improvements:
  *
  * - Uses TypeRef and TypeSubstitution for clean type manipulation
@@ -12,11 +12,11 @@
  * - No string-based type substitution
  ******************************************************************************/
 
-#include "Types2/TypeID.hpp"
-#include "Types2/Type.hpp"
-#include "Types2/TypeArena.hpp"
-#include "Types2/GenericRegistry.hpp"
-#include "Types2/ModuleTypeRegistry.hpp"
+#include "Types/TypeID.hpp"
+#include "Types/Type.hpp"
+#include "Types/TypeArena.hpp"
+#include "Types/GenericRegistry.hpp"
+#include "Types/ModuleTypeRegistry.hpp"
 
 #include <string>
 #include <vector>
@@ -102,7 +102,7 @@ namespace Cryo
     };
 
     /**************************************************************************
-     * @brief Monomorphizer using Types2 system
+     * @brief Monomorphizer using Types system
      *
      * Handles:
      * - Type substitution using TypeSubstitution
@@ -110,7 +110,7 @@ namespace Cryo
      * - Demand-driven monomorphization
      *
      * Usage:
-     *   Monomorphizer2 mono(arena, generics, modules);
+     *   Monomorphizer mono(arena, generics, modules);
      *
      *   // Add instantiation requests
      *   mono.add_request(array_type, {int_type}, loc, mod);
@@ -118,7 +118,7 @@ namespace Cryo
      *   // Process all pending requests
      *   mono.process_all();
      **************************************************************************/
-    class Monomorphizer2
+    class Monomorphizer
     {
     private:
         TypeArena &_arena;
@@ -147,15 +147,15 @@ namespace Cryo
         // Construction
         // ====================================================================
 
-        Monomorphizer2(TypeArena &arena,
+        Monomorphizer(TypeArena &arena,
                        GenericRegistry &generics,
                        ModuleTypeRegistry &modules);
 
-        ~Monomorphizer2() = default;
+        ~Monomorphizer() = default;
 
         // Non-copyable
-        Monomorphizer2(const Monomorphizer2 &) = delete;
-        Monomorphizer2 &operator=(const Monomorphizer2 &) = delete;
+        Monomorphizer(const Monomorphizer &) = delete;
+        Monomorphizer &operator=(const Monomorphizer &) = delete;
 
         // ====================================================================
         // Configuration

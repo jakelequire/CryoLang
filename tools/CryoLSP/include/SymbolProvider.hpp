@@ -2,7 +2,7 @@
 
 #include "LSPTypes.hpp"
 #include "Compiler/CompilerInstance.hpp"
-#include "AST/TypeChecker.hpp"
+#include "Types/TypeChecker.hpp"
 #include "AST/ASTNode.hpp"
 #include <vector>
 #include <optional>

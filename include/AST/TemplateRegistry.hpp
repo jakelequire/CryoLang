@@ -11,7 +11,7 @@ namespace Cryo
      *
      * This registry maintains references to all generic class, enum, and function
      * templates that have been discovered during compilation. It allows the
-     * MonomorphizationPass to find templates from any imported module.
+     * Monomorphizer to find templates from any imported module.
      */
     class TemplateRegistry
     {

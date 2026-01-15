@@ -2,8 +2,8 @@
 
 #include "AST/ASTNode.hpp"
 #include "AST/ASTContext.hpp"
-#include "AST/SymbolTable.hpp"
-#include "AST/TypeChecker.hpp"
+#include "Types/SymbolTable.hpp"
+#include "Types/TypeChecker.hpp"
 #include "GDM/GDM.hpp"
 #include "Codegen/LLVMContext.hpp"
 #include "Codegen/CodegenVisitor.hpp"

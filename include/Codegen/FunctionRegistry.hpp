@@ -70,7 +70,7 @@ namespace Cryo::Codegen
         /**
          * @brief Initialize the function registry with symbol table and type context
          */
-        FunctionRegistry(const Cryo::SymbolTable &symbol_table, Cryo::TypeContext &type_context);
+        FunctionRegistry(const Cryo::SymbolTable &symbol_table, Cryo::TypeArena &type_context);
 
         /**
          * @brief Get function metadata by looking up in symbol table and applying rules
@@ -107,7 +107,7 @@ namespace Cryo::Codegen
 
     private:
         const Cryo::SymbolTable &_symbol_table;
-        Cryo::TypeContext &_type_context;
+        Cryo::TypeArena &_type_context;
         std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _symbol_resolution_manager;
 
         // Pattern matchers for different function types

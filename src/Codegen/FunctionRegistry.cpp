@@ -1,8 +1,8 @@
 #include "Codegen/FunctionRegistry.hpp"
-#include "AST/SymbolTable.hpp"
-#include "AST/Type.hpp"
-#include "AST/TypeChecker.hpp"
-#include "Types2/UserDefinedTypes.hpp"
+#include "Types/SymbolTable.hpp"
+#include "Types/Types.hpp"
+#include "Types/TypeChecker.hpp"
+#include "Types/UserDefinedTypes.hpp"
 #include "Utils/Logger.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 
@@ -18,7 +18,7 @@
 namespace Cryo::Codegen
 {
 
-    FunctionRegistry::FunctionRegistry(const Cryo::SymbolTable &symbol_table, Cryo::TypeContext &type_context)
+    FunctionRegistry::FunctionRegistry(const Cryo::SymbolTable &symbol_table, Cryo::TypeArena &type_context)
         : _symbol_table(symbol_table), _type_context(type_context)
     {
         // Initialize Symbol Resolution Manager

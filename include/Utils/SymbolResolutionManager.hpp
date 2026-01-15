@@ -10,8 +10,8 @@
 #include <string_view>
 #include <iostream>
 
-#include "AST/Type.hpp"
-#include "AST/SymbolTable.hpp"
+#include "Types/Types.hpp"
+#include "Types/SymbolTable.hpp"
 #include "Utils/Logger.hpp"
 
 // Forward declarations
@@ -351,7 +351,7 @@ namespace Cryo::SRM {
         std::vector<std::string> import_search_paths_;
         
         // Integration with type system (for naming purposes)
-        Cryo::TypeContext* type_context_;
+        Cryo::TypeArena* type_context_;
         
         // Caching for performance
         mutable std::unordered_map<std::string, std::vector<std::string>> resolved_namespace_cache_;
@@ -362,7 +362,7 @@ namespace Cryo::SRM {
         bool enable_namespace_fallback_;
     
     public:
-        explicit SymbolResolutionContext(Cryo::TypeContext* type_context = nullptr);        ~SymbolResolutionContext() = default;
+        explicit SymbolResolutionContext(Cryo::TypeArena* type_context = nullptr);        ~SymbolResolutionContext() = default;
         
         // Namespace management
         void push_namespace(const std::string& namespace_name);
@@ -413,8 +413,8 @@ namespace Cryo::SRM {
             const std::string& symbol_name, Cryo::SymbolKind kind) const;
             
         // Integration accessors
-        Cryo::TypeContext* get_type_context() const { return type_context_; }
-        void set_type_context(Cryo::TypeContext* type_context) { type_context_ = type_context; }
+        Cryo::TypeArena* get_type_context() const { return type_context_; }
+        void set_type_context(Cryo::TypeArena* type_context) { type_context_ = type_context; }
         
         // Cache management
         void clear_namespace_cache() const;

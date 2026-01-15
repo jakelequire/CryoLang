@@ -16,9 +16,9 @@
  * - TypeRef is the external interface; raw Type* stays internal
  ******************************************************************************/
 
-#include "Types2/TypeID.hpp"
-#include "Types2/TypeKind.hpp"
-#include "Types2/Type.hpp"
+#include "Types/TypeID.hpp"
+#include "Types/TypeKind.hpp"
+#include "Types/Type.hpp"
 #include "Lexer/lexer.hpp"
 
 #include <memory>
