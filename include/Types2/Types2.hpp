@@ -33,3 +33,6 @@
 #include "Types2/ModuleTypeRegistry.hpp"
 #include "Types2/GenericRegistry.hpp"
 #include "Types2/TypeResolver.hpp"
+
+// Codegen bridge (Phase 3)
+#include "Types2/TypeMapper2.hpp"
