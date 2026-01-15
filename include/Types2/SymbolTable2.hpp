@@ -44,6 +44,7 @@ namespace Cryo
         GenericParam,// Generic type parameter
         Namespace,   // Namespace
         Import,      // Imported symbol
+        Intrinsic,   // Compiler intrinsic
     };
 
     /**************************************************************************
@@ -73,6 +74,8 @@ namespace Cryo
         // Optional metadata
         std::string qualified_name;      // Fully qualified name
         std::string documentation;       // Documentation string
+        std::string scope;               // Namespace scope (for compatibility)
+
 
         Symbol2() : kind(SymbolKind2::Variable),
                     visibility(SymbolVisibility::Private),
@@ -364,6 +367,31 @@ namespace Cryo
         const TypeArena &arena() const { return _arena; }
         ModuleTypeRegistry &modules() { return _modules; }
         const ModuleTypeRegistry &modules() const { return _modules; }
+
+        // ====================================================================
+        // Backward Compatibility Methods
+        // ====================================================================
+
+        /**
+         * @brief Look up a symbol by name (backward compatibility)
+         * @return Symbol pointer or nullptr if not found
+         */
+        Symbol2 *lookup_symbol(const std::string &name) { return lookup(name); }
+        const Symbol2 *lookup_symbol(const std::string &name) const { return lookup(name); }
+
+        /**
+         * @brief Look up a symbol in a specific namespace
+         * @param ns Namespace to look in
+         * @param name Symbol name
+         * @return Symbol pointer or nullptr if not found
+         */
+        Symbol2 *lookup_namespaced_symbol(const std::string &ns, const std::string &name);
+        const Symbol2 *lookup_namespaced_symbol(const std::string &ns, const std::string &name) const;
+
+        /**
+         * @brief Get all symbols for LSP support
+         */
+        std::vector<Symbol2> get_all_symbols_for_lsp() const;
 
         // ====================================================================
         // Debug

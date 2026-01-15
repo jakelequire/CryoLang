@@ -484,9 +484,40 @@ namespace Cryo
             return "Namespace";
         case SymbolKind2::Import:
             return "Import";
+        case SymbolKind2::Intrinsic:
+            return "Intrinsic";
         default:
             return "Unknown";
         }
+    }
+
+    // ========================================================================
+    // Backward Compatibility Methods
+    // ========================================================================
+
+    Symbol2 *SymbolTable2::lookup_namespaced_symbol(const std::string &ns, const std::string &name)
+    {
+        // Build qualified name and look up
+        std::string qualified_name = ns.empty() ? name : ns + "::" + name;
+        Symbol2 *sym = lookup(qualified_name);
+        if (sym)
+            return sym;
+
+        // Try just the name
+        return lookup(name);
+    }
+
+    const Symbol2 *SymbolTable2::lookup_namespaced_symbol(const std::string &ns, const std::string &name) const
+    {
+        return const_cast<SymbolTable2 *>(this)->lookup_namespaced_symbol(ns, name);
+    }
+
+    std::vector<Symbol2> SymbolTable2::get_all_symbols_for_lsp() const
+    {
+        std::vector<Symbol2> result;
+        for_each_symbol([&result](const Symbol2 &sym)
+                        { result.push_back(sym); });
+        return result;
     }
 
     std::string visibility_to_string(SymbolVisibility vis)

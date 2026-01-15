@@ -927,6 +927,64 @@ namespace Cryo
     }
 
     // ========================================================================
+    // Backward Compatibility Methods
+    // ========================================================================
+
+    llvm::Type *TypeMapper2::get_type(const std::string &name)
+    {
+        // First check struct cache
+        auto it = _struct_cache.find(name);
+        if (it != _struct_cache.end())
+        {
+            return it->second;
+        }
+
+        // Try to look up in module if available
+        if (_module)
+        {
+            llvm::StructType *st = _module->getTypeByName(name);
+            if (st)
+            {
+                _struct_cache[name] = st;
+                return st;
+            }
+        }
+
+        // Try primitive type names
+        if (name == "void")
+            return void_type();
+        if (name == "bool")
+            return bool_type();
+        if (name == "i8" || name == "u8")
+            return i8_type();
+        if (name == "i16" || name == "u16")
+            return i16_type();
+        if (name == "i32" || name == "int" || name == "u32")
+            return i32_type();
+        if (name == "i64" || name == "u64")
+            return i64_type();
+        if (name == "f32" || name == "float")
+            return f32_type();
+        if (name == "f64" || name == "double")
+            return f64_type();
+        if (name == "string")
+            return string_type();
+
+        return nullptr;
+    }
+
+    llvm::Type *TypeMapper2::resolve_and_map(const std::string &name)
+    {
+        // Try get_type first
+        llvm::Type *result = get_type(name);
+        if (result)
+            return result;
+
+        // Create opaque struct as fallback
+        return get_or_create_struct(name);
+    }
+
+    // ========================================================================
     // Utility Functions
     // ========================================================================
 
