@@ -507,8 +507,8 @@ namespace Cryo
     {
         std::unordered_map<std::string, Symbol> symbol_map;
 
-        // Get TypeContext for creating proper type objects
-        TypeContext *type_context = _symbol_table.get_type_context();
+        // Get TypeArena for creating proper type objects
+        TypeArena &type_arena = _symbol_table.arena();
 
         // Process all top-level declarations
         for (const auto &statement : ast.statements())
@@ -518,38 +518,41 @@ namespace Cryo
                 if (auto func_decl = dynamic_cast<FunctionDeclarationNode *>(decl))
                 {
                     // Create function symbol with proper type information
-                    TypeRef func_type = create_function_type_from_declaration(func_decl, type_context);
-                    Symbol symbol(func_decl->name(), SymbolKind::Function, func_decl->location(), func_type, module_name);
+                    TypeRef func_type = create_function_type_from_declaration(func_decl, &type_arena);
+                    Symbol symbol(func_decl->name(), SymbolKind::Function, func_type, ModuleID::invalid(), func_decl->location());
+                    symbol.scope = module_name;
                     symbol_map[func_decl->name()] = symbol;
                 }
                 else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(decl))
                 {
                     // Create variable symbol
-                    Symbol symbol(var_decl->name(), SymbolKind::Variable, var_decl->location(), nullptr, module_name);
+                    Symbol symbol(var_decl->name(), SymbolKind::Variable, TypeRef{}, ModuleID::invalid(), var_decl->location());
+                    symbol.scope = module_name;
                     symbol_map[var_decl->name()] = symbol;
                 }
                 else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(decl))
                 {
                     // Create type symbol for struct
-                    Symbol symbol(struct_decl->name(), SymbolKind::Type, struct_decl->location(), nullptr, module_name);
+                    Symbol symbol(struct_decl->name(), SymbolKind::Type, TypeRef{}, ModuleID::invalid(), struct_decl->location());
+                    symbol.scope = module_name;
                     symbol_map[struct_decl->name()] = symbol;
                 }
                 else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(decl))
                 {
                     // Create type symbol for class
-                    Symbol symbol(class_decl->name(), SymbolKind::Type, class_decl->location(), nullptr, module_name);
+                    Symbol symbol(class_decl->name(), SymbolKind::Type, TypeRef{}, ModuleID::invalid(), class_decl->location());
+                    symbol.scope = module_name;
                     symbol_map[class_decl->name()] = symbol;
                 }
                 else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(decl))
                 {
-                    TypeRef enum_type = nullptr;
+                    TypeRef enum_type{};
                     if (!enum_decl->generic_parameters().empty())
                     {
-                        // For generic enums, try to get the parameterized enum template from TypeContext
-                        auto parameterized_enum = type_context->get_parameterized_enum_template(enum_decl->name());
-                        if (parameterized_enum)
+                        // For generic enums, try to look up the enum template from TypeArena
+                        enum_type = type_arena.lookup_enum_type(enum_decl->name());
+                        if (enum_type.is_valid())
                         {
-                            enum_type = parameterized_enum.get();
                             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Found parameterized enum template for {}", enum_decl->name());
                         }
                         else
@@ -560,28 +563,32 @@ namespace Cryo
                     else
                     {
                         // For non-generic enums, create a regular enum type
-                        std::vector<std::string> variant_names;
+                        std::vector<EnumVariantInfo> variant_infos;
                         for (const auto &variant : enum_decl->variants())
                         {
-                            variant_names.push_back(variant->name());
+                            EnumVariantInfo info;
+                            info.name = variant->name();
+                            variant_infos.push_back(info);
                         }
-                        enum_type = type_context->get_enum_type(enum_decl->name(), std::move(variant_names), true);
+                        enum_type = type_arena.create_enum(enum_decl->name(), variant_infos);
                     }
 
                     // Create type symbol for enum
-                    Symbol symbol(enum_decl->name(), SymbolKind::Type, enum_decl->location(), enum_type, module_name);
+                    Symbol symbol(enum_decl->name(), SymbolKind::Type, enum_type, ModuleID::invalid(), enum_decl->location());
+                    symbol.scope = module_name;
                     symbol_map[enum_decl->name()] = symbol;
                 }
                 else if (auto intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(decl))
                 {
                     // Create intrinsic symbol with proper type information (same as regular functions)
-                    TypeRef intrinsic_type = create_function_type_from_declaration(intrinsic_decl, type_context);
-                    if (intrinsic_type)
+                    TypeRef intrinsic_type = create_function_type_from_declaration(intrinsic_decl, &type_arena);
+                    if (intrinsic_type.is_valid())
                     {
-                        Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_decl->location(), intrinsic_type, module_name);
+                        Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_type, ModuleID::invalid(), intrinsic_decl->location());
+                        symbol.scope = module_name;
                         symbol_map[intrinsic_decl->name()] = symbol;
                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added intrinsic '{}' to symbol map with type '{}'",
-                                  intrinsic_decl->name(), intrinsic_type.get()->display_name());
+                                  intrinsic_decl->name(), intrinsic_type->display_name());
                     }
                     else
                     {
@@ -641,76 +648,74 @@ namespace Cryo
         return _loading_modules.find(module_path) != _loading_modules.end();
     }
 
-    TypeRef ModuleLoader::create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeContext *type_context)
+    TypeRef ModuleLoader::create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeArena *type_arena)
     {
-        if (!func_decl || !type_context)
+        if (!func_decl || !type_arena)
         {
-            return nullptr;
+            return TypeRef{};
         }
 
         // Get return type
-        TypeRef return_type;
-        return_type = func_decl->get_resolved_return_type();
-        const std::string &return_type_str = return_type.is_valid() ? return_type.get()->display_name() : "void";
-        if (!return_type || return_type_str == "void")
+        TypeRef return_type = func_decl->get_resolved_return_type();
+        const std::string return_type_str = return_type.is_valid() ? return_type->display_name() : "void";
+        if (!return_type.is_valid() || return_type_str == "void")
         {
             // Default to void for functions without explicit return type or explicit void
-            return_type = type_context->get_void_type();
+            return_type = type_arena->get_void();
         }
 
         // Get parameter types
-        std::vector<Type *> parameter_types;
+        std::vector<TypeRef> parameter_types;
         for (const auto &param : func_decl->parameters())
         {
             TypeRef param_type = param->get_resolved_type();
-            if (param_type)
+            if (param_type.is_valid())
             {
                 parameter_types.push_back(param_type);
             }
             else
             {
-                const std::string &param_type_str = param_type.is_valid() ? param_type.get()->display_name() : "unknown";
+                const std::string param_type_str = param_type.is_valid() ? param_type->display_name() : "unknown";
                 std::cerr << "Warning: Failed to get resolved type for parameter '" << param->name()
                           << "' (type: " << param_type_str << ") in function '" << func_decl->name() << "'" << std::endl;
-                return nullptr;
+                return TypeRef{};
             }
         }
 
         // Create FunctionType
-        return type_context->create_function_type(return_type, parameter_types);
+        return type_arena->create_function(return_type, parameter_types);
     }
 
-    TypeRef ModuleLoader::create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeContext *type_context)
+    TypeRef ModuleLoader::create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeArena *type_arena)
     {
-        if (!intrinsic_decl || !type_context)
+        if (!intrinsic_decl || !type_arena)
         {
-            return nullptr;
+            return TypeRef{};
         }
 
         const std::string &intrinsic_name = intrinsic_decl->name();
         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Creating function type for intrinsic '{}'", intrinsic_name);
 
         // Get return type
-        TypeRef return_type;
-        return_type = intrinsic_decl->get_resolved_return_type();
-        const std::string &return_type_str = return_type.is_valid() ? return_type.get()->display_name() : "void";
+        TypeRef return_type = intrinsic_decl->get_resolved_return_type();
+        const std::string return_type_str = return_type.is_valid() ? return_type->display_name() : "void";
 
         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Intrinsic '{}' has_resolved_return_type={}, return_type_str='{}'",
                   intrinsic_name, intrinsic_decl->has_resolved_return_type(), return_type_str);
 
-        if (!return_type || return_type_str == "void")
+        if (!return_type.is_valid() || return_type_str == "void")
         {
             // Default to void for intrinsics without explicit return type or explicit void
-            return_type = type_context->get_void_type();
+            return_type = type_arena->get_void();
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Intrinsic '{}' using void return type", intrinsic_name);
         }
 
         // Get parameter types
-        std::vector<Type *> parameter_types;
+        std::vector<TypeRef> parameter_types;
         for (const auto &param : intrinsic_decl->parameters())
         {
             TypeRef param_type = param->get_resolved_type();
-            if (param_type)
+            if (param_type.is_valid())
             {
                 parameter_types.push_back(param_type);
                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Intrinsic '{}' param '{}' resolved to '{}'",
@@ -720,16 +725,16 @@ namespace Cryo
             {
                 LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Failed to get resolved type for parameter '{}' in intrinsic '{}' - intrinsic will not be available",
                             param->name(), intrinsic_name);
-                return nullptr;
+                return TypeRef{};
             }
         }
 
         // Create FunctionType
-        TypeRef func_type = type_context->create_function_type(return_type, parameter_types);
-        if (func_type)
+        TypeRef func_type = type_arena->create_function(return_type, parameter_types);
+        if (func_type.is_valid())
         {
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Successfully created function type for intrinsic '{}': {}",
-                      intrinsic_name, func_type.get()->display_name());
+                      intrinsic_name, func_type->display_name());
         }
         else
         {
@@ -865,9 +870,9 @@ namespace Cryo
                             {
                                 field_names.push_back(field->name());
                                 TypeRef field_type = field->get_resolved_type();
-                                if (field_type)
+                                if (field_type.is_valid())
                                 {
-                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' has resolved type: {}", field->name(), field_type.get()->display_name());
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' has resolved type: {}", field->name(), field_type->display_name());
                                     field_types.push_back(field_type);
                                 }
                                 else
@@ -876,26 +881,26 @@ namespace Cryo
                                     std::string type_str = field->type_annotation();
                                     LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' needs type resolution from annotation: '{}'", field->name(), type_str);
                                     field_type = resolve_primitive_type(type_str, _ast_context.types());
-                                    if (field_type)
+                                    if (field_type.is_valid())
                                     {
-                                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' to primitive type: {}", type_str, field_type.get()->display_name());
+                                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' to primitive type: {}", type_str, field_type->display_name());
                                         field_types.push_back(field_type);
                                     }
                                     else
                                     {
-                                        // For complex types, use get_struct_type which creates if not found
+                                        // For complex types, use lookup_struct_type which looks up existing types
                                         // This ensures struct types referenced before their declarations are still registered
-                                        field_type = _ast_context.types().get_struct_type(type_str);
-                                        // Note: get_struct_type auto-creates the struct type if it doesn't exist
-                                        if (field_type)
+                                        field_type = _ast_context.types().lookup_struct_type(type_str);
+                                        // Note: lookup_struct_type returns invalid TypeRef if not found
+                                        if (field_type.is_valid())
                                         {
-                                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' from TypeContext: {}", type_str, field_type.get()->display_name());
+                                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' from TypeArena: {}", type_str, field_type->display_name());
                                         }
                                         else
                                         {
                                             LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Could not resolve field type for '{}': '{}'", field->name(), type_str);
                                         }
-                                        field_types.push_back(field_type); // May be nullptr for unresolvable types
+                                        field_types.push_back(field_type); // May be invalid for unresolvable types
                                     }
                                 }
                             }
@@ -967,10 +972,10 @@ namespace Cryo
                             std::string return_type_str = method->return_type_annotation();
                             if (!return_type_str.empty())
                             {
-                                // Resolve the return type using TypeContext
-                                TypeContext &types = _ast_context.types();
-                                TypeRef return_type = resolve_primitive_type(return_type_str, types);
-                                if (return_type)
+                                // Resolve the return type using TypeArena
+                                TypeArena &arena = _ast_context.types();
+                                TypeRef return_type = resolve_primitive_type(return_type_str, arena);
+                                if (return_type.is_valid())
                                 {
                                     std::string qualified_method_name = qualified_type + "::" + method->name();
                                     _template_registry.register_method_return_type(qualified_method_name, return_type);
@@ -993,54 +998,54 @@ namespace Cryo
     }
 
     // Helper to resolve primitive type annotations to Type objects
-    TypeRef ModuleLoader::resolve_primitive_type(const std::string &type_str, TypeContext &types)
+    TypeRef ModuleLoader::resolve_primitive_type(const std::string &type_str, TypeArena &arena)
     {
         // Handle pointer types (e.g., "u8*", "i32*")
         if (type_str.size() > 1 && type_str.back() == '*')
         {
             std::string base_type_str = type_str.substr(0, type_str.size() - 1);
-            TypeRef base_type = resolve_primitive_type(base_type_str, types);
-            if (base_type)
+            TypeRef base_type = resolve_primitive_type(base_type_str, arena);
+            if (base_type.is_valid())
             {
-                return types.create_pointer_type(base_type);
+                return arena.get_pointer_to(base_type);
             }
             // If base type not found, still return a generic pointer type
-            return types.create_pointer_type(types.get_void_type());
+            return arena.get_pointer_to(arena.get_void());
         }
 
         // Handle primitive types
         if (type_str == "boolean" || type_str == "bool")
-            return types.get_boolean_type();
+            return arena.get_bool();
         if (type_str == "void")
-            return types.get_void_type();
+            return arena.get_void();
         if (type_str == "i8")
-            return types.get_i8_type();
+            return arena.get_i8();
         if (type_str == "i16")
-            return types.get_i16_type();
+            return arena.get_i16();
         if (type_str == "i32" || type_str == "int")
-            return types.get_i32_type();
+            return arena.get_i32();
         if (type_str == "i64")
-            return types.get_i64_type();
+            return arena.get_i64();
         if (type_str == "u8")
-            return types.get_u8_type();
+            return arena.get_u8();
         if (type_str == "u16")
-            return types.get_u16_type();
+            return arena.get_u16();
         if (type_str == "u32" || type_str == "uint")
-            return types.get_u32_type();
+            return arena.get_u32();
         if (type_str == "u64")
-            return types.get_u64_type();
+            return arena.get_u64();
         if (type_str == "f32" || type_str == "float")
-            return types.get_f32_type();
+            return arena.get_f32();
         if (type_str == "f64" || type_str == "double")
-            return types.get_f64_type();
+            return arena.get_f64();
         if (type_str == "char")
-            return types.get_char_type();
+            return arena.get_char();
         if (type_str == "string")
-            return types.get_string_type();
+            return arena.get_string();
 
-        // For non-primitive types (generics, user-defined), return nullptr
+        // For non-primitive types (generics, user-defined), return invalid TypeRef
         // These would need more complex resolution
-        return nullptr;
+        return TypeRef{};
     }
 
     void ModuleLoader::mark_declarations_as_imported(ProgramNode &ast, const std::string &module_name)

@@ -3,6 +3,7 @@
 #include "AST/ASTVisitor.hpp"
 #include "AST/ASTNode.hpp"
 #include "AST/SymbolTable.hpp"
+#include "AST/TypeChecker.hpp"
 #include "Codegen/LLVMContext.hpp"
 #include "Codegen/CodegenContext.hpp"
 #include "GDM/DiagnosticBuilders.hpp"
@@ -13,8 +14,6 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
-
-// TypeChecker is included via AST/TypeChecker.hpp which is part of AST/ASTNode.hpp
 
 namespace Cryo::Codegen
 {
@@ -183,8 +182,8 @@ namespace Cryo::Codegen
         //===================================================================
 
         void pre_register_functions_from_symbol_table();
-        void import_specialized_methods(const Cryo::TypeChecker &type_checker);
-        void import_namespace_aliases(const Cryo::TypeChecker &type_checker);
+        void import_specialized_methods(const Cryo::TypeChecker2 &type_checker);
+        void import_namespace_aliases(const Cryo::TypeChecker2 &type_checker);
         void process_global_variables_recursively(ASTNode *node);
         void generate_global_constructors();
         void set_pre_registration_mode(bool enabled);
