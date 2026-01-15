@@ -1,12 +1,12 @@
 /******************************************************************************
- * @file Monomorphizer2.cpp
- * @brief Implementation of Monomorphizer2 for Cryo's new type system
+ * @file Monomorphizer.cpp
+ * @brief Implementation of Monomorphizer for Cryo's new type system
  ******************************************************************************/
 
-#include "Types2/Monomorphizer2.hpp"
-#include "Types2/GenericTypes.hpp"
-#include "Types2/UserDefinedTypes.hpp"
-#include "Types2/ErrorType.hpp"
+#include "Types/Monomorphizer.hpp"
+#include "Types/GenericTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
+#include "Types/ErrorType.hpp"
 
 #include <sstream>
 #include <algorithm>
@@ -47,10 +47,10 @@ namespace Cryo
     }
 
     // ========================================================================
-    // Monomorphizer2 Implementation
+    // Monomorphizer Implementation
     // ========================================================================
 
-    Monomorphizer2::Monomorphizer2(TypeArena &arena,
+    Monomorphizer::Monomorphizer(TypeArena &arena,
                                    GenericRegistry &generics,
                                    ModuleTypeRegistry &modules)
         : _arena(arena),
@@ -63,7 +63,7 @@ namespace Cryo
     // Request Management
     // ========================================================================
 
-    void Monomorphizer2::add_request(TypeRef generic_type,
+    void Monomorphizer::add_request(TypeRef generic_type,
                                       std::vector<TypeRef> type_args,
                                       SourceLocation location,
                                       ModuleID source_module)
@@ -88,13 +88,13 @@ namespace Cryo
                                         location, source_module);
     }
 
-    void Monomorphizer2::add_request(const InstantiationRequest &request)
+    void Monomorphizer::add_request(const InstantiationRequest &request)
     {
         add_request(request.generic_type, request.type_args,
                     request.location, ModuleID::invalid());
     }
 
-    void Monomorphizer2::import_pending_from_registry()
+    void Monomorphizer::import_pending_from_registry()
     {
         for (const auto &request : _generics.pending_instantiations())
         {
@@ -106,7 +106,7 @@ namespace Cryo
     // Processing
     // ========================================================================
 
-    bool Monomorphizer2::process_all()
+    bool Monomorphizer::process_all()
     {
         bool all_success = true;
 
@@ -128,7 +128,7 @@ namespace Cryo
         return all_success;
     }
 
-    MonomorphResult Monomorphizer2::process_request(const MonomorphRequest &request)
+    MonomorphResult Monomorphizer::process_request(const MonomorphRequest &request)
     {
         std::string key = request.key();
 
@@ -162,7 +162,7 @@ namespace Cryo
         return result;
     }
 
-    MonomorphResult Monomorphizer2::specialize(TypeRef generic_type,
+    MonomorphResult Monomorphizer::specialize(TypeRef generic_type,
                                                  const std::vector<TypeRef> &type_args)
     {
         if (!generic_type.is_valid())
@@ -210,12 +210,12 @@ namespace Cryo
     // Specialization Cache
     // ========================================================================
 
-    bool Monomorphizer2::has_specialization(const std::string &key) const
+    bool Monomorphizer::has_specialization(const std::string &key) const
     {
         return _specializations.find(key) != _specializations.end();
     }
 
-    std::optional<SpecializationEntry> Monomorphizer2::get_specialization(
+    std::optional<SpecializationEntry> Monomorphizer::get_specialization(
         const std::string &key) const
     {
         auto it = _specializations.find(key);
@@ -226,7 +226,7 @@ namespace Cryo
         return std::nullopt;
     }
 
-    void Monomorphizer2::cache_specialization(const std::string &key,
+    void Monomorphizer::cache_specialization(const std::string &key,
                                                TypeRef type,
                                                ASTNode *ast)
     {
@@ -238,7 +238,7 @@ namespace Cryo
         _specializations[key] = entry;
     }
 
-    void Monomorphizer2::mark_generated(const std::string &key)
+    void Monomorphizer::mark_generated(const std::string &key)
     {
         auto it = _specializations.find(key);
         if (it != _specializations.end())
@@ -247,7 +247,7 @@ namespace Cryo
         }
     }
 
-    size_t Monomorphizer2::generated_count() const
+    size_t Monomorphizer::generated_count() const
     {
         size_t count = 0;
         for (const auto &[key, entry] : _specializations)
@@ -264,14 +264,14 @@ namespace Cryo
     // Type Substitution
     // ========================================================================
 
-    TypeSubstitution Monomorphizer2::create_substitution(
+    TypeSubstitution Monomorphizer::create_substitution(
         TypeRef generic_type,
         const std::vector<TypeRef> &type_args)
     {
         return _generics.create_substitution(generic_type, type_args);
     }
 
-    TypeRef Monomorphizer2::apply_substitution(TypeRef type,
+    TypeRef Monomorphizer::apply_substitution(TypeRef type,
                                                  const TypeSubstitution &subst)
     {
         return _generics.substitute(type, subst, _arena);
@@ -281,7 +281,7 @@ namespace Cryo
     // Name Generation
     // ========================================================================
 
-    std::string Monomorphizer2::generate_specialized_name(
+    std::string Monomorphizer::generate_specialized_name(
         TypeRef base,
         const std::vector<TypeRef> &args)
     {
@@ -324,7 +324,7 @@ namespace Cryo
         return oss.str();
     }
 
-    std::string Monomorphizer2::generate_key(TypeRef base,
+    std::string Monomorphizer::generate_key(TypeRef base,
                                                const std::vector<TypeRef> &args)
     {
         std::ostringstream oss;

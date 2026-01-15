@@ -3,7 +3,7 @@
 #include "Codegen/ICodegenComponent.hpp"
 #include "Codegen/CodegenContext.hpp"
 #include "AST/ASTNode.hpp"
-#include "AST/TypeChecker.hpp"
+#include "Types/TypeChecker.hpp"
 
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Function.h>

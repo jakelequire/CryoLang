@@ -1,6 +1,6 @@
 #include "Utils/SymbolResolutionManager.hpp"
-#include "AST/Type.hpp"
-#include "AST/SymbolTable.hpp"
+#include "Types/Types.hpp"
+#include "Types/SymbolTable.hpp"
 #include <sstream>
 
 namespace Cryo::SRM {
@@ -283,7 +283,7 @@ namespace Cryo::SRM {
 
     // SymbolResolutionContext Implementation
     
-    SymbolResolutionContext::SymbolResolutionContext(Cryo::TypeContext* type_context)
+    SymbolResolutionContext::SymbolResolutionContext(Cryo::TypeArena* type_context)
         : type_context_(type_context),
           enable_implicit_std_import_(true),
           enable_namespace_fallback_(true) {

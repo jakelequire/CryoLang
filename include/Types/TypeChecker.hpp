@@ -1,9 +1,9 @@
 #pragma once
 /******************************************************************************
- * @file TypeChecker2.hpp
- * @brief Type checking infrastructure using the new Types2 system
+ * @file TypeChecker.hpp
+ * @brief Type checking infrastructure using the new Types system
  *
- * TypeChecker2 provides type checking, inference, and compatibility analysis
+ * TypeChecker provides type checking, inference, and compatibility analysis
  * using the new TypeRef-based type system. Key improvements over the old
  * TypeChecker:
  *
@@ -14,16 +14,16 @@
  * - Module-aware type checking
  ******************************************************************************/
 
-#include "Types2/TypeID.hpp"
-#include "Types2/Type.hpp"
-#include "Types2/TypeArena.hpp"
-#include "Types2/TypeResolver.hpp"
-#include "Types2/ModuleTypeRegistry.hpp"
-#include "Types2/GenericRegistry.hpp"
-#include "Types2/PrimitiveTypes.hpp"
-#include "Types2/CompoundTypes.hpp"
-#include "Types2/UserDefinedTypes.hpp"
-#include "Types2/ErrorType.hpp"
+#include "Types/TypeID.hpp"
+#include "Types/Type.hpp"
+#include "Types/TypeArena.hpp"
+#include "Types/TypeResolver.hpp"
+#include "Types/ModuleTypeRegistry.hpp"
+#include "Types/GenericRegistry.hpp"
+#include "Types/PrimitiveTypes.hpp"
+#include "Types/CompoundTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
+#include "Types/ErrorType.hpp"
 
 #include <string>
 #include <vector>
@@ -104,7 +104,7 @@ namespace Cryo
     };
 
     /**************************************************************************
-     * @brief Type checker using the new Types2 system
+     * @brief Type checker using the new Types system
      *
      * Provides type checking operations including:
      * - Type compatibility checking
@@ -113,7 +113,7 @@ namespace Cryo
      * - Binary/unary operation type resolution
      *
      * Usage:
-     *   TypeChecker2 checker(arena, resolver, modules, generics);
+     *   TypeChecker checker(arena, resolver, modules, generics);
      *
      *   TypeRef int_type = arena.get_i32();
      *   TypeRef float_type = arena.get_f32();
@@ -121,7 +121,7 @@ namespace Cryo
      *   auto compat = checker.check_compatibility(int_type, float_type);
      *   // compat == TypeCompatibility::ImplicitConvert
      **************************************************************************/
-    class TypeChecker2
+    class TypeChecker
     {
     private:
         TypeArena &_arena;
@@ -135,13 +135,13 @@ namespace Cryo
         // Construction
         // ====================================================================
 
-        TypeChecker2(TypeArena &arena,
+        TypeChecker(TypeArena &arena,
                      TypeResolver &resolver,
                      ModuleTypeRegistry &modules,
                      GenericRegistry &generics,
                      DiagnosticManager *diag = nullptr);
 
-        ~TypeChecker2() = default;
+        ~TypeChecker() = default;
 
         // ====================================================================
         // Type Compatibility
@@ -395,16 +395,16 @@ namespace Cryo
     };
 
     /**************************************************************************
-     * @brief Type inference utilities using Types2
+     * @brief Type inference utilities using Types
      **************************************************************************/
-    class TypeInference2
+    class TypeInference
     {
     private:
         TypeArena &_arena;
         TypeResolver &_resolver;
 
     public:
-        TypeInference2(TypeArena &arena, TypeResolver &resolver)
+        TypeInference(TypeArena &arena, TypeResolver &resolver)
             : _arena(arena), _resolver(resolver) {}
 
         /**

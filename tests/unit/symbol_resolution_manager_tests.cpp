@@ -2,8 +2,8 @@
 #include "include/test_helpers.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 #include "Utils/ASTNodeSRMExtensions.hpp"
-#include "AST/Type.hpp"
-#include "AST/SymbolTable.hpp"
+#include "Types/Types.hpp"
+#include "Types/SymbolTable.hpp"
 #include <memory>
 #include <vector>
 
@@ -31,7 +31,7 @@ using namespace CryoTest;
  */
 class SRMTestHelper : public CompilerTestHelper {
 private:
-    std::unique_ptr<Cryo::TypeContext> type_context_;
+    std::unique_ptr<Cryo::TypeArena> type_context_;
     std::unique_ptr<Cryo::SymbolTable> symbol_table_;
     std::unique_ptr<Cryo::SRM::SymbolResolutionContext> srm_context_;
     std::unique_ptr<Cryo::SRM::SymbolResolutionManager> srm_manager_;
@@ -41,7 +41,7 @@ public:
         CompilerTestHelper::setup();
         
         // Create type context
-        type_context_ = std::make_unique<Cryo::TypeContext>();
+        type_context_ = std::make_unique<Cryo::TypeArena>();
         
         // Create symbol table with type context
         symbol_table_ = std::make_unique<Cryo::SymbolTable>(nullptr, type_context_.get());
@@ -54,7 +54,7 @@ public:
         srm_manager_ = std::make_unique<Cryo::SRM::SymbolResolutionManager>(srm_context_.get());
     }
     
-    Cryo::TypeContext* get_type_context() { return type_context_.get(); }
+    Cryo::TypeArena* get_type_context() { return type_context_.get(); }
     Cryo::SymbolTable* get_symbol_table() { return symbol_table_.get(); }
     Cryo::SRM::SymbolResolutionContext* get_srm_context() { return srm_context_.get(); }
     Cryo::SRM::SymbolResolutionManager* get_srm_manager() { return srm_manager_.get(); }

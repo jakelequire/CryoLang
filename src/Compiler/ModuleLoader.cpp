@@ -5,8 +5,8 @@
 #include "Utils/Logger.hpp"
 #include "Utils/OS.hpp"
 #include "AST/ASTContext.hpp"
-#include "AST/Type.hpp"
-#include "Types2/UserDefinedTypes.hpp"
+#include "Types/Types.hpp"
+#include "Types/UserDefinedTypes.hpp"
 
 #include <filesystem>
 #include <fstream>

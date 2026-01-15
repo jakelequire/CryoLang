@@ -3,7 +3,7 @@
 #include "GDM/GDM.hpp"
 #include "GDM/ErrorCodes.hpp"
 #include "AST/ASTNode.hpp"
-#include "AST/Type.hpp"
+#include "Types/Types.hpp"
 #include "Lexer/lexer.hpp"
 #include <memory>
 #include <string>

@@ -10,8 +10,8 @@
  * - Module-qualified type lookup
  ******************************************************************************/
 
-#include "Types2/TypeID.hpp"
-#include "Types2/Type.hpp"
+#include "Types/TypeID.hpp"
+#include "Types/Type.hpp"
 
 #include <string>
 #include <vector>

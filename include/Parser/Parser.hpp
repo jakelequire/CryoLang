@@ -4,7 +4,7 @@
 #include "AST/ASTNode.hpp"
 #include "AST/ASTBuilder.hpp"
 #include "AST/ASTContext.hpp"
-#include "AST/Type.hpp"
+#include "Types/Types.hpp"
 #include "AST/DirectiveSystem.hpp"
 #include "GDM/GDM.hpp"
 #include "GDM/DiagnosticBuilders.hpp"

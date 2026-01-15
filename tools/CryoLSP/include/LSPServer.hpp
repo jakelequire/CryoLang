@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Compiler/CompilerInstance.hpp"
-#include "AST/TypeChecker.hpp"
+#include "Types/TypeChecker.hpp"
 #include "GDM/GDM.hpp"
 #include "Utils/Logger.hpp"
 #include "LSPTypes.hpp"

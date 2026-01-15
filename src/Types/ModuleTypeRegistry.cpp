@@ -3,8 +3,8 @@
  * @brief Implementation of ModuleTypeRegistry for Cryo's new type system
  ******************************************************************************/
 
-#include "Types2/ModuleTypeRegistry.hpp"
-#include "Types2/TypeArena.hpp"
+#include "Types/ModuleTypeRegistry.hpp"
+#include "Types/TypeArena.hpp"
 
 #include <algorithm>
 #include <sstream>

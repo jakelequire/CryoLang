@@ -12,13 +12,13 @@
  * - Generic-aware: Clean handling of type parameters and instantiation
  ******************************************************************************/
 
-#include "Types2/TypeID.hpp"
-#include "Types2/Type.hpp"
-#include "Types2/TypeArena.hpp"
-#include "Types2/TypeAnnotation.hpp"
-#include "Types2/ModuleTypeRegistry.hpp"
-#include "Types2/GenericRegistry.hpp"
-#include "Types2/ErrorType.hpp"
+#include "Types/TypeID.hpp"
+#include "Types/Type.hpp"
+#include "Types/TypeArena.hpp"
+#include "Types/TypeAnnotation.hpp"
+#include "Types/ModuleTypeRegistry.hpp"
+#include "Types/GenericRegistry.hpp"
+#include "Types/ErrorType.hpp"
 
 #include <string>
 #include <vector>

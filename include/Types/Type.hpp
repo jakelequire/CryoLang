@@ -13,8 +13,8 @@
  * - Types know their size/alignment for codegen
  ******************************************************************************/
 
-#include "Types2/TypeID.hpp"
-#include "Types2/TypeKind.hpp"
+#include "Types/TypeID.hpp"
+#include "Types/TypeKind.hpp"
 #include <string>
 #include <cstddef>
 

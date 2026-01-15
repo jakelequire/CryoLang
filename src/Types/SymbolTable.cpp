@@ -1,9 +1,9 @@
 /******************************************************************************
- * @file SymbolTable2.cpp
- * @brief Implementation of SymbolTable2 for Cryo's new type system
+ * @file SymbolTable.cpp
+ * @brief Implementation of SymbolTable for Cryo's new type system
  ******************************************************************************/
 
-#include "Types2/SymbolTable2.hpp"
+#include "Types/SymbolTable.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -12,10 +12,10 @@
 namespace Cryo
 {
     // ========================================================================
-    // Scope2 Implementation
+    // Scope Implementation
     // ========================================================================
 
-    bool Scope2::declare(const std::string &name, const Symbol2 &symbol)
+    bool Scope::declare(const std::string &name, const Symbol &symbol)
     {
         if (_symbols.find(name) != _symbols.end())
         {
@@ -25,7 +25,7 @@ namespace Cryo
         return true;
     }
 
-    Symbol2 *Scope2::lookup(const std::string &name)
+    Symbol *Scope::lookup(const std::string &name)
     {
         // First check local
         auto it = _symbols.find(name);
@@ -43,7 +43,7 @@ namespace Cryo
         return nullptr;
     }
 
-    const Symbol2 *Scope2::lookup(const std::string &name) const
+    const Symbol *Scope::lookup(const std::string &name) const
     {
         auto it = _symbols.find(name);
         if (it != _symbols.end())
@@ -59,39 +59,39 @@ namespace Cryo
         return nullptr;
     }
 
-    Symbol2 *Scope2::lookup_local(const std::string &name)
+    Symbol *Scope::lookup_local(const std::string &name)
     {
         auto it = _symbols.find(name);
         return (it != _symbols.end()) ? &it->second : nullptr;
     }
 
-    const Symbol2 *Scope2::lookup_local(const std::string &name) const
+    const Symbol *Scope::lookup_local(const std::string &name) const
     {
         auto it = _symbols.find(name);
         return (it != _symbols.end()) ? &it->second : nullptr;
     }
 
-    bool Scope2::has_symbol(const std::string &name) const
+    bool Scope::has_symbol(const std::string &name) const
     {
         return lookup(name) != nullptr;
     }
 
-    bool Scope2::has_symbol_local(const std::string &name) const
+    bool Scope::has_symbol_local(const std::string &name) const
     {
         return _symbols.find(name) != _symbols.end();
     }
 
     // ========================================================================
-    // ScopeGuard2 Implementation
+    // ScopeGuard Implementation
     // ========================================================================
 
-    ScopeGuard2::ScopeGuard2(SymbolTable2 &table)
+    ScopeGuard::ScopeGuard(SymbolTable &table)
         : _table(table), _active(true)
     {
         _table.enter_scope();
     }
 
-    ScopeGuard2::~ScopeGuard2()
+    ScopeGuard::~ScopeGuard()
     {
         if (_active)
         {
@@ -100,10 +100,10 @@ namespace Cryo
     }
 
     // ========================================================================
-    // SymbolTable2 Implementation
+    // SymbolTable Implementation
     // ========================================================================
 
-    SymbolTable2::SymbolTable2(TypeArena &arena, ModuleTypeRegistry &modules)
+    SymbolTable::SymbolTable(TypeArena &arena, ModuleTypeRegistry &modules)
         : _arena(arena),
           _modules(modules),
           _current_scope(nullptr),
@@ -112,16 +112,16 @@ namespace Cryo
         ensure_global_scope();
     }
 
-    void SymbolTable2::ensure_global_scope()
+    void SymbolTable::ensure_global_scope()
     {
         if (_scopes.empty())
         {
-            _scopes.push_back(std::make_unique<Scope2>(nullptr, "global", _current_module));
+            _scopes.push_back(std::make_unique<Scope>(nullptr, "global", _current_module));
             _current_scope = _scopes.back().get();
         }
     }
 
-    void SymbolTable2::add_import(const ImportDecl &import)
+    void SymbolTable::add_import(const ImportDecl &import)
     {
         _active_imports.push_back(import);
     }
@@ -130,16 +130,16 @@ namespace Cryo
     // Scope Management
     // ========================================================================
 
-    void SymbolTable2::enter_scope(const std::string &name)
+    void SymbolTable::enter_scope(const std::string &name)
     {
         ensure_global_scope();
 
-        auto new_scope = std::make_unique<Scope2>(_current_scope, name, _current_module);
+        auto new_scope = std::make_unique<Scope>(_current_scope, name, _current_module);
         _current_scope = new_scope.get();
         _scopes.push_back(std::move(new_scope));
     }
 
-    void SymbolTable2::exit_scope()
+    void SymbolTable::exit_scope()
     {
         if (_scopes.size() <= 1)
         {
@@ -151,29 +151,29 @@ namespace Cryo
         _current_scope = _scopes.empty() ? nullptr : _scopes.back().get();
     }
 
-    ScopeGuard2 SymbolTable2::scope_guard()
+    ScopeGuard SymbolTable::scope_guard()
     {
-        return ScopeGuard2(*this);
+        return ScopeGuard(*this);
     }
 
     // ========================================================================
     // Symbol Declaration
     // ========================================================================
 
-    bool SymbolTable2::declare(const Symbol2 &symbol)
+    bool SymbolTable::declare(const Symbol &symbol)
     {
         ensure_global_scope();
         return _current_scope->declare(symbol.name, symbol);
     }
 
-    bool SymbolTable2::declare_variable(const std::string &name,
+    bool SymbolTable::declare_variable(const std::string &name,
                                          TypeRef type,
                                          SourceLocation loc,
                                          bool is_mutable)
     {
-        Symbol2 sym;
+        Symbol sym;
         sym.name = name;
-        sym.kind = SymbolKind2::Variable;
+        sym.kind = SymbolKind::Variable;
         sym.type = type;
         sym.module = _current_module;
         sym.location = loc;
@@ -183,13 +183,13 @@ namespace Cryo
         return declare(sym);
     }
 
-    bool SymbolTable2::declare_function(const std::string &name,
+    bool SymbolTable::declare_function(const std::string &name,
                                          TypeRef type,
                                          SourceLocation loc)
     {
-        Symbol2 sym;
+        Symbol sym;
         sym.name = name;
-        sym.kind = SymbolKind2::Function;
+        sym.kind = SymbolKind::Function;
         sym.type = type;
         sym.module = _current_module;
         sym.location = loc;
@@ -198,13 +198,13 @@ namespace Cryo
         return declare(sym);
     }
 
-    bool SymbolTable2::declare_type(const std::string &name,
+    bool SymbolTable::declare_type(const std::string &name,
                                      TypeRef type,
                                      SourceLocation loc)
     {
-        Symbol2 sym;
+        Symbol sym;
         sym.name = name;
-        sym.kind = SymbolKind2::Type;
+        sym.kind = SymbolKind::Type;
         sym.type = type;
         sym.module = _current_module;
         sym.location = loc;
@@ -213,13 +213,13 @@ namespace Cryo
         return declare(sym);
     }
 
-    bool SymbolTable2::declare_constant(const std::string &name,
+    bool SymbolTable::declare_constant(const std::string &name,
                                          TypeRef type,
                                          SourceLocation loc)
     {
-        Symbol2 sym;
+        Symbol sym;
         sym.name = name;
-        sym.kind = SymbolKind2::Constant;
+        sym.kind = SymbolKind::Constant;
         sym.type = type;
         sym.module = _current_module;
         sym.location = loc;
@@ -229,13 +229,13 @@ namespace Cryo
         return declare(sym);
     }
 
-    bool SymbolTable2::declare_intrinsic(const std::string &name,
+    bool SymbolTable::declare_intrinsic(const std::string &name,
                                          TypeRef type,
                                          SourceLocation loc)
     {
-        Symbol2 sym;
+        Symbol sym;
         sym.name = name;
-        sym.kind = SymbolKind2::Intrinsic;
+        sym.kind = SymbolKind::Intrinsic;
         sym.type = type;
         sym.module = _current_module;
         sym.location = loc;
@@ -244,13 +244,13 @@ namespace Cryo
         return declare(sym);
     }
 
-    bool SymbolTable2::declare_symbol(const std::string &name,
-                                      SymbolKind2 kind,
+    bool SymbolTable::declare_symbol(const std::string &name,
+                                      SymbolKind kind,
                                       SourceLocation loc,
                                       TypeRef type,
                                       const std::string &scope_name)
     {
-        Symbol2 sym;
+        Symbol sym;
         sym.name = name;
         sym.kind = kind;
         sym.type = type;
@@ -262,8 +262,8 @@ namespace Cryo
         return declare(sym);
     }
 
-    void SymbolTable2::register_namespace(const std::string &namespace_name,
-                                          const std::unordered_map<std::string, Symbol2> &symbols)
+    void SymbolTable::register_namespace(const std::string &namespace_name,
+                                          const std::unordered_map<std::string, Symbol> &symbols)
     {
         ensure_global_scope();
 
@@ -272,7 +272,7 @@ namespace Cryo
         {
             // Register with qualified name for qualified access (e.g., IO::println)
             std::string qualified_name = namespace_name + "::" + name;
-            Symbol2 qualified_sym = symbol;
+            Symbol qualified_sym = symbol;
             qualified_sym.name = qualified_name;
             _current_scope->declare(qualified_name, qualified_sym);
         }
@@ -282,35 +282,35 @@ namespace Cryo
     // Symbol Lookup
     // ========================================================================
 
-    Symbol2 *SymbolTable2::lookup(const std::string &name)
+    Symbol *SymbolTable::lookup(const std::string &name)
     {
         if (!_current_scope)
             return nullptr;
         return _current_scope->lookup(name);
     }
 
-    const Symbol2 *SymbolTable2::lookup(const std::string &name) const
+    const Symbol *SymbolTable::lookup(const std::string &name) const
     {
         if (!_current_scope)
             return nullptr;
         return _current_scope->lookup(name);
     }
 
-    Symbol2 *SymbolTable2::lookup_local(const std::string &name)
+    Symbol *SymbolTable::lookup_local(const std::string &name)
     {
         if (!_current_scope)
             return nullptr;
         return _current_scope->lookup_local(name);
     }
 
-    const Symbol2 *SymbolTable2::lookup_local(const std::string &name) const
+    const Symbol *SymbolTable::lookup_local(const std::string &name) const
     {
         if (!_current_scope)
             return nullptr;
         return _current_scope->lookup_local(name);
     }
 
-    Symbol2 *SymbolTable2::lookup_qualified(const std::vector<std::string> &path)
+    Symbol *SymbolTable::lookup_qualified(const std::vector<std::string> &path)
     {
         if (path.empty())
             return nullptr;
@@ -335,15 +335,15 @@ namespace Cryo
         return lookup(oss.str());
     }
 
-    const Symbol2 *SymbolTable2::lookup_qualified(const std::vector<std::string> &path) const
+    const Symbol *SymbolTable::lookup_qualified(const std::vector<std::string> &path) const
     {
-        return const_cast<SymbolTable2 *>(this)->lookup_qualified(path);
+        return const_cast<SymbolTable *>(this)->lookup_qualified(path);
     }
 
-    Symbol2 *SymbolTable2::lookup_with_imports(const std::string &name)
+    Symbol *SymbolTable::lookup_with_imports(const std::string &name)
     {
         // First try local lookup
-        Symbol2 *sym = lookup(name);
+        Symbol *sym = lookup(name);
         if (sym)
             return sym;
 
@@ -381,17 +381,17 @@ namespace Cryo
         return nullptr;
     }
 
-    const Symbol2 *SymbolTable2::lookup_with_imports(const std::string &name) const
+    const Symbol *SymbolTable::lookup_with_imports(const std::string &name) const
     {
-        return const_cast<SymbolTable2 *>(this)->lookup_with_imports(name);
+        return const_cast<SymbolTable *>(this)->lookup_with_imports(name);
     }
 
-    bool SymbolTable2::has_symbol(const std::string &name) const
+    bool SymbolTable::has_symbol(const std::string &name) const
     {
         return lookup(name) != nullptr;
     }
 
-    bool SymbolTable2::has_symbol_local(const std::string &name) const
+    bool SymbolTable::has_symbol_local(const std::string &name) const
     {
         return lookup_local(name) != nullptr;
     }
@@ -400,9 +400,9 @@ namespace Cryo
     // Type Resolution
     // ========================================================================
 
-    std::optional<TypeRef> SymbolTable2::get_type(const std::string &name) const
+    std::optional<TypeRef> SymbolTable::get_type(const std::string &name) const
     {
-        const Symbol2 *sym = lookup(name);
+        const Symbol *sym = lookup(name);
         if (sym && sym->type.is_valid())
         {
             return sym->type;
@@ -410,11 +410,11 @@ namespace Cryo
         return std::nullopt;
     }
 
-    std::optional<TypeRef> SymbolTable2::resolve_type(const std::string &name) const
+    std::optional<TypeRef> SymbolTable::resolve_type(const std::string &name) const
     {
         // First check symbol table for type symbols
-        const Symbol2 *sym = lookup(name);
-        if (sym && sym->kind == SymbolKind2::Type)
+        const Symbol *sym = lookup(name);
+        if (sym && sym->kind == SymbolKind::Type)
         {
             return sym->type;
         }
@@ -424,7 +424,7 @@ namespace Cryo
         return type;
     }
 
-    TypeRef SymbolTable2::lookup_struct_type(const std::string &name) const
+    TypeRef SymbolTable::lookup_struct_type(const std::string &name) const
     {
         auto type_opt = resolve_type(name);
         if (type_opt && type_opt->is_valid() && type_opt->get()->kind() == TypeKind::Struct)
@@ -434,7 +434,7 @@ namespace Cryo
         return TypeRef{}; // Invalid TypeRef
     }
 
-    TypeRef SymbolTable2::lookup_class_type(const std::string &name) const
+    TypeRef SymbolTable::lookup_class_type(const std::string &name) const
     {
         auto type_opt = resolve_type(name);
         if (type_opt && type_opt->is_valid() && type_opt->get()->kind() == TypeKind::Class)
@@ -444,7 +444,7 @@ namespace Cryo
         return TypeRef{}; // Invalid TypeRef
     }
 
-    TypeRef SymbolTable2::lookup_enum_type(const std::string &name) const
+    TypeRef SymbolTable::lookup_enum_type(const std::string &name) const
     {
         auto type_opt = resolve_type(name);
         if (type_opt && type_opt->is_valid() && type_opt->get()->kind() == TypeKind::Enum)
@@ -458,7 +458,7 @@ namespace Cryo
     // Iteration
     // ========================================================================
 
-    void SymbolTable2::for_each_symbol(std::function<void(const Symbol2 &)> callback) const
+    void SymbolTable::for_each_symbol(std::function<void(const Symbol &)> callback) const
     {
         // Iterate through all scopes from current to global
         for (const auto &scope : _scopes)
@@ -470,7 +470,7 @@ namespace Cryo
         }
     }
 
-    void SymbolTable2::for_each_local(std::function<void(const Symbol2 &)> callback) const
+    void SymbolTable::for_each_local(std::function<void(const Symbol &)> callback) const
     {
         if (_current_scope)
         {
@@ -481,14 +481,14 @@ namespace Cryo
         }
     }
 
-    std::vector<const Symbol2 *> SymbolTable2::get_overloads(const std::string &name) const
+    std::vector<const Symbol *> SymbolTable::get_overloads(const std::string &name) const
     {
-        std::vector<const Symbol2 *> result;
+        std::vector<const Symbol *> result;
 
         for (const auto &scope : _scopes)
         {
-            const Symbol2 *sym = scope->lookup_local(name);
-            if (sym && sym->kind == SymbolKind2::Function)
+            const Symbol *sym = scope->lookup_local(name);
+            if (sym && sym->kind == SymbolKind::Function)
             {
                 result.push_back(sym);
             }
@@ -501,7 +501,7 @@ namespace Cryo
     // Debug
     // ========================================================================
 
-    void SymbolTable2::dump(std::ostream &os) const
+    void SymbolTable::dump(std::ostream &os) const
     {
         os << "=== Symbol Table ===\n";
         os << "Module: " << _current_module.id << "\n";
@@ -535,35 +535,35 @@ namespace Cryo
     // Utility Functions
     // ========================================================================
 
-    std::string symbol_kind_to_string(SymbolKind2 kind)
+    std::string symbol_kind_to_string(SymbolKind kind)
     {
         switch (kind)
         {
-        case SymbolKind2::Variable:
+        case SymbolKind::Variable:
             return "Variable";
-        case SymbolKind2::Parameter:
+        case SymbolKind::Parameter:
             return "Parameter";
-        case SymbolKind2::Function:
+        case SymbolKind::Function:
             return "Function";
-        case SymbolKind2::Method:
+        case SymbolKind::Method:
             return "Method";
-        case SymbolKind2::Type:
+        case SymbolKind::Type:
             return "Type";
-        case SymbolKind2::TypeAlias:
+        case SymbolKind::TypeAlias:
             return "TypeAlias";
-        case SymbolKind2::Constant:
+        case SymbolKind::Constant:
             return "Constant";
-        case SymbolKind2::Field:
+        case SymbolKind::Field:
             return "Field";
-        case SymbolKind2::EnumVariant:
+        case SymbolKind::EnumVariant:
             return "EnumVariant";
-        case SymbolKind2::GenericParam:
+        case SymbolKind::GenericParam:
             return "GenericParam";
-        case SymbolKind2::Namespace:
+        case SymbolKind::Namespace:
             return "Namespace";
-        case SymbolKind2::Import:
+        case SymbolKind::Import:
             return "Import";
-        case SymbolKind2::Intrinsic:
+        case SymbolKind::Intrinsic:
             return "Intrinsic";
         default:
             return "Unknown";
@@ -574,11 +574,11 @@ namespace Cryo
     // Backward Compatibility Methods
     // ========================================================================
 
-    Symbol2 *SymbolTable2::lookup_namespaced_symbol(const std::string &ns, const std::string &name)
+    Symbol *SymbolTable::lookup_namespaced_symbol(const std::string &ns, const std::string &name)
     {
         // Build qualified name and look up
         std::string qualified_name = ns.empty() ? name : ns + "::" + name;
-        Symbol2 *sym = lookup(qualified_name);
+        Symbol *sym = lookup(qualified_name);
         if (sym)
             return sym;
 
@@ -586,15 +586,15 @@ namespace Cryo
         return lookup(name);
     }
 
-    const Symbol2 *SymbolTable2::lookup_namespaced_symbol(const std::string &ns, const std::string &name) const
+    const Symbol *SymbolTable::lookup_namespaced_symbol(const std::string &ns, const std::string &name) const
     {
-        return const_cast<SymbolTable2 *>(this)->lookup_namespaced_symbol(ns, name);
+        return const_cast<SymbolTable *>(this)->lookup_namespaced_symbol(ns, name);
     }
 
-    std::vector<Symbol2> SymbolTable2::get_all_symbols_for_lsp() const
+    std::vector<Symbol> SymbolTable::get_all_symbols_for_lsp() const
     {
-        std::vector<Symbol2> result;
-        for_each_symbol([&result](const Symbol2 &sym)
+        std::vector<Symbol> result;
+        for_each_symbol([&result](const Symbol &sym)
                         { result.push_back(sym); });
         return result;
     }

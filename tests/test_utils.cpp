@@ -564,7 +564,7 @@ int TestRegistry::run_all_tests() {
                     }
                     // Template/Generic errors
                     else if (line.find("Cannot find generic template") != std::string::npos ||
-                             line.find("MonomorphizationPass") != std::string::npos) {
+                             line.find("Monomorphizer") != std::string::npos) {
                         errors.push_back(line);
                     }
                 }

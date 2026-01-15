@@ -3,12 +3,12 @@
  * @brief Implementation of TypeArena for Cryo's new type system
  ******************************************************************************/
 
-#include "Types2/TypeArena.hpp"
-#include "Types2/PrimitiveTypes.hpp"
-#include "Types2/CompoundTypes.hpp"
-#include "Types2/UserDefinedTypes.hpp"
-#include "Types2/GenericTypes.hpp"
-#include "Types2/ErrorType.hpp"
+#include "Types/TypeArena.hpp"
+#include "Types/PrimitiveTypes.hpp"
+#include "Types/CompoundTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
+#include "Types/GenericTypes.hpp"
+#include "Types/ErrorType.hpp"
 
 #include <sstream>
 #include <cassert>

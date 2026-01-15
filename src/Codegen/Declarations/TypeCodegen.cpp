@@ -1,5 +1,5 @@
 #include "Codegen/Declarations/TypeCodegen.hpp"
-#include "AST/Type.hpp"
+#include "Types/Types.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen

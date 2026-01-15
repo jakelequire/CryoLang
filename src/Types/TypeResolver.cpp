@@ -3,10 +3,10 @@
  * @brief Implementation of TypeResolver for Cryo's new type system
  ******************************************************************************/
 
-#include "Types2/TypeResolver.hpp"
-#include "Types2/PrimitiveTypes.hpp"
-#include "Types2/CompoundTypes.hpp"
-#include "Types2/UserDefinedTypes.hpp"
+#include "Types/TypeResolver.hpp"
+#include "Types/PrimitiveTypes.hpp"
+#include "Types/CompoundTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
 
 #include <sstream>
 

@@ -12,9 +12,9 @@
  * - OptionalType: Option<T>
  ******************************************************************************/
 
-#include "Types2/Type.hpp"
-#include "Types2/TypeID.hpp"
-#include "Types2/TypeKind.hpp"
+#include "Types/Type.hpp"
+#include "Types/TypeID.hpp"
+#include "Types/TypeKind.hpp"
 
 #include <vector>
 #include <optional>
