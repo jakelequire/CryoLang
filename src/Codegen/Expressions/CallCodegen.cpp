@@ -142,9 +142,9 @@ namespace Cryo::Codegen
                     if (receiver)
                     {
                         TypeRef nested_type = nested_member->get_resolved_type();
-                        if (nested_type)
+                        if (nested_type.is_valid())
                         {
-                            std::string type_name = nested_type.get()->display_name();
+                            std::string type_name = nested_type->display_name();
                             // Check if it's a primitive type that stores a pointer value
                             static const std::unordered_set<std::string> primitive_ptr_types = {
                                 "string", "i8*", "u8*", "char*"};
@@ -328,41 +328,41 @@ namespace Cryo::Codegen
                 }
 
                 // Resolve the type argument - try struct/class types first
-                TypeRef arg_type = symbols().get_type_context()->lookup_struct_type(type_args_str);
-                if (!arg_type)
+                TypeRef arg_type = symbols().arena().lookup_struct_type(type_args_str);
+                if (!arg_type.is_valid())
                 {
-                    arg_type = symbols().get_type_context()->lookup_class_type(type_args_str);
+                    arg_type = symbols().arena().lookup_class_type(type_args_str);
                 }
-                if (!arg_type)
+                if (!arg_type.is_valid())
                 {
                     // Try common primitive types using convenience methods
                     if (type_args_str == "int" || type_args_str == "i32")
                     {
-                        arg_type = symbols().get_type_context()->get_i32_type();
+                        arg_type = symbols().arena().get_i32();
                     }
                     else if (type_args_str == "i64")
                     {
-                        arg_type = symbols().get_type_context()->get_i64_type();
+                        arg_type = symbols().arena().get_i64();
                     }
                     else if (type_args_str == "f32" || type_args_str == "float")
                     {
-                        arg_type = symbols().get_type_context()->get_f32_type();
+                        arg_type = symbols().arena().get_f32();
                     }
                     else if (type_args_str == "f64" || type_args_str == "double")
                     {
-                        arg_type = symbols().get_type_context()->get_f64_type();
+                        arg_type = symbols().arena().get_f64();
                     }
                     else if (type_args_str == "string")
                     {
-                        arg_type = symbols().get_type_context()->get_string_type();
+                        arg_type = symbols().arena().get_string();
                     }
                     else if (type_args_str == "bool" || type_args_str == "boolean")
                     {
-                        arg_type = symbols().get_type_context()->get_boolean_type();
+                        arg_type = symbols().arena().get_bool();
                     }
                 }
 
-                if (arg_type)
+                if (arg_type.is_valid())
                 {
                     type_args.push_back(arg_type);
                 }
@@ -1119,9 +1119,9 @@ namespace Cryo::Codegen
         if (callee && callee->object())
         {
             TypeRef obj_type = callee->object()->get_resolved_type();
-            if (obj_type)
+            if (obj_type.is_valid())
             {
-                type_name = obj_type.get()->display_name();
+                type_name = obj_type->display_name();
                 // Strip pointer suffix if present
                 if (!type_name.empty() && type_name.back() == '*')
                 {
@@ -1131,9 +1131,9 @@ namespace Cryo::Codegen
                 if (obj_type->kind() == Cryo::TypeKind::Pointer)
                 {
                     auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
-                    if (ptr_type && ptr_type->pointee())
+                    if (ptr_type && ptr_type->pointee().is_valid())
                     {
-                        type_name = ptr_type->pointee().get()->display_name();
+                        type_name = ptr_type->pointee()->display_name();
                     }
                 }
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1147,9 +1147,9 @@ namespace Cryo::Codegen
                 {
                     auto &var_types = ctx().variable_types_map();
                     auto it = var_types.find(id->name());
-                    if (it != var_types.end() && it->second)
+                    if (it != var_types.end() && it->second.is_valid())
                     {
-                        type_name = it->second.get()->display_name();
+                        type_name = it->second->display_name();
                         // Strip pointer suffix if present
                         if (!type_name.empty() && type_name.back() == '*')
                         {
@@ -1186,9 +1186,9 @@ namespace Cryo::Codegen
                     if (call_expr->has_resolved_type())
                     {
                         TypeRef call_return_type = call_expr->get_resolved_type();
-                        if (call_return_type)
+                        if (call_return_type.is_valid())
                         {
-                            type_name = call_return_type.get()->display_name();
+                            type_name = call_return_type->display_name();
                             // Strip pointer suffix if present
                             if (!type_name.empty() && type_name.back() == '*')
                             {
@@ -1218,9 +1218,9 @@ namespace Cryo::Codegen
                                 {
                                     auto &var_types = ctx().variable_types_map();
                                     auto it = var_types.find(inner_id->name());
-                                    if (it != var_types.end() && it->second)
+                                    if (it != var_types.end() && it->second.is_valid())
                                     {
-                                        inner_receiver_type = it->second.get()->display_name();
+                                        inner_receiver_type = it->second->display_name();
                                         if (!inner_receiver_type.empty() && inner_receiver_type.back() == '*')
                                         {
                                             inner_receiver_type.pop_back();
@@ -1230,9 +1230,9 @@ namespace Cryo::Codegen
                                 else if (inner_callee->object()->has_resolved_type())
                                 {
                                     TypeRef inner_obj_type = inner_callee->object()->get_resolved_type();
-                                    if (inner_obj_type)
+                                    if (inner_obj_type.is_valid())
                                     {
-                                        inner_receiver_type = inner_obj_type.get()->display_name();
+                                        inner_receiver_type = inner_obj_type->display_name();
                                         if (!inner_receiver_type.empty() && inner_receiver_type.back() == '*')
                                         {
                                             inner_receiver_type.pop_back();
@@ -1241,9 +1241,9 @@ namespace Cryo::Codegen
                                         if (inner_obj_type->kind() == Cryo::TypeKind::Pointer)
                                         {
                                             auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(inner_obj_type.get());
-                                            if (ptr_type && ptr_type->pointee())
+                                            if (ptr_type && ptr_type->pointee().is_valid())
                                             {
-                                                inner_receiver_type = ptr_type->pointee().get()->display_name();
+                                                inner_receiver_type = ptr_type->pointee()->display_name();
                                             }
                                         }
                                     }
@@ -1522,16 +1522,16 @@ namespace Cryo::Codegen
                 }
             }
 
-            if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->data_type)
+            if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->type.is_valid())
             {
-                const Cryo::FunctionType *func_type = dynamic_cast<const Cryo::FunctionType *>(symbol->data_type.get());
+                const Cryo::FunctionType *func_type = dynamic_cast<const Cryo::FunctionType *>(symbol->type.get());
                 if (func_type)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "create_forward_declaration_from_symbol: Found function '{}' in symbol table", candidate);
 
                     // Build LLVM function type from Cryo function type
-                    llvm::Type *return_type = types().map(func_type->return_type().get());
+                    llvm::Type *return_type = types().map(func_type->return_type());
                     if (!return_type)
                     {
                         LOG_ERROR(Cryo::LogComponent::CODEGEN,
@@ -1542,7 +1542,7 @@ namespace Cryo::Codegen
                     std::vector<llvm::Type *> param_types;
                     for (const auto &param : func_type->parameter_types())
                     {
-                        llvm::Type *pt = types().map(param.get());
+                        llvm::Type *pt = types().map(param);
                         if (!pt)
                         {
                             LOG_ERROR(Cryo::LogComponent::CODEGEN,
@@ -1832,8 +1832,8 @@ namespace Cryo::Codegen
     {
         // First try direct lookup with the unqualified name
         // Enums are registered with just their name (e.g., "Shape"), not namespace-qualified
-        TypeRef direct_lookup = const_cast<CallCodegen *>(this)->symbols().get_type_context()->lookup_enum_type(name);
-        if (direct_lookup)
+        TypeRef direct_lookup = const_cast<CallCodegen *>(this)->symbols().arena().lookup_enum_type(name);
+        if (direct_lookup.is_valid())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "is_enum_type: Found '{}' as enum type via direct lookup", name);
@@ -1849,20 +1849,20 @@ namespace Cryo::Codegen
 
         for (const auto &candidate : candidates)
         {
-            // Try TypeContext's enum type lookup
-            TypeRef enum_type = const_cast<CallCodegen *>(this)->symbols().get_type_context()->lookup_enum_type(candidate);
-            if (enum_type)
+            // Try TypeArena's enum type lookup
+            TypeRef enum_type = const_cast<CallCodegen *>(this)->symbols().arena().lookup_enum_type(candidate);
+            if (enum_type.is_valid())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "is_enum_type: Found '{}' as enum type via TypeContext lookup '{}'", name, candidate);
+                          "is_enum_type: Found '{}' as enum type via TypeArena lookup '{}'", name, candidate);
                 return true;
             }
 
             // Also check symbol table for enum type
             Symbol *sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(candidate);
-            if (sym && sym->kind == SymbolKind::Type && sym->data_type)
+            if (sym && sym->kind == SymbolKind::Type && sym->type.is_valid())
             {
-                if (sym->data_type->kind() == TypeKind::Enum)
+                if (sym->type->kind() == TypeKind::Enum)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "is_enum_type: Found '{}' as enum type via symbol table '{}'", name, candidate);
@@ -1888,9 +1888,9 @@ namespace Cryo::Codegen
         {
             // Check symbol table for class type
             Symbol *sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(candidate);
-            if (sym && sym->kind == SymbolKind::Type && sym->data_type)
+            if (sym && sym->kind == SymbolKind::Type && sym->type.is_valid())
             {
-                if (sym->data_type->kind() == TypeKind::Class)
+                if (sym->type->kind() == TypeKind::Class)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "is_class_type: Found '{}' as class type via '{}'", name, candidate);
@@ -1997,16 +1997,16 @@ namespace Cryo::Codegen
 
         // Get the resolved type of the object expression
         TypeRef obj_type = node->object()->get_resolved_type();
-        if (obj_type)
+        if (obj_type.is_valid())
         {
-            type_name = obj_type.get()->display_name();
+            type_name = obj_type->display_name();
             // Handle pointer types - get the pointee type name
             if (obj_type->kind() == Cryo::TypeKind::Pointer)
             {
                 auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
-                if (ptr_type && ptr_type->pointee())
+                if (ptr_type && ptr_type->pointee().is_valid())
                 {
-                    type_name = ptr_type->pointee().get()->display_name();
+                    type_name = ptr_type->pointee()->display_name();
                 }
             }
             else if (!type_name.empty() && type_name.back() == '*')
@@ -2024,9 +2024,9 @@ namespace Cryo::Codegen
                     // Try to get 'this' type from variable_types_map
                     auto &var_types = ctx().variable_types_map();
                     auto it = var_types.find("this");
-                    if (it != var_types.end() && it->second)
+                    if (it != var_types.end() && it->second.is_valid())
                     {
-                        type_name = it->second.get()->display_name();
+                        type_name = it->second->display_name();
                         if (!type_name.empty() && type_name.back() == '*')
                         {
                             type_name.pop_back();

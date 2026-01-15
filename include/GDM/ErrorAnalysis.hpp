@@ -15,10 +15,6 @@ namespace Cryo
     // Forward declarations
     class ASTNode;
     class Type;
-    class SymbolTable;
-    class TypeChecker;
-    class SymbolTable;
-    class TypeChecker;
 
     // ================================================================
     // Advanced Error Analysis System
@@ -49,7 +45,7 @@ namespace Cryo
             std::string current_function;
             std::string current_namespace;
             std::string current_class;
-            TypeRef expected_return_type = nullptr;
+            TypeRef expected_return_type{};
             const SymbolTable *current_scope = nullptr;
             std::vector<std::string> available_symbols;
             std::unordered_map<std::string, TypeRef> available_types;

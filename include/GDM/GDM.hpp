@@ -3,6 +3,7 @@
 #include "Lexer/lexer.hpp"
 #include "Utils/File.hpp"
 #include "GDM/ErrorCodes.hpp"
+#include "Types2/TypeID.hpp"
 #include <memory>
 #include <string>
 #include <vector>

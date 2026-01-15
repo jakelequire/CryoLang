@@ -175,26 +175,26 @@ namespace Cryo
         /**
          * @brief Create a FunctionType from a FunctionDeclarationNode
          * @param func_decl The function declaration node
-         * @param type_context TypeContext for creating type objects
-         * @return FunctionType object or nullptr if creation fails
+         * @param type_arena TypeArena for creating type objects
+         * @return FunctionType object or invalid TypeRef if creation fails
          */
-        TypeRef create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeContext *type_context);
+        TypeRef create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeArena *type_arena);
 
         /**
          * @brief Create a FunctionType from an IntrinsicDeclarationNode
          * @param intrinsic_decl The intrinsic declaration node
-         * @param type_context TypeContext for creating type objects
-         * @return FunctionType object or nullptr if creation fails
+         * @param type_arena TypeArena for creating type objects
+         * @return FunctionType object or invalid TypeRef if creation fails
          */
-        TypeRef create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeContext *type_context);
+        TypeRef create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeArena *type_arena);
 
         /**
          * @brief Resolve a primitive type annotation string to a Type object
          * @param type_str The type annotation string (e.g., "boolean", "i32")
-         * @param types TypeContext for getting primitive types
-         * @return Type object or nullptr if not a primitive type
+         * @param arena TypeArena for getting primitive types
+         * @return Type object or invalid TypeRef if not a primitive type
          */
-        TypeRef resolve_primitive_type(const std::string &type_str, TypeContext &types);
+        TypeRef resolve_primitive_type(const std::string &type_str, TypeArena &arena);
 
         /**
          * @brief Filter import result to only include specific symbols
