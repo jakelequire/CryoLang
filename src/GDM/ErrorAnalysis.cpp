@@ -11,7 +11,7 @@ namespace Cryo
     // CompilerContext Implementation
     // ================================================================
 
-    void ErrorAnalysis::CompilerContext::set_function_context(const std::string &function_name, const Type *return_type)
+    void ErrorAnalysis::CompilerContext::set_function_context(const std::string &function_name, TypeRef return_type)
     {
         current_function = function_name;
         expected_return_type = return_type;
@@ -38,7 +38,7 @@ namespace Cryo
     // TypeMismatchAnalysis Implementation
     // ================================================================
 
-    ErrorAnalysis::TypeMismatchAnalysis::TypeMismatchAnalysis(const Type *expected, const Type *actual, const std::string &ctx)
+    ErrorAnalysis::TypeMismatchAnalysis::TypeMismatchAnalysis(TypeRef expected, TypeRef actual, const std::string &ctx)
         : expected_type(expected), actual_type(actual), context(ctx), can_convert(false), can_cast(false), likely_typo(false)
     {
         analyze();
@@ -224,7 +224,7 @@ namespace Cryo
         _current_context = context;
     }
 
-    void ErrorAnalysis::set_function_context(const std::string &function_name, const Type *return_type)
+    void ErrorAnalysis::set_function_context(const std::string &function_name, TypeRef return_type)
     {
         _current_context.set_function_context(function_name, return_type);
     }
@@ -246,8 +246,8 @@ namespace Cryo
 
     Diagnostic ErrorAnalysis::create_type_mismatch_diagnostic(
         const SourceSpan &error_span,
-        const Type *expected_type,
-        const Type *actual_type,
+        TypeRef expected_type,
+        TypeRef actual_type,
         const std::string &context)
     {
         auto analysis = analyze_type_mismatch(expected_type, actual_type, context);
@@ -310,8 +310,8 @@ namespace Cryo
     }
 
     ErrorAnalysis::TypeMismatchAnalysis ErrorAnalysis::analyze_type_mismatch(
-        const Type *expected,
-        const Type *actual,
+        TypeRef expected,
+        TypeRef actual,
         const std::string &context)
     {
         return TypeMismatchAnalysis(expected, actual, context);
@@ -402,7 +402,7 @@ namespace Cryo
         return matrix[len1][len2];
     }
 
-    bool ErrorAnalysis::can_suggest_conversion(const Type *from, const Type *to)
+    bool ErrorAnalysis::can_suggest_conversion(TypeRef from, TypeRef to)
     {
         if (!from || !to)
             return false;
@@ -422,7 +422,7 @@ namespace Cryo
         return false;
     }
 
-    bool ErrorAnalysis::can_suggest_cast(const Type *from, const Type *to)
+    bool ErrorAnalysis::can_suggest_cast(TypeRef from, TypeRef to)
     {
         if (!from || !to)
             return false;
@@ -431,7 +431,7 @@ namespace Cryo
         return true; // Simplified - would need more sophisticated type system analysis
     }
 
-    bool ErrorAnalysis::are_related_types(const Type *type1, const Type *type2)
+    bool ErrorAnalysis::are_related_types(TypeRef type1, TypeRef type2)
     {
         if (!type1 || !type2)
             return false;
@@ -458,7 +458,7 @@ namespace Cryo
     // TypeMismatchContext Implementation
     // ================================================================
 
-    TypeMismatchContext::TypeMismatchContext(const Type *expected, const Type *actual, const std::string &context)
+    TypeMismatchContext::TypeMismatchContext(TypeRef expected, TypeRef actual, const std::string &context)
         : _expected_type(expected), _actual_type(actual), _context(context), _analysis(expected, actual, context)
     {
     }
@@ -610,7 +610,7 @@ namespace Cryo
             // Try to extract TypeMismatchContext from std::any
             try
             {
-                auto context_data = std::any_cast<std::pair<const Type *, const Type *>>(context);
+                auto context_data = std::any_cast<std::pair<TypeRef, TypeRef>>(context);
                 TypeMismatchContext *heap_context = new TypeMismatchContext(
                     context_data.first, context_data.second, "");
                 payload._data = std::unique_ptr<void, void (*)(void *)>(

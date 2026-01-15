@@ -24,7 +24,7 @@ namespace Cryo::Codegen
     // Literal Expressions
     //===================================================================
 
-    llvm::Value *ExpressionCodegen::generate_integer_literal(int64_t value, Cryo::Type *type)
+    llvm::Value *ExpressionCodegen::generate_integer_literal(int64_t value, TypeRef type)
     {
         // Determine bit width and signedness
         unsigned bits = 32; // Default to i32
@@ -87,7 +87,7 @@ namespace Cryo::Codegen
         return llvm::ConstantInt::get(get_int_type(bits), value, is_signed);
     }
 
-    llvm::Value *ExpressionCodegen::generate_unsigned_integer_literal(uint64_t value, Cryo::Type *type)
+    llvm::Value *ExpressionCodegen::generate_unsigned_integer_literal(uint64_t value, TypeRef type)
     {
         // Determine bit width for unsigned types
         unsigned bits = 64; // Default to u64 for large unsigned values
@@ -165,7 +165,7 @@ namespace Cryo::Codegen
         return llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_ctx()), static_cast<uint8_t>(value));
     }
 
-    llvm::Value *ExpressionCodegen::generate_null_literal(Cryo::Type *type)
+    llvm::Value *ExpressionCodegen::generate_null_literal(TypeRef type)
     {
         llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
         return llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptr_type));
@@ -196,7 +196,7 @@ namespace Cryo::Codegen
                     value_str.starts_with("0o") || value_str.starts_with("0O"))
                 {
                     // Parse as integer - check if type is unsigned
-                    Cryo::Type *resolved_type = node->get_resolved_type();
+                    TypeRef resolved_type = node->get_resolved_type();
                     bool is_unsigned = false;
                     if (resolved_type)
                     {
@@ -233,7 +233,7 @@ namespace Cryo::Codegen
                 else
                 {
                     // Parse as integer - check if type is unsigned
-                    Cryo::Type *resolved_type = node->get_resolved_type();
+                    TypeRef resolved_type = node->get_resolved_type();
                     bool is_unsigned = false;
                     if (resolved_type)
                     {
@@ -733,7 +733,7 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: *** Processing array access for identifier: '{}'", array_name);
 
             // Check if this is an Array<T> type first
-            Cryo::Type *resolved_type = identifier->get_resolved_type();
+            TypeRef resolved_type = identifier->get_resolved_type();
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Identifier resolved type: {}",
                       resolved_type ? resolved_type->to_string() : "null");
@@ -765,7 +765,7 @@ namespace Cryo::Codegen
 
             if (resolved_type && resolved_type->kind() == TypeKind::Array)
             {
-                auto *cryo_array_type = static_cast<Cryo::ArrayType *>(resolved_type);
+                auto *cryo_array_type = static_cast<const Cryo::ArrayType *>(resolved_type.get());
                 std::string element_type_name = cryo_array_type->element_type()->name();
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Detected Array<{}> access for variable: {}", element_type_name, array_name);
@@ -1102,12 +1102,12 @@ namespace Cryo::Codegen
             else if (array_val->getType()->isPointerTy())
             {
                 // For pointer types (strings, etc.), try to get from resolved type
-                Cryo::Type *cryo_array_type = node->array()->get_resolved_type();
+                TypeRef cryo_array_type = node->array()->get_resolved_type();
                 if (cryo_array_type)
                 {
                     if (cryo_array_type->kind() == TypeKind::Array)
                     {
-                        auto *arr = static_cast<Cryo::ArrayType *>(cryo_array_type);
+                        auto *arr = static_cast<const Cryo::ArrayType *>(cryo_array_type.get());
                         element_type = get_llvm_type(arr->element_type().get());
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Determined element type from resolved Cryo array type for non-stack array");
                     }
@@ -1117,7 +1117,7 @@ namespace Cryo::Codegen
                     }
                     else if (cryo_array_type->kind() == TypeKind::Pointer)
                     {
-                        auto *ptr = static_cast<Cryo::PointerType *>(cryo_array_type);
+                        auto *ptr = static_cast<const Cryo::PointerType *>(cryo_array_type.get());
                         element_type = get_llvm_type(ptr->pointee_type().get());
                     }
                 }
@@ -1197,7 +1197,7 @@ namespace Cryo::Codegen
             std::string array_name = identifier->name();
 
             // Check if this is an Array<T> type first
-            Cryo::Type *resolved_type = identifier->get_resolved_type();
+            TypeRef resolved_type = identifier->get_resolved_type();
 
             // Fallback: if identifier doesn't have resolved type, check variable_types_map
             if (!resolved_type)
@@ -1215,7 +1215,7 @@ namespace Cryo::Codegen
 
             if (resolved_type && resolved_type->kind() == TypeKind::Array)
             {
-                auto *cryo_array_type = static_cast<Cryo::ArrayType *>(resolved_type);
+                auto *cryo_array_type = static_cast<const Cryo::ArrayType *>(resolved_type.get());
                 std::string element_type_name = cryo_array_type->element_type()->name();
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected Array<{}> address access for variable: {}", element_type_name, array_name);
@@ -1393,7 +1393,7 @@ namespace Cryo::Codegen
         return cast_if_needed(value, llvm_target);
     }
 
-    llvm::Value *ExpressionCodegen::generate_cast(llvm::Value *value, Cryo::Type *target_type)
+    llvm::Value *ExpressionCodegen::generate_cast(llvm::Value *value, TypeRef target_type)
     {
         if (!value || !target_type)
             return value;
@@ -1443,7 +1443,7 @@ namespace Cryo::Codegen
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), size);
     }
 
-    llvm::Value *ExpressionCodegen::generate_sizeof(Cryo::Type *type)
+    llvm::Value *ExpressionCodegen::generate_sizeof(TypeRef type)
     {
         if (!type)
         {
@@ -1503,7 +1503,7 @@ namespace Cryo::Codegen
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), align);
     }
 
-    llvm::Value *ExpressionCodegen::generate_alignof(Cryo::Type *type)
+    llvm::Value *ExpressionCodegen::generate_alignof(TypeRef type)
     {
         if (!type)
         {
@@ -1562,7 +1562,7 @@ namespace Cryo::Codegen
         return nullptr;
     }
 
-    llvm::Value *ExpressionCodegen::generate_dereference(llvm::Value *operand, Cryo::Type *pointee_type)
+    llvm::Value *ExpressionCodegen::generate_dereference(llvm::Value *operand, TypeRef pointee_type)
     {
         if (!operand)
         {
@@ -1894,7 +1894,7 @@ namespace Cryo::Codegen
                 auto it = var_types.find("this");
                 if (it != var_types.end() && it->second)
                 {
-                    Cryo::Type *this_type = it->second;
+                    TypeRef this_type = it->second;
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "resolve_member_info: Found 'this' in variable_types_map: {}",
                               this_type->to_string());
@@ -1903,7 +1903,7 @@ namespace Cryo::Codegen
                     std::string this_type_name = this_type->to_string();
                     if (this_type->kind() == Cryo::TypeKind::Pointer)
                     {
-                        auto *ptr_type = dynamic_cast<Cryo::PointerType *>(this_type);
+                        auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(this_type.get());
                         if (ptr_type && ptr_type->pointee_type())
                         {
                             this_type_name = ptr_type->pointee_type()->to_string();
@@ -1941,7 +1941,7 @@ namespace Cryo::Codegen
         }
 
         // Get the resolved type of the object expression
-        Cryo::Type *obj_type = object->get_resolved_type();
+        TypeRef obj_type = object->get_resolved_type();
         if (!obj_type)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1955,7 +1955,7 @@ namespace Cryo::Codegen
         // Handle pointer types - get the pointee type name
         if (obj_type->kind() == Cryo::TypeKind::Pointer)
         {
-            auto *ptr_type = dynamic_cast<Cryo::PointerType *>(obj_type);
+            auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
             if (ptr_type && ptr_type->pointee_type())
             {
                 type_name = ptr_type->pointee_type()->to_string();
@@ -2045,7 +2045,7 @@ namespace Cryo::Codegen
 
         // Check if this array literal is being used to initialize an Array<T> type
         // by looking at the context or expected type
-        Cryo::Type *resolved_type = node->get_resolved_type();
+        TypeRef resolved_type = node->get_resolved_type();
         if (resolved_type)
         {
             std::string type_name = resolved_type->to_string();
@@ -2060,7 +2060,7 @@ namespace Cryo::Codegen
                 // This ensures u64[] uses i64, not i32 (which integer literals default to)
                 if (resolved_type->kind() == TypeKind::Array)
                 {
-                    auto *arr_type = static_cast<Cryo::ArrayType *>(resolved_type);
+                    auto *arr_type = static_cast<const Cryo::ArrayType *>(resolved_type.get());
                     llvm::Type *cryo_elem_type = get_llvm_type(arr_type->element_type().get());
                     if (cryo_elem_type)
                     {
@@ -2147,7 +2147,7 @@ namespace Cryo::Codegen
         }
 
         // Get Array<T> struct type
-        Cryo::Type *resolved_type = node->get_resolved_type();
+        TypeRef resolved_type = node->get_resolved_type();
         if (!resolved_type)
         {
             report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node, "No resolved Array<T> type");
@@ -2419,10 +2419,10 @@ namespace Cryo::Codegen
             }
 
             // Convert string type arguments to Cryo::Type*
-            std::vector<Cryo::Type *> type_args;
+            std::vector<TypeRef> type_args;
             for (const auto &type_arg_str : node->generic_args())
             {
-                Cryo::Type *arg_type = symbols().get_type_context()->lookup_struct_type(type_arg_str);
+                TypeRef arg_type = symbols().get_type_context()->lookup_struct_type(type_arg_str);
                 if (!arg_type)
                 {
                     arg_type = symbols().get_type_context()->lookup_class_type(type_arg_str);

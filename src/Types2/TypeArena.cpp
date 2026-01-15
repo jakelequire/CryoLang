@@ -846,4 +846,137 @@ namespace Cryo
         return "A" + std::to_string(_qualified_name.module.id) + "_" + _qualified_name.name;
     }
 
+    // ========================================================================
+    // Interning (backward compatibility)
+    // ========================================================================
+
+    TypeRef TypeArena::intern(const Type *type)
+    {
+        if (!type)
+        {
+            return create_error("null type", SourceLocation{});
+        }
+
+        // Check if this exact type pointer is already in our arena
+        for (size_t i = 0; i < _types.size(); ++i)
+        {
+            if (_types[i].get() == type)
+            {
+                return TypeRef(_types[i]->id(), this);
+            }
+        }
+
+        // Type is not in our arena - we need to create an equivalent
+        // This is a fallback for legacy code; ideally this shouldn't happen
+        // Return an equivalent type based on kind
+        TypeKind kind = type->kind();
+
+        switch (kind)
+        {
+        case TypeKind::Void:
+            return get_void();
+        case TypeKind::Bool:
+            return get_bool();
+        case TypeKind::Char:
+            return get_char();
+        case TypeKind::String:
+            return get_string();
+        case TypeKind::Never:
+            return get_never();
+        case TypeKind::Int:
+        {
+            auto *int_type = static_cast<const IntType *>(type);
+            return get_integer(int_type->integer_kind());
+        }
+        case TypeKind::Float:
+        {
+            auto *float_type = static_cast<const FloatType *>(type);
+            return get_float(float_type->float_kind());
+        }
+        case TypeKind::Pointer:
+        {
+            auto *ptr_type = static_cast<const PointerType *>(type);
+            TypeRef pointee = intern(ptr_type->pointee().get());
+            return get_pointer_to(pointee);
+        }
+        case TypeKind::Reference:
+        {
+            auto *ref_type = static_cast<const ReferenceType *>(type);
+            TypeRef referent = intern(ref_type->referent().get());
+            return get_reference_to(referent, ref_type->mutability());
+        }
+        case TypeKind::Array:
+        {
+            auto *arr_type = static_cast<const ArrayType *>(type);
+            TypeRef elem = intern(arr_type->element().get());
+            return get_array_of(elem, arr_type->size());
+        }
+        case TypeKind::Optional:
+        {
+            auto *opt_type = static_cast<const OptionalType *>(type);
+            TypeRef wrapped = intern(opt_type->wrapped().get());
+            return get_optional_of(wrapped);
+        }
+        case TypeKind::Function:
+        {
+            auto *func_type = static_cast<const FunctionType *>(type);
+            TypeRef ret = intern(func_type->return_type().get());
+            std::vector<TypeRef> params;
+            for (const auto &p : func_type->param_types())
+            {
+                params.push_back(intern(p.get()));
+            }
+            return get_function(ret, params, func_type->is_variadic());
+        }
+        case TypeKind::Tuple:
+        {
+            auto *tuple_type = static_cast<const TupleType *>(type);
+            std::vector<TypeRef> elems;
+            for (const auto &e : tuple_type->elements())
+            {
+                elems.push_back(intern(e.get()));
+            }
+            return get_tuple(elems);
+        }
+        case TypeKind::Struct:
+        {
+            auto *struct_type = static_cast<const StructType *>(type);
+            return create_struct(struct_type->qualified_name());
+        }
+        case TypeKind::Class:
+        {
+            auto *class_type = static_cast<const ClassType *>(type);
+            return create_class(class_type->qualified_name());
+        }
+        case TypeKind::Enum:
+        {
+            auto *enum_type = static_cast<const EnumType *>(type);
+            return create_enum(enum_type->qualified_name());
+        }
+        case TypeKind::Trait:
+        {
+            auto *trait_type = static_cast<const TraitType *>(type);
+            return create_trait(trait_type->qualified_name());
+        }
+        case TypeKind::TypeAlias:
+        {
+            auto *alias_type = static_cast<const TypeAliasType *>(type);
+            TypeRef target = intern(alias_type->target().get());
+            return create_type_alias(alias_type->qualified_name(), target);
+        }
+        case TypeKind::GenericParam:
+        {
+            auto *gen_type = static_cast<const GenericParamType *>(type);
+            return create_generic_param(gen_type->param_name(), gen_type->param_index());
+        }
+        case TypeKind::Error:
+        {
+            auto *err_type = static_cast<const ErrorType *>(type);
+            return create_error(err_type->reason(), err_type->location());
+        }
+        default:
+            return create_error("unknown type kind in intern", SourceLocation{});
+        }
+    }
+
 } // namespace Cryo

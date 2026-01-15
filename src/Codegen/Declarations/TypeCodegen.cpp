@@ -17,7 +17,7 @@ namespace Cryo::Codegen
     // Type Resolution
     //===================================================================
 
-    llvm::Type *TypeCodegen::resolve_type(Cryo::Type *cryo_type)
+    llvm::Type *TypeCodegen::resolve_type(TypeRef cryo_type)
     {
         if (!cryo_type)
             return nullptr;
@@ -44,7 +44,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Type *TypeCodegen::resolve_generic_type(const std::string &base_type,
-                                                    const std::vector<Cryo::Type *> &type_args)
+                                                    const std::vector<TypeRef> &type_args)
     {
         // Build cache key
         std::string cache_key = base_type + "<";
@@ -548,7 +548,7 @@ namespace Cryo::Codegen
         return type && type->isFloatingPointTy();
     }
 
-    bool TypeCodegen::is_signed_integer(Cryo::Type *cryo_type) const
+    bool TypeCodegen::is_signed_integer(TypeRef cryo_type) const
     {
         if (!cryo_type)
             return true; // Default to signed
@@ -605,7 +605,7 @@ namespace Cryo::Codegen
         LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Mapping {} fields for struct '{}' ===", node->fields().size(), name);
         for (const auto &field : node->fields())
         {
-            Cryo::Type *cryo_field_type = field->get_resolved_type();
+            TypeRef cryo_field_type = field->get_resolved_type();
             if (cryo_field_type)
             {
                 LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Mapping field '{}' of type '{}' ===",
@@ -707,7 +707,7 @@ namespace Cryo::Codegen
 
         for (const auto &field : node->fields())
         {
-            Cryo::Type *cryo_field_type = field->get_resolved_type();
+            TypeRef cryo_field_type = field->get_resolved_type();
             if (cryo_field_type)
             {
                 // DEBUG: Log the actual type kind for class fields

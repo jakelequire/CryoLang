@@ -263,7 +263,7 @@ namespace Cryo
     // Method Return Type Registry Implementation
     //===================================================================
 
-    void TemplateRegistry::register_method_return_type(const std::string &qualified_method_name, Type *return_type)
+    void TemplateRegistry::register_method_return_type(const std::string &qualified_method_name, TypeRef return_type)
     {
         if (qualified_method_name.empty() || !return_type)
             return;
@@ -274,7 +274,7 @@ namespace Cryo
                   qualified_method_name, return_type->to_string());
     }
 
-    Type *TemplateRegistry::get_method_return_type(const std::string &qualified_method_name) const
+    TypeRef TemplateRegistry::get_method_return_type(const std::string &qualified_method_name) const
     {
         auto it = _method_return_types.find(qualified_method_name);
         if (it != _method_return_types.end())
@@ -298,7 +298,7 @@ namespace Cryo
 
     void TemplateRegistry::register_struct_field_types(const std::string &qualified_struct_name,
                                                        const std::vector<std::string> &field_names,
-                                                       const std::vector<Type *> &field_types)
+                                                       const std::vector<TypeRef> &field_types)
     {
         if (qualified_struct_name.empty())
             return;

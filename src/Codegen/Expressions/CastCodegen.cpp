@@ -43,7 +43,7 @@ namespace Cryo::Codegen
         return generate_implicit_cast(value, node->get_resolved_type());
     }
 
-    llvm::Value *CastCodegen::generate_implicit_cast(llvm::Value *value, Cryo::Type *target_type)
+    llvm::Value *CastCodegen::generate_implicit_cast(llvm::Value *value, TypeRef target_type)
     {
         if (!value || !target_type)
             return value;
@@ -473,7 +473,7 @@ namespace Cryo::Codegen
         return false;
     }
 
-    bool CastCodegen::is_signed_type(Cryo::Type *type) const
+    bool CastCodegen::is_signed_type(TypeRef type) const
     {
         if (!type)
             return true; // Default to signed

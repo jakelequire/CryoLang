@@ -480,7 +480,7 @@ namespace Cryo::Codegen
                         {
                             if (method->name() == method_name)
                             {
-                                Cryo::Type *method_return = method->get_resolved_return_type();
+                                TypeRef method_return = method->get_resolved_return_type();
                                 if (method_return)
                                 {
                                     return_type = types().get_type(method_return);
@@ -498,7 +498,7 @@ namespace Cryo::Codegen
                         {
                             if (method->name() == method_name)
                             {
-                                Cryo::Type *method_return = method->get_resolved_return_type();
+                                TypeRef method_return = method->get_resolved_return_type();
                                 if (method_return)
                                 {
                                     return_type = types().get_type(method_return);
@@ -518,7 +518,7 @@ namespace Cryo::Codegen
                 // First check local CodegenContext, then shared TemplateRegistry
                 if (!return_type)
                 {
-                    Cryo::Type *cryo_return_type = ctx().get_method_return_type(full_method_name);
+                    TypeRef cryo_return_type = ctx().get_method_return_type(full_method_name);
                     if (!cryo_return_type && template_registry)
                     {
                         // Try TemplateRegistry for cross-module method signatures
@@ -792,7 +792,7 @@ namespace Cryo::Codegen
     // Common Type Operations
     //===================================================================
 
-    llvm::Type *ICodegenComponent::get_llvm_type(Cryo::Type *cryo_type)
+    llvm::Type *ICodegenComponent::get_llvm_type(TypeRef cryo_type)
     {
         if (!cryo_type)
             return nullptr;

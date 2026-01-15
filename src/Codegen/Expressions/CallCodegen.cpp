@@ -141,7 +141,7 @@ namespace Cryo::Codegen
                     //   - So we need to load the pointer value from the field
                     if (receiver)
                     {
-                        Cryo::Type *nested_type = nested_member->get_resolved_type();
+                        TypeRef nested_type = nested_member->get_resolved_type();
                         if (nested_type)
                         {
                             std::string type_name = nested_type->to_string();
@@ -207,7 +207,7 @@ namespace Cryo::Codegen
                             // Example: pool_ptr: MemoryPool* stored in %pool_ptr = alloca ptr
                             //   - We need to load the ptr value: %loaded = load ptr, ptr %pool_ptr
                             //   - Then pass %loaded as 'this', not %pool_ptr
-                            Cryo::Type *obj_type = member->object()->get_resolved_type();
+                            TypeRef obj_type = member->object()->get_resolved_type();
                             if (obj_type && obj_type->kind() == Cryo::TypeKind::Pointer)
                             {
                                 // The variable is a pointer type - we need the loaded pointer value
@@ -317,7 +317,7 @@ namespace Cryo::Codegen
 
                 // Parse type arguments (simple single type arg for now)
                 // TODO: Handle multiple type arguments with proper parsing
-                std::vector<Cryo::Type *> type_args;
+                std::vector<TypeRef> type_args;
 
                 // Trim whitespace from type_args_str
                 size_t start = type_args_str.find_first_not_of(" \t");
@@ -328,7 +328,7 @@ namespace Cryo::Codegen
                 }
 
                 // Resolve the type argument - try struct/class types first
-                Cryo::Type *arg_type = symbols().get_type_context()->lookup_struct_type(type_args_str);
+                TypeRef arg_type = symbols().get_type_context()->lookup_struct_type(type_args_str);
                 if (!arg_type)
                 {
                     arg_type = symbols().get_type_context()->lookup_class_type(type_args_str);
@@ -1118,7 +1118,7 @@ namespace Cryo::Codegen
         std::string type_name;
         if (callee && callee->object())
         {
-            Cryo::Type *obj_type = callee->object()->get_resolved_type();
+            TypeRef obj_type = callee->object()->get_resolved_type();
             if (obj_type)
             {
                 type_name = obj_type->to_string();
@@ -1130,7 +1130,7 @@ namespace Cryo::Codegen
                 // Handle pointer types explicitly
                 if (obj_type->kind() == Cryo::TypeKind::Pointer)
                 {
-                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(obj_type);
+                    auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
                     if (ptr_type && ptr_type->pointee_type())
                     {
                         type_name = ptr_type->pointee_type()->to_string();
@@ -1185,7 +1185,7 @@ namespace Cryo::Codegen
                     // Try to get the resolved type from the call expression
                     if (call_expr->has_resolved_type())
                     {
-                        Cryo::Type *call_return_type = call_expr->get_resolved_type();
+                        TypeRef call_return_type = call_expr->get_resolved_type();
                         if (call_return_type)
                         {
                             type_name = call_return_type->to_string();
@@ -1229,7 +1229,7 @@ namespace Cryo::Codegen
                                 }
                                 else if (inner_callee->object()->has_resolved_type())
                                 {
-                                    Cryo::Type *inner_obj_type = inner_callee->object()->get_resolved_type();
+                                    TypeRef inner_obj_type = inner_callee->object()->get_resolved_type();
                                     if (inner_obj_type)
                                     {
                                         inner_receiver_type = inner_obj_type->to_string();
@@ -1240,7 +1240,7 @@ namespace Cryo::Codegen
                                         // Handle pointer types
                                         if (inner_obj_type->kind() == Cryo::TypeKind::Pointer)
                                         {
-                                            auto *ptr_type = dynamic_cast<Cryo::PointerType *>(inner_obj_type);
+                                            auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(inner_obj_type.get());
                                             if (ptr_type && ptr_type->pointee_type())
                                             {
                                                 inner_receiver_type = ptr_type->pointee_type()->to_string();
@@ -1524,7 +1524,7 @@ namespace Cryo::Codegen
 
             if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->data_type)
             {
-                Cryo::FunctionType *func_type = dynamic_cast<Cryo::FunctionType *>(symbol->data_type);
+                const Cryo::FunctionType *func_type = dynamic_cast<const Cryo::FunctionType *>(symbol->data_type.get());
                 if (func_type)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1832,7 +1832,7 @@ namespace Cryo::Codegen
     {
         // First try direct lookup with the unqualified name
         // Enums are registered with just their name (e.g., "Shape"), not namespace-qualified
-        Cryo::Type *direct_lookup = const_cast<CallCodegen *>(this)->symbols().get_type_context()->lookup_enum_type(name);
+        TypeRef direct_lookup = const_cast<CallCodegen *>(this)->symbols().get_type_context()->lookup_enum_type(name);
         if (direct_lookup)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1850,7 +1850,7 @@ namespace Cryo::Codegen
         for (const auto &candidate : candidates)
         {
             // Try TypeContext's enum type lookup
-            Cryo::Type *enum_type = const_cast<CallCodegen *>(this)->symbols().get_type_context()->lookup_enum_type(candidate);
+            TypeRef enum_type = const_cast<CallCodegen *>(this)->symbols().get_type_context()->lookup_enum_type(candidate);
             if (enum_type)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1996,14 +1996,14 @@ namespace Cryo::Codegen
         std::string type_name;
 
         // Get the resolved type of the object expression
-        Cryo::Type *obj_type = node->object()->get_resolved_type();
+        TypeRef obj_type = node->object()->get_resolved_type();
         if (obj_type)
         {
             type_name = obj_type->to_string();
             // Handle pointer types - get the pointee type name
             if (obj_type->kind() == Cryo::TypeKind::Pointer)
             {
-                auto *ptr_type = dynamic_cast<Cryo::PointerType *>(obj_type);
+                auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
                 if (ptr_type && ptr_type->pointee_type())
                 {
                     type_name = ptr_type->pointee_type()->to_string();

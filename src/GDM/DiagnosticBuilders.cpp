@@ -55,7 +55,7 @@ namespace Cryo
         return SourceSpan(start, end, _source_file, true);
     }
 
-    SourceSpan BaseDiagnosticBuilder::create_type_span(Type *type, SourceLocation location) const
+    SourceSpan BaseDiagnosticBuilder::create_type_span(TypeRef type, SourceLocation location) const
     {
         if (!type)
         {
@@ -400,7 +400,7 @@ namespace Cryo
         return report_error(error_code, node, message);
     }
 
-    Diagnostic &CodegenDiagnosticBuilder::create_type_mapping_error(Type *cryo_type,
+    Diagnostic &CodegenDiagnosticBuilder::create_type_mapping_error(TypeRef cryo_type,
                                                                     ASTNode *node,
                                                                     const std::string &reason)
     {
@@ -1119,8 +1119,8 @@ namespace Cryo
     // TypeCheckerDiagnosticBuilder Implementation
     //===================================================================
 
-    Diagnostic &TypeCheckerDiagnosticBuilder::create_assignment_type_error(Type *expected,
-                                                                           Type *actual,
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_assignment_type_error(TypeRef expected,
+                                                                           TypeRef actual,
                                                                            SourceLocation location,
                                                                            ASTNode *node)
     {
@@ -1170,8 +1170,8 @@ namespace Cryo
     }
 
     Diagnostic &TypeCheckerDiagnosticBuilder::create_operation_type_error(const std::string &operation,
-                                                                          Type *left_type,
-                                                                          Type *right_type,
+                                                                          TypeRef left_type,
+                                                                          TypeRef right_type,
                                                                           SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
@@ -1400,7 +1400,7 @@ namespace Cryo
         return diagnostic;
     }
 
-    Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_dereference_error(Type *type,
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_dereference_error(TypeRef type,
                                                                                SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
@@ -1420,7 +1420,7 @@ namespace Cryo
     }
 
     Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_member_access_error(const std::string &member_name,
-                                                                                 Type *object_type,
+                                                                                 TypeRef object_type,
                                                                                  SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
@@ -1463,7 +1463,7 @@ namespace Cryo
     }
 
     Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_operation_error(const std::string &operation,
-                                                                             Type *left_type, Type *right_type,
+                                                                             TypeRef left_type, TypeRef right_type,
                                                                              SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);
@@ -1490,7 +1490,7 @@ namespace Cryo
     }
 
     Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_operation_error(const std::string &operation,
-                                                                             Type *left_type, Type *right_type,
+                                                                             TypeRef left_type, TypeRef right_type,
                                                                              ASTNode *node)
     {
         // Use create_node_span which properly extracts source file from the node
@@ -1526,7 +1526,7 @@ namespace Cryo
         return diagnostic;
     }
 
-    Diagnostic &TypeCheckerDiagnosticBuilder::create_non_callable_error(Type *type, SourceLocation location, ASTNode *node)
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_non_callable_error(TypeRef type, SourceLocation location, ASTNode *node)
     {
         // Check for duplicate error reporting
         if (should_skip_error_reporting(node))
@@ -1577,7 +1577,7 @@ namespace Cryo
         return diagnostic;
     }
 
-    Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_assignment_error(Type *target_type, Type *value_type,
+    Diagnostic &TypeCheckerDiagnosticBuilder::create_invalid_assignment_error(TypeRef target_type, TypeRef value_type,
                                                                               SourceLocation location)
     {
         SourceSpan span(location, location, _source_file, true);

@@ -149,7 +149,7 @@ namespace Cryo::Codegen
         /**
          * @brief Get return type category from Cryo type
          */
-        FunctionCategory get_category_from_cryo_type(const Cryo::Type *cryo_type) const;
+        FunctionCategory get_category_from_cryo_type(const TypeRef cryo_type) const;
 
         /**
          * @brief Convert function category to LLVM type

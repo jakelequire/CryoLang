@@ -163,7 +163,7 @@ namespace Cryo::Codegen
         llvm::Value *generate_arithmetic(TokenKind op,
                                          llvm::Value *lhs,
                                          llvm::Value *rhs,
-                                         Cryo::Type *result_type = nullptr);
+                                         TypeRef result_type = nullptr);
 
         /**
          * @brief Generate integer arithmetic
@@ -216,7 +216,7 @@ namespace Cryo::Codegen
         llvm::Value *generate_comparison(TokenKind op,
                                          llvm::Value *lhs,
                                          llvm::Value *rhs,
-                                         Cryo::Type *operand_type = nullptr);
+                                         TypeRef operand_type = nullptr);
 
         /**
          * @brief Generate integer comparison
@@ -324,7 +324,7 @@ namespace Cryo::Codegen
          * @param type Operand type
          * @return Negated value
          */
-        llvm::Value *generate_negation(llvm::Value *operand, Cryo::Type *type = nullptr);
+        llvm::Value *generate_negation(llvm::Value *operand, TypeRef type = nullptr);
 
         /**
          * @brief Generate logical NOT (!)
@@ -353,7 +353,7 @@ namespace Cryo::Codegen
          * @param pointee_type Type being pointed to
          * @return Dereferenced value
          */
-        llvm::Value *generate_dereference(llvm::Value *ptr, Cryo::Type *pointee_type = nullptr);
+        llvm::Value *generate_dereference(llvm::Value *ptr, TypeRef pointee_type = nullptr);
 
         /**
          * @brief Generate pre/post increment (++)
@@ -405,21 +405,21 @@ namespace Cryo::Codegen
          * @param type Cryo type to check
          * @return true if signed integer
          */
-        bool is_signed_integer_type(Cryo::Type *type);
+        bool is_signed_integer_type(TypeRef type);
 
         /**
          * @brief Check if a type is floating point
          * @param type Cryo type to check
          * @return true if floating point
          */
-        bool is_float_type(Cryo::Type *type);
+        bool is_float_type(TypeRef type);
 
         /**
          * @brief Check if a type is a string
          * @param type Cryo type to check
          * @return true if string
          */
-        bool is_string_type(Cryo::Type *type);
+        bool is_string_type(TypeRef type);
 
         /**
          * @brief Ensure operands have compatible types

@@ -52,7 +52,7 @@ namespace Cryo::Codegen
          * @param target_type Target Cryo type
          * @return Cast value
          */
-        llvm::Value *generate_implicit_cast(llvm::Value *value, Cryo::Type *target_type);
+        llvm::Value *generate_implicit_cast(llvm::Value *value, TypeRef target_type);
 
         /**
          * @brief Generate cast to specific LLVM type
@@ -244,7 +244,7 @@ namespace Cryo::Codegen
          * @param type Cryo type
          * @return true if signed
          */
-        bool is_signed_type(Cryo::Type *type) const;
+        bool is_signed_type(TypeRef type) const;
 
     private:
         //===================================================================

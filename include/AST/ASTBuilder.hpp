@@ -34,13 +34,13 @@ namespace Cryo
         std::unique_ptr<ReturnStatementNode> create_return_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> expr = nullptr);
         std::unique_ptr<VariableDeclarationNode> create_variable_declaration(SourceLocation loc,
                                                                              std::string name,
-                                                                             Cryo::Type *resolved_type,
+                                                                             TypeRef resolved_type,
                                                                              std::unique_ptr<ExpressionNode> init = nullptr,
                                                                              bool is_mutable = false,
                                                                              bool is_global = false);
         std::unique_ptr<FunctionDeclarationNode> create_function_declaration(SourceLocation loc,
                                                                              std::string name,
-                                                                             Cryo::Type *return_type,
+                                                                             TypeRef return_type,
                                                                              bool is_public = false);
         std::unique_ptr<CallExpressionNode> create_call_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> callee);
         std::unique_ptr<NewExpressionNode> create_new_expression(SourceLocation loc, std::string type_name);
@@ -64,8 +64,8 @@ namespace Cryo
 
         // Struct and Class creation methods
         std::unique_ptr<GenericParameterNode> create_generic_parameter(SourceLocation loc, std::string name);
-        std::unique_ptr<StructFieldNode> create_struct_field(SourceLocation loc, std::string name, Cryo::Type *resolved_type, Visibility visibility = Visibility::Public);
-        std::unique_ptr<StructMethodNode> create_struct_method(SourceLocation loc, std::string name, Cryo::Type *return_type, Visibility visibility = Visibility::Public, bool is_constructor = false, bool is_destructor = false, bool is_static = false, bool is_default_destructor = false);
+        std::unique_ptr<StructFieldNode> create_struct_field(SourceLocation loc, std::string name, TypeRef resolved_type, Visibility visibility = Visibility::Public);
+        std::unique_ptr<StructMethodNode> create_struct_method(SourceLocation loc, std::string name, TypeRef return_type, Visibility visibility = Visibility::Public, bool is_constructor = false, bool is_destructor = false, bool is_static = false, bool is_default_destructor = false);
         std::unique_ptr<StructDeclarationNode> create_struct_declaration(SourceLocation loc, std::string name);
         std::unique_ptr<ClassDeclarationNode> create_class_declaration(SourceLocation loc, std::string name);
         std::unique_ptr<TraitDeclarationNode> create_trait_declaration(SourceLocation loc, std::string name);
@@ -84,6 +84,6 @@ namespace Cryo
         void validate_literal_token(const Token &token) const;
 
         // Type lookup helper (replacement for parse_type_from_string)
-        Cryo::Type *lookup_type_by_name(const std::string &type_name);
+        TypeRef lookup_type_by_name(const std::string &type_name);
     };
 }

@@ -44,7 +44,7 @@ namespace Cryo::Codegen
         {
             if (param && param->get_resolved_type())
             {
-                Cryo::Type *ptype = param->get_resolved_type();
+                TypeRef ptype = param->get_resolved_type();
                 if (ptype->kind() == TypeKind::Generic)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -67,7 +67,7 @@ namespace Cryo::Codegen
         }
 
         // Check 3: Detect uninstantiated return type
-        if (Cryo::Type *ret_type = node->get_resolved_return_type())
+        if (TypeRef ret_type = node->get_resolved_return_type())
         {
             if (ret_type->kind() == TypeKind::Generic)
             {
@@ -173,7 +173,7 @@ namespace Cryo::Codegen
         {
             if (param && param->get_resolved_type())
             {
-                Cryo::Type *ptype = param->get_resolved_type();
+                TypeRef ptype = param->get_resolved_type();
                 // Check for Generic type kind
                 if (ptype->kind() == TypeKind::Generic)
                 {
@@ -198,7 +198,7 @@ namespace Cryo::Codegen
         }
 
         // Check 3: Detect uninstantiated return type
-        if (Cryo::Type *ret_type = node->get_resolved_return_type())
+        if (TypeRef ret_type = node->get_resolved_return_type())
         {
             if (ret_type->kind() == TypeKind::Generic)
             {
@@ -306,7 +306,7 @@ namespace Cryo::Codegen
         {
             if (param && param->get_resolved_type())
             {
-                Cryo::Type *ptype = param->get_resolved_type();
+                TypeRef ptype = param->get_resolved_type();
                 // Check for Generic type kind or undefined struct/class types
                 if (ptype->kind() == TypeKind::Generic)
                 {
@@ -418,7 +418,7 @@ namespace Cryo::Codegen
         // This allows other modules to create correct extern declarations for this method
         // Register in both CodegenContext (for current compilation unit) and
         // TemplateRegistry (for cross-module lookups)
-        Cryo::Type *return_type = node->get_resolved_return_type();
+        TypeRef return_type = node->get_resolved_return_type();
         if (return_type)
         {
             // Register in local CodegenContext
@@ -498,7 +498,7 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating local variable: {}", name);
 
         // Get variable type
-        Cryo::Type *cryo_var_type = node->get_resolved_type();
+        TypeRef cryo_var_type = node->get_resolved_type();
         llvm::Type *var_type = get_llvm_type(cryo_var_type);
         if (!var_type)
         {
@@ -610,7 +610,7 @@ namespace Cryo::Codegen
         values().set_value(name, nullptr, alloca);
 
         // Register the variable type in variable_types_map for Array<T> detection
-        Cryo::Type *resolved_type = node->get_resolved_type();
+        TypeRef resolved_type = node->get_resolved_type();
         if (resolved_type)
         {
             ctx().variable_types_map()[name] = resolved_type;
@@ -670,7 +670,7 @@ namespace Cryo::Codegen
         }
 
         // Get variable type from the AST node's resolved type
-        Cryo::Type *cryo_type = node->get_resolved_type();
+        TypeRef cryo_type = node->get_resolved_type();
         if (!cryo_type)
         {
             report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
@@ -705,7 +705,7 @@ namespace Cryo::Codegen
 
             // Get the type's name and look up the struct directly
             std::string type_name = cryo_type->name();
-            llvm::StructType *struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+            llvm::StructTypeRef struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
             if (!struct_type)
             {
                 // Try with namespace context
@@ -886,7 +886,7 @@ namespace Cryo::Codegen
         }
 
         // Create opaque struct first (for recursive types)
-        llvm::StructType *struct_type = llvm::StructType::create(llvm_ctx(), name);
+        llvm::StructTypeRef struct_type = llvm::StructType::create(llvm_ctx(), name);
 
         // Collect field types
         std::vector<llvm::Type *> field_types;
@@ -1187,7 +1187,7 @@ namespace Cryo::Codegen
             return nullptr;
 
         // Get return type
-        Type *resolved_type = node->get_resolved_return_type();
+        TypeRef resolved_type = node->get_resolved_return_type();
         
         // Check for corrupted or invalid type pointer
         if (resolved_type != nullptr)
@@ -1216,7 +1216,7 @@ namespace Cryo::Codegen
             !parent_type_name.empty())
         {
             // This is a constructor with wrong return type - fix it to pointer to struct type
-            Type *struct_type = ctx().symbols().get_type_context()->get_struct_type(parent_type_name);
+            TypeRef struct_type = ctx().symbols().get_type_context()->get_struct_type(parent_type_name);
             if (struct_type)
             {
                 resolved_type = ctx().symbols().get_type_context()->create_pointer_type(struct_type);
@@ -1259,10 +1259,10 @@ namespace Cryo::Codegen
             bool is_simple_enum = false;
             if (!parent_type_name.empty())
             {
-                Cryo::Type *parent_cryo_type = symbols().get_type_context()->lookup_enum_type(parent_type_name);
+                TypeRef parent_cryo_type = symbols().get_type_context()->lookup_enum_type(parent_type_name);
                 if (parent_cryo_type && parent_cryo_type->kind() == Cryo::TypeKind::Enum)
                 {
-                    auto *enum_type = static_cast<Cryo::EnumType *>(parent_cryo_type);
+                    auto *enum_type = static_cast<const Cryo::EnumType *>(parent_cryo_type.get());
                     is_simple_enum = enum_type->is_simple_enum();
                 }
             }
@@ -1298,7 +1298,7 @@ namespace Cryo::Codegen
 
     std::string DeclarationCodegen::mangle_function_name(const std::string &name,
                                                          const std::vector<std::string> &namespace_parts,
-                                                         const std::vector<Cryo::Type *> &param_types)
+                                                         const std::vector<TypeRef> &param_types)
     {
         std::string result;
 
@@ -1331,7 +1331,7 @@ namespace Cryo::Codegen
 
     std::string DeclarationCodegen::generate_method_name(const std::string &type_name,
                                                          const std::string &method_name,
-                                                         const std::vector<Cryo::Type *> &param_types)
+                                                         const std::vector<TypeRef> &param_types)
     {
         std::string result = type_name + "::" + method_name;
 
@@ -1428,7 +1428,7 @@ namespace Cryo::Codegen
         {
             if (param_idx < ast_params.size())
             {
-                Cryo::Type *param_type = ast_params[param_idx]->get_resolved_type();
+                TypeRef param_type = ast_params[param_idx]->get_resolved_type();
                 if (param_type)
                 {
                     std::string param_name = arg.getName().str();
@@ -1479,7 +1479,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *DeclarationCodegen::generate_default_constructor(const std::string &type_name,
-                                                                     llvm::StructType *struct_type)
+                                                                     llvm::StructTypeRef struct_type)
     {
         std::string ctor_name = type_name + "::init";
 
@@ -1774,7 +1774,7 @@ namespace Cryo::Codegen
         {
             if (param && param->get_resolved_type())
             {
-                Cryo::Type *ptype = param->get_resolved_type();
+                TypeRef ptype = param->get_resolved_type();
                 if (ptype->kind() == TypeKind::Generic)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1846,7 +1846,7 @@ namespace Cryo::Codegen
                 if (arg.getName() == "this")
                 {
                     // Get the Cryo type for the current struct/class
-                    Cryo::Type *this_type = ctx().symbols().get_type_context()->get_struct_type(parent_type);
+                    TypeRef this_type = ctx().symbols().get_type_context()->get_struct_type(parent_type);
                     if (!this_type)
                     {
                         this_type = ctx().symbols().get_type_context()->get_class_type(parent_type);
@@ -1888,7 +1888,7 @@ namespace Cryo::Codegen
                 size_t ast_idx = seen_this ? param_idx - 1 : param_idx;
                 if (ast_idx < ast_params.size())
                 {
-                    Cryo::Type *param_type = ast_params[ast_idx]->get_resolved_type();
+                    TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
                     if (param_type)
                     {
                         std::string param_name = arg.getName().str();
@@ -2011,7 +2011,7 @@ namespace Cryo::Codegen
                             Cryo::StructMethodNode *fn_node = method.get();
                             if (fn_node)
                             {
-                                Cryo::Type *return_type = fn_node->get_resolved_return_type();
+                                TypeRef return_type = fn_node->get_resolved_return_type();
                                 if (return_type)
                                 {
                                     std::string qualified_method_name = qualified_type + "::" + fn_node->name();
@@ -2109,7 +2109,7 @@ namespace Cryo::Codegen
                         if (arg.getName() == "this")
                         {
                             // Get the Cryo type for the current struct/class/enum
-                            Cryo::Type *this_type = ctx().symbols().get_type_context()->get_struct_type(type_name);
+                            TypeRef this_type = ctx().symbols().get_type_context()->get_struct_type(type_name);
                             if (!this_type)
                             {
                                 this_type = ctx().symbols().get_type_context()->get_class_type(type_name);
@@ -2294,7 +2294,7 @@ namespace Cryo::Codegen
         for (llvm::GlobalVariable *global : globals_needing_ctors)
         {
             llvm::Type *global_type = global->getValueType();
-            if (llvm::StructType *struct_type = llvm::dyn_cast<llvm::StructType>(global_type))
+            if (llvm::StructTypeRef struct_type = llvm::dyn_cast<llvm::StructType>(global_type))
             {
                 std::string type_name = struct_type->hasName() ? struct_type->getName().str() : "unnamed_struct";
                 std::string global_name = global->getName().str();
