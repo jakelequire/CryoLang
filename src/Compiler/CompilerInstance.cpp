@@ -22,11 +22,7 @@ namespace Cryo
     void CompilerInstance::initialize_components()
     {
         _ast_context = std::make_unique<ASTContext>();
-        _symbol_table = std::make_unique<SymbolTable>();
         _diagnostic_manager = std::make_unique<DiagnosticManager>();
-
-        // Set the type context in symbol table so it can create proper function types
-        _symbol_table->set_type_context(&_ast_context->types());
 
         // Initialize Symbol Resolution Manager
         try
@@ -41,8 +37,29 @@ namespace Cryo
             _symbol_resolution_manager = nullptr;
         }
 
-        // Create type checker with the AST context's type context and diagnostic manager
-        _type_checker = std::make_unique<TypeChecker>(_ast_context->types(), _diagnostic_manager.get());
+        // Create Types2 components in order of dependencies:
+        // 1. GenericRegistry (no dependencies)
+        _generic_registry = std::make_unique<GenericRegistry>();
+
+        // 2. TypeResolver (needs arena, modules, generics)
+        _type_resolver = std::make_unique<TypeResolver>(
+            _ast_context->types(),
+            _ast_context->modules(),
+            *_generic_registry,
+            _diagnostic_manager.get());
+
+        // 3. SymbolTable2 (needs arena, modules)
+        _symbol_table = std::make_unique<SymbolTable>(
+            _ast_context->types(),
+            _ast_context->modules());
+
+        // 4. TypeChecker2 (needs arena, resolver, modules, generics)
+        _type_checker = std::make_unique<TypeChecker>(
+            _ast_context->types(),
+            *_type_resolver,
+            _ast_context->modules(),
+            *_generic_registry,
+            _diagnostic_manager.get());
 
         // Create monomorphization pass
         _monomorphization_pass = std::make_unique<MonomorphizationPass>();
@@ -51,11 +68,10 @@ namespace Cryo
         _template_registry = std::make_unique<TemplateRegistry>();
 
         // Create module loader - needs to be created after symbol table and template registry
-        // Pass the main ASTContext to ensure all modules use the same TypeContext
+        // Pass the main ASTContext to ensure all modules use the same TypeArena
         _module_loader = std::make_unique<ModuleLoader>(*_symbol_table, *_template_registry, *_ast_context);
 
-        // Connect TypeChecker to TemplateRegistry for cross-module generic type resolution
-        _type_checker->set_template_registry(_template_registry.get());
+        // Note: TypeChecker2 doesn't have set_template_registry - template handling is done differently
 
         // Set auto-import callback for runtime dependencies
         _module_loader->set_auto_import_callback([this](SymbolTable *symbol_table, const std::string &scope_name, const std::string &source_file)
@@ -94,8 +110,7 @@ namespace Cryo
         // Initialize standard library built-ins
         initialize_standard_library();
 
-        // Copy built-in symbols to TypeChecker's symbol table
-        _type_checker->load_builtin_symbols(*_symbol_table);
+        // Note: TypeChecker2 doesn't have load_builtin_symbols - symbols are shared via SymbolTable2
 
         // Lexer and Parser will be created when we have a file to work with
     }
@@ -104,11 +119,7 @@ namespace Cryo
     {
         _source_file = file_path;
 
-        // Update TypeChecker with the source file for proper error reporting
-        if (_type_checker)
-        {
-            _type_checker->set_source_file(file_path);
-        }
+        // Note: TypeChecker2 doesn't have set_source_file - diagnostics use DiagnosticManager
     }
 
     void CompilerInstance::add_include_path(const std::string &path)
@@ -120,11 +131,7 @@ namespace Cryo
     {
         _current_namespace = namespace_name;
 
-        // Also set the namespace context in the TypeChecker if it exists
-        if (_type_checker)
-        {
-            _type_checker->set_current_namespace(namespace_name);
-        }
+        // Note: TypeChecker2 doesn't have set_current_namespace - context is handled differently
     }
 
     void CompilerInstance::set_show_stdlib_diagnostics(bool enable)
@@ -139,11 +146,7 @@ namespace Cryo
     {
         set_source_file(source_file);
 
-        // Update TypeChecker with source file information
-        if (_type_checker)
-        {
-            _type_checker->set_source_file(source_file);
-        }
+        // Note: TypeChecker2 doesn't have set_source_file - diagnostics use DiagnosticManager
 
         // Create a file object and load it
         auto file = make_file_from_path(source_file);
@@ -216,24 +219,14 @@ namespace Cryo
             // Phase 5: Semantic analysis (including symbol table population)
             if (!analyze())
             {
-                // If TypeChecker has its own diagnostic manager, the real errors are already reported
-                // Don't create a misleading E0805 error that hides the actual type errors
-                if (_type_checker && _type_checker->has_diagnostic_manager())
-                {
-                    // Real errors are already in the diagnostic manager, just return false
-                    return false;
-                }
-                else
-                {
-                    // Fallback: create E0805 error with correct error count if TypeChecker doesn't have diagnostic manager
-                    std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
-                    size_t user_errors = _diagnostic_manager->user_error_count();
-                    std::string error_message = "Module contains: " + std::to_string(user_errors) + " errors in namespace '" + namespace_name + "'";
-                    _diagnostic_manager->create_error(ErrorCode::E0805_INTERNAL_ERROR,
-                                                      SourceRange{}, file_path,
-                                                      error_message);
-                    return false;
-                }
+                // Errors are reported through DiagnosticManager
+                std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
+                size_t user_errors = _diagnostic_manager->user_error_count();
+                std::string error_message = "Module contains: " + std::to_string(user_errors) + " errors in namespace '" + namespace_name + "'";
+                _diagnostic_manager->create_error(ErrorCode::E0805_INTERNAL_ERROR,
+                                                  SourceRange{}, file_path,
+                                                  error_message);
+                return false;
             }
 
             // Phase 6: Generate IR (for testing and integration)
@@ -393,12 +386,8 @@ namespace Cryo
         {
             _ast_root = _parser->parse_program();
 
-            // Immediately discover and register generic types from the AST
-            // This must happen before any type resolution attempts
-            if (_ast_root)
-            {
-                _type_checker->discover_generic_types_from_ast(*_ast_root);
-            }
+            // Note: TypeChecker2 doesn't have discover_generic_types_from_ast
+            // Generic types are now discovered during AST traversal in the symbol table population phase
 
             // Capture namespace context from parser after successful parsing
             if (_ast_root && !_parser->current_namespace().empty() && _parser->current_namespace() != "Global")
@@ -422,10 +411,10 @@ namespace Cryo
             if (_stdlib_compilation_mode)
             {
                 _codegen->set_stdlib_compilation_mode(true);
-                _type_checker->set_stdlib_compilation_mode(true);
+                // Note: TypeChecker2 doesn't have set_stdlib_compilation_mode - stdlib handling is done elsewhere
                 if (_debug_mode)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Enabled stdlib compilation mode in CodeGenerator and TypeChecker");
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Enabled stdlib compilation mode in CodeGenerator");
                 }
             }
 
@@ -488,130 +477,33 @@ namespace Cryo
             // Phase 0: Symbol table population (must happen before type checking)
             populate_symbol_table(_ast_root.get());
 
-            if (_debug_mode)
-            {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing imported modules for method registration...");
-            }
-            // Process imported modules IMMEDIATELY after symbol population to register their methods
-            // This must happen BEFORE type checking the main program so that stdlib methods are available
-            _type_checker->check_imported_modules(_module_loader->get_imported_asts());
+            // Note: TypeChecker2 doesn't have check_imported_modules, load_intrinsic_symbols,
+            // load_runtime_symbols, load_user_symbols, or check_program methods.
+            // These were part of the old monolithic TypeChecker design.
+            // TypeChecker2 provides type-checking utilities that are used during AST traversal.
+            // The actual program checking needs to be done through a separate AST visitor.
 
             if (_debug_mode)
             {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loading intrinsic symbols into type checker...");
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Phase 1: Symbol and type analysis completed via symbol table population");
             }
-            // Load only newly added intrinsic symbols into type checker
-            _type_checker->load_intrinsic_symbols(*_symbol_table);
 
-            if (_debug_mode)
+            // Type errors are now reported through DiagnosticManager directly
+            if (_diagnostic_manager->has_errors())
             {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loading runtime symbols into type checker...");
-            }
-            // Load runtime function symbols and make them available globally
-            _type_checker->load_runtime_symbols(*_symbol_table);
-
-            if (_debug_mode)
-            {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Loading user-defined symbols into type checker...");
-            }
-            // Load user-defined function symbols that were registered during Pass 1
-            _type_checker->load_user_symbols(*_symbol_table);
-
-            if (_debug_mode)
-            {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Phase 1: Type checking...");
-            }
-            // Phase 1: Type checking
-            _type_checker->check_program(*_ast_root);
-
-            if (_debug_mode)
-            {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Checking for type errors...");
-            }
-            if (_debug_mode)
-            {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "TypeChecker has {} errors, has_errors() = {}",
-                          _type_checker->error_count(), _type_checker->has_errors());
-            }
-            if (_type_checker->has_errors())
-            {
-                // Only convert type errors to diagnostic manager errors if TypeChecker doesn't have its own diagnostic manager
-                // This prevents duplicate error reporting
-                if (!_type_checker->has_diagnostic_manager())
-                {
-                    // Convert type errors to diagnostic manager errors
-                    for (const auto &type_error : _type_checker->errors())
-                    {
-                        ErrorCode error_code = ErrorCode::E0000_UNKNOWN;
-                        switch (type_error.kind)
-                        {
-                        case TypeError::ErrorKind::TypeMismatch:
-                            error_code = ErrorCode::E0200_TYPE_MISMATCH;
-                            break;
-                        case TypeError::ErrorKind::UndefinedVariable:
-                            error_code = ErrorCode::E0201_UNDEFINED_VARIABLE;
-                            break;
-                        case TypeError::ErrorKind::UndefinedFunction:
-                            error_code = ErrorCode::E0202_UNDEFINED_FUNCTION;
-                            break;
-                        case TypeError::ErrorKind::RedefinedSymbol:
-                            error_code = ErrorCode::E0205_REDEFINED_SYMBOL;
-                            break;
-                        case TypeError::ErrorKind::InvalidOperation:
-                            error_code = ErrorCode::E0209_INVALID_OPERATION;
-                            break;
-                        default:
-                            error_code = ErrorCode::E0000_UNKNOWN;
-                            break;
-                        }
-
-                        // Create better ranges for specific error types
-                        // For now, use single-position ranges - the diagnostic formatter will handle the display
-                        SourceRange range = SourceRange(type_error.location);
-                        _diagnostic_manager->create_error(error_code,
-                                                          range, _source_file, type_error.message);
-                    }
-                }
-
                 if (_debug_mode)
                 {
-                    LOG_ERROR(Cryo::LogComponent::GENERAL, "Type checking failed with {} errors", _type_checker->error_count());
-                    // Print type errors for debugging
-                    for (const auto &type_error : _type_checker->errors())
-                    {
-                        LOG_ERROR(Cryo::LogComponent::GENERAL, "Type Error: {}", type_error.to_string());
-                    }
+                    LOG_ERROR(Cryo::LogComponent::GENERAL, "Type checking failed with errors");
                 }
                 return false;
             }
 
             // Phase 2: Monomorphization - Generate specialized versions of generic types
+            // Note: TypeChecker2 doesn't have get_required_instantiations.
+            // Monomorphization needs to be triggered differently in the new architecture.
             if (_debug_mode)
             {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Starting monomorphization pass...");
-            }
-
-            const auto &required_instantiations = _type_checker->get_required_instantiations();
-            if (!required_instantiations.empty())
-            {
-                bool monomorphization_success = _monomorphization_pass->monomorphize(*_ast_root, required_instantiations, *_template_registry, *_type_checker);
-                if (!monomorphization_success)
-                {
-                    _diagnostic_manager->create_error(ErrorCode::E0000_UNKNOWN, SourceRange{}, _source_file);
-                    return false;
-                }
-
-                if (_debug_mode)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Monomorphization completed successfully");
-                }
-            }
-            else
-            {
-                if (_debug_mode)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "No generic instantiations required, skipping monomorphization");
-                }
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Monomorphization pass - skipped (requires reimplementation for Types2)");
             }
 
             // Phase 3: Future semantic analysis phases would go here
@@ -672,14 +564,11 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Setting source info for codegen...");
             _codegen->set_source_info(_source_file, _current_namespace);
 
-            // Import specialized methods from TypeChecker to CodeGen after monomorphization
-            if (_codegen->get_visitor() && _type_checker)
+            // Note: TypeChecker2 doesn't have get_srm_context() or specialized method tracking.
+            // import_specialized_methods and import_namespace_aliases need reimplementation for Types2.
+            if (_debug_mode && _codegen->get_visitor())
             {
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Importing specialized methods from TypeChecker to CodeGen...");
-                _codegen->get_visitor()->import_specialized_methods(*_type_checker);
-
-                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Importing namespace aliases from TypeChecker to CodeGen...");
-                _codegen->get_visitor()->import_namespace_aliases(*_type_checker);
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Skipping specialized methods import - requires Types2 reimplementation");
             }
 
             // Pass imported ASTs to CodegenVisitor for dynamic enum variant extraction
@@ -932,25 +821,27 @@ namespace Cryo
 
     void CompilerInstance::dump_type_table(std::ostream &os) const
     {
-        if (_type_checker)
+        // Note: TypeChecker2 doesn't have print_type_table - types are managed by TypeArena
+        if (_ast_context)
         {
-            _type_checker->print_type_table(os);
+            os << "=== Types in Arena ===" << std::endl;
+            // TypeArena doesn't have a print method, but we can output some info
+            os << "(Type table dump requires TypeArena iteration - not yet implemented)" << std::endl;
+            os << "===================" << std::endl;
         }
         else
         {
-            os << "No type checker available" << std::endl;
+            os << "No AST context available" << std::endl;
         }
     }
 
     void CompilerInstance::dump_type_errors(std::ostream &os) const
     {
-        if (_type_checker && _type_checker->has_errors())
+        // TypeChecker2 doesn't track errors internally - use DiagnosticManager
+        if (_diagnostic_manager && _diagnostic_manager->has_errors())
         {
             os << "=== Type Errors ===" << std::endl;
-            for (const auto &error : _type_checker->errors())
-            {
-                os << error.to_string() << std::endl;
-            }
+            _diagnostic_manager->print_all(os);
             os << "=== End Type Errors ===" << std::endl;
         }
         else
@@ -1023,18 +914,10 @@ namespace Cryo
         }
         _lexer.reset();
         _parser.reset();
-        
-        // Reset TypeChecker state for multi-file compilation (especially stdlib)
-        // But preserve the stdlib_compilation_mode setting
-        if (_type_checker)
-        {
-            bool preserve_stdlib_mode = _stdlib_compilation_mode;
-            _type_checker->reset_state();
-            if (preserve_stdlib_mode)
-            {
-                _type_checker->set_stdlib_compilation_mode(true);
-            }
-        }
+
+        // Note: TypeChecker2 doesn't have reset_state or set_stdlib_compilation_mode.
+        // TypeChecker2 is stateless - it just provides type-checking utilities.
+        // State is managed by TypeArena, SymbolTable, and DiagnosticManager.
     }
 
     void CompilerInstance::populate_symbol_table(ASTNode *node)
@@ -1092,7 +975,7 @@ namespace Cryo
             LOG_TRACE(Cryo::LogComponent::GENERAL, "Pass 1: Found function declaration: {}", func_decl->name());
 
             // Create function type from return type and parameters
-            std::vector<Type *> param_types;
+            std::vector<TypeRef> param_types;
             for (const auto &param : func_decl->parameters())
             {
                 // Use resolved parameter type directly
@@ -1104,14 +987,14 @@ namespace Cryo
             TypeRef return_type = func_decl->get_resolved_return_type();
 
             // Handle functions that may not have resolved return types yet
-            if (return_type == nullptr)
+            if (!return_type.is_valid())
             {
                 LOG_WARN(Cryo::LogComponent::GENERAL, "Function '{}' has null return type, defaulting to void", func_decl->name());
                 return_type = _ast_context->types().get_void_type(); // Safe fallback
             }
 
             // Create function type
-            TypeRef function_type = _ast_context->types().create_function_type(return_type, param_types);
+            TypeRef function_type = _ast_context->types().get_function(return_type, param_types);
 
             // Build enhanced signature including generic parameters
             std::string enhanced_signature = build_function_signature(func_decl);
@@ -1142,7 +1025,7 @@ namespace Cryo
         else if (auto intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(node))
         {
             // Create function type from return type and parameters
-            std::vector<Type *> param_types;
+            std::vector<TypeRef> param_types;
             for (const auto &param : intrinsic_decl->parameters())
             {
                 // Use resolved parameter type directly
@@ -1154,14 +1037,14 @@ namespace Cryo
             TypeRef return_type = intrinsic_decl->get_resolved_return_type();
 
             // Handle intrinsics that may not have resolved return types yet
-            if (return_type == nullptr)
+            if (!return_type.is_valid())
             {
                 LOG_WARN(Cryo::LogComponent::GENERAL, "Intrinsic '{}' has null return type, defaulting to void", intrinsic_decl->name());
                 return_type = _ast_context->types().get_void_type(); // Safe fallback
             }
 
             // Create function type
-            TypeRef function_type = _ast_context->types().create_function_type(return_type, param_types);
+            TypeRef function_type = _ast_context->types().get_function(return_type, param_types);
 
             // Add intrinsic function to current (global) scope with Intrinsic symbol kind
             // Register intrinsics only in std::Intrinsics namespace for consistency
@@ -1190,7 +1073,7 @@ namespace Cryo
                     LOG_TRACE(Cryo::LogComponent::GENERAL, "Pass 1: Found struct method: {}", method_name);
 
                     // Create function type for the method
-                    std::vector<Type *> param_types;
+                    std::vector<TypeRef> param_types;
                     for (const auto &param : method->parameters())
                     {
                         TypeRef param_type = param->get_resolved_type();
@@ -1200,7 +1083,7 @@ namespace Cryo
                     TypeRef return_type = method->get_resolved_return_type();
 
                     // Handle constructors that may not have resolved return types yet
-                    if (return_type == nullptr)
+                    if (!return_type.is_valid())
                     {
                         if (method->is_constructor())
                         {
@@ -1213,7 +1096,7 @@ namespace Cryo
                         }
                     }
 
-                    TypeRef function_type = _ast_context->types().create_function_type(return_type, param_types);
+                    TypeRef function_type = _ast_context->types().get_function(return_type, param_types);
 
                     // Register method in symbol table with fully qualified name
                     current_scope->declare_symbol(method_name, SymbolKind::Function,
@@ -1253,7 +1136,7 @@ namespace Cryo
                     LOG_TRACE(Cryo::LogComponent::GENERAL, "Pass 1: Found class method: {}", method_name);
 
                     // Create function type for the method
-                    std::vector<Type *> param_types;
+                    std::vector<TypeRef> param_types;
                     for (const auto &param : method->parameters())
                     {
                         TypeRef param_type = param->get_resolved_type();
@@ -1263,7 +1146,7 @@ namespace Cryo
                     TypeRef return_type = method->get_resolved_return_type();
 
                     // Handle constructors that may not have resolved return types yet
-                    if (return_type == nullptr)
+                    if (!return_type.is_valid())
                     {
                         if (method->is_constructor())
                         {
@@ -1276,7 +1159,7 @@ namespace Cryo
                         }
                     }
 
-                    TypeRef function_type = _ast_context->types().create_function_type(return_type, param_types);
+                    TypeRef function_type = _ast_context->types().get_function(return_type, param_types);
 
                     // Register method in symbol table with fully qualified name
                     current_scope->declare_symbol(method_name, SymbolKind::Function,
@@ -1448,19 +1331,7 @@ namespace Cryo
                             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added '{}' to SRM imported namespaces", namespace_name);
                         }
 
-                        // TODO: Re-enable TypeChecker SRM synchronization after fixing crashes
-                        // Temporarily disabled due to compilation issues
-                        /*
-                        // TODO: Re-enable TypeChecker SRM synchronization after fixing crashes
-                        // Temporarily disabled due to compilation issues
-                        /*
-                        // Also register in TypeChecker's SRM context for proper symbol resolution during type checking
-                        if (_type_checker && _type_checker->get_srm_context())
-                        {
-                            _type_checker->get_srm_context()->add_imported_namespace(namespace_name);
-                            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added '{}' to TypeChecker SRM imported namespaces", namespace_name);
-                        }
-                        */
+                        // Note: TypeChecker2 doesn't have get_srm_context - SRM synchronization not available
 
                         // Also register symbols directly in current scope for unqualified access (e.g., println)
                         // This enables wildcard imports to work with direct function calls

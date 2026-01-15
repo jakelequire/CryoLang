@@ -2,6 +2,7 @@
 #include "AST/SymbolTable.hpp"
 #include "AST/Type.hpp"
 #include "AST/TypeChecker.hpp"
+#include "Types2/UserDefinedTypes.hpp"
 #include "Utils/Logger.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 
@@ -131,7 +132,7 @@ namespace Cryo::Codegen
 
         // SPECIAL HANDLING: Check if we have a symbol with direct type information
         // This handles cases where primitive methods have direct type info but aren't FunctionType
-        Cryo::Symbol *symbol = nullptr;
+        const Cryo::Symbol *symbol = nullptr;
         if (!resolved_namespace.empty())
         {
             symbol = _symbol_table.lookup_namespaced_symbol(resolved_namespace, function_name);
@@ -234,7 +235,7 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "classify_from_symbol_table: '{}' in namespace '{}'", function_name, resolved_namespace);
 
         // Try to find the function in the symbol table
-        Cryo::Symbol *symbol = nullptr;
+        const Cryo::Symbol *symbol = nullptr;
 
         if (!resolved_namespace.empty())
         {
@@ -300,7 +301,7 @@ namespace Cryo::Codegen
 
         // Use symbol table lookup to get actual function information instead of hardcoded patterns
         std::string qualified_name = generate_qualified_function_name(resolved_namespace, function_name);
-        auto symbol = _symbol_table.lookup_symbol(qualified_name);
+        const Cryo::Symbol *symbol = _symbol_table.lookup_symbol(qualified_name);
         if (!symbol)
         {
             // Try namespaced lookup
@@ -410,7 +411,7 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking enum constructor: {}::{}", enum_name, variant_name);
 
         // Try to find the enum in the symbol table via qualified name lookup
-        auto symbol = _symbol_table.lookup_symbol(enum_name);
+        const Cryo::Symbol *symbol = _symbol_table.lookup_symbol(enum_name);
         if (!symbol || symbol->kind != SymbolKind::Type)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No enum type found for: {}", enum_name);

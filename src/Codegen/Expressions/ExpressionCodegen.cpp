@@ -766,12 +766,12 @@ namespace Cryo::Codegen
             if (resolved_type && resolved_type->kind() == TypeKind::Array)
             {
                 auto *cryo_array_type = static_cast<const Cryo::ArrayType *>(resolved_type.get());
-                std::string element_type_name = cryo_array_type->element()->name();
+                std::string element_type_name = cryo_array_type->element()->display_name();
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Detected Array<{}> access for variable: {}", element_type_name, array_name);
 
                 // Get the element type from the Cryo array type
-                element_type = get_llvm_type(cryo_array_type->element().get());
+                element_type = get_llvm_type(cryo_array_type->element());
                 if (!element_type)
                 {
                     report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
@@ -1103,12 +1103,12 @@ namespace Cryo::Codegen
             {
                 // For pointer types (strings, etc.), try to get from resolved type
                 TypeRef cryo_array_type = node->array()->get_resolved_type();
-                if (cryo_array_type)
+                if (cryo_array_type.is_valid())
                 {
                     if (cryo_array_type->kind() == TypeKind::Array)
                     {
                         auto *arr = static_cast<const Cryo::ArrayType *>(cryo_array_type.get());
-                        element_type = get_llvm_type(arr->element().get());
+                        element_type = get_llvm_type(arr->element());
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Determined element type from resolved Cryo array type for non-stack array");
                     }
                     else if (cryo_array_type->kind() == TypeKind::String)
@@ -1118,7 +1118,7 @@ namespace Cryo::Codegen
                     else if (cryo_array_type->kind() == TypeKind::Pointer)
                     {
                         auto *ptr = static_cast<const Cryo::PointerType *>(cryo_array_type.get());
-                        element_type = get_llvm_type(ptr->pointee().get());
+                        element_type = get_llvm_type(ptr->pointee());
                     }
                 }
                 // Fallback to i8 for string-like access only if we still don't have an element type
@@ -1233,7 +1233,7 @@ namespace Cryo::Codegen
                 }
 
                 // Get the element type from the Cryo array type
-                element_type = get_llvm_type(cryo_array_type->element().get());
+                element_type = get_llvm_type(cryo_array_type->element());
                 if (!element_type)
                 {
                     report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
@@ -2061,7 +2061,7 @@ namespace Cryo::Codegen
                 if (resolved_type->kind() == TypeKind::Array)
                 {
                     auto *arr_type = static_cast<const Cryo::ArrayType *>(resolved_type.get());
-                    llvm::Type *cryo_elem_type = get_llvm_type(arr_type->element().get());
+                    llvm::Type *cryo_elem_type = get_llvm_type(arr_type->element());
                     if (cryo_elem_type)
                     {
                         elem_type = cryo_elem_type;
