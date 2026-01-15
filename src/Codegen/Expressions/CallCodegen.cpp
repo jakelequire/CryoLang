@@ -327,11 +327,12 @@ namespace Cryo::Codegen
                     type_args_str = type_args_str.substr(start, end - start + 1);
                 }
 
-                // Resolve the type argument - try struct/class types first
-                TypeRef arg_type = symbols().arena().lookup_struct_type(type_args_str);
-                if (!arg_type.is_valid())
+                // Resolve the type argument - try looking up in symbol table first
+                TypeRef arg_type{};
+                Symbol *type_sym = symbols().lookup_symbol(type_args_str);
+                if (type_sym && type_sym->kind == SymbolKind::Type && type_sym->type.is_valid())
                 {
-                    arg_type = symbols().arena().lookup_class_type(type_args_str);
+                    arg_type = type_sym->type;
                 }
                 if (!arg_type.is_valid())
                 {
@@ -1540,7 +1541,7 @@ namespace Cryo::Codegen
                     }
 
                     std::vector<llvm::Type *> param_types;
-                    for (const auto &param : func_type->parameter_types())
+                    for (const auto &param : func_type->param_types())
                     {
                         llvm::Type *pt = types().map(param);
                         if (!pt)
@@ -1552,7 +1553,7 @@ namespace Cryo::Codegen
                         param_types.push_back(pt);
                     }
 
-                    if (param_types.size() != func_type->parameter_types().size())
+                    if (param_types.size() != func_type->param_types().size())
                     {
                         continue; // Failed to map all parameter types
                     }
@@ -1830,14 +1831,16 @@ namespace Cryo::Codegen
 
     bool CallCodegen::is_enum_type(const std::string &name) const
     {
-        // First try direct lookup with the unqualified name
-        // Enums are registered with just their name (e.g., "Shape"), not namespace-qualified
-        TypeRef direct_lookup = const_cast<CallCodegen *>(this)->symbols().arena().lookup_enum_type(name);
-        if (direct_lookup.is_valid())
+        // First try direct lookup in symbol table with the unqualified name
+        Symbol *direct_sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(name);
+        if (direct_sym && direct_sym->kind == SymbolKind::Type && direct_sym->type.is_valid())
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "is_enum_type: Found '{}' as enum type via direct lookup", name);
-            return true;
+            if (direct_sym->type->kind() == TypeKind::Enum)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "is_enum_type: Found '{}' as enum type via direct lookup", name);
+                return true;
+            }
         }
 
         // Use SRM to generate type candidates and check if any is an enum type
@@ -1849,16 +1852,7 @@ namespace Cryo::Codegen
 
         for (const auto &candidate : candidates)
         {
-            // Try TypeArena's enum type lookup
-            TypeRef enum_type = const_cast<CallCodegen *>(this)->symbols().arena().lookup_enum_type(candidate);
-            if (enum_type.is_valid())
-            {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "is_enum_type: Found '{}' as enum type via TypeArena lookup '{}'", name, candidate);
-                return true;
-            }
-
-            // Also check symbol table for enum type
+            // Check symbol table for enum type
             Symbol *sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(candidate);
             if (sym && sym->kind == SymbolKind::Type && sym->type.is_valid())
             {

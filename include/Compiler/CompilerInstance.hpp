@@ -11,6 +11,8 @@
 #include "AST/TemplateRegistry.hpp"
 #include "AST/DirectiveSystem.hpp"
 #include "AST/DirectiveProcessors.hpp"
+#include "Types2/GenericRegistry.hpp"
+#include "Types2/TypeResolver.hpp"
 #include "GDM/GDM.hpp"
 #include "Codegen/CodeGenerator.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
@@ -47,10 +49,14 @@ namespace Cryo
         std::unique_ptr<Lexer> _lexer;
         std::unique_ptr<Parser> _parser;
         std::unique_ptr<ASTContext> _ast_context;
-        std::unique_ptr<SymbolTable> _symbol_table;
         std::unique_ptr<DiagnosticManager> _diagnostic_manager;
         std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _symbol_resolution_manager;
-        // TypeChecker must come AFTER ASTContext since it holds a reference to ast_context->types()
+        // Types2 components - GenericRegistry and TypeResolver must come before TypeChecker2
+        std::unique_ptr<GenericRegistry> _generic_registry;
+        std::unique_ptr<TypeResolver> _type_resolver;
+        // SymbolTable2 needs arena and modules from ASTContext
+        std::unique_ptr<SymbolTable> _symbol_table;
+        // TypeChecker2 needs arena, resolver, modules, generics
         std::unique_ptr<TypeChecker> _type_checker;
         std::unique_ptr<MonomorphizationPass> _monomorphization_pass;
         std::unique_ptr<TemplateRegistry> _template_registry;

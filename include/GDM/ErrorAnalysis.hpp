@@ -135,7 +135,7 @@ namespace Cryo
             const SourceSpan &error_span,
             const std::string &operation,
             TypeRef left_type,
-            TypeRef right_type = nullptr);
+            TypeRef right_type = TypeRef{});
 
         Diagnostic create_field_access_diagnostic(
             const SourceSpan &error_span,

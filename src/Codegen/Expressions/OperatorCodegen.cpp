@@ -2233,9 +2233,9 @@ namespace Cryo::Codegen
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Detected TypeKind::Array");
                     auto *arr_type = dynamic_cast<const Cryo::ArrayType *>(array_type.get());
-                    if (arr_type && arr_type->element())
+                    if (arr_type && arr_type->element().is_valid())
                     {
-                        element_type = get_llvm_type(arr_type->element().get());
+                        element_type = get_llvm_type(arr_type->element());
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Got element type from ArrayType");
                     }
                 }
@@ -2243,9 +2243,9 @@ namespace Cryo::Codegen
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Detected TypeKind::Pointer");
                     auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(array_type.get());
-                    if (ptr_type && ptr_type->pointee())
+                    if (ptr_type && ptr_type->pointee().is_valid())
                     {
-                        element_type = get_llvm_type(ptr_type->pointee().get());
+                        element_type = get_llvm_type(ptr_type->pointee());
                     }
                 }
                 else
