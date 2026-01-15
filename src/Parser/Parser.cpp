@@ -1196,7 +1196,7 @@ namespace Cryo
         return base_type;
     }
 
-    Type *Parser::parse_type_annotation()
+    TypeRef Parser::parse_type_annotation()
     {
 
         // Handle reference types (&type, &mut type) - keep existing logic
@@ -1212,7 +1212,7 @@ namespace Cryo
                 advance(); // consume 'mut'
             }
 
-            Type *base_type = parse_type_annotation(); // recursive call
+            TypeRef base_type = parse_type_annotation(); // recursive call
 
             // For now, create reference type (could be enhanced later for mut references)
             return _context.types().create_reference_type(base_type);
@@ -1455,7 +1455,7 @@ namespace Cryo
 
         // Parse required colon and type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after variable name");
-        Type *var_type = parse_type_annotation();
+        TypeRef var_type = parse_type_annotation();
 
         // Parse optional initializer
         std::unique_ptr<ExpressionNode> initializer = nullptr;
@@ -1526,7 +1526,7 @@ namespace Cryo
         }
 
         // Create function declaration early so we can add generic parameters
-        Type *void_type = resolve_type_from_string("void");
+        TypeRef void_type = resolve_type_from_string("void");
         auto func_decl = _builder.create_function_declaration(start_loc, func_name, void_type, is_public);
 
         // Attach documentation if available
@@ -1557,7 +1557,7 @@ namespace Cryo
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
         // Parse return type
-        Type *return_type = _context.types().get_void_type();
+        TypeRef return_type = _context.types().get_void_type();
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
@@ -1581,12 +1581,12 @@ namespace Cryo
         if (func_name == "_user_main_")
         {
             // Create argc: i32 parameter
-            Type *i32_type = _context.types().get_i32_type();
+            TypeRef i32_type = _context.types().get_i32_type();
             auto argc_param = _builder.create_variable_declaration(start_loc, "argc", i32_type);
             func_decl->add_parameter(std::move(argc_param));
 
             // Create argv: ptr parameter (pointer to string array)
-            Type *ptr_type = _context.types().create_pointer_type(_context.types().get_i8_type());
+            TypeRef ptr_type = _context.types().create_pointer_type(_context.types().get_i8_type());
             auto argv_param = _builder.create_variable_declaration(start_loc, "argv", ptr_type);
             func_decl->add_parameter(std::move(argv_param));
         }
@@ -1630,7 +1630,7 @@ namespace Cryo
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
         // Parse return type
-        Type *return_type = _context.types().get_void_type();
+        TypeRef return_type = _context.types().get_void_type();
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
@@ -1733,7 +1733,7 @@ namespace Cryo
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
         // Parse return type
-        Type *return_type = _context.types().get_void_type();
+        TypeRef return_type = _context.types().get_void_type();
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
@@ -1779,7 +1779,7 @@ namespace Cryo
 
         // Parse type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after intrinsic constant name");
-        Type *const_type = parse_type_annotation();
+        TypeRef const_type = parse_type_annotation();
 
         // Create intrinsic const declaration
         auto intrinsic_const = std::make_unique<IntrinsicConstDeclarationNode>(start_loc, const_name, const_type);
@@ -2633,7 +2633,7 @@ namespace Cryo
                                 auto namespace_parts = get_current_namespace_parts();
                                 // Convert string generic args to Type* for TypeIdentifier
                                 // Note: This is a simplification - in practice we'd need proper type resolution
-                                std::vector<Cryo::Type *> template_types; // Empty for now, proper resolution needed
+                                std::vector<TypeRef> template_types; // Empty for now, proper resolution needed
                                 auto type_id = std::make_unique<Cryo::SRM::TypeIdentifier>(
                                     namespace_parts, type_name, Cryo::TypeKind::Struct, template_types);
                                 generic_type_name = type_id->to_template_name();
@@ -3589,7 +3589,7 @@ namespace Cryo
 
         // Parse type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after parameter name");
-        Type *param_type = parse_type_annotation();
+        TypeRef param_type = parse_type_annotation();
 
         // Create parameter as variable declaration (without initializer)
         return _builder.create_variable_declaration(name_token.location(), param_name, param_type);
@@ -3659,11 +3659,11 @@ namespace Cryo
         advance(); // consume 'this'
 
         // For now, create a simple type - we'll enhance this later
-        Type *this_type = nullptr;
+        TypeRef this_type = nullptr;
         if (is_reference)
         {
             // Create a reference type to a placeholder type
-            Type *base_type = _context.types().get_auto_type(); // Use auto as placeholder
+            TypeRef base_type = _context.types().get_auto_type(); // Use auto as placeholder
             this_type = _context.types().create_reference_type(base_type);
         }
         else
@@ -3703,7 +3703,7 @@ namespace Cryo
 
         // For variadic parameters, we'll use a special type to indicate it's variadic
         // The actual type will be handled by the codegen later
-        Type *variadic_type = resolve_type_from_string("...");
+        TypeRef variadic_type = resolve_type_from_string("...");
         return _builder.create_variable_declaration(name_token.location(), param_name, variadic_type);
     }
 
@@ -4454,7 +4454,7 @@ namespace Cryo
                     consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
                     // Parse return type
-                    Type *return_type = _context.types().get_void_type(); // Default to void
+                    TypeRef return_type = _context.types().get_void_type(); // Default to void
                     if (_current_token.is(TokenKind::TK_ARROW))
                     {
                         advance(); // consume '->'
@@ -4833,7 +4833,7 @@ namespace Cryo
                     consume(TokenKind::TK_SEMICOLON, "Expected ';' after field implementation");
 
                     // Create a field node with the default value
-                    Type *auto_type = resolve_type_from_string("auto"); // Type will be inferred
+                    TypeRef auto_type = resolve_type_from_string("auto"); // Type will be inferred
                     auto field = _builder.create_struct_field(field_token.location(),
                                                               std::string(field_token.text()),
                                                               auto_type,
@@ -4995,7 +4995,7 @@ namespace Cryo
 
         consume(TokenKind::TK_COLON, "Expected ':' after field name");
 
-        Type *field_type = parse_type_annotation();
+        TypeRef field_type = parse_type_annotation();
 
         auto field = _builder.create_struct_field(start_loc, field_name, field_type, visibility);
 
@@ -5132,7 +5132,7 @@ namespace Cryo
         }
 
         // Parse return type (optional for constructors)
-        Type *return_type = _context.types().get_void_type(); // Default to void
+        TypeRef return_type = _context.types().get_void_type(); // Default to void
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
@@ -5144,7 +5144,7 @@ namespace Cryo
             // Use the struct name passed to this method
             if (!struct_name.empty())
             {
-                Type *struct_type = _context.types().get_struct_type(struct_name);
+                TypeRef struct_type = _context.types().get_struct_type(struct_name);
                 if (struct_type)
                 {
                     return_type = _context.types().create_pointer_type(struct_type);
@@ -5659,7 +5659,7 @@ namespace Cryo
         }
     }
 
-    Type *Parser::parse_type_annotation_with_tokens()
+    TypeRef Parser::parse_type_annotation_with_tokens()
     {
         // Create a string stream to build type tokens
         std::string type_string = "";
@@ -5782,7 +5782,7 @@ namespace Cryo
 
         // Use the token-based parsing system
         size_t index = 0;
-        Type *parsed_type = _context.types().parse_type_from_token_stream(collected_tokens, index);
+        TypeRef parsed_type = _context.types().parse_type_from_token_stream(collected_tokens, index);
 
         if (!parsed_type)
         {
@@ -5801,7 +5801,7 @@ namespace Cryo
         return parsed_type ? parsed_type : _context.types().get_unknown_type();
     }
 
-    Type *Parser::resolve_type_from_string(const std::string &type_str)
+    TypeRef Parser::resolve_type_from_string(const std::string &type_str)
     {
         // Handle basic built-in types first
         if (type_str == "void")
@@ -5851,7 +5851,7 @@ namespace Cryo
         {
             LOG_DEBUG(LogComponent::PARSER, "Parser detected generic type syntax: '{}'", type_str);
             // Use TypeRegistry's parse_and_instantiate for proper generic type resolution
-            ParameterizedType *generic_type = _context.types().get_type_registry()->parse_and_instantiate(type_str);
+            ParameterizedTypeRef generic_type = _context.types().get_type_registry()->parse_and_instantiate(type_str);
             if (generic_type && generic_type->kind() != TypeKind::Unknown)
             {
                 LOG_DEBUG(LogComponent::PARSER, "Successfully resolved generic type '{}' via TypeRegistry", type_str);
@@ -5873,28 +5873,28 @@ namespace Cryo
         }
 
         // Try to resolve as a struct/class type
-        Type *struct_type = _context.types().lookup_struct_type(type_str);
+        TypeRef struct_type = _context.types().lookup_struct_type(type_str);
         if (struct_type && struct_type->kind() != TypeKind::Unknown)
         {
             return struct_type;
         }
 
         // Try to resolve as a class type (lookup only, don't create)
-        Type *class_type = _context.types().lookup_class_type(type_str);
+        TypeRef class_type = _context.types().lookup_class_type(type_str);
         if (class_type && class_type->kind() != TypeKind::Unknown)
         {
             return class_type;
         }
 
         // Try to resolve as an enum type (lookup only, don't create)
-        Type *enum_type = _context.types().lookup_enum_type(type_str);
+        TypeRef enum_type = _context.types().lookup_enum_type(type_str);
         if (enum_type && enum_type->kind() != TypeKind::Unknown)
         {
             return enum_type;
         }
 
         // Could be a generic parameter
-        Type *generic_type = _context.types().get_generic_type(type_str);
+        TypeRef generic_type = _context.types().get_generic_type(type_str);
         if (generic_type)
         {
             return generic_type;

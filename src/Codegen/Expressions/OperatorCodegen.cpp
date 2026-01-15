@@ -78,7 +78,7 @@ namespace Cryo::Codegen
         if (op == TokenKind::TK_PLUS)
         {
             // Check semantic types from AST to determine if operands are strings
-            auto is_string_type = [](Cryo::Type *type) -> bool
+            auto is_string_type = [](TypeRef type) -> bool
             {
                 if (!type)
                     return false;
@@ -88,7 +88,7 @@ namespace Cryo::Codegen
                 // Check for pointer to char (C-style string)
                 if (type->kind() == Cryo::TypeKind::Pointer)
                 {
-                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(type);
+                    auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(type.get());
                     if (ptr_type && ptr_type->pointee_type())
                     {
                         return ptr_type->pointee_type()->kind() == Cryo::TypeKind::Char;
@@ -97,15 +97,15 @@ namespace Cryo::Codegen
                 return false;
             };
 
-            auto is_char_type = [](Cryo::Type *type) -> bool
+            auto is_char_type = [](TypeRef type) -> bool
             {
                 if (!type)
                     return false;
                 return type->kind() == Cryo::TypeKind::Char;
             };
 
-            Cryo::Type *lhs_type = node->left()->get_resolved_type();
-            Cryo::Type *rhs_type = node->right()->get_resolved_type();
+            TypeRef lhs_type = node->left()->get_resolved_type();
+            TypeRef rhs_type = node->right()->get_resolved_type();
 
             bool lhs_is_string = is_string_type(lhs_type);
             bool rhs_is_string = is_string_type(rhs_type);
@@ -842,12 +842,12 @@ namespace Cryo::Codegen
             if (!callee_name.empty())
             {
                 // Get the pointed-to type from the AST
-                Cryo::Type *target_resolved_type = target->operand()->get_resolved_type();
+                TypeRef target_resolved_type = target->operand()->get_resolved_type();
                 llvm::Type *pointee_type = nullptr;
 
                 if (target_resolved_type && target_resolved_type->kind() == Cryo::TypeKind::Pointer)
                 {
-                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(target_resolved_type);
+                    auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(target_resolved_type.get());
                     if (ptr_type && ptr_type->pointee_type())
                     {
                         // Try to resolve the pointee type to LLVM type
@@ -931,7 +931,7 @@ namespace Cryo::Codegen
         {
             // The value might be a pointer to a struct (e.g., from a previous constructor)
             // Check if we should do a memcpy
-            Cryo::Type *value_resolved_type = value_node->get_resolved_type();
+            TypeRef value_resolved_type = value_node->get_resolved_type();
             if (value_resolved_type &&
                 (value_resolved_type->kind() == Cryo::TypeKind::Struct ||
                  value_resolved_type->kind() == Cryo::TypeKind::Class))
@@ -1067,7 +1067,7 @@ namespace Cryo::Codegen
     llvm::Value *OperatorCodegen::generate_arithmetic(TokenKind op,
                                                       llvm::Value *lhs,
                                                       llvm::Value *rhs,
-                                                      Cryo::Type *result_type)
+                                                      TypeRef result_type)
     {
         if (!lhs || !rhs)
             return nullptr;
@@ -1082,7 +1082,7 @@ namespace Cryo::Codegen
             llvm::Type *element_type = nullptr;
             if (result_type && result_type->kind() == Cryo::TypeKind::Pointer)
             {
-                auto *ptr_type = dynamic_cast<Cryo::PointerType *>(result_type);
+                auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(result_type.get());
                 if (ptr_type && ptr_type->pointee_type())
                 {
                     element_type = resolve_type_by_name(ptr_type->pointee_type()->to_string());
@@ -1246,7 +1246,7 @@ namespace Cryo::Codegen
     llvm::Value *OperatorCodegen::generate_comparison(TokenKind op,
                                                       llvm::Value *lhs,
                                                       llvm::Value *rhs,
-                                                      Cryo::Type *operand_type)
+                                                      TypeRef operand_type)
     {
         if (!lhs || !rhs)
             return nullptr;
@@ -1774,7 +1774,7 @@ namespace Cryo::Codegen
     // Unary Operations
     //===================================================================
 
-    llvm::Value *OperatorCodegen::generate_negation(llvm::Value *operand, Cryo::Type *type)
+    llvm::Value *OperatorCodegen::generate_negation(llvm::Value *operand, TypeRef type)
     {
         if (!operand)
             return nullptr;
@@ -1845,7 +1845,7 @@ namespace Cryo::Codegen
         return addr;
     }
 
-    llvm::Value *OperatorCodegen::generate_dereference(llvm::Value *ptr, Cryo::Type *pointee_type)
+    llvm::Value *OperatorCodegen::generate_dereference(llvm::Value *ptr, TypeRef pointee_type)
     {
         if (!ptr)
             return nullptr;
@@ -2062,7 +2062,7 @@ namespace Cryo::Codegen
             unsigned field_idx = 0;
 
             // Get the resolved type of the object expression
-            Cryo::Type *obj_type = member->object()->get_resolved_type();
+            TypeRef obj_type = member->object()->get_resolved_type();
             std::string type_name;
 
             if (obj_type)
@@ -2071,7 +2071,7 @@ namespace Cryo::Codegen
                 // Handle pointer types - get the pointee type name
                 if (obj_type->kind() == Cryo::TypeKind::Pointer)
                 {
-                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(obj_type);
+                    auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
                     if (ptr_type && ptr_type->pointee_type())
                     {
                         type_name = ptr_type->pointee_type()->to_string();
@@ -2183,7 +2183,7 @@ namespace Cryo::Codegen
 
             // Determine element type
             llvm::Type *element_type = nullptr;
-            Cryo::Type *array_type = array_access->array()->get_resolved_type();
+            TypeRef array_type = array_access->array()->get_resolved_type();
 
             // If no resolved type, check variable_types_map (like in ExpressionCodegen)
             if (!array_type)
@@ -2232,7 +2232,7 @@ namespace Cryo::Codegen
                 if (array_type->kind() == Cryo::TypeKind::Array)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Detected TypeKind::Array");
-                    auto *arr_type = dynamic_cast<Cryo::ArrayType *>(array_type);
+                    auto *arr_type = dynamic_cast<const Cryo::ArrayType *>(array_type.get());
                     if (arr_type && arr_type->element_type())
                     {
                         element_type = get_llvm_type(arr_type->element_type().get());
@@ -2242,7 +2242,7 @@ namespace Cryo::Codegen
                 else if (array_type->kind() == Cryo::TypeKind::Pointer)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Detected TypeKind::Pointer");
-                    auto *ptr_type = dynamic_cast<Cryo::PointerType *>(array_type);
+                    auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(array_type.get());
                     if (ptr_type && ptr_type->pointee_type())
                     {
                         element_type = get_llvm_type(ptr_type->pointee_type().get());
@@ -2331,7 +2331,7 @@ namespace Cryo::Codegen
         return false;
     }
 
-    bool OperatorCodegen::is_signed_integer_type(Cryo::Type *type)
+    bool OperatorCodegen::is_signed_integer_type(TypeRef type)
     {
         if (!type)
             return true; // Default to signed
@@ -2341,7 +2341,7 @@ namespace Cryo::Codegen
         return type_str.find('u') != 0; // Not starting with 'u' means signed
     }
 
-    bool OperatorCodegen::is_float_type(Cryo::Type *type)
+    bool OperatorCodegen::is_float_type(TypeRef type)
     {
         if (!type)
             return false;
@@ -2350,7 +2350,7 @@ namespace Cryo::Codegen
         return kind == TypeKind::Float;
     }
 
-    bool OperatorCodegen::is_string_type(Cryo::Type *type)
+    bool OperatorCodegen::is_string_type(TypeRef type)
     {
         if (!type)
             return false;

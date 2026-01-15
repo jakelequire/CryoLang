@@ -103,7 +103,7 @@ namespace Cryo::Codegen
         GenericCodegen *generics_ptr = _generics.get();
         _ctx->types().set_generic_instantiator(
             [generics_ptr](const std::string &generic_name,
-                           const std::vector<Cryo::Type *> &type_args) -> llvm::StructType *
+                           const std::vector<TypeRef> &type_args) -> llvm::StructType *
             {
                 llvm::Type *type = generics_ptr->get_instantiated_type(generic_name, type_args);
                 return llvm::dyn_cast_or_null<llvm::StructType>(type);

@@ -76,7 +76,7 @@ namespace Cryo::Codegen
          * @param type Target type (determines bit width)
          * @return Constant integer value
          */
-        llvm::Value *generate_integer_literal(int64_t value, Cryo::Type *type = nullptr);
+        llvm::Value *generate_integer_literal(int64_t value, TypeRef type = nullptr);
 
         /**
          * @brief Generate unsigned integer literal (for large unsigned values like U64_MAX)
@@ -84,7 +84,7 @@ namespace Cryo::Codegen
          * @param type Target type (determines bit width)
          * @return Constant unsigned integer value
          */
-        llvm::Value *generate_unsigned_integer_literal(uint64_t value, Cryo::Type *type = nullptr);
+        llvm::Value *generate_unsigned_integer_literal(uint64_t value, TypeRef type = nullptr);
 
         /**
          * @brief Generate floating-point literal
@@ -120,7 +120,7 @@ namespace Cryo::Codegen
          * @param type Optional type for typed null
          * @return Null pointer constant
          */
-        llvm::Value *generate_null_literal(Cryo::Type *type = nullptr);
+        llvm::Value *generate_null_literal(TypeRef type = nullptr);
 
         /**
          * @brief Generate literal from AST node
@@ -261,7 +261,7 @@ namespace Cryo::Codegen
          * @param target_type Target Cryo type
          * @return Cast value
          */
-        llvm::Value *generate_cast(llvm::Value *value, Cryo::Type *target_type);
+        llvm::Value *generate_cast(llvm::Value *value, TypeRef target_type);
 
         //===================================================================
         // Sizeof/Alignof
@@ -280,14 +280,14 @@ namespace Cryo::Codegen
          * @param type Cryo type
          * @return Size in bytes as i64
          */
-        llvm::Value *generate_sizeof(Cryo::Type *type);
+        llvm::Value *generate_sizeof(TypeRef type);
 
         /**
          * @brief Generate alignof expression
          * @param type Cryo type
          * @return Alignment in bytes as i64
          */
-        llvm::Value *generate_alignof(Cryo::Type *type);
+        llvm::Value *generate_alignof(TypeRef type);
 
         //===================================================================
         // Address-of and Dereference
@@ -306,7 +306,7 @@ namespace Cryo::Codegen
          * @param pointee_type Type of pointed-to value
          * @return Dereferenced value
          */
-        llvm::Value *generate_dereference(llvm::Value *operand, Cryo::Type *pointee_type);
+        llvm::Value *generate_dereference(llvm::Value *operand, TypeRef pointee_type);
 
         //===================================================================
         // Ternary Expression

@@ -334,6 +334,20 @@ namespace Cryo
         TypeRef create_error(const std::string &reason,
                              SourceLocation location,
                              std::vector<std::string> notes);
+
+        // ====================================================================
+        // Interning (for backward compatibility with raw Type*)
+        // ====================================================================
+
+        /**
+         * @brief Intern a raw Type* into a TypeRef
+         *
+         * If the type is already in the arena (same pointer), returns existing TypeRef.
+         * Otherwise, this is a compatibility method that searches for an equivalent type.
+         *
+         * WARNING: This is primarily for migration. New code should use TypeRef directly.
+         */
+        TypeRef intern(const Type *type);
     };
 
     // ========================================================================

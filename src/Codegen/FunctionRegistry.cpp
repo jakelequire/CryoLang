@@ -253,7 +253,7 @@ namespace Cryo::Codegen
         if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->data_type)
         {
             // We found a function symbol with type information
-            FunctionType *func_type = dynamic_cast<FunctionType *>(symbol->data_type);
+            const FunctionType *func_type = dynamic_cast<const FunctionType *>(symbol->data_type.get());
             if (func_type)
             {
                 // Classify based on the return type
@@ -310,7 +310,7 @@ namespace Cryo::Codegen
         if (symbol && symbol->data_type)
         {
             // Classify function based on actual return type from symbol table
-            auto *function_type = dynamic_cast<const FunctionType *>(symbol->data_type);
+            auto *function_type = dynamic_cast<const FunctionType *>(symbol->data_type.get());
             if (function_type && function_type->return_type())
             {
                 auto return_type_kind = function_type->return_type()->kind();
@@ -410,14 +410,14 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking enum constructor: {}::{}", enum_name, variant_name);
 
         // Look up the enum type in the type context
-        Cryo::Type *enum_type = _type_context.lookup_enum_type(enum_name);
+        TypeRef enum_type = _type_context.lookup_enum_type(enum_name);
         if (!enum_type)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No enum type found for: {}", enum_name);
             return metadata; // Not an enum
         }
 
-        Cryo::EnumType *cryo_enum_type = dynamic_cast<Cryo::EnumType *>(enum_type);
+        const Cryo::EnumType *cryo_enum_type = dynamic_cast<const Cryo::EnumType *>(enum_type.get());
         if (!cryo_enum_type)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type is not an enum: {}", enum_name);
@@ -449,7 +449,7 @@ namespace Cryo::Codegen
         return metadata;
     }
 
-    FunctionCategory FunctionRegistry::get_category_from_cryo_type(const Cryo::Type *cryo_type) const
+    FunctionCategory FunctionRegistry::get_category_from_cryo_type(const TypeRef cryo_type) const
     {
         if (!cryo_type)
         {
@@ -458,7 +458,7 @@ namespace Cryo::Codegen
         }
 
         // Check for pointer types first, before string name comparison
-        if (dynamic_cast<const PointerType *>(cryo_type) != nullptr)
+        if (dynamic_cast<const PointerType *>(cryo_type.get()) != nullptr)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_category_from_cryo_type: Detected PointerType '{}'", cryo_type->name());
             return FunctionCategory::PointerFunction;

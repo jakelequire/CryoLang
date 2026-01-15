@@ -307,11 +307,11 @@ namespace Cryo
     // Structured type mismatch context - eliminates need for string parsing
     struct BasicTypeMismatchContext
     {
-        const Type *expected_type;
-        const Type *actual_type;
+        TypeRef expected_type;
+        TypeRef actual_type;
         std::string context_description; // "variable initialization", "assignment", etc.
 
-        BasicTypeMismatchContext(const Type *expected, const Type *actual, const std::string &context = "")
+        BasicTypeMismatchContext(TypeRef expected, TypeRef actual, const std::string &context = "")
             : expected_type(expected), actual_type(actual), context_description(context) {}
 
         // Generate the "expected X, found Y" label dynamically

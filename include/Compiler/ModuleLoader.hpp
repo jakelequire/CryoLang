@@ -178,7 +178,7 @@ namespace Cryo
          * @param type_context TypeContext for creating type objects
          * @return FunctionType object or nullptr if creation fails
          */
-        Type *create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeContext *type_context);
+        TypeRef create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeContext *type_context);
 
         /**
          * @brief Create a FunctionType from an IntrinsicDeclarationNode
@@ -186,7 +186,7 @@ namespace Cryo
          * @param type_context TypeContext for creating type objects
          * @return FunctionType object or nullptr if creation fails
          */
-        Type *create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeContext *type_context);
+        TypeRef create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeContext *type_context);
 
         /**
          * @brief Resolve a primitive type annotation string to a Type object
@@ -194,7 +194,7 @@ namespace Cryo
          * @param types TypeContext for getting primitive types
          * @return Type object or nullptr if not a primitive type
          */
-        Type *resolve_primitive_type(const std::string &type_str, TypeContext &types);
+        TypeRef resolve_primitive_type(const std::string &type_str, TypeContext &types);
 
         /**
          * @brief Filter import result to only include specific symbols

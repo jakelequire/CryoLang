@@ -62,7 +62,7 @@ namespace Cryo::Codegen
          * @return Instantiated struct type
          */
         llvm::StructType *instantiate_struct(const std::string &generic_name,
-                                              const std::vector<Cryo::Type *> &type_args);
+                                              const std::vector<TypeRef> &type_args);
 
         /**
          * @brief Instantiate a generic class type
@@ -71,7 +71,7 @@ namespace Cryo::Codegen
          * @return Instantiated class type (as struct)
          */
         llvm::StructType *instantiate_class(const std::string &generic_name,
-                                             const std::vector<Cryo::Type *> &type_args);
+                                             const std::vector<TypeRef> &type_args);
 
         /**
          * @brief Get or create instantiated type
@@ -80,7 +80,7 @@ namespace Cryo::Codegen
          * @return Instantiated LLVM type
          */
         llvm::Type *get_instantiated_type(const std::string &generic_name,
-                                           const std::vector<Cryo::Type *> &type_args);
+                                           const std::vector<TypeRef> &type_args);
 
         //===================================================================
         // Generic Function Instantiation
@@ -93,7 +93,7 @@ namespace Cryo::Codegen
          * @return Instantiated function
          */
         llvm::Function *instantiate_function(const std::string &generic_name,
-                                              const std::vector<Cryo::Type *> &type_args);
+                                              const std::vector<TypeRef> &type_args);
 
         /**
          * @brief Instantiate a generic method
@@ -104,7 +104,7 @@ namespace Cryo::Codegen
          */
         llvm::Function *instantiate_method(const std::string &type_name,
                                             const std::string &method_name,
-                                            const std::vector<Cryo::Type *> &type_args);
+                                            const std::vector<TypeRef> &type_args);
 
         //===================================================================
         // Type Parameter Handling
@@ -116,7 +116,7 @@ namespace Cryo::Codegen
          * @param args Corresponding type arguments
          */
         void begin_type_params(const std::vector<std::string> &params,
-                                const std::vector<Cryo::Type *> &args);
+                                const std::vector<TypeRef> &args);
 
         /**
          * @brief End type parameter scope
@@ -128,14 +128,14 @@ namespace Cryo::Codegen
          * @param param_name Type parameter name (e.g., "T")
          * @return Resolved type, or nullptr if not in scope
          */
-        Cryo::Type *resolve_type_param(const std::string &param_name);
+        TypeRef resolve_type_param(const std::string &param_name);
 
         /**
          * @brief Substitute type parameters in a type
          * @param type Type potentially containing type parameters
          * @return Type with parameters substituted
          */
-        Cryo::Type *substitute_type_params(Cryo::Type *type);
+        TypeRef substitute_type_params(TypeRef type);
 
         //===================================================================
         // Name Mangling
@@ -148,7 +148,7 @@ namespace Cryo::Codegen
          * @return Mangled name (e.g., "Array_i32")
          */
         std::string mangle_type_name(const std::string &generic_name,
-                                      const std::vector<Cryo::Type *> &type_args);
+                                      const std::vector<TypeRef> &type_args);
 
         /**
          * @brief Generate mangled name for instantiated function
@@ -157,7 +157,7 @@ namespace Cryo::Codegen
          * @return Mangled name
          */
         std::string mangle_function_name(const std::string &generic_name,
-                                          const std::vector<Cryo::Type *> &type_args);
+                                          const std::vector<TypeRef> &type_args);
 
         //===================================================================
         // Instantiation Cache
@@ -240,7 +240,7 @@ namespace Cryo::Codegen
 
         struct TypeParamScope
         {
-            std::unordered_map<std::string, Cryo::Type *> bindings;
+            std::unordered_map<std::string, TypeRef> bindings;
         };
         std::vector<TypeParamScope> _type_param_stack;
 

@@ -20,7 +20,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::StructType *GenericCodegen::instantiate_struct(const std::string &generic_name,
-                                                           const std::vector<Cryo::Type *> &type_args)
+                                                           const std::vector<TypeRef> &type_args)
     {
         // Check if any type arguments are uninstantiated type parameters
         // This happens when compiling generic templates where K, V, T etc. aren't yet concrete
@@ -275,7 +275,7 @@ namespace Cryo::Codegen
     }
 
     llvm::StructType *GenericCodegen::instantiate_class(const std::string &generic_name,
-                                                          const std::vector<Cryo::Type *> &type_args)
+                                                          const std::vector<TypeRef> &type_args)
     {
         // Classes are represented as structs in LLVM
         // Similar to struct instantiation but may include vtable pointer
@@ -524,7 +524,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Type *GenericCodegen::get_instantiated_type(const std::string &generic_name,
-                                                        const std::vector<Cryo::Type *> &type_args)
+                                                        const std::vector<TypeRef> &type_args)
     {
         std::string mangled = mangle_type_name(generic_name, type_args);
 
@@ -558,7 +558,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::Function *GenericCodegen::instantiate_function(const std::string &generic_name,
-                                                           const std::vector<Cryo::Type *> &type_args)
+                                                           const std::vector<TypeRef> &type_args)
     {
         // Check if any type arguments are uninstantiated type parameters
         for (const auto &arg : type_args)
@@ -668,7 +668,7 @@ namespace Cryo::Codegen
 
     llvm::Function *GenericCodegen::instantiate_method(const std::string &type_name,
                                                          const std::string &method_name,
-                                                         const std::vector<Cryo::Type *> &type_args)
+                                                         const std::vector<TypeRef> &type_args)
     {
         std::string qualified = type_name + "::" + method_name;
         return instantiate_function(qualified, type_args);
@@ -679,7 +679,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     void GenericCodegen::begin_type_params(const std::vector<std::string> &params,
-                                             const std::vector<Cryo::Type *> &args)
+                                             const std::vector<TypeRef> &args)
     {
         TypeParamScope scope;
 
@@ -694,7 +694,7 @@ namespace Cryo::Codegen
         _type_param_stack.push_back(std::move(scope));
 
         // Set the type parameter resolver on TypeMapper so type lookups can resolve T, E, etc.
-        types().set_type_param_resolver([this](const std::string &name) -> Cryo::Type * {
+        types().set_type_param_resolver([this](const std::string &name) -> TypeRef {
             return this->resolve_type_param(name);
         });
     }
@@ -713,7 +713,7 @@ namespace Cryo::Codegen
         }
     }
 
-    Cryo::Type *GenericCodegen::resolve_type_param(const std::string &param_name)
+    TypeRef GenericCodegen::resolve_type_param(const std::string &param_name)
     {
         // Search from innermost to outermost scope
         for (auto it = _type_param_stack.rbegin(); it != _type_param_stack.rend(); ++it)
@@ -727,14 +727,14 @@ namespace Cryo::Codegen
         return nullptr;
     }
 
-    Cryo::Type *GenericCodegen::substitute_type_params(Cryo::Type *type)
+    TypeRef GenericCodegen::substitute_type_params(TypeRef type)
     {
         if (!type)
             return nullptr;
 
         // If type is a type parameter, resolve it
         std::string type_name = type->to_string();
-        if (Cryo::Type *resolved = resolve_type_param(type_name))
+        if (TypeRef resolved = resolve_type_param(type_name))
         {
             return resolved;
         }
@@ -750,7 +750,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     std::string GenericCodegen::mangle_type_name(const std::string &generic_name,
-                                                   const std::vector<Cryo::Type *> &type_args)
+                                                   const std::vector<TypeRef> &type_args)
     {
         if (type_args.empty())
         {
@@ -781,7 +781,7 @@ namespace Cryo::Codegen
     }
 
     std::string GenericCodegen::mangle_function_name(const std::string &generic_name,
-                                                       const std::vector<Cryo::Type *> &type_args)
+                                                       const std::vector<TypeRef> &type_args)
     {
         // Same mangling scheme as types
         return mangle_type_name(generic_name, type_args);
@@ -861,8 +861,8 @@ namespace Cryo::Codegen
             if (!field)
                 continue;
 
-            Cryo::Type *field_type = field->get_resolved_type();
-            Cryo::Type *substituted = substitute_type_params(field_type);
+            TypeRef field_type = field->get_resolved_type();
+            TypeRef substituted = substitute_type_params(field_type);
 
             llvm::Type *llvm_type = get_llvm_type(substituted);
             if (llvm_type)
@@ -881,7 +881,7 @@ namespace Cryo::Codegen
             return nullptr;
 
         // Substitute return type
-        Cryo::Type *ret_type = substitute_type_params(node->get_resolved_return_type());
+        TypeRef ret_type = substitute_type_params(node->get_resolved_return_type());
         llvm::Type *llvm_ret = get_llvm_type(ret_type);
         if (!llvm_ret)
         {
@@ -897,7 +897,7 @@ namespace Cryo::Codegen
         {
             for (const auto &param : node->parameters())
             {
-                Cryo::Type *param_type = substitute_type_params(param->get_resolved_type());
+                TypeRef param_type = substitute_type_params(param->get_resolved_type());
                 llvm::Type *llvm_param = get_llvm_type(param_type);
                 if (llvm_param)
                 {

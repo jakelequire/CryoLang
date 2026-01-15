@@ -78,7 +78,7 @@ namespace Cryo::Codegen
          * @param cryo_type Cryo type
          * @return Corresponding LLVM type
          */
-        llvm::Type *resolve_type(Cryo::Type *cryo_type);
+        llvm::Type *resolve_type(TypeRef cryo_type);
 
         /**
          * @brief Get LLVM type by name
@@ -94,7 +94,7 @@ namespace Cryo::Codegen
          * @return Instantiated type
          */
         llvm::Type *resolve_generic_type(const std::string &base_type,
-                                          const std::vector<Cryo::Type *> &type_args);
+                                          const std::vector<TypeRef> &type_args);
 
         //===================================================================
         // Type Casting
@@ -299,7 +299,7 @@ namespace Cryo::Codegen
          * @param cryo_type Original Cryo type
          * @return true if signed
          */
-        bool is_signed_integer(Cryo::Type *cryo_type) const;
+        bool is_signed_integer(TypeRef cryo_type) const;
 
         // Cache for generic instantiations
         std::unordered_map<std::string, llvm::Type *> _generic_cache;

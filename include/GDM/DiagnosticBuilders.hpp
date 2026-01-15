@@ -36,7 +36,7 @@ namespace Cryo
         // Helper methods for common diagnostic patterns
         SourceSpan create_node_span(ASTNode *node) const;
         SourceSpan create_token_span(const Token &token) const;
-        SourceSpan create_type_span(Type *type, SourceLocation location) const;
+        SourceSpan create_type_span(TypeRef type, SourceLocation location) const;
 
         // Add contextual help based on error patterns
         void add_common_help(Diagnostic &diagnostic, ErrorCode code) const;
@@ -87,7 +87,7 @@ namespace Cryo
         Diagnostic &report_error(ErrorCode error_code, const std::string &message, 
                                 ASTNode *node = nullptr);
 
-        Diagnostic &create_type_mapping_error(Type *cryo_type, ASTNode *node,
+        Diagnostic &create_type_mapping_error(TypeRef cryo_type, ASTNode *node,
                                               const std::string &reason = "");
 
         Diagnostic &create_value_generation_error(const std::string &value_type, ASTNode *node,
@@ -220,11 +220,11 @@ namespace Cryo
             : BaseDiagnosticBuilder(manager, source_file) {}
 
         // Enhanced type mismatch errors with better context
-        Diagnostic &create_assignment_type_error(Type *expected, Type *actual,
+        Diagnostic &create_assignment_type_error(TypeRef expected, TypeRef actual,
                                                  SourceLocation location, ASTNode *node = nullptr);
 
         Diagnostic &create_operation_type_error(const std::string &operation,
-                                                Type *left_type, Type *right_type,
+                                                TypeRef left_type, TypeRef right_type,
                                                 SourceLocation location);
 
         Diagnostic &create_function_call_error(const std::string &function_name,
@@ -252,14 +252,14 @@ namespace Cryo
 
         // Access and dereference errors
         Diagnostic &create_invalid_member_access_error(const std::string &member_name,
-                                                       Type *object_type,
+                                                       TypeRef object_type,
                                                        SourceLocation location);
 
         Diagnostic &create_private_member_access_error(const std::string &member_name,
                                                        const std::string &type_name,
                                                        SourceLocation location);
 
-        Diagnostic &create_invalid_dereference_error(Type *type, SourceLocation location);
+        Diagnostic &create_invalid_dereference_error(TypeRef type, SourceLocation location);
 
         Diagnostic &create_invalid_address_of_error(SourceLocation location,
                                                     const std::string &reason = "");
@@ -271,19 +271,19 @@ namespace Cryo
 
         // Constraint and validation errors
         Diagnostic &create_constraint_violation_error(const std::string &constraint,
-                                                      Type *type, SourceLocation location);
+                                                      TypeRef type, SourceLocation location);
 
         // Additional methods for TypeError migration
         Diagnostic &create_invalid_operation_error(const std::string &operation,
-                                                   Type *left_type, Type *right_type,
+                                                   TypeRef left_type, TypeRef right_type,
                                                    SourceLocation location);
 
         // Overload with node for proper source context
         Diagnostic &create_invalid_operation_error(const std::string &operation,
-                                                   Type *left_type, Type *right_type,
+                                                   TypeRef left_type, TypeRef right_type,
                                                    ASTNode *node);
 
-        Diagnostic &create_non_callable_error(Type *type, SourceLocation location, ASTNode *node = nullptr);
+        Diagnostic &create_non_callable_error(TypeRef type, SourceLocation location, ASTNode *node = nullptr);
 
         Diagnostic &create_too_many_args_error(const std::string &function_name,
                                                size_t expected, size_t actual,
@@ -293,7 +293,7 @@ namespace Cryo
                                                     NodeKind symbol_kind,
                                                     SourceLocation location);
 
-        Diagnostic &create_invalid_assignment_error(Type *target_type, Type *value_type,
+        Diagnostic &create_invalid_assignment_error(TypeRef target_type, TypeRef value_type,
                                                     SourceLocation location);
 
         // Generic type error with custom message
