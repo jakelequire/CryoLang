@@ -679,7 +679,7 @@ namespace Cryo::Codegen
         }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Global '{}' has Cryo type: {} (kind={})",
-                  name, cryo_type.get()->display_name(), Cryo::TypeKindToString(cryo_type->kind()));
+                  name, cryo_type.get()->display_name(), Cryo::type_kind_to_string(cryo_type->kind()));
 
         llvm::Type *var_type = get_llvm_type(cryo_type);
         if (!var_type)
@@ -701,11 +701,11 @@ namespace Cryo::Codegen
             LOG_WARN(Cryo::LogComponent::CODEGEN,
                      "DeclarationCodegen: Global '{}' has {} type but got pointer LLVM type. "
                      "Looking up struct type directly.",
-                     name, Cryo::TypeKindToString(cryo_type->kind()));
+                     name, Cryo::type_kind_to_string(cryo_type->kind()));
 
             // Get the type's name and look up the struct directly
-            std::string type_name = cryo_type->name();
-            llvm::StructTypeRef struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+            std::string type_name = cryo_type->display_name();
+            llvm::StructType* struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
             if (!struct_type)
             {
                 // Try with namespace context
@@ -886,7 +886,7 @@ namespace Cryo::Codegen
         }
 
         // Create opaque struct first (for recursive types)
-        llvm::StructTypeRef struct_type = llvm::StructType::create(llvm_ctx(), name);
+        llvm::StructType* struct_type = llvm::StructType::create(llvm_ctx(), name);
 
         // Collect field types
         std::vector<llvm::Type *> field_types;
@@ -1195,7 +1195,7 @@ namespace Cryo::Codegen
             try {
                 // Attempt to access the type safely
                 TypeKind kind = resolved_type->kind();
-                std::string type_name = resolved_type->name();
+                std::string type_name = resolved_type->display_name();
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Function '{}' resolved return type: '{}'", 
                           node->name(), resolved_type.get()->display_name());
             }
@@ -1479,7 +1479,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *DeclarationCodegen::generate_default_constructor(const std::string &type_name,
-                                                                     llvm::StructTypeRef struct_type)
+                                                                     llvm::StructType* struct_type)
     {
         std::string ctor_name = type_name + "::init";
 
@@ -2294,7 +2294,7 @@ namespace Cryo::Codegen
         for (llvm::GlobalVariable *global : globals_needing_ctors)
         {
             llvm::Type *global_type = global->getValueType();
-            if (llvm::StructTypeRef struct_type = llvm::dyn_cast<llvm::StructType>(global_type))
+            if (llvm::StructType* struct_type = llvm::dyn_cast<llvm::StructType>(global_type))
             {
                 std::string type_name = struct_type->hasName() ? struct_type->getName().str() : "unnamed_struct";
                 std::string global_name = global->getName().str();

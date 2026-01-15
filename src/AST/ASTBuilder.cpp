@@ -1,5 +1,6 @@
 #include "AST/ASTBuilder.hpp"
 #include "AST/ASTNode.hpp"
+#include "Utils/Logger.hpp"
 
 namespace Cryo
 {
@@ -310,7 +311,7 @@ namespace Cryo
         if (target_type_str.empty())
         {
             // Forward declaration - no target type to resolve
-            auto node = std::make_unique<TypeAliasDeclarationNode>(loc, std::move(alias_name), nullptr, std::move(generic_params));
+            auto node = std::make_unique<TypeAliasDeclarationNode>(loc, std::move(alias_name), TypeRef{}, std::move(generic_params));
             node->set_source_file(_source_file);
             return node;
         }
@@ -436,61 +437,41 @@ namespace Cryo
         if (type_name == "f64")
             return type_context.get_f64();
         if (type_name == "float")
-            return type_context.get_default_float_type();
+            return type_context.get_f64(); // Default float is f64
         if (type_name == "double")
             return type_context.get_f64();
 
         // Check for pointer types (ends with '*')
-        if (type_name.back() == '*')
+        if (!type_name.empty() && type_name.back() == '*')
         {
             std::string pointee_type = type_name.substr(0, type_name.length() - 1);
             TypeRef pointee = lookup_type_by_name(pointee_type);
-            if (pointee)
+            if (pointee.is_valid())
             {
-                return type_context.create_pointer_type(pointee);
+                return type_context.get_pointer_to(pointee);
             }
         }
 
         // Check for reference types (ends with '&')
-        if (type_name.back() == '&')
+        if (!type_name.empty() && type_name.back() == '&')
         {
             std::string referent_type = type_name.substr(0, type_name.length() - 1);
             TypeRef referent = lookup_type_by_name(referent_type);
-            if (referent)
+            if (referent.is_valid())
             {
-                return type_context.create_reference_type(referent);
+                return type_context.get_reference_to(referent);
             }
         }
 
-        // Try looking up as struct type
-        TypeRef struct_type = type_context.get_struct_type(type_name);
-        if (struct_type && struct_type->kind() != Cryo::TypeKind::Unknown)
+        // For user-defined types (struct, class, enum, alias), lookup via symbol table
+        SymbolTable2 &symbols = _context.symbols();
+        auto resolved = symbols.resolve_type(type_name);
+        if (resolved.has_value())
         {
-            return struct_type;
+            return resolved.value();
         }
 
-        // Try looking up as class type
-        TypeRef class_type = type_context.get_class_type(type_name);
-        if (class_type && class_type->kind() != Cryo::TypeKind::Unknown)
-        {
-            return class_type;
-        }
-
-        // Try looking up as enum type
-        TypeRef enum_type = type_context.lookup_enum_type(type_name);
-        if (enum_type)
-        {
-            return enum_type;
-        }
-
-        // Try looking up as type alias
-        TypeRef alias_type = type_context.lookup_type_alias(type_name);
-        if (alias_type)
-        {
-            return alias_type;
-        }
-
-        // Fall back to unknown type
-        return type_context.get_unknown_type();
+        // Type not found - return invalid TypeRef (type checker will handle)
+        return TypeRef{};
     }
 }

@@ -62,7 +62,7 @@ namespace Cryo
             return SourceSpan(location, location, _source_file, true);
         }
 
-        std::string type_str = type->to_string();
+        std::string type_str = type->display_name();
         SourceLocation end(location.line(), location.column() + type_str.length());
         return SourceSpan(location, end, _source_file, true);
     }
@@ -407,7 +407,7 @@ namespace Cryo
         return *create_diagnostic_with_error_tracking(node, [&]()
                                                       {
             SourceSpan span = create_node_span(node);
-            std::string type_name = cryo_type ? cryo_type->to_string() : "unknown";
+            std::string type_name = cryo_type ? cryo_type->display_name() : "unknown";
             span.set_label("cannot map type '" + type_name + "' to LLVM");
 
             std::string message = "failed to map Cryo type '" + type_name + "' to LLVM type";
@@ -1136,8 +1136,8 @@ namespace Cryo
 
         SourceSpan span = node ? create_node_span(node) : SourceSpan(location, location, _source_file, true);
 
-        std::string expected_name = expected ? expected->to_string() : "unknown";
-        std::string actual_name = actual ? actual->to_string() : "unknown";
+        std::string expected_name = expected ? expected->display_name() : "unknown";
+        std::string actual_name = actual ? actual->display_name() : "unknown";
 
         span.set_label("expected `" + expected_name + "`, found `" + actual_name + "`");
 
@@ -1176,8 +1176,8 @@ namespace Cryo
     {
         SourceSpan span(location, location, _source_file, true);
 
-        std::string left_name = left_type ? left_type->to_string() : "unknown";
-        std::string right_name = right_type ? right_type->to_string() : "unknown";
+        std::string left_name = left_type ? left_type->display_name() : "unknown";
+        std::string right_name = right_type ? right_type->display_name() : "unknown";
 
         span.set_label("incompatible types for " + operation);
 
@@ -1405,7 +1405,7 @@ namespace Cryo
     {
         SourceSpan span(location, location, _source_file, true);
 
-        std::string type_name = type ? type->to_string() : "unknown";
+        std::string type_name = type ? type->display_name() : "unknown";
         span.set_label("cannot dereference non-pointer type '" + type_name + "'");
 
         std::string message = "Cannot dereference value of type '" + type_name + "'";
@@ -1425,7 +1425,7 @@ namespace Cryo
     {
         SourceSpan span(location, location, _source_file, true);
 
-        std::string type_name = object_type ? object_type->to_string() : "unknown";
+        std::string type_name = object_type ? object_type->display_name() : "unknown";
         span.set_label("field does not exist on type '" + type_name + "'");
 
         std::string message = "No field '" + member_name + "' on type '" + type_name + "'";
@@ -1468,8 +1468,8 @@ namespace Cryo
     {
         SourceSpan span(location, location, _source_file, true);
 
-        std::string left_name = left_type ? left_type->to_string() : "unknown";
-        std::string right_name = right_type ? right_type->to_string() : "unknown";
+        std::string left_name = left_type ? left_type->display_name() : "unknown";
+        std::string right_name = right_type ? right_type->display_name() : "unknown";
 
         if (right_type)
         {
@@ -1496,8 +1496,8 @@ namespace Cryo
         // Use create_node_span which properly extracts source file from the node
         SourceSpan span = create_node_span(node);
 
-        std::string left_name = left_type ? left_type->to_string() : "unknown";
-        std::string right_name = right_type ? right_type->to_string() : "unknown";
+        std::string left_name = left_type ? left_type->display_name() : "unknown";
+        std::string right_name = right_type ? right_type->display_name() : "unknown";
 
         if (right_type)
         {
@@ -1540,7 +1540,7 @@ namespace Cryo
 
         SourceSpan span(location, location, _source_file, true);
 
-        std::string type_name = type ? type->to_string() : "unknown";
+        std::string type_name = type ? type->display_name() : "unknown";
         span.set_label("type '" + type_name + "' cannot be called");
 
         std::string message = "Cannot call type '" + type_name + "' as a function";
@@ -1582,8 +1582,8 @@ namespace Cryo
     {
         SourceSpan span(location, location, _source_file, true);
 
-        std::string target_name = target_type ? target_type->to_string() : "unknown";
-        std::string value_name = value_type ? value_type->to_string() : "unknown";
+        std::string target_name = target_type ? target_type->display_name() : "unknown";
+        std::string value_name = value_type ? value_type->display_name() : "unknown";
 
         span.set_label("invalid assignment to '" + target_name + "'");
 
