@@ -141,9 +141,9 @@ namespace Cryo::Codegen
             symbol = _symbol_table.lookup_symbol(function_name);
         }
 
-        if (symbol && symbol->data_type)
+        if (symbol && symbol->type)
         {
-            std::string type_name = symbol->data_type->name();
+            std::string type_name = symbol->type->display_name();
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FunctionRegistry: Direct type mapping for '{}' with type '{}'", function_name, type_name);
 
             // Direct type mapping for primitive return types
@@ -250,10 +250,10 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Direct lookup for '{}': {}", function_name, symbol ? "FOUND" : "NOT FOUND");
         }
 
-        if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->data_type)
+        if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->type)
         {
             // We found a function symbol with type information
-            const FunctionType *func_type = dynamic_cast<const FunctionType *>(symbol->data_type.get());
+            const FunctionType *func_type = dynamic_cast<const FunctionType *>(symbol->type.get());
             if (func_type)
             {
                 // Classify based on the return type
@@ -307,14 +307,14 @@ namespace Cryo::Codegen
             symbol = _symbol_table.lookup_namespaced_symbol(resolved_namespace, function_name);
         }
 
-        if (symbol && symbol->data_type)
+        if (symbol && symbol->type)
         {
             // Classify function based on actual return type from symbol table
-            auto *function_type = dynamic_cast<const FunctionType *>(symbol->data_type.get());
+            auto *function_type = dynamic_cast<const FunctionType *>(symbol->type.get());
             if (function_type && function_type->return_type())
             {
                 auto return_type_kind = function_type->return_type()->kind();
-                std::string return_type_name = function_type->return_type()->name();
+                std::string return_type_name = function_type->return_type()->display_name();
                 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "classify_from_namespace: function '{}' has return type '{}' (kind: {})", 
                           function_name, return_type_name, static_cast<int>(return_type_kind));
@@ -409,15 +409,21 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Checking enum constructor: {}::{}", enum_name, variant_name);
 
-        // Look up the enum type in the type context
-        TypeRef enum_type = _type_context.lookup_enum_type(enum_name);
-        if (!enum_type)
+        // Try to find the enum in the symbol table via qualified name lookup
+        auto symbol = _symbol_table.lookup_symbol(enum_name);
+        if (!symbol || symbol->kind != SymbolKind::Type)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No enum type found for: {}", enum_name);
             return metadata; // Not an enum
         }
 
-        const Cryo::EnumType *cryo_enum_type = dynamic_cast<const Cryo::EnumType *>(enum_type.get());
+        if (!symbol->type.is_valid())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Enum symbol has no type: {}", enum_name);
+            return metadata;
+        }
+
+        const Cryo::EnumType *cryo_enum_type = dynamic_cast<const Cryo::EnumType *>(symbol->type.get());
         if (!cryo_enum_type)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Type is not an enum: {}", enum_name);
@@ -426,7 +432,15 @@ namespace Cryo::Codegen
 
         // Check if the variant exists in the enum
         const auto &variants = cryo_enum_type->variants();
-        bool variant_found = std::find(variants.begin(), variants.end(), variant_name) != variants.end();
+        bool variant_found = false;
+        for (const auto &v : variants)
+        {
+            if (v.name == variant_name)
+            {
+                variant_found = true;
+                break;
+            }
+        }
 
         if (!variant_found)
         {
@@ -460,11 +474,11 @@ namespace Cryo::Codegen
         // Check for pointer types first, before string name comparison
         if (dynamic_cast<const PointerType *>(cryo_type.get()) != nullptr)
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_category_from_cryo_type: Detected PointerType '{}'", cryo_type->name());
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_category_from_cryo_type: Detected PointerType '{}'", cryo_type->display_name());
             return FunctionCategory::PointerFunction;
         }
 
-        std::string type_name = cryo_type->name();
+        std::string type_name = cryo_type->display_name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_category_from_cryo_type: Categorizing type '{}'", type_name);
 
         if (type_name == "void")
