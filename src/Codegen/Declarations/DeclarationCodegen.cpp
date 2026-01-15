@@ -1188,16 +1188,16 @@ namespace Cryo::Codegen
 
         // Get return type
         TypeRef resolved_type = node->get_resolved_return_type();
-        
+
         // Check for corrupted or invalid type pointer
-        if (resolved_type != nullptr)
+        if (resolved_type.is_valid())
         {
             try {
                 // Attempt to access the type safely
                 TypeKind kind = resolved_type->kind();
                 std::string type_name = resolved_type->display_name();
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Function '{}' resolved return type: '{}'", 
-                          node->name(), resolved_type.get()->display_name());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Function '{}' resolved return type: '{}'",
+                          node->name(), resolved_type->display_name());
             }
             catch (...)
             {

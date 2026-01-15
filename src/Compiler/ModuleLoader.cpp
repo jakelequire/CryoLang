@@ -6,6 +6,7 @@
 #include "Utils/OS.hpp"
 #include "AST/ASTContext.hpp"
 #include "AST/Type.hpp"
+#include "Types2/UserDefinedTypes.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -549,10 +550,11 @@ namespace Cryo
                     TypeRef enum_type{};
                     if (!enum_decl->generic_parameters().empty())
                     {
-                        // For generic enums, try to look up the enum template from TypeArena
-                        enum_type = type_arena.lookup_enum_type(enum_decl->name());
-                        if (enum_type.is_valid())
+                        // For generic enums, try to look up in symbol table
+                        Symbol *enum_sym = _symbol_table.lookup_symbol(enum_decl->name());
+                        if (enum_sym && enum_sym->type.is_valid() && enum_sym->type->kind() == TypeKind::Enum)
                         {
+                            enum_type = enum_sym->type;
                             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Found parameterized enum template for {}", enum_decl->name());
                         }
                         else
@@ -563,14 +565,26 @@ namespace Cryo
                     else
                     {
                         // For non-generic enums, create a regular enum type
-                        std::vector<EnumVariantInfo> variant_infos;
+                        QualifiedTypeName enum_qname{enum_decl->name()};
+                        enum_type = type_arena.create_enum(enum_qname);
+
+                        // Build variants and set them on the enum type
+                        std::vector<EnumVariant> variants;
+                        size_t tag = 0;
                         for (const auto &variant : enum_decl->variants())
                         {
-                            EnumVariantInfo info;
-                            info.name = variant->name();
-                            variant_infos.push_back(info);
+                            variants.push_back(EnumVariant(variant->name(), {}, tag++));
                         }
-                        enum_type = type_arena.create_enum(enum_decl->name(), variant_infos);
+
+                        // Set variants on the enum type (completes it)
+                        if (enum_type.is_valid())
+                        {
+                            auto *enum_ptr = const_cast<EnumType *>(dynamic_cast<const EnumType *>(enum_type.get()));
+                            if (enum_ptr)
+                            {
+                                enum_ptr->set_variants(std::move(variants));
+                            }
+                        }
                     }
 
                     // Create type symbol for enum
@@ -683,7 +697,7 @@ namespace Cryo
         }
 
         // Create FunctionType
-        return type_arena->create_function(return_type, parameter_types);
+        return type_arena->get_function(return_type, parameter_types);
     }
 
     TypeRef ModuleLoader::create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeArena *type_arena)
@@ -730,7 +744,7 @@ namespace Cryo
         }
 
         // Create FunctionType
-        TypeRef func_type = type_arena->create_function(return_type, parameter_types);
+        TypeRef func_type = type_arena->get_function(return_type, parameter_types);
         if (func_type.is_valid())
         {
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Successfully created function type for intrinsic '{}': {}",
@@ -862,7 +876,7 @@ namespace Cryo
                         LOG_ERROR(LogComponent::GENERAL, "=== STRUCT_REG: Found non-generic struct '{}' with {} fields ===", struct_decl->name(), struct_decl->fields().size());
 
                         std::vector<std::string> field_names;
-                        std::vector<Type *> field_types;
+                        std::vector<TypeRef> field_types;
 
                         for (const auto &field : struct_decl->fields())
                         {
@@ -888,13 +902,12 @@ namespace Cryo
                                     }
                                     else
                                     {
-                                        // For complex types, use lookup_struct_type which looks up existing types
-                                        // This ensures struct types referenced before their declarations are still registered
-                                        field_type = _ast_context.types().lookup_struct_type(type_str);
-                                        // Note: lookup_struct_type returns invalid TypeRef if not found
-                                        if (field_type.is_valid())
+                                        // For complex types, try to look up in symbol table
+                                        Symbol *type_sym = _symbol_table.lookup_symbol(type_str);
+                                        if (type_sym && type_sym->type.is_valid())
                                         {
-                                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' from TypeArena: {}", type_str, field_type->display_name());
+                                            field_type = type_sym->type;
+                                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' from symbol table: {}", type_str, field_type->display_name());
                                         }
                                         else
                                         {
