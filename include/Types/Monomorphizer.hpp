@@ -321,11 +321,4 @@ namespace Cryo
         }
     };
 
-    /**************************************************************************
-     * @brief Utility: Get all instantiation requests from a program
-     **************************************************************************/
-    std::vector<MonomorphRequest> collect_instantiation_requests(
-        const ProgramNode &program,
-        const GenericRegistry &generics);
-
 } // namespace Cryo
