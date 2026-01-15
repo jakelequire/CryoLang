@@ -36,3 +36,6 @@
 
 // Codegen bridge (Phase 3)
 #include "Types2/TypeMapper2.hpp"
+
+// Type checking (Phase 4)
+#include "Types2/TypeChecker2.hpp"
