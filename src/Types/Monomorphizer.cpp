@@ -102,6 +102,23 @@ namespace Cryo
         }
     }
 
+    void Monomorphizer::import_cached_instantiations()
+    {
+        auto all_instantiations = _generics.get_all_instantiations();
+
+        for (const auto &[base_type, type_args] : all_instantiations)
+        {
+            // Skip if already monomorphized
+            if (_generics.is_monomorphized(base_type, type_args))
+            {
+                continue;
+            }
+
+            // Add to pending requests
+            add_request(base_type, type_args, SourceLocation{}, ModuleID::invalid());
+        }
+    }
+
     // ========================================================================
     // Processing
     // ========================================================================

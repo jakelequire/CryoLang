@@ -260,6 +260,9 @@ namespace Cryo
         // Check if an instantiation has been monomorphized
         bool is_monomorphized(TypeRef base, const std::vector<TypeRef> &args) const;
 
+        // Get all cached instantiations for monomorphization
+        std::vector<std::pair<TypeRef, std::vector<TypeRef>>> get_all_instantiations() const;
+
         // ====================================================================
         // Type substitution
         // ====================================================================

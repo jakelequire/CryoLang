@@ -333,6 +333,24 @@ namespace Cryo
         return _monomorphized.find(key) != _monomorphized.end();
     }
 
+    std::vector<std::pair<TypeRef, std::vector<TypeRef>>>
+    GenericRegistry::get_all_instantiations() const
+    {
+        std::vector<std::pair<TypeRef, std::vector<TypeRef>>> result;
+        result.reserve(_instantiations.size());
+
+        for (const auto &[key, instantiated_type] : _instantiations)
+        {
+            if (instantiated_type.is_valid() &&
+                instantiated_type->kind() == TypeKind::InstantiatedType)
+            {
+                auto *inst = static_cast<const InstantiatedType *>(instantiated_type.get());
+                result.emplace_back(inst->generic_base(), inst->type_args());
+            }
+        }
+        return result;
+    }
+
     TypeSubstitution GenericRegistry::create_substitution(
         TypeRef generic_type,
         const std::vector<TypeRef> &type_args) const

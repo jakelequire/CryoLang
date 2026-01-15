@@ -195,6 +195,15 @@ namespace Cryo
         void import_pending_from_registry();
 
         /**
+         * @brief Import all cached instantiations from GenericRegistry
+         *
+         * This imports ALL instantiated types that haven't been monomorphized yet,
+         * not just pending requests. This is the primary way to collect work
+         * when TypeResolver eagerly instantiates types during resolution.
+         */
+        void import_cached_instantiations();
+
+        /**
          * @brief Get pending request count
          */
         size_t pending_count() const { return _pending_requests.size(); }
