@@ -482,10 +482,32 @@ namespace Cryo::Codegen
         }
 
         // Pass 1: Generate struct TYPE only (when _defer_method_generation is true)
+        llvm::StructType *struct_type = nullptr;
         if (!_generate_method_bodies_only)
         {
             // Generate the struct type
-            _types->generate_struct(&node);
+            struct_type = _types->generate_struct(&node);
+
+            // If struct type generation failed (e.g., fields have unresolved types), skip method generation
+            if (!struct_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "CodegenVisitor: Skipping method generation for struct {} - struct type could not be generated",
+                          node.name());
+                return;
+            }
+        }
+        else
+        {
+            // In method bodies only mode, check if the struct type exists
+            struct_type = llvm::StructType::getTypeByName(_ctx->llvm_context(), node.name());
+            if (!struct_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "CodegenVisitor: Skipping method body generation for struct {} - struct type not found",
+                          node.name());
+                return;
+            }
         }
 
         // Generate method declarations even in "type only" mode to enable forward references
@@ -589,10 +611,32 @@ namespace Cryo::Codegen
         }
 
         // Pass 1: Generate class TYPE only (when _defer_method_generation is true)
+        llvm::StructType *class_type = nullptr;
         if (!_generate_method_bodies_only)
         {
             // Generate the class type (struct layout)
-            _types->generate_class(&node);
+            class_type = _types->generate_class(&node);
+
+            // If class type generation failed (e.g., fields have unresolved types), skip method generation
+            if (!class_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "CodegenVisitor: Skipping method generation for class {} - class type could not be generated",
+                          node.name());
+                return;
+            }
+        }
+        else
+        {
+            // In method bodies only mode, check if the class type exists
+            class_type = llvm::StructType::getTypeByName(_ctx->llvm_context(), node.name());
+            if (!class_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "CodegenVisitor: Skipping method body generation for class {} - class type not found",
+                          node.name());
+                return;
+            }
         }
 
         // Generate method declarations even in "type only" mode to enable forward references

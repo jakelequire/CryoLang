@@ -39,12 +39,20 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Check 2: Detect uninstantiated type parameters in function signature
+        // Check 2: Detect uninstantiated type parameters or error types in function signature
         for (const auto &param : node->parameters())
         {
             if (param && param->get_resolved_type())
             {
                 TypeRef ptype = param->get_resolved_type();
+                // Check for error types (unresolved generics, undefined types, etc.)
+                if (ptype.is_error())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping function declaration '{}' - param '{}' has error type '{}'",
+                              node->name(), param->name(), ptype->display_name());
+                    return nullptr;
+                }
                 if (ptype->kind() == TypeKind::GenericParam)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -66,9 +74,17 @@ namespace Cryo::Codegen
             }
         }
 
-        // Check 3: Detect uninstantiated return type
+        // Check 3: Detect uninstantiated return type or error types
         if (TypeRef ret_type = node->get_resolved_return_type())
         {
+            // Check for error types (unresolved generics, undefined types, etc.)
+            if (ret_type.is_error())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Skipping function declaration '{}' - return type is error: '{}'",
+                          node->name(), ret_type->display_name());
+                return nullptr;
+            }
             if (ret_type->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -92,7 +108,7 @@ namespace Cryo::Codegen
         // Generate properly qualified function name using namespace context
         std::string name;
         std::string ns_context = ctx().namespace_context();
-        
+
         // Special case: main and _user_main_ functions should never be namespace qualified
         if (node->name() == "main" || node->name() == "_user_main_")
         {
@@ -168,12 +184,20 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Check 2: Detect uninstantiated type parameters in function signature
+        // Check 2: Detect uninstantiated type parameters or error types in function signature
         for (const auto &param : node->parameters())
         {
             if (param && param->get_resolved_type())
             {
                 TypeRef ptype = param->get_resolved_type();
+                // Check for error types (unresolved generics, undefined types, etc.)
+                if (ptype.is_error())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping function '{}' - param '{}' has error type '{}'",
+                              node->name(), param->name(), ptype->display_name());
+                    return nullptr;
+                }
                 // Check for Generic type kind
                 if (ptype->kind() == TypeKind::GenericParam)
                 {
@@ -197,9 +221,17 @@ namespace Cryo::Codegen
             }
         }
 
-        // Check 3: Detect uninstantiated return type
+        // Check 3: Detect uninstantiated return type or error types
         if (TypeRef ret_type = node->get_resolved_return_type())
         {
+            // Check for error types (unresolved generics, undefined types, etc.)
+            if (ret_type.is_error())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Skipping function '{}' - return type is error: '{}'",
+                          node->name(), ret_type->display_name());
+                return nullptr;
+            }
             if (ret_type->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -223,7 +255,7 @@ namespace Cryo::Codegen
         // Generate properly qualified function name using namespace context
         std::string name;
         std::string ns_context = ctx().namespace_context();
-        
+
         // Special case: main and _user_main_ functions should never be namespace qualified
         if (node->name() == "main" || node->name() == "_user_main_")
         {
@@ -317,6 +349,15 @@ namespace Cryo::Codegen
             if (param && param->get_resolved_type())
             {
                 TypeRef ptype = param->get_resolved_type();
+                // Check for error types (unresolved function types, etc.)
+                // Error types map to void in LLVM, which is invalid as a parameter type
+                if (ptype.is_error())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping method '{}' - param '{}' has error type '{}'",
+                              node->name(), param->name(), ptype.get()->display_name());
+                    return nullptr;
+                }
                 // Check for Generic type kind or undefined struct/class types
                 if (ptype->kind() == TypeKind::GenericParam)
                 {
@@ -362,6 +403,14 @@ namespace Cryo::Codegen
                               node->name());
                     return nullptr;
                 }
+            }
+            // Check if return type is an error type (unresolved generics, undefined types, etc.)
+            if (ret_type.is_error())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Skipping method declaration '{}' - return type is error: '{}'",
+                          node->name(), ret_type->display_name());
+                return nullptr;
             }
         }
 
@@ -539,6 +588,16 @@ namespace Cryo::Codegen
 
         // Get variable type
         TypeRef cryo_var_type = node->get_resolved_type();
+
+        // Check if variable type is an error type (unresolved generics, undefined types, etc.)
+        if (cryo_var_type.is_error())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Skipping local variable '{}' - type is error: '{}'",
+                      name, cryo_var_type->display_name());
+            return nullptr;
+        }
+
         llvm::Type *var_type = get_llvm_type(cryo_var_type);
         if (!var_type)
         {
@@ -1883,6 +1942,14 @@ namespace Cryo::Codegen
                               node->name());
                     return;
                 }
+            }
+            // Check if return type is an error type (unresolved generics, undefined types, etc.)
+            if (ret_type.is_error())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Skipping method '{}' - return type is error: '{}'",
+                          node->name(), ret_type->display_name());
+                return;
             }
         }
 
