@@ -43,6 +43,7 @@ namespace Cryo
         bool _parsing_class_members = false;       // Track if we're parsing class/struct members (for synchronize context)
         std::string _current_namespace = "Global"; // Current namespace context
         std::string _current_parsing_type_name;    // Track current struct/class being parsed (for self-referential types)
+        ModuleID _current_module_id;               // Current module ID for proper type qualification
         int _scope_depth = 0;                      // Track nesting depth (0 = global scope)
 
         // Bracket depth tracking for improved error recovery
@@ -50,6 +51,9 @@ namespace Cryo
         int _paren_depth = 0;        // Track ( ) nesting
         int _bracket_depth = 0;      // Track [ ] nesting
         size_t _tokens_consumed = 0; // Track total tokens processed for diagnostics
+
+        // Token lookahead buffer for multi-token lookahead
+        std::vector<Token> _lookahead_buffer; // Buffered tokens for peek_next_n
 
         // Documentation comment collection
         std::vector<std::string> _pending_doc_comments; // Collected doc comments waiting to be attached
@@ -72,8 +76,9 @@ namespace Cryo
         const std::vector<ParseError> &errors() const { return _errors; }
         bool has_errors() const { return !_errors.empty(); }
 
-        // Namespace access
+        // Namespace and module access
         const std::string &current_namespace() const { return _current_namespace; }
+        ModuleID current_module() const { return _current_module_id; }
 
         // Scope tracking
         bool is_global_scope() const { return _scope_depth == 0; }
@@ -259,6 +264,10 @@ namespace Cryo
         Token peek() const { return _current_token; }
         Token peek_next();
         Token peek_next_n(int n);
+
+        // Generic call detection - scans ahead to determine if '<' starts a generic call
+        // Returns true if pattern matches: identifier<type_args>(
+        bool is_generic_call_ahead();
 
         // Type resolution helper
         TypeRef resolve_type_from_string(const std::string &type_str);

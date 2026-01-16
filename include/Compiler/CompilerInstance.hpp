@@ -47,6 +47,8 @@ namespace Cryo
         std::unique_ptr<Parser> _parser;
         std::unique_ptr<ASTContext> _ast_context;
         std::unique_ptr<DiagEmitter> _diagnostics;
+        // SRM context must be declared before manager (destruction order)
+        std::unique_ptr<Cryo::SRM::SymbolResolutionContext> _symbol_resolution_context;
         std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _symbol_resolution_manager;
         // Types components - GenericRegistry and TypeResolver must come before TypeChecker
         std::unique_ptr<GenericRegistry> _generic_registry;
