@@ -27,14 +27,16 @@ namespace Cryo
         // Initialize Symbol Resolution Manager
         try
         {
-            auto context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(
+            _symbol_resolution_context = std::make_unique<Cryo::SRM::SymbolResolutionContext>(
                 &_ast_context->types());
-            _symbol_resolution_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(context.release());
+            _symbol_resolution_manager = std::make_unique<Cryo::SRM::SymbolResolutionManager>(
+                _symbol_resolution_context.get());
         }
         catch (const std::exception &e)
         {
             LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to initialize Symbol Resolution Manager: {}", e.what());
-            _symbol_resolution_manager = nullptr;
+            _symbol_resolution_context.reset();
+            _symbol_resolution_manager.reset();
         }
 
         // Create Types components in order of dependencies:
@@ -595,6 +597,25 @@ namespace Cryo
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Setting source info for codegen...");
             _codegen->set_source_info(_source_file, _current_namespace);
 
+            // Sync imported namespaces from compiler's SRM to codegen's SRM
+            // This ensures functions like malloc from imported namespaces can be resolved
+            if (_symbol_resolution_manager && _codegen->ensure_visitor_initialized())
+            {
+                auto *compiler_srm_ctx = _symbol_resolution_manager->get_context();
+                auto *codegen_srm_ctx = _codegen->get_visitor()->get_srm_context();
+
+                if (compiler_srm_ctx && codegen_srm_ctx)
+                {
+                    const auto &imported_namespaces = compiler_srm_ctx->get_imported_namespaces();
+                    for (const auto &ns : imported_namespaces)
+                    {
+                        codegen_srm_ctx->add_imported_namespace(ns);
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Synced imported namespace to codegen SRM: '{}'", ns);
+                    }
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Synced {} imported namespaces to codegen SRM", imported_namespaces.size());
+                }
+            }
+
             // Note: TypeChecker doesn't have get_srm_context() or specialized method tracking.
             // import_specialized_methods and import_namespace_aliases need reimplementation for Types.
             if (_debug_mode && _codegen->get_visitor())
@@ -933,6 +954,10 @@ namespace Cryo
 
     void CompilerInstance::reset_state()
     {
+        // Reset codegen FIRST before parser, as codegen may have references to data
+        // that was created during parsing. Order matters for proper cleanup.
+        _codegen.reset();
+
         _ast_root.reset();
         if (_diagnostics)
         {
@@ -1080,11 +1105,15 @@ namespace Cryo
         // Handle struct declarations
         else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(node))
         {
-            // Get or create struct type
-            TypeRef struct_type = _ast_context->types().create_struct(QualifiedTypeName{ModuleID::invalid(), struct_decl->name()});
-
-            // Add struct to symbol table as a Type symbol
-            _symbol_table->declare_type(struct_decl->name(), struct_type, struct_decl->location());
+            // Check if type was already pre-registered during parsing (for self-referential types)
+            TypeRef struct_type = _symbol_table->lookup_struct_type(struct_decl->name());
+            if (!struct_type.is_valid())
+            {
+                // Type wasn't pre-registered, create and register it now
+                ModuleID current_module = _symbol_table->current_module();
+                struct_type = _ast_context->types().create_struct(QualifiedTypeName{current_module, struct_decl->name()});
+                _symbol_table->declare_type(struct_decl->name(), struct_type, struct_decl->location());
+            }
 
             // Register struct methods with fully qualified names
             for (const auto &method : struct_decl->methods())
@@ -1141,11 +1170,15 @@ namespace Cryo
         // Handle class declarations
         else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(node))
         {
-            // Get or create class type
-            TypeRef class_type = _ast_context->types().create_class(QualifiedTypeName{ModuleID::invalid(), class_decl->name()});
-
-            // Add class to symbol table as a Type symbol
-            _symbol_table->declare_type(class_decl->name(), class_type, class_decl->location());
+            // Check if type was already pre-registered during parsing (for self-referential types)
+            TypeRef class_type = _symbol_table->lookup_class_type(class_decl->name());
+            if (!class_type.is_valid())
+            {
+                // Type wasn't pre-registered, create and register it now
+                ModuleID current_module = _symbol_table->current_module();
+                class_type = _ast_context->types().create_class(QualifiedTypeName{current_module, class_decl->name()});
+                _symbol_table->declare_type(class_decl->name(), class_type, class_decl->location());
+            }
 
             // Register class methods with fully qualified names
             for (const auto &method : class_decl->methods())
@@ -1221,7 +1254,8 @@ namespace Cryo
             }
 
             // Create enum type and register it
-            TypeRef enum_type = _ast_context->types().create_enum(QualifiedTypeName{ModuleID::invalid(), enum_decl->name()});
+            ModuleID current_module = _symbol_table->current_module();
+            TypeRef enum_type = _ast_context->types().create_enum(QualifiedTypeName{current_module, enum_decl->name()});
             _symbol_table->declare_type(enum_decl->name(), enum_type, enum_decl->location());
 
             // IMMEDIATELY register enum variants in codegen context to prevent early reference issues
@@ -1269,7 +1303,8 @@ namespace Cryo
         else if (auto trait_decl = dynamic_cast<TraitDeclarationNode *>(node))
         {
             // Create trait type and add to symbol table as a type
-            TypeRef trait_type = _ast_context->types().create_trait(QualifiedTypeName{ModuleID::invalid(), trait_decl->name()});
+            ModuleID current_module = _symbol_table->current_module();
+            TypeRef trait_type = _ast_context->types().create_trait(QualifiedTypeName{current_module, trait_decl->name()});
             _symbol_table->declare_type(trait_decl->name(), trait_type, trait_decl->location());
 
             // Register generic trait templates if this trait has generic parameters

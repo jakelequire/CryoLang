@@ -17,6 +17,10 @@ namespace Cryo
             _builder.set_source_file(_source_file);
         }
 
+        // Initialize current module to "Global" by default
+        _current_module_id = _context.modules().get_or_create_module("Global", _source_file);
+        _context.symbols().set_current_module(_current_module_id);
+
         // Initialize Symbol Resolution Manager (SRM) - only if symbol table is valid
         try
         {
@@ -43,6 +47,10 @@ namespace Cryo
     {
         // Set source file on the builder so created nodes know their origin
         _builder.set_source_file(source_file);
+
+        // Initialize current module to "Global" by default
+        _current_module_id = _context.modules().get_or_create_module("Global", source_file);
+        _context.symbols().set_current_module(_current_module_id);
 
         // Initialize Symbol Resolution Manager (SRM) - only if symbol table is valid
         try
@@ -300,6 +308,11 @@ namespace Cryo
             std::string namespace_name = parse_namespace();
             _current_namespace = namespace_name; // Store the namespace in parser state
 
+            // Get or create a ModuleID for this namespace and update context
+            _current_module_id = _context.modules().get_or_create_module(namespace_name, _source_file);
+            _context.symbols().set_current_module(_current_module_id);
+            LOG_DEBUG(LogComponent::PARSER, "Set current module to '{}' (id={})", namespace_name, _current_module_id.id);
+
             // Update SRM context with the new namespace
             if (_srm_context)
             {
@@ -343,6 +356,16 @@ namespace Cryo
     // Token management
     void Parser::advance()
     {
+        // First, check if we have buffered tokens from lookahead
+        if (!_lookahead_buffer.empty())
+        {
+            _current_token = _lookahead_buffer.front();
+            _lookahead_buffer.erase(_lookahead_buffer.begin());
+            update_bracket_depth(_current_token.kind());
+            _tokens_consumed++;
+            return;
+        }
+
         do
         {
             if (_lexer && _lexer->has_more_tokens())
@@ -2492,12 +2515,16 @@ namespace Cryo
                 // We need to peek ahead to see if there are parentheses after the generic args
                 if (auto identifier_node = dynamic_cast<IdentifierNode *>(expr.get()))
                 {
-                    // Use a simple heuristic: only try to parse generics if the identifier starts with uppercase
-                    // This avoids conflicts with comparison operators in most cases
                     std::string type_name = identifier_node->name();
                     SourceLocation type_location = identifier_node->location();
 
-                    if (!type_name.empty() && std::isupper(type_name[0]))
+                    // Use lookahead-based detection: scan ahead to see if pattern matches <...>(
+                    // This properly handles cases like:
+                    //   func<T>()  -> generic call (pattern: <type_args>()
+                    //   i < n      -> comparison (no matching > followed by ()
+                    bool looks_like_generic = is_generic_call_ahead();
+
+                    if (looks_like_generic)
                     {
                         // Parse generic arguments
                         advance(); // consume '<'
@@ -2518,75 +2545,113 @@ namespace Cryo
 
                         consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic arguments");
 
-                        // Check if this is followed by parentheses (constructor call) or scope resolution
+                        // Check if this is followed by parentheses (call) or scope resolution
                         if (_current_token.is(TokenKind::TK_L_PAREN))
                         {
-                            // Parse the constructor call with arguments
-                            advance(); // consume '('
+                            // Determine if this is a struct constructor (uppercase) or function call (lowercase)
+                            bool is_type_constructor = !type_name.empty() && std::isupper(type_name[0]);
 
-                            // Check if this is a struct literal ({field: value})
-                            if (_current_token.is(TokenKind::TK_L_BRACE))
+                            if (is_type_constructor)
                             {
-                                // This is a struct literal
-                                advance(); // consume '{'
+                                // Parse the constructor call with arguments
+                                advance(); // consume '('
 
-                                auto struct_literal = _builder.create_struct_literal(type_location, type_name);
-
-                                // Add generic arguments to struct literal
-                                for (const auto &generic_arg : generic_args)
+                                // Check if this is a struct literal ({field: value})
+                                if (_current_token.is(TokenKind::TK_L_BRACE))
                                 {
-                                    struct_literal->add_generic_arg(generic_arg);
-                                }
+                                    // This is a struct literal
+                                    advance(); // consume '{'
 
-                                // Parse field initializers
-                                if (!_current_token.is(TokenKind::TK_R_BRACE))
-                                {
-                                    do
+                                    auto struct_literal = _builder.create_struct_literal(type_location, type_name);
+
+                                    // Add generic arguments to struct literal
+                                    for (const auto &generic_arg : generic_args)
                                     {
-                                        // Parse field name
-                                        if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                                        struct_literal->add_generic_arg(generic_arg);
+                                    }
+
+                                    // Parse field initializers
+                                    if (!_current_token.is(TokenKind::TK_R_BRACE))
+                                    {
+                                        do
                                         {
-                                            error("Expected field name in struct literal");
-                                            return nullptr;
-                                        }
+                                            // Parse field name
+                                            if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                                            {
+                                                error("Expected field name in struct literal");
+                                                return nullptr;
+                                            }
 
-                                        std::string field_name = std::string(_current_token.text());
-                                        advance(); // consume field name
+                                            std::string field_name = std::string(_current_token.text());
+                                            advance(); // consume field name
 
-                                        consume(TokenKind::TK_COLON, "Expected ':' after field name");
+                                            consume(TokenKind::TK_COLON, "Expected ':' after field name");
 
-                                        // Parse field value
-                                        auto field_value = parse_expression();
-                                        if (!field_value)
-                                        {
-                                            error("Expected expression for field value");
-                                            return nullptr;
-                                        }
+                                            // Parse field value
+                                            auto field_value = parse_expression();
+                                            if (!field_value)
+                                            {
+                                                error("Expected expression for field value");
+                                                return nullptr;
+                                            }
 
-                                        // Create field initializer
-                                        auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
-                                        struct_literal->add_field_initializer(std::move(field_init));
+                                            // Create field initializer
+                                            auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
+                                            struct_literal->add_field_initializer(std::move(field_init));
 
-                                    } while (match(TokenKind::TK_COMMA));
+                                        } while (match(TokenKind::TK_COMMA));
+                                    }
+
+                                    consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
+                                    consume(TokenKind::TK_R_PAREN, "Expected ')' after struct literal");
+
+                                    expr = std::move(struct_literal);
                                 }
+                                else
+                                {
+                                    // Regular constructor call - create NewExpressionNode and parse arguments
+                                    auto new_expr = _builder.create_new_expression(type_location, type_name);
 
-                                consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
-                                consume(TokenKind::TK_R_PAREN, "Expected ')' after struct literal");
+                                    // Add generic arguments
+                                    for (const auto &generic_arg : generic_args)
+                                    {
+                                        new_expr->add_generic_arg(generic_arg);
+                                    }
 
-                                expr = std::move(struct_literal);
+                                    // Parse constructor arguments (if any)
+                                    if (!_current_token.is(TokenKind::TK_R_PAREN))
+                                    {
+                                        do
+                                        {
+                                            auto arg = parse_expression();
+                                            if (!arg)
+                                            {
+                                                error("Expected expression in constructor arguments");
+                                                return nullptr;
+                                            }
+                                            new_expr->add_argument(std::move(arg));
+
+                                        } while (match(TokenKind::TK_COMMA));
+                                    }
+
+                                    consume(TokenKind::TK_R_PAREN, "Expected ')' after constructor arguments");
+                                    expr = std::move(new_expr);
+                                }
                             }
                             else
                             {
-                                // Regular constructor call - create NewExpressionNode and parse arguments
-                                auto new_expr = _builder.create_new_expression(type_location, type_name);
+                                // Generic function call (lowercase identifier) - create CallExpressionNode
+                                auto call_expr = _builder.create_call_expression(type_location, std::move(expr));
 
-                                // Add generic arguments
+                                // Add generic arguments to call expression
                                 for (const auto &generic_arg : generic_args)
                                 {
-                                    new_expr->add_generic_arg(generic_arg);
+                                    call_expr->add_generic_arg(generic_arg);
                                 }
 
-                                // Parse constructor arguments (if any)
+                                advance(); // consume '('
+
+                                // Parse call arguments (if any)
                                 if (!_current_token.is(TokenKind::TK_R_PAREN))
                                 {
                                     do
@@ -2594,16 +2659,16 @@ namespace Cryo
                                         auto arg = parse_expression();
                                         if (!arg)
                                         {
-                                            error("Expected expression in constructor arguments");
+                                            error("Expected expression in function call arguments");
                                             return nullptr;
                                         }
-                                        new_expr->add_argument(std::move(arg));
+                                        call_expr->add_argument(std::move(arg));
 
                                     } while (match(TokenKind::TK_COMMA));
                                 }
 
-                                consume(TokenKind::TK_R_PAREN, "Expected ')' after constructor arguments");
-                                expr = std::move(new_expr);
+                                consume(TokenKind::TK_R_PAREN, "Expected ')' after function call arguments");
+                                expr = std::move(call_expr);
                             }
                         }
                         else if (_current_token.is(TokenKind::TK_COLONCOLON))
@@ -2643,6 +2708,7 @@ namespace Cryo
                             return nullptr;
                         }
                     }
+                    // else: not a generic pattern, treat '<' as less-than operator (handled by caller)
                 }
             }
 
@@ -4095,6 +4161,14 @@ namespace Cryo
             }
         }
 
+        // PRE-REGISTER the struct type in the symbol table BEFORE parsing fields.
+        // This enables self-referential types like: type struct Node { next: Node*; }
+        // Without this, the field type resolution fails because the struct isn't known yet.
+        TypeRef struct_type = _context.types().create_struct(QualifiedTypeName{_current_module_id, struct_name});
+        _context.symbols().declare_type(struct_name, struct_type, start_loc);
+        LOG_DEBUG(LogComponent::PARSER, "Pre-registered struct type '{}' in module {} for self-referential field support",
+                  struct_name, _current_module_id.id);
+
         consume(TokenKind::TK_L_BRACE, "Expected '{' after struct name");
 
         // Parse struct members (fields and methods)
@@ -4224,6 +4298,13 @@ namespace Cryo
             Token base_token = consume(TokenKind::TK_IDENTIFIER, "Expected base class name");
             class_decl->set_base_class(std::string(base_token.text()));
         }
+
+        // PRE-REGISTER the class type in the symbol table BEFORE parsing fields.
+        // This enables self-referential types like: type class Node { next: Node*; }
+        TypeRef class_type = _context.types().create_class(QualifiedTypeName{_current_module_id, class_name});
+        _context.symbols().declare_type(class_name, class_type, start_loc);
+        LOG_DEBUG(LogComponent::PARSER, "Pre-registered class type '{}' in module {} for self-referential field support",
+                  class_name, _current_module_id.id);
 
         consume(TokenKind::TK_L_BRACE, "Expected '{' after class declaration");
 
@@ -4652,10 +4733,11 @@ namespace Cryo
         // Skip registration for generic enums (they'll be handled by template system)
         if (enum_decl->generic_parameters().empty())
         {
-            QualifiedTypeName qname{ModuleID::invalid(), enum_name};
+            QualifiedTypeName qname{_current_module_id, enum_name};
             _context.types().create_enum(qname);
             // TODO: Populate enum variants on the type - currently handled in TypeChecker
-            LOG_DEBUG(LogComponent::PARSER, "Registered enum type: {} (simple={}, variants={})", enum_name, is_simple_enum, variant_names.size());
+            LOG_DEBUG(LogComponent::PARSER, "Registered enum type: {} in module {} (simple={}, variants={})",
+                      enum_name, _current_module_id.id, is_simple_enum, variant_names.size());
         }
 
         return enum_decl;
@@ -5132,7 +5214,7 @@ namespace Cryo
             {
                 // Create struct type for this constructor/destructor
                 // TypeChecker will resolve this properly later
-                QualifiedTypeName qname{ModuleID::invalid(), struct_name};
+                QualifiedTypeName qname{_current_module_id, struct_name};
                 TypeRef struct_type = _context.types().create_struct(qname);
                 return_type = _context.types().get_pointer_to(struct_type);
             }
@@ -5354,17 +5436,116 @@ namespace Cryo
 
     Token Parser::peek_next_n(int n)
     {
-        // Simple implementation that only supports n=1 for now
-        // The complex lookahead for 'mut &this' is handled differently
-        if (n == 1)
+        // Multi-token lookahead using buffer
+        if (n <= 0)
         {
-            return peek_next();
+            return _current_token;
         }
-        else
+
+        // Ensure buffer has enough tokens (skip comments when buffering)
+        while (static_cast<int>(_lookahead_buffer.size()) < n)
         {
-            // Return EOF token for unsupported cases
-            return Token(TokenKind::TK_EOF, "", SourceLocation{});
+            if (!_lexer->has_more_tokens())
+            {
+                // Fill remaining with EOF
+                _lookahead_buffer.push_back(Token(TokenKind::TK_EOF, "", SourceLocation{}));
+            }
+            else
+            {
+                Token tok = _lexer->next_token();
+                // Skip comment tokens in lookahead (consistent with advance())
+                while ((tok.is(TokenKind::TK_COMMENT) ||
+                        tok.is(TokenKind::TK_DOC_COMMENT_BLOCK) ||
+                        tok.is(TokenKind::TK_DOC_COMMENT_LINE)) &&
+                       _lexer->has_more_tokens())
+                {
+                    tok = _lexer->next_token();
+                }
+                _lookahead_buffer.push_back(tok);
+            }
         }
+
+        return _lookahead_buffer[n - 1];
+    }
+
+    bool Parser::is_generic_call_ahead()
+    {
+        // Scans ahead from current position (at '<') to determine if this is a generic call.
+        // A generic call follows the pattern: <type_args>(
+        // A comparison follows the pattern: < expr (without closing > followed by ()
+        //
+        // Strategy: Track angle bracket depth, looking for matching '>' followed by '('.
+        // If we find '>(', it's a generic call.
+        // If we hit certain tokens that can't appear in type arguments, it's a comparison.
+
+        int pos = 1; // Start looking after '<' (peek_next_n(1) = first token after current '<')
+        int angle_depth = 1;
+        const int max_lookahead = 50; // Reasonable limit to prevent infinite scanning
+
+        while (pos <= max_lookahead)
+        {
+            Token tok = peek_next_n(pos);
+
+            if (tok.is(TokenKind::TK_EOF))
+            {
+                // Hit end of file - definitely not a valid generic call
+                return false;
+            }
+
+            if (tok.is(TokenKind::TK_L_ANGLE))
+            {
+                angle_depth++;
+            }
+            else if (tok.is(TokenKind::TK_R_ANGLE))
+            {
+                angle_depth--;
+                if (angle_depth == 0)
+                {
+                    // Found matching '>'. Check if next token is '('
+                    Token next_tok = peek_next_n(pos + 1);
+                    return next_tok.is(TokenKind::TK_L_PAREN);
+                }
+            }
+            else if (tok.is(TokenKind::TK_SEMICOLON) ||
+                     tok.is(TokenKind::TK_L_BRACE) ||
+                     tok.is(TokenKind::TK_R_BRACE) ||
+                     tok.is(TokenKind::TK_R_PAREN) ||
+                     tok.is(TokenKind::TK_EQUAL) ||
+                     tok.is(TokenKind::TK_EXCLAIMEQUAL) ||
+                     tok.is(TokenKind::TK_L_ANGLE) ||
+                     tok.is(TokenKind::TK_R_ANGLE) ||
+                     tok.is(TokenKind::TK_AMP) ||
+                     tok.is(TokenKind::TK_PIPE) ||
+                     tok.is(TokenKind::TK_PLUS) ||
+                     tok.is(TokenKind::TK_MINUS) ||
+                     tok.is(TokenKind::TK_SLASH) ||
+                     tok.is(TokenKind::TK_PERCENT) ||
+                     tok.is(TokenKind::TK_KW_IF) ||
+                     tok.is(TokenKind::TK_KW_WHILE) ||
+                     tok.is(TokenKind::TK_KW_FOR) ||
+                     tok.is(TokenKind::TK_KW_RETURN))
+            {
+                // These tokens cannot appear inside generic type arguments
+                // If we see them before finding '>(' at depth 0, it's a comparison
+                // Note: TK_STAR is not included since * can be a pointer type modifier
+                return false;
+            }
+
+            // Tokens that ARE valid in generic type args:
+            // - Identifiers (type names)
+            // - Type keywords (i32, u64, string, etc.)
+            // - Comma (separating type args)
+            // - Star (pointer types)
+            // - Ampersand (reference types)
+            // - Square brackets (array types)
+            // - Colons (for scope resolution like std::Vec)
+
+            pos++;
+        }
+
+        // Exceeded lookahead limit without finding definitive answer
+        // Default to treating as comparison (safer)
+        return false;
     }
 
     // Function type parsing helpers
@@ -5780,6 +5961,47 @@ namespace Cryo
 
     TypeRef Parser::resolve_type_from_string(const std::string &type_str)
     {
+        // Handle pointer types - check if type ends with '*'
+        // This handles types like u8*, ArenaChunk*, int**, etc.
+        if (!type_str.empty() && type_str.back() == '*')
+        {
+            // Count trailing asterisks to handle multi-level pointers
+            size_t ptr_count = 0;
+            size_t pos = type_str.size();
+            while (pos > 0 && type_str[pos - 1] == '*')
+            {
+                ptr_count++;
+                pos--;
+            }
+
+            // Get the base type string (without the asterisks)
+            std::string base_type_str = type_str.substr(0, pos);
+
+            LOG_DEBUG(LogComponent::PARSER, "Resolving pointer type '{}': base='{}', ptr_levels={}",
+                      type_str, base_type_str, ptr_count);
+
+            // Recursively resolve the base type
+            TypeRef base_type = resolve_type_from_string(base_type_str);
+
+            // If base type failed to resolve, propagate the error
+            if (!base_type.is_valid() || base_type.is_error())
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Base type '{}' could not be resolved, deferring pointer type '{}'",
+                          base_type_str, type_str);
+                return _context.types().create_error("unresolved type: " + type_str, SourceLocation{});
+            }
+
+            // Wrap the base type in pointer types
+            TypeRef result = base_type;
+            for (size_t i = 0; i < ptr_count; i++)
+            {
+                result = _context.types().get_pointer_to(result);
+            }
+
+            LOG_DEBUG(LogComponent::PARSER, "Successfully resolved pointer type '{}'", type_str);
+            return result;
+        }
+
         // Handle basic built-in types first
         if (type_str == "void")
             return _context.types().get_void();

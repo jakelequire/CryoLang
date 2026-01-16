@@ -2107,6 +2107,67 @@ namespace Cryo::Codegen
                         }
                     }
                 }
+                // Handle nested member access (e.g., this.current_chunk.next)
+                else if (auto *nested_member = dynamic_cast<Cryo::MemberAccessNode *>(member->object()))
+                {
+                    // Recursively resolve the type of the nested member access
+                    // First, get the base type (e.g., for this.current_chunk, get 'this' type)
+                    std::string base_type_name;
+                    if (auto *base_ident = dynamic_cast<Cryo::IdentifierNode *>(nested_member->object()))
+                    {
+                        if (base_ident->name() == "this")
+                        {
+                            auto &var_types = ctx().variable_types_map();
+                            auto it = var_types.find("this");
+                            if (it != var_types.end() && it->second)
+                            {
+                                base_type_name = it->second.get()->display_name();
+                                if (!base_type_name.empty() && base_type_name.back() == '*')
+                                {
+                                    base_type_name.pop_back();
+                                }
+                            }
+                            else
+                            {
+                                base_type_name = ctx().current_type_name();
+                            }
+                        }
+                    }
+
+                    // Now look up the nested member's type (e.g., current_chunk in ArenaChunk)
+                    if (!base_type_name.empty())
+                    {
+                        std::string nested_field = nested_member->member();
+                        // Look up the struct type to get field type
+                        TypeRef struct_type_ref = ctx().symbols().lookup_struct_type(base_type_name);
+                        if (struct_type_ref.is_valid() && struct_type_ref->kind() == Cryo::TypeKind::Struct)
+                        {
+                            auto *struct_ty = static_cast<const Cryo::StructType *>(struct_type_ref.get());
+                            auto field_type_opt = struct_ty->field_type(nested_field);
+                            if (field_type_opt.has_value())
+                            {
+                                TypeRef field_type = field_type_opt.value();
+                                type_name = field_type.get()->display_name();
+                                // If it's a pointer, get the pointee type name
+                                if (field_type->kind() == Cryo::TypeKind::Pointer)
+                                {
+                                    auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(field_type.get());
+                                    if (ptr_type && ptr_type->pointee().is_valid())
+                                    {
+                                        type_name = ptr_type->pointee().get()->display_name();
+                                    }
+                                }
+                                else if (!type_name.empty() && type_name.back() == '*')
+                                {
+                                    type_name.pop_back();
+                                }
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "get_lvalue_address: Resolved nested member {} in {} to type {}",
+                                          nested_field, base_type_name, type_name);
+                            }
+                        }
+                    }
+                }
             }
 
             if (type_name.empty())

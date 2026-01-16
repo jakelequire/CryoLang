@@ -511,6 +511,9 @@ namespace Cryo
         // Get TypeArena for creating proper type objects
         TypeArena &type_arena = _symbol_table.arena();
 
+        // Get or create a proper ModuleID for this module
+        ModuleID module_id = _ast_context.modules().get_or_create_module(module_name);
+
         // Process all top-level declarations
         for (const auto &statement : ast.statements())
         {
@@ -520,28 +523,28 @@ namespace Cryo
                 {
                     // Create function symbol with proper type information
                     TypeRef func_type = create_function_type_from_declaration(func_decl, &type_arena);
-                    Symbol symbol(func_decl->name(), SymbolKind::Function, func_type, ModuleID::invalid(), func_decl->location());
+                    Symbol symbol(func_decl->name(), SymbolKind::Function, func_type, module_id, func_decl->location());
                     symbol.scope = module_name;
                     symbol_map[func_decl->name()] = symbol;
                 }
                 else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(decl))
                 {
                     // Create variable symbol
-                    Symbol symbol(var_decl->name(), SymbolKind::Variable, TypeRef{}, ModuleID::invalid(), var_decl->location());
+                    Symbol symbol(var_decl->name(), SymbolKind::Variable, TypeRef{}, module_id, var_decl->location());
                     symbol.scope = module_name;
                     symbol_map[var_decl->name()] = symbol;
                 }
                 else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(decl))
                 {
                     // Create type symbol for struct
-                    Symbol symbol(struct_decl->name(), SymbolKind::Type, TypeRef{}, ModuleID::invalid(), struct_decl->location());
+                    Symbol symbol(struct_decl->name(), SymbolKind::Type, TypeRef{}, module_id, struct_decl->location());
                     symbol.scope = module_name;
                     symbol_map[struct_decl->name()] = symbol;
                 }
                 else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(decl))
                 {
                     // Create type symbol for class
-                    Symbol symbol(class_decl->name(), SymbolKind::Type, TypeRef{}, ModuleID::invalid(), class_decl->location());
+                    Symbol symbol(class_decl->name(), SymbolKind::Type, TypeRef{}, module_id, class_decl->location());
                     symbol.scope = module_name;
                     symbol_map[class_decl->name()] = symbol;
                 }
@@ -565,7 +568,7 @@ namespace Cryo
                     else
                     {
                         // For non-generic enums, create a regular enum type
-                        QualifiedTypeName enum_qname{ModuleID::invalid(), enum_decl->name()};
+                        QualifiedTypeName enum_qname{module_id, enum_decl->name()};
                         enum_type = type_arena.create_enum(enum_qname);
 
                         // Build variants and set them on the enum type
@@ -588,7 +591,7 @@ namespace Cryo
                     }
 
                     // Create type symbol for enum
-                    Symbol symbol(enum_decl->name(), SymbolKind::Type, enum_type, ModuleID::invalid(), enum_decl->location());
+                    Symbol symbol(enum_decl->name(), SymbolKind::Type, enum_type, module_id, enum_decl->location());
                     symbol.scope = module_name;
                     symbol_map[enum_decl->name()] = symbol;
                 }
@@ -598,7 +601,7 @@ namespace Cryo
                     TypeRef intrinsic_type = create_function_type_from_declaration(intrinsic_decl, &type_arena);
                     if (intrinsic_type.is_valid())
                     {
-                        Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_type, ModuleID::invalid(), intrinsic_decl->location());
+                        Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_type, module_id, intrinsic_decl->location());
                         symbol.scope = module_name;
                         symbol_map[intrinsic_decl->name()] = symbol;
                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added intrinsic '{}' to symbol map with type '{}'",
