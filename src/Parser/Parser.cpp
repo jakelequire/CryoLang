@@ -4,6 +4,7 @@
 #include <iostream>
 #include <cctype>
 #include <algorithm>
+#include <optional>
 
 namespace Cryo
 {
@@ -4729,12 +4730,14 @@ namespace Cryo
             }
         }
 
-        // Register the enum type in TypeContext so future type resolution can find it
+        // Register the enum type in TypeContext AND SymbolTable so future type resolution can find it
         // Skip registration for generic enums (they'll be handled by template system)
         if (enum_decl->generic_parameters().empty())
         {
             QualifiedTypeName qname{_current_module_id, enum_name};
-            _context.types().create_enum(qname);
+            TypeRef enum_type = _context.types().create_enum(qname);
+            // Register in symbol table so other types in the same file can reference this enum
+            _context.symbols().declare_type(enum_name, enum_type, start_loc);
             // TODO: Populate enum variants on the type - currently handled in TypeChecker
             LOG_DEBUG(LogComponent::PARSER, "Registered enum type: {} in module {} (simple={}, variants={})",
                       enum_name, _current_module_id.id, is_simple_enum, variant_names.size());
@@ -5999,6 +6002,50 @@ namespace Cryo
             }
 
             LOG_DEBUG(LogComponent::PARSER, "Successfully resolved pointer type '{}'", type_str);
+            return result;
+        }
+
+        // Handle fixed-size array types - e.g., u8[4], i32[10], etc.
+        // Array types end with [size] where size is a number
+        size_t bracket_pos = type_str.find('[');
+        if (bracket_pos != std::string::npos && type_str.back() == ']')
+        {
+            std::string base_type_str = type_str.substr(0, bracket_pos);
+            std::string size_str = type_str.substr(bracket_pos + 1, type_str.size() - bracket_pos - 2);
+
+            LOG_DEBUG(LogComponent::PARSER, "Resolving array type '{}': base='{}', size_str='{}'",
+                      type_str, base_type_str, size_str);
+
+            // Parse the size
+            std::optional<size_t> array_size;
+            if (!size_str.empty())
+            {
+                try
+                {
+                    array_size = std::stoull(size_str);
+                }
+                catch (...)
+                {
+                    LOG_DEBUG(LogComponent::PARSER, "Failed to parse array size '{}' for type '{}'",
+                              size_str, type_str);
+                    return _context.types().create_error("invalid array size: " + type_str, SourceLocation{});
+                }
+            }
+
+            // Recursively resolve the base type
+            TypeRef base_type = resolve_type_from_string(base_type_str);
+
+            // If base type failed to resolve, propagate the error
+            if (!base_type.is_valid() || base_type.is_error())
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Base type '{}' could not be resolved, deferring array type '{}'",
+                          base_type_str, type_str);
+                return _context.types().create_error("unresolved type: " + type_str, SourceLocation{});
+            }
+
+            // Create the array type
+            TypeRef result = _context.types().get_array_of(base_type, array_size);
+            LOG_DEBUG(LogComponent::PARSER, "Successfully resolved array type '{}'", type_str);
             return result;
         }
 

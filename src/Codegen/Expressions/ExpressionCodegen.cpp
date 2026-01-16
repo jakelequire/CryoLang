@@ -1957,9 +1957,27 @@ namespace Cryo::Codegen
         TypeRef obj_type = object->get_resolved_type();
         if (!obj_type)
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "resolve_member_info: No resolved type for object");
-            return false;
+            // Fallback: If object is an identifier, try looking up its type from variable_types_map
+            if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(object))
+            {
+                const std::string &var_name = identifier->name();
+                auto &var_types = ctx().variable_types_map();
+                auto it = var_types.find(var_name);
+                if (it != var_types.end() && it->second.is_valid())
+                {
+                    obj_type = it->second;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_member_info: Found type for '{}' in variable_types_map: {}",
+                              var_name, obj_type->display_name());
+                }
+            }
+
+            if (!obj_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_member_info: No resolved type for object");
+                return false;
+            }
         }
 
         // Get type name (handle pointer types)

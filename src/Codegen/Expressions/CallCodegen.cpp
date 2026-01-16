@@ -4,6 +4,8 @@
 #include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Codegen/Intrinsics.hpp"
 #include "AST/ASTVisitor.hpp"
+#include "AST/TemplateRegistry.hpp"
+#include "Types/UserDefinedTypes.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -2113,7 +2115,9 @@ namespace Cryo::Codegen
                 type_name.pop_back();
             }
         }
-        else
+
+        // If type_name is still empty, try fallback methods
+        if (type_name.empty())
         {
             // Fallback: Check if this is the 'this' identifier
             if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(node->object()))
@@ -2135,6 +2139,119 @@ namespace Cryo::Codegen
                     {
                         // Fallback to current_type_name if available
                         type_name = ctx().current_type_name();
+                    }
+                }
+            }
+            // Handle nested member access (e.g., this.current_chunk.next)
+            else if (auto *nested_member = dynamic_cast<Cryo::MemberAccessNode *>(node->object()))
+            {
+                // Recursively resolve the type of the nested member access
+                std::string base_type_name;
+                if (auto *base_ident = dynamic_cast<Cryo::IdentifierNode *>(nested_member->object()))
+                {
+                    if (base_ident->name() == "this")
+                    {
+                        auto &var_types = ctx().variable_types_map();
+                        auto it = var_types.find("this");
+                        if (it != var_types.end() && it->second.is_valid())
+                        {
+                            base_type_name = it->second->display_name();
+                            if (!base_type_name.empty() && base_type_name.back() == '*')
+                            {
+                                base_type_name.pop_back();
+                            }
+                        }
+                        else
+                        {
+                            base_type_name = ctx().current_type_name();
+                        }
+                    }
+                }
+
+                // Look up the nested member's type
+                if (!base_type_name.empty())
+                {
+                    std::string nested_field = nested_member->member();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_member_receiver_address: Looking up field '{}' in struct '{}'",
+                              nested_field, base_type_name);
+
+                    // Use TemplateRegistry to get field type (it stores struct field types)
+                    bool found_field = false;
+                    if (auto *template_reg = ctx().template_registry())
+                    {
+                        const TemplateRegistry::StructFieldInfo *field_info = template_reg->get_struct_field_types(base_type_name);
+                        if (field_info)
+                        {
+                            // Find the field in field_names and get its type from field_types
+                            for (size_t i = 0; i < field_info->field_names.size(); ++i)
+                            {
+                                if (field_info->field_names[i] == nested_field && i < field_info->field_types.size())
+                                {
+                                    TypeRef field_type = field_info->field_types[i];
+                                    if (field_type.is_valid())
+                                    {
+                                        type_name = field_type->display_name();
+                                        if (field_type->kind() == Cryo::TypeKind::Pointer)
+                                        {
+                                            auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(field_type.get());
+                                            if (ptr_type && ptr_type->pointee().is_valid())
+                                            {
+                                                type_name = ptr_type->pointee()->display_name();
+                                            }
+                                        }
+                                        else if (!type_name.empty() && type_name.back() == '*')
+                                        {
+                                            type_name.pop_back();
+                                        }
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "generate_member_receiver_address: Resolved nested member {} in {} to type {} (via TemplateRegistry)",
+                                                  nested_field, base_type_name, type_name);
+                                        found_field = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!found_field)
+                    {
+                        // Fallback: try StructType::field_type (in case fields were populated there)
+                        TypeRef struct_type_ref = ctx().symbols().lookup_struct_type(base_type_name);
+                        if (struct_type_ref.is_valid() && struct_type_ref->kind() == Cryo::TypeKind::Struct)
+                        {
+                            auto *struct_ty = static_cast<const Cryo::StructType *>(struct_type_ref.get());
+                            auto field_type_opt = struct_ty->field_type(nested_field);
+                            if (field_type_opt.has_value())
+                            {
+                                TypeRef field_type = field_type_opt.value();
+                                type_name = field_type->display_name();
+                                if (field_type->kind() == Cryo::TypeKind::Pointer)
+                                {
+                                    auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(field_type.get());
+                                    if (ptr_type && ptr_type->pointee().is_valid())
+                                    {
+                                        type_name = ptr_type->pointee()->display_name();
+                                    }
+                                }
+                                else if (!type_name.empty() && type_name.back() == '*')
+                                {
+                                    type_name.pop_back();
+                                }
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_member_receiver_address: Resolved nested member {} in {} to type {} (via StructType)",
+                                          nested_field, base_type_name, type_name);
+                                found_field = true;
+                            }
+                        }
+                    }
+
+                    if (!found_field)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_member_receiver_address: field_type not found for '{}' in struct '{}' (checked TemplateRegistry and StructType)",
+                                  nested_field, base_type_name);
                     }
                 }
             }
