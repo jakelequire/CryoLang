@@ -25,9 +25,6 @@ include makefile.config
 # Include test framework configuration
 include test.makefile.config
 
-# Include WebAssembly build configuration
-include wasm.makefile.config
-
 # Determine number of CPU cores
 ifeq ($(OS), Windows_NT)
     NUM_CORES = $(NUMBER_OF_PROCESSORS)
@@ -78,12 +75,12 @@ endif
 # Define all source files
 ifeq ($(OS), Windows_NT)
     # Windows - using MSYS2 find with full path
-    C_SRCS := $(shell C:/msys64/usr/bin/find $(SRC_DIR) -name "*.c" -type f ! -path "$(SRC_DIR)wasm/*")
-    CPP_SRCS := $(shell C:/msys64/usr/bin/find $(SRC_DIR) -name "*.cpp" -type f ! -path "$(SRC_DIR)wasm/*")
+    C_SRCS := $(shell C:/msys64/usr/bin/find $(SRC_DIR) -name "*.c" -type f ! -path "*/wasm/*")
+    CPP_SRCS := $(shell C:/msys64/usr/bin/find $(SRC_DIR) -name "*.cpp" -type f ! -path "*/wasm/*")
 else
     # Linux - native find
-    C_SRCS := $(shell find $(SRC_DIR) -name "*.c" -type f ! -path "$(SRC_DIR)wasm/*")
-    CPP_SRCS := $(shell find $(SRC_DIR) -name "*.cpp" -type f ! -path "$(SRC_DIR)wasm/*")
+    C_SRCS := $(shell find $(SRC_DIR) -name "*.c" -type f ! -path "*/wasm/*")
+    CPP_SRCS := $(shell find $(SRC_DIR) -name "*.cpp" -type f ! -path "*/wasm/*")
 endif
 
 # ---------------------------------------------
@@ -204,8 +201,8 @@ STDLIB_FLAGS ?= # Additional flags for stdlib compilation (e.g., --debug --verbo
 # Find all stdlib source files - using dynamic discovery for both Windows and Linux
 # Exclude the runtime directory from stdlib compilation
 ifeq ($(OS), Windows_NT)
-    # Use PowerShell to find all .cryo files recursively, excluding runtime directory
-    STDLIB_SRCS := $(shell powershell -Command "Get-ChildItem -Path './stdlib' -Recurse -Filter '*.cryo' | Where-Object { $$_.FullName -notlike '*runtime*' } | ForEach-Object { $$_.FullName.Replace('$(shell powershell -Command "(Get-Location).Path")', '.').Replace('\', '/') } | ForEach-Object { $$_.Replace('./stdlib/', '') }")
+    # Use MSYS2 find for reliable file discovery on Windows
+    STDLIB_SRCS := $(shell C:/msys64/usr/bin/find $(STDLIB_DIR) -name "*.cryo" -type f ! -path "*/test-cases/*" ! -path "*/runtime/*" | sed 's|$(STDLIB_DIR)/||')
 else
     STDLIB_SRCS := $(shell find $(STDLIB_DIR) -name "*.cryo" -type f | grep -v test-cases | grep -v runtime | sed 's|$(STDLIB_DIR)/||')
 endif
@@ -220,10 +217,10 @@ RUNTIME_LIB = $(BIN_DIR)stdlib/runtime.a
 
 # Find all runtime source files
 ifeq ($(OS), Windows_NT)
-    # Use PowerShell to find all .cryo files in runtime directory
-    RUNTIME_SRCS := $(shell powershell -Command "Get-ChildItem -Path './stdlib/runtime' -Filter '*.cryo' | ForEach-Object { $$_.Name }")
+    # Use MSYS2 find for reliable file discovery on Windows (handle missing dir gracefully)
+    RUNTIME_SRCS := $(shell C:/msys64/usr/bin/find $(RUNTIME_DIR) -name "*.cryo" -type f 2>/dev/null | sed 's|$(RUNTIME_DIR)/||')
 else
-    RUNTIME_SRCS := $(shell find $(RUNTIME_DIR) -name "*.cryo" -type f | sed 's|$(RUNTIME_DIR)/||')
+    RUNTIME_SRCS := $(shell find $(RUNTIME_DIR) -name "*.cryo" -type f 2>/dev/null | sed 's|$(RUNTIME_DIR)/||')
 endif
 
 # Generate corresponding bitcode files
