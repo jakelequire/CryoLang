@@ -6,9 +6,11 @@
 #include "Diagnostics/Diag.hpp"
 #include "AST/ASTNode.hpp"
 #include "Utils/File.hpp"
+#include "Utils/SyntaxHighlighter.hpp"
 
 #include <sstream>
 #include <algorithm>
+#include <iomanip>
 
 namespace Cryo
 {
@@ -176,6 +178,28 @@ namespace Cryo
 
     void DiagEmitter::emit(Diag diagnostic)
     {
+        // Check for duplicate errors at the same location (cascading error prevention)
+        auto new_span = diagnostic.primary_span();
+        if (new_span && new_span->is_valid() && diagnostic.is_error())
+        {
+            for (const auto &existing : _diagnostics)
+            {
+                if (!existing.is_error())
+                    continue;
+
+                auto existing_span = existing.primary_span();
+                if (existing_span && existing_span->is_valid() &&
+                    existing_span->file == new_span->file &&
+                    existing_span->start_line == new_span->start_line &&
+                    existing_span->start_col == new_span->start_col)
+                {
+                    // Already have an error at this exact location - skip this one
+                    // This prevents cascading parser errors from cluttering output
+                    return;
+                }
+            }
+        }
+
         // Update counts
         if (diagnostic.is_error())
         {
@@ -193,10 +217,7 @@ namespace Cryo
             }
         }
 
-        // Render immediately
-        render(diagnostic, std::cerr);
-
-        // Store for later access
+        // Store for later batch rendering (don't render immediately to avoid duplicates)
         _diagnostics.push_back(std::move(diagnostic));
     }
 
@@ -225,23 +246,52 @@ namespace Cryo
 
     void DiagEmitter::render_all(std::ostream &out) const
     {
+        // Create syntax highlighter for code highlighting
+        SyntaxHighlighter highlighter;
+        highlighter.set_color_output(_config.colors);
+
+        size_t error_num = 0;
         for (const auto &diag : _diagnostics)
         {
-            render(diag, out);
+            if (error_num > 0)
+            {
+                // Separator between diagnostics
+                if (_config.colors)
+                {
+                    out << "\033[90m" << std::string(80, '-') << "\033[0m\n\n";
+                }
+                else
+                {
+                    out << std::string(80, '-') << "\n\n";
+                }
+            }
+            ++error_num;
+            render_diagnostic(diag, highlighter, error_num, out);
         }
     }
 
     void DiagEmitter::render(const Diag &diagnostic, std::ostream &out) const
     {
+        SyntaxHighlighter highlighter;
+        highlighter.set_color_output(_config.colors);
+        render_diagnostic(diagnostic, highlighter, 0, out);
+    }
+
+    void DiagEmitter::render_diagnostic(const Diag &diagnostic, SyntaxHighlighter &highlighter,
+                                        size_t error_num, std::ostream &out) const
+    {
         // Color codes
         const char *RESET = _config.colors ? "\033[0m" : "";
         const char *BOLD = _config.colors ? "\033[1m" : "";
-        const char *RED = _config.colors ? "\033[31m" : "";
-        const char *YELLOW = _config.colors ? "\033[33m" : "";
-        const char *CYAN = _config.colors ? "\033[36m" : "";
-        const char *BLUE = _config.colors ? "\033[34m" : "";
-        const char *GREEN = _config.colors ? "\033[32m" : "";
-        const char *MAGENTA = _config.colors ? "\033[35m" : "";
+        const char *DIM = _config.colors ? "\033[2m" : "";
+        const char *RED = _config.colors ? "\033[91m" : "";       // Bright red
+        const char *YELLOW = _config.colors ? "\033[93m" : "";    // Bright yellow
+        const char *CYAN = _config.colors ? "\033[96m" : "";      // Bright cyan
+        const char *BLUE = _config.colors ? "\033[94m" : "";      // Bright blue
+        const char *GREEN = _config.colors ? "\033[92m" : "";     // Bright green
+        const char *MAGENTA = _config.colors ? "\033[95m" : "";   // Bright magenta
+        const char *WHITE = _config.colors ? "\033[97m" : "";     // Bright white
+        const char *GREY = _config.colors ? "\033[90m" : "";      // Grey for line numbers
 
         // Get level color and text
         const char *level_color = RED;
@@ -262,20 +312,24 @@ namespace Cryo
             break;
         case Diag::Level::Fatal:
             level_color = RED;
-            level_text = "fatal";
+            level_text = "fatal error";
             break;
         }
 
-        // Format error code
-        std::string code_str = ErrorRegistry::format_error_code(diagnostic.code());
+        // Get full error code name (e.g., E0101_UNEXPECTED_TOKEN)
+        std::string full_code = ErrorRegistry::error_code_to_string(diagnostic.code());
 
-        // Header: error[E0200]: message
-        out << BOLD << level_color << level_text << RESET;
-        if (!code_str.empty() && diagnostic.code() != ErrorCode::E0000_UNKNOWN)
+        // Header: (1) error[E0101_UNEXPECTED_TOKEN]: message
+        if (error_num > 0)
         {
-            out << "[" << BOLD << MAGENTA << code_str << RESET << "]";
+            out << GREY << "(" << error_num << ") " << RESET;
         }
-        out << ": " << BOLD << diagnostic.message() << RESET << "\n";
+        out << BOLD << level_color << level_text << RESET;
+        if (diagnostic.code() != ErrorCode::E0000_UNKNOWN)
+        {
+            out << "[" << BOLD << level_color << full_code << RESET << "]";
+        }
+        out << ": " << BOLD << WHITE << diagnostic.message() << RESET << "\n";
 
         // Location and source snippet
         auto primary = diagnostic.primary_span();
@@ -286,17 +340,17 @@ namespace Cryo
                 << primary->file << ":" << primary->start_line << ":"
                 << primary->start_col << "\n";
 
-            // Try to show source code
+            // Try to show source code with syntax highlighting
             if (has_source(primary->file))
             {
-                // Calculate line number width
+                // Calculate line number width (minimum 3 for aesthetics)
                 size_t max_line = primary->end_line + _config.context_lines;
-                size_t line_width = std::to_string(max_line).length();
+                size_t line_width = std::max(size_t(3), std::to_string(max_line).length());
 
                 // Empty margin line
-                out << std::string(line_width + 1, ' ') << BLUE << "|" << RESET << "\n";
+                out << std::string(line_width, ' ') << " " << BLUE << "|" << RESET << "\n";
 
-                // Show lines
+                // Show lines with syntax highlighting
                 size_t start_line = primary->start_line > _config.context_lines
                                         ? primary->start_line - _config.context_lines
                                         : 1;
@@ -308,92 +362,171 @@ namespace Cryo
                     if (line_content.empty() && line_no > primary->end_line)
                         break;
 
-                    // Line number
+                    // Line number (right-aligned, dimmed for context lines)
                     std::string line_num = std::to_string(line_no);
-                    out << std::string(line_width - line_num.length(), ' ')
-                        << BLUE << line_num << " |" << RESET << " ";
+                    bool is_error_line = (line_no >= primary->start_line && line_no <= primary->end_line);
 
-                    // Line content
-                    out << line_content << "\n";
+                    out << std::string(line_width - line_num.length(), ' ');
+                    if (is_error_line)
+                    {
+                        out << BOLD << BLUE << line_num << RESET;
+                    }
+                    else
+                    {
+                        out << GREY << line_num << RESET;
+                    }
+                    out << " " << BLUE << "|" << RESET << " ";
+
+                    // Syntax-highlighted line content
+                    std::string line_str(line_content);
+                    if (_config.colors)
+                    {
+                        out << highlighter.highlight_line(line_str) << "\n";
+                    }
+                    else
+                    {
+                        out << line_str << "\n";
+                    }
 
                     // Underline for error lines
-                    if (line_no >= primary->start_line && line_no <= primary->end_line)
+                    if (is_error_line)
                     {
-                        out << std::string(line_width + 1, ' ') << BLUE << "|" << RESET << " ";
+                        out << std::string(line_width, ' ') << " " << BLUE << "|" << RESET << " ";
 
                         // Calculate underline position
                         size_t underline_start = (line_no == primary->start_line)
-                                                     ? primary->start_col - 1
+                                                     ? (primary->start_col > 0 ? primary->start_col - 1 : 0)
                                                      : 0;
                         size_t underline_end = (line_no == primary->end_line)
-                                                   ? primary->end_col - 1
+                                                   ? (primary->end_col > 0 ? primary->end_col - 1 : line_content.length())
                                                    : line_content.length();
 
-                        // Spaces before underline
-                        out << std::string(underline_start, ' ');
+                        // Ensure valid range
+                        if (underline_start > line_content.length())
+                            underline_start = line_content.length();
+                        if (underline_end > line_content.length())
+                            underline_end = line_content.length();
+                        if (underline_end <= underline_start)
+                            underline_end = underline_start + 1;
 
-                        // Underline
-                        size_t underline_len = underline_end > underline_start
-                                                   ? underline_end - underline_start
-                                                   : 1;
-                        out << BOLD << level_color
-                            << std::string(underline_len, '^') << RESET;
-
-                        // Label on last line
-                        if (line_no == primary->end_line && !primary->label.empty())
+                        // Spaces before underline (account for tabs)
+                        std::string spaces;
+                        for (size_t i = 0; i < underline_start && i < line_content.length(); ++i)
                         {
-                            out << " " << BOLD << level_color << primary->label << RESET;
+                            if (line_content[i] == '\t')
+                                spaces += "    "; // 4 spaces per tab
+                            else
+                                spaces += ' ';
+                        }
+                        out << spaces;
+
+                        // Calculate underline length - try to extend to cover the token
+                        size_t underline_len = underline_end - underline_start;
+                        if (underline_len <= 1 && underline_start < line_content.length())
+                        {
+                            // Try to find the extent of the current token
+                            size_t token_end = underline_start;
+                            // Extend to cover alphanumeric characters or operators
+                            while (token_end < line_content.length())
+                            {
+                                char c = line_content[token_end];
+                                if (std::isalnum(c) || c == '_' || c == ':' || c == '(' || c == ')')
+                                {
+                                    ++token_end;
+                                }
+                                else if (token_end == underline_start)
+                                {
+                                    // At least include the first character
+                                    ++token_end;
+                                    break;
+                                }
+                                else
+                                {
+                                    break;
+                                }
+                            }
+                            underline_len = token_end - underline_start;
+                            if (underline_len < 1) underline_len = 1;
+                        }
+
+                        // Draw the underline: ^~~~ style
+                        out << BOLD << level_color << "^";
+                        if (underline_len > 1)
+                        {
+                            out << std::string(underline_len - 1, '~');
+                        }
+                        out << RESET;
+
+                        // Inline label on the underline - use span label if set, otherwise use the error message
+                        if (line_no == primary->end_line)
+                        {
+                            std::string inline_label = primary->label.empty()
+                                ? diagnostic.message()
+                                : primary->label;
+                            if (!inline_label.empty())
+                            {
+                                out << " " << BOLD << level_color << inline_label << RESET;
+                            }
                         }
                         out << "\n";
                     }
                 }
 
                 // Empty margin line after
-                out << std::string(line_width + 1, ' ') << BLUE << "|" << RESET << "\n";
+                out << std::string(line_width, ' ') << " " << BLUE << "|" << RESET << "\n";
             }
         }
 
-        // Secondary spans
+        // Secondary spans with their own source snippets
         for (const auto &span : diagnostic.spans())
         {
             if (span.is_primary || !span.is_valid())
                 continue;
 
-            out << "  " << BLUE << "-->" << RESET << " "
+            out << "  " << BLUE << "::" << RESET << " "
                 << span.file << ":" << span.start_line << ":" << span.start_col;
             if (!span.label.empty())
             {
-                out << ": " << span.label;
+                out << " - " << CYAN << span.label << RESET;
             }
             out << "\n";
         }
 
-        // Notes
+        // Notes (indented with marker)
         for (const auto &note : diagnostic.notes())
         {
             out << "  " << BOLD << CYAN << "note" << RESET << ": " << note << "\n";
         }
 
-        // Help messages
+        // Help messages (indented with marker)
         for (const auto &help : diagnostic.help_messages())
         {
             out << "  " << BOLD << GREEN << "help" << RESET << ": " << help << "\n";
         }
 
-        // Suggestions with code
+        // Suggestions with replacement code
         for (const auto &suggestion : diagnostic.suggestions())
         {
             if (!suggestion.message.empty())
             {
-                out << "  " << BOLD << GREEN << "help" << RESET << ": "
+                out << "  " << BOLD << GREEN << "suggestion" << RESET << ": "
                     << suggestion.message << "\n";
             }
             if (!suggestion.replacement.empty() && suggestion.span.is_valid())
             {
-                out << "  " << BLUE << "|" << RESET << "\n";
-                out << "  " << BLUE << "|" << RESET << " "
-                    << suggestion.replacement << "\n";
-                out << "  " << BLUE << "|" << RESET << "\n";
+                out << "   " << BLUE << "|" << RESET << "\n";
+                // Highlight the suggestion too
+                if (_config.colors)
+                {
+                    out << "   " << BLUE << "|" << RESET << " "
+                        << GREEN << suggestion.replacement << RESET << "\n";
+                }
+                else
+                {
+                    out << "   " << BLUE << "|" << RESET << " "
+                        << suggestion.replacement << "\n";
+                }
+                out << "   " << BLUE << "|" << RESET << "\n";
             }
         }
 
