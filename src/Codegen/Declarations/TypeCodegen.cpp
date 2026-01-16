@@ -581,6 +581,19 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Check if any field has an error type - if so, skip generating this struct
+        for (const auto &field : node->fields())
+        {
+            TypeRef field_type = field->get_resolved_type();
+            if (field_type.is_error())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "TypeCodegen: Skipping struct '{}' - field '{}' has error type: '{}'",
+                          name, field->name(), field_type->display_name());
+                return nullptr;
+            }
+        }
+
         llvm::StructType *struct_type = nullptr;
 
         // Check if already declared
