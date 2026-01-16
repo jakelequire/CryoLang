@@ -300,6 +300,16 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Skip methods that have their own generic parameters (e.g., alloc_one<T>)
+        // These should only be generated when instantiated with concrete types
+        if (!node->generic_parameters().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Skipping generic method declaration '{}' - has {} generic type parameters",
+                      node->name(), node->generic_parameters().size());
+            return nullptr;
+        }
+
         // Additional check: detect uninstantiated type parameters in signature
         // This catches cases where the generic template check above didn't work
         for (const auto &param : node->parameters())
@@ -326,6 +336,31 @@ namespace Cryo::Codegen
                                   node->name(), param->name(), ptype.get()->display_name());
                         return nullptr;
                     }
+                }
+            }
+        }
+
+        // Also check if return type has generic parameters
+        if (node->get_resolved_return_type())
+        {
+            TypeRef ret_type = node->get_resolved_return_type();
+            if (ret_type->kind() == TypeKind::GenericParam)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Skipping method declaration '{}' - return type is generic '{}'",
+                          node->name(), ret_type.get()->display_name());
+                return nullptr;
+            }
+            // Also check for pointer to generic type
+            if (ret_type->kind() == TypeKind::Pointer)
+            {
+                auto *ptr_type = static_cast<const PointerType *>(ret_type.get());
+                if (ptr_type->pointee().is_valid() && ptr_type->pointee()->kind() == TypeKind::GenericParam)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping method declaration '{}' - return type is pointer to generic",
+                              node->name());
+                    return nullptr;
                 }
             }
         }
@@ -387,11 +422,16 @@ namespace Cryo::Codegen
             ++arg_it;
         }
 
-        // Name remaining parameters
+        // Name remaining parameters (skip 'this' since we already handled it above)
         if (node->parameters().size() > 0)
         {
             for (const auto &param : node->parameters())
             {
+                // Skip 'this' parameter - already named above for non-static methods
+                if (param->name() == "this")
+                {
+                    continue;
+                }
                 if (arg_it != fn->arg_end())
                 {
                     arg_it->setName(param->name());
@@ -1212,8 +1252,17 @@ namespace Cryo::Codegen
         }
         
         // Special handling for constructors - if return type is void, fix it to pointer type
+        // Only apply this fix for static methods named "new" (conventional constructor name)
+        // Regular void-returning methods like reset(), drop() should stay void
+        bool is_likely_constructor = false;
+        if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode *>(node))
+        {
+            // Constructors are static methods named "new"
+            is_likely_constructor = struct_method->is_static() && node->name() == "new";
+        }
+
         if (resolved_type.is_valid() && resolved_type->kind() == TypeKind::Void &&
-            !parent_type_name.empty())
+            !parent_type_name.empty() && is_likely_constructor)
         {
             // This is a constructor with wrong return type - fix it to pointer to struct type
             TypeRef struct_type = ctx().symbols().lookup_struct_type(parent_type_name);
@@ -1285,6 +1334,12 @@ namespace Cryo::Codegen
         {
             for (const auto &param : node->parameters())
             {
+                // Skip 'this' parameter - it's already added above when has_this_param is true
+                if (param->name() == "this")
+                {
+                    continue;
+                }
+
                 llvm::Type *param_type = get_llvm_type(param->get_resolved_type());
                 if (param_type)
                 {
@@ -1769,6 +1824,16 @@ namespace Cryo::Codegen
             return;
         }
 
+        // Skip methods that have their own generic parameters (e.g., alloc_one<T>)
+        // These should only be generated when instantiated with concrete types
+        if (!node->generic_parameters().empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Skipping generic method '{}' - has {} generic type parameters",
+                      node->name(), node->generic_parameters().size());
+            return;
+        }
+
         // Additional check: detect uninstantiated type parameters in signature
         for (const auto &param : node->parameters())
         {
@@ -1792,6 +1857,31 @@ namespace Cryo::Codegen
                                   node->name(), ptype.get()->display_name());
                         return;
                     }
+                }
+            }
+        }
+
+        // Also check if return type has generic parameters
+        if (node->get_resolved_return_type())
+        {
+            TypeRef ret_type = node->get_resolved_return_type();
+            if (ret_type->kind() == TypeKind::GenericParam)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Skipping method '{}' - return type is generic '{}'",
+                          node->name(), ret_type.get()->display_name());
+                return;
+            }
+            // Also check for pointer to generic type
+            if (ret_type->kind() == TypeKind::Pointer)
+            {
+                auto *ptr_type = static_cast<const PointerType *>(ret_type.get());
+                if (ptr_type->pointee().is_valid() && ptr_type->pointee()->kind() == TypeKind::GenericParam)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping method '{}' - return type is pointer to generic",
+                              node->name());
+                    return;
                 }
             }
         }
@@ -1870,25 +1960,24 @@ namespace Cryo::Codegen
 
             // Register all parameter types in variable_types_map for Array<T> detection
             // StructMethodNode inherits from FunctionDeclarationNode so parameters() is available
+            // Note: AST params DO include 'this' for non-static methods, so LLVM args and AST params
+            // are aligned 1:1. We still skip 'this' since it's handled separately above.
             const auto &ast_params = node->parameters();
             size_t param_idx = 0;
-            bool seen_this = false;
             for (auto &arg : fn->args())
             {
                 // Skip 'this' as it's handled above (only for non-static methods)
                 if (arg.getName() == "this")
                 {
-                    seen_this = true;
                     param_idx++;
                     continue;
                 }
 
-                // Account for 'this' parameter offset - AST params don't include 'this'
-                // Only subtract 1 if we've seen 'this' (non-static methods)
-                size_t ast_idx = seen_this ? param_idx - 1 : param_idx;
-                if (ast_idx < ast_params.size())
+                // AST params and LLVM args are aligned 1:1 (both include 'this')
+                // So we use param_idx directly
+                if (param_idx < ast_params.size())
                 {
-                    TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
+                    TypeRef param_type = ast_params[param_idx]->get_resolved_type();
                     if (param_type.is_valid())
                     {
                         std::string param_name = arg.getName().str();
@@ -2126,6 +2215,34 @@ namespace Cryo::Codegen
                                           type_name, this_type->display_name());
                             }
                         }
+                    }
+
+                    // Register all parameter types in variable_types_map
+                    // AST params and LLVM args are aligned 1:1 (both include 'this')
+                    const auto &ast_params = fn_node->parameters();
+                    size_t param_idx = 0;
+                    for (auto &arg : fn->args())
+                    {
+                        // Skip 'this' as it's handled above
+                        if (arg.getName() == "this")
+                        {
+                            param_idx++;
+                            continue;
+                        }
+
+                        if (param_idx < ast_params.size())
+                        {
+                            TypeRef param_type = ast_params[param_idx]->get_resolved_type();
+                            if (param_type.is_valid())
+                            {
+                                std::string param_name = arg.getName().str();
+                                ctx().variable_types_map()[param_name] = param_type;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "Registered impl method parameter type: {} -> {}",
+                                          param_name, param_type->display_name());
+                            }
+                        }
+                        param_idx++;
                     }
 
                     // Generate body

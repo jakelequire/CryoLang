@@ -1869,6 +1869,7 @@ namespace Cryo
     private:
         std::unique_ptr<ExpressionNode> _callee;
         std::vector<std::unique_ptr<ExpressionNode>> _arguments;
+        std::vector<std::string> _generic_args; // For generic function calls like alloc_one<T>()
 
     public:
         CallExpressionNode(SourceLocation loc, std::unique_ptr<ExpressionNode> callee)
@@ -1876,15 +1877,31 @@ namespace Cryo
 
         ExpressionNode *callee() const { return _callee.get(); }
         const std::vector<std::unique_ptr<ExpressionNode>> &arguments() const { return _arguments; }
+        const std::vector<std::string> &generic_args() const { return _generic_args; }
+        bool has_generic_args() const { return !_generic_args.empty(); }
 
         void add_argument(std::unique_ptr<ExpressionNode> arg)
         {
             _arguments.push_back(std::move(arg));
         }
 
+        void add_generic_arg(const std::string &type) { _generic_args.push_back(type); }
+
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "Call:" << std::endl;
+            os << std::string(indent, ' ') << "Call";
+            if (!_generic_args.empty())
+            {
+                os << "<";
+                for (size_t i = 0; i < _generic_args.size(); ++i)
+                {
+                    if (i > 0)
+                        os << ", ";
+                    os << _generic_args[i];
+                }
+                os << ">";
+            }
+            os << ":" << std::endl;
             if (_callee)
             {
                 os << std::string(indent + 2, ' ') << "Callee:" << std::endl;

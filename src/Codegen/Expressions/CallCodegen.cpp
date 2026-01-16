@@ -275,10 +275,39 @@ namespace Cryo::Codegen
                       "GenericInstantiation: Processing '{}'", function_name);
 
             // Parse the generic type name: "GenericStruct<int>" -> base="GenericStruct", type_args=["int"]
+            // Handle two cases:
+            // 1. function_name already contains <> (from identifier name embedding)
+            // 2. function_name is base name only, with generic_args stored separately in node
             size_t open_bracket = function_name.find('<');
             size_t close_bracket = function_name.rfind('>');
 
-            if (open_bracket == std::string::npos || close_bracket == std::string::npos)
+            std::string base_name;
+            std::string type_args_str;
+
+            if (open_bracket != std::string::npos && close_bracket != std::string::npos)
+            {
+                // Case 1: function_name contains the full generic signature
+                base_name = function_name.substr(0, open_bracket);
+                type_args_str = function_name.substr(open_bracket + 1, close_bracket - open_bracket - 1);
+            }
+            else if (node->has_generic_args())
+            {
+                // Case 2: generic_args are stored separately in the node
+                base_name = function_name;
+                const auto &generic_args = node->generic_args();
+                for (size_t i = 0; i < generic_args.size(); ++i)
+                {
+                    if (i > 0)
+                        type_args_str += ",";
+                    type_args_str += generic_args[i];
+                }
+                // Rebuild the full function_name for later use
+                function_name = base_name + "<" + type_args_str + ">";
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericInstantiation: Built function_name '{}' from node->generic_args()",
+                          function_name);
+            }
+            else
             {
                 // Fallback to function resolution
                 llvm::Function *fn = resolve_function(function_name);
@@ -290,9 +319,6 @@ namespace Cryo::Codegen
                              "Failed to resolve generic instantiation: " + function_name);
                 return nullptr;
             }
-
-            std::string base_name = function_name.substr(0, open_bracket);
-            std::string type_args_str = function_name.substr(open_bracket + 1, close_bracket - open_bracket - 1);
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "GenericInstantiation: base='{}', type_args_str='{}'", base_name, type_args_str);
@@ -385,7 +411,69 @@ namespace Cryo::Codegen
                 return generate_struct_constructor(node, instantiated_type->getName().str());
             }
 
-            // Not a generic struct, try as a function
+            // Not a generic struct, try as a generic function
+            // First check if there's a generic function template registered
+            if (generics->get_generic_function_def(base_name))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericInstantiation: '{}' is a generic function, instantiating",
+                          base_name);
+
+                // Parse type arguments similar to struct handling
+                std::vector<TypeRef> type_args;
+
+                // Trim whitespace from type_args_str
+                std::string trimmed = type_args_str;
+                size_t start = trimmed.find_first_not_of(" \t");
+                size_t end = trimmed.find_last_not_of(" \t");
+                if (start != std::string::npos && end != std::string::npos)
+                {
+                    trimmed = trimmed.substr(start, end - start + 1);
+                }
+
+                // Resolve the type argument
+                TypeRef arg_type{};
+                Symbol *type_sym = symbols().lookup_symbol(trimmed);
+                if (type_sym && type_sym->kind == SymbolKind::Type && type_sym->type.is_valid())
+                {
+                    arg_type = type_sym->type;
+                }
+                if (!arg_type.is_valid())
+                {
+                    // Try common primitive types
+                    if (trimmed == "int" || trimmed == "i32")
+                        arg_type = symbols().arena().get_i32();
+                    else if (trimmed == "i64")
+                        arg_type = symbols().arena().get_i64();
+                    else if (trimmed == "f32" || trimmed == "float")
+                        arg_type = symbols().arena().get_f32();
+                    else if (trimmed == "f64" || trimmed == "double")
+                        arg_type = symbols().arena().get_f64();
+                    else if (trimmed == "string")
+                        arg_type = symbols().arena().get_string();
+                    else if (trimmed == "bool" || trimmed == "boolean")
+                        arg_type = symbols().arena().get_bool();
+                }
+
+                if (arg_type.is_valid())
+                {
+                    type_args.push_back(arg_type);
+                }
+
+                // Instantiate the generic function
+                llvm::Function *instantiated_fn = generics->instantiate_function(base_name, type_args);
+                if (instantiated_fn)
+                {
+                    return generate_free_function(node, instantiated_fn);
+                }
+
+                // Fall through to try regular resolution
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericInstantiation: Failed to instantiate generic function '{}', trying regular resolution",
+                          base_name);
+            }
+
+            // Try as a regular (non-generic) function
             llvm::Function *fn = resolve_function(function_name);
             if (fn)
             {
@@ -457,8 +545,8 @@ namespace Cryo::Codegen
                 return CallKind::StructConstructor;
             }
 
-            // Check for generic instantiation (contains angle brackets)
-            if (name.find('<') != std::string::npos)
+            // Check for generic instantiation (contains angle brackets OR has generic_args)
+            if (name.find('<') != std::string::npos || node->has_generic_args())
             {
                 return CallKind::GenericInstantiation;
             }
@@ -1523,13 +1611,21 @@ namespace Cryo::Codegen
                 }
             }
 
-            if (symbol && symbol->kind == Cryo::SymbolKind::Function && symbol->type.is_valid())
+            // Check for both regular functions and intrinsics (which are also functions)
+            bool is_function_or_intrinsic = symbol &&
+                                            (symbol->kind == Cryo::SymbolKind::Function ||
+                                             symbol->kind == Cryo::SymbolKind::Intrinsic) &&
+                                            symbol->type.is_valid();
+
+            if (is_function_or_intrinsic)
             {
                 const Cryo::FunctionType *func_type = dynamic_cast<const Cryo::FunctionType *>(symbol->type.get());
                 if (func_type)
                 {
+                    bool is_intrinsic = (symbol->kind == Cryo::SymbolKind::Intrinsic);
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "create_forward_declaration_from_symbol: Found function '{}' in symbol table", candidate);
+                              "create_forward_declaration_from_symbol: Found {} '{}' in symbol table",
+                              is_intrinsic ? "intrinsic" : "function", candidate);
 
                     // Build LLVM function type from Cryo function type
                     llvm::Type *return_type = types().map(func_type->return_type());
@@ -1562,18 +1658,27 @@ namespace Cryo::Codegen
                     llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(
                         return_type, param_types, func_type->is_variadic());
 
-                    // Create the function declaration with the qualified name
+                    // For intrinsics (like malloc, free, etc.), use the simple name as LLVM function name
+                    // since they map to actual C library functions. For regular functions, use qualified name.
+                    std::string llvm_name = is_intrinsic ? name : candidate;
+
+                    // Create the function declaration
                     llvm::Function *fn = llvm::Function::Create(
                         llvm_func_type,
                         llvm::Function::ExternalLinkage,
-                        candidate,
+                        llvm_name,
                         module());
 
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "create_forward_declaration_from_symbol: Created forward declaration for '{}'", candidate);
+                              "create_forward_declaration_from_symbol: Created forward declaration for '{}' (LLVM name: '{}')",
+                              candidate, llvm_name);
 
-                    // Register in context for future lookups
+                    // Register in context for future lookups (using both qualified and simple names for intrinsics)
                     ctx().register_function(candidate, fn);
+                    if (is_intrinsic && candidate != name)
+                    {
+                        ctx().register_function(name, fn);
+                    }
 
                     return fn;
                 }
