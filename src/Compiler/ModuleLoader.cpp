@@ -884,18 +884,20 @@ namespace Cryo
                             {
                                 field_names.push_back(field->name());
                                 TypeRef field_type = field->get_resolved_type();
-                                if (field_type.is_valid())
+                                // Check both is_valid() AND !is_error() - error types have valid IDs
+                                // but shouldn't be used directly; they need to be re-resolved
+                                if (field_type.is_valid() && !field_type.is_error())
                                 {
                                     LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' has resolved type: {}", field->name(), field_type->display_name());
                                     field_types.push_back(field_type);
                                 }
                                 else
                                 {
-                                    // Try to resolve from type annotation
+                                    // Try to resolve from type annotation (either invalid type or error type from parsing)
                                     std::string type_str = field->type_annotation() ? field->type_annotation()->to_string() : "unknown";
                                     LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' needs type resolution from annotation: '{}'", field->name(), type_str);
                                     field_type = resolve_primitive_type(type_str, _ast_context.types());
-                                    if (field_type.is_valid())
+                                    if (field_type.is_valid() && !field_type.is_error())
                                     {
                                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' to primitive type: {}", type_str, field_type->display_name());
                                         field_types.push_back(field_type);
@@ -904,7 +906,7 @@ namespace Cryo
                                     {
                                         // For complex types, try to look up in symbol table
                                         Symbol *type_sym = _symbol_table.lookup_symbol(type_str);
-                                        if (type_sym && type_sym->type.is_valid())
+                                        if (type_sym && type_sym->type.is_valid() && !type_sym->type.is_error())
                                         {
                                             field_type = type_sym->type;
                                             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved '{}' from symbol table: {}", type_str, field_type->display_name());
