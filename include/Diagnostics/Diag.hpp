@@ -32,6 +32,7 @@ namespace Cryo
     class ASTNode;
     class Type;
     class TypeRef;
+    class SyntaxHighlighter;
 
     //=========================================================================
     // Span - A labeled region of source code
@@ -394,6 +395,11 @@ namespace Cryo
         //=====================================================================
 
         const std::vector<Diag> &diagnostics() const { return _diagnostics; }
+
+    private:
+        // Internal rendering helper with syntax highlighter
+        void render_diagnostic(const Diag &diagnostic, SyntaxHighlighter &highlighter,
+                               size_t error_num, std::ostream &out) const;
     };
 
     //=========================================================================
