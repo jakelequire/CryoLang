@@ -24,6 +24,7 @@ namespace Cryo::CLI
         bool optimize = true;
         bool stdlib_mode = false;  // Compile in stdlib mode (for runtime/stdlib)
         bool no_std = false;       // Don't link standard library
+        bool dump_symbols = false; // Dump symbol tables for each module to debug files
         std::vector<std::string> args;
 
         // [dependencies] section (future feature)

@@ -7,6 +7,7 @@
 #include "Utils/File.hpp"
 #include "Utils/Logger.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
+#include "Utils/SymbolDumper.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -15,7 +16,7 @@
 namespace Cryo
 {
     CompilerInstance::CompilerInstance()
-        : _debug_mode(false), _show_ast_before_ir(false), _stdlib_linking_enabled(true), _stdlib_compilation_mode(false), _auto_imports_enabled(true), _current_namespace(""), _lsp_mode(false), _frontend_only(false)
+        : _debug_mode(false), _show_ast_before_ir(false), _stdlib_linking_enabled(true), _stdlib_compilation_mode(false), _auto_imports_enabled(true), _lsp_mode(false), _frontend_only(false), _dump_symbols(false), _dump_symbols_output_dir(""), _current_namespace("")
     {
         initialize_components();
     }
@@ -2122,7 +2123,21 @@ namespace Cryo
             } else {
                 LOG_DEBUG(LogComponent::GENERAL, "Successfully compiled stdlib module: {}", source_file);
             }
-            
+
+            // Dump symbols for this module if enabled (works whether compilation succeeded or failed)
+            // Always use module_output_dir to match where .ll and .o files are generated
+            if (_dump_symbols && _symbol_table) {
+                std::string symbol_output_dir = module_output_dir.string();
+
+                if (SymbolDumper::dump_module_symbols(*_symbol_table, module_name, symbol_output_dir)) {
+                    std::cout << "  ✓ Generated symbol dump: " << symbol_output_dir << "/" << module_name << "-symbols.dbg.txt" << std::endl;
+                    LOG_INFO(LogComponent::GENERAL, "✓ Generated symbol dump: {}/{}-symbols.dbg.txt", symbol_output_dir, module_name);
+                } else {
+                    std::cout << "  ⚠ Failed to dump symbols for module: " << module_name << std::endl;
+                    LOG_WARN(LogComponent::GENERAL, "⚠ Failed to dump symbols for module: {}", module_name);
+                }
+            }
+
             // Generate LLVM IR for this module (even if compile_file failed, we might have partial IR)
             if (module_success && !generate_ir()) {
                 LOG_ERROR(LogComponent::GENERAL, "Failed to generate IR for stdlib module: {}", source_file);
