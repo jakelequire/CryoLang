@@ -26,9 +26,15 @@ namespace Cryo
 
     PassResult LexingPass::run(PassContext &ctx)
     {
-        // Lexing is handled by the parser in the current implementation
-        // This pass is a placeholder for future separation
-        LOG_DEBUG(LogComponent::GENERAL, "LexingPass: Lexer initialization handled by parser");
+        // Run the lexing phase on the compiler instance
+        if (!_compiler.run_lexing_phase())
+        {
+            ctx.emit_error(ErrorCode::E0011_LEXING_EXCEPTION,
+                           "Lexing phase failed");
+            return PassResult::failure();
+        }
+
+        LOG_DEBUG(LogComponent::GENERAL, "LexingPass: Lexer created successfully");
         return PassResult::ok({PassProvides::TOKENS});
     }
 
@@ -39,14 +45,16 @@ namespace Cryo
 
     PassResult ParsingPass::run(PassContext &ctx)
     {
-        // The actual parsing is done by CompilerInstance::parse()
-        // This pass validates that parsing was successful
-        if (!ctx.ast_root())
+        // Run the parsing phase on the compiler instance
+        if (!_compiler.run_parsing_phase())
         {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                           "AST root is null - parsing may have failed");
+            ctx.emit_error(ErrorCode::E0116_PARSE_EXCEPTION,
+                           "Parsing phase failed");
             return PassResult::failure();
         }
+
+        // Update the PassContext with the newly created AST root
+        ctx.set_ast_root(_compiler.ast_root());
 
         // Check if parsing produced any errors
         if (ctx.has_errors())
@@ -65,7 +73,8 @@ namespace Cryo
 
     PassResult ASTValidationPass::run(PassContext &ctx)
     {
-        if (!ctx.ast_root())
+        auto *program = _compiler.ast_root();
+        if (!program)
         {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                            "Cannot validate null AST");
@@ -73,7 +82,6 @@ namespace Cryo
         }
 
         // Basic validation - check that we have a ProgramNode with statements
-        auto *program = ctx.ast_root();
         if (program->statements().empty())
         {
             ctx.emit_warning(ErrorCode::W0009_DEAD_CODE, "Program has no statements");
@@ -97,23 +105,9 @@ namespace Cryo
 
     PassResult AutoImportPass::run(PassContext &ctx)
     {
-        // Auto imports are injected based on compilation mode
-        // This is currently handled by inject_auto_imports() in CompilerInstance
+        // Run the auto-import phase on the compiler instance
+        _compiler.run_auto_import_phase();
 
-        if (ctx.is_stdlib_mode())
-        {
-            LOG_DEBUG(LogComponent::GENERAL, "AutoImportPass: Skipping auto-imports in stdlib mode");
-            return PassResult::ok({PassProvides::IMPORTS_DISCOVERED});
-        }
-
-        if (!ctx.auto_imports_enabled())
-        {
-            LOG_DEBUG(LogComponent::GENERAL, "AutoImportPass: Auto-imports disabled");
-            return PassResult::ok({PassProvides::IMPORTS_DISCOVERED});
-        }
-
-        // The actual auto-import injection happens in CompilerInstance
-        // This pass marks that the discovery phase is complete
         LOG_DEBUG(LogComponent::GENERAL, "AutoImportPass: Auto-imports processed");
         return PassResult::ok({PassProvides::IMPORTS_DISCOVERED});
     }
@@ -143,8 +137,9 @@ namespace Cryo
 
     PassResult TypeDeclarationPass::run(PassContext &ctx)
     {
-        // Type declarations are collected during collect_declarations_pass
-        // This pass represents the type declaration portion
+        // Run the declaration collection phase on the compiler instance
+        // This collects all declarations: types, functions, and templates
+        _compiler.run_declaration_collection_phase();
 
         LOG_DEBUG(LogComponent::GENERAL, "TypeDeclarationPass: Type declarations collected");
         return PassResult::ok({PassProvides::TYPE_DECLARATIONS});
@@ -157,9 +152,8 @@ namespace Cryo
 
     PassResult FunctionSignaturePass::run(PassContext &ctx)
     {
-        // Function signatures are collected during collect_declarations_pass
-        // This pass represents the function signature portion
-
+        // Function signatures were collected in TypeDeclarationPass (collect_declarations_pass)
+        // This pass marks the function signature portion as complete
         LOG_DEBUG(LogComponent::GENERAL, "FunctionSignaturePass: Function signatures collected");
         return PassResult::ok({PassProvides::FUNCTION_SIGNATURES});
     }
@@ -171,9 +165,8 @@ namespace Cryo
 
     PassResult TemplateRegistrationPass::run(PassContext &ctx)
     {
-        // Template registration happens during collect_declarations_pass
-        // This pass represents the template registration portion
-
+        // Templates were registered in TypeDeclarationPass (collect_declarations_pass)
+        // This pass marks the template registration portion as complete
         LOG_DEBUG(LogComponent::GENERAL, "TemplateRegistrationPass: Templates registered");
         return PassResult::ok({PassProvides::TEMPLATES_REGISTERED});
     }
@@ -189,8 +182,13 @@ namespace Cryo
 
     PassResult DirectiveProcessingPass::run(PassContext &ctx)
     {
-        // Directive processing is handled by CompilerInstance::process_directives()
-        // This pass represents that phase
+        // Run the directive processing phase on the compiler instance
+        if (!_compiler.run_directive_processing_phase())
+        {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                           "Directive processing failed");
+            return PassResult::failure();
+        }
 
         LOG_DEBUG(LogComponent::GENERAL, "DirectiveProcessingPass: Directives processed");
         return PassResult::ok({PassProvides::DIRECTIVES_PROCESSED});
@@ -203,13 +201,10 @@ namespace Cryo
 
     PassResult FunctionBodyPass::run(PassContext &ctx)
     {
-        // Function body processing is handled by populate_symbol_table_with_scope
-        // This pass represents that phase
-
-        // Check for type errors via the diagnostic system
-        if (ctx.has_errors())
+        // Run the function body processing phase on the compiler instance
+        if (!_compiler.run_function_body_phase())
         {
-            // Errors already emitted to DiagEmitter, just return failure
+            // Errors already emitted to DiagEmitter
             return PassResult::failure();
         }
 
@@ -270,7 +265,7 @@ namespace Cryo
 
     PassResult TypeLoweringPass::run(PassContext &ctx)
     {
-        auto *codegen = ctx.codegen();
+        auto *codegen = _compiler.codegen();
         if (!codegen)
         {
             ctx.emit_error(ErrorCode::E0600_CODEGEN_FAILED,
@@ -278,8 +273,8 @@ namespace Cryo
             return PassResult::failure();
         }
 
-        // Type lowering is handled by process_struct_declarations_for_preregistration
-        // in the current implementation
+        // Run the type lowering phase on the compiler instance
+        _compiler.run_type_lowering_phase();
 
         LOG_DEBUG(LogComponent::GENERAL, "TypeLoweringPass: Types lowered to LLVM");
         return PassResult::ok({PassProvides::TYPES_LOWERED});
@@ -292,7 +287,7 @@ namespace Cryo
 
     PassResult FunctionDeclarationPass::run(PassContext &ctx)
     {
-        auto *codegen = ctx.codegen();
+        auto *codegen = _compiler.codegen();
         if (!codegen)
         {
             ctx.emit_error(ErrorCode::E0600_CODEGEN_FAILED,
@@ -300,8 +295,8 @@ namespace Cryo
             return PassResult::failure();
         }
 
-        // Function pre-registration is handled by pre_register_functions_from_symbol_table
-        // in the current implementation
+        // Run the function declaration phase on the compiler instance
+        _compiler.run_function_declaration_phase();
 
         LOG_DEBUG(LogComponent::GENERAL, "FunctionDeclarationPass: Functions declared in LLVM module");
         return PassResult::ok({PassProvides::FUNCTIONS_DECLARED});
@@ -318,8 +313,12 @@ namespace Cryo
 
     PassResult IRGenerationPass::run(PassContext &ctx)
     {
-        // IR generation is handled by CompilerInstance::generate_ir()
-        // This pass represents that phase
+        // Run the IR generation phase on the compiler instance
+        if (!_compiler.run_ir_generation_phase())
+        {
+            // Errors already emitted to DiagEmitter
+            return PassResult::failure();
+        }
 
         LOG_DEBUG(LogComponent::GENERAL, "IRGenerationPass: LLVM IR generated");
         return PassResult::ok({PassProvides::IR_GENERATED});

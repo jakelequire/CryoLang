@@ -29,6 +29,7 @@ namespace Cryo
     X(E0008_INVALID_BINARY, 8)                      \
     X(E0009_INVALID_OCTAL, 9)                       \
     X(E0010_NUMBER_TOO_LARGE, 10)                   \
+    X(E0011_LEXING_EXCEPTION, 11)                   \
                                                     \
     /* Syntax Errors (E0100-E0199) */               \
     X(E0100_EXPECTED_TOKEN, 100)                    \
@@ -47,6 +48,7 @@ namespace Cryo
     X(E0113_INVALID_PATTERN, 113)                   \
     X(E0114_DUPLICATE_DEFAULT, 114)                 \
     X(E0115_PARSE_RECOVERY_FAILED, 115)             \
+    X(E0116_PARSE_EXCEPTION, 116)                   \
                                                     \
     /* Type Checking Errors (E0200-E0399) */        \
     X(E0200_TYPE_MISMATCH, 200)                     \

@@ -124,12 +124,21 @@ namespace Cryo
             // Check that all dependencies are satisfied
             for (const auto &dep : pass->dependencies())
             {
-                if (all_provided.find(dep) == all_provided.end())
+                if (all_provided.find(dep.id) == all_provided.end())
                 {
-                    LOG_ERROR(LogComponent::GENERAL,
-                              "PassManager validation failed: Pass '{}' requires '{}' but no earlier pass provides it",
-                              pass->name(), dep);
-                    return false;
+                    if (dep.is_required)
+                    {
+                        LOG_ERROR(LogComponent::GENERAL,
+                                  "PassManager validation failed: Pass '{}' requires '{}' but no earlier pass provides it",
+                                  pass->name(), dep.id);
+                        return false;
+                    }
+                    else
+                    {
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "PassManager validation: Pass '{}' has optional dependency '{}' which is not provided",
+                                  pass->name(), dep.id);
+                    }
                 }
             }
 
@@ -176,12 +185,21 @@ namespace Cryo
     {
         for (const auto &dep : pass->dependencies())
         {
-            if (!ctx.has_provided(dep))
+            if (!ctx.has_provided(dep.id))
             {
-                LOG_ERROR(LogComponent::GENERAL,
-                          "Pass '{}' requires '{}' which has not been provided",
-                          pass->name(), dep);
-                return false;
+                if (dep.is_required)
+                {
+                    LOG_ERROR(LogComponent::GENERAL,
+                              "Pass '{}' requires '{}' which has not been provided",
+                              pass->name(), dep.id);
+                    return false;
+                }
+                else
+                {
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "Pass '{}' optional dependency '{}' not provided",
+                              pass->name(), dep.id);
+                }
             }
         }
         return true;
@@ -480,7 +498,9 @@ namespace Cryo
                 {
                     if (i > 0)
                         os << ", ";
-                    os << deps[i];
+                    os << deps[i].id;
+                    if (!deps[i].is_required)
+                        os << " (optional)";
                 }
             }
 

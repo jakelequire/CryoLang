@@ -60,9 +60,9 @@ namespace Cryo
         int order() const override { return 2; }
         PassScope scope() const override { return PassScope::PerFile; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::TOKENS};
+            return {PassDependency::required(PassProvides::TOKENS)};
         }
 
         std::vector<std::string> provides() const override
@@ -96,9 +96,9 @@ namespace Cryo
         int order() const override { return 3; }
         PassScope scope() const override { return PassScope::PerFile; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::AST};
+            return {PassDependency::required(PassProvides::AST)};
         }
 
         std::vector<std::string> provides() const override
@@ -136,9 +136,9 @@ namespace Cryo
         int order() const override { return 1; }
         PassScope scope() const override { return PassScope::PerFile; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::AST_VALIDATED};
+            return {PassDependency::required(PassProvides::AST_VALIDATED)};
         }
 
         std::vector<std::string> provides() const override
@@ -172,9 +172,9 @@ namespace Cryo
         int order() const override { return 2; }
         PassScope scope() const override { return PassScope::PerModule; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::IMPORTS_DISCOVERED};
+            return {PassDependency::required(PassProvides::IMPORTS_DISCOVERED)};
         }
 
         std::vector<std::string> provides() const override
@@ -212,9 +212,9 @@ namespace Cryo
         int order() const override { return 1; }
         PassScope scope() const override { return PassScope::PerModule; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::MODULES_LOADED};
+            return {PassDependency::required(PassProvides::MODULES_LOADED)};
         }
 
         std::vector<std::string> provides() const override
@@ -248,9 +248,9 @@ namespace Cryo
         int order() const override { return 2; }
         PassScope scope() const override { return PassScope::PerModule; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::TYPE_DECLARATIONS};
+            return {PassDependency::required(PassProvides::TYPE_DECLARATIONS)};
         }
 
         std::vector<std::string> provides() const override
@@ -284,9 +284,9 @@ namespace Cryo
         int order() const override { return 3; }
         PassScope scope() const override { return PassScope::PerModule; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::FUNCTION_SIGNATURES};
+            return {PassDependency::required(PassProvides::FUNCTION_SIGNATURES)};
         }
 
         std::vector<std::string> provides() const override
@@ -324,9 +324,9 @@ namespace Cryo
         int order() const override { return 1; }
         PassScope scope() const override { return PassScope::PerFile; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::TEMPLATES_REGISTERED};
+            return {PassDependency::required(PassProvides::TEMPLATES_REGISTERED)};
         }
 
         std::vector<std::string> provides() const override
@@ -360,9 +360,12 @@ namespace Cryo
         int order() const override { return 2; }
         PassScope scope() const override { return PassScope::PerModule; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::DIRECTIVES_PROCESSED, PassProvides::TEMPLATES_REGISTERED};
+            return {
+                PassDependency::required(PassProvides::DIRECTIVES_PROCESSED),
+                PassDependency::required(PassProvides::TEMPLATES_REGISTERED)
+            };
         }
 
         std::vector<std::string> provides() const override
@@ -400,9 +403,9 @@ namespace Cryo
         int order() const override { return 1; }
         PassScope scope() const override { return PassScope::WholeProgram; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::BODIES_TYPE_CHECKED};
+            return {PassDependency::required(PassProvides::BODIES_TYPE_CHECKED)};
         }
 
         std::vector<std::string> provides() const override
@@ -443,9 +446,9 @@ namespace Cryo
         int order() const override { return 1; }
         PassScope scope() const override { return PassScope::PerModule; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::MONOMORPHIZATION_COMPLETE};
+            return {PassDependency::required(PassProvides::MONOMORPHIZATION_COMPLETE)};
         }
 
         std::vector<std::string> provides() const override
@@ -479,9 +482,9 @@ namespace Cryo
         int order() const override { return 2; }
         PassScope scope() const override { return PassScope::PerModule; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::TYPES_LOWERED};
+            return {PassDependency::required(PassProvides::TYPES_LOWERED)};
         }
 
         std::vector<std::string> provides() const override
@@ -519,9 +522,9 @@ namespace Cryo
         int order() const override { return 1; }
         PassScope scope() const override { return PassScope::PerModule; }
 
-        std::vector<std::string> dependencies() const override
+        std::vector<PassDependency> dependencies() const override
         {
-            return {PassProvides::FUNCTIONS_DECLARED};
+            return {PassDependency::required(PassProvides::FUNCTIONS_DECLARED)};
         }
 
         std::vector<std::string> provides() const override
