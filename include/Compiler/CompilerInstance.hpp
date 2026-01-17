@@ -19,6 +19,7 @@
 #include "Linker/CryoLinker.hpp"
 #include "Utils/File.hpp"
 #include "Compiler/ModuleLoader.hpp"
+#include "Compiler/PassManager.hpp"
 #include <memory>
 #include <string>
 #include <vector>
@@ -64,6 +65,10 @@ namespace Cryo
         // ModuleLoader must be declared AFTER the objects it references (symbol_table, template_registry)
         // This ensures proper destruction order (ModuleLoader destroyed first)
         std::unique_ptr<ModuleLoader> _module_loader;
+
+        // Pass Manager - manages the compilation pipeline
+        std::unique_ptr<PassManager> _pass_manager;
+        std::unique_ptr<PassContext> _pass_context;
 
         // Directive system
         std::unique_ptr<DirectiveRegistry> _directive_registry;
@@ -120,6 +125,11 @@ namespace Cryo
         SymbolTable *symbol_table() const { return _symbol_table.get(); }
         DiagEmitter *diagnostics() const { return _diagnostics.get(); }
         TypeChecker *type_checker() const { return _type_checker.get(); }
+        TypeResolver *type_resolver() const { return _type_resolver.get(); }
+        GenericRegistry *generic_registry() const { return _generic_registry.get(); }
+        Monomorphizer *monomorphizer() const { return _monomorphization_pass.get(); }
+        TemplateRegistry *template_registry() const { return _template_registry.get(); }
+        Cryo::SRM::SymbolResolutionManager *symbol_resolution_manager() const { return _symbol_resolution_manager.get(); }
         Cryo::Codegen::CodeGenerator *codegen() const { return _codegen.get(); }
         Cryo::Linker::CryoLinker *linker() const { return _linker.get(); }
         ModuleLoader *module_loader() const { return _module_loader.get(); }
@@ -128,6 +138,21 @@ namespace Cryo
         DirectiveRegistry *directive_registry() const { return _directive_registry.get(); }
         CompilationContext &compilation_context() { return _compilation_context; }
         const CompilationContext &compilation_context() const { return _compilation_context; }
+
+        // Pass Manager access
+        PassManager *pass_manager() const { return _pass_manager.get(); }
+        PassContext *pass_context() const { return _pass_context.get(); }
+
+        // Pass-based compilation (new pipeline)
+        bool compile_with_passes(const std::string &source_file);
+        bool compile_frontend_with_passes(const std::string &source_file);
+
+        // Initialize pass pipeline
+        void initialize_pass_manager();
+        void initialize_pass_context();
+
+        // Dump pass execution order for debugging
+        void dump_pass_order(std::ostream &os = std::cout) const;
 
         // Standard library linking control
         void set_stdlib_linking(bool enable) { _stdlib_linking_enabled = enable; }
