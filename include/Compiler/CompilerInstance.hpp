@@ -90,6 +90,11 @@ namespace Cryo
         // Results
         std::unique_ptr<ProgramNode> _ast_root;
 
+        // Loaded source file (for pass-based compilation)
+        std::unique_ptr<File> _loaded_file;
+        std::string _loaded_file_path;
+        std::string _loaded_file_content;
+
     public:
         CompilerInstance();
         ~CompilerInstance() = default;
@@ -143,10 +148,6 @@ namespace Cryo
         PassManager *pass_manager() const { return _pass_manager.get(); }
         PassContext *pass_context() const { return _pass_context.get(); }
 
-        // Pass-based compilation (new pipeline)
-        bool compile_with_passes(const std::string &source_file);
-        bool compile_frontend_with_passes(const std::string &source_file);
-
         // Initialize pass pipeline
         void initialize_pass_manager();
         void initialize_pass_context();
@@ -190,6 +191,42 @@ namespace Cryo
         void set_lsp_mode(bool enabled) { _lsp_mode = enabled; }
         bool is_lsp_mode() const { return _lsp_mode; }
         void clear();
+
+        // ============================================================================
+        // Pass Implementation Methods
+        // These methods are called by the standard passes and encapsulate
+        // the actual compilation logic for each pass.
+        // ============================================================================
+
+        /// Load a source file and prepare for compilation (used before running passes)
+        bool load_source_file(const std::string &source_file);
+
+        /// Run lexing phase - creates lexer from loaded file
+        bool run_lexing_phase();
+
+        /// Run parsing phase - creates parser and parses to AST
+        bool run_parsing_phase();
+
+        /// Inject auto-imports for core types
+        void run_auto_import_phase();
+
+        /// Collect all declarations (types, functions, signatures)
+        void run_declaration_collection_phase();
+
+        /// Process compiler directives
+        bool run_directive_processing_phase();
+
+        /// Type-check function bodies and validate directive effects
+        bool run_function_body_phase();
+
+        /// Process struct declarations for LLVM type registration
+        void run_type_lowering_phase();
+
+        /// Pre-register functions in LLVM module
+        void run_function_declaration_phase();
+
+        /// Generate LLVM IR
+        bool run_ir_generation_phase();
 
     private:
         void initialize_components();

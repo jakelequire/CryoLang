@@ -95,6 +95,33 @@ namespace Cryo
     }
 
     /**
+     * @brief Represents a dependency that a pass requires from earlier passes
+     *
+     * Wraps the PassProvides identifier with metadata about whether the
+     * dependency is required or optional.
+     */
+    struct PassDependency
+    {
+        /// The identifier of what's required (from PassProvides namespace)
+        std::string id;
+
+        /// Whether this dependency is required (true) or optional (false)
+        bool is_required;
+
+        /// Create a required dependency
+        static PassDependency required(const std::string &id)
+        {
+            return PassDependency{id, true};
+        }
+
+        /// Create an optional/soft dependency
+        static PassDependency soft(const std::string &id)
+        {
+            return PassDependency{id, false};
+        }
+    };
+
+    /**
      * @brief Result of running a compiler pass
      *
      * Note: Errors and warnings should be emitted directly to the DiagEmitter
@@ -339,10 +366,11 @@ namespace Cryo
         /**
          * @brief Items this pass requires from previous passes
          *
-         * The PassManager will ensure all required items are provided
-         * before running this pass.
+         * The PassManager will ensure all required dependencies are provided
+         * before running this pass. Optional dependencies are checked but
+         * do not prevent the pass from running.
          */
-        virtual std::vector<std::string> dependencies() const { return {}; }
+        virtual std::vector<PassDependency> dependencies() const { return {}; }
 
         /**
          * @brief Items this pass provides for later passes
