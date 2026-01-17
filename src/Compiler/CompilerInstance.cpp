@@ -156,25 +156,43 @@ namespace Cryo
 
     bool CompilerInstance::compile_file(const std::string &source_file)
     {
-        set_source_file(source_file);
+        LOG_DEBUG(LogComponent::GENERAL, "Compiling file: {}", source_file);
 
-        // Create a file object and load it
-        auto file = make_file_from_path(source_file);
-        if (!file)
+        // Step 1: Load the source file
+        if (!load_source_file(source_file))
         {
-            _diagnostics->emit(Diag::error(ErrorCode::E0800_FILE_NOT_FOUND,
-                                           "file not found: " + source_file));
             return false;
         }
 
-        if (!file->load())
+        // Step 2: Initialize pass manager if not already done
+        if (!_pass_manager)
         {
-            _diagnostics->emit(Diag::error(ErrorCode::E0801_FILE_READ_ERROR,
-                                           "failed to read file: " + source_file));
-            return false;
+            initialize_pass_manager();
         }
 
-        return parse_source_from_file(std::move(file));
+        // Step 3: Initialize pass context
+        initialize_pass_context();
+
+        // Step 4: Run all passes through the PassManager
+        bool success = _pass_manager->run_all(*_pass_context);
+
+        if (success)
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "Compilation completed successfully");
+        }
+        else
+        {
+            LOG_ERROR(LogComponent::GENERAL, "Compilation failed");
+        }
+
+        // Print AST if requested after compilation
+        if (_show_ast_before_ir && _ast_root)
+        {
+            LOG_INFO(LogComponent::GENERAL, "Generated AST:");
+            dump_ast();
+        }
+
+        return success && !_diagnostics->has_errors();
     }
 
     bool CompilerInstance::parse_source(const std::string &source_code)
@@ -276,75 +294,50 @@ namespace Cryo
 
     bool CompilerInstance::compile_frontend_only(const std::string &source_file)
     {
-        set_source_file(source_file);
+        LOG_DEBUG(LogComponent::GENERAL, "Frontend-only compilation: {}", source_file);
 
-        // Create a file object and load it
-        auto file = make_file_from_path(source_file);
-        if (!file)
+        // Skip runtime.cryo in LSP mode
+        if (source_file.find("runtime.cryo") != std::string::npos)
         {
-            _diagnostics->emit(Diag::error(ErrorCode::E0800_FILE_NOT_FOUND, "File not found: " + source_file));
-            return false;
-        }
-
-        if (!file->load())
-        {
-            _diagnostics->emit(Diag::error(ErrorCode::E0801_FILE_READ_ERROR, "Failed to read file: " + source_file));
-            return false;
-        }
-
-        // Frontend-only parsing - stops before IR generation and codegen
-        reset_state();
-
-        try
-        {
-            // Store file information for diagnostics
-            std::string file_path = file->path();
-
-            if (file_path.find("runtime.cryo") != std::string::npos)
-            {
-                return true; // Skip parsing runtime.cryo in LSP mode
-            }
-
-            // Phase 1: Create lexer
-            _lexer = std::make_unique<Lexer>(std::move(file));
-
-            // Phase 2: Create parser with lexer and AST context
-            _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostics.get(), file_path);
-            _parser->set_directive_registry(_directive_registry.get());
-
-            // Phase 3: Parse the program
-            if (!parse())
-            {
-                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Failed to parse file"));
-                return false;
-            }
-
-            // Phase 4: Basic validation
-            if (!_ast_root)
-            {
-                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Failed to create AST root"));
-                return false;
-            }
-
-            // Phase 5: Semantic analysis (including symbol table population)
-            if (!analyze())
-            {
-                std::string namespace_name = _current_namespace.empty() ? "Global" : _current_namespace;
-                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "Analysis failed for namespace '" + namespace_name + "'"));
-                // For LSP, we continue even if analysis fails partially
-                // This allows hover to work even with some compilation errors
-            }
-
-            // Stop here - no IR generation or codegen for LSP
-            // Frontend-only compilation completed successfully
-
             return true;
         }
-        catch (const std::exception &e)
+
+        // Step 1: Load the source file
+        if (!load_source_file(source_file))
         {
-            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, std::string("Exception: ") + e.what()));
             return false;
         }
+
+        // Step 2: Create frontend-only pass manager
+        _pass_manager = StandardPassFactory::create_frontend_pipeline(*this);
+
+        if (_debug_mode)
+        {
+            _pass_manager->set_verbose(true);
+        }
+
+        _pass_manager->validate();
+
+        // Step 3: Initialize pass context
+        initialize_pass_context();
+
+        // Step 4: Run frontend passes only (stops before codegen)
+        bool success = _pass_manager->run_all(*_pass_context);
+
+        if (success)
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "Frontend-only compilation completed successfully");
+        }
+        else
+        {
+            LOG_WARN(LogComponent::GENERAL, "Frontend-only compilation completed with errors");
+            // For LSP, we continue even if analysis fails partially
+            // This allows hover to work even with some compilation errors
+        }
+
+        // For frontend-only mode, we return true even if there are errors
+        // to allow LSP features to work with partial information
+        return true;
     }
 
     bool CompilerInstance::tokenize()
@@ -2246,138 +2239,288 @@ namespace Cryo
         }
     }
 
-    bool CompilerInstance::compile_with_passes(const std::string &source_file)
-    {
-        LOG_INFO(LogComponent::GENERAL, "Compiling with pass pipeline: {}", source_file);
+    // ============================================================================
+    // Pass Implementation Methods
+    // ============================================================================
 
-        // Set source file
+    bool CompilerInstance::load_source_file(const std::string &source_file)
+    {
         set_source_file(source_file);
 
-        // Load the source file
-        auto file = File::load(source_file);
-        if (!file)
+        // Create a file object and load it
+        _loaded_file = make_file_from_path(source_file);
+        if (!_loaded_file)
         {
             _diagnostics->emit(Diag::error(ErrorCode::E0800_FILE_NOT_FOUND,
-                                           "Failed to load source file: " + source_file));
+                                           "file not found: " + source_file));
             return false;
         }
 
-        // Parse the source (this sets up _ast_root)
-        if (!parse_source_from_file(std::move(file)))
+        if (!_loaded_file->load())
         {
-            LOG_ERROR(LogComponent::GENERAL, "Failed to parse source file");
+            _diagnostics->emit(Diag::error(ErrorCode::E0801_FILE_READ_ERROR,
+                                           "failed to read file: " + source_file));
             return false;
         }
 
-        // Initialize pass manager if not already done
-        if (!_pass_manager)
-        {
-            initialize_pass_manager();
-        }
+        // Store file info for later phases
+        _loaded_file_path = _loaded_file->path().empty() ? _loaded_file->name() : _loaded_file->path();
+        _loaded_file_content = std::string(_loaded_file->content());
 
-        // Initialize pass context
-        initialize_pass_context();
+        // Add source for diagnostic rendering
+        _diagnostics->add_source_file(_loaded_file_path);
 
-        // The frontend passes (lexing, parsing) are already done by parse_source_from_file
-        // Mark them as provided
-        _pass_context->mark_provided(PassProvides::TOKENS);
-        _pass_context->mark_provided(PassProvides::AST);
+        // Reset state for new compilation
+        reset_state();
 
-        // Run the existing analyze() which does the semantic analysis
-        // This bridges the old system with the new pass tracking
-        if (!analyze())
-        {
-            LOG_ERROR(LogComponent::GENERAL, "Analysis failed");
-            return false;
-        }
-
-        // Mark semantic passes as provided
-        _pass_context->mark_provided(PassProvides::AST_VALIDATED);
-        _pass_context->mark_provided(PassProvides::IMPORTS_DISCOVERED);
-        _pass_context->mark_provided(PassProvides::MODULES_LOADED);
-        _pass_context->mark_provided(PassProvides::MODULE_ORDER);
-        _pass_context->mark_provided(PassProvides::TYPE_DECLARATIONS);
-        _pass_context->mark_provided(PassProvides::FUNCTION_SIGNATURES);
-        _pass_context->mark_provided(PassProvides::TEMPLATES_REGISTERED);
-        _pass_context->mark_provided(PassProvides::DIRECTIVES_PROCESSED);
-        _pass_context->mark_provided(PassProvides::BODIES_TYPE_CHECKED);
-        _pass_context->mark_provided(PassProvides::MONOMORPHIZATION_COMPLETE);
-
-        // Run IR generation
-        if (!generate_ir())
-        {
-            LOG_ERROR(LogComponent::GENERAL, "IR generation failed");
-            return false;
-        }
-
-        // Mark codegen passes as provided
-        _pass_context->mark_provided(PassProvides::TYPES_LOWERED);
-        _pass_context->mark_provided(PassProvides::FUNCTIONS_DECLARED);
-        _pass_context->mark_provided(PassProvides::IR_GENERATED);
-
-        LOG_INFO(LogComponent::GENERAL, "Compilation with passes completed successfully");
         return true;
     }
 
-    bool CompilerInstance::compile_frontend_with_passes(const std::string &source_file)
+    bool CompilerInstance::run_lexing_phase()
     {
-        LOG_INFO(LogComponent::GENERAL, "Frontend-only compilation with passes: {}", source_file);
-
-        // Set source file
-        set_source_file(source_file);
-
-        // Load the source file
-        auto file = File::load(source_file);
-        if (!file)
+        if (!_loaded_file)
         {
-            _diagnostics->emit(Diag::error(ErrorCode::E0800_FILE_NOT_FOUND,
-                                           "Failed to load source file: " + source_file));
+            _diagnostics->emit(Diag::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                                           "No source file loaded - call load_source_file first"));
             return false;
         }
 
-        // Parse the source
-        if (!parse_source_from_file(std::move(file)))
+        try
         {
-            LOG_ERROR(LogComponent::GENERAL, "Failed to parse source file");
+            _lexer = std::make_unique<Lexer>(std::move(_loaded_file));
+            LOG_DEBUG(LogComponent::GENERAL, "Lexing phase: Lexer created successfully");
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            _diagnostics->emit(Diag::error(ErrorCode::E0101_UNEXPECTED_TOKEN,
+                                           std::string("Lexer error: ") + e.what()));
+            return false;
+        }
+    }
+
+    bool CompilerInstance::run_parsing_phase()
+    {
+        if (!_lexer)
+        {
+            _diagnostics->emit(Diag::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                                           "Lexer not initialized - run lexing phase first"));
             return false;
         }
 
-        // Create frontend-only pass manager
-        _pass_manager = StandardPassFactory::create_frontend_pipeline(*this);
-
-        if (_debug_mode)
+        try
         {
-            _pass_manager->set_verbose(true);
+            // Create parser with lexer and AST context
+            _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostics.get(), _loaded_file_path);
+            _parser->set_directive_registry(_directive_registry.get());
+
+            // Parse the program
+            _ast_root = _parser->parse_program();
+
+            if (!_ast_root)
+            {
+                _diagnostics->emit(Diag::error(ErrorCode::E0116_PARSE_EXCEPTION,
+                                               "Failed to create AST root"));
+                return false;
+            }
+
+            // Capture namespace context from parser after successful parsing
+            if (!_parser->current_namespace().empty() && _parser->current_namespace() != "Global")
+            {
+                set_namespace_context(_parser->current_namespace());
+                LOG_DEBUG(LogComponent::GENERAL, "Parsed namespace: {}", _parser->current_namespace());
+            }
+
+            // Create CodeGenerator now that we have the namespace information
+            std::string namespace_for_module = _current_namespace.empty() ? "cryo_program" : _current_namespace;
+            _codegen = Cryo::Codegen::create_default_codegen(*_ast_context, *_symbol_table, namespace_for_module, _diagnostics.get());
+
+            // Set source info immediately after creating CodeGenerator
+            _codegen->set_source_info(_source_file, _current_namespace);
+
+            // Configure stdlib compilation mode if enabled
+            if (_stdlib_compilation_mode)
+            {
+                _codegen->set_stdlib_compilation_mode(true);
+                LOG_DEBUG(LogComponent::GENERAL, "Enabled stdlib compilation mode in CodeGenerator");
+            }
+
+            // Set TemplateRegistry for cross-module type resolution
+            if (_codegen->ensure_visitor_initialized() && _template_registry)
+            {
+                _codegen->get_visitor()->context().set_template_registry(_template_registry.get());
+                LOG_DEBUG(LogComponent::GENERAL, "Set TemplateRegistry in CodegenContext for cross-module resolution");
+            }
+
+            LOG_DEBUG(LogComponent::GENERAL, "Parsing phase: AST created with module name '{}'", namespace_for_module);
+
+            // Register struct/class AST nodes with TypeMapper immediately after CodeGenerator creation
+            register_ast_nodes_with_typemapper();
+
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            _diagnostics->emit(Diag::error(ErrorCode::E0116_PARSE_EXCEPTION,
+                                           std::string("Parse exception: ") + e.what()));
+            return false;
+        }
+    }
+
+    void CompilerInstance::run_auto_import_phase()
+    {
+        if (!_stdlib_compilation_mode && _auto_imports_enabled)
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "Auto-import phase: Injecting auto-imports");
+            inject_auto_imports(_symbol_table.get(), "Global");
+        }
+        else
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "Auto-import phase: Skipped (stdlib mode or disabled)");
+        }
+    }
+
+    void CompilerInstance::run_declaration_collection_phase()
+    {
+        if (!_ast_root)
+        {
+            LOG_ERROR(LogComponent::GENERAL, "Declaration collection: AST root is null");
+            return;
         }
 
-        _pass_manager->validate();
+        LOG_DEBUG(LogComponent::GENERAL, "Declaration collection phase: Collecting declarations");
+        collect_declarations_pass(_ast_root.get(), _symbol_table.get(), "Global");
+    }
 
-        // Initialize pass context
-        initialize_pass_context();
+    bool CompilerInstance::run_directive_processing_phase()
+    {
+        LOG_DEBUG(LogComponent::GENERAL, "Directive processing phase: Processing directives");
+        return process_directives();
+    }
 
-        // Mark frontend passes as provided
-        _pass_context->mark_provided(PassProvides::TOKENS);
-        _pass_context->mark_provided(PassProvides::AST);
-
-        // Run the existing analyze() for semantic analysis
-        if (!analyze())
+    bool CompilerInstance::run_function_body_phase()
+    {
+        if (!_ast_root)
         {
-            LOG_ERROR(LogComponent::GENERAL, "Analysis failed");
+            _diagnostics->emit(Diag::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                                           "AST root is null for function body processing"));
             return false;
         }
 
-        // Mark semantic passes as provided
-        _pass_context->mark_provided(PassProvides::AST_VALIDATED);
-        _pass_context->mark_provided(PassProvides::IMPORTS_DISCOVERED);
-        _pass_context->mark_provided(PassProvides::MODULES_LOADED);
-        _pass_context->mark_provided(PassProvides::TYPE_DECLARATIONS);
-        _pass_context->mark_provided(PassProvides::FUNCTION_SIGNATURES);
-        _pass_context->mark_provided(PassProvides::TEMPLATES_REGISTERED);
-        _pass_context->mark_provided(PassProvides::DIRECTIVES_PROCESSED);
-        _pass_context->mark_provided(PassProvides::BODIES_TYPE_CHECKED);
+        LOG_DEBUG(LogComponent::GENERAL, "Function body phase: Processing function bodies and references");
+        populate_symbol_table_with_scope(_ast_root.get(), _symbol_table.get(), "Global");
 
-        LOG_INFO(LogComponent::GENERAL, "Frontend-only compilation with passes completed");
+        // Check for type errors
+        if (_diagnostics->has_errors())
+        {
+            LOG_ERROR(LogComponent::GENERAL, "Function body phase: Type checking failed with errors");
+            return false;
+        }
+
+        // Validate directive effects
+        LOG_DEBUG(LogComponent::GENERAL, "Function body phase: Validating directive effects");
+        if (!validate_directive_effects())
+        {
+            return false;
+        }
+
         return true;
+    }
+
+    void CompilerInstance::run_type_lowering_phase()
+    {
+        if (!_codegen)
+        {
+            LOG_WARN(LogComponent::GENERAL, "Type lowering phase: CodeGenerator not available");
+            return;
+        }
+
+        if (_codegen->ensure_visitor_initialized())
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "Type lowering phase: Processing struct declarations");
+
+            // Enable pre-registration mode to skip method body generation
+            _codegen->get_visitor()->set_pre_registration_mode(true);
+
+            // Process struct declarations to ensure TypeMapper has correct type information
+            process_struct_declarations_for_preregistration(_ast_root.get());
+
+            // Disable pre-registration mode
+            _codegen->get_visitor()->set_pre_registration_mode(false);
+        }
+        else
+        {
+            LOG_WARN(LogComponent::GENERAL, "Type lowering phase: Failed to initialize CodegenVisitor");
+        }
+    }
+
+    void CompilerInstance::run_function_declaration_phase()
+    {
+        if (!_codegen)
+        {
+            LOG_WARN(LogComponent::GENERAL, "Function declaration phase: CodeGenerator not available");
+            return;
+        }
+
+        if (_codegen->ensure_visitor_initialized())
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "Function declaration phase: Pre-registering functions in LLVM module");
+            _codegen->get_visitor()->pre_register_functions_from_symbol_table();
+        }
+        else
+        {
+            LOG_WARN(LogComponent::GENERAL, "Function declaration phase: Failed to initialize CodegenVisitor");
+        }
+    }
+
+    bool CompilerInstance::run_ir_generation_phase()
+    {
+        if (!_ast_root)
+        {
+            _diagnostics->emit(Diag::error(ErrorCode::E0600_CODEGEN_FAILED,
+                                           "AST root is null for IR generation"));
+            return false;
+        }
+
+        if (!_codegen)
+        {
+            _diagnostics->emit(Diag::error(ErrorCode::E0600_CODEGEN_FAILED,
+                                           "CodeGenerator not initialized"));
+            return false;
+        }
+
+        try
+        {
+            // Set source file and namespace context before generating IR
+            LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Setting source info");
+            _codegen->set_source_info(_source_file, _current_namespace);
+
+            // Pass imported ASTs to CodegenVisitor for dynamic enum variant extraction
+            if (_codegen->get_visitor() && _module_loader)
+            {
+                LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Setting imported ASTs");
+                _codegen->get_visitor()->set_imported_asts(&_module_loader->get_imported_asts());
+            }
+
+            LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Generating LLVM IR");
+            bool success = _codegen->generate_ir(_ast_root.get());
+
+            if (!success)
+            {
+                LOG_ERROR(LogComponent::GENERAL, "IR generation phase: Failed with error: {}",
+                          _codegen->get_last_error());
+                _diagnostics->emit(Diag::error(ErrorCode::E0600_CODEGEN_FAILED,
+                                               "IR generation failed: " + _codegen->get_last_error()));
+            }
+
+            return success;
+        }
+        catch (const std::exception &e)
+        {
+            _diagnostics->emit(Diag::error(ErrorCode::E0600_CODEGEN_FAILED,
+                                           std::string("IR generation exception: ") + e.what()));
+            return false;
+        }
     }
 
     void CompilerInstance::dump_pass_order(std::ostream &os) const
