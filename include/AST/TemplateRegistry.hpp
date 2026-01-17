@@ -61,6 +61,7 @@ namespace Cryo
         {
             std::vector<std::string> field_names;
             std::vector<TypeRef> field_types;
+            std::string source_namespace; // The namespace where the struct was originally defined
         };
 
         // Method metadata extracted from AST at registration time
@@ -105,6 +106,10 @@ namespace Cryo
         // Template method metadata registry: template_name -> TemplateMethodInfo
         // Stores method signatures extracted at registration time, persists after AST cleanup
         std::unordered_map<std::string, TemplateMethodInfo> _template_method_info;
+
+        // Method return type annotations: qualified method name -> return type annotation string
+        // Used for cross-module extern declarations when TypeRef resolution fails
+        std::unordered_map<std::string, std::string> _method_return_type_annotations;
 
     public:
         TemplateRegistry() = default;
@@ -200,6 +205,31 @@ namespace Cryo
          */
         bool has_method_return_type(const std::string &qualified_method_name) const;
 
+        /**
+         * @brief Register a method's return type annotation string for cross-module lookups
+         * @param qualified_method_name Fully qualified method name (e.g., "std::collections::string::String::find")
+         * @param return_type_annotation The return type annotation as a string (e.g., "Option<u64>")
+         *
+         * This is used when TypeRef cannot be resolved during module loading (for complex types).
+         * The annotation is later resolved to an LLVM type during codegen when full type context is available.
+         */
+        void register_method_return_type_annotation(const std::string &qualified_method_name,
+                                                    const std::string &return_type_annotation);
+
+        /**
+         * @brief Get a method's return type annotation string
+         * @param qualified_method_name Fully qualified method name
+         * @return The return type annotation, or empty string if not registered
+         */
+        std::string get_method_return_type_annotation(const std::string &qualified_method_name) const;
+
+        /**
+         * @brief Check if a method's return type annotation is registered
+         * @param qualified_method_name Fully qualified method name
+         * @return true if registered
+         */
+        bool has_method_return_type_annotation(const std::string &qualified_method_name) const;
+
         //===================================================================
         // Struct Field Types Registry (for cross-module struct definitions)
         //===================================================================
@@ -209,10 +239,12 @@ namespace Cryo
          * @param qualified_struct_name Fully qualified struct name (e.g., "std::collections::string::String")
          * @param field_names Names of the struct fields
          * @param field_types Types of the struct fields
+         * @param source_namespace The namespace where the struct was originally defined
          */
         void register_struct_field_types(const std::string &qualified_struct_name,
                                          const std::vector<std::string> &field_names,
-                                         const std::vector<TypeRef> &field_types);
+                                         const std::vector<TypeRef> &field_types,
+                                         const std::string &source_namespace = "");
 
         /**
          * @brief Get a struct's field types for LLVM struct body definition

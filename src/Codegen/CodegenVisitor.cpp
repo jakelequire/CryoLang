@@ -335,6 +335,237 @@ namespace Cryo::Codegen
         }
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2: Processed {} global variable declarations", var_count);
 
+        // Pass 2.5: Pre-register impl block method return types BEFORE generating struct method bodies
+        // This ensures that when struct methods call impl block methods, the return types are already registered.
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2.5: Pre-registering impl block method return types (namespace_context='{}')",
+                  _ctx->namespace_context());
+        int impl_method_count = 0;
+        int impl_block_count = 0;
+        Cryo::TemplateRegistry *template_registry = _ctx->template_registry();
+        for (const auto &stmt : node.statements())
+        {
+            if (!stmt)
+                continue;
+            Cryo::ImplementationBlockNode *impl_block = nullptr;
+            if (auto *impl = dynamic_cast<Cryo::ImplementationBlockNode *>(stmt.get()))
+            {
+                impl_block = impl;
+            }
+            else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+            {
+                if (decl_stmt->declaration())
+                {
+                    impl_block = dynamic_cast<Cryo::ImplementationBlockNode *>(decl_stmt->declaration());
+                }
+            }
+            if (impl_block && template_registry)
+            {
+                impl_block_count++;
+                std::string type_name = impl_block->target_type();
+                std::string ns_context = _ctx->namespace_context();
+                std::string qualified_type = ns_context.empty() ? type_name : ns_context + "::" + type_name;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2.5: Found impl block for '{}', qualified_type='{}', methods={}",
+                          type_name, qualified_type, impl_block->method_implementations().size());
+
+                // For generic types like "Option<T>", extract base name
+                std::string base_type_name = type_name;
+                size_t angle_pos = type_name.find('<');
+                if (angle_pos != std::string::npos)
+                {
+                    base_type_name = type_name.substr(0, angle_pos);
+                    qualified_type = ns_context.empty() ? base_type_name : ns_context + "::" + base_type_name;
+                }
+
+                for (const auto &method : impl_block->method_implementations())
+                {
+                    Cryo::StructMethodNode *fn_node = method.get();
+                    if (!fn_node)
+                        continue;
+
+                    std::string qualified_method_name = qualified_type + "::" + fn_node->name();
+
+                    // Register string-based return type annotation from the parser
+                    std::string return_type_str = "void";
+                    if (fn_node->return_type_annotation())
+                    {
+                        return_type_str = fn_node->return_type_annotation()->to_string();
+                    }
+
+                    // Only register non-void return types
+                    if (!return_type_str.empty() && return_type_str != "void")
+                    {
+                        template_registry->register_method_return_type_annotation(qualified_method_name, return_type_str);
+                        impl_method_count++;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Pass 2.5: Pre-registered method return type: {} -> {}",
+                                  qualified_method_name, return_type_str);
+                    }
+
+                    // Also register resolved TypeRef if available
+                    TypeRef return_type = fn_node->get_resolved_return_type();
+                    if (return_type.is_valid() && !return_type.is_error())
+                    {
+                        template_registry->register_method_return_type(qualified_method_name, return_type);
+                    }
+                }
+            }
+        }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2.5: Found {} impl blocks, pre-registered {} method return types", impl_block_count, impl_method_count);
+
+        // Pass 2.6: Pre-register STRUCT-EMBEDDED method return types
+        // This is critical for methods that call other methods defined later in the same struct.
+        // Example: String::contains() calls String::find(), but find is declared after contains.
+        // Without pre-registration, find's return type won't be known when generating contains body.
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2.6: Pre-registering struct-embedded method return types");
+        int struct_method_count = 0;
+        for (const auto &stmt : node.statements())
+        {
+            if (!stmt)
+                continue;
+
+            Cryo::StructDeclarationNode *struct_decl = nullptr;
+            Cryo::ClassDeclarationNode *class_decl = nullptr;
+
+            if (auto *s = dynamic_cast<Cryo::StructDeclarationNode *>(stmt.get()))
+            {
+                struct_decl = s;
+            }
+            else if (auto *c = dynamic_cast<Cryo::ClassDeclarationNode *>(stmt.get()))
+            {
+                class_decl = c;
+            }
+            else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+            {
+                if (decl_stmt->declaration())
+                {
+                    struct_decl = dynamic_cast<Cryo::StructDeclarationNode *>(decl_stmt->declaration());
+                    class_decl = dynamic_cast<Cryo::ClassDeclarationNode *>(decl_stmt->declaration());
+                }
+            }
+
+            // Process struct-embedded methods
+            if (struct_decl && template_registry && !struct_decl->methods().empty())
+            {
+                std::string type_name = struct_decl->name();
+                std::string ns_context = _ctx->namespace_context();
+                std::string qualified_type = ns_context.empty() ? type_name : ns_context + "::" + type_name;
+
+                // Skip generic templates - their methods are registered when instantiated
+                if (!struct_decl->generic_parameters().empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Pass 2.6: Skipping generic template struct '{}'", type_name);
+                    continue;
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Pass 2.6: Processing struct '{}' ({} methods), qualified_type='{}'",
+                          type_name, struct_decl->methods().size(), qualified_type);
+
+                for (const auto &method : struct_decl->methods())
+                {
+                    if (!method)
+                        continue;
+
+                    // Skip generic methods
+                    if (!method->generic_parameters().empty())
+                        continue;
+
+                    std::string qualified_method_name = qualified_type + "::" + method->name();
+
+                    // Register string-based return type annotation from the parser
+                    std::string return_type_str = "void";
+                    if (method->return_type_annotation())
+                    {
+                        return_type_str = method->return_type_annotation()->to_string();
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                  "Pass 2.6: Method '{}' has return_type_annotation: '{}'",
+                                  qualified_method_name, return_type_str);
+                    }
+                    else
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                  "Pass 2.6: Method '{}' has NO return_type_annotation (null)",
+                                  qualified_method_name);
+                    }
+
+                    // Register non-void return types
+                    if (!return_type_str.empty() && return_type_str != "void")
+                    {
+                        template_registry->register_method_return_type_annotation(qualified_method_name, return_type_str);
+                        struct_method_count++;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Pass 2.6: Pre-registered struct method return type: {} -> {}",
+                                  qualified_method_name, return_type_str);
+                    }
+
+                    // Also register resolved TypeRef if available
+                    TypeRef return_type = method->get_resolved_return_type();
+                    if (return_type.is_valid() && !return_type.is_error())
+                    {
+                        template_registry->register_method_return_type(qualified_method_name, return_type);
+                    }
+                }
+            }
+
+            // Process class-embedded methods
+            if (class_decl && template_registry && !class_decl->methods().empty())
+            {
+                std::string type_name = class_decl->name();
+                std::string ns_context = _ctx->namespace_context();
+                std::string qualified_type = ns_context.empty() ? type_name : ns_context + "::" + type_name;
+
+                // Skip generic templates
+                if (!class_decl->generic_parameters().empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Pass 2.6: Skipping generic template class '{}'", type_name);
+                    continue;
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Pass 2.6: Processing class '{}' ({} methods), qualified_type='{}'",
+                          type_name, class_decl->methods().size(), qualified_type);
+
+                for (const auto &method : class_decl->methods())
+                {
+                    if (!method)
+                        continue;
+
+                    // Skip generic methods
+                    if (!method->generic_parameters().empty())
+                        continue;
+
+                    std::string qualified_method_name = qualified_type + "::" + method->name();
+
+                    // Register string-based return type annotation from the parser
+                    std::string return_type_str = "void";
+                    if (method->return_type_annotation())
+                    {
+                        return_type_str = method->return_type_annotation()->to_string();
+                    }
+
+                    // Register non-void return types
+                    if (!return_type_str.empty() && return_type_str != "void")
+                    {
+                        template_registry->register_method_return_type_annotation(qualified_method_name, return_type_str);
+                        struct_method_count++;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Pass 2.6: Pre-registered class method return type: {} -> {}",
+                                  qualified_method_name, return_type_str);
+                    }
+
+                    // Also register resolved TypeRef if available
+                    TypeRef return_type = method->get_resolved_return_type();
+                    if (return_type.is_valid() && !return_type.is_error())
+                    {
+                        template_registry->register_method_return_type(qualified_method_name, return_type);
+                    }
+                }
+            }
+        }
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2.6: Pre-registered {} struct/class method return types", struct_method_count);
+
         // Pass 3: Generate struct/class METHOD BODIES (now globals are available)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 3: Processing struct/class method bodies");
         _generate_method_bodies_only = true; // Flag to only generate method bodies, skip type generation

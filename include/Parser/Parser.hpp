@@ -131,7 +131,8 @@ namespace Cryo
 
         // Type parsing
         std::string parse_type();
-        TypeRef parse_type_annotation();              // New method that returns Type*
+        // If out_type_string is provided, the raw type string will be stored there
+        TypeRef parse_type_annotation(std::string *out_type_string = nullptr);
         std::vector<std::string> parse_type_list(); // For arrays like i32[][]
 
         // Documentation comment handling
@@ -273,7 +274,8 @@ namespace Cryo
         TypeRef resolve_type_from_string(const std::string &type_str);
 
         // Enhanced type parsing using tokens
-        TypeRef parse_type_annotation_with_tokens();
+        // If out_type_string is provided, the raw type string will be stored there
+        TypeRef parse_type_annotation_with_tokens(std::string *out_type_string = nullptr);
 
         // Type parsing helpers for cast expressions
         std::string parse_generic_type_suffix();

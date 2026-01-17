@@ -421,8 +421,23 @@ namespace Cryo::Codegen
 
             // Try to get namespace from TemplateRegistry (dynamic lookup)
             std::string type_namespace;
+            std::string simple_type_name = base_type; // The type name without namespace
             Cryo::TemplateRegistry *template_registry = ctx().template_registry();
-            if (template_registry)
+
+            // First check if the type name is already fully qualified (contains ::)
+            // If so, extract namespace and simple name directly
+            size_t last_sep = base_type.rfind("::");
+            if (last_sep != std::string::npos)
+            {
+                type_namespace = base_type.substr(0, last_sep);
+                simple_type_name = base_type.substr(last_sep + 2);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Extracted namespace '{}' and simple name '{}' from qualified type '{}'",
+                          type_namespace, simple_type_name, base_type);
+            }
+
+            // If not already qualified, try to get namespace from TemplateRegistry
+            if (type_namespace.empty() && template_registry)
             {
                 const Cryo::TemplateRegistry::TemplateInfo *template_info = template_registry->find_template(base_type);
                 if (template_info)
@@ -430,6 +445,19 @@ namespace Cryo::Codegen
                     type_namespace = template_info->module_namespace;
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "resolve_method_by_name: Found template '{}' in namespace '{}'",
+                              base_type, type_namespace);
+                }
+            }
+
+            // Also check struct field types for source_namespace (for non-generic imported structs)
+            if (type_namespace.empty() && template_registry)
+            {
+                const Cryo::TemplateRegistry::StructFieldInfo *field_info = template_registry->get_struct_field_types(base_type);
+                if (field_info && !field_info->source_namespace.empty())
+                {
+                    type_namespace = field_info->source_namespace;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found struct '{}' source_namespace '{}'",
                               base_type, type_namespace);
                 }
             }
@@ -442,7 +470,8 @@ namespace Cryo::Codegen
 
             if (!type_namespace.empty())
             {
-                std::string full_method_name = type_namespace + "::" + base_type + "::" + method_name;
+                // Use simple_type_name (without namespace) when building the full method name
+                std::string full_method_name = type_namespace + "::" + simple_type_name + "::" + method_name;
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "resolve_method_by_name: Trying dynamically resolved method '{}'", full_method_name);
 
@@ -471,9 +500,10 @@ namespace Cryo::Codegen
                 param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
 
                 // Try to get return type from template methods
+                // Use simple_type_name for template lookup (templates are stored by simple name)
                 if (template_registry)
                 {
-                    const Cryo::TemplateRegistry::TemplateInfo *template_info = template_registry->find_template(base_type);
+                    const Cryo::TemplateRegistry::TemplateInfo *template_info = template_registry->find_template(simple_type_name);
                     if (template_info && template_info->struct_template)
                     {
                         for (const auto &method : template_info->struct_template->methods())
@@ -534,12 +564,41 @@ namespace Cryo::Codegen
                     }
                 }
 
-                // Default return type if not found
+                // Try string annotation fallback for complex types (Option<T>, String, etc.)
+                if (!return_type && template_registry)
+                {
+                    std::string return_type_annotation = template_registry->get_method_return_type_annotation(full_method_name);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Annotation lookup for '{}': '{}'",
+                              full_method_name, return_type_annotation.empty() ? "<not found>" : return_type_annotation);
+                    if (!return_type_annotation.empty() && return_type_annotation != "void")
+                    {
+                        // Use TypeMapper to resolve the type annotation to LLVM type
+                        return_type = types().resolve_and_map(return_type_annotation);
+                        if (return_type)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_method_by_name: Got return type from annotation for '{}': {} -> LLVM type",
+                                      full_method_name, return_type_annotation);
+                        }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_method_by_name: Failed to resolve annotation '{}' for '{}'",
+                                      return_type_annotation, full_method_name);
+                        }
+                    }
+                }
+
+                // Default return type if not found - this is a fallback that indicates
+                // a missing annotation registration or type resolution failure
                 if (!return_type)
                 {
                     return_type = llvm::Type::getVoidTy(llvm_ctx());
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "resolve_method_by_name: Using default void return type for '{}'", full_method_name);
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: WARNING - Using default void return type for '{}'. "
+                              "This may cause issues if the method actually returns a non-void type. "
+                              "Check if the method's return type annotation is registered.", full_method_name);
                 }
 
                 // Create function type and declaration

@@ -1080,6 +1080,121 @@ namespace Cryo::Codegen
             }
         }
 
+        // Check if this is a member access expression (e.g., this.octets[0] or other.octets[0])
+        // For array fields accessed via member access, we need to get the address
+        // of the array member, not load its value, so we can do proper GEP
+        if (!array_ptr)
+        {
+            if (auto *member_access = dynamic_cast<Cryo::MemberAccessNode *>(node->array()))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "ExpressionCodegen: Processing array access on member: '{}'",
+                          member_access->member());
+
+                // First, try to get the address of the member directly
+                // This works for references (like 'this') but may fail for by-value parameters
+                llvm::Value *member_ptr = generate_member_address(member_access);
+
+                // If generate_member_address failed, it might be because the object is a
+                // by-value parameter (stored in an alloca but generate() loads the value).
+                // In this case, check if the object is an identifier with an alloca.
+                if (!member_ptr)
+                {
+                    if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(member_access->object()))
+                    {
+                        std::string obj_name = identifier->name();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "ExpressionCodegen: generate_member_address failed, trying alloca for '{}'",
+                                  obj_name);
+
+                        // Check if this identifier has an alloca (by-value parameter case)
+                        if (llvm::AllocaInst *alloca = values().get_alloca(obj_name))
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "ExpressionCodegen: Found alloca for '{}', using it for member access",
+                                      obj_name);
+
+                            // Resolve struct type and field index
+                            llvm::StructType *struct_type = nullptr;
+                            unsigned field_idx = 0;
+                            if (resolve_member_info(member_access->object(), member_access->member(),
+                                                    struct_type, field_idx))
+                            {
+                                // Create GEP to get field pointer from the alloca
+                                member_ptr = create_struct_gep(struct_type, alloca, field_idx,
+                                                               member_access->member() + ".ptr");
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "ExpressionCodegen: Created struct GEP for field '{}' at index {}",
+                                          member_access->member(), field_idx);
+                            }
+                        }
+                    }
+                }
+
+                if (member_ptr)
+                {
+                    // Resolve struct type and field info to get the field's LLVM type
+                    llvm::StructType *struct_type = nullptr;
+                    unsigned field_idx = 0;
+                    if (resolve_member_info(member_access->object(), member_access->member(),
+                                            struct_type, field_idx))
+                    {
+                        llvm::Type *field_type = struct_type->getElementType(field_idx);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "ExpressionCodegen: Member field type ID: {}, isArrayTy: {}",
+                                  field_type->getTypeID(),
+                                  field_type->isArrayTy() ? "true" : "false");
+
+                        // Check if the field is an array type (like [4 x i8])
+                        if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(field_type))
+                        {
+                            element_type = arr_type->getElementType();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "ExpressionCodegen: Array field element type ID: {}",
+                                      element_type->getTypeID());
+
+                            // Generate index expression
+                            llvm::Value *index_val = generate(node->index());
+                            if (!index_val)
+                            {
+                                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                             "Failed to generate index expression");
+                                return nullptr;
+                            }
+
+                            // Ensure index is integer type
+                            if (!index_val->getType()->isIntegerTy())
+                            {
+                                index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
+                            }
+
+                            // For array fields, we need [0, index] indices to access element
+                            std::vector<llvm::Value *> indices = {
+                                llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0),
+                                index_val};
+
+                            llvm::Value *element_ptr = builder().CreateInBoundsGEP(
+                                field_type,
+                                member_ptr,
+                                indices,
+                                member_access->member() + ".elem.ptr");
+
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "ExpressionCodegen: Created GEP for array member element access");
+
+                            // Load and return the element value
+                            llvm::Value *result = create_load(element_ptr, element_type,
+                                                              member_access->member() + ".elem.load");
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "ExpressionCodegen: Loaded array element, type ID: {}",
+                                      result->getType()->getTypeID());
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
+
         // If we didn't find a stack array, use the standard path
         if (!array_ptr)
         {
