@@ -88,6 +88,10 @@ namespace Cryo::CLI
                     {
                         config.no_std = parse_bool(value);
                     }
+                    else if (key == "dump_symbols")
+                    {
+                        config.dump_symbols = parse_bool(value);
+                    }
                     else if (key == "args")
                     {
                         config.args = parse_array(value);

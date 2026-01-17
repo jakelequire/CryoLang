@@ -4,6 +4,7 @@
 #include "Compiler/CompilerInstance.hpp"
 #include "Utils/Logger.hpp"
 #include "Utils/OS.hpp"
+#include "Utils/SymbolDumper.hpp"
 #include <iostream>
 #include <filesystem>
 #include <chrono>
@@ -958,6 +959,16 @@ namespace Cryo::CLI::Commands
             }
         }
 
+        // Configure symbol dumping from config
+        if (config.dump_symbols)
+        {
+            compiler->set_dump_symbols(true, config.output_dir);
+            if (use_verbose)
+            {
+                std::cout << "Symbol table dumps enabled" << std::endl;
+            }
+        }
+
         // When building stdlib itself, show all stdlib diagnostics
         if (is_stdlib)
         {
@@ -1005,6 +1016,29 @@ namespace Cryo::CLI::Commands
                 std::cout << "Compiling " << main_file << " -> " << output_path << std::endl;
             }
             compilation_success = compiler->compile_file(main_file);
+        }
+
+        // Dump symbols if enabled in config (for non-stdlib compilations only)
+        // For stdlib compilations, symbols are dumped per-module inside compile_stdlib
+        if (config.dump_symbols && !is_stdlib && compiler->symbol_table())
+        {
+            if (use_verbose)
+            {
+                std::cout << "Dumping symbol table to " << config.output_dir << "..." << std::endl;
+            }
+
+            std::string module_name = project_name;
+            if (Cryo::SymbolDumper::dump_module_symbols(*compiler->symbol_table(), module_name, config.output_dir))
+            {
+                if (use_verbose)
+                {
+                    std::cout << "✓ Symbol table dumped: " << config.output_dir << "/" << module_name << "-symbols.dbg.txt" << std::endl;
+                }
+            }
+            else
+            {
+                std::cerr << "Warning: Failed to dump symbol table" << std::endl;
+            }
         }
 
         if (!compilation_success)

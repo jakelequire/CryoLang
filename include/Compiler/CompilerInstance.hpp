@@ -84,6 +84,8 @@ namespace Cryo
         bool _auto_imports_enabled;                    // Control whether to automatically import core types
         bool _lsp_mode;                                // LSP compilation mode
         bool _frontend_only;                           // Frontend-only compilation mode
+        bool _dump_symbols;                            // Dump symbol tables for each module to debug files
+        std::string _dump_symbols_output_dir;          // Output directory for symbol dumps
         std::string _current_namespace;                // Current namespace context
         std::vector<std::string> _imported_namespaces; // Track imported namespaces for enhanced resolution
 
@@ -168,6 +170,11 @@ namespace Cryo
 
         void set_auto_imports_enabled(bool enable) { _auto_imports_enabled = enable; }
         bool auto_imports_enabled() const { return _auto_imports_enabled; }
+
+        // Symbol dump control
+        void set_dump_symbols(bool enable, const std::string &output_dir = "") { _dump_symbols = enable; _dump_symbols_output_dir = output_dir; }
+        bool dump_symbols_enabled() const { return _dump_symbols; }
+        const std::string &dump_symbols_output_dir() const { return _dump_symbols_output_dir; }
 
         // Namespace context
         void set_namespace_context(const std::string &namespace_name);
