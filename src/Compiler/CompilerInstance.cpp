@@ -1,4 +1,5 @@
 #include "Compiler/CompilerInstance.hpp"
+#include "Compiler/StandardPasses.hpp"
 #include "Types/TypeMapper.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "AST/DirectiveProcessors.hpp"
@@ -2199,6 +2200,196 @@ namespace Cryo
         // For now, individual object files are sufficient for testing
         
         return overall_success;
+    }
+
+    // ============================================================================
+    // Pass Manager Integration
+    // ============================================================================
+
+    void CompilerInstance::initialize_pass_manager()
+    {
+        // Create the standard pass pipeline
+        _pass_manager = StandardPassFactory::create_standard_pipeline(*this);
+
+        if (_debug_mode)
+        {
+            _pass_manager->set_verbose(true);
+        }
+
+        // Validate the pipeline
+        if (!_pass_manager->validate())
+        {
+            LOG_ERROR(LogComponent::GENERAL, "Failed to validate pass pipeline");
+        }
+        else
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "Pass pipeline validated with {} passes",
+                      _pass_manager->passes().size());
+        }
+    }
+
+    void CompilerInstance::initialize_pass_context()
+    {
+        _pass_context = std::make_unique<PassContext>(*this);
+
+        // Set context flags from compiler instance
+        _pass_context->set_stdlib_mode(_stdlib_compilation_mode);
+        _pass_context->set_debug_mode(_debug_mode);
+        _pass_context->set_auto_imports_enabled(_auto_imports_enabled);
+        _pass_context->set_current_namespace(_current_namespace);
+        _pass_context->set_source_file(_source_file);
+
+        // Set AST root if available
+        if (_ast_root)
+        {
+            _pass_context->set_ast_root(_ast_root.get());
+        }
+    }
+
+    bool CompilerInstance::compile_with_passes(const std::string &source_file)
+    {
+        LOG_INFO(LogComponent::GENERAL, "Compiling with pass pipeline: {}", source_file);
+
+        // Set source file
+        set_source_file(source_file);
+
+        // Load the source file
+        auto file = File::load(source_file);
+        if (!file)
+        {
+            _diagnostics->emit(Diag::error(ErrorCode::E0800_FILE_NOT_FOUND,
+                                           "Failed to load source file: " + source_file));
+            return false;
+        }
+
+        // Parse the source (this sets up _ast_root)
+        if (!parse_source_from_file(std::move(file)))
+        {
+            LOG_ERROR(LogComponent::GENERAL, "Failed to parse source file");
+            return false;
+        }
+
+        // Initialize pass manager if not already done
+        if (!_pass_manager)
+        {
+            initialize_pass_manager();
+        }
+
+        // Initialize pass context
+        initialize_pass_context();
+
+        // The frontend passes (lexing, parsing) are already done by parse_source_from_file
+        // Mark them as provided
+        _pass_context->mark_provided(PassProvides::TOKENS);
+        _pass_context->mark_provided(PassProvides::AST);
+
+        // Run the existing analyze() which does the semantic analysis
+        // This bridges the old system with the new pass tracking
+        if (!analyze())
+        {
+            LOG_ERROR(LogComponent::GENERAL, "Analysis failed");
+            return false;
+        }
+
+        // Mark semantic passes as provided
+        _pass_context->mark_provided(PassProvides::AST_VALIDATED);
+        _pass_context->mark_provided(PassProvides::IMPORTS_DISCOVERED);
+        _pass_context->mark_provided(PassProvides::MODULES_LOADED);
+        _pass_context->mark_provided(PassProvides::MODULE_ORDER);
+        _pass_context->mark_provided(PassProvides::TYPE_DECLARATIONS);
+        _pass_context->mark_provided(PassProvides::FUNCTION_SIGNATURES);
+        _pass_context->mark_provided(PassProvides::TEMPLATES_REGISTERED);
+        _pass_context->mark_provided(PassProvides::DIRECTIVES_PROCESSED);
+        _pass_context->mark_provided(PassProvides::BODIES_TYPE_CHECKED);
+        _pass_context->mark_provided(PassProvides::MONOMORPHIZATION_COMPLETE);
+
+        // Run IR generation
+        if (!generate_ir())
+        {
+            LOG_ERROR(LogComponent::GENERAL, "IR generation failed");
+            return false;
+        }
+
+        // Mark codegen passes as provided
+        _pass_context->mark_provided(PassProvides::TYPES_LOWERED);
+        _pass_context->mark_provided(PassProvides::FUNCTIONS_DECLARED);
+        _pass_context->mark_provided(PassProvides::IR_GENERATED);
+
+        LOG_INFO(LogComponent::GENERAL, "Compilation with passes completed successfully");
+        return true;
+    }
+
+    bool CompilerInstance::compile_frontend_with_passes(const std::string &source_file)
+    {
+        LOG_INFO(LogComponent::GENERAL, "Frontend-only compilation with passes: {}", source_file);
+
+        // Set source file
+        set_source_file(source_file);
+
+        // Load the source file
+        auto file = File::load(source_file);
+        if (!file)
+        {
+            _diagnostics->emit(Diag::error(ErrorCode::E0800_FILE_NOT_FOUND,
+                                           "Failed to load source file: " + source_file));
+            return false;
+        }
+
+        // Parse the source
+        if (!parse_source_from_file(std::move(file)))
+        {
+            LOG_ERROR(LogComponent::GENERAL, "Failed to parse source file");
+            return false;
+        }
+
+        // Create frontend-only pass manager
+        _pass_manager = StandardPassFactory::create_frontend_pipeline(*this);
+
+        if (_debug_mode)
+        {
+            _pass_manager->set_verbose(true);
+        }
+
+        _pass_manager->validate();
+
+        // Initialize pass context
+        initialize_pass_context();
+
+        // Mark frontend passes as provided
+        _pass_context->mark_provided(PassProvides::TOKENS);
+        _pass_context->mark_provided(PassProvides::AST);
+
+        // Run the existing analyze() for semantic analysis
+        if (!analyze())
+        {
+            LOG_ERROR(LogComponent::GENERAL, "Analysis failed");
+            return false;
+        }
+
+        // Mark semantic passes as provided
+        _pass_context->mark_provided(PassProvides::AST_VALIDATED);
+        _pass_context->mark_provided(PassProvides::IMPORTS_DISCOVERED);
+        _pass_context->mark_provided(PassProvides::MODULES_LOADED);
+        _pass_context->mark_provided(PassProvides::TYPE_DECLARATIONS);
+        _pass_context->mark_provided(PassProvides::FUNCTION_SIGNATURES);
+        _pass_context->mark_provided(PassProvides::TEMPLATES_REGISTERED);
+        _pass_context->mark_provided(PassProvides::DIRECTIVES_PROCESSED);
+        _pass_context->mark_provided(PassProvides::BODIES_TYPE_CHECKED);
+
+        LOG_INFO(LogComponent::GENERAL, "Frontend-only compilation with passes completed");
+        return true;
+    }
+
+    void CompilerInstance::dump_pass_order(std::ostream &os) const
+    {
+        if (_pass_manager)
+        {
+            _pass_manager->dump_pass_order(os);
+        }
+        else
+        {
+            os << "Pass manager not initialized\n";
+        }
     }
 
     std::unique_ptr<CompilerInstance> create_compiler_instance()
