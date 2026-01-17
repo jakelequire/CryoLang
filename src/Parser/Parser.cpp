@@ -1,4 +1,5 @@
 #include "Parser/Parser.hpp"
+#include "Types/TypeAnnotation.hpp"
 #include "Utils/Logger.hpp"
 #include "Diagnostics/Diag.hpp"
 #include <iostream>
@@ -1200,7 +1201,7 @@ namespace Cryo
         return base_type;
     }
 
-    TypeRef Parser::parse_type_annotation()
+    TypeRef Parser::parse_type_annotation(std::string *out_type_string)
     {
 
         // Handle reference types (&type, &mut type) - keep existing logic
@@ -1216,14 +1217,21 @@ namespace Cryo
                 advance(); // consume 'mut'
             }
 
-            TypeRef base_type = parse_type_annotation(); // recursive call
+            std::string inner_type_string;
+            TypeRef base_type = parse_type_annotation(&inner_type_string); // recursive call
+
+            // Build the full type string including the reference
+            if (out_type_string)
+            {
+                *out_type_string = is_mutable ? ("&mut " + inner_type_string) : ("&" + inner_type_string);
+            }
 
             // For now, create reference type (could be enhanced later for mut references)
             return _context.types().get_reference_to(base_type);
         }
 
         // Use the new comprehensive token-based parsing system
-        return parse_type_annotation_with_tokens();
+        return parse_type_annotation_with_tokens(out_type_string);
     }
 
     // Namespace parsing
@@ -3706,22 +3714,57 @@ namespace Cryo
         }
         advance(); // consume 'this'
 
-        // For now, create a simple type - we'll enhance this later
-        // Use an error type as placeholder that will be resolved during type checking
+        // Resolve the 'this' type from the enclosing struct/class context
         TypeRef this_type;
-        TypeRef placeholder = _context.types().create_error("__this_placeholder__", start_loc);
-        if (is_reference)
+
+        if (!_current_parsing_type_name.empty())
         {
-            // Create a reference type to a placeholder type
-            this_type = _context.types().get_reference_to(placeholder);
+            // For generic types like "Option<T>", extract the base type name "Option"
+            // The symbol table registers the base type, not the parameterized version
+            std::string lookup_name = _current_parsing_type_name;
+            size_t angle_pos = lookup_name.find('<');
+            if (angle_pos != std::string::npos)
+            {
+                lookup_name = lookup_name.substr(0, angle_pos);
+            }
+
+            // Look up the struct/class type from the symbol table
+            // It was pre-registered when we started parsing the struct/class declaration
+            const Symbol *sym = _context.symbols().lookup(lookup_name);
+            TypeRef base_type = sym ? sym->type : TypeRef{};
+
+            if (sym && base_type.is_valid() && !base_type.is_error())
+            {
+                if (is_reference)
+                {
+                    // Create a reference to the struct/class type
+                    this_type = _context.types().get_reference_to(base_type);
+                }
+                else
+                {
+                    // By value - use the struct/class type directly
+                    this_type = base_type;
+                }
+                LOG_DEBUG(LogComponent::PARSER, "Resolved 'this' parameter type to '{}'",
+                          this_type.is_valid() ? this_type->display_name() : "<invalid>");
+            }
+            else
+            {
+                // Type not found - create error with informative message
+                std::string err_msg = "unresolved_this:" + _current_parsing_type_name;
+                this_type = _context.types().create_error(err_msg, start_loc);
+                LOG_DEBUG(LogComponent::PARSER, "Could not resolve 'this' type for '{}'",
+                          _current_parsing_type_name);
+            }
         }
         else
         {
-            // By value - use placeholder for now
-            this_type = placeholder;
+            // Not inside a struct/class - should not have 'this' parameter
+            error("'this' parameter can only be used inside struct or class methods");
+            this_type = _context.types().create_error("orphan_this_parameter", start_loc);
         }
 
-        // Create a special parameter for 'this'
+        // Create the 'this' parameter with the resolved type
         auto param = _builder.create_variable_declaration(start_loc, "this", this_type);
 
         // TODO: Add metadata to indicate this is a 'this' parameter and whether it's mutable
@@ -4175,8 +4218,9 @@ namespace Cryo
         // Parse struct members (fields and methods)
         Visibility current_visibility = Visibility::Public; // Default for structs
 
-        // Set flag to indicate we're parsing struct members
+        // Set flags to indicate we're parsing struct members
         _parsing_class_members = true;
+        _current_parsing_type_name = struct_name;
 
         while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
         {
@@ -4245,8 +4289,9 @@ namespace Cryo
             }
         }
 
-        // Clear flag after parsing struct members
+        // Clear flags after parsing struct members
         _parsing_class_members = false;
+        _current_parsing_type_name.clear();
 
         consume(TokenKind::TK_R_BRACE, "Expected '}' after struct body");
 
@@ -4312,8 +4357,9 @@ namespace Cryo
         // Parse class members
         Visibility current_visibility = Visibility::Private; // Default for classes
 
-        // Set flag to indicate we're parsing class members
+        // Set flags to indicate we're parsing class members
         _parsing_class_members = true;
+        _current_parsing_type_name = class_name;
 
         while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
         {
@@ -4396,8 +4442,9 @@ namespace Cryo
             }
         }
 
-        // Clear flag after parsing class members
+        // Clear flags after parsing class members
         _parsing_class_members = false;
+        _current_parsing_type_name.clear();
 
         consume(TokenKind::TK_R_BRACE, "Expected '}' after class body");
         return class_decl;
@@ -4886,7 +4933,8 @@ namespace Cryo
 
         consume(TokenKind::TK_L_BRACE, "Expected '{' after implement declaration");
 
-        // TODO: Add implementation block context tracking
+        // Set context for 'this' parameter resolution in implementation block methods
+        _current_parsing_type_name = target_type;
 
         while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
         {
@@ -4937,6 +4985,9 @@ namespace Cryo
                 synchronize();
             }
         }
+
+        // Clear context after parsing implementation block
+        _current_parsing_type_name.clear();
 
         consume(TokenKind::TK_R_BRACE, "Expected '}' after implementation block");
 
@@ -5204,10 +5255,11 @@ namespace Cryo
 
         // Parse return type (optional for constructors)
         TypeRef return_type = _context.types().get_void(); // Default to void
+        std::string return_type_string = "void"; // Track the type string for TypeAnnotation
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
-            return_type = parse_type_annotation();
+            return_type = parse_type_annotation(&return_type_string);
         }
         else if (is_constructor)
         {
@@ -5238,6 +5290,22 @@ namespace Cryo
         }
 
         auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor, is_destructor, is_static, is_default_destructor);
+
+        // Set the return type annotation from the captured type string
+        // This preserves the original type annotation (e.g., "Option<u64>") for later phases
+        if (!return_type_string.empty())
+        {
+            auto annotation = std::make_unique<TypeAnnotation>(
+                TypeAnnotation::named(return_type_string, start_loc));
+            method->set_return_type_annotation(std::move(annotation));
+            LOG_ERROR(LogComponent::PARSER, "PARSER: Set return type annotation '{}' for struct method '{}'",
+                      return_type_string, method_name);
+        }
+        else
+        {
+            LOG_ERROR(LogComponent::PARSER, "PARSER: No return type string for struct method '{}' (empty string)",
+                      method_name);
+        }
 
         // Set variadic flag if detected
         method->set_variadic(is_variadic);
@@ -5825,7 +5893,7 @@ namespace Cryo
         }
     }
 
-    TypeRef Parser::parse_type_annotation_with_tokens()
+    TypeRef Parser::parse_type_annotation_with_tokens(std::string *out_type_string)
     {
         // Create a string stream to build type tokens
         std::string type_string = "";
@@ -5952,6 +6020,14 @@ namespace Cryo
         // Use string-based parsing
         // Trim whitespace
         type_string.erase(type_string.find_last_not_of(" \t\n\r\f\v") + 1);
+
+        // Store the type string if caller requested it
+        // This preserves the original type annotation for later use (e.g., in struct methods)
+        if (out_type_string)
+        {
+            *out_type_string = type_string;
+        }
+
         TypeRef parsed_type = resolve_type_from_string(type_string);
 
         if (!parsed_type.is_valid())

@@ -197,6 +197,16 @@ namespace Cryo
         TypeRef resolve_primitive_type(const std::string &type_str, TypeArena &arena);
 
         /**
+         * @brief Qualify a type annotation with its full namespace path
+         * @param type_annotation The type annotation to qualify (e.g., "Option<u64>")
+         * @return Fully qualified type annotation (e.g., "std::core::option::Option<u64>")
+         *
+         * Uses TemplateRegistry to find the defining namespace for user-defined types.
+         * Primitives are returned unqualified.
+         */
+        std::string qualify_type_annotation(const std::string &type_annotation);
+
+        /**
          * @brief Filter import result to only include specific symbols
          * @param result The import result to filter
          * @param specific_imports List of specific symbols to include

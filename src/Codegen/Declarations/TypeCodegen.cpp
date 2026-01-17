@@ -1,6 +1,7 @@
 #include "Codegen/Declarations/TypeCodegen.hpp"
 #include "Types/Types.hpp"
 #include "Utils/Logger.hpp"
+#include "AST/TemplateRegistry.hpp"
 
 namespace Cryo::Codegen
 {
@@ -664,14 +665,43 @@ namespace Cryo::Codegen
 
         // Register field names for member access resolution
         std::vector<std::string> field_names;
+        std::vector<TypeRef> cryo_field_type_refs; // For TemplateRegistry registration
         field_names.reserve(node->fields().size());
+        cryo_field_type_refs.reserve(node->fields().size());
         for (const auto &field : node->fields())
         {
             field_names.push_back(field->name());
+            // Collect field types for TemplateRegistry
+            TypeRef ftype = field->get_resolved_type();
+            if (ftype.is_valid() && !ftype.is_error())
+            {
+                cryo_field_type_refs.push_back(ftype);
+            }
+            else
+            {
+                // Push invalid type to maintain index alignment
+                cryo_field_type_refs.push_back(TypeRef{});
+            }
         }
         ctx().register_struct_fields(name, field_names);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered {} field names for struct {}",
                   field_names.size(), name);
+
+        // Also register field types in TemplateRegistry for nested member access resolution
+        if (auto *template_reg = ctx().template_registry())
+        {
+            // Get the qualified name using current namespace context
+            std::string source_ns = ctx().namespace_context();
+            std::string qualified_name = source_ns.empty() ? name : source_ns + "::" + name;
+            template_reg->register_struct_field_types(qualified_name, field_names, cryo_field_type_refs, source_ns);
+            // Also register with simple name for direct lookup
+            if (qualified_name != name)
+            {
+                template_reg->register_struct_field_types(name, field_names, cryo_field_type_refs, source_ns);
+            }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered {} field types in TemplateRegistry for struct {} (qualified: {}, source_namespace: {})",
+                      cryo_field_type_refs.size(), name, qualified_name, source_ns);
+        }
 
         return struct_type;
     }

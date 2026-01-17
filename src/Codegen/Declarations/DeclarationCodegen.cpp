@@ -323,6 +323,12 @@ namespace Cryo::Codegen
         if (!node)
             return nullptr;
 
+        // Early trace to track which methods are being processed
+        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                  "DeclarationCodegen: TRACE ENTRY generate_method_declaration for '{}::{}' (return_type_annotation='{}')",
+                  parent_type, node->name(),
+                  node->return_type_annotation() ? node->return_type_annotation()->to_string() : "<none>");
+
         // Skip methods of generic templates - they should only be instantiated with concrete types
         if (_generics && !parent_type.empty() && _generics->is_generic_template(parent_type))
         {
@@ -382,9 +388,16 @@ namespace Cryo::Codegen
         }
 
         // Also check if return type has generic parameters
-        if (node->get_resolved_return_type())
+        TypeRef resolved_ret = node->get_resolved_return_type();
+        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                  "DeclarationCodegen: TRACE Method '{}::{}' resolved_return_type valid={}, is_error={}, kind={}",
+                  parent_type, node->name(),
+                  resolved_ret.is_valid(),
+                  resolved_ret.is_valid() ? resolved_ret.is_error() : false,
+                  resolved_ret.is_valid() ? static_cast<int>(resolved_ret->kind()) : -1);
+        if (resolved_ret.is_valid())
         {
-            TypeRef ret_type = node->get_resolved_return_type();
+            TypeRef ret_type = resolved_ret;
             if (ret_type->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -407,10 +420,51 @@ namespace Cryo::Codegen
             // Check if return type is an error type (unresolved generics, undefined types, etc.)
             if (ret_type.is_error())
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Skipping method declaration '{}' - return type is error: '{}'",
-                          node->name(), ret_type->display_name());
-                return nullptr;
+                // Check if we have a valid annotation string we can use instead
+                if (node->return_type_annotation())
+                {
+                    // We have an annotation - proceed with method generation
+                    // The annotation will be registered and used to resolve the actual return type at call-time
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Method '{}::{}' has error return type '{}' but has annotation '{}' - proceeding",
+                              parent_type, node->name(), ret_type->display_name(),
+                              node->return_type_annotation()->to_string());
+                }
+                else
+                {
+                    // No annotation - we can't resolve the type, skip
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping method declaration '{}::{}' - return type is error '{}' with no annotation",
+                              parent_type, node->name(), ret_type->display_name());
+                    return nullptr;
+                }
+            }
+            // Check for Struct return types that don't exist in LLVM yet
+            if (ret_type->kind() == TypeKind::Struct || ret_type->kind() == TypeKind::Class)
+            {
+                std::string ret_type_name = ret_type->display_name();
+                // Check if this is a generic instantiation (e.g., Option<u64>)
+                size_t angle_pos = ret_type_name.find('<');
+                if (angle_pos != std::string::npos)
+                {
+                    // This is a monomorphized generic type - it should be valid
+                    // Don't skip, let it proceed to code generation
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Method '{}::{}' returns monomorphized type '{}', proceeding",
+                              parent_type, node->name(), ret_type_name);
+                }
+                else
+                {
+                    // Plain struct type - check if it exists
+                    llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), ret_type_name);
+                    if (!existing)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Method '{}::{}' returns undefined struct '{}', checking alternatives",
+                                  parent_type, node->name(), ret_type_name);
+                        // Don't skip yet - the type might be defined in another namespace
+                    }
+                }
             }
         }
 
@@ -438,13 +492,69 @@ namespace Cryo::Codegen
             llvm_fn_name = ns_context + "::" + base_method_name;
         }
 
+        // IMPORTANT: Register method return type annotation BEFORE early return check
+        // This ensures annotations are registered even when the function already exists
+        // (e.g., from Pass 2.5 forward declarations)
+        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                  "DeclarationCodegen: TRACE registering annotation for '{}' (passed skip checks)",
+                  llvm_fn_name);
+        Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+        if (template_registry)
+        {
+            // Check if annotation is already registered
+            std::string existing_annotation = template_registry->get_method_return_type_annotation(llvm_fn_name);
+            if (existing_annotation.empty())
+            {
+                // Get the return type annotation string
+                TypeRef resolved_ret = node->get_resolved_return_type();
+                std::string return_type_str;
+
+                // First try the AST annotation
+                if (node->return_type_annotation())
+                {
+                    return_type_str = node->return_type_annotation()->to_string();
+                }
+                // For StructMethodNode, return_type_annotation() may be null but resolved type is valid
+                else if (resolved_ret.is_valid() && !resolved_ret.is_error())
+                {
+                    return_type_str = resolved_ret.get()->display_name();
+                }
+
+                if (!return_type_str.empty() && return_type_str != "void")
+                {
+                    template_registry->register_method_return_type_annotation(llvm_fn_name, return_type_str);
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: TRACE registered annotation for '{}': '{}'",
+                              llvm_fn_name, return_type_str);
+                }
+                else
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: TRACE NOT registering annotation for '{}': return_type_str='{}' (empty or void)",
+                              llvm_fn_name, return_type_str);
+                }
+            }
+            else
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: TRACE annotation already exists for '{}': '{}'",
+                          llvm_fn_name, existing_annotation);
+            }
+        }
+
         // Check if already declared (check both names to handle existing declarations)
         if (llvm::Function *existing = module()->getFunction(llvm_fn_name))
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Method '{}' already exists (llvm_fn_name match), returning early",
+                      llvm_fn_name);
             return existing;
         }
         if (llvm::Function *existing = module()->getFunction(base_method_name))
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Method '{}' already exists (base_method_name='{}' match), returning early",
+                      llvm_fn_name, base_method_name);
             return existing;
         }
 
@@ -503,10 +613,9 @@ namespace Cryo::Codegen
                       "DeclarationCodegen: Registered method as: {}", llvm_fn_name);
         }
 
-        // Register method return type for cross-module extern declarations
+        // Register method return type (TypeRef) for cross-module extern declarations
         // This allows other modules to create correct extern declarations for this method
-        // Register in both CodegenContext (for current compilation unit) and
-        // TemplateRegistry (for cross-module lookups)
+        // Note: String annotation is registered earlier (before early return check)
         TypeRef return_type = node->get_resolved_return_type();
         if (return_type)
         {
@@ -514,7 +623,6 @@ namespace Cryo::Codegen
             ctx().register_method_return_type(llvm_fn_name, return_type);
 
             // Also register in shared TemplateRegistry for cross-module access
-            Cryo::TemplateRegistry *template_registry = ctx().template_registry();
             if (template_registry)
             {
                 template_registry->register_method_return_type(llvm_fn_name, return_type);
@@ -979,13 +1087,18 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating struct: {}", name);
 
         // Check if already declared
-        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
+        llvm::StructType *struct_type = llvm::StructType::getTypeByName(llvm_ctx(), name);
+        if (struct_type && !struct_type->isOpaque())
         {
-            return existing;
+            // Already fully defined
+            return struct_type;
         }
 
-        // Create opaque struct first (for recursive types)
-        llvm::StructType* struct_type = llvm::StructType::create(llvm_ctx(), name);
+        // Create opaque struct first if it doesn't exist (for recursive types)
+        if (!struct_type)
+        {
+            struct_type = llvm::StructType::create(llvm_ctx(), name);
+        }
 
         // Collect field types
         std::vector<llvm::Type *> field_types;
@@ -998,8 +1111,10 @@ namespace Cryo::Codegen
             }
         }
 
-        // Set struct body
+        // Set struct body (this works even if struct was previously opaque)
         struct_type->setBody(field_types);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "DeclarationCodegen: Set struct '{}' body with {} fields", name, field_types.size());
 
         // Register type
         ctx().register_type(name, struct_type);
@@ -1025,13 +1140,18 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating class: {}", name);
 
         // Check if already declared
-        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
+        llvm::StructType *class_type = llvm::StructType::getTypeByName(llvm_ctx(), name);
+        if (class_type && !class_type->isOpaque())
         {
-            return existing;
+            // Already fully defined
+            return class_type;
         }
 
-        // Create opaque struct
-        llvm::StructType *class_type = llvm::StructType::create(llvm_ctx(), name);
+        // Create opaque struct if it doesn't exist (for recursive types)
+        if (!class_type)
+        {
+            class_type = llvm::StructType::create(llvm_ctx(), name);
+        }
 
         // Collect field types (including inherited fields if any)
         std::vector<llvm::Type *> field_types;
@@ -1049,8 +1169,10 @@ namespace Cryo::Codegen
             }
         }
 
-        // Set class body
+        // Set class body (this works even if class was previously opaque)
         class_type->setBody(field_types);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "DeclarationCodegen: Set class '{}' body with {} fields", name, field_types.size());
 
         // Register type
         ctx().register_type(name, class_type);
@@ -1334,19 +1456,75 @@ namespace Cryo::Codegen
                           resolved_type.is_valid() ? resolved_type->display_name() : "NULL");
             }
         }
-        
+
+        // If resolved_type is an error type but we have an annotation, try to resolve from annotation
+        if (resolved_type.is_valid() && resolved_type.is_error() && node->return_type_annotation())
+        {
+            std::string annotation_str = node->return_type_annotation()->to_string();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "get_function_type: Function '{}' has error return type, trying annotation '{}'",
+                      node->name(), annotation_str);
+
+            // Try to get the LLVM type from the annotation string (handles generic instantiations)
+            llvm::Type *annotation_type = types().resolve_and_map(annotation_str);
+            if (annotation_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_function_type: Successfully resolved return type from annotation '{}' for '{}'",
+                          annotation_str, node->name());
+                llvm::Type *return_type = annotation_type;
+
+                // Collect parameter types
+                std::vector<llvm::Type *> param_types;
+
+                // Add 'this' parameter for methods (pointer to parent type)
+                if (has_this_param && !parent_type_name.empty())
+                {
+                    param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+                }
+
+                // Add regular parameters
+                for (const auto &param : node->parameters())
+                {
+                    if (!param)
+                        continue;
+                    TypeRef param_type = param->get_resolved_type();
+                    llvm::Type *llvm_param = get_llvm_type(param_type);
+                    if (llvm_param)
+                    {
+                        param_types.push_back(llvm_param);
+                    }
+                }
+
+                return llvm::FunctionType::get(return_type, param_types, node->is_variadic());
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_function_type: Could not resolve annotation '{}' - using opaque pointer for '{}'",
+                          annotation_str, node->name());
+                // Use opaque pointer for now - the actual type will be resolved at call-time
+                resolved_type = TypeRef(); // Clear to trigger fallback
+            }
+        }
+
         llvm::Type *return_type = get_llvm_type(resolved_type);
         if (!return_type)
         {
             // For generic methods, check if this is a template context where the return type
             // should be resolved during monomorphization rather than defaulting to void
-            bool is_generic_context = !parent_type_name.empty() && 
+            bool is_generic_context = !parent_type_name.empty() &&
                                      (parent_type_name.find('<') != std::string::npos ||
                                       parent_type_name.find('_') != std::string::npos); // e.g., Option_T
-            
-            if (is_generic_context && resolved_type && resolved_type->kind() == Cryo::TypeKind::GenericParam)
+
+            // Also check if we have an annotation for a generic return type
+            bool has_generic_annotation = node->return_type_annotation() &&
+                                         node->return_type_annotation()->to_string().find('<') != std::string::npos;
+
+            if ((is_generic_context && resolved_type && resolved_type->kind() == Cryo::TypeKind::GenericParam) ||
+                has_generic_annotation)
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Generic method '{}' using opaque pointer return type", node->name());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Method '{}' using opaque pointer return type for generic", node->name());
                 // Use opaque pointer for generic return types that will be resolved later
                 return_type = llvm::PointerType::get(llvm_ctx(), 0);
             }

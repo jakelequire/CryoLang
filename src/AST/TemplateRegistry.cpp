@@ -292,13 +292,44 @@ namespace Cryo
         return _method_return_types.find(qualified_method_name) != _method_return_types.end();
     }
 
+    void TemplateRegistry::register_method_return_type_annotation(const std::string &qualified_method_name,
+                                                                   const std::string &return_type_annotation)
+    {
+        if (qualified_method_name.empty() || return_type_annotation.empty())
+            return;
+
+        _method_return_type_annotations[qualified_method_name] = return_type_annotation;
+        LOG_DEBUG(Cryo::LogComponent::AST,
+                  "Registered method return type annotation: {} -> {}",
+                  qualified_method_name, return_type_annotation);
+    }
+
+    std::string TemplateRegistry::get_method_return_type_annotation(const std::string &qualified_method_name) const
+    {
+        auto it = _method_return_type_annotations.find(qualified_method_name);
+        if (it != _method_return_type_annotations.end())
+        {
+            LOG_TRACE(Cryo::LogComponent::AST,
+                      "Found method return type annotation: {} -> {}",
+                      qualified_method_name, it->second);
+            return it->second;
+        }
+        return "";
+    }
+
+    bool TemplateRegistry::has_method_return_type_annotation(const std::string &qualified_method_name) const
+    {
+        return _method_return_type_annotations.find(qualified_method_name) != _method_return_type_annotations.end();
+    }
+
     //===================================================================
     // Struct Field Types Registry Implementation
     //===================================================================
 
     void TemplateRegistry::register_struct_field_types(const std::string &qualified_struct_name,
                                                        const std::vector<std::string> &field_names,
-                                                       const std::vector<TypeRef> &field_types)
+                                                       const std::vector<TypeRef> &field_types,
+                                                       const std::string &source_namespace)
     {
         if (qualified_struct_name.empty())
             return;
@@ -306,11 +337,12 @@ namespace Cryo
         StructFieldInfo info;
         info.field_names = field_names;
         info.field_types = field_types;
+        info.source_namespace = source_namespace;
 
         _struct_field_types[qualified_struct_name] = std::move(info);
         LOG_DEBUG(Cryo::LogComponent::AST,
-                  "Registered struct field types: {} with {} fields",
-                  qualified_struct_name, field_names.size());
+                  "Registered struct field types: {} with {} fields (source_namespace: '{}')",
+                  qualified_struct_name, field_names.size(), source_namespace);
     }
 
     const TemplateRegistry::StructFieldInfo *TemplateRegistry::get_struct_field_types(

@@ -830,6 +830,36 @@ namespace Cryo
                         );
                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic class template: {} from module: {}", class_decl->name(), module_name);
                     }
+
+                    // Register method return type annotations for class methods
+                    for (const auto &method : class_decl->methods())
+                    {
+                        if (method)
+                        {
+                            std::string qualified_type = module_name.empty() ? class_decl->name() : module_name + "::" + class_decl->name();
+                            std::string return_type_str = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "";
+                            std::string qualified_method_name = qualified_type + "::" + method->name();
+
+                            if (!return_type_str.empty())
+                            {
+                                std::string qualified_return_type = qualify_type_annotation(return_type_str);
+                                _template_registry.register_method_return_type_annotation(qualified_method_name, qualified_return_type);
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered class method return type annotation: {} -> {}",
+                                          qualified_method_name, qualified_return_type);
+
+                                TypeArena &arena = _ast_context.types();
+                                TypeRef return_type = resolve_primitive_type(return_type_str, arena);
+                                if (return_type.is_valid())
+                                {
+                                    _template_registry.register_method_return_type(qualified_method_name, return_type);
+                                }
+                            }
+                            else
+                            {
+                                _template_registry.register_method_return_type_annotation(qualified_method_name, "void");
+                            }
+                        }
+                    }
                 }
                 else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(decl))
                 {
@@ -926,17 +956,55 @@ namespace Cryo
 
                         if (!field_types.empty())
                         {
-                            _template_registry.register_struct_field_types(qualified_name, field_names, field_types);
+                            _template_registry.register_struct_field_types(qualified_name, field_names, field_types, module_name);
                             // Also register with simple name for flexibility
                             if (qualified_name != struct_decl->name())
                             {
-                                _template_registry.register_struct_field_types(struct_decl->name(), field_names, field_types);
+                                _template_registry.register_struct_field_types(struct_decl->name(), field_names, field_types, module_name);
                             }
-                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered struct field types: {} with {} fields (simple name: {})", qualified_name, field_types.size(), struct_decl->name());
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered struct field types: {} with {} fields (simple name: {}, source_namespace: {})", qualified_name, field_types.size(), struct_decl->name(), module_name);
                         }
                         else
                         {
                             LOG_WARN(LogComponent::GENERAL, "ModuleLoader: No field types found for struct '{}', not registering", struct_decl->name());
+                        }
+                    }
+
+                    // Register method return type annotations for struct-embedded methods
+                    // This is critical for cross-module method resolution
+                    for (const auto &method : struct_decl->methods())
+                    {
+                        if (method)
+                        {
+                            std::string qualified_type = module_name.empty() ? struct_decl->name() : module_name + "::" + struct_decl->name();
+                            std::string return_type_str = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "";
+                            std::string qualified_method_name = qualified_type + "::" + method->name();
+
+                            if (!return_type_str.empty())
+                            {
+                                // Qualify the return type (e.g., "Option<u64>" -> "std::core::option::Option<u64>")
+                                std::string qualified_return_type = qualify_type_annotation(return_type_str);
+                                _template_registry.register_method_return_type_annotation(qualified_method_name, qualified_return_type);
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered struct method return type annotation: {} -> {}",
+                                          qualified_method_name, qualified_return_type);
+
+                                // Also try to resolve to TypeRef for primitives
+                                TypeArena &arena = _ast_context.types();
+                                TypeRef return_type = resolve_primitive_type(return_type_str, arena);
+                                if (return_type.is_valid())
+                                {
+                                    _template_registry.register_method_return_type(qualified_method_name, return_type);
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Also registered TypeRef for struct method: {} -> {}",
+                                              qualified_method_name, return_type->display_name());
+                                }
+                            }
+                            else
+                            {
+                                // Method returns void - register that explicitly
+                                _template_registry.register_method_return_type_annotation(qualified_method_name, "void");
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered void return type for struct method: {}",
+                                          qualified_method_name);
+                            }
                         }
                     }
                 }
@@ -988,23 +1056,32 @@ namespace Cryo
                         if (method)
                         {
                             std::string return_type_str = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "";
+                            std::string qualified_method_name = qualified_type + "::" + method->name();
+
+                            // Always register the string annotation for cross-module lookups
+                            // Qualify the return type to include its full namespace path
                             if (!return_type_str.empty())
                             {
-                                // Resolve the return type using TypeArena
+                                // Qualify the return type (e.g., "Option<u64>" -> "std::core::option::Option<u64>")
+                                std::string qualified_return_type = qualify_type_annotation(return_type_str);
+                                _template_registry.register_method_return_type_annotation(qualified_method_name, qualified_return_type);
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered method return type annotation: {} -> {}",
+                                          qualified_method_name, qualified_return_type);
+
+                                // Also try to resolve to TypeRef for primitives (enables faster lookup)
                                 TypeArena &arena = _ast_context.types();
                                 TypeRef return_type = resolve_primitive_type(return_type_str, arena);
                                 if (return_type.is_valid())
                                 {
-                                    std::string qualified_method_name = qualified_type + "::" + method->name();
                                     _template_registry.register_method_return_type(qualified_method_name, return_type);
-                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered method return type: {} -> {}",
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Also registered TypeRef for: {} -> {}",
                                               qualified_method_name, return_type->display_name());
                                 }
-                                else
-                                {
-                                    LOG_TRACE(LogComponent::GENERAL, "ModuleLoader: Could not resolve type '{}' for method {}::{}",
-                                              return_type_str, qualified_type, method->name());
-                                }
+                            }
+                            else
+                            {
+                                // Method returns void - register that explicitly
+                                _template_registry.register_method_return_type_annotation(qualified_method_name, "void");
                             }
                         }
                     }
@@ -1064,6 +1141,59 @@ namespace Cryo
         // For non-primitive types (generics, user-defined), return invalid TypeRef
         // These would need more complex resolution
         return TypeRef{};
+    }
+
+    std::string ModuleLoader::qualify_type_annotation(const std::string &type_annotation)
+    {
+        if (type_annotation.empty())
+            return type_annotation;
+
+        // Already qualified - return as-is
+        if (type_annotation.find("::") != std::string::npos)
+            return type_annotation;
+
+        // Extract base type name (for generics like "Option<u64>" -> "Option")
+        std::string base_type = type_annotation;
+        std::string type_suffix;
+        size_t angle_pos = type_annotation.find('<');
+        if (angle_pos != std::string::npos)
+        {
+            base_type = type_annotation.substr(0, angle_pos);
+            type_suffix = type_annotation.substr(angle_pos);
+        }
+
+        // Don't qualify primitive types
+        static const std::unordered_set<std::string> primitives = {
+            "void", "bool", "boolean", "i8", "i16", "i32", "i64",
+            "u8", "u16", "u32", "u64", "f32", "f64", "float", "double",
+            "char", "string", "int", "uint"};
+        if (primitives.find(base_type) != primitives.end())
+            return type_annotation;
+
+        // Look up the base type in TemplateRegistry to find its namespace
+        const TemplateRegistry::TemplateInfo *template_info = _template_registry.find_template(base_type);
+        if (template_info && !template_info->module_namespace.empty())
+        {
+            std::string qualified = template_info->module_namespace + "::" + base_type + type_suffix;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Qualified type annotation '{}' to '{}'",
+                      type_annotation, qualified);
+            return qualified;
+        }
+
+        // Check struct field types registry for non-template types
+        const TemplateRegistry::StructFieldInfo *field_info = _template_registry.get_struct_field_types(base_type);
+        if (field_info && !field_info->source_namespace.empty())
+        {
+            std::string qualified = field_info->source_namespace + "::" + base_type + type_suffix;
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Qualified type annotation '{}' to '{}' (from struct registry)",
+                      type_annotation, qualified);
+            return qualified;
+        }
+
+        // Could not qualify - return original
+        LOG_TRACE(LogComponent::GENERAL, "ModuleLoader: Could not qualify type annotation '{}', returning as-is",
+                  type_annotation);
+        return type_annotation;
     }
 
     void ModuleLoader::mark_declarations_as_imported(ProgramNode &ast, const std::string &module_name)

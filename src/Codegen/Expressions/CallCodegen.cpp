@@ -1250,20 +1250,179 @@ namespace Cryo::Codegen
                                   "Instance method receiver type from variable map: {}", type_name);
                     }
                 }
-                // Additional fallback for nested member access (e.g., this.stack_trace.capture())
+                // For nested member access (e.g., this.ip.eq()), resolve the field type properly
                 else if (auto *member_access = dynamic_cast<MemberAccessNode *>(callee->object()))
                 {
-                    // For member access, try to infer type from the member name and context
                     std::string member_name = member_access->member();
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "Attempting type resolution for nested member access: {}", member_name);
 
-                    // Special case for common field types in runtime
-                    if (member_name == "stack_trace")
+                    // Get the parent object's type to look up the field type
+                    std::string parent_type_name;
+
+                    // Check if the parent object is 'this'
+                    if (auto *parent_id = dynamic_cast<IdentifierNode *>(member_access->object()))
                     {
-                        type_name = "StackTrace";
+                        if (parent_id->name() == "this")
+                        {
+                            // Use current_type_name for 'this'
+                            parent_type_name = ctx().current_type_name();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Nested member access: parent is 'this' -> {}", parent_type_name);
+                        }
+                        else
+                        {
+                            // Look up the identifier's type from variable_types_map
+                            auto &var_types = ctx().variable_types_map();
+                            auto it = var_types.find(parent_id->name());
+                            if (it != var_types.end() && it->second.is_valid())
+                            {
+                                parent_type_name = it->second->display_name();
+                                if (!parent_type_name.empty() && parent_type_name.back() == '*')
+                                {
+                                    parent_type_name.pop_back();
+                                }
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "Nested member access: parent '{}' -> {}", parent_id->name(), parent_type_name);
+                            }
+                        }
+                    }
+
+                    // Now look up the field type using TemplateRegistry
+                    if (!parent_type_name.empty())
+                    {
+                        // Generate type name candidates (simple name, qualified name, etc.)
+                        std::vector<std::string> type_candidates = generate_lookup_candidates(parent_type_name, Cryo::SymbolKind::Type);
+
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "Resolved nested member access type: {} -> {}", member_name, type_name);
+                                  "Nested member access: Looking up field '{}' in type '{}', {} candidates generated",
+                                  member_name, parent_type_name, type_candidates.size());
+                        for (size_t i = 0; i < type_candidates.size(); ++i)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "  Candidate[{}]: '{}'", i, type_candidates[i]);
+                        }
+
+                        if (auto *template_reg = ctx().template_registry())
+                        {
+                            // Try each candidate name
+                            for (const auto &candidate : type_candidates)
+                            {
+                                const TemplateRegistry::StructFieldInfo *field_info = template_reg->get_struct_field_types(candidate);
+                                if (field_info)
+                                {
+                                    for (size_t i = 0; i < field_info->field_names.size(); ++i)
+                                    {
+                                        if (field_info->field_names[i] == member_name && i < field_info->field_types.size())
+                                        {
+                                            TypeRef field_type = field_info->field_types[i];
+                                            if (field_type.is_valid())
+                                            {
+                                                type_name = field_type->display_name();
+                                                if (field_type->kind() == Cryo::TypeKind::Pointer)
+                                                {
+                                                    auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(field_type.get());
+                                                    if (ptr_type && ptr_type->pointee().is_valid())
+                                                    {
+                                                        type_name = ptr_type->pointee()->display_name();
+                                                    }
+                                                }
+                                                else if (!type_name.empty() && type_name.back() == '*')
+                                                {
+                                                    type_name.pop_back();
+                                                }
+
+                                                // Now look up the source_namespace for this type so method resolution
+                                                // can find methods defined in the type's original module
+                                                if (!type_name.empty() && type_name.find("::") == std::string::npos)
+                                                {
+                                                    // Type name is unqualified, look up its source namespace
+                                                    std::vector<std::string> field_type_candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
+                                                    for (const auto &type_candidate : field_type_candidates)
+                                                    {
+                                                        const TemplateRegistry::StructFieldInfo *type_field_info = template_reg->get_struct_field_types(type_candidate);
+                                                        if (type_field_info && !type_field_info->source_namespace.empty())
+                                                        {
+                                                            // Found the type's source namespace - qualify the type name
+                                                            std::string qualified_type = type_field_info->source_namespace + "::" + type_name;
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                                      "Qualified field type '{}' to '{}' using source_namespace from '{}'",
+                                                                      type_name, qualified_type, type_candidate);
+                                                            type_name = qualified_type;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "Resolved nested member access: {}.{} -> {} (via TemplateRegistry, found as '{}')",
+                                                          parent_type_name, member_name, type_name, candidate);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (!type_name.empty())
+                                        break;
+                                }
+                            }
+
+                            if (type_name.empty())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "No field info in TemplateRegistry for type: {} (tried {} candidates)",
+                                          parent_type_name, type_candidates.size());
+                            }
+                        }
+
+                        // Fallback: try StructType::field_type from symbols
+                        if (type_name.empty())
+                        {
+                            for (const auto &candidate : type_candidates)
+                            {
+                                TypeRef struct_type_ref = ctx().symbols().lookup_struct_type(candidate);
+                                if (struct_type_ref.is_valid() && struct_type_ref->kind() == Cryo::TypeKind::Struct)
+                                {
+                                    auto *struct_ty = static_cast<const Cryo::StructType *>(struct_type_ref.get());
+                                    auto field_type_opt = struct_ty->field_type(member_name);
+                                    if (field_type_opt.has_value() && field_type_opt->is_valid())
+                                    {
+                                        type_name = field_type_opt->get()->display_name();
+                                        if (!type_name.empty() && type_name.back() == '*')
+                                        {
+                                            type_name.pop_back();
+                                        }
+
+                                        // Now look up the source_namespace for this type so method resolution
+                                        // can find methods defined in the type's original module
+                                        if (!type_name.empty() && type_name.find("::") == std::string::npos)
+                                        {
+                                            if (auto *template_reg = ctx().template_registry())
+                                            {
+                                                std::vector<std::string> field_type_candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
+                                                for (const auto &type_candidate : field_type_candidates)
+                                                {
+                                                    const TemplateRegistry::StructFieldInfo *type_field_info = template_reg->get_struct_field_types(type_candidate);
+                                                    if (type_field_info && !type_field_info->source_namespace.empty())
+                                                    {
+                                                        std::string qualified_type = type_field_info->source_namespace + "::" + type_name;
+                                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                                  "Qualified field type '{}' to '{}' using source_namespace from '{}'",
+                                                                  type_name, qualified_type, type_candidate);
+                                                        type_name = qualified_type;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "Resolved nested member access: {}.{} -> {} (via StructType, found as '{}')",
+                                                  parent_type_name, member_name, type_name, candidate);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // Additional fallback for chained method calls (e.g., this.next().is_some())

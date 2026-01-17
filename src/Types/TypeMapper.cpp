@@ -520,7 +520,15 @@ namespace Cryo
             return nullptr;
         }
 
-        // Arrays in Cryo are represented as struct { T* elements, u64 length, u64 capacity }
+        // Fixed-size arrays (T[N]) are mapped to native LLVM arrays [N x T]
+        // This is important for struct field layout and efficient access
+        if (type->is_fixed_size())
+        {
+            size_t array_size = type->size().value();
+            return llvm::ArrayType::get(elem_llvm, array_size);
+        }
+
+        // Dynamic arrays (T[]) are represented as struct { T* elements, u64 length, u64 capacity }
         std::string array_name = "Array<" + elem_ref.get()->display_name() + ">";
 
         auto it = _struct_cache.find(array_name);
@@ -975,10 +983,71 @@ namespace Cryo
 
     llvm::Type *TypeMapper::resolve_and_map(const std::string &name)
     {
-        // Try get_type first
+        // Try exact name first (handles primitives and exact struct name matches)
         llvm::Type *result = get_type(name);
         if (result)
             return result;
+
+        // If the name is qualified (contains ::), extract the simple type name and try that
+        // e.g., "std::core::option::Option<u64>" -> "Option<u64>"
+        size_t last_sep = name.rfind("::");
+        if (last_sep != std::string::npos)
+        {
+            std::string simple_name = name.substr(last_sep + 2);
+            if (!simple_name.empty())
+            {
+                result = get_type(simple_name);
+                if (result)
+                {
+                    _struct_cache[name] = static_cast<llvm::StructType *>(result);
+                    return result;
+                }
+
+                // For generic types like "Option<u64>", also try the mangled form "Option_u64"
+                size_t angle_pos = simple_name.find('<');
+                if (angle_pos != std::string::npos)
+                {
+                    std::string mangled = simple_name;
+                    for (char &c : mangled)
+                    {
+                        if (c == '<' || c == '>' || c == ',' || c == ' ')
+                            c = '_';
+                    }
+                    // Remove trailing underscore if present
+                    while (!mangled.empty() && mangled.back() == '_')
+                        mangled.pop_back();
+
+                    llvm::StructType *st = llvm::StructType::getTypeByName(_llvm_ctx, mangled);
+                    if (st)
+                    {
+                        _struct_cache[name] = st;
+                        _struct_cache[simple_name] = st;
+                        return st;
+                    }
+                }
+            }
+        }
+
+        // For non-qualified generic types, try the mangled form directly
+        size_t angle_pos = name.find('<');
+        if (angle_pos != std::string::npos)
+        {
+            std::string mangled = name;
+            for (char &c : mangled)
+            {
+                if (c == '<' || c == '>' || c == ',' || c == ' ')
+                    c = '_';
+            }
+            while (!mangled.empty() && mangled.back() == '_')
+                mangled.pop_back();
+
+            llvm::StructType *st = llvm::StructType::getTypeByName(_llvm_ctx, mangled);
+            if (st)
+            {
+                _struct_cache[name] = st;
+                return st;
+            }
+        }
 
         // Create opaque struct as fallback
         return get_or_create_struct(name);
