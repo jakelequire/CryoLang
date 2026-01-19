@@ -2138,10 +2138,53 @@ namespace Cryo::Codegen
         int field_idx = ctx().get_struct_field_index(type_name, member_name);
         if (field_idx < 0)
         {
+            // Fallback: try TemplateRegistry for cross-module struct field lookup
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "resolve_member_info: Field '{}' not found in struct '{}'",
+                      "resolve_member_info: Field '{}' not in local registry for '{}', trying TemplateRegistry",
                       member_name, type_name);
-            return false;
+
+            if (auto *template_reg = ctx().template_registry())
+            {
+                // Try various name candidates (qualified and unqualified)
+                std::vector<std::string> candidates = {type_name};
+                if (!ctx().namespace_context().empty())
+                {
+                    candidates.push_back(ctx().namespace_context() + "::" + type_name);
+                }
+
+                for (const auto &candidate : candidates)
+                {
+                    const TemplateRegistry::StructFieldInfo *field_info = template_reg->get_struct_field_types(candidate);
+                    if (field_info && !field_info->field_names.empty())
+                    {
+                        // Find the field index by name
+                        for (size_t i = 0; i < field_info->field_names.size(); ++i)
+                        {
+                            if (field_info->field_names[i] == member_name)
+                            {
+                                field_idx = static_cast<int>(i);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_member_info: Found field '{}' at index {} via TemplateRegistry ({})",
+                                          member_name, field_idx, candidate);
+
+                                // Register the field indices for future lookups
+                                ctx().register_struct_fields(type_name, field_info->field_names);
+                                break;
+                            }
+                        }
+                        if (field_idx >= 0)
+                            break;
+                    }
+                }
+            }
+
+            if (field_idx < 0)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_member_info: Field '{}' not found in struct '{}' (also checked TemplateRegistry)",
+                          member_name, type_name);
+                return false;
+            }
         }
 
         out_field_idx = static_cast<unsigned>(field_idx);

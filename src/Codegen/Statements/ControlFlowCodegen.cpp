@@ -794,6 +794,13 @@ namespace Cryo::Codegen
             // Generate arm body
             builder().SetInsertPoint(arm_block);
             enter_scope(arm_block);
+
+            // Bind pattern variables before generating body
+            if (pattern)
+            {
+                bind_enum_pattern_variables(match_value, pattern);
+            }
+
             if (arm->body())
             {
                 CodegenVisitor *visitor = ctx().visitor();
@@ -886,6 +893,171 @@ namespace Cryo::Codegen
 
         // Default: wildcard behavior
         return nullptr;
+    }
+
+    void ControlFlowCodegen::bind_enum_pattern_variables(llvm::Value *value, Cryo::PatternNode *pattern)
+    {
+        if (!value || !pattern)
+            return;
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: bind_enum_pattern_variables called");
+
+        // Handle identifier patterns (simple variable binding)
+        if (pattern->pattern_type() == Cryo::PatternNode::PatternType::Identifier)
+        {
+            std::string var_name = pattern->identifier();
+            if (!var_name.empty() && var_name != "_")
+            {
+                // The matched value becomes the bound variable
+                // Create an alloca for the variable and store the value
+                llvm::Type *value_type = value->getType();
+                llvm::AllocaInst *alloca = create_entry_alloca(value_type, var_name);
+                if (alloca)
+                {
+                    builder().CreateStore(value, alloca);
+                    // Register in scope so it can be looked up later
+                    values().set_value(var_name, alloca, alloca, value_type);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "bind_enum_pattern_variables: Bound identifier '{}' to value", var_name);
+                }
+            }
+            return;
+        }
+
+        // Handle enum patterns with bindings (e.g., Result::Ok(d))
+        auto *enum_pattern = dynamic_cast<Cryo::EnumPatternNode *>(pattern);
+        if (!enum_pattern)
+            return;
+
+        const auto &elements = enum_pattern->pattern_elements();
+        if (elements.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "bind_enum_pattern_variables: No pattern elements in {}::{}",
+                      enum_pattern->enum_name(), enum_pattern->variant_name());
+            return;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "bind_enum_pattern_variables: Processing {}::{} with {} pattern elements",
+                  enum_pattern->enum_name(), enum_pattern->variant_name(), elements.size());
+
+        // The match value should be an enum struct with layout: { i32 discriminant, [N x i8] payload }
+        // We need to extract payload fields for each binding
+
+        llvm::Type *value_type = value->getType();
+
+        // If value is not a struct or not a pointer to struct, we can't extract fields
+        llvm::StructType *struct_type = nullptr;
+        llvm::Value *base_ptr = nullptr;
+
+        if (value_type->isStructTy())
+        {
+            struct_type = llvm::cast<llvm::StructType>(value_type);
+            // Value is by-value, we need to create an alloca to get a pointer for GEP
+            base_ptr = create_entry_alloca(struct_type, "enum_match_temp");
+            builder().CreateStore(value, base_ptr);
+        }
+        else if (value_type->isPointerTy())
+        {
+            // Value is already a pointer, use it directly
+            base_ptr = value;
+            // Try to get the struct type from the pointer
+            // In opaque pointer mode, we need to look it up by name
+            std::string type_name = enum_pattern->enum_name();
+            llvm::Type *resolved_type = ctx().get_type(type_name);
+            if (resolved_type && resolved_type->isStructTy())
+            {
+                struct_type = llvm::cast<llvm::StructType>(resolved_type);
+            }
+        }
+
+        if (!struct_type || struct_type->getNumElements() < 2)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "bind_enum_pattern_variables: Cannot determine struct type for enum, trying fallback");
+            // Fallback: just bind the value directly for single bindings
+            if (elements.size() == 1 && elements[0].is_binding())
+            {
+                const std::string &var_name = elements[0].binding_name;
+                if (!var_name.empty() && var_name != "_")
+                {
+                    llvm::AllocaInst *alloca = create_entry_alloca(value_type, var_name);
+                    if (alloca)
+                    {
+                        builder().CreateStore(value, alloca);
+                        values().set_value(var_name, alloca, alloca, value_type);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "bind_enum_pattern_variables: Fallback - bound '{}' to match value", var_name);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Get pointer to payload (index 1 in the enum struct)
+        llvm::Value *payload_ptr = builder().CreateStructGEP(struct_type, base_ptr, 1, "payload_ptr");
+
+        // Extract fields from payload for each binding
+        // The payload is typically a byte array, and fields are at specific offsets
+        // For simplicity, we'll treat each binding as extracting from the payload sequentially
+
+        size_t offset = 0;
+        size_t binding_index = 0;
+
+        for (const auto &element : elements)
+        {
+            if (element.is_binding())
+            {
+                const std::string &var_name = element.binding_name;
+                if (var_name.empty() || var_name == "_")
+                {
+                    // Skip wildcards
+                    offset += 8; // Default pointer size
+                    continue;
+                }
+
+                // Calculate pointer to this field in payload
+                // Using i8* arithmetic for byte offsets
+                llvm::Type *i8_type = llvm::Type::getInt8Ty(llvm_ctx());
+                llvm::Value *field_ptr = builder().CreateConstGEP1_32(i8_type, payload_ptr, offset, var_name + "_ptr");
+
+                // For now, assume payload fields are pointer-sized (8 bytes) as a reasonable default
+                // A more complete implementation would look up the actual variant field types
+                llvm::Type *field_type = llvm::Type::getInt64Ty(llvm_ctx());
+
+                // Cast to pointer of the assumed type
+                llvm::Value *typed_ptr = field_ptr;
+
+                // Load the value
+                llvm::Value *field_value = builder().CreateLoad(field_type, typed_ptr, var_name + "_val");
+
+                // Create alloca and store
+                llvm::AllocaInst *alloca = create_entry_alloca(field_type, var_name);
+                if (alloca)
+                {
+                    builder().CreateStore(field_value, alloca);
+                    values().set_value(var_name, alloca, alloca, field_type);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "bind_enum_pattern_variables: Bound '{}' from payload at offset {}",
+                              var_name, offset);
+                }
+
+                offset += 8; // Default pointer/i64 size
+            }
+            else if (element.is_wildcard())
+            {
+                // Wildcard - skip this position
+                offset += 8;
+            }
+            else if (element.is_literal())
+            {
+                // Literal - skip (already matched in generate_pattern_match)
+                offset += 8;
+            }
+
+            binding_index++;
+        }
     }
 
     //===================================================================

@@ -182,6 +182,15 @@ namespace Cryo
         // Tuple types: element hash -> tuple TypeRef
         std::unordered_map<std::string, TypeRef> _tuple_types;
 
+        // User-defined type caches (deduplicated by qualified name)
+        std::unordered_map<std::string, TypeRef> _struct_types;
+        std::unordered_map<std::string, TypeRef> _class_types;
+        std::unordered_map<std::string, TypeRef> _enum_types;
+        std::unordered_map<std::string, TypeRef> _trait_types;
+
+        // Generate key for user-defined types
+        static std::string make_user_type_key(const QualifiedTypeName &name);
+
         // ====================================================================
         // Helper methods
         // ====================================================================

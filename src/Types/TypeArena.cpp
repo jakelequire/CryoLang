@@ -435,35 +435,93 @@ namespace Cryo
     }
 
     // ========================================================================
-    // User-defined type creation
+    // User-defined type creation (with deduplication)
     // ========================================================================
+
+    std::string TypeArena::make_user_type_key(const QualifiedTypeName &name)
+    {
+        // Use module ID and name for uniqueness
+        return std::to_string(name.module.id) + "::" + name.name;
+    }
 
     TypeRef TypeArena::create_struct(const QualifiedTypeName &name)
     {
+        // Check cache first for deduplication
+        std::string key = make_user_type_key(name);
+        auto it = _struct_types.find(key);
+        if (it != _struct_types.end())
+        {
+            return it->second;
+        }
+
+        // Create new struct type
         TypeID id = allocate_id();
         auto type = std::make_unique<StructType>(id, name);
-        return register_type(std::move(type));
+        TypeRef ref = register_type(std::move(type));
+
+        // Cache and return
+        _struct_types[key] = ref;
+        return ref;
     }
 
     TypeRef TypeArena::create_class(const QualifiedTypeName &name)
     {
+        // Check cache first for deduplication
+        std::string key = make_user_type_key(name);
+        auto it = _class_types.find(key);
+        if (it != _class_types.end())
+        {
+            return it->second;
+        }
+
+        // Create new class type
         TypeID id = allocate_id();
         auto type = std::make_unique<ClassType>(id, name);
-        return register_type(std::move(type));
+        TypeRef ref = register_type(std::move(type));
+
+        // Cache and return
+        _class_types[key] = ref;
+        return ref;
     }
 
     TypeRef TypeArena::create_enum(const QualifiedTypeName &name)
     {
+        // Check cache first for deduplication
+        std::string key = make_user_type_key(name);
+        auto it = _enum_types.find(key);
+        if (it != _enum_types.end())
+        {
+            return it->second;
+        }
+
+        // Create new enum type
         TypeID id = allocate_id();
         auto type = std::make_unique<EnumType>(id, name);
-        return register_type(std::move(type));
+        TypeRef ref = register_type(std::move(type));
+
+        // Cache and return
+        _enum_types[key] = ref;
+        return ref;
     }
 
     TypeRef TypeArena::create_trait(const QualifiedTypeName &name)
     {
+        // Check cache first for deduplication
+        std::string key = make_user_type_key(name);
+        auto it = _trait_types.find(key);
+        if (it != _trait_types.end())
+        {
+            return it->second;
+        }
+
+        // Create new trait type
         TypeID id = allocate_id();
         auto type = std::make_unique<TraitType>(id, name);
-        return register_type(std::move(type));
+        TypeRef ref = register_type(std::move(type));
+
+        // Cache and return
+        _trait_types[key] = ref;
+        return ref;
     }
 
     TypeRef TypeArena::create_type_alias(const QualifiedTypeName &name, TypeRef target)

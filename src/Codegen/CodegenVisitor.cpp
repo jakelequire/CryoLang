@@ -1505,6 +1505,10 @@ namespace Cryo::Codegen
     void CodegenVisitor::set_pre_registration_mode(bool enabled)
     {
         _pre_registration_mode = enabled;
+        // When pre-registration mode is enabled, also defer method generation
+        // This prevents method bodies from being generated during pre-registration,
+        // which would cause them to be skipped during the actual Pass 3 method body generation
+        _defer_method_generation = enabled;
         _declarations->set_pre_registration_mode(enabled);
     }
 

@@ -600,9 +600,43 @@ namespace Cryo::Codegen
         // Check if already declared
         if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
         {
-            // If already complete (non-opaque), just return it
+            // If already complete (non-opaque), ensure field names are registered and return
             if (!existing->isOpaque())
             {
+                // Even if struct already exists, we need to ensure field names are registered
+                // This can happen when struct is generated during pre-registration but fields
+                // aren't registered until Pass 1
+                if (!node->fields().empty() && ctx().get_struct_field_index(name, node->fields()[0]->name()) < 0)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registering field names for existing struct: {}", name);
+                    std::vector<std::string> field_names;
+                    std::vector<TypeRef> cryo_field_type_refs;
+                    field_names.reserve(node->fields().size());
+                    cryo_field_type_refs.reserve(node->fields().size());
+                    for (const auto &field : node->fields())
+                    {
+                        field_names.push_back(field->name());
+                        TypeRef ftype = field->get_resolved_type();
+                        cryo_field_type_refs.push_back(ftype.is_valid() && !ftype.is_error() ? ftype : TypeRef{});
+                    }
+                    ctx().register_struct_fields(name, field_names);
+
+                    // Also register in TemplateRegistry
+                    if (auto *template_reg = ctx().template_registry())
+                    {
+                        std::string source_ns = ctx().namespace_context();
+                        std::string qualified_name = source_ns.empty() ? name : source_ns + "::" + name;
+                        template_reg->register_struct_field_types(qualified_name, field_names, cryo_field_type_refs, source_ns);
+                        if (qualified_name != name)
+                        {
+                            template_reg->register_struct_field_types(name, field_names, cryo_field_type_refs, source_ns);
+                        }
+                    }
+
+                    // Also ensure TypeMapper cache has the struct
+                    types().register_struct(name, existing);
+                    ctx().register_type(name, existing);
+                }
                 return existing;
             }
             // Otherwise, we'll complete the opaque struct below
@@ -730,9 +764,25 @@ namespace Cryo::Codegen
         // Check if already declared
         if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
         {
-            // If already complete (non-opaque), just return it
+            // If already complete (non-opaque), ensure field names are registered and return
             if (!existing->isOpaque())
             {
+                // Even if class already exists, we need to ensure field names are registered
+                // This can happen when class is generated during pre-registration but fields
+                // aren't registered until Pass 1
+                if (!node->fields().empty() && ctx().get_struct_field_index(name, node->fields()[0]->name()) < 0)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registering field names for existing class: {}", name);
+                    std::vector<std::string> field_names;
+                    field_names.reserve(node->fields().size());
+                    for (const auto &field : node->fields())
+                    {
+                        field_names.push_back(field->name());
+                    }
+                    ctx().register_struct_fields(name, field_names);
+                    types().register_struct(name, existing);
+                    ctx().register_type(name, existing);
+                }
                 return existing;
             }
             // Otherwise, we'll complete the opaque struct below

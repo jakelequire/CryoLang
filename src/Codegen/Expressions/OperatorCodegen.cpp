@@ -395,10 +395,10 @@ namespace Cryo::Codegen
                          "Assignment: Callee name is '{}'", callee_name);
             }
 
-            // Check if this is a class type constructor
-            bool is_class = _calls ? _calls->is_class_type(callee_name) : false;
+            // Check if this is a class type constructor (only if callee_name is non-empty)
+            bool is_class = (!callee_name.empty() && _calls) ? _calls->is_class_type(callee_name) : false;
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                     "Assignment: Callee '{}' is_class_type={}, _calls={}", 
+                     "Assignment: Callee '{}' is_class_type={}, _calls={}",
                      callee_name, is_class, (void*)_calls);
 
             if (!callee_name.empty() && _calls)
@@ -2093,56 +2093,75 @@ namespace Cryo::Codegen
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "get_lvalue_address: type_name empty, trying fallbacks");
-                // Fallback: Check if this is the 'this' identifier
+                // Fallback: If object is an identifier, look up its type from variable_types_map
                 if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(member->object()))
                 {
-                    if (identifier->name() == "this")
+                    const std::string &var_name = identifier->name();
+                    auto &var_types = ctx().variable_types_map();
+                    auto it = var_types.find(var_name);
+                    if (it != var_types.end() && it->second.is_valid())
                     {
-                        // Try to get 'this' type from variable_types_map
-                        auto &var_types = ctx().variable_types_map();
-                        auto it = var_types.find("this");
-                        if (it != var_types.end() && it->second)
+                        TypeRef obj_type = it->second;
+                        type_name = obj_type.get()->display_name();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "get_lvalue_address: Found type for '{}' in variable_types_map: {}",
+                                  var_name, type_name);
+                        // Handle pointer types - get the pointee type name
+                        if (obj_type->kind() == Cryo::TypeKind::Pointer)
                         {
-                            type_name = it->second.get()->display_name();
-                            if (!type_name.empty() && type_name.back() == '*')
+                            auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
+                            if (ptr_type && ptr_type->pointee().is_valid())
                             {
-                                type_name.pop_back();
+                                type_name = ptr_type->pointee().get()->display_name();
                             }
                         }
-                        else
+                        else if (!type_name.empty() && type_name.back() == '*')
                         {
-                            // Fallback to current_type_name if available
-                            type_name = ctx().current_type_name();
+                            type_name.pop_back();
                         }
                     }
+                    else if (var_name == "this")
+                    {
+                        // Special case: Fallback to current_type_name for 'this' if not in map
+                        type_name = ctx().current_type_name();
+                    }
                 }
-                // Handle nested member access (e.g., this.current_chunk.next)
+                // Handle nested member access (e.g., obj.field.subfield or this.current_chunk.next)
                 else if (auto *nested_member = dynamic_cast<Cryo::MemberAccessNode *>(member->object()))
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "get_lvalue_address: Handling nested member access, nested_member='{}', outer_member='{}'",
                               nested_member->member(), member_name);
                     // Recursively resolve the type of the nested member access
-                    // First, get the base type (e.g., for this.current_chunk, get 'this' type)
+                    // First, get the base type (e.g., for obj.field, get type of 'obj')
                     std::string base_type_name;
                     if (auto *base_ident = dynamic_cast<Cryo::IdentifierNode *>(nested_member->object()))
                     {
-                        if (base_ident->name() == "this")
+                        const std::string &var_name = base_ident->name();
+                        auto &var_types = ctx().variable_types_map();
+                        auto it = var_types.find(var_name);
+                        if (it != var_types.end() && it->second.is_valid())
                         {
-                            auto &var_types = ctx().variable_types_map();
-                            auto it = var_types.find("this");
-                            if (it != var_types.end() && it->second)
+                            TypeRef base_obj_type = it->second;
+                            base_type_name = base_obj_type.get()->display_name();
+                            // Handle pointer types - get the pointee type name
+                            if (base_obj_type->kind() == Cryo::TypeKind::Pointer)
                             {
-                                base_type_name = it->second.get()->display_name();
-                                if (!base_type_name.empty() && base_type_name.back() == '*')
+                                auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(base_obj_type.get());
+                                if (ptr_type && ptr_type->pointee().is_valid())
                                 {
-                                    base_type_name.pop_back();
+                                    base_type_name = ptr_type->pointee().get()->display_name();
                                 }
                             }
-                            else
+                            else if (!base_type_name.empty() && base_type_name.back() == '*')
                             {
-                                base_type_name = ctx().current_type_name();
+                                base_type_name.pop_back();
                             }
+                        }
+                        else if (var_name == "this")
+                        {
+                            // Special case: Fallback to current_type_name for 'this' if not in map
+                            base_type_name = ctx().current_type_name();
                         }
                     }
 
