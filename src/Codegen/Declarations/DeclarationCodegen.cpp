@@ -2,6 +2,7 @@
 #include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
+#include "Types/ErrorType.hpp"
 #include "Utils/Logger.hpp"
 
 #include <llvm/IR/Verifier.h>
@@ -698,12 +699,119 @@ namespace Cryo::Codegen
         TypeRef cryo_var_type = node->get_resolved_type();
 
         // Check if variable type is an error type (unresolved generics, undefined types, etc.)
+        // This can happen with forward-referenced types that weren't resolved during parsing
         if (cryo_var_type.is_error())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "DeclarationCodegen: Skipping local variable '{}' - type is error: '{}'",
+                      "DeclarationCodegen: Variable '{}' has error type: '{}', attempting late resolution",
                       name, cryo_var_type->display_name());
-            return nullptr;
+
+            const TypeAnnotation *annotation = node->type_annotation();
+            TypeRef resolved;
+
+            // First try: Use the type annotation directly for proper generic resolution
+            // This handles generic types like Array<String> properly
+            if (annotation)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Attempting late resolution via type annotation (kind={})",
+                          static_cast<int>(annotation->kind));
+
+                resolved = resolve_type_annotation(annotation);
+
+                if (resolved.is_valid() && !resolved.is_error())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Late resolution via annotation succeeded -> '{}'",
+                              resolved->display_name());
+                    cryo_var_type = resolved;
+                    node->set_resolved_type(resolved);
+                }
+            }
+
+            // Second try: Fallback for simple named types without proper annotations
+            if (!resolved.is_valid() || resolved.is_error())
+            {
+                std::string type_name;
+
+                if (annotation && !annotation->name.empty() &&
+                    annotation->kind != TypeAnnotationKind::Generic)
+                {
+                    // Use annotation name for non-generic types
+                    type_name = annotation->name;
+                }
+                else
+                {
+                    // Fallback: Extract type name from the error reason
+                    // Error format is "unresolved type: TypeName" or "unresolved generic: TypeName<...>"
+                    const ErrorType *error_type = static_cast<const ErrorType *>(cryo_var_type.get());
+                    if (error_type)
+                    {
+                        std::string reason = error_type->reason();
+                        const std::string prefix = "unresolved type: ";
+                        const std::string generic_prefix = "unresolved generic: ";
+
+                        if (reason.rfind(prefix, 0) == 0)
+                        {
+                            // Simple type: "unresolved type: timespec"
+                            type_name = reason.substr(prefix.length());
+                        }
+                        else if (reason.rfind(generic_prefix, 0) == 0)
+                        {
+                            // For unresolved generics, the annotation-based resolution should
+                            // have worked. If we're here, it means we don't have the annotation.
+                            // Log a warning and skip - we can't resolve generics without annotations.
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "DeclarationCodegen: Cannot resolve generic type without proper annotation");
+                            return nullptr;
+                        }
+                    }
+                }
+
+                if (type_name.empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Skipping local variable '{}' - cannot determine type name for late resolution",
+                              name);
+                    return nullptr;
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Fallback resolution for simple type '{}'", type_name);
+
+                // Try to look up as struct type first
+                resolved = ctx().symbols().lookup_struct_type(type_name);
+                if (!resolved.is_valid())
+                {
+                    // Try with current namespace prefix
+                    std::string ns = ctx().namespace_context();
+                    if (!ns.empty())
+                    {
+                        std::string qualified = ns + "::" + type_name;
+                        resolved = ctx().symbols().lookup_struct_type(qualified);
+                    }
+                }
+                if (!resolved.is_valid())
+                {
+                    // Try as class type
+                    resolved = ctx().symbols().lookup_class_type(type_name);
+                }
+
+                if (resolved.is_valid() && !resolved.is_error())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Late resolution succeeded for type '{}' -> '{}'",
+                              type_name, resolved->display_name());
+                    cryo_var_type = resolved;
+                    node->set_resolved_type(resolved);
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Late resolution failed for type '{}'", type_name);
+                    return nullptr;
+                }
+            }
         }
 
         llvm::Type *var_type = get_llvm_type(cryo_var_type);
@@ -2758,8 +2866,262 @@ namespace Cryo::Codegen
                                 llvm::GlobalValue::AppendingLinkage, 
                                 ctor_array, "llvm.global_ctors");
 
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                  "Global constructor function created and registered with @llvm.global_ctors");
+    }
+
+    //===================================================================
+    // Type Resolution Helpers
+    //===================================================================
+
+    TypeRef DeclarationCodegen::resolve_type_annotation(const TypeAnnotation *annotation)
+    {
+        if (!annotation)
+            return TypeRef();
+
+        TypeArena &arena = ctx().types().arena();
+
+        switch (annotation->kind)
+        {
+        case TypeAnnotationKind::Primitive:
+        {
+            // Lookup primitive type in arena
+            const std::string &name = annotation->name;
+            if (name == "void") return arena.get_void();
+            if (name == "bool") return arena.get_bool();
+            if (name == "char") return arena.get_char();
+            if (name == "string" || name == "String") return arena.get_string();
+            if (name == "i8") return arena.get_i8();
+            if (name == "i16") return arena.get_i16();
+            if (name == "i32" || name == "int") return arena.get_i32();
+            if (name == "i64") return arena.get_i64();
+            if (name == "i128") return arena.get_i128();
+            if (name == "u8") return arena.get_u8();
+            if (name == "u16") return arena.get_u16();
+            if (name == "u32" || name == "uint") return arena.get_u32();
+            if (name == "u64") return arena.get_u64();
+            if (name == "u128") return arena.get_u128();
+            if (name == "f32" || name == "float") return arena.get_f32();
+            if (name == "f64" || name == "double") return arena.get_f64();
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_type_annotation: Unknown primitive type '{}'", name);
+            return TypeRef();
+        }
+
+        case TypeAnnotationKind::Named:
+        {
+            // Try to lookup as struct, class, or enum type
+            const std::string &name = annotation->name;
+
+            TypeRef resolved = ctx().symbols().lookup_struct_type(name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            resolved = ctx().symbols().lookup_class_type(name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            resolved = ctx().symbols().lookup_enum_type(name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            // Try with current namespace prefix
+            std::string ns = ctx().namespace_context();
+            if (!ns.empty())
+            {
+                std::string qualified = ns + "::" + name;
+                resolved = ctx().symbols().lookup_struct_type(qualified);
+                if (resolved.is_valid() && !resolved.is_error())
+                    return resolved;
+
+                resolved = ctx().symbols().lookup_class_type(qualified);
+                if (resolved.is_valid() && !resolved.is_error())
+                    return resolved;
+
+                resolved = ctx().symbols().lookup_enum_type(qualified);
+                if (resolved.is_valid() && !resolved.is_error())
+                    return resolved;
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_type_annotation: Could not resolve named type '{}'", name);
+            return TypeRef();
+        }
+
+        case TypeAnnotationKind::Qualified:
+        {
+            // Join qualified path and lookup
+            std::string qualified_name;
+            for (size_t i = 0; i < annotation->qualified_path.size(); ++i)
+            {
+                if (i > 0) qualified_name += "::";
+                qualified_name += annotation->qualified_path[i];
+            }
+
+            TypeRef resolved = ctx().symbols().lookup_struct_type(qualified_name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            resolved = ctx().symbols().lookup_class_type(qualified_name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            resolved = ctx().symbols().lookup_enum_type(qualified_name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_type_annotation: Could not resolve qualified type '{}'", qualified_name);
+            return TypeRef();
+        }
+
+        case TypeAnnotationKind::Generic:
+        {
+            // Resolve base type from inner annotation
+            if (!annotation->inner)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_type_annotation: Generic type has no inner (base) annotation");
+                return TypeRef();
+            }
+
+            TypeRef base_type = resolve_type_annotation(annotation->inner.get());
+            if (!base_type.is_valid() || base_type.is_error())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_type_annotation: Failed to resolve generic base type");
+                return base_type;
+            }
+
+            // Resolve type arguments from elements
+            std::vector<TypeRef> type_args;
+            type_args.reserve(annotation->elements.size());
+
+            for (const auto &arg_annotation : annotation->elements)
+            {
+                TypeRef arg_type = resolve_type_annotation(&arg_annotation);
+                if (!arg_type.is_valid() || arg_type.is_error())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_type_annotation: Failed to resolve type argument");
+                    return arg_type;
+                }
+                type_args.push_back(arg_type);
+            }
+
+            // Create instantiated type
+            TypeRef instantiated = arena.create_instantiation(base_type, std::move(type_args));
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_type_annotation: Created instantiation '{}' with {} type args",
+                      instantiated.is_valid() ? instantiated->display_name() : "invalid",
+                      annotation->elements.size());
+
+            return instantiated;
+        }
+
+        case TypeAnnotationKind::Pointer:
+        {
+            if (!annotation->inner)
+                return TypeRef();
+
+            TypeRef inner = resolve_type_annotation(annotation->inner.get());
+            if (!inner.is_valid() || inner.is_error())
+                return inner;
+
+            return arena.get_pointer_to(inner);
+        }
+
+        case TypeAnnotationKind::Reference:
+        {
+            if (!annotation->inner)
+                return TypeRef();
+
+            TypeRef inner = resolve_type_annotation(annotation->inner.get());
+            if (!inner.is_valid() || inner.is_error())
+                return inner;
+
+            return arena.get_reference_to(inner,
+                annotation->is_mutable ? RefMutability::Mutable : RefMutability::Immutable);
+        }
+
+        case TypeAnnotationKind::Array:
+        {
+            if (!annotation->inner)
+                return TypeRef();
+
+            TypeRef element = resolve_type_annotation(annotation->inner.get());
+            if (!element.is_valid() || element.is_error())
+                return element;
+
+            return arena.get_array_of(element, annotation->array_size);
+        }
+
+        case TypeAnnotationKind::Optional:
+        {
+            if (!annotation->inner)
+                return TypeRef();
+
+            TypeRef inner = resolve_type_annotation(annotation->inner.get());
+            if (!inner.is_valid() || inner.is_error())
+                return inner;
+
+            return arena.get_optional_of(inner);
+        }
+
+        case TypeAnnotationKind::Tuple:
+        {
+            std::vector<TypeRef> elements;
+            elements.reserve(annotation->elements.size());
+
+            for (const auto &elem : annotation->elements)
+            {
+                TypeRef resolved = resolve_type_annotation(&elem);
+                if (!resolved.is_valid() || resolved.is_error())
+                    return resolved;
+                elements.push_back(resolved);
+            }
+
+            return arena.get_tuple(std::move(elements));
+        }
+
+        case TypeAnnotationKind::Function:
+        {
+            // Resolve return type
+            TypeRef return_type;
+            if (annotation->return_type)
+            {
+                return_type = resolve_type_annotation(annotation->return_type.get());
+                if (!return_type.is_valid() || return_type.is_error())
+                    return return_type;
+            }
+            else
+            {
+                return_type = arena.get_void();
+            }
+
+            // Resolve parameter types
+            std::vector<TypeRef> param_types;
+            param_types.reserve(annotation->elements.size());
+
+            for (const auto &param : annotation->elements)
+            {
+                TypeRef resolved = resolve_type_annotation(&param);
+                if (!resolved.is_valid() || resolved.is_error())
+                    return resolved;
+                param_types.push_back(resolved);
+            }
+
+            return arena.get_function(return_type, std::move(param_types), annotation->is_variadic);
+        }
+
+        default:
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_type_annotation: Unhandled annotation kind {}",
+                      static_cast<int>(annotation->kind));
+            return TypeRef();
+        }
     }
 
 } // namespace Cryo::Codegen

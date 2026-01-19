@@ -651,10 +651,29 @@ namespace Cryo
 
         std::string name = type->qualified_name().name;
 
+        // First check our cache
         auto existing = lookup_struct(name);
         if (existing && !existing->isOpaque())
         {
             return existing;
+        }
+
+        // Check LLVM context directly - the struct might have been generated
+        // by TypeCodegen but not yet in our cache
+        if (llvm::StructType *llvm_existing = llvm::StructType::getTypeByName(_llvm_ctx, name))
+        {
+            if (!llvm_existing->isOpaque())
+            {
+                // Found a complete struct - add to our cache and return
+                _struct_cache[name] = llvm_existing;
+                return llvm_existing;
+            }
+            // Use existing opaque struct
+            if (!existing)
+            {
+                existing = llvm_existing;
+                _struct_cache[name] = llvm_existing;
+            }
         }
 
         llvm::StructType *st = existing ? existing : get_or_create_struct(name);
@@ -664,7 +683,10 @@ namespace Cryo
             return st;
         }
 
-        // Try to complete with field information
+        // Try to complete with field information from the Cryo type
+        // Note: For locally-defined structs, fields() may be empty because set_fields
+        // is only called for imported modules. In that case, the struct was completed
+        // by TypeCodegen using AST node fields, and we should find it in LLVM context above.
         const auto &fields = type->fields();
         if (!fields.empty())
         {
@@ -697,10 +719,29 @@ namespace Cryo
 
         std::string name = type->qualified_name().name;
 
+        // First check our cache
         auto existing = lookup_struct(name);
         if (existing && !existing->isOpaque())
         {
             return existing;
+        }
+
+        // Check LLVM context directly - the class might have been generated
+        // by TypeCodegen but not yet in our cache
+        if (llvm::StructType *llvm_existing = llvm::StructType::getTypeByName(_llvm_ctx, name))
+        {
+            if (!llvm_existing->isOpaque())
+            {
+                // Found a complete class - add to our cache and return
+                _struct_cache[name] = llvm_existing;
+                return llvm_existing;
+            }
+            // Use existing opaque struct
+            if (!existing)
+            {
+                existing = llvm_existing;
+                _struct_cache[name] = llvm_existing;
+            }
         }
 
         llvm::StructType *st = existing ? existing : get_or_create_struct(name);
@@ -710,7 +751,7 @@ namespace Cryo
             return st;
         }
 
-        // Try to complete with field information
+        // Try to complete with field information from the Cryo type
         const auto &fields = type->fields();
         if (!fields.empty())
         {

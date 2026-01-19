@@ -536,15 +536,143 @@ namespace Cryo
                 }
                 else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(decl))
                 {
-                    // Create type symbol for struct
-                    Symbol symbol(struct_decl->name(), SymbolKind::Type, TypeRef{}, module_id, struct_decl->location());
+                    TypeRef struct_type{};
+
+                    // Skip generic struct templates - they'll be instantiated when used with concrete types
+                    if (!struct_decl->generic_parameters().empty())
+                    {
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Skipping generic struct template '{}' in create_symbol_map", struct_decl->name());
+                    }
+                    else
+                    {
+                        // For non-generic structs, create a proper StructType with field information
+                        QualifiedTypeName struct_qname{module_id, struct_decl->name()};
+                        struct_type = type_arena.create_struct(struct_qname);
+
+                        // Build field information from the struct declaration
+                        if (struct_type.is_valid() && !struct_decl->fields().empty())
+                        {
+                            std::vector<FieldInfo> fields;
+                            for (const auto &field : struct_decl->fields())
+                            {
+                                if (field)
+                                {
+                                    TypeRef field_type = field->get_resolved_type();
+
+                                    // If resolved type is not available, try to resolve from type annotation
+                                    if (!field_type.is_valid() && field->has_type_annotation())
+                                    {
+                                        std::string type_str = field->type_annotation()->to_string();
+                                        field_type = resolve_primitive_type(type_str, type_arena);
+                                        if (field_type.is_valid())
+                                        {
+                                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved field '{}' type '{}' from annotation in struct '{}'",
+                                                      field->name(), type_str, struct_decl->name());
+                                        }
+                                    }
+
+                                    if (field_type.is_valid())
+                                    {
+                                        fields.push_back(FieldInfo(field->name(), field_type, 0, true, field->is_mutable()));
+                                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added field '{}' of type '{}' to struct '{}'",
+                                                  field->name(), field_type->display_name(), struct_decl->name());
+                                    }
+                                    else
+                                    {
+                                        LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Field '{}' in struct '{}' has no resolved type (annotation: '{}')",
+                                                 field->name(), struct_decl->name(),
+                                                 field->has_type_annotation() ? field->type_annotation()->to_string() : "none");
+                                    }
+                                }
+                            }
+
+                            // Set fields on the struct type (completes it)
+                            if (!fields.empty())
+                            {
+                                auto *struct_ptr = const_cast<StructType *>(dynamic_cast<const StructType *>(struct_type.get()));
+                                if (struct_ptr)
+                                {
+                                    struct_ptr->set_fields(std::move(fields));
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created complete StructType for '{}' with {} fields",
+                                              struct_decl->name(), struct_decl->fields().size());
+                                }
+                            }
+                        }
+                    }
+
+                    // Create type symbol for struct (with proper type if non-generic)
+                    Symbol symbol(struct_decl->name(), SymbolKind::Type, struct_type, module_id, struct_decl->location());
                     symbol.scope = module_name;
                     symbol_map[struct_decl->name()] = symbol;
                 }
                 else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(decl))
                 {
-                    // Create type symbol for class
-                    Symbol symbol(class_decl->name(), SymbolKind::Type, TypeRef{}, module_id, class_decl->location());
+                    TypeRef class_type{};
+
+                    // Skip generic class templates - they'll be instantiated when used with concrete types
+                    if (!class_decl->generic_parameters().empty())
+                    {
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Skipping generic class template '{}' in create_symbol_map", class_decl->name());
+                    }
+                    else
+                    {
+                        // For non-generic classes, create a proper ClassType with field information
+                        QualifiedTypeName class_qname{module_id, class_decl->name()};
+                        class_type = type_arena.create_class(class_qname);
+
+                        // Build field information from the class declaration
+                        if (class_type.is_valid() && !class_decl->fields().empty())
+                        {
+                            std::vector<FieldInfo> fields;
+                            for (const auto &field : class_decl->fields())
+                            {
+                                if (field)
+                                {
+                                    TypeRef field_type = field->get_resolved_type();
+
+                                    // If resolved type is not available, try to resolve from type annotation
+                                    if (!field_type.is_valid() && field->has_type_annotation())
+                                    {
+                                        std::string type_str = field->type_annotation()->to_string();
+                                        field_type = resolve_primitive_type(type_str, type_arena);
+                                        if (field_type.is_valid())
+                                        {
+                                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved field '{}' type '{}' from annotation in class '{}'",
+                                                      field->name(), type_str, class_decl->name());
+                                        }
+                                    }
+
+                                    if (field_type.is_valid())
+                                    {
+                                        fields.push_back(FieldInfo(field->name(), field_type, 0, true, field->is_mutable()));
+                                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added field '{}' of type '{}' to class '{}'",
+                                                  field->name(), field_type->display_name(), class_decl->name());
+                                    }
+                                    else
+                                    {
+                                        LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Field '{}' in class '{}' has no resolved type (annotation: '{}')",
+                                                 field->name(), class_decl->name(),
+                                                 field->has_type_annotation() ? field->type_annotation()->to_string() : "none");
+                                    }
+                                }
+                            }
+
+                            // Set fields on the class type (completes it)
+                            if (!fields.empty())
+                            {
+                                auto *class_ptr = const_cast<ClassType *>(dynamic_cast<const ClassType *>(class_type.get()));
+                                if (class_ptr)
+                                {
+                                    class_ptr->set_fields(std::move(fields));
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created complete ClassType for '{}' with {} fields",
+                                              class_decl->name(), class_decl->fields().size());
+                                }
+                            }
+                        }
+                    }
+
+                    // Create type symbol for class (with proper type if non-generic)
+                    Symbol symbol(class_decl->name(), SymbolKind::Type, class_type, module_id, class_decl->location());
                     symbol.scope = module_name;
                     symbol_map[class_decl->name()] = symbol;
                 }
