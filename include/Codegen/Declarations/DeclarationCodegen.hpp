@@ -347,6 +347,19 @@ namespace Cryo::Codegen
          */
         llvm::Constant *generate_global_initializer(Cryo::VariableDeclarationNode *node,
                                                      llvm::Type *type);
+
+        /**
+         * @brief Resolve a TypeAnnotation to a TypeRef during late resolution
+         *
+         * This properly handles generic types by:
+         * 1. Resolving the base type
+         * 2. Resolving each type argument recursively
+         * 3. Creating a proper instantiated type via TypeArena
+         *
+         * @param annotation The type annotation to resolve
+         * @return Resolved TypeRef, or invalid TypeRef on failure
+         */
+        TypeRef resolve_type_annotation(const TypeAnnotation *annotation);
     };
 
 } // namespace Cryo::Codegen
