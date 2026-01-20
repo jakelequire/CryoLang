@@ -231,6 +231,9 @@ namespace Cryo
         // Look up a type by its ID
         const Type *lookup(TypeID id) const;
 
+        // Look up a type by name (searches struct, enum, class, trait caches)
+        TypeRef lookup_type_by_name(const std::string &name) const;
+
         // Get the number of types in the arena
         size_t type_count() const { return _types.size(); }
 

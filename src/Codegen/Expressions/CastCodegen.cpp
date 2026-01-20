@@ -40,7 +40,33 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        return generate_implicit_cast(value, node->get_resolved_type());
+        // Get the target type - prefer resolved target type, fall back to annotation
+        llvm::Type *llvm_target = nullptr;
+        std::string target_type_name;
+
+        if (node->has_resolved_target_type())
+        {
+            TypeRef resolved = node->get_resolved_target_type();
+            llvm_target = get_llvm_type(resolved);
+            target_type_name = resolved->display_name();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CastCodegen: Using resolved target type: {}", target_type_name);
+        }
+        else if (node->target_type_annotation())
+        {
+            // Fall back to type annotation if not resolved
+            target_type_name = node->target_type_annotation()->to_string();
+            llvm_target = types().get_type(target_type_name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CastCodegen: Using type annotation: {}", target_type_name);
+        }
+
+        if (!llvm_target)
+        {
+            report_error(ErrorCode::E0641_NULL_CAST_EXPRESSION, node,
+                         "CastCodegen: Unknown cast target type: " + target_type_name);
+            return value; // Return uncasted value as fallback
+        }
+
+        return cast_to(value, llvm_target, "cast");
     }
 
     llvm::Value *CastCodegen::generate_implicit_cast(llvm::Value *value, TypeRef target_type)

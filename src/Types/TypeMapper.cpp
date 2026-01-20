@@ -890,9 +890,15 @@ namespace Cryo
         if (!type)
             return nullptr;
 
+        // If we have a resolved concrete type, use that directly
+        if (type->has_resolved_type())
+        {
+            return map(type->resolved_type());
+        }
+
         std::string name = type->display_name();
 
-        // Check if already exists
+        // Check if already exists and is complete
         auto existing = lookup_struct(name);
         if (existing && !existing->isOpaque())
         {
@@ -913,9 +919,194 @@ namespace Cryo
             }
         }
 
+        // Handle based on the generic base type
+        TypeRef base = type->generic_base();
+        const std::vector<TypeRef> &args = type->type_args();
+
+        if (base.is_valid())
+        {
+            const Type *base_type = base.get();
+
+            if (base_type->kind() == TypeKind::Enum)
+            {
+                // Handle instantiated enum (like Result<T, E> or Option<T>)
+                auto *enum_type = static_cast<const EnumType *>(base_type);
+                return map_instantiated_enum(type, enum_type, args);
+            }
+            else if (base_type->kind() == TypeKind::Struct)
+            {
+                // Handle instantiated struct (like Array<T>)
+                auto *struct_type = static_cast<const StructType *>(base_type);
+                return map_instantiated_struct(type, struct_type, args);
+            }
+        }
+
         // Fallback: create opaque struct
         llvm::StructType *st = existing ? existing : get_or_create_struct(name);
         return st;
+    }
+
+    llvm::Type *TypeMapper::map_instantiated_enum(
+        const InstantiatedType *inst,
+        const EnumType *base_enum,
+        const std::vector<TypeRef> &type_args)
+    {
+        std::string name = inst->display_name();
+
+        // Check if already complete
+        auto existing = lookup_struct(name);
+        if (existing && !existing->isOpaque())
+        {
+            return existing;
+        }
+
+        // Simple enum (no data) -> integer
+        if (base_enum->is_simple_enum())
+        {
+            return i32_type();
+        }
+
+        // Complex enum - compute payload size with substituted types
+        // Build a simple positional mapping: index 0 = first type arg, etc.
+        size_t max_payload = 0;
+
+        for (const auto &variant : base_enum->variants())
+        {
+            size_t variant_size = 0;
+            for (const auto &payload_type : variant.payload_types)
+            {
+                // Substitute generic params with concrete type args
+                TypeRef concrete = substitute_generic_param(payload_type, type_args);
+                llvm::Type *mapped = map(concrete);
+                if (mapped)
+                {
+                    variant_size += size_of(mapped);
+                }
+            }
+            max_payload = std::max(max_payload, variant_size);
+        }
+
+        // Ensure minimum payload size
+        max_payload = std::max(max_payload, static_cast<size_t>(8));
+
+        return create_tagged_union(name, 4, max_payload);
+    }
+
+    llvm::Type *TypeMapper::map_instantiated_struct(
+        const InstantiatedType *inst,
+        const StructType *base_struct,
+        const std::vector<TypeRef> &type_args)
+    {
+        std::string name = inst->display_name();
+
+        // Check if already complete
+        auto existing = lookup_struct(name);
+        if (existing && !existing->isOpaque())
+        {
+            return existing;
+        }
+
+        // Create struct with substituted field types
+        llvm::StructType *st = existing ? existing : get_or_create_struct(name);
+
+        std::vector<llvm::Type *> field_types;
+        for (const auto &field : base_struct->fields())
+        {
+            TypeRef concrete = substitute_generic_param(field.type, type_args);
+            llvm::Type *mapped = map(concrete);
+            if (mapped)
+            {
+                field_types.push_back(mapped);
+            }
+            else
+            {
+                field_types.push_back(ptr_type()); // Fallback
+            }
+        }
+
+        if (!field_types.empty())
+        {
+            st->setBody(field_types, false);
+        }
+
+        return st;
+    }
+
+    TypeRef TypeMapper::substitute_generic_param(TypeRef type,
+                                                    const std::vector<TypeRef> &type_args)
+    {
+        if (!type.is_valid())
+            return type;
+
+        const Type *t = type.get();
+
+        // If it's a generic param, substitute with the corresponding type arg
+        if (t->kind() == TypeKind::GenericParam)
+        {
+            auto *param = static_cast<const GenericParamType *>(t);
+            size_t index = param->param_index();
+            if (index < type_args.size())
+            {
+                return type_args[index];
+            }
+            // Can't substitute - return as-is
+            return type;
+        }
+
+        // For bounded params, also substitute
+        if (t->kind() == TypeKind::BoundedParam)
+        {
+            auto *param = static_cast<const BoundedParamType *>(t);
+            size_t index = param->param_index();
+            if (index < type_args.size())
+            {
+                return type_args[index];
+            }
+            return type;
+        }
+
+        // For compound types, recursively substitute
+        if (t->kind() == TypeKind::Pointer)
+        {
+            auto *ptr = static_cast<const PointerType *>(t);
+            TypeRef inner = substitute_generic_param(ptr->pointee(), type_args);
+            if (inner != ptr->pointee())
+            {
+                return _arena.get_pointer_to(inner);
+            }
+        }
+        else if (t->kind() == TypeKind::Reference)
+        {
+            auto *ref = static_cast<const ReferenceType *>(t);
+            TypeRef inner = substitute_generic_param(ref->referent(), type_args);
+            if (inner != ref->referent())
+            {
+                RefMutability mut = ref->is_mutable() ? RefMutability::Mutable : RefMutability::Immutable;
+                return _arena.get_reference_to(inner, mut);
+            }
+        }
+        else if (t->kind() == TypeKind::Array)
+        {
+            auto *arr = static_cast<const ArrayType *>(t);
+            TypeRef elem = substitute_generic_param(arr->element(), type_args);
+            if (elem != arr->element())
+            {
+                // get_array_of handles both fixed and dynamic arrays via optional size
+                return _arena.get_array_of(elem, arr->size());
+            }
+        }
+        else if (t->kind() == TypeKind::Optional)
+        {
+            auto *opt = static_cast<const OptionalType *>(t);
+            TypeRef inner = substitute_generic_param(opt->wrapped(), type_args);
+            if (inner != opt->wrapped())
+            {
+                return _arena.get_optional_of(inner);
+            }
+        }
+
+        // Non-generic or unhandled - return as-is
+        return type;
     }
 
     llvm::Type *TypeMapper::map_error(const ErrorType *type)
@@ -1026,8 +1217,11 @@ namespace Cryo
     {
         // Try exact name first (handles primitives and exact struct name matches)
         llvm::Type *result = get_type(name);
-        if (result)
+        if (result && (!llvm::isa<llvm::StructType>(result) ||
+                       !llvm::cast<llvm::StructType>(result)->isOpaque()))
+        {
             return result;
+        }
 
         // If the name is qualified (contains ::), extract the simple type name and try that
         // e.g., "std::core::option::Option<u64>" -> "Option<u64>"
@@ -1038,7 +1232,8 @@ namespace Cryo
             if (!simple_name.empty())
             {
                 result = get_type(simple_name);
-                if (result)
+                if (result && (!llvm::isa<llvm::StructType>(result) ||
+                               !llvm::cast<llvm::StructType>(result)->isOpaque()))
                 {
                     _struct_cache[name] = static_cast<llvm::StructType *>(result);
                     return result;
@@ -1059,7 +1254,7 @@ namespace Cryo
                         mangled.pop_back();
 
                     llvm::StructType *st = llvm::StructType::getTypeByName(_llvm_ctx, mangled);
-                    if (st)
+                    if (st && !st->isOpaque())
                     {
                         _struct_cache[name] = st;
                         _struct_cache[simple_name] = st;
@@ -1069,10 +1264,11 @@ namespace Cryo
             }
         }
 
-        // For non-qualified generic types, try the mangled form directly
+        // For generic types, try to parse and instantiate properly
         size_t angle_pos = name.find('<');
         if (angle_pos != std::string::npos)
         {
+            // Try the mangled form first
             std::string mangled = name;
             for (char &c : mangled)
             {
@@ -1083,15 +1279,246 @@ namespace Cryo
                 mangled.pop_back();
 
             llvm::StructType *st = llvm::StructType::getTypeByName(_llvm_ctx, mangled);
-            if (st)
+            if (st && !st->isOpaque())
             {
                 _struct_cache[name] = st;
                 return st;
+            }
+
+            // Try to parse and instantiate the generic type
+            llvm::Type *instantiated = try_instantiate_generic_from_string(name);
+            if (instantiated && (!llvm::isa<llvm::StructType>(instantiated) ||
+                                 !llvm::cast<llvm::StructType>(instantiated)->isOpaque()))
+            {
+                return instantiated;
             }
         }
 
         // Create opaque struct as fallback
         return get_or_create_struct(name);
+    }
+
+    llvm::Type *TypeMapper::try_instantiate_generic_from_string(const std::string &name)
+    {
+        // Parse "Result<Duration,SystemTimeError>" or "Option<u64>"
+        size_t angle_start = name.find('<');
+        size_t angle_end = name.rfind('>');
+
+        if (angle_start == std::string::npos || angle_end == std::string::npos ||
+            angle_end <= angle_start)
+        {
+            return nullptr;
+        }
+
+        std::string base_name = name.substr(0, angle_start);
+        std::string args_str = name.substr(angle_start + 1, angle_end - angle_start - 1);
+
+        // Parse type arguments (handle nested generics)
+        std::vector<std::string> arg_names;
+        std::string current_arg;
+        int nesting = 0;
+
+        for (size_t i = 0; i < args_str.size(); ++i)
+        {
+            char c = args_str[i];
+            if (c == '<')
+            {
+                nesting++;
+                current_arg += c;
+            }
+            else if (c == '>')
+            {
+                nesting--;
+                current_arg += c;
+            }
+            else if (c == ',' && nesting == 0)
+            {
+                // End of argument - trim and save
+                while (!current_arg.empty() && current_arg.front() == ' ')
+                    current_arg.erase(0, 1);
+                while (!current_arg.empty() && current_arg.back() == ' ')
+                    current_arg.pop_back();
+                if (!current_arg.empty())
+                    arg_names.push_back(current_arg);
+                current_arg.clear();
+            }
+            else
+            {
+                current_arg += c;
+            }
+        }
+
+        // Don't forget the last argument
+        if (!current_arg.empty())
+        {
+            while (!current_arg.empty() && current_arg.front() == ' ')
+                current_arg.erase(0, 1);
+            while (!current_arg.empty() && current_arg.back() == ' ')
+                current_arg.pop_back();
+            if (!current_arg.empty())
+                arg_names.push_back(current_arg);
+        }
+
+        if (arg_names.empty())
+        {
+            return nullptr;
+        }
+
+        // Try to look up base type in arena first
+        TypeRef base_type = _arena.lookup_type_by_name(base_name);
+        if (!base_type.is_valid())
+        {
+            // Try qualified names
+            base_type = _arena.lookup_type_by_name("std::core::result::" + base_name);
+            if (!base_type.is_valid())
+                base_type = _arena.lookup_type_by_name("std::core::option::" + base_name);
+        }
+
+        // If we found the base type, try the full instantiation path
+        if (base_type.is_valid())
+        {
+            std::vector<TypeRef> type_args;
+            bool all_args_valid = true;
+            for (const auto &arg_name : arg_names)
+            {
+                TypeRef arg_type = resolve_type_from_string(arg_name);
+                if (!arg_type.is_valid())
+                {
+                    all_args_valid = false;
+                    break;
+                }
+                type_args.push_back(arg_type);
+            }
+
+            if (all_args_valid && !type_args.empty())
+            {
+                TypeRef instantiated = _arena.create_instantiation(base_type, type_args);
+                if (instantiated.is_valid() && !instantiated.is_error())
+                {
+                    return map(instantiated);
+                }
+            }
+        }
+
+        // Fallback: For well-known generic types, directly compute the LLVM type
+        // This handles cases where the base type is a template not in TypeArena
+        if (base_name == "Result" || base_name == "Option")
+        {
+            return create_generic_enum_type_directly(name, base_name, arg_names);
+        }
+
+        return nullptr;
+    }
+
+    llvm::Type *TypeMapper::create_generic_enum_type_directly(
+        const std::string &full_name,
+        const std::string &base_name,
+        const std::vector<std::string> &arg_names)
+    {
+        // Check if we already have this type
+        auto existing = lookup_struct(full_name);
+        if (existing && !existing->isOpaque())
+        {
+            return existing;
+        }
+
+        // Compute the payload size based on type arguments
+        size_t max_payload = 0;
+
+        if (base_name == "Option")
+        {
+            // Option<T> has variants: Some(T), None
+            // Payload is just T
+            if (arg_names.size() >= 1)
+            {
+                llvm::Type *t_type = resolve_and_map(arg_names[0]);
+                if (t_type)
+                {
+                    max_payload = size_of(t_type);
+                }
+            }
+        }
+        else if (base_name == "Result")
+        {
+            // Result<T, E> has variants: Ok(T), Err(E)
+            // Payload is max(sizeof(T), sizeof(E))
+            if (arg_names.size() >= 1)
+            {
+                llvm::Type *t_type = resolve_and_map(arg_names[0]);
+                if (t_type)
+                {
+                    max_payload = std::max(max_payload, static_cast<size_t>(size_of(t_type)));
+                }
+            }
+            if (arg_names.size() >= 2)
+            {
+                llvm::Type *e_type = resolve_and_map(arg_names[1]);
+                if (e_type)
+                {
+                    max_payload = std::max(max_payload, static_cast<size_t>(size_of(e_type)));
+                }
+            }
+        }
+
+        // Ensure minimum payload size
+        max_payload = std::max(max_payload, static_cast<size_t>(8));
+
+        // Create the tagged union type
+        return create_tagged_union(full_name, 4, max_payload);
+    }
+
+    TypeRef TypeMapper::resolve_type_from_string(const std::string &name)
+    {
+        // Try primitives first
+        if (name == "void")
+            return _arena.get_void();
+        if (name == "boolean" || name == "bool")
+            return _arena.get_bool();
+        if (name == "i8")
+            return _arena.get_i8();
+        if (name == "i16")
+            return _arena.get_i16();
+        if (name == "i32" || name == "int")
+            return _arena.get_i32();
+        if (name == "i64")
+            return _arena.get_i64();
+        if (name == "u8")
+            return _arena.get_u8();
+        if (name == "u16")
+            return _arena.get_u16();
+        if (name == "u32")
+            return _arena.get_u32();
+        if (name == "u64")
+            return _arena.get_u64();
+        if (name == "f32" || name == "float")
+            return _arena.get_f32();
+        if (name == "f64" || name == "double")
+            return _arena.get_f64();
+        if (name == "char")
+            return _arena.get_char();
+        if (name == "string")
+            return _arena.get_string();
+
+        // Try to look up user-defined types
+        TypeRef found = _arena.lookup_type_by_name(name);
+        if (found.is_valid())
+        {
+            return found;
+        }
+
+        // Check if it's a generic type itself
+        if (name.find('<') != std::string::npos)
+        {
+            // Recursively handle nested generic
+            llvm::Type *nested = try_instantiate_generic_from_string(name);
+            if (nested)
+            {
+                // Return the type from cache or create a placeholder
+                // Since we mapped it, it should be in the type cache
+            }
+        }
+
+        return TypeRef{}; // Invalid
     }
 
     // ========================================================================

@@ -406,4 +406,25 @@ namespace Cryo
     {
         return _template_method_info.find(template_name) != _template_method_info.end();
     }
+
+    //===================================================================
+    // Method Static Flag Registry Implementation
+    //===================================================================
+
+    void TemplateRegistry::register_method_is_static(const std::string &qualified_method_name, bool is_static)
+    {
+        _method_is_static[qualified_method_name] = is_static;
+        LOG_DEBUG(Cryo::LogComponent::AST, "Registered method is_static: {} -> {}",
+                  qualified_method_name, is_static);
+    }
+
+    std::pair<bool, bool> TemplateRegistry::get_method_is_static(const std::string &qualified_method_name) const
+    {
+        auto it = _method_is_static.find(qualified_method_name);
+        if (it != _method_is_static.end())
+        {
+            return {it->second, true};
+        }
+        return {false, false}; // Not found
+    }
 }

@@ -306,6 +306,49 @@ namespace Cryo
     };
 
     // ============================================================================
+    // Stage 4: Type Resolution Passes
+    // ============================================================================
+
+    /**
+     * @brief Pass 4.1: Type Resolution
+     *
+     * Resolves TypeAnnotations on AST nodes to TypeRefs.
+     * This is the critical pass that converts generic type syntax like
+     * "Result<Duration,SystemTimeError>" from error placeholders to
+     * properly instantiated types.
+     */
+    class TypeResolutionPass : public CompilerPass
+    {
+    public:
+        explicit TypeResolutionPass(CompilerInstance &compiler);
+
+        std::string name() const override { return "TypeResolution"; }
+        PassStage stage() const override { return PassStage::TypeResolution; }
+        int order() const override { return 1; }
+        PassScope scope() const override { return PassScope::PerModule; }
+
+        std::vector<PassDependency> dependencies() const override
+        {
+            return {PassDependency::required(PassProvides::TEMPLATES_REGISTERED)};
+        }
+
+        std::vector<std::string> provides() const override
+        {
+            return {PassProvides::TYPES_RESOLVED};
+        }
+
+        std::string description() const override
+        {
+            return "Resolve type annotations to TypeRefs";
+        }
+
+        PassResult run(PassContext &ctx) override;
+
+    private:
+        CompilerInstance &_compiler;
+    };
+
+    // ============================================================================
     // Stage 5: Semantic Analysis Passes
     // ============================================================================
 
@@ -326,7 +369,7 @@ namespace Cryo
 
         std::vector<PassDependency> dependencies() const override
         {
-            return {PassDependency::required(PassProvides::TEMPLATES_REGISTERED)};
+            return {PassDependency::required(PassProvides::TYPES_RESOLVED)};
         }
 
         std::vector<std::string> provides() const override

@@ -231,6 +231,11 @@ namespace Cryo
         void report_error(const std::string &message, const SourceLocation &location);
         void report_note(const std::string &message, const SourceLocation &location);
 
+        // String-based type resolution helpers (for types stored as Named annotations)
+        TypeRef resolve_function_type_string(const std::string &type_str, ResolutionContext &ctx);
+        TypeRef resolve_pointer_type_string(const std::string &type_str, ResolutionContext &ctx);
+        TypeRef resolve_reference_type_string(const std::string &type_str, ResolutionContext &ctx);
+
         // Primitive type mapping
         static const std::unordered_map<std::string, std::function<TypeRef(TypeArena &)>> _primitive_map;
     };

@@ -7,6 +7,9 @@
 #include "AST/DirectiveSystem.hpp"
 #include "Types/SymbolTable.hpp"
 #include "Types/TypeChecker.hpp"
+#include "Types/TypeResolver.hpp"
+#include "Types/GenericRegistry.hpp"
+#include "Types/ModuleTypeRegistry.hpp"
 #include "Types/Monomorphizer.hpp"
 #include "Codegen/CodeGenerator.hpp"
 #include "Codegen/CodegenVisitor.hpp"
@@ -169,6 +172,181 @@ namespace Cryo
         // This pass marks the template registration portion as complete
         LOG_DEBUG(LogComponent::GENERAL, "TemplateRegistrationPass: Templates registered");
         return PassResult::ok({PassProvides::TEMPLATES_REGISTERED});
+    }
+
+    // ============================================================================
+    // Stage 4: Type Resolution Passes
+    // ============================================================================
+
+    TypeResolutionPass::TypeResolutionPass(CompilerInstance &compiler)
+        : _compiler(compiler)
+    {
+    }
+
+    PassResult TypeResolutionPass::run(PassContext &ctx)
+    {
+        auto *program = _compiler.ast_root();
+        if (!program)
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: No AST to process");
+            return PassResult::ok({PassProvides::TYPES_RESOLVED});
+        }
+
+        // Get the components we need
+        auto *ast_ctx = _compiler.ast_context();
+        if (!ast_ctx)
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: No AST context");
+            return PassResult::ok({PassProvides::TYPES_RESOLVED});
+        }
+
+        TypeArena &arena = ast_ctx->types();
+        ModuleTypeRegistry &module_registry = ast_ctx->modules();
+
+        auto *gen_reg = _compiler.generic_registry();
+        if (!gen_reg)
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: No generic registry");
+            return PassResult::ok({PassProvides::TYPES_RESOLVED});
+        }
+        GenericRegistry &generic_registry = *gen_reg;
+
+        // Create the TypeResolver
+        TypeResolver resolver(arena, module_registry, generic_registry, ctx.diagnostics());
+
+        LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: GenericRegistry has {} templates",
+            generic_registry.template_count());
+
+        // Set up resolution context
+        ResolutionContext res_ctx;
+        res_ctx.current_module = ModuleID::invalid(); // Use default for now
+
+        // Collect imports from the symbol table
+        auto *symbols = _compiler.symbol_table();
+        if (symbols)
+        {
+            // The symbol table should have the imports
+            // For now, we'll rely on the module registry
+        }
+
+        size_t resolved_count = 0;
+        size_t error_count = 0;
+
+        // Walk the AST and resolve type annotations
+        for (auto &stmt : program->statements())
+        {
+            // Handle implement blocks
+            if (auto *impl = dynamic_cast<ImplementationBlockNode *>(stmt.get()))
+            {
+                for (auto &method : impl->method_implementations())
+                {
+                    auto *ann = method->return_type_annotation();
+                    if (ann && method->get_resolved_return_type().is_error())
+                    {
+                        TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                        if (!resolved.is_error())
+                        {
+                            method->set_resolved_return_type(resolved);
+                            resolved_count++;
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                "TypeResolutionPass: Resolved method '{}' return type to '{}'",
+                                method->name(), resolved->display_name());
+                        }
+                        else
+                        {
+                            error_count++;
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                "TypeResolutionPass: Could not resolve method '{}' return type: {}",
+                                method->name(), resolved->display_name());
+                        }
+                    }
+                }
+            }
+            // Handle struct declarations (with methods)
+            else if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(stmt.get()))
+            {
+                for (auto &method : struct_decl->methods())
+                {
+                    auto *ann = method->return_type_annotation();
+                    if (ann && method->get_resolved_return_type().is_error())
+                    {
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Attempting to resolve '{}::{}' annotation='{}' kind={}",
+                            struct_decl->name(), method->name(), ann->to_string(), static_cast<int>(ann->kind));
+                        TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                        if (!resolved.is_error())
+                        {
+                            method->set_resolved_return_type(resolved);
+                            resolved_count++;
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                "TypeResolutionPass: Resolved struct method '{}::{}' return type to '{}'",
+                                struct_decl->name(), method->name(), resolved->display_name());
+                        }
+                        else
+                        {
+                            error_count++;
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                "TypeResolutionPass: Failed to resolve '{}::{}' annotation='{}': {}",
+                                struct_decl->name(), method->name(), ann->to_string(), resolved->display_name());
+                        }
+                    }
+                }
+
+                // Resolve struct field types
+                for (auto &field : struct_decl->fields())
+                {
+                    const auto *ann = field->type_annotation();
+                    if (ann && (!field->has_resolved_type() || field->get_resolved_type().is_error()))
+                    {
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Attempting to resolve field '{}::{}' annotation='{}' kind={}",
+                            struct_decl->name(), field->name(), ann->to_string(), static_cast<int>(ann->kind));
+                        TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                        if (!resolved.is_error())
+                        {
+                            field->set_resolved_type(resolved);
+                            resolved_count++;
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                "TypeResolutionPass: Resolved struct field '{}::{}' type to '{}'",
+                                struct_decl->name(), field->name(), resolved->display_name());
+                        }
+                        else
+                        {
+                            error_count++;
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                "TypeResolutionPass: Failed to resolve field '{}::{}' annotation='{}': {}",
+                                struct_decl->name(), field->name(), ann->to_string(), resolved->display_name());
+                        }
+                    }
+                }
+            }
+            // Handle function declarations
+            else if (auto *func = dynamic_cast<FunctionDeclarationNode *>(stmt.get()))
+            {
+                auto *ann = func->return_type_annotation();
+                if (ann && func->get_resolved_return_type().is_error())
+                {
+                    TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                    if (!resolved.is_error())
+                    {
+                        func->set_resolved_return_type(resolved);
+                        resolved_count++;
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Resolved function '{}' return type to '{}'",
+                            func->name(), resolved->display_name());
+                    }
+                    else
+                    {
+                        error_count++;
+                    }
+                }
+            }
+        }
+
+        LOG_DEBUG(LogComponent::GENERAL,
+            "TypeResolutionPass: Resolved {} types, {} errors", resolved_count, error_count);
+
+        return PassResult::ok({PassProvides::TYPES_RESOLVED});
     }
 
     // ============================================================================
@@ -346,6 +524,9 @@ namespace Cryo
         manager->register_pass(std::make_unique<FunctionSignaturePass>(compiler));
         manager->register_pass(std::make_unique<TemplateRegistrationPass>(compiler));
 
+        // Stage 4: Type Resolution
+        manager->register_pass(std::make_unique<TypeResolutionPass>(compiler));
+
         // Stage 5: Semantic Analysis
         manager->register_pass(std::make_unique<DirectiveProcessingPass>(compiler));
         manager->register_pass(std::make_unique<FunctionBodyPass>(compiler));
@@ -380,6 +561,9 @@ namespace Cryo
         manager->register_pass(std::make_unique<TypeDeclarationPass>(compiler));
         manager->register_pass(std::make_unique<FunctionSignaturePass>(compiler));
         manager->register_pass(std::make_unique<TemplateRegistrationPass>(compiler));
+
+        // Stage 4: Type Resolution
+        manager->register_pass(std::make_unique<TypeResolutionPass>(compiler));
 
         // Stage 5: Semantic Analysis (partial - for LSP)
         manager->register_pass(std::make_unique<DirectiveProcessingPass>(compiler));

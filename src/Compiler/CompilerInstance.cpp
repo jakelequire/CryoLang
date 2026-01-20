@@ -1,6 +1,7 @@
 #include "Compiler/CompilerInstance.hpp"
 #include "Compiler/StandardPasses.hpp"
 #include "Types/TypeMapper.hpp"
+#include "Types/GenericTypes.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "AST/DirectiveProcessors.hpp"
 #include "AST/DirectiveWalker.hpp"
@@ -77,6 +78,7 @@ namespace Cryo
         // Create module loader - needs to be created after symbol table and template registry
         // Pass the main ASTContext to ensure all modules use the same TypeArena
         _module_loader = std::make_unique<ModuleLoader>(*_symbol_table, *_template_registry, *_ast_context);
+        _module_loader->set_generic_registry(_generic_registry.get());
 
         // Note: TypeChecker doesn't have set_template_registry - template handling is done differently
 
@@ -1159,6 +1161,23 @@ namespace Cryo
                     "Main", // Use "Main" as the module name for local templates
                     ""      // No source file path for main file templates
                 );
+
+                // Also register in GenericRegistry for the new type system
+                if (_generic_registry)
+                {
+                    std::vector<GenericParam> params;
+                    for (size_t i = 0; i < struct_decl->generic_parameters().size(); ++i)
+                    {
+                        auto &param_node = struct_decl->generic_parameters()[i];
+                        TypeRef param_type = _ast_context->types().create_generic_param(param_node->name(), i);
+                        params.emplace_back(param_node->name(), i, param_type);
+                    }
+                    _generic_registry->register_template(struct_type, params,
+                        _symbol_table->current_module(), struct_decl, struct_decl->name());
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered struct '{}' in GenericRegistry with {} params",
+                        struct_decl->name(), params.size());
+                }
+
                 LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic struct template: {}", struct_decl->name());
             }
         }
@@ -1224,6 +1243,23 @@ namespace Cryo
                     "Main", // Use "Main" as the module name for local templates
                     ""      // No source file path for main file templates
                 );
+
+                // Also register in GenericRegistry for the new type system
+                if (_generic_registry)
+                {
+                    std::vector<GenericParam> params;
+                    for (size_t i = 0; i < class_decl->generic_parameters().size(); ++i)
+                    {
+                        auto &param_node = class_decl->generic_parameters()[i];
+                        TypeRef param_type = _ast_context->types().create_generic_param(param_node->name(), i);
+                        params.emplace_back(param_node->name(), i, param_type);
+                    }
+                    _generic_registry->register_template(class_type, params,
+                        _symbol_table->current_module(), class_decl, class_decl->name());
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered class '{}' in GenericRegistry with {} params",
+                        class_decl->name(), params.size());
+                }
+
                 LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic class template: {}", class_decl->name());
             }
         }
@@ -1291,6 +1327,23 @@ namespace Cryo
                     "Main", // Use "Main" as the module name for local templates
                     ""      // No source file path for main file templates
                 );
+
+                // Also register in GenericRegistry for the new type system
+                if (_generic_registry)
+                {
+                    std::vector<GenericParam> params;
+                    for (size_t i = 0; i < enum_decl->generic_parameters().size(); ++i)
+                    {
+                        auto &param_node = enum_decl->generic_parameters()[i];
+                        TypeRef param_type = _ast_context->types().create_generic_param(param_node->name(), i);
+                        params.emplace_back(param_node->name(), i, param_type);
+                    }
+                    _generic_registry->register_template(enum_type, params,
+                        _symbol_table->current_module(), enum_decl, enum_decl->name());
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered enum '{}' in GenericRegistry with {} params",
+                        enum_decl->name(), params.size());
+                }
+
                 LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic enum template: {}", enum_decl->name());
             }
         }
