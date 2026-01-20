@@ -166,6 +166,7 @@ namespace Cryo::Codegen
         void visit(Cryo::StructLiteralNode &node) override;
         void visit(Cryo::ArrayLiteralNode &node) override;
         void visit(Cryo::TupleLiteralNode &node) override;
+        void visit(Cryo::LambdaExpressionNode &node) override;
         void visit(Cryo::ArrayAccessNode &node) override;
         void visit(Cryo::MemberAccessNode &node) override;
         void visit(Cryo::ScopeResolutionNode &node) override;
