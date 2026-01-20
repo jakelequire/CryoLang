@@ -2921,19 +2921,60 @@ namespace Cryo
             return expr;
         }
 
-        // Parenthesized expressions, tuple literals, or void literal ()
+        // Parenthesized expressions, tuple literals, void literal (), or lambda expressions
         if (_current_token.is(TokenKind::TK_L_PAREN))
         {
             SourceLocation paren_loc = _current_token.location();
             advance(); // consume '('
 
-            // Check for empty parentheses () which represents void/unit value
+            // Check for empty parentheses () - could be void or lambda with no params
             if (_current_token.is(TokenKind::TK_R_PAREN))
             {
                 advance(); // consume ')'
+
+                // Check if this is a lambda: () -> T { ... }
+                if (_current_token.is(TokenKind::TK_ARROW))
+                {
+                    return parse_lambda_body(paren_loc, {});
+                }
+
                 // Create a void literal token and return it as a literal node
                 Token void_token(TokenKind::TK_KW_VOID, "void", paren_loc);
                 return _builder.create_literal_node(void_token);
+            }
+
+            // Check if this looks like lambda parameters: (name: Type, ...) -> ...
+            // Lambda parameters have the form: identifier COLON type
+            if (_current_token.is(TokenKind::TK_IDENTIFIER) && peek_next().is(TokenKind::TK_COLON))
+            {
+                // This looks like a lambda parameter list
+                std::vector<std::pair<std::string, TypeRef>> params;
+
+                do
+                {
+                    // Parse parameter name
+                    std::string param_name = std::string(_current_token.text());
+                    advance(); // consume identifier
+
+                    consume(TokenKind::TK_COLON, "Expected ':' after parameter name");
+
+                    // Parse parameter type
+                    TypeRef param_type = parse_type_annotation();
+
+                    params.push_back({param_name, param_type});
+
+                } while (match(TokenKind::TK_COMMA) && _current_token.is(TokenKind::TK_IDENTIFIER));
+
+                consume(TokenKind::TK_R_PAREN, "Expected ')' after lambda parameters");
+
+                // Must have -> after parameter list
+                if (!_current_token.is(TokenKind::TK_ARROW))
+                {
+                    error("Expected '->' after lambda parameters");
+                    return nullptr;
+                }
+
+                return parse_lambda_body(paren_loc, std::move(params));
             }
 
             // Parse first expression
@@ -4069,6 +4110,41 @@ namespace Cryo
         consume(TokenKind::TK_R_SQUARE, "Expected ']' after array index");
 
         return _builder.create_array_access(access_location, std::move(expr), std::move(index));
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_lambda_body(
+        SourceLocation loc,
+        std::vector<std::pair<std::string, TypeRef>> params)
+    {
+        // At this point we've already parsed the parameters and are at '->'
+        consume(TokenKind::TK_ARROW, "Expected '->' in lambda expression");
+
+        // Parse return type
+        TypeRef return_type = parse_type_annotation();
+
+        // Create lambda node
+        auto lambda = _builder.create_lambda_expression(loc);
+
+        // Add parameters
+        for (auto &[name, type] : params)
+        {
+            lambda->add_parameter(name, type);
+        }
+
+        // Set return type
+        lambda->set_return_type(return_type);
+
+        // Parse body (must be a block)
+        if (!_current_token.is(TokenKind::TK_L_BRACE))
+        {
+            error("Expected '{' for lambda body");
+            return nullptr;
+        }
+
+        auto body = parse_block_statement();
+        lambda->set_body(std::move(body));
+
+        return lambda;
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_new_expression()

@@ -865,6 +865,41 @@ namespace Cryo
         }
     }
 
+    void ASTDumper::visit(LambdaExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "LambdaExpression";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+
+        // Show parameter count and return type inline
+        _output << " (";
+        const auto &params = node.parameters();
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            if (i > 0)
+                _output << ", ";
+            _output << params[i].first;
+            if (params[i].second)
+                _output << ": " << params[i].second->display_name();
+        }
+        _output << ")";
+
+        if (node.return_type())
+        {
+            _output << " -> " << node.return_type()->display_name();
+        }
+
+        _output << std::endl;
+
+        // Dump body
+        if (node.body())
+        {
+            dump_child(node.body(), true);
+        }
+    }
+
     void ASTDumper::visit(ArrayAccessNode &node)
     {
         print_prefix();

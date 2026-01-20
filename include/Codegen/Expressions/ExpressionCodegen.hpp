@@ -150,6 +150,13 @@ namespace Cryo::Codegen
         llvm::Value *generate_tuple_literal(Cryo::TupleLiteralNode *node);
 
         /**
+         * @brief Generate lambda expression
+         * @param node Lambda expression node
+         * @return Function pointer to generated lambda
+         */
+        llvm::Value *generate_lambda(Cryo::LambdaExpressionNode *node);
+
+        /**
          * @brief Generate Array<T> constructor call for array literals
          * @param node Array literal node
          * @param elements Array elements

@@ -124,6 +124,11 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    void LambdaExpressionNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     void ArrayAccessNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);
