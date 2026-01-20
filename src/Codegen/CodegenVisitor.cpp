@@ -84,6 +84,9 @@ namespace Cryo::Codegen
         // Expressions needs Casts for cast expressions
         _expressions->set_cast_codegen(_casts.get());
 
+        // Expressions needs ControlFlow for match expressions
+        _expressions->set_control_flow_codegen(_control_flow.get());
+
         // Declarations needs TypeCodegen for struct/class types
         _declarations->set_type_codegen(_types.get());
 
@@ -1303,6 +1306,19 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting IfExpressionNode");
 
         llvm::Value *result = _expressions->generate_if_expression(&node);
+        if (result)
+        {
+            _ctx->set_result(result);
+            _ctx->register_value(&node, result);
+        }
+    }
+
+    void CodegenVisitor::visit(Cryo::MatchExpressionNode &node)
+    {
+        NodeTracker tracker(*_ctx, &node);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting MatchExpressionNode");
+
+        llvm::Value *result = _expressions->generate_match_expression(&node);
         if (result)
         {
             _ctx->set_result(result);

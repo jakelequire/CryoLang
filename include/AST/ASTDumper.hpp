@@ -71,6 +71,7 @@ namespace Cryo
         void visit(UnaryExpressionNode &node) override;
         void visit(TernaryExpressionNode &node) override;
         void visit(IfExpressionNode &node) override;
+        void visit(MatchExpressionNode &node) override;
         void visit(ProgramNode &node) override;
         void visit(BlockStatementNode &node) override;
         void visit(UnsafeBlockStatementNode &node) override;

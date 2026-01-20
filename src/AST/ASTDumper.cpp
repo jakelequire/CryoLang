@@ -348,6 +348,28 @@ namespace Cryo
         dump_child(node.else_expression(), true);
     }
 
+    void ASTDumper::visit(MatchExpressionNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "MatchExpression";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " 'match'";
+        _output << std::endl;
+
+        // Dump the expression being matched
+        dump_child(node.expression(), node.arms().empty());
+
+        // Dump each match arm
+        const auto &arms = node.arms();
+        for (size_t i = 0; i < arms.size(); ++i)
+        {
+            bool is_last = (i == arms.size() - 1);
+            dump_child(arms[i].get(), is_last);
+        }
+    }
+
     void ASTDumper::visit(ProgramNode &node)
     {
         print_prefix();

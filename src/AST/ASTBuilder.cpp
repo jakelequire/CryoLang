@@ -241,6 +241,13 @@ namespace Cryo
         return node;
     }
 
+    std::unique_ptr<MatchExpressionNode> ASTBuilder::create_match_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> expr)
+    {
+        auto node = std::make_unique<MatchExpressionNode>(loc, std::move(expr));
+        node->set_source_file(_source_file);
+        return node;
+    }
+
     std::unique_ptr<WhileStatementNode> ASTBuilder::create_while_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<StatementNode> body)
     {
         auto node = std::make_unique<WhileStatementNode>(loc, std::move(condition), std::move(body));
@@ -418,7 +425,8 @@ namespace Cryo
                kind == TokenKind::TK_BOOLEAN_LITERAL ||
                kind == TokenKind::TK_KW_TRUE ||
                kind == TokenKind::TK_KW_FALSE ||
-               kind == TokenKind::TK_KW_NULL;
+               kind == TokenKind::TK_KW_NULL ||
+               kind == TokenKind::TK_KW_VOID;
     }
 
     void ASTBuilder::validate_identifier_token(const Token &token) const
