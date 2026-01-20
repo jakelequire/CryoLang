@@ -159,6 +159,7 @@ namespace Cryo
         CastExpression,
         StructLiteral,
         ArrayLiteral,
+        TupleLiteral,
         ArrayAccess,
         MemberAccess,
         ScopeResolution,
@@ -246,6 +247,8 @@ namespace Cryo
             return "StructLiteral";
         case NodeKind::ArrayLiteral:
             return "ArrayLiteral";
+        case NodeKind::TupleLiteral:
+            return "TupleLiteral";
         case NodeKind::ArrayAccess:
             return "ArrayAccess";
         case NodeKind::MemberAccess:
@@ -2182,6 +2185,37 @@ namespace Cryo
             if (!_element_type.empty())
                 os << " (" << _element_type << ")";
             os << ":" << std::endl;
+            for (const auto &element : _elements)
+            {
+                if (element)
+                    element->print(os, indent + 2);
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Tuple literal - (expr1, expr2, ...)
+    class TupleLiteralNode : public ExpressionNode
+    {
+    private:
+        std::vector<std::unique_ptr<ExpressionNode>> _elements;
+
+    public:
+        TupleLiteralNode(SourceLocation loc)
+            : ExpressionNode(NodeKind::TupleLiteral, loc) {}
+
+        const std::vector<std::unique_ptr<ExpressionNode>> &elements() const { return _elements; }
+        size_t size() const { return _elements.size(); }
+
+        void add_element(std::unique_ptr<ExpressionNode> element)
+        {
+            _elements.push_back(std::move(element));
+        }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "TupleLiteral[" << _elements.size() << "]:" << std::endl;
             for (const auto &element : _elements)
             {
                 if (element)

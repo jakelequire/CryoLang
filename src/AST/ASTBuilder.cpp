@@ -206,6 +206,13 @@ namespace Cryo
         return node;
     }
 
+    std::unique_ptr<TupleLiteralNode> ASTBuilder::create_tuple_literal(SourceLocation loc)
+    {
+        auto node = std::make_unique<TupleLiteralNode>(loc);
+        node->set_source_file(_source_file);
+        return node;
+    }
+
     std::unique_ptr<ArrayAccessNode> ASTBuilder::create_array_access(SourceLocation loc, std::unique_ptr<ExpressionNode> array, std::unique_ptr<ExpressionNode> index)
     {
         auto node = std::make_unique<ArrayAccessNode>(loc, std::move(array), std::move(index));
