@@ -240,6 +240,7 @@ namespace Cryo
             {
                 for (auto &method : impl->method_implementations())
                 {
+                    // Resolve return type
                     auto *ann = method->return_type_annotation();
                     if (ann && method->get_resolved_return_type().is_error())
                     {
@@ -260,6 +261,24 @@ namespace Cryo
                                 method->name(), resolved->display_name());
                         }
                     }
+
+                    // Resolve parameter types
+                    for (auto &param : method->parameters())
+                    {
+                        const auto *param_ann = param->type_annotation();
+                        if (param_ann && (!param->has_resolved_type() || param->get_resolved_type().is_error()))
+                        {
+                            TypeRef resolved = resolver.resolve(*param_ann, res_ctx);
+                            if (!resolved.is_error())
+                            {
+                                param->set_resolved_type(resolved);
+                                resolved_count++;
+                                LOG_DEBUG(LogComponent::GENERAL,
+                                    "TypeResolutionPass: Resolved impl param '{}::{}' type to '{}'",
+                                    method->name(), param->name(), resolved->display_name());
+                            }
+                        }
+                    }
                 }
             }
             // Handle struct declarations (with methods)
@@ -267,6 +286,7 @@ namespace Cryo
             {
                 for (auto &method : struct_decl->methods())
                 {
+                    // Resolve return type
                     auto *ann = method->return_type_annotation();
                     if (ann && method->get_resolved_return_type().is_error())
                     {
@@ -288,6 +308,31 @@ namespace Cryo
                             LOG_DEBUG(LogComponent::GENERAL,
                                 "TypeResolutionPass: Failed to resolve '{}::{}' annotation='{}': {}",
                                 struct_decl->name(), method->name(), ann->to_string(), resolved->display_name());
+                        }
+                    }
+
+                    // Resolve parameter types
+                    for (auto &param : method->parameters())
+                    {
+                        const auto *param_ann = param->type_annotation();
+                        if (param_ann && (!param->has_resolved_type() || param->get_resolved_type().is_error()))
+                        {
+                            TypeRef resolved = resolver.resolve(*param_ann, res_ctx);
+                            if (!resolved.is_error())
+                            {
+                                param->set_resolved_type(resolved);
+                                resolved_count++;
+                                LOG_DEBUG(LogComponent::GENERAL,
+                                    "TypeResolutionPass: Resolved param '{}::{}::{}' type to '{}'",
+                                    struct_decl->name(), method->name(), param->name(), resolved->display_name());
+                            }
+                            else
+                            {
+                                error_count++;
+                                LOG_DEBUG(LogComponent::GENERAL,
+                                    "TypeResolutionPass: Failed to resolve param '{}::{}::{}' type",
+                                    struct_decl->name(), method->name(), param->name());
+                            }
                         }
                     }
                 }
@@ -323,6 +368,7 @@ namespace Cryo
             // Handle function declarations
             else if (auto *func = dynamic_cast<FunctionDeclarationNode *>(stmt.get()))
             {
+                // Resolve return type
                 auto *ann = func->return_type_annotation();
                 if (ann && func->get_resolved_return_type().is_error())
                 {
@@ -338,6 +384,24 @@ namespace Cryo
                     else
                     {
                         error_count++;
+                    }
+                }
+
+                // Resolve parameter types
+                for (auto &param : func->parameters())
+                {
+                    const auto *param_ann = param->type_annotation();
+                    if (param_ann && (!param->has_resolved_type() || param->get_resolved_type().is_error()))
+                    {
+                        TypeRef resolved = resolver.resolve(*param_ann, res_ctx);
+                        if (!resolved.is_error())
+                        {
+                            param->set_resolved_type(resolved);
+                            resolved_count++;
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                "TypeResolutionPass: Resolved func param '{}::{}' type to '{}'",
+                                func->name(), param->name(), resolved->display_name());
+                        }
                     }
                 }
             }
