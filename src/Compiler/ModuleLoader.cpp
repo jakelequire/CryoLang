@@ -684,7 +684,7 @@ namespace Cryo
                     TypeRef enum_type{};
                     if (!enum_decl->generic_parameters().empty())
                     {
-                        // For generic enums, try to look up in symbol table
+                        // For generic enums, try to look up in symbol table first
                         Symbol *enum_sym = _symbol_table.lookup_symbol(enum_decl->name());
                         if (enum_sym && enum_sym->type.is_valid() && enum_sym->type->kind() == TypeKind::Enum)
                         {
@@ -693,7 +693,11 @@ namespace Cryo
                         }
                         else
                         {
-                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: No parameterized enum template found for {}", enum_decl->name());
+                            // Create enum type for generic enums - this is needed for is_enum_type() checks
+                            // The type serves as a marker that this is an enum, even if generic
+                            QualifiedTypeName enum_qname{module_id, enum_decl->name()};
+                            enum_type = type_arena.create_enum(enum_qname);
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created enum type for generic enum '{}'", enum_decl->name());
                         }
                     }
                     else
