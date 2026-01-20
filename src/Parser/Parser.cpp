@@ -1030,9 +1030,6 @@ namespace Cryo
                kind == TokenKind::TK_KW_BREAK ||
                kind == TokenKind::TK_KW_CONTINUE ||
                kind == TokenKind::TK_KW_UNSAFE ||
-               kind == TokenKind::TK_KW_TRY ||
-               kind == TokenKind::TK_KW_CATCH ||
-               kind == TokenKind::TK_KW_THROW ||
                kind == TokenKind::TK_KW_WITH ||
                kind == TokenKind::TK_KW_YIELD;
     }
@@ -4518,11 +4515,6 @@ namespace Cryo
                 {
                     is_method = true;
                 }
-                // Case 4: constructor with explicit constructor keyword
-                else if (_current_token.is(TokenKind::TK_KW_CONSTRUCTOR))
-                {
-                    is_method = true;
-                }
 
                 if (is_method)
                 {
@@ -4672,11 +4664,6 @@ namespace Cryo
                 }
                 // Case 3: destructor - ~ followed by identifier
                 else if (_current_token.is(TokenKind::TK_TILDE) && next.is(TokenKind::TK_IDENTIFIER))
-                {
-                    is_method = true;
-                }
-                // Case 4: constructor with explicit constructor keyword
-                else if (_current_token.is(TokenKind::TK_KW_CONSTRUCTOR))
                 {
                     is_method = true;
                 }
@@ -5238,7 +5225,7 @@ namespace Cryo
                     impl_block->add_method_implementation(std::move(method));
                 }
                 else if ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
-                         (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_L_ANGLE) || next.is(TokenKind::TK_KW_CONSTRUCTOR)))
+                         (next.is(TokenKind::TK_L_PAREN) || next.is(TokenKind::TK_L_ANGLE)))
                 {
                     // Method implementation (including generic methods with <T> syntax)
                     auto method = parse_struct_method(target_type);
@@ -5438,11 +5425,6 @@ namespace Cryo
 
         // Check for constructor
         bool is_constructor = false;
-        if (_current_token.is(TokenKind::TK_KW_CONSTRUCTOR))
-        {
-            is_constructor = true;
-            advance();
-        }
 
         // Check for destructor
         bool is_destructor = false;
