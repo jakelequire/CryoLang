@@ -237,6 +237,12 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    // MatchExpressionNode visitor implementation
+    void MatchExpressionNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     // ProgramNode visitor implementation
     void ProgramNode::accept(ASTVisitor &visitor)
     {

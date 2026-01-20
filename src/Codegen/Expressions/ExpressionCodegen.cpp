@@ -2,6 +2,7 @@
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "Codegen/Declarations/TypeCodegen.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
+#include "Codegen/Statements/ControlFlowCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Lexer/lexer.hpp"
 #include "AST/ASTNode.hpp"
@@ -1894,6 +1895,156 @@ namespace Cryo::Codegen
         llvm::PHINode *phi = builder().CreatePHI(then_val->getType(), 2, "ifexpr.result");
         phi->addIncoming(then_val, then_end);
         phi->addIncoming(cast_if_needed(else_val, then_val->getType()), else_end);
+
+        return phi;
+    }
+
+    //===================================================================
+    // Match Expression
+    //===================================================================
+
+    llvm::Value *ExpressionCodegen::generate_match_expression(Cryo::MatchExpressionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Null match-expression node");
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating match-expression");
+
+        // Check that control flow codegen is available
+        if (!_control_flow)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "ControlFlowCodegen not available for match expression");
+            return nullptr;
+        }
+
+        // Get current context
+        llvm::BasicBlock *match_block = builder().GetInsertBlock();
+        if (!match_block)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current basic block for match expression");
+            return nullptr;
+        }
+
+        llvm::Function *fn = match_block->getParent();
+        if (!fn)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for match expression");
+            return nullptr;
+        }
+
+        // Generate the match expression value
+        llvm::Value *match_value = generate(node->expression());
+        if (!match_value)
+        {
+            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "Failed to generate match expression value");
+            return nullptr;
+        }
+
+        // Create merge block for collecting results
+        llvm::BasicBlock *merge_block = create_block("matchexpr.merge", fn);
+
+        // We need to track arm values and their source blocks for the PHI node
+        std::vector<std::pair<llvm::Value *, llvm::BasicBlock *>> arm_results;
+
+        // Generate arms as a chain of comparisons
+        llvm::BasicBlock *current_test_block = builder().GetInsertBlock();
+
+        const auto &arms = node->arms();
+        for (size_t i = 0; i < arms.size(); ++i)
+        {
+            auto *arm = arms[i].get();
+            if (!arm)
+                continue;
+
+            bool is_last = (i == arms.size() - 1);
+
+            // Create blocks for this arm
+            llvm::BasicBlock *arm_block = create_block("matchexpr.arm." + std::to_string(i), fn);
+            llvm::BasicBlock *next_test_block = is_last
+                                                    ? merge_block
+                                                    : create_block("matchexpr.test." + std::to_string(i + 1), fn);
+
+            builder().SetInsertPoint(current_test_block);
+
+            // Generate pattern match
+            Cryo::PatternNode *pattern = arm->pattern();
+            if (pattern)
+            {
+                // Use control flow codegen to generate pattern match
+                llvm::Value *matches = _control_flow->generate_pattern_match(match_value, pattern);
+                if (matches)
+                {
+                    builder().CreateCondBr(matches, arm_block, next_test_block);
+                }
+                else
+                {
+                    // Wildcard/default pattern - always matches
+                    builder().CreateBr(arm_block);
+                }
+            }
+            else
+            {
+                // No pattern - always matches (wildcard)
+                builder().CreateBr(arm_block);
+            }
+
+            // Generate arm body and get result value
+            builder().SetInsertPoint(arm_block);
+            values().enter_scope("matchexpr.arm." + std::to_string(i));
+
+            // Bind pattern variables before generating body
+            if (pattern)
+            {
+                _control_flow->bind_enum_pattern_variables(match_value, pattern);
+            }
+
+            llvm::Value *arm_value = nullptr;
+            if (arm->body())
+            {
+                // For match expressions, the arm body should be an expression that returns a value
+                // The body is a StatementNode, typically a BlockStatement containing an expression
+                Cryo::Codegen::CodegenVisitor *visitor = ctx().visitor();
+                arm->body()->accept(*visitor);
+                arm_value = get_result();
+            }
+
+            values().exit_scope();
+
+            // If we got a value, branch to merge and record it
+            llvm::BasicBlock *arm_end = builder().GetInsertBlock();
+            if (arm_end && !arm_end->getTerminator())
+            {
+                builder().CreateBr(merge_block);
+                if (arm_value)
+                {
+                    arm_results.push_back({arm_value, arm_end});
+                }
+            }
+
+            current_test_block = next_test_block;
+        }
+
+        // Create PHI node to merge results
+        builder().SetInsertPoint(merge_block);
+
+        if (arm_results.empty())
+        {
+            // No arms produced values - return void
+            return llvm::Constant::getNullValue(llvm::Type::getInt8Ty(llvm_ctx()));
+        }
+
+        // Determine result type from first arm
+        llvm::Type *result_type = arm_results[0].first->getType();
+        llvm::PHINode *phi = builder().CreatePHI(result_type, arm_results.size(), "matchexpr.result");
+
+        for (const auto &[value, block] : arm_results)
+        {
+            llvm::Value *casted_value = cast_if_needed(value, result_type);
+            phi->addIncoming(casted_value, block);
+        }
 
         return phi;
     }
