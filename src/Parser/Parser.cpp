@@ -1510,9 +1510,25 @@ namespace Cryo
 
         consume(TokenKind::TK_KW_FUNCTION, "Expected 'function'");
 
-        // Parse function name
-        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected function name");
-        std::string func_name = std::string(name_token.text());
+        // Parse function name - allow keywords as function names (e.g., some, none)
+        Token name_token = _current_token;
+        std::string func_name;
+        if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            func_name = std::string(name_token.text());
+            advance();
+        }
+        else if (_current_token.is_keyword())
+        {
+            // Allow keywords as function names (e.g., some, none, as, etc.)
+            func_name = std::string(name_token.text());
+            advance();
+        }
+        else
+        {
+            error("Expected function name");
+            return nullptr;
+        }
 
         // Runtime function name transformation: main -> _user_main_
         // Only transform if this is not a stdlib module (not in "std" namespace)
@@ -1545,11 +1561,15 @@ namespace Cryo
         attach_documentation(func_decl.get());
 
         // Parse optional generic parameters
+        size_t func_generic_count = 0; // Track how many generics we add for cleanup
         if (_current_token.is(TokenKind::TK_L_ANGLE))
         {
             auto generics = parse_generic_parameters();
             for (auto &generic : generics)
             {
+                // Track generic params so parameter/return type parsing can recognize them
+                _current_generic_params.push_back(generic->name());
+                func_generic_count++;
                 func_decl->add_generic_parameter(std::move(generic));
             }
         }
@@ -1613,6 +1633,15 @@ namespace Cryo
         auto body = parse_block_statement();
         func_decl->set_body(std::unique_ptr<BlockStatementNode>(
             dynamic_cast<BlockStatementNode *>(body.release())));
+
+        // Clean up function's generic parameters from tracking
+        for (size_t i = 0; i < func_generic_count; ++i)
+        {
+            if (!_current_generic_params.empty())
+            {
+                _current_generic_params.pop_back();
+            }
+        }
 
         return func_decl;
     }
@@ -1726,9 +1755,26 @@ namespace Cryo
             throw ParseError("Expected 'function' or 'const' after 'intrinsic'", _current_token.location());
         }
 
-        // Parse function name
-        Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected function name");
-        std::string func_name = std::string(name_token.text());
+        // Parse function name - allow keywords as intrinsic names since they map to C functions
+        // which may have names that conflict with language keywords (e.g., raise, signal, read, write)
+        Token name_token = _current_token;
+        std::string func_name;
+        if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            func_name = std::string(name_token.text());
+            advance();
+        }
+        else if (_current_token.is_keyword())
+        {
+            // Allow keywords as intrinsic function names (e.g., raise, signal, read, write, open, close)
+            func_name = std::string(name_token.text());
+            advance();
+        }
+        else
+        {
+            error("Expected function name");
+            return nullptr;
+        }
 
         // Parse parameter list
         consume(TokenKind::TK_L_PAREN, "Expected '(' after function name");
@@ -2584,8 +2630,8 @@ namespace Cryo
                                     {
                                         do
                                         {
-                                            // Parse field name
-                                            if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                                            // Parse field name (allow keywords as field names)
+                                            if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
                                             {
                                                 error("Expected field name in struct literal");
                                                 return nullptr;
@@ -2822,8 +2868,8 @@ namespace Cryo
                     {
                         do
                         {
-                            // Parse field name
-                            if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                            // Parse field name (allow keywords as field names)
+                            if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
                             {
                                 error("Expected field name in struct literal");
                                 return nullptr;
@@ -2923,6 +2969,45 @@ namespace Cryo
         if (_current_token.is(TokenKind::TK_KW_ALIGNOF))
         {
             return parse_alignof_expression();
+        }
+
+        // Keywords used as variable names (e.g., ref, default, some, none)
+        // This handles cases where a keyword is used as a parameter name and then referenced
+        if (_current_token.is_keyword())
+        {
+            // Treat the keyword as an identifier
+            Token keyword_token = _current_token;
+            advance();
+
+            // Create identifier node from the keyword
+            Token identifier_token(TokenKind::TK_IDENTIFIER,
+                                   keyword_token.text(),
+                                   keyword_token.location());
+            auto keyword_expr = _builder.create_identifier_node(identifier_token);
+
+            // Handle postfix expressions
+            std::unique_ptr<ExpressionNode> expr = std::move(keyword_expr);
+            while (true)
+            {
+                if (_current_token.is(TokenKind::TK_L_PAREN))
+                {
+                    expr = parse_call_expression(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_L_SQUARE))
+                {
+                    expr = parse_array_access(std::move(expr));
+                }
+                else if (_current_token.is(TokenKind::TK_PERIOD) || _current_token.is(TokenKind::TK_ARROW))
+                {
+                    expr = parse_member_access(std::move(expr));
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            return expr;
         }
 
         error("Expected expression");
@@ -3621,7 +3706,7 @@ namespace Cryo
             return parse_this_parameter();
         }
 
-        // Parse parameter name - allow both identifiers and 'this' keyword (for this: Type syntax)
+        // Parse parameter name - allow identifiers, 'this', and other keywords as parameter names
         Token name_token;
         std::string param_name;
         if (_current_token.is(TokenKind::TK_IDENTIFIER))
@@ -3635,6 +3720,13 @@ namespace Cryo
             // Allow 'this' as a parameter name when followed by ':'
             name_token = _current_token;
             param_name = "this";
+            advance();
+        }
+        else if (_current_token.is_keyword())
+        {
+            // Allow keywords as parameter names (e.g., default, type, as)
+            name_token = _current_token;
+            param_name = std::string(name_token.text());
             advance();
         }
         else
@@ -3821,8 +3913,8 @@ namespace Cryo
                 {
                     do
                     {
-                        // Parse field name
-                        if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+                        // Parse field name (allow keywords as field names)
+                        if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
                         {
                             error("Expected field name in struct literal");
                             return nullptr;
@@ -4126,6 +4218,156 @@ namespace Cryo
         std::string member_name = std::string(_current_token.text());
         advance(); // consume member name
 
+        // Check for generic method call: method_name<T>(args)
+        // Use lookahead to determine if < starts generic args followed by (
+        std::vector<std::string> generic_args;
+        if (_current_token.is(TokenKind::TK_L_ANGLE))
+        {
+            // Use lookahead to check if this is generic args followed by '('
+            // Pattern: <type_args>() where type_args can contain nested <>
+            bool is_generic_call = false;
+            int lookahead_idx = 1;
+            int angle_depth = 1;
+
+            // Scan ahead to find matching '>' and check if followed by '('
+            while (angle_depth > 0)
+            {
+                Token peek_tok = peek_next_n(lookahead_idx);
+                if (peek_tok.is_eof())
+                    break;
+
+                if (peek_tok.is(TokenKind::TK_L_ANGLE))
+                {
+                    angle_depth++;
+                }
+                else if (peek_tok.is(TokenKind::TK_R_ANGLE))
+                {
+                    angle_depth--;
+                }
+                else if (peek_tok.is(TokenKind::TK_GREATERGREATER))
+                {
+                    angle_depth -= 2;
+                }
+                else if (!peek_tok.is_identifier() && !peek_tok.is_keyword() &&
+                         !peek_tok.is(TokenKind::TK_COMMA) && !peek_tok.is(TokenKind::TK_STAR) &&
+                         !peek_tok.is(TokenKind::TK_COLONCOLON) && !peek_tok.is(TokenKind::TK_AMP))
+                {
+                    // Invalid token for generic args - not a generic call
+                    break;
+                }
+                lookahead_idx++;
+            }
+
+            // Check if the token after '>' is '('
+            if (angle_depth == 0)
+            {
+                Token after_close = peek_next_n(lookahead_idx);
+                if (after_close.is(TokenKind::TK_L_PAREN))
+                {
+                    is_generic_call = true;
+                }
+            }
+
+            if (is_generic_call)
+            {
+                // Parse generic arguments
+                advance(); // consume '<'
+
+                while (!_current_token.is(TokenKind::TK_R_ANGLE) &&
+                       !_current_token.is(TokenKind::TK_GREATERGREATER) && !is_at_end())
+                {
+                    if (_current_token.is(TokenKind::TK_COMMA))
+                    {
+                        advance();
+                        continue;
+                    }
+
+                    // Build up the type string (handle pointers, qualified names, nested generics)
+                    std::string type_arg;
+                    int nested_angle = 0;
+
+                    while (!is_at_end())
+                    {
+                        if (_current_token.is(TokenKind::TK_L_ANGLE))
+                        {
+                            nested_angle++;
+                            type_arg += "<";
+                            advance();
+                        }
+                        else if (_current_token.is(TokenKind::TK_R_ANGLE))
+                        {
+                            if (nested_angle > 0)
+                            {
+                                nested_angle--;
+                                type_arg += ">";
+                                advance();
+                            }
+                            else
+                            {
+                                break;
+                            }
+                        }
+                        else if (_current_token.is(TokenKind::TK_GREATERGREATER))
+                        {
+                            if (nested_angle > 1)
+                            {
+                                nested_angle -= 2;
+                                type_arg += ">>";
+                                advance();
+                            }
+                            else
+                            {
+                                break;
+                            }
+                        }
+                        else if (_current_token.is(TokenKind::TK_COMMA) && nested_angle == 0)
+                        {
+                            break;
+                        }
+                        else if (_current_token.is_identifier() || _current_token.is_keyword())
+                        {
+                            type_arg += std::string(_current_token.text());
+                            advance();
+                        }
+                        else if (_current_token.is(TokenKind::TK_STAR))
+                        {
+                            type_arg += "*";
+                            advance();
+                        }
+                        else if (_current_token.is(TokenKind::TK_AMP))
+                        {
+                            type_arg += "&";
+                            advance();
+                        }
+                        else if (_current_token.is(TokenKind::TK_COLONCOLON))
+                        {
+                            type_arg += "::";
+                            advance();
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+
+                    if (!type_arg.empty())
+                    {
+                        generic_args.push_back(type_arg);
+                    }
+                }
+
+                // Consume closing '>' or '>>'
+                if (_current_token.is(TokenKind::TK_R_ANGLE))
+                {
+                    advance();
+                }
+                else if (_current_token.is(TokenKind::TK_GREATERGREATER))
+                {
+                    advance();
+                }
+            }
+        }
+
         // Check if this is a method call (member access followed by function call)
         if (_current_token.is(TokenKind::TK_L_PAREN))
         {
@@ -4133,7 +4375,22 @@ namespace Cryo
             auto member_access = _builder.create_member_access(access_location, std::move(expr), member_name);
 
             // Then parse the function call with the member access as the callee
-            return parse_call_expression(std::move(member_access));
+            auto call_expr = parse_call_expression(std::move(member_access));
+
+            // Add generic arguments if present
+            if (!generic_args.empty() && call_expr)
+            {
+                auto* call_node = dynamic_cast<CallExpressionNode*>(call_expr.get());
+                if (call_node)
+                {
+                    for (const auto& arg : generic_args)
+                    {
+                        call_node->add_generic_arg(arg);
+                    }
+                }
+            }
+
+            return call_expr;
         }
         else
         {
@@ -4201,6 +4458,8 @@ namespace Cryo
             auto generics = parse_generic_parameters();
             for (auto &generic : generics)
             {
+                // Track generic param names so field type parsing can recognize them
+                _current_generic_params.push_back(generic->name());
                 struct_decl->add_generic_parameter(std::move(generic));
             }
         }
@@ -4292,6 +4551,7 @@ namespace Cryo
         // Clear flags after parsing struct members
         _parsing_class_members = false;
         _current_parsing_type_name.clear();
+        _current_generic_params.clear();
 
         consume(TokenKind::TK_R_BRACE, "Expected '}' after struct body");
 
@@ -4333,6 +4593,8 @@ namespace Cryo
             auto generics = parse_generic_parameters();
             for (auto &generic : generics)
             {
+                // Track generic param names so field type parsing can recognize them
+                _current_generic_params.push_back(generic->name());
                 class_decl->add_generic_parameter(std::move(generic));
             }
         }
@@ -4445,6 +4707,7 @@ namespace Cryo
         // Clear flags after parsing class members
         _parsing_class_members = false;
         _current_parsing_type_name.clear();
+        _current_generic_params.clear();
 
         consume(TokenKind::TK_R_BRACE, "Expected '}' after class body");
         return class_decl;
@@ -4734,6 +4997,8 @@ namespace Cryo
             auto generic_params = parse_generic_parameters();
             for (auto &param : generic_params)
             {
+                // Track generic param names so variant type parsing can recognize them
+                _current_generic_params.push_back(param->name());
                 enum_decl->add_generic_parameter(std::move(param));
             }
         }
@@ -4757,6 +5022,9 @@ namespace Cryo
         }
 
         consume(TokenKind::TK_R_BRACE, "Expected '}' after enum body");
+
+        // Clear generic params after parsing enum body
+        _current_generic_params.clear();
 
         // CRITICAL FIX: Register enum type immediately during parsing
         // This allows later type annotations to resolve to this enum
@@ -4905,12 +5173,15 @@ namespace Cryo
             target_type += "<";
             advance(); // consume '<'
 
-            // Parse generic arguments
+            // Parse generic arguments and track them for method type resolution
             do
             {
                 if (_current_token.is(TokenKind::TK_IDENTIFIER))
                 {
-                    target_type += std::string(_current_token.text());
+                    std::string param_name = std::string(_current_token.text());
+                    target_type += param_name;
+                    // Track generic param so method return types can reference it
+                    _current_generic_params.push_back(param_name);
                     advance();
                 }
 
@@ -4988,6 +5259,7 @@ namespace Cryo
 
         // Clear context after parsing implementation block
         _current_parsing_type_name.clear();
+        _current_generic_params.clear();
 
         consume(TokenKind::TK_R_BRACE, "Expected '}' after implementation block");
 
@@ -5117,9 +5389,24 @@ namespace Cryo
 
         consume(TokenKind::TK_COLON, "Expected ':' after field name");
 
-        TypeRef field_type = parse_type_annotation();
+        // Capture the type string for deferred resolution
+        std::string type_string;
+        TypeRef field_type = parse_type_annotation(&type_string);
 
-        auto field = _builder.create_struct_field(start_loc, field_name, field_type, visibility);
+        std::unique_ptr<StructFieldNode> field;
+
+        // If type resolution failed, create a TypeAnnotation for deferred resolution
+        if (field_type.is_error())
+        {
+            LOG_DEBUG(LogComponent::PARSER, "Struct field '{}' type '{}' deferred to type resolution phase",
+                      field_name, type_string);
+            auto annotation = std::make_unique<TypeAnnotation>(TypeAnnotation::named(type_string, start_loc));
+            field = _builder.create_struct_field(start_loc, field_name, std::move(annotation), visibility);
+        }
+        else
+        {
+            field = _builder.create_struct_field(start_loc, field_name, field_type, visibility);
+        }
 
         // Parse optional default value
         if (_current_token.is(TokenKind::TK_EQUAL))
@@ -5206,11 +5493,18 @@ namespace Cryo
 
         // Parse optional generic parameters (e.g., <T> or <T, U>)
         std::vector<std::unique_ptr<GenericParameterNode>> method_generics;
+        size_t method_generic_count = 0; // Track how many we add for cleanup
         if (_current_token.is(TokenKind::TK_L_ANGLE))
         {
             method_generics = parse_generic_parameters();
             LOG_DEBUG(LogComponent::PARSER, "[METHOD] Parsed {} generic parameters for method '{}'",
                       method_generics.size(), method_name);
+            // Track method's generic params so param/return type parsing can recognize them
+            for (const auto &generic : method_generics)
+            {
+                _current_generic_params.push_back(generic->name());
+                method_generic_count++;
+            }
         }
 
         consume(TokenKind::TK_L_PAREN, "Expected '(' after method name");
@@ -5370,6 +5664,14 @@ namespace Cryo
                     // Consume it and we're done - this is the normal case
                     advance();
                     LOG_DEBUG(LogComponent::PARSER, "Recovery: Already positioned at method closing brace, consumed it");
+                    // Clean up method-level generic params before early return
+                    for (size_t i = 0; i < method_generic_count; ++i)
+                    {
+                        if (!_current_generic_params.empty())
+                        {
+                            _current_generic_params.pop_back();
+                        }
+                    }
                     return method;
                 }
 
@@ -5472,6 +5774,15 @@ namespace Cryo
         {
             // Method signature only
             consume(TokenKind::TK_SEMICOLON, "Expected ';' after method signature");
+        }
+
+        // Clean up method-level generic params from the tracking list
+        for (size_t i = 0; i < method_generic_count; ++i)
+        {
+            if (!_current_generic_params.empty())
+            {
+                _current_generic_params.pop_back();
+            }
         }
 
         return method;
@@ -6040,6 +6351,59 @@ namespace Cryo
 
     TypeRef Parser::resolve_type_from_string(const std::string &type_str)
     {
+        // Handle reference types - check if type starts with '&'
+        // This handles types like &T, &mut T, &i32, &mut String, etc.
+        if (!type_str.empty() && type_str[0] == '&')
+        {
+            bool is_mutable = false;
+            std::string base_type_str;
+
+            // Check for &mut T pattern
+            if (type_str.length() > 4 && type_str.substr(0, 4) == "&mut")
+            {
+                is_mutable = true;
+                // Skip "&mut" and any whitespace
+                size_t start = 4;
+                while (start < type_str.length() && (type_str[start] == ' ' || type_str[start] == '\t'))
+                {
+                    start++;
+                }
+                base_type_str = type_str.substr(start);
+            }
+            else
+            {
+                // Just & (immutable reference)
+                // Skip "&" and any whitespace
+                size_t start = 1;
+                while (start < type_str.length() && (type_str[start] == ' ' || type_str[start] == '\t'))
+                {
+                    start++;
+                }
+                base_type_str = type_str.substr(start);
+            }
+
+            LOG_DEBUG(LogComponent::PARSER, "Resolving reference type '{}': base='{}', mutable={}",
+                      type_str, base_type_str, is_mutable);
+
+            // Recursively resolve the base type
+            TypeRef base_type = resolve_type_from_string(base_type_str);
+
+            // If base type failed to resolve, propagate the error
+            if (!base_type.is_valid() || base_type.is_error())
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Base type '{}' could not be resolved, deferring reference type '{}'",
+                          base_type_str, type_str);
+                return _context.types().create_error("unresolved type: " + type_str, SourceLocation{});
+            }
+
+            // Create the reference type
+            TypeRef result = is_mutable ? _context.types().get_mut_reference_to(base_type)
+                                        : _context.types().get_reference_to(base_type);
+
+            LOG_DEBUG(LogComponent::PARSER, "Successfully resolved reference type '{}'", type_str);
+            return result;
+        }
+
         // Handle pointer types - check if type ends with '*'
         // This handles types like u8*, ArenaChunk*, int**, etc.
         if (!type_str.empty() && type_str.back() == '*')
@@ -6125,6 +6489,17 @@ namespace Cryo
             return result;
         }
 
+        // Check if this is a generic type parameter (e.g., T, U, E)
+        // These should be recognized within the context of a generic struct/class/enum/impl
+        for (size_t i = 0; i < _current_generic_params.size(); ++i)
+        {
+            if (type_str == _current_generic_params[i])
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Resolved '{}' as generic parameter at index {}", type_str, i);
+                return _context.types().create_generic_param(type_str, i);
+            }
+        }
+
         // Handle basic built-in types first
         if (type_str == "void")
             return _context.types().get_void();
@@ -6177,6 +6552,112 @@ namespace Cryo
             LOG_DEBUG(LogComponent::PARSER, "Parser detected generic type syntax: '{}' - deferring to type resolution", type_str);
             // Return an error type with the type string - TypeResolver will handle it
             return _context.types().create_error("unresolved generic: " + type_str, SourceLocation{});
+        }
+
+        // For function types (e.g., "()->R", "(T)->U", "(A,B)->R"), parse properly
+        // Function types are identified by starting with '(' and containing '->'
+        if (!type_str.empty() && type_str[0] == '(' && type_str.find("->") != std::string::npos)
+        {
+            LOG_DEBUG(LogComponent::PARSER, "Parser parsing function type syntax: '{}'", type_str);
+
+            // Find the closing paren that matches the opening one
+            int depth = 0;
+            size_t params_end = 0;
+            for (size_t i = 0; i < type_str.size(); ++i)
+            {
+                if (type_str[i] == '(')
+                    depth++;
+                else if (type_str[i] == ')')
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        params_end = i;
+                        break;
+                    }
+                }
+            }
+
+            if (params_end == 0)
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Function type '{}' has unbalanced parens", type_str);
+                return _context.types().create_error("invalid function type: " + type_str, SourceLocation{});
+            }
+
+            // Extract parameter list and return type
+            std::string params_str = type_str.substr(1, params_end - 1); // Content inside ()
+            std::string rest = type_str.substr(params_end + 1);
+
+            // Find -> and extract return type
+            size_t arrow_pos = rest.find("->");
+            if (arrow_pos == std::string::npos)
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Function type '{}' missing arrow", type_str);
+                return _context.types().create_error("invalid function type: " + type_str, SourceLocation{});
+            }
+
+            std::string return_type_str = rest.substr(arrow_pos + 2);
+            // Trim whitespace from return type
+            while (!return_type_str.empty() && std::isspace(static_cast<unsigned char>(return_type_str.front())))
+                return_type_str.erase(0, 1);
+            while (!return_type_str.empty() && std::isspace(static_cast<unsigned char>(return_type_str.back())))
+                return_type_str.pop_back();
+
+            LOG_DEBUG(LogComponent::PARSER, "Function type params='{}', return='{}'", params_str, return_type_str);
+
+            // Parse parameter types
+            std::vector<TypeRef> param_types;
+            if (!params_str.empty())
+            {
+                // Split by comma, respecting nested types
+                int nested_depth = 0;
+                size_t start = 0;
+                for (size_t i = 0; i <= params_str.size(); ++i)
+                {
+                    if (i == params_str.size() || (params_str[i] == ',' && nested_depth == 0))
+                    {
+                        std::string param_type_str = params_str.substr(start, i - start);
+                        // Trim whitespace
+                        while (!param_type_str.empty() && std::isspace(static_cast<unsigned char>(param_type_str.front())))
+                            param_type_str.erase(0, 1);
+                        while (!param_type_str.empty() && std::isspace(static_cast<unsigned char>(param_type_str.back())))
+                            param_type_str.pop_back();
+
+                        if (!param_type_str.empty())
+                        {
+                            TypeRef param_type = resolve_type_from_string(param_type_str);
+                            if (param_type.is_error())
+                            {
+                                LOG_DEBUG(LogComponent::PARSER, "Function type param '{}' failed to resolve", param_type_str);
+                                return param_type; // Propagate error
+                            }
+                            param_types.push_back(param_type);
+                        }
+                        start = i + 1;
+                    }
+                    else if (params_str[i] == '<' || params_str[i] == '(')
+                    {
+                        nested_depth++;
+                    }
+                    else if (params_str[i] == '>' || params_str[i] == ')')
+                    {
+                        nested_depth--;
+                    }
+                }
+            }
+
+            // Parse return type
+            TypeRef return_type = resolve_type_from_string(return_type_str);
+            if (return_type.is_error())
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Function type return type '{}' failed to resolve", return_type_str);
+                return return_type; // Propagate error
+            }
+
+            LOG_DEBUG(LogComponent::PARSER, "Successfully parsed function type: {} params, return='{}'",
+                      param_types.size(), return_type->display_name());
+
+            return _context.types().get_function(return_type, std::move(param_types), false);
         }
 
         // Try to resolve as a struct type

@@ -345,6 +345,50 @@ namespace Cryo
         llvm::Type *map_error(const ErrorType *type);
 
         // ====================================================================
+        // Instantiated Type Helpers
+        // ====================================================================
+
+        /**
+         * @brief Map an instantiated enum type with type arguments
+         */
+        llvm::Type *map_instantiated_enum(const InstantiatedType *inst,
+                                           const EnumType *base_enum,
+                                           const std::vector<TypeRef> &type_args);
+
+        /**
+         * @brief Map an instantiated struct type with type arguments
+         */
+        llvm::Type *map_instantiated_struct(const InstantiatedType *inst,
+                                             const StructType *base_struct,
+                                             const std::vector<TypeRef> &type_args);
+
+        /**
+         * @brief Substitute generic params in a type with concrete type args
+         */
+        TypeRef substitute_generic_param(TypeRef type,
+                                          const std::vector<TypeRef> &type_args);
+
+        /**
+         * @brief Try to parse and instantiate a generic type from string
+         * e.g., "Result<Duration,SystemTimeError>" -> proper LLVM type
+         */
+        llvm::Type *try_instantiate_generic_from_string(const std::string &name);
+
+        /**
+         * @brief Directly create LLVM type for well-known generic enums
+         * when the base type isn't available as a TypeRef (template-only)
+         */
+        llvm::Type *create_generic_enum_type_directly(
+            const std::string &full_name,
+            const std::string &base_name,
+            const std::vector<std::string> &arg_names);
+
+        /**
+         * @brief Resolve a type name string to a TypeRef
+         */
+        TypeRef resolve_type_from_string(const std::string &name);
+
+        // ====================================================================
         // Helpers
         // ====================================================================
 

@@ -6,7 +6,10 @@
 #include "Utils/OS.hpp"
 #include "AST/ASTContext.hpp"
 #include "Types/Types.hpp"
+#include "Types/Type.hpp"
 #include "Types/UserDefinedTypes.hpp"
+#include "Types/GenericRegistry.hpp"
+#include "Types/GenericTypes.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -957,6 +960,25 @@ namespace Cryo
                             "imported_module"   // source_file (placeholder)
                         );
                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic class template: {} from module: {}", class_decl->name(), module_name);
+
+                        // Also register in GenericRegistry for the new type system
+                        if (_generic_registry)
+                        {
+                            TypeArena &arena = _ast_context.types();
+                            TypeRef class_type = arena.create_class(QualifiedTypeName{ModuleID::invalid(), class_decl->name()});
+
+                            std::vector<GenericParam> params;
+                            for (size_t i = 0; i < class_decl->generic_parameters().size(); ++i)
+                            {
+                                auto &param_node = class_decl->generic_parameters()[i];
+                                TypeRef param_type = arena.create_generic_param(param_node->name(), i);
+                                params.emplace_back(param_node->name(), i, param_type);
+                            }
+                            _generic_registry->register_template(class_type, params,
+                                ModuleID::invalid(), class_decl, class_decl->name());
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered class '{}' in GenericRegistry with {} params",
+                                class_decl->name(), params.size());
+                        }
                     }
 
                     // Register method return type annotations for class methods
@@ -1014,6 +1036,26 @@ namespace Cryo
                             "imported_module"  // source_file (placeholder)
                         );
                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic enum template: {} from module: {}", enum_decl->name(), module_name);
+
+                        // Also register in GenericRegistry for the new type system
+                        if (_generic_registry)
+                        {
+                            TypeArena &arena = _ast_context.types();
+                            // Create the enum type if it doesn't exist
+                            TypeRef enum_type = arena.create_enum(QualifiedTypeName{ModuleID::invalid(), enum_decl->name()});
+
+                            std::vector<GenericParam> params;
+                            for (size_t i = 0; i < enum_decl->generic_parameters().size(); ++i)
+                            {
+                                auto &param_node = enum_decl->generic_parameters()[i];
+                                TypeRef param_type = arena.create_generic_param(param_node->name(), i);
+                                params.emplace_back(param_node->name(), i, param_type);
+                            }
+                            _generic_registry->register_template(enum_type, params,
+                                ModuleID::invalid(), enum_decl, enum_decl->name());
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered enum '{}' in GenericRegistry with {} params",
+                                enum_decl->name(), params.size());
+                        }
                     }
                 }
                 else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(decl))
@@ -1028,6 +1070,25 @@ namespace Cryo
                             "imported_module"    // source_file (placeholder)
                         );
                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic struct template: {} from module: {}", struct_decl->name(), module_name);
+
+                        // Also register in GenericRegistry for the new type system
+                        if (_generic_registry)
+                        {
+                            TypeArena &arena = _ast_context.types();
+                            TypeRef struct_type = arena.create_struct(QualifiedTypeName{ModuleID::invalid(), struct_decl->name()});
+
+                            std::vector<GenericParam> params;
+                            for (size_t i = 0; i < struct_decl->generic_parameters().size(); ++i)
+                            {
+                                auto &param_node = struct_decl->generic_parameters()[i];
+                                TypeRef param_type = arena.create_generic_param(param_node->name(), i);
+                                params.emplace_back(param_node->name(), i, param_type);
+                            }
+                            _generic_registry->register_template(struct_type, params,
+                                ModuleID::invalid(), struct_decl, struct_decl->name());
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered struct '{}' in GenericRegistry with {} params",
+                                struct_decl->name(), params.size());
+                        }
                     }
                     else
                     {

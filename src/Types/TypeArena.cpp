@@ -52,6 +52,31 @@ namespace Cryo
         return _types[it->second].get();
     }
 
+    TypeRef TypeArena::lookup_type_by_name(const std::string &name) const
+    {
+        // Try struct types
+        auto struct_it = _struct_types.find(name);
+        if (struct_it != _struct_types.end())
+            return struct_it->second;
+
+        // Try enum types
+        auto enum_it = _enum_types.find(name);
+        if (enum_it != _enum_types.end())
+            return enum_it->second;
+
+        // Try class types
+        auto class_it = _class_types.find(name);
+        if (class_it != _class_types.end())
+            return class_it->second;
+
+        // Try trait types
+        auto trait_it = _trait_types.find(name);
+        if (trait_it != _trait_types.end())
+            return trait_it->second;
+
+        return TypeRef{}; // Invalid/not found
+    }
+
     // ========================================================================
     // Primitive type initialization
     // ========================================================================
