@@ -366,8 +366,6 @@ namespace Cryo::Codegen
         }
 
         case TokenKind::TK_KW_NULL:
-        case TokenKind::TK_KW_NIL:
-        case TokenKind::TK_KW_NONE:
         {
             // Null/nil/none literals - return null pointer
             return generate_null_literal(node->get_resolved_type());

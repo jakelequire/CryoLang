@@ -60,17 +60,9 @@ namespace Cryo
         {"continue", TokenKind::TK_KW_CONTINUE},
         {"return", TokenKind::TK_KW_RETURN},
         {"match", TokenKind::TK_KW_MATCH},
-        {"goto", TokenKind::TK_KW_GOTO},
-        {"try", TokenKind::TK_KW_TRY},
-        {"catch", TokenKind::TK_KW_CATCH},
-        {"finally", TokenKind::TK_KW_FINALLY},
-        {"throw", TokenKind::TK_KW_THROW},
-        {"raise", TokenKind::TK_KW_RAISE},
         {"yield", TokenKind::TK_KW_YIELD},
 
         // Declarations
-        {"var", TokenKind::TK_KW_VAR},
-        {"let", TokenKind::TK_KW_LET},
         {"const", TokenKind::TK_KW_CONST},
         {"static", TokenKind::TK_KW_STATIC},
         {"extern", TokenKind::TK_KW_EXTERN},
@@ -78,7 +70,6 @@ namespace Cryo
         {"function", TokenKind::TK_KW_FUNCTION},
         {"class", TokenKind::TK_KW_CLASS},
         {"struct", TokenKind::TK_KW_STRUCT},
-        {"union", TokenKind::TK_KW_UNION},
         {"enum", TokenKind::TK_KW_ENUM},
         {"trait", TokenKind::TK_KW_TRAIT},
         {"type", TokenKind::TK_KW_TYPE},
@@ -110,10 +101,6 @@ namespace Cryo
         {"double", TokenKind::TK_KW_DOUBLE},
         {"char", TokenKind::TK_KW_CHAR},
         {"string", TokenKind::TK_KW_STRING},
-        {"list", TokenKind::TK_KW_LIST},
-        {"map", TokenKind::TK_KW_MAP},
-        {"dict", TokenKind::TK_KW_DICT},
-        {"set", TokenKind::TK_KW_SET},
         {"tuple", TokenKind::TK_KW_TUPLE},
         {"optional", TokenKind::TK_KW_OPTIONAL},
         {"any", TokenKind::TK_KW_ANY},
@@ -130,17 +117,12 @@ namespace Cryo
         {"unsafe", TokenKind::TK_KW_UNSAFE},
 
         // Memory & Ownership
-        {"ref", TokenKind::TK_KW_REF},
         {"mut", TokenKind::TK_KW_MUT},
 
         // Special Values
         {"true", TokenKind::TK_KW_TRUE},
         {"false", TokenKind::TK_KW_FALSE},
         {"null", TokenKind::TK_KW_NULL},
-        {"nil", TokenKind::TK_KW_NIL},
-        {"none", TokenKind::TK_KW_NONE},
-        {"some", TokenKind::TK_KW_SOME},
-        {"super", TokenKind::TK_KW_SUPER},
         {"this", TokenKind::TK_KW_THIS},
         {"This", TokenKind::TK_KW_THIS_TYPE},
 
