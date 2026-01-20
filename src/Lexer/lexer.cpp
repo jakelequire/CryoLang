@@ -728,7 +728,20 @@ namespace Cryo
         {
             advance(); // consume backslash
             if (!at_end())
-                advance(); // consume escaped character
+            {
+                char escape_char = peek();
+                advance(); // consume escape character (n, t, x, etc.)
+
+                // Handle hex escape sequences (\xHH)
+                if (escape_char == 'x')
+                {
+                    // Consume up to 2 hex digits
+                    for (int i = 0; i < 2 && !at_end() && is_hex_digit(peek()); i++)
+                    {
+                        advance();
+                    }
+                }
+            }
         }
         else
         {
@@ -1347,6 +1360,34 @@ namespace Cryo
                     break;
                 case 'v':
                     result += '\v';
+                    break;
+                case 'x':
+                    // Handle hex escape sequences (\xHH)
+                    {
+                        std::string hex_str;
+                        size_t hex_pos = i + 2; // Start after \x
+
+                        // Collect up to 2 hex digits
+                        for (int digit_count = 0; digit_count < 2 && hex_pos < str.length() && is_hex_digit(str[hex_pos]); ++digit_count, ++hex_pos)
+                        {
+                            hex_str += str[hex_pos];
+                        }
+
+                        if (!hex_str.empty())
+                        {
+                            // Convert hex string to integer
+                            int hex_value = std::stoi(hex_str, nullptr, 16);
+                            result += static_cast<char>(hex_value);
+                            // Skip the hex digits (first char 'x' is handled by normal ++i)
+                            i += hex_str.length();
+                        }
+                        else
+                        {
+                            // No hex digits after \x, treat as literal
+                            result += '\\';
+                            result += 'x';
+                        }
+                    }
                     break;
                 case '0':
                 case '1':

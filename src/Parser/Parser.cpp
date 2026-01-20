@@ -2051,7 +2051,18 @@ namespace Cryo
             expr = parse_expression();
         }
 
-        consume(TokenKind::TK_SEMICOLON, "Expected ';' after return statement");
+        // Semicolon is optional if the expression ended with '}' (struct literal, block, match, etc.)
+        // This allows: return StructName { field: value }
+        // The closing } of the struct literal is followed by } of the function body
+        if (_current_token.is(TokenKind::TK_SEMICOLON))
+        {
+            advance(); // consume optional ';'
+        }
+        else if (!_current_token.is(TokenKind::TK_R_BRACE))
+        {
+            // If not followed by ; or }, that's an error
+            error("Expected ';' after return statement");
+        }
 
         return _builder.create_return_statement(start_loc, std::move(expr));
     }
@@ -2553,24 +2564,79 @@ namespace Cryo
         }
 
         // Primitive type constructors (e.g., i64(value), i32(value), f64(value))
+        // or primitive type scope resolution (e.g., i64::max_value(), u8::MIN)
         if (is_primitive_type_token())
         {
-            // Look ahead to see if this is followed by parentheses
-            if (peek_next().is(TokenKind::TK_L_PAREN))
+            Token next_tok = peek_next();
+            // Look ahead to see if this is followed by parentheses or scope resolution
+            if (next_tok.is(TokenKind::TK_L_PAREN) || next_tok.is(TokenKind::TK_COLONCOLON))
             {
-                // This is a primitive constructor call like i64(value) or f64(value)
+                // This is a primitive constructor call like i64(value) or scope resolution like i64::max_value()
                 std::string type_name = std::string(_current_token.text());
                 SourceLocation type_location = _current_token.location();
                 advance(); // consume the type name (e.g., 'i64', 'f64')
 
                 // Create an identifier node with the type name
                 Token type_token(TokenKind::TK_IDENTIFIER, type_name, type_location);
-                auto type_identifier = _builder.create_identifier_node(type_token);
+                std::unique_ptr<ExpressionNode> expr = _builder.create_identifier_node(type_token);
 
-                // Parse as a function call
-                auto constructor_call = parse_call_expression(std::move(type_identifier));
+                // Handle scope resolution (e.g., i64::max_value())
+                while (_current_token.is(TokenKind::TK_COLONCOLON))
+                {
+                    advance(); // consume '::'
 
-                return constructor_call;
+                    if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
+                    {
+                        error("Expected identifier after '::'");
+                        return nullptr;
+                    }
+
+                    std::string member_name = std::string(_current_token.text());
+                    SourceLocation loc;
+
+                    if (auto scope_node = dynamic_cast<ScopeResolutionNode *>(expr.get()))
+                    {
+                        std::string full_scope = generate_scope_resolution_name(scope_node->scope_name(), scope_node->member_name());
+                        loc = scope_node->location();
+                        expr = _builder.create_scope_resolution(loc, full_scope, member_name);
+                    }
+                    else if (auto identifier_node = dynamic_cast<IdentifierNode *>(expr.get()))
+                    {
+                        std::string scope_name = identifier_node->name();
+                        loc = identifier_node->location();
+                        expr = _builder.create_scope_resolution(loc, scope_name, member_name);
+                    }
+                    else
+                    {
+                        error("Invalid scope resolution expression");
+                        return nullptr;
+                    }
+
+                    advance(); // consume member identifier
+                }
+
+                // Handle postfix operations (function calls, etc.)
+                while (true)
+                {
+                    if (_current_token.is(TokenKind::TK_L_PAREN))
+                    {
+                        expr = parse_call_expression(std::move(expr));
+                    }
+                    else if (_current_token.is(TokenKind::TK_L_SQUARE))
+                    {
+                        expr = parse_array_access(std::move(expr));
+                    }
+                    else if (_current_token.is(TokenKind::TK_PERIOD) || _current_token.is(TokenKind::TK_ARROW))
+                    {
+                        expr = parse_member_access(std::move(expr));
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                return expr;
             }
         }
 
@@ -2646,6 +2712,12 @@ namespace Cryo
                                     {
                                         do
                                         {
+                                            // Check for trailing comma - if we see '}' after comma, break out
+                                            if (_current_token.is(TokenKind::TK_R_BRACE))
+                                            {
+                                                break;
+                                            }
+
                                             // Parse field name (allow keywords as field names)
                                             if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
                                             {
@@ -2670,7 +2742,10 @@ namespace Cryo
                                             auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
                                             struct_literal->add_field_initializer(std::move(field_init));
 
-                                        } while (match(TokenKind::TK_COMMA));
+                                            // Continue if comma or another field (identifier:)
+                                        } while (match(TokenKind::TK_COMMA) ||
+                                                 ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
+                                                  peek_next().is(TokenKind::TK_COLON)));
                                     }
 
                                     consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
@@ -2772,10 +2847,68 @@ namespace Cryo
                             Token generic_token(TokenKind::TK_IDENTIFIER, generic_type_name, type_location);
                             expr = _builder.create_identifier_node(generic_token);
                         }
+                        else if (_current_token.is(TokenKind::TK_L_BRACE))
+                        {
+                            // Generic struct literal: Type<T> { field: value, ... }
+                            advance(); // consume '{'
+
+                            auto struct_literal = _builder.create_struct_literal(type_location, type_name);
+
+                            // Add generic arguments to struct literal
+                            for (const auto &generic_arg : generic_args)
+                            {
+                                struct_literal->add_generic_arg(generic_arg);
+                            }
+
+                            // Parse field initializers
+                            if (!_current_token.is(TokenKind::TK_R_BRACE))
+                            {
+                                do
+                                {
+                                    // Check for trailing comma - if we see '}' after comma, break out
+                                    if (_current_token.is(TokenKind::TK_R_BRACE))
+                                    {
+                                        break;
+                                    }
+
+                                    // Parse field name (allow keywords as field names)
+                                    if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
+                                    {
+                                        error("Expected field name in struct literal");
+                                        return nullptr;
+                                    }
+
+                                    std::string field_name = std::string(_current_token.text());
+                                    advance(); // consume field name
+
+                                    consume(TokenKind::TK_COLON, "Expected ':' after field name");
+
+                                    // Parse field value
+                                    auto field_value = parse_expression();
+                                    if (!field_value)
+                                    {
+                                        error("Expected expression for field value");
+                                        return nullptr;
+                                    }
+
+                                    // Create field initializer
+                                    auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
+                                    struct_literal->add_field_initializer(std::move(field_init));
+
+                                    // Continue if comma or another field (identifier:)
+                                } while (match(TokenKind::TK_COMMA) ||
+                                         ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
+                                          peek_next().is(TokenKind::TK_COLON)));
+                            }
+
+                            consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
+
+                            expr = std::move(struct_literal);
+                        }
                         else
                         {
-                            // Not a constructor call or scope resolution, this is an error for now
-                            error("Generic type expressions must be followed by constructor call '()' or scope resolution '::'");
+                            // Not a constructor call, struct literal, or scope resolution, this is an error for now
+                            error("Generic type expressions must be followed by constructor call '()', struct literal '{...}', or scope resolution '::'");
                             return nullptr;
                         }
                     }
@@ -2884,6 +3017,12 @@ namespace Cryo
                     {
                         do
                         {
+                            // Check for trailing comma - if we see '}' after comma, break out
+                            if (_current_token.is(TokenKind::TK_R_BRACE))
+                            {
+                                break;
+                            }
+
                             // Parse field name (allow keywords as field names)
                             if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
                             {
@@ -2904,7 +3043,11 @@ namespace Cryo
                             auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
                             struct_literal->add_field_initializer(std::move(field_init));
 
-                        } while (match(TokenKind::TK_COMMA));
+                            // Continue if we see comma, or if we see another field (identifier:)
+                            // This allows struct literals without commas after match/block expressions
+                        } while (match(TokenKind::TK_COMMA) ||
+                                 ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
+                                  peek_next().is(TokenKind::TK_COLON)));
                     }
 
                     consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
@@ -3402,8 +3545,43 @@ namespace Cryo
 
         consume(TokenKind::TK_L_PAREN, "Expected '(' after 'for'");
 
-        // Parse initialization (variable declaration)
-        auto init = parse_variable_declaration();
+        // Parse initialization - can be either:
+        // 1. Standard variable declaration: const/mut name: type = value;
+        // 2. Simplified for-loop syntax: name: type = value; (implicitly mutable)
+        std::unique_ptr<VariableDeclarationNode> init = nullptr;
+
+        if (_current_token.is(TokenKind::TK_KW_CONST) || _current_token.is(TokenKind::TK_KW_MUT))
+        {
+            // Standard variable declaration
+            init = parse_variable_declaration();
+        }
+        else if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            // Simplified for-loop syntax: i: u32 = 0
+            SourceLocation var_loc = _current_token.location();
+            Token name_token = consume(TokenKind::TK_IDENTIFIER, "Expected variable name");
+            std::string var_name = std::string(name_token.text());
+
+            consume(TokenKind::TK_COLON, "Expected ':' after variable name");
+            TypeRef var_type = parse_type_annotation();
+
+            std::unique_ptr<ExpressionNode> initializer = nullptr;
+            if (_current_token.is(TokenKind::TK_EQUAL))
+            {
+                advance(); // consume '='
+                initializer = parse_expression();
+            }
+
+            consume(TokenKind::TK_SEMICOLON, "Expected ';' after for-loop initializer");
+
+            // For-loop variables are implicitly mutable
+            init = _builder.create_variable_declaration(var_loc, var_name, var_type, std::move(initializer), true, false);
+        }
+        else
+        {
+            error("Expected variable declaration in for-loop initializer");
+            return nullptr;
+        }
 
         // Parse condition
         auto condition = parse_expression();
@@ -3536,8 +3714,120 @@ namespace Cryo
 
         if (_current_token.is(TokenKind::TK_L_BRACE))
         {
-            // Block statement: { ... }
-            body = parse_block_statement();
+            // Match arm block body
+            // Handles: empty blocks {}, single expressions { expr }, multi-statement { stmt; stmt; }
+            SourceLocation block_loc = _current_token.location();
+            advance(); // consume '{'
+
+            // Handle empty block
+            if (_current_token.is(TokenKind::TK_R_BRACE))
+            {
+                advance(); // consume '}'
+                // Create an empty block statement
+                auto block = _builder.create_block_statement(block_loc);
+                body = std::move(block);
+            }
+            else
+            {
+                // Parse block content - can be statements or expressions
+                auto block = _builder.create_block_statement(block_loc);
+                enter_scope();
+
+                while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+                {
+                    // Check if this is a statement keyword that needs special handling
+                    if (_current_token.is(TokenKind::TK_KW_RETURN))
+                    {
+                        // Parse return statement
+                        SourceLocation return_loc = _current_token.location();
+                        advance(); // consume 'return'
+
+                        std::unique_ptr<ExpressionNode> expr = nullptr;
+                        if (!_current_token.is(TokenKind::TK_SEMICOLON) && !_current_token.is(TokenKind::TK_R_BRACE))
+                        {
+                            expr = parse_expression();
+                        }
+
+                        auto return_stmt = _builder.create_return_statement(return_loc, std::move(expr));
+
+                        // Consume optional semicolon
+                        if (_current_token.is(TokenKind::TK_SEMICOLON))
+                        {
+                            advance();
+                        }
+
+                        block->add_statement(std::move(return_stmt));
+                    }
+                    else if (_current_token.is(TokenKind::TK_KW_CONST) ||
+                             _current_token.is(TokenKind::TK_KW_MUT))
+                    {
+                        // Variable declaration - parse as statement
+                        auto stmt = parse_statement();
+                        if (stmt)
+                        {
+                            if (auto statement_node = dynamic_cast<StatementNode *>(stmt.get()))
+                            {
+                                stmt.release();
+                                block->add_statement(std::unique_ptr<StatementNode>(statement_node));
+                            }
+                            else if (auto decl_node = dynamic_cast<DeclarationNode *>(stmt.get()))
+                            {
+                                stmt.release();
+                                auto decl_stmt = _builder.create_declaration_statement(decl_node->location(),
+                                                                                       std::unique_ptr<DeclarationNode>(decl_node));
+                                block->add_statement(std::move(decl_stmt));
+                            }
+                        }
+                    }
+                    else if (_current_token.is(TokenKind::TK_KW_IF) ||
+                             _current_token.is(TokenKind::TK_KW_WHILE) ||
+                             _current_token.is(TokenKind::TK_KW_FOR) ||
+                             _current_token.is(TokenKind::TK_KW_LOOP))
+                    {
+                        // Control flow statement - parse as statement
+                        auto stmt = parse_statement();
+                        if (stmt)
+                        {
+                            if (auto statement_node = dynamic_cast<StatementNode *>(stmt.get()))
+                            {
+                                stmt.release();
+                                block->add_statement(std::unique_ptr<StatementNode>(statement_node));
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Parse as expression
+                        auto expr = parse_expression();
+
+                        // Check what follows
+                        if (_current_token.is(TokenKind::TK_SEMICOLON))
+                        {
+                            // Expression statement with semicolon - more statements may follow
+                            advance(); // consume ';'
+                            auto expr_stmt = std::make_unique<ExpressionStatementNode>(expr->location(), std::move(expr));
+                            block->add_statement(std::move(expr_stmt));
+                        }
+                        else if (_current_token.is(TokenKind::TK_R_BRACE))
+                        {
+                            // Final expression without semicolon - this is the block's value
+                            auto expr_stmt = std::make_unique<ExpressionStatementNode>(expr->location(), std::move(expr));
+                            block->add_statement(std::move(expr_stmt));
+                            // Don't advance, let the outer loop handle the }
+                        }
+                        else
+                        {
+                            // Error - expected ; or }
+                            error("Expected ';' or '}' after expression in match arm block");
+                            break;
+                        }
+                    }
+                }
+
+                exit_scope();
+                consume(TokenKind::TK_R_BRACE, "Expected '}' after match arm block");
+                body = std::move(block);
+            }
         }
         else if (_current_token.is(TokenKind::TK_KW_RETURN))
         {
@@ -4064,7 +4354,10 @@ namespace Cryo
                         auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
                         struct_literal->add_field_initializer(std::move(field_init));
 
-                    } while (match(TokenKind::TK_COMMA));
+                        // Continue if comma or another field (identifier:)
+                    } while (match(TokenKind::TK_COMMA) ||
+                             ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
+                              peek_next().is(TokenKind::TK_COLON)));
                 }
 
                 consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
@@ -4152,8 +4445,8 @@ namespace Cryo
         SourceLocation new_location = _current_token.location();
         consume(TokenKind::TK_KW_NEW, "Expected 'new' keyword");
 
-        // Parse type name
-        if (!_current_token.is(TokenKind::TK_IDENTIFIER))
+        // Parse type name - accept both identifiers and type keywords (char, int, etc.)
+        if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !is_type_token())
         {
             error("Expected type name after 'new'");
             return nullptr;
@@ -4186,8 +4479,28 @@ namespace Cryo
             consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic arguments");
         }
 
+        // Check for array allocation syntax: new Type[size]
+        if (_current_token.is(TokenKind::TK_L_SQUARE))
+        {
+            advance(); // consume '['
+
+            // Parse the array size expression
+            auto size_expr = parse_expression();
+            if (!size_expr)
+            {
+                error("Expected array size expression");
+                return nullptr;
+            }
+
+            new_expr->set_array_size(std::move(size_expr));
+
+            consume(TokenKind::TK_R_SQUARE, "Expected ']' after array size");
+
+            return new_expr;
+        }
+
         // Parse constructor arguments
-        consume(TokenKind::TK_L_PAREN, "Expected '(' after type name");
+        consume(TokenKind::TK_L_PAREN, "Expected '(' for constructor call");
 
         // Check if this is a struct literal ({field: value})
         if (_current_token.is(TokenKind::TK_L_BRACE))
@@ -4369,7 +4682,18 @@ namespace Cryo
             return expr;
         }
 
+        bool is_arrow = _current_token.is(TokenKind::TK_ARROW);
         advance(); // consume '.' or '->'
+
+        // Handle postfix dereference: expr.*
+        // This dereferences a pointer stored in expr
+        if (_current_token.is(TokenKind::TK_STAR) && !is_arrow)
+        {
+            advance(); // consume '*'
+            // Create a dereference expression
+            Token deref_token(TokenKind::TK_STAR, "*", access_location);
+            return _builder.create_unary_expression(deref_token, std::move(expr));
+        }
 
         if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
         {
@@ -5959,6 +6283,12 @@ namespace Cryo
 
     Token Parser::peek_next()
     {
+        // Check if we have buffered tokens from previous lookahead
+        // This ensures synchronization with peek_next_n() which uses _lookahead_buffer
+        if (!_lookahead_buffer.empty())
+        {
+            return _lookahead_buffer.front();
+        }
         // Use the lexer's built-in peek functionality
         return _lexer->peek_token();
     }
@@ -5999,12 +6329,15 @@ namespace Cryo
 
     bool Parser::is_generic_call_ahead()
     {
-        // Scans ahead from current position (at '<') to determine if this is a generic call.
-        // A generic call follows the pattern: <type_args>(
-        // A comparison follows the pattern: < expr (without closing > followed by ()
+        // Scans ahead from current position (at '<') to determine if this is a generic expression.
+        // A generic expression follows one of these patterns:
+        //   - <type_args>(  - generic function call or constructor
+        //   - <type_args>{  - generic struct literal
+        //   - <type_args>:: - generic type with scope resolution
+        // A comparison follows the pattern: < expr (without closing > followed by one of the above)
         //
-        // Strategy: Track angle bracket depth, looking for matching '>' followed by '('.
-        // If we find '>(', it's a generic call.
+        // Strategy: Track angle bracket depth, looking for matching '>' followed by '(', '{', or '::'.
+        // If we find one of those patterns, it's a generic expression.
         // If we hit certain tokens that can't appear in type arguments, it's a comparison.
 
         int pos = 1; // Start looking after '<' (peek_next_n(1) = first token after current '<')
@@ -6030,20 +6363,18 @@ namespace Cryo
                 angle_depth--;
                 if (angle_depth == 0)
                 {
-                    // Found matching '>'. Check if next token is '('
+                    // Found matching '>'. Check if next token indicates a generic expression
                     Token next_tok = peek_next_n(pos + 1);
-                    return next_tok.is(TokenKind::TK_L_PAREN);
+                    return next_tok.is(TokenKind::TK_L_PAREN) ||   // Generic call: Type<T>()
+                           next_tok.is(TokenKind::TK_L_BRACE) ||   // Generic struct literal: Type<T> { ... }
+                           next_tok.is(TokenKind::TK_COLONCOLON);  // Generic scope resolution: Type<T>::method()
                 }
             }
             else if (tok.is(TokenKind::TK_SEMICOLON) ||
-                     tok.is(TokenKind::TK_L_BRACE) ||
                      tok.is(TokenKind::TK_R_BRACE) ||
                      tok.is(TokenKind::TK_R_PAREN) ||
                      tok.is(TokenKind::TK_EQUAL) ||
                      tok.is(TokenKind::TK_EXCLAIMEQUAL) ||
-                     tok.is(TokenKind::TK_L_ANGLE) ||
-                     tok.is(TokenKind::TK_R_ANGLE) ||
-                     tok.is(TokenKind::TK_AMP) ||
                      tok.is(TokenKind::TK_PIPE) ||
                      tok.is(TokenKind::TK_PLUS) ||
                      tok.is(TokenKind::TK_MINUS) ||
@@ -6055,8 +6386,9 @@ namespace Cryo
                      tok.is(TokenKind::TK_KW_RETURN))
             {
                 // These tokens cannot appear inside generic type arguments
-                // If we see them before finding '>(' at depth 0, it's a comparison
+                // If we see them before finding a valid generic suffix, it's a comparison
                 // Note: TK_STAR is not included since * can be a pointer type modifier
+                // Note: TK_L_BRACE, TK_L_ANGLE, TK_AMP removed - they can appear in nested generics or types
                 return false;
             }
 
@@ -6068,6 +6400,8 @@ namespace Cryo
             // - Ampersand (reference types)
             // - Square brackets (array types)
             // - Colons (for scope resolution like std::Vec)
+            // - L_ANGLE (nested generics)
+            // - L_BRACE (should not appear but let the matching > check handle it)
 
             pos++;
         }

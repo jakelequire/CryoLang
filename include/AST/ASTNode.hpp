@@ -1936,6 +1936,8 @@ namespace Cryo
         std::string _type_name;
         std::vector<std::string> _generic_args; // For generic types like GenericStruct<string>
         std::vector<std::unique_ptr<ExpressionNode>> _arguments;
+        std::unique_ptr<ExpressionNode> _array_size; // For array allocation: new Type[size]
+        bool _is_array_allocation = false;
 
     public:
         NewExpressionNode(SourceLocation loc, std::string type_name)
@@ -1944,8 +1946,15 @@ namespace Cryo
         const std::string &type_name() const { return _type_name; }
         const std::vector<std::string> &generic_args() const { return _generic_args; }
         const std::vector<std::unique_ptr<ExpressionNode>> &arguments() const { return _arguments; }
+        bool is_array_allocation() const { return _is_array_allocation; }
+        ExpressionNode *array_size() const { return _array_size.get(); }
 
         void add_generic_arg(const std::string &type) { _generic_args.push_back(type); }
+        void set_array_size(std::unique_ptr<ExpressionNode> size)
+        {
+            _array_size = std::move(size);
+            _is_array_allocation = true;
+        }
 
         void add_argument(std::unique_ptr<ExpressionNode> arg)
         {

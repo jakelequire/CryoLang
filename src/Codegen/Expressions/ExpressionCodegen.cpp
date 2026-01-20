@@ -2909,6 +2909,59 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating new expression for {}",
                   node->type_name());
 
+        // Handle array allocation: new Type[size]
+        if (node->is_array_allocation())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Array allocation for type {}",
+                      node->type_name());
+
+            // Get the element type
+            llvm::Type *element_type = ctx().get_type(node->type_name());
+            if (!element_type)
+            {
+                report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
+                             "Unknown type for array allocation: " + node->type_name());
+                return nullptr;
+            }
+
+            // Generate the size expression
+            llvm::Value *count = generate(node->array_size());
+            if (!count)
+            {
+                report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
+                             "Failed to generate array size expression");
+                return nullptr;
+            }
+
+            // Ensure count is i64
+            if (count->getType() != llvm::Type::getInt64Ty(llvm_ctx()))
+            {
+                count = builder().CreateIntCast(count, llvm::Type::getInt64Ty(llvm_ctx()), false, "array.size.i64");
+            }
+
+            // Calculate element size
+            const llvm::DataLayout &dl = module()->getDataLayout();
+            uint64_t element_size = element_type->isSized() ? dl.getTypeAllocSize(element_type) : 1;
+            llvm::Value *elem_size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), element_size);
+
+            // Calculate total allocation size
+            llvm::Value *total_size = builder().CreateMul(count, elem_size_val, "array.total.size");
+
+            // Call cryo_alloc
+            llvm::Function *cryo_alloc_fn = module()->getFunction("std::Runtime::cryo_alloc");
+            if (!cryo_alloc_fn)
+            {
+                llvm::Type *i64_type = llvm::Type::getInt64Ty(llvm_ctx());
+                llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
+                llvm::FunctionType *cryo_alloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
+                cryo_alloc_fn = llvm::Function::Create(cryo_alloc_type, llvm::Function::ExternalLinkage,
+                                                       "std::Runtime::cryo_alloc", module());
+            }
+
+            llvm::Value *ptr = builder().CreateCall(cryo_alloc_fn, {total_size}, "new.array." + node->type_name());
+            return ptr;
+        }
+
         llvm::Type *alloc_type = nullptr;
         std::string type_name_for_alloc = node->type_name();
 
