@@ -2719,6 +2719,14 @@ namespace Cryo::Codegen
             return;
         }
 
+        // Check if @llvm.global_ctors already exists - if so, we've already processed this
+        if (mod->getNamedGlobal("llvm.global_ctors"))
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                     "Global constructors already registered, skipping duplicate generation");
+            return;
+        }
+
         llvm::LLVMContext &ctx = llvm_ctx();
 
         // Check if we need global constructors (look for global variables with non-trivial types)
@@ -2767,6 +2775,14 @@ namespace Cryo::Codegen
         if (globals_needing_ctors.empty())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "No global variables need constructors");
+            return;
+        }
+
+        // Check if the constructor function already exists
+        if (mod->getFunction("__cryo_global_constructors"))
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                     "Global constructor function already exists, skipping duplicate creation");
             return;
         }
 

@@ -2028,11 +2028,26 @@ namespace Cryo::Codegen
             if (alloca)
                 return alloca;
 
-            // Try global
+            // Try global from context map
             auto &globals = ctx().globals_map();
             auto it = globals.find(name);
             if (it != globals.end())
                 return it->second;
+
+            // Try LLVM module's global variables with various name patterns
+            std::vector<std::string> candidates = {name};
+            if (!ctx().namespace_context().empty())
+            {
+                candidates.push_back(ctx().namespace_context() + "::" + name);
+            }
+
+            for (const auto &candidate : candidates)
+            {
+                if (llvm::GlobalVariable *global = module()->getGlobalVariable(candidate))
+                {
+                    return global;
+                }
+            }
 
             return nullptr;
         }
