@@ -13,6 +13,7 @@ namespace Cryo::Codegen
     // Forward declarations
     class MemoryCodegen;
     class TypeCodegen;
+    class ControlFlowCodegen;
 
     /**
      * @brief Handles expression code generation
@@ -65,6 +66,11 @@ namespace Cryo::Codegen
          * @brief Set the cast codegen component
          */
         void set_cast_codegen(class CastCodegen *casts) { _casts = casts; }
+
+        /**
+         * @brief Set the control flow codegen component
+         */
+        void set_control_flow_codegen(ControlFlowCodegen *control_flow) { _control_flow = control_flow; }
 
         //===================================================================
         // Literal Expressions
@@ -326,6 +332,13 @@ namespace Cryo::Codegen
          */
         llvm::Value *generate_if_expression(Cryo::IfExpressionNode *node);
 
+        /**
+         * @brief Generate match-expression (match as a value)
+         * @param node Match expression node
+         * @return Result value
+         */
+        llvm::Value *generate_match_expression(Cryo::MatchExpressionNode *node);
+
         //===================================================================
         // Helpers
         //===================================================================
@@ -350,6 +363,7 @@ namespace Cryo::Codegen
         OperatorCodegen *_operators = nullptr;
         CallCodegen *_calls = nullptr;
         CastCodegen *_casts = nullptr;
+        ControlFlowCodegen *_control_flow = nullptr;
 
         //===================================================================
         // Internal Helpers

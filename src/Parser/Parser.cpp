@@ -2484,6 +2484,12 @@ namespace Cryo
             return parse_if_expression();
         }
 
+        // Match-expression: match (expr) { pattern => { expr } ... }
+        if (_current_token.is(TokenKind::TK_KW_MATCH))
+        {
+            return parse_match_expression();
+        }
+
         if (_current_token.is(TokenKind::TK_KW_NULL))
         {
             return parse_null_literal();
@@ -2902,10 +2908,21 @@ namespace Cryo
             return expr;
         }
 
-        // Parenthesized expressions
+        // Parenthesized expressions or void literal ()
         if (_current_token.is(TokenKind::TK_L_PAREN))
         {
+            SourceLocation paren_loc = _current_token.location();
             advance(); // consume '('
+
+            // Check for empty parentheses () which represents void/unit value
+            if (_current_token.is(TokenKind::TK_R_PAREN))
+            {
+                advance(); // consume ')'
+                // Create a void literal token and return it as a literal node
+                Token void_token(TokenKind::TK_KW_VOID, "void", paren_loc);
+                return _builder.create_literal_node(void_token);
+            }
+
             auto expr = parse_expression();
             consume(TokenKind::TK_R_PAREN, "Expected ')' after expression");
 
@@ -3220,6 +3237,34 @@ namespace Cryo
         consume(TokenKind::TK_R_BRACE, "Expected '}' after else expression");
 
         return _builder.create_if_expression(start_loc, std::move(condition), std::move(then_expr), std::move(else_expr));
+    }
+
+    std::unique_ptr<ExpressionNode> Parser::parse_match_expression()
+    {
+        SourceLocation start_loc = _current_token.location();
+        consume(TokenKind::TK_KW_MATCH, "Expected 'match'");
+
+        // Parse the expression to match on
+        auto expr = parse_expression();
+
+        consume(TokenKind::TK_L_BRACE, "Expected '{' after match expression");
+
+        // Create the match expression
+        auto match_expr = _builder.create_match_expression(start_loc, std::move(expr));
+
+        // Parse match arms
+        while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+        {
+            auto arm = parse_match_arm();
+            if (arm)
+            {
+                match_expr->add_arm(std::move(arm));
+            }
+        }
+
+        consume(TokenKind::TK_R_BRACE, "Expected '}' after match arms");
+
+        return match_expr;
     }
 
     std::unique_ptr<ASTNode> Parser::parse_while_statement()

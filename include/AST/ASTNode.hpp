@@ -151,6 +151,7 @@ namespace Cryo
         UnaryExpression,
         TernaryExpression,
         IfExpression,
+        MatchExpression,
         CallExpression,
         NewExpression,
         SizeofExpression,
@@ -227,6 +228,10 @@ namespace Cryo
             return "UnaryExpression";
         case NodeKind::TernaryExpression:
             return "TernaryExpression";
+        case NodeKind::IfExpression:
+            return "IfExpression";
+        case NodeKind::MatchExpression:
+            return "MatchExpression";
         case NodeKind::CallExpression:
             return "CallExpression";
         case NodeKind::NewExpression:
@@ -2601,6 +2606,43 @@ namespace Cryo
             {
                 os << std::string(indent + 2, ' ') << "Body:" << std::endl;
                 _body->print(os, indent + 4);
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Match expression - match used in expression context
+    class MatchExpressionNode : public ExpressionNode
+    {
+    private:
+        std::unique_ptr<ExpressionNode> _expr;
+        std::vector<std::unique_ptr<MatchArmNode>> _arms;
+
+    public:
+        MatchExpressionNode(SourceLocation loc, std::unique_ptr<ExpressionNode> expr)
+            : ExpressionNode(NodeKind::MatchExpression, loc), _expr(std::move(expr)) {}
+
+        void add_arm(std::unique_ptr<MatchArmNode> arm)
+        {
+            _arms.push_back(std::move(arm));
+        }
+
+        ExpressionNode *expression() const { return _expr.get(); }
+        const std::vector<std::unique_ptr<MatchArmNode>> &arms() const { return _arms; }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "MatchExpression:" << std::endl;
+            if (_expr)
+            {
+                os << std::string(indent + 2, ' ') << "Expression:" << std::endl;
+                _expr->print(os, indent + 4);
+            }
+            os << std::string(indent + 2, ' ') << "Arms:" << std::endl;
+            for (const auto &arm : _arms)
+            {
+                arm->print(os, indent + 4);
             }
         }
 
