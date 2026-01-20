@@ -1599,11 +1599,24 @@ namespace Cryo::Codegen
                 {
                     if (!param)
                         continue;
+                    // Skip 'this' parameter - it's already added above when has_this_param is true
+                    if (param->name() == "this")
+                    {
+                        continue;
+                    }
                     TypeRef param_type = param->get_resolved_type();
                     llvm::Type *llvm_param = get_llvm_type(param_type);
                     if (llvm_param)
                     {
                         param_types.push_back(llvm_param);
+                    }
+                    else
+                    {
+                        // Fallback to pointer type to avoid silently dropping parameters
+                        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                 "get_function_type: Parameter '{}' type could not be resolved, using ptr fallback",
+                                 param->name());
+                        param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
                     }
                 }
 
@@ -1692,6 +1705,15 @@ namespace Cryo::Codegen
                 if (param_type)
                 {
                     param_types.push_back(param_type);
+                }
+                else
+                {
+                    // Fallback to pointer type if parameter type can't be resolved
+                    // This prevents silently dropping parameters which causes argument count mismatches
+                    LOG_WARN(Cryo::LogComponent::CODEGEN,
+                             "get_function_type: Parameter '{}' type could not be resolved, using ptr fallback",
+                             param->name());
+                    param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
                 }
             }
         }

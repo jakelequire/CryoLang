@@ -1090,7 +1090,18 @@ namespace Cryo::Codegen
         {
             if (i < fn_type->getNumParams())
             {
-                coerced_args.push_back(cast_if_needed(args[i], fn_type->getParamType(i)));
+                llvm::Value *arg = args[i];
+                llvm::Type *param_type = fn_type->getParamType(i);
+
+                // Handle struct-to-pointer conversion
+                if (arg && param_type->isPointerTy() && arg->getType()->isStructTy())
+                {
+                    llvm::AllocaInst *temp = create_entry_alloca(arg->getType(), "struct.arg.tmp");
+                    builder().CreateStore(arg, temp);
+                    arg = temp;
+                }
+
+                coerced_args.push_back(cast_if_needed(arg, param_type));
             }
             else if (fn_type->isVarArg())
             {
@@ -1121,7 +1132,18 @@ namespace Cryo::Codegen
 
             for (size_t i = 0; i < args.size() && i < fn_type->getNumParams(); ++i)
             {
-                coerced_args.push_back(cast_if_needed(args[i], fn_type->getParamType(i)));
+                llvm::Value *arg = args[i];
+                llvm::Type *param_type = fn_type->getParamType(i);
+
+                // Handle struct-to-pointer conversion
+                if (arg && param_type->isPointerTy() && arg->getType()->isStructTy())
+                {
+                    llvm::AllocaInst *temp = create_entry_alloca(arg->getType(), "struct.arg.tmp");
+                    builder().CreateStore(arg, temp);
+                    arg = temp;
+                }
+
+                coerced_args.push_back(cast_if_needed(arg, param_type));
             }
 
             std::string result_name = method->getReturnType()->isVoidTy() ? "" : method_name + ".result";
@@ -1591,7 +1613,22 @@ namespace Cryo::Codegen
             size_t param_idx = i + 1; // Skip 'this' parameter
             if (param_idx < fn_type->getNumParams())
             {
-                call_args.push_back(cast_if_needed(args[i], fn_type->getParamType(param_idx)));
+                llvm::Value *arg = args[i];
+                llvm::Type *param_type = fn_type->getParamType(param_idx);
+
+                // Handle struct-to-pointer conversion: if arg is a struct value but param expects pointer,
+                // create a temporary alloca and pass its address
+                if (arg && param_type->isPointerTy() && arg->getType()->isStructTy())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_instance_method: Converting struct arg to pointer for param {}",
+                              param_idx);
+                    llvm::AllocaInst *temp = create_entry_alloca(arg->getType(), "struct.arg.tmp");
+                    builder().CreateStore(arg, temp);
+                    arg = temp;
+                }
+
+                call_args.push_back(cast_if_needed(arg, param_type));
             }
             else if (fn_type->isVarArg())
             {
@@ -1626,7 +1663,18 @@ namespace Cryo::Codegen
         {
             if (i < fn_type->getNumParams())
             {
-                coerced_args.push_back(cast_if_needed(args[i], fn_type->getParamType(i)));
+                llvm::Value *arg = args[i];
+                llvm::Type *param_type = fn_type->getParamType(i);
+
+                // Handle struct-to-pointer conversion
+                if (arg && param_type->isPointerTy() && arg->getType()->isStructTy())
+                {
+                    llvm::AllocaInst *temp = create_entry_alloca(arg->getType(), "struct.arg.tmp");
+                    builder().CreateStore(arg, temp);
+                    arg = temp;
+                }
+
+                coerced_args.push_back(cast_if_needed(arg, param_type));
             }
             else if (fn_type->isVarArg())
             {
