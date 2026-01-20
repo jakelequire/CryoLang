@@ -1417,6 +1417,19 @@ namespace Cryo::Codegen
         }
     }
 
+    void CodegenVisitor::visit(Cryo::TupleLiteralNode &node)
+    {
+        NodeTracker tracker(*_ctx, &node);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting TupleLiteralNode");
+
+        llvm::Value *result = _expressions->generate_tuple_literal(&node);
+        if (result)
+        {
+            _ctx->set_result(result);
+            _ctx->register_value(&node, result);
+        }
+    }
+
     void CodegenVisitor::visit(Cryo::ArrayAccessNode &node)
     {
         NodeTracker tracker(*_ctx, &node);

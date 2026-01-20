@@ -119,6 +119,11 @@ namespace Cryo
         visitor.visit(*this);
     }
 
+    void TupleLiteralNode::accept(ASTVisitor &visitor)
+    {
+        visitor.visit(*this);
+    }
+
     void ArrayAccessNode::accept(ASTVisitor &visitor)
     {
         visitor.visit(*this);
