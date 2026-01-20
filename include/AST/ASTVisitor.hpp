@@ -30,6 +30,7 @@ namespace Cryo
     class CastExpressionNode;
     class StructLiteralNode;
     class ArrayLiteralNode;
+    class TupleLiteralNode;
     class ArrayAccessNode;
     class MemberAccessNode;
     class ScopeResolutionNode;
@@ -92,6 +93,7 @@ namespace Cryo
         virtual void visit(CastExpressionNode &node) = 0;
         virtual void visit(StructLiteralNode &node) = 0;
         virtual void visit(ArrayLiteralNode &node) = 0;
+        virtual void visit(TupleLiteralNode &node) = 0;
         virtual void visit(ArrayAccessNode &node) = 0;
         virtual void visit(MemberAccessNode &node) = 0;
         virtual void visit(ScopeResolutionNode &node) = 0;
@@ -153,6 +155,7 @@ namespace Cryo
         void visit(CastExpressionNode &node) override {}
         void visit(StructLiteralNode &node) override {}
         void visit(ArrayLiteralNode &node) override {}
+        void visit(TupleLiteralNode &node) override {}
         void visit(ArrayAccessNode &node) override {}
         void visit(MemberAccessNode &node) override {}
         void visit(ScopeResolutionNode &node) override {}

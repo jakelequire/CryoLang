@@ -846,6 +846,25 @@ namespace Cryo
         }
     }
 
+    void ASTDumper::visit(TupleLiteralNode &node)
+    {
+        print_prefix();
+        _output << get_node_color(node.kind()) << "TupleLiteral";
+        if (_use_colors)
+            _output << Colors::RESET;
+        print_location(node.location());
+        _output << " [" << node.size() << "]";
+        _output << std::endl;
+
+        // Dump tuple elements
+        const auto &elements = node.elements();
+        for (size_t i = 0; i < elements.size(); ++i)
+        {
+            bool is_last = (i == elements.size() - 1);
+            dump_child(elements[i].get(), is_last);
+        }
+    }
+
     void ASTDumper::visit(ArrayAccessNode &node)
     {
         print_prefix();

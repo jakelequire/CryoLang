@@ -89,6 +89,7 @@ namespace Cryo
         void visit(CastExpressionNode &node) override;
         void visit(StructLiteralNode &node) override;
         void visit(ArrayLiteralNode &node) override;
+        void visit(TupleLiteralNode &node) override;
         void visit(ArrayAccessNode &node) override;
         void visit(MemberAccessNode &node) override;
         void visit(IfStatementNode &node) override;

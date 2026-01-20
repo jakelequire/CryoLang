@@ -1180,12 +1180,25 @@ namespace Cryo
             base_type += ">";
         }
 
-        // Handle array types (e.g., i32[], str[][])
+        // Handle array types (e.g., i32[], str[][], u32[10], void[8])
         while (_current_token.is(TokenKind::TK_L_SQUARE))
         {
             consume(TokenKind::TK_L_SQUARE, "Expected '['");
+
+            // Check for fixed-size array syntax [N]
+            if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
+            {
+                std::string size = std::string(_current_token.text());
+                advance(); // consume the number
+                base_type += "[" + size + "]";
+            }
+            else
+            {
+                // Dynamic array []
+                base_type += "[]";
+            }
+
             consume(TokenKind::TK_R_SQUARE, "Expected ']'");
-            base_type += "[]";
         }
 
         // Handle pointer types (type *)
@@ -2908,7 +2921,7 @@ namespace Cryo
             return expr;
         }
 
-        // Parenthesized expressions or void literal ()
+        // Parenthesized expressions, tuple literals, or void literal ()
         if (_current_token.is(TokenKind::TK_L_PAREN))
         {
             SourceLocation paren_loc = _current_token.location();
@@ -2923,8 +2936,39 @@ namespace Cryo
                 return _builder.create_literal_node(void_token);
             }
 
-            auto expr = parse_expression();
+            // Parse first expression
+            auto first_expr = parse_expression();
+
+            // Check if this is a tuple (has comma) or just a parenthesized expression
+            if (_current_token.is(TokenKind::TK_COMMA))
+            {
+                // This is a tuple literal
+                auto tuple = _builder.create_tuple_literal(paren_loc);
+                tuple->add_element(std::move(first_expr));
+
+                // Parse remaining elements
+                while (_current_token.is(TokenKind::TK_COMMA))
+                {
+                    advance(); // consume ','
+
+                    // Handle trailing comma before )
+                    if (_current_token.is(TokenKind::TK_R_PAREN))
+                    {
+                        break;
+                    }
+
+                    auto element = parse_expression();
+                    tuple->add_element(std::move(element));
+                }
+
+                consume(TokenKind::TK_R_PAREN, "Expected ')' after tuple elements");
+                return tuple;
+            }
+
+            // Just a parenthesized expression
             consume(TokenKind::TK_R_PAREN, "Expected ')' after expression");
+
+            std::unique_ptr<ExpressionNode> expr = std::move(first_expr);
 
             // Handle postfix expressions after parentheses (like (*ptr).method())
             while (true)
@@ -6579,6 +6623,79 @@ namespace Cryo
             LOG_DEBUG(LogComponent::PARSER, "Parser detected generic type syntax: '{}' - deferring to type resolution", type_str);
             // Return an error type with the type string - TypeResolver will handle it
             return _context.types().create_error("unresolved generic: " + type_str, SourceLocation{});
+        }
+
+        // For tuple types (e.g., "(i32, i32)", "(string, i64)"), parse properly
+        // Tuple types start with '(' and don't contain '->' (which would make it a function type)
+        if (!type_str.empty() && type_str[0] == '(' && type_str.back() == ')' && type_str.find("->") == std::string::npos)
+        {
+            LOG_DEBUG(LogComponent::PARSER, "Parser parsing tuple type syntax: '{}'", type_str);
+
+            // Extract the content inside parentheses
+            std::string inner = type_str.substr(1, type_str.size() - 2);
+
+            // If inner is empty, this is unit/void type ()
+            if (inner.empty())
+            {
+                return _context.types().get_void();
+            }
+
+            // Parse comma-separated types
+            std::vector<TypeRef> element_types;
+            size_t start = 0;
+            int paren_depth = 0;
+            int angle_depth = 0;
+
+            for (size_t i = 0; i <= inner.size(); ++i)
+            {
+                if (i < inner.size())
+                {
+                    char c = inner[i];
+                    if (c == '(')
+                        paren_depth++;
+                    else if (c == ')')
+                        paren_depth--;
+                    else if (c == '<')
+                        angle_depth++;
+                    else if (c == '>')
+                        angle_depth--;
+                }
+
+                // Split on comma only when not inside nested parens or angle brackets
+                if (i == inner.size() || (inner[i] == ',' && paren_depth == 0 && angle_depth == 0))
+                {
+                    std::string elem_str = inner.substr(start, i - start);
+                    // Trim whitespace
+                    size_t elem_start = elem_str.find_first_not_of(" \t");
+                    size_t elem_end = elem_str.find_last_not_of(" \t");
+                    if (elem_start != std::string::npos)
+                    {
+                        elem_str = elem_str.substr(elem_start, elem_end - elem_start + 1);
+                    }
+
+                    if (!elem_str.empty())
+                    {
+                        TypeRef elem_type = resolve_type_from_string(elem_str);
+                        if (!elem_type.is_valid() || elem_type.is_error())
+                        {
+                            LOG_DEBUG(LogComponent::PARSER, "Failed to resolve tuple element type: '{}'", elem_str);
+                            return _context.types().create_error("unresolved tuple element: " + elem_str, SourceLocation{});
+                        }
+                        element_types.push_back(elem_type);
+                    }
+
+                    start = i + 1;
+                }
+            }
+
+            // If only one element and no trailing comma, treat as parenthesized type
+            if (element_types.size() == 1)
+            {
+                return element_types[0];
+            }
+
+            // Create tuple type
+            return _context.types().get_tuple(element_types);
         }
 
         // For function types (e.g., "()->R", "(T)->U", "(A,B)->R"), parse properly

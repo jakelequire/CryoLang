@@ -143,6 +143,13 @@ namespace Cryo::Codegen
         llvm::Value *generate_array_literal(Cryo::ArrayLiteralNode *node);
 
         /**
+         * @brief Generate tuple literal
+         * @param node Tuple literal node
+         * @return Generated tuple value (as struct)
+         */
+        llvm::Value *generate_tuple_literal(Cryo::TupleLiteralNode *node);
+
+        /**
          * @brief Generate Array<T> constructor call for array literals
          * @param node Array literal node
          * @param elements Array elements

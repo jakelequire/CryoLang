@@ -63,6 +63,7 @@ namespace Cryo
         std::unique_ptr<CastExpressionNode> create_cast_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> expression, std::unique_ptr<TypeAnnotation> target_type_annotation);
         std::unique_ptr<StructLiteralNode> create_struct_literal(SourceLocation loc, std::string struct_type);
         std::unique_ptr<ArrayLiteralNode> create_array_literal(SourceLocation loc);
+        std::unique_ptr<TupleLiteralNode> create_tuple_literal(SourceLocation loc);
         std::unique_ptr<ArrayAccessNode> create_array_access(SourceLocation loc, std::unique_ptr<ExpressionNode> array, std::unique_ptr<ExpressionNode> index);
         std::unique_ptr<MemberAccessNode> create_member_access(SourceLocation loc, std::unique_ptr<ExpressionNode> object, std::string member);
         std::unique_ptr<ScopeResolutionNode> create_scope_resolution(SourceLocation loc, std::string scope_name, std::string member_name);

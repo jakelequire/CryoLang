@@ -2536,6 +2536,59 @@ namespace Cryo::Codegen
         }
     }
 
+    llvm::Value *ExpressionCodegen::generate_tuple_literal(Cryo::TupleLiteralNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Null tuple literal node");
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating tuple literal with {} elements",
+                  node->size());
+
+        const auto &elements = node->elements();
+        if (elements.empty())
+        {
+            // Empty tuple - return void/unit value
+            return llvm::Constant::getNullValue(llvm::Type::getInt8Ty(llvm_ctx()));
+        }
+
+        // Generate each element and collect their types
+        std::vector<llvm::Value *> element_values;
+        std::vector<llvm::Type *> element_types;
+
+        for (size_t i = 0; i < elements.size(); ++i)
+        {
+            llvm::Value *elem_val = generate(elements[i].get());
+            if (!elem_val)
+            {
+                report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
+                             "Failed to generate tuple element at index " + std::to_string(i));
+                return nullptr;
+            }
+            element_values.push_back(elem_val);
+            element_types.push_back(elem_val->getType());
+        }
+
+        // Create an anonymous struct type for this tuple
+        llvm::StructType *tuple_type = llvm::StructType::get(llvm_ctx(), element_types, true);
+
+        // Allocate the tuple on the stack
+        llvm::AllocaInst *tuple_alloca = create_entry_alloca(tuple_type, "tuple.literal");
+
+        // Store each element
+        for (size_t i = 0; i < element_values.size(); ++i)
+        {
+            llvm::Value *elem_ptr = builder().CreateStructGEP(tuple_type, tuple_alloca, i,
+                                                              "tuple.elem." + std::to_string(i) + ".ptr");
+            builder().CreateStore(element_values[i], elem_ptr);
+        }
+
+        // Load and return the tuple value
+        return create_load(tuple_alloca, tuple_type, "tuple.value");
+    }
+
     llvm::Value *ExpressionCodegen::generate_struct_literal(Cryo::StructLiteralNode *node)
     {
         if (!node)
