@@ -213,6 +213,13 @@ namespace Cryo
         return node;
     }
 
+    std::unique_ptr<LambdaExpressionNode> ASTBuilder::create_lambda_expression(SourceLocation loc)
+    {
+        auto node = std::make_unique<LambdaExpressionNode>(loc);
+        node->set_source_file(_source_file);
+        return node;
+    }
+
     std::unique_ptr<ArrayAccessNode> ASTBuilder::create_array_access(SourceLocation loc, std::unique_ptr<ExpressionNode> array, std::unique_ptr<ExpressionNode> index)
     {
         auto node = std::make_unique<ArrayAccessNode>(loc, std::move(array), std::move(index));

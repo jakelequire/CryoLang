@@ -2589,6 +2589,124 @@ namespace Cryo::Codegen
         return create_load(tuple_alloca, tuple_type, "tuple.value");
     }
 
+    llvm::Value *ExpressionCodegen::generate_lambda(Cryo::LambdaExpressionNode *node)
+    {
+        if (!node)
+        {
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Null lambda expression node");
+            return nullptr;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating lambda expression");
+
+        // Build parameter types
+        std::vector<llvm::Type *> param_types;
+        for (const auto &[name, param_type] : node->parameters())
+        {
+            if (param_type)
+            {
+                llvm::Type *llvm_param_type = get_llvm_type(param_type);
+                if (llvm_param_type)
+                {
+                    param_types.push_back(llvm_param_type);
+                }
+                else
+                {
+                    // Default to pointer type
+                    param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+                }
+            }
+            else
+            {
+                // No type - default to pointer
+                param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+            }
+        }
+
+        // Build return type
+        llvm::Type *return_type = llvm::Type::getVoidTy(llvm_ctx());
+        TypeRef ret_type = node->return_type();
+        if (ret_type)
+        {
+            llvm::Type *llvm_ret_type = get_llvm_type(ret_type);
+            if (llvm_ret_type)
+            {
+                return_type = llvm_ret_type;
+            }
+        }
+
+        // Create function type
+        llvm::FunctionType *func_type = llvm::FunctionType::get(return_type, param_types, false);
+
+        // Generate unique name for the lambda
+        static int lambda_counter = 0;
+        std::string lambda_name = "__lambda_" + std::to_string(lambda_counter++);
+
+        // Create the lambda function
+        llvm::Function *lambda_func = llvm::Function::Create(
+            func_type,
+            llvm::Function::InternalLinkage,
+            lambda_name,
+            module());
+
+        // Save current insertion point
+        llvm::BasicBlock *saved_block = builder().GetInsertBlock();
+        llvm::BasicBlock::iterator saved_point = builder().GetInsertPoint();
+
+        // Create entry block for lambda
+        llvm::BasicBlock *entry_block = llvm::BasicBlock::Create(llvm_ctx(), "entry", lambda_func);
+        builder().SetInsertPoint(entry_block);
+
+        // Create allocas for parameters and bind them
+        size_t param_idx = 0;
+        for (auto &arg : lambda_func->args())
+        {
+            if (param_idx < node->parameters().size())
+            {
+                const auto &[name, param_type] = node->parameters()[param_idx];
+                arg.setName(name);
+
+                // Create alloca for parameter
+                llvm::AllocaInst *param_alloca = create_entry_alloca(lambda_func, arg.getType(), name);
+                builder().CreateStore(&arg, param_alloca);
+
+                // Register in value context
+                values().set_value(name, param_alloca, param_alloca, arg.getType());
+            }
+            param_idx++;
+        }
+
+        // Generate lambda body
+        if (node->body())
+        {
+            Cryo::Codegen::CodegenVisitor *visitor = ctx().visitor();
+            node->body()->accept(*visitor);
+        }
+
+        // Add terminator if needed
+        if (!builder().GetInsertBlock()->getTerminator())
+        {
+            if (return_type->isVoidTy())
+            {
+                builder().CreateRetVoid();
+            }
+            else
+            {
+                // Return default value
+                builder().CreateRet(llvm::Constant::getNullValue(return_type));
+            }
+        }
+
+        // Restore insertion point
+        if (saved_block)
+        {
+            builder().SetInsertPoint(saved_block, saved_point);
+        }
+
+        // Return pointer to the lambda function
+        return lambda_func;
+    }
+
     llvm::Value *ExpressionCodegen::generate_struct_literal(Cryo::StructLiteralNode *node)
     {
         if (!node)

@@ -210,6 +210,7 @@ namespace Cryo
         std::unique_ptr<ExpressionNode> parse_alignof_expression();
         std::unique_ptr<ExpressionNode> parse_array_access(std::unique_ptr<ExpressionNode> expr);
         std::unique_ptr<ExpressionNode> parse_member_access(std::unique_ptr<ExpressionNode> expr);
+        std::unique_ptr<ExpressionNode> parse_lambda_body(SourceLocation loc, std::vector<std::pair<std::string, TypeRef>> params);
 
         // Literal parsing
         std::unique_ptr<LiteralNode> parse_number_literal();

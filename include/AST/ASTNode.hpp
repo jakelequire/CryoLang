@@ -160,6 +160,7 @@ namespace Cryo
         StructLiteral,
         ArrayLiteral,
         TupleLiteral,
+        LambdaExpression,
         ArrayAccess,
         MemberAccess,
         ScopeResolution,
@@ -249,6 +250,8 @@ namespace Cryo
             return "ArrayLiteral";
         case NodeKind::TupleLiteral:
             return "TupleLiteral";
+        case NodeKind::LambdaExpression:
+            return "LambdaExpression";
         case NodeKind::ArrayAccess:
             return "ArrayAccess";
         case NodeKind::MemberAccess:
@@ -2220,6 +2223,64 @@ namespace Cryo
             {
                 if (element)
                     element->print(os, indent + 2);
+            }
+        }
+
+        void accept(ASTVisitor &visitor) override;
+    };
+
+    // Lambda/anonymous function expression - () -> T { body }
+    class LambdaExpressionNode : public ExpressionNode
+    {
+    private:
+        std::vector<std::pair<std::string, TypeRef>> _parameters;
+        TypeRef _return_type;
+        std::unique_ptr<StatementNode> _body;
+
+    public:
+        LambdaExpressionNode(SourceLocation loc)
+            : ExpressionNode(NodeKind::LambdaExpression, loc) {}
+
+        void add_parameter(const std::string &name, TypeRef type)
+        {
+            _parameters.push_back({name, type});
+        }
+
+        void set_return_type(TypeRef type)
+        {
+            _return_type = type;
+        }
+
+        void set_body(std::unique_ptr<StatementNode> body)
+        {
+            _body = std::move(body);
+        }
+
+        const std::vector<std::pair<std::string, TypeRef>> &parameters() const
+        {
+            return _parameters;
+        }
+
+        TypeRef return_type() const { return _return_type; }
+        StatementNode *body() const { return _body.get(); }
+
+        void print(std::ostream &os, int indent = 0) const override
+        {
+            os << std::string(indent, ' ') << "LambdaExpression:" << std::endl;
+            os << std::string(indent + 2, ' ') << "Parameters: " << _parameters.size() << std::endl;
+            for (const auto &[name, type] : _parameters)
+            {
+                os << std::string(indent + 4, ' ') << name;
+                if (type)
+                    os << ": " << type->display_name();
+                os << std::endl;
+            }
+            if (_return_type)
+                os << std::string(indent + 2, ' ') << "Returns: " << _return_type->display_name() << std::endl;
+            if (_body)
+            {
+                os << std::string(indent + 2, ' ') << "Body:" << std::endl;
+                _body->print(os, indent + 4);
             }
         }
 
