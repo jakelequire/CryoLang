@@ -956,7 +956,9 @@ namespace Cryo
         _codegen.reset();
 
         _ast_root.reset();
-        if (_diagnostics)
+        // Don't clear diagnostics during stdlib compilation - we want to accumulate
+        // errors from all modules so they can be reported together at the end
+        if (_diagnostics && !_stdlib_compilation_mode)
         {
             _diagnostics->clear();
         }

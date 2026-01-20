@@ -238,13 +238,75 @@ namespace Cryo
             // Handle implement blocks
             if (auto *impl = dynamic_cast<ImplementationBlockNode *>(stmt.get()))
             {
+                // Create a child context for this implement block
+                ResolutionContext impl_ctx = res_ctx.child();
+
+                // Parse target type to extract generic parameters (e.g., "Option<T>" -> ["T"])
+                const std::string &target = impl->target_type();
+                size_t angle_pos = target.find('<');
+                if (angle_pos != std::string::npos && target.back() == '>')
+                {
+                    std::string params_str = target.substr(angle_pos + 1, target.size() - angle_pos - 2);
+                    // Split by comma
+                    std::vector<std::string> param_names;
+                    size_t start = 0;
+                    for (size_t i = 0; i <= params_str.size(); ++i)
+                    {
+                        if (i == params_str.size() || params_str[i] == ',')
+                        {
+                            std::string param = params_str.substr(start, i - start);
+                            // Trim whitespace
+                            while (!param.empty() && (param.front() == ' ' || param.front() == '\t'))
+                                param.erase(0, 1);
+                            while (!param.empty() && (param.back() == ' ' || param.back() == '\t'))
+                                param.pop_back();
+                            if (!param.empty())
+                                param_names.push_back(param);
+                            start = i + 1;
+                        }
+                    }
+
+                    // Bind each generic parameter
+                    for (size_t i = 0; i < param_names.size(); ++i)
+                    {
+                        TypeRef param_type = arena.create_generic_param(param_names[i], i);
+                        impl_ctx.bind_generic(param_names[i], param_type);
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Bound generic param '{}' (index {}) for impl block '{}'",
+                            param_names[i], i, target);
+                    }
+                }
+
                 for (auto &method : impl->method_implementations())
                 {
+                    // Create a method-level context that inherits impl's generic params
+                    // and adds the method's own generic params (if any)
+                    ResolutionContext method_ctx = impl_ctx.child();
+
+                    // Bind method-level generic parameters
+                    const auto &method_generic_params = method->generic_parameters();
+                    size_t impl_param_count = 0; // Count how many params impl_ctx has
+                    for (const auto &[name, _] : impl_ctx.generic_bindings)
+                        impl_param_count++;
+
+                    if (!method_generic_params.empty())
+                    {
+                        for (size_t i = 0; i < method_generic_params.size(); ++i)
+                        {
+                            const std::string &param_name = method_generic_params[i]->name();
+                            TypeRef param_type = arena.create_generic_param(param_name, impl_param_count + i);
+                            method_ctx.bind_generic(param_name, param_type);
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                "TypeResolutionPass: Bound impl method generic param '{}' (index {}) for '{}::{}'",
+                                param_name, impl_param_count + i, target, method->name());
+                        }
+                    }
+
                     // Resolve return type
                     auto *ann = method->return_type_annotation();
                     if (ann && method->get_resolved_return_type().is_error())
                     {
-                        TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                        TypeRef resolved = resolver.resolve(*ann, method_ctx);
                         if (!resolved.is_error())
                         {
                             method->set_resolved_return_type(resolved);
@@ -268,7 +330,7 @@ namespace Cryo
                         const auto *param_ann = param->type_annotation();
                         if (param_ann && (!param->has_resolved_type() || param->get_resolved_type().is_error()))
                         {
-                            TypeRef resolved = resolver.resolve(*param_ann, res_ctx);
+                            TypeRef resolved = resolver.resolve(*param_ann, method_ctx);
                             if (!resolved.is_error())
                             {
                                 param->set_resolved_type(resolved);
@@ -284,8 +346,65 @@ namespace Cryo
             // Handle struct declarations (with methods)
             else if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(stmt.get()))
             {
+                // Create a child context for this struct
+                ResolutionContext struct_ctx = res_ctx.child();
+
+                // If the struct is generic, bind its type parameters
+                const auto &struct_generic_params = struct_decl->generic_parameters();
+                if (!struct_generic_params.empty())
+                {
+                    for (size_t i = 0; i < struct_generic_params.size(); ++i)
+                    {
+                        const std::string &param_name = struct_generic_params[i]->name();
+                        // Create a GenericParamType for this parameter
+                        TypeRef param_type = arena.create_generic_param(param_name, i);
+                        struct_ctx.bind_generic(param_name, param_type);
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Bound generic param '{}' (index {}) for struct '{}'",
+                            param_name, i, struct_decl->name());
+                    }
+                }
+
+                // Try to get the struct's own type for self-referential resolution
+                // The struct should already be registered in the symbol table from the declaration pass
+                auto *symbols = _compiler.symbol_table();
+                if (symbols)
+                {
+                    TypeRef struct_type = symbols->lookup_struct_type(struct_decl->name());
+                    if (struct_type.is_valid())
+                    {
+                        // Temporarily register the struct type in the module registry so it can be found
+                        // during method return type resolution (for self-referential types)
+                        module_registry.register_type(struct_ctx.current_module, struct_decl->name(), struct_type);
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Registered struct '{}' in module registry for self-reference",
+                            struct_decl->name());
+                    }
+                }
+
                 for (auto &method : struct_decl->methods())
                 {
+                    // Create a method-level context that inherits struct's generic params
+                    // and adds the method's own generic params (if any)
+                    ResolutionContext method_ctx = struct_ctx.child();
+
+                    // Bind method-level generic parameters (e.g., alloc<T>())
+                    const auto &method_generic_params = method->generic_parameters();
+                    if (!method_generic_params.empty())
+                    {
+                        // Start index after struct's generic params to avoid collision
+                        size_t base_index = struct_generic_params.size();
+                        for (size_t i = 0; i < method_generic_params.size(); ++i)
+                        {
+                            const std::string &param_name = method_generic_params[i]->name();
+                            TypeRef param_type = arena.create_generic_param(param_name, base_index + i);
+                            method_ctx.bind_generic(param_name, param_type);
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                "TypeResolutionPass: Bound method generic param '{}' (index {}) for '{}::{}'",
+                                param_name, base_index + i, struct_decl->name(), method->name());
+                        }
+                    }
+
                     // Resolve return type
                     auto *ann = method->return_type_annotation();
                     if (ann && method->get_resolved_return_type().is_error())
@@ -293,7 +412,7 @@ namespace Cryo
                         LOG_DEBUG(LogComponent::GENERAL,
                             "TypeResolutionPass: Attempting to resolve '{}::{}' annotation='{}' kind={}",
                             struct_decl->name(), method->name(), ann->to_string(), static_cast<int>(ann->kind));
-                        TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                        TypeRef resolved = resolver.resolve(*ann, method_ctx);
                         if (!resolved.is_error())
                         {
                             method->set_resolved_return_type(resolved);
@@ -317,7 +436,7 @@ namespace Cryo
                         const auto *param_ann = param->type_annotation();
                         if (param_ann && (!param->has_resolved_type() || param->get_resolved_type().is_error()))
                         {
-                            TypeRef resolved = resolver.resolve(*param_ann, res_ctx);
+                            TypeRef resolved = resolver.resolve(*param_ann, method_ctx);
                             if (!resolved.is_error())
                             {
                                 param->set_resolved_type(resolved);
@@ -346,7 +465,7 @@ namespace Cryo
                         LOG_DEBUG(LogComponent::GENERAL,
                             "TypeResolutionPass: Attempting to resolve field '{}::{}' annotation='{}' kind={}",
                             struct_decl->name(), field->name(), ann->to_string(), static_cast<int>(ann->kind));
-                        TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                        TypeRef resolved = resolver.resolve(*ann, struct_ctx);
                         if (!resolved.is_error())
                         {
                             field->set_resolved_type(resolved);
@@ -368,11 +487,30 @@ namespace Cryo
             // Handle function declarations
             else if (auto *func = dynamic_cast<FunctionDeclarationNode *>(stmt.get()))
             {
+                // Create a child context for this function
+                ResolutionContext func_ctx = res_ctx.child();
+
+                // If the function is generic, bind its type parameters
+                const auto &generic_params = func->generic_parameters();
+                if (!generic_params.empty())
+                {
+                    for (size_t i = 0; i < generic_params.size(); ++i)
+                    {
+                        const std::string &param_name = generic_params[i]->name();
+                        // Create a GenericParamType for this parameter
+                        TypeRef param_type = arena.create_generic_param(param_name, i);
+                        func_ctx.bind_generic(param_name, param_type);
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Bound generic param '{}' (index {}) for function '{}'",
+                            param_name, i, func->name());
+                    }
+                }
+
                 // Resolve return type
                 auto *ann = func->return_type_annotation();
                 if (ann && func->get_resolved_return_type().is_error())
                 {
-                    TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                    TypeRef resolved = resolver.resolve(*ann, func_ctx);
                     if (!resolved.is_error())
                     {
                         func->set_resolved_return_type(resolved);
@@ -393,7 +531,7 @@ namespace Cryo
                     const auto *param_ann = param->type_annotation();
                     if (param_ann && (!param->has_resolved_type() || param->get_resolved_type().is_error()))
                     {
-                        TypeRef resolved = resolver.resolve(*param_ann, res_ctx);
+                        TypeRef resolved = resolver.resolve(*param_ann, func_ctx);
                         if (!resolved.is_error())
                         {
                             param->set_resolved_type(resolved);

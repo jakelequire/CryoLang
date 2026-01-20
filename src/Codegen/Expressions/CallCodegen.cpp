@@ -952,6 +952,63 @@ namespace Cryo::Codegen
 
         // Look up the enum type to check if it exists
         llvm::Type *enum_type = ctx().get_type(enum_name);
+
+        // For cross-module enum variant calls with payloads, create an extern declaration
+        // This handles cases where the enum is defined in another module
+        if (!args.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_enum_variant: Creating extern declaration for '{}' with {} args",
+                      qualified_variant, args.size());
+
+            // Build parameter types from the arguments
+            std::vector<llvm::Type *> param_types;
+            for (auto *arg : args)
+            {
+                param_types.push_back(arg->getType());
+            }
+
+            // If we don't have the enum type, create a simple tagged union placeholder
+            // The actual type will be resolved at link time
+            if (!enum_type)
+            {
+                // For Option/Result, create a standard tagged union: { i32, [payload_size x i8] }
+                size_t max_payload = 0;
+                for (auto *pt : param_types)
+                {
+                    if (pt->isSized())
+                    {
+                        size_t sz = module()->getDataLayout().getTypeAllocSize(pt);
+                        max_payload = std::max(max_payload, sz);
+                    }
+                }
+                max_payload = std::max(max_payload, static_cast<size_t>(8)); // Minimum 8 bytes
+
+                // Create tagged union: { i32 discriminant, [max_payload x i8] payload }
+                llvm::Type *disc_type = llvm::Type::getInt32Ty(llvm_ctx());
+                llvm::Type *payload_type = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload);
+                std::string struct_name = enum_name + "_placeholder";
+                enum_type = llvm::StructType::create(llvm_ctx(), {disc_type, payload_type}, struct_name);
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_enum_variant: Created placeholder type '{}' with payload size {}",
+                          struct_name, max_payload);
+            }
+
+            // Create function type: (...payload_types) -> enum_type
+            llvm::FunctionType *ctor_type = llvm::FunctionType::get(enum_type, param_types, false);
+
+            // Create extern declaration
+            llvm::Function *extern_ctor = llvm::Function::Create(
+                ctor_type, llvm::Function::ExternalLinkage, qualified_variant, module());
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_enum_variant: Created extern declaration for '{}'", qualified_variant);
+
+            return builder().CreateCall(extern_ctor, args, variant_name);
+        }
+
+        // For simple enum variants (no args), we need the type to exist
         if (!enum_type)
         {
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
