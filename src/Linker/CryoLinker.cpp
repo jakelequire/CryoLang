@@ -470,23 +470,12 @@ namespace Cryo::Linker
         if (global_ctors_before)
         {
             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Before PassManager run: @llvm.global_ctors found");
-
-            // Mark the global constructor array as used to prevent optimization removal
-            global_ctors_before->setLinkage(llvm::GlobalValue::ExternalLinkage);
-
-            // Also try to mark any global constructor functions as used
-            for (auto &func : module->getFunctionList())
-            {
-                if (func.getName().contains("cryo_global_constructors"))
-                {
-                    func.setLinkage(llvm::GlobalValue::ExternalLinkage);
-                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Marked function {} as external linkage", func.getName().str());
-                }
-            }
+            // Note: Do NOT change the linkage of @llvm.global_ctors - it must remain
+            // AppendingLinkage for LLVM to properly emit it
         }
         else
         {
-            LOG_ERROR(Cryo::LogComponent::GENERAL, "Before PassManager run: @llvm.global_ctors NOT found!");
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Before PassManager run: @llvm.global_ctors NOT found (this is OK if no global constructors)");
         }
 
         pass.run(*module);

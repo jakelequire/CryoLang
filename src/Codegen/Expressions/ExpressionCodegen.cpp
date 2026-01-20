@@ -395,6 +395,29 @@ namespace Cryo::Codegen
         std::string name = node->name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating identifier: {}", name);
 
+        // Handle built-in pseudo-macros FILE and LINE
+        if (name == "FILE")
+        {
+            // Return the current source file as a string constant
+            std::string filename = module()->getSourceFileName();
+            if (filename.empty())
+            {
+                filename = "<unknown>";
+            }
+            return builder().CreateGlobalStringPtr(filename, "FILE.str");
+        }
+        else if (name == "LINE")
+        {
+            // Return the current line number
+            // Get line number from the node's location if available
+            int line = 0;
+            if (node->location().line() > 0)
+            {
+                line = node->location().line();
+            }
+            return llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), line);
+        }
+
         llvm::Value *value = lookup_variable(name);
         if (!value)
         {
@@ -2235,6 +2258,89 @@ namespace Cryo::Codegen
                               var_name, obj_type->display_name());
                 }
             }
+            // Fallback: If object is a MemberAccessNode, recursively resolve its type
+            else if (auto *member_access = dynamic_cast<Cryo::MemberAccessNode *>(object))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_member_info: Object is MemberAccessNode, resolving nested member '{}'",
+                          member_access->member());
+
+                // Recursively resolve the outer object's type
+                llvm::StructType *outer_struct = nullptr;
+                unsigned outer_field_idx = 0;
+                if (resolve_member_info(member_access->object(), member_access->member(), outer_struct, outer_field_idx))
+                {
+                    // Get the outer object type to look up field types in TemplateRegistry
+                    TypeRef outer_obj_type = member_access->object()->get_resolved_type();
+                    std::string outer_type_name;
+
+                    // Try to get the outer type name
+                    if (outer_obj_type)
+                    {
+                        outer_type_name = outer_obj_type->display_name();
+                        if (outer_obj_type->kind() == Cryo::TypeKind::Pointer)
+                        {
+                            auto *ptr = dynamic_cast<const Cryo::PointerType *>(outer_obj_type.get());
+                            if (ptr && ptr->pointee())
+                            {
+                                outer_type_name = ptr->pointee()->display_name();
+                            }
+                        }
+                        else if (!outer_type_name.empty() && outer_type_name.back() == '*')
+                        {
+                            outer_type_name.pop_back();
+                        }
+                    }
+                    else if (auto *id = dynamic_cast<Cryo::IdentifierNode *>(member_access->object()))
+                    {
+                        auto &var_types = ctx().variable_types_map();
+                        auto it = var_types.find(id->name());
+                        if (it != var_types.end() && it->second.is_valid())
+                        {
+                            outer_type_name = it->second->display_name();
+                            if (it->second->kind() == Cryo::TypeKind::Pointer)
+                            {
+                                auto *ptr = dynamic_cast<const Cryo::PointerType *>(it->second.get());
+                                if (ptr && ptr->pointee())
+                                {
+                                    outer_type_name = ptr->pointee()->display_name();
+                                }
+                            }
+                            else if (!outer_type_name.empty() && outer_type_name.back() == '*')
+                            {
+                                outer_type_name.pop_back();
+                            }
+                        }
+                    }
+
+                    // Look up the field type from TemplateRegistry
+                    if (!outer_type_name.empty())
+                    {
+                        if (auto *template_reg = ctx().template_registry())
+                        {
+                            // Try various name candidates
+                            std::vector<std::string> candidates = {outer_type_name};
+                            if (!ctx().namespace_context().empty())
+                            {
+                                candidates.push_back(ctx().namespace_context() + "::" + outer_type_name);
+                            }
+
+                            for (const auto &candidate : candidates)
+                            {
+                                const auto *field_info = template_reg->get_struct_field_types(candidate);
+                                if (field_info && outer_field_idx < field_info->field_types.size())
+                                {
+                                    obj_type = field_info->field_types[outer_field_idx];
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_member_info: Resolved nested member '{}' type to '{}' via TemplateRegistry",
+                                              member_access->member(), obj_type ? obj_type->display_name() : "<null>");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             if (!obj_type)
             {
@@ -2296,9 +2402,36 @@ namespace Cryo::Codegen
             {
                 // Try various name candidates (qualified and unqualified)
                 std::vector<std::string> candidates = {type_name};
+
+                // Add LLVM struct type name as a candidate
+                if (out_struct_type && out_struct_type->hasName())
+                {
+                    std::string llvm_name = out_struct_type->getName().str();
+                    if (llvm_name != type_name)
+                    {
+                        candidates.push_back(llvm_name);
+                    }
+                }
+
+                // Add current namespace prefix
                 if (!ctx().namespace_context().empty())
                 {
                     candidates.push_back(ctx().namespace_context() + "::" + type_name);
+                }
+
+                // Try type_namespace_map for the registered namespace
+                std::string type_ns = ctx().get_type_namespace(type_name);
+                if (!type_ns.empty())
+                {
+                    candidates.push_back(type_ns + "::" + type_name);
+                }
+
+                // Also try unqualified name if type_name looks qualified
+                size_t last_colon = type_name.rfind("::");
+                if (last_colon != std::string::npos)
+                {
+                    std::string simple_name = type_name.substr(last_colon + 2);
+                    candidates.push_back(simple_name);
                 }
 
                 for (const auto &candidate : candidates)
@@ -3110,18 +3243,64 @@ namespace Cryo::Codegen
 
             if (ctor_fn)
             {
-                std::vector<llvm::Value *> ctor_args;
-                ctor_args.push_back(ptr); // 'this' pointer
+                llvm::FunctionType *fn_type = ctor_fn->getFunctionType();
 
-                // Generate constructor arguments
-                for (const auto &arg : node->arguments())
+                // Check if this is a static factory method (returns struct type, not void)
+                // vs a regular constructor (returns void, first param is pointer for 'this')
+                bool is_static_factory = !fn_type->getReturnType()->isVoidTy() &&
+                                         fn_type->getReturnType()->isStructTy();
+
+                if (is_static_factory)
                 {
-                    llvm::Value *arg_val = generate(arg.get());
-                    if (arg_val)
-                        ctor_args.push_back(arg_val);
-                }
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_new: '{}' is a static factory method, calling without 'this'",
+                              ctor_fn->getName().str());
 
-                builder().CreateCall(ctor_fn, ctor_args);
+                    // Static factory method - call without 'this' pointer
+                    std::vector<llvm::Value *> factory_args;
+                    for (const auto &arg : node->arguments())
+                    {
+                        llvm::Value *arg_val = generate(arg.get());
+                        if (arg_val)
+                            factory_args.push_back(arg_val);
+                    }
+
+                    // Coerce arguments to match function signature
+                    std::vector<llvm::Value *> coerced_args;
+                    for (size_t i = 0; i < factory_args.size() && i < fn_type->getNumParams(); ++i)
+                    {
+                        llvm::Value *arg = factory_args[i];
+                        llvm::Type *param_type = fn_type->getParamType(i);
+                        if (arg->getType() != param_type)
+                        {
+                            if (arg->getType()->isIntegerTy() && param_type->isIntegerTy())
+                            {
+                                arg = builder().CreateIntCast(arg, param_type, true, "arg.cast");
+                            }
+                        }
+                        coerced_args.push_back(arg);
+                    }
+
+                    // Call the factory and store result in allocated memory
+                    llvm::Value *result = builder().CreateCall(ctor_fn, coerced_args, "factory.result");
+                    builder().CreateStore(result, ptr);
+                }
+                else
+                {
+                    // Regular constructor - call with 'this' pointer
+                    std::vector<llvm::Value *> ctor_args;
+                    ctor_args.push_back(ptr); // 'this' pointer
+
+                    // Generate constructor arguments
+                    for (const auto &arg : node->arguments())
+                    {
+                        llvm::Value *arg_val = generate(arg.get());
+                        if (arg_val)
+                            ctor_args.push_back(arg_val);
+                    }
+
+                    builder().CreateCall(ctor_fn, ctor_args);
+                }
             }
             else
             {
