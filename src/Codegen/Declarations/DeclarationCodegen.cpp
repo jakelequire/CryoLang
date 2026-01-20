@@ -541,6 +541,9 @@ namespace Cryo::Codegen
                           "DeclarationCodegen: TRACE annotation already exists for '{}': '{}'",
                           llvm_fn_name, existing_annotation);
             }
+
+            // Register is_static flag for cross-module extern declarations
+            template_registry->register_method_is_static(llvm_fn_name, is_static);
         }
 
         // Check if already declared (check both names to handle existing declarations)

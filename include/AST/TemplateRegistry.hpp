@@ -111,6 +111,10 @@ namespace Cryo
         // Used for cross-module extern declarations when TypeRef resolution fails
         std::unordered_map<std::string, std::string> _method_return_type_annotations;
 
+        // Method static flags: qualified method name -> is_static
+        // Used for cross-module extern declarations to know whether to add 'this' parameter
+        std::unordered_map<std::string, bool> _method_is_static;
+
     public:
         TemplateRegistry() = default;
         ~TemplateRegistry() = default;
@@ -229,6 +233,24 @@ namespace Cryo
          * @return true if registered
          */
         bool has_method_return_type_annotation(const std::string &qualified_method_name) const;
+
+        //===================================================================
+        // Method Static Flag Registry (for cross-module extern declarations)
+        //===================================================================
+
+        /**
+         * @brief Register whether a method is static
+         * @param qualified_method_name Fully qualified method name (e.g., "std::time::duration::Duration::zero")
+         * @param is_static true if the method is static (no 'this' parameter)
+         */
+        void register_method_is_static(const std::string &qualified_method_name, bool is_static);
+
+        /**
+         * @brief Get whether a method is static
+         * @param qualified_method_name Fully qualified method name
+         * @return Pair of (is_static, found). found is false if the method is not registered.
+         */
+        std::pair<bool, bool> get_method_is_static(const std::string &qualified_method_name) const;
 
         //===================================================================
         // Struct Field Types Registry (for cross-module struct definitions)

@@ -495,11 +495,24 @@ namespace Cryo::Codegen
                 // Get method signature from the template if possible
                 llvm::Type *return_type = nullptr;
                 std::vector<llvm::Type *> param_types;
+                bool is_static_method = false;
+                bool found_is_static = false;
 
-                // Add 'this' parameter (pointer to the type)
-                param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+                // First, try to look up is_static from the shared registry (works for all struct methods)
+                if (template_registry)
+                {
+                    auto [is_static, found] = template_registry->get_method_is_static(full_method_name);
+                    if (found)
+                    {
+                        is_static_method = is_static;
+                        found_is_static = true;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_method_by_name: Got is_static={} from registry for '{}'",
+                                  is_static_method, full_method_name);
+                    }
+                }
 
-                // Try to get return type from template methods
+                // Then, look up the method in the template to get its signature (for generic types)
                 // Use simple_type_name for template lookup (templates are stored by simple name)
                 if (template_registry)
                 {
@@ -510,6 +523,15 @@ namespace Cryo::Codegen
                         {
                             if (method->name() == method_name)
                             {
+                                // Check if method is static (only if not already found from registry)
+                                if (!found_is_static)
+                                {
+                                    is_static_method = method->is_static();
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_method_by_name: Found struct method '{}::{}' is_static={} (from template)",
+                                              simple_type_name, method_name, is_static_method);
+                                }
+
                                 TypeRef method_return = method->get_resolved_return_type();
                                 if (method_return)
                                 {
@@ -528,6 +550,15 @@ namespace Cryo::Codegen
                         {
                             if (method->name() == method_name)
                             {
+                                // Check if method is static (only if not already found from registry)
+                                if (!found_is_static)
+                                {
+                                    is_static_method = method->is_static();
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_method_by_name: Found class method '{}::{}' is_static={} (from template)",
+                                              simple_type_name, method_name, is_static_method);
+                                }
+
                                 TypeRef method_return = method->get_resolved_return_type();
                                 if (method_return)
                                 {
@@ -542,6 +573,19 @@ namespace Cryo::Codegen
                     }
                     // Note: EnumDeclarationNode doesn't have methods() - enum methods are in impl blocks
                     // which are stored separately. Check the method registry for return type.
+                }
+
+                // Only add 'this' parameter for non-static methods
+                if (!is_static_method)
+                {
+                    param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Added 'this' parameter for instance method '{}'", full_method_name);
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Skipping 'this' parameter for static method '{}'", full_method_name);
                 }
 
                 // Try to get return type from method registry (populated from impl blocks)

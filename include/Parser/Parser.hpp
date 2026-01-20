@@ -45,6 +45,7 @@ namespace Cryo
         std::string _current_parsing_type_name;    // Track current struct/class being parsed (for self-referential types)
         ModuleID _current_module_id;               // Current module ID for proper type qualification
         int _scope_depth = 0;                      // Track nesting depth (0 = global scope)
+        std::vector<std::string> _current_generic_params; // Track generic params of current type being parsed (e.g., T, U in struct Foo<T, U>)
 
         // Bracket depth tracking for improved error recovery
         int _brace_depth = 0;        // Track { } nesting

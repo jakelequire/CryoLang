@@ -2557,6 +2557,24 @@ namespace Cryo::Codegen
             return true;
         }
 
+        // Integer to float conversion (when one operand is float and the other is integer)
+        if (lhs_type->isFloatingPointTy() && rhs_type->isIntegerTy())
+        {
+            // Convert integer to float type
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ensure_compatible_types: Converting rhs integer to float");
+            rhs = builder().CreateSIToFP(rhs, lhs_type, "sitofp");
+            return true;
+        }
+        if (lhs_type->isIntegerTy() && rhs_type->isFloatingPointTy())
+        {
+            // Convert integer to float type
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ensure_compatible_types: Converting lhs integer to float");
+            lhs = builder().CreateSIToFP(lhs, rhs_type, "sitofp");
+            return true;
+        }
+
         // Pointer comparison (both should be pointers)
         if (lhs_type->isPointerTy() && rhs_type->isPointerTy())
         {
