@@ -343,27 +343,11 @@ namespace Cryo::Codegen
             }
         }
 
-        // Fallback for parameterized types (e.g., Option<i64>, Array<string>, Result<T, E>)
-        // Extract the base type name and try to resolve the method using that
-        size_t angle_pos = type_name.find('<');
-        if (angle_pos != std::string::npos)
-        {
-            std::string base_type_name = type_name.substr(0, angle_pos);
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "resolve_method_by_name: Trying parameterized type fallback with base type '{}'", base_type_name);
-
-            // Recursively try to resolve using the base type name
-            llvm::Function *fn = resolve_method_by_name(base_type_name, method_name);
-            if (fn)
-            {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "resolve_method_by_name: Found '{}.{}' via base type '{}'",
-                          type_name, method_name, base_type_name);
-                return fn;
-            }
-        }
-
         // Pattern-based method lookup: scan module for functions matching *::BaseType::method
+        // NOTE: We no longer recursively call resolve_method_by_name with the base type,
+        // as that would strip the type arguments (e.g., "String" from "Array<String>")
+        // and create extern declarations with wrong return types for generic methods.
+        // The pattern-based lookup below already handles the base type extraction.
         // This handles cross-module cases where we don't have the namespace info
         {
             std::string base_type = type_name;
@@ -607,19 +591,89 @@ namespace Cryo::Codegen
                                             }
                                         }
 
-                                        // Use pointer type as fallback when we have type arguments (even if some couldn't be resolved)
-                                        // This is safer than using void type which causes crashes
+                                        // Use annotation-based substitution when we have type arguments
                                         if (!arg_names.empty())
                                         {
-                                            // Substitute generic parameters in the return type
-                                            // Note: method_return might be an error type representing Option<T>
-                                            // We need to rebuild it with concrete types
-                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                      "resolve_method_by_name: Substituting {} type args in return type", type_args.size());
+                                            // Get the method's return type annotation string (e.g., "Option<T>")
+                                            std::string return_annotation;
+                                            if (method->return_type_annotation())
+                                            {
+                                                return_annotation = method->return_type_annotation()->to_string();
+                                            }
 
-                                            // For now, use ptr type as fallback for unresolved generics
-                                            // A proper fix would reconstruct the instantiated type
-                                            return_type = llvm::PointerType::get(llvm_ctx(), 0);
+                                            // Get the template's generic parameter names
+                                            std::vector<std::string> generic_param_names;
+                                            if (template_info && !template_info->metadata.generic_parameter_names.empty())
+                                            {
+                                                generic_param_names = template_info->metadata.generic_parameter_names;
+                                            }
+
+                                            // Perform substitution if we have both param names and annotation
+                                            if (!return_annotation.empty() && !generic_param_names.empty() &&
+                                                generic_param_names.size() == arg_names.size())
+                                            {
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_method_by_name: Substituting generic params in annotation '{}'",
+                                                          return_annotation);
+
+                                                for (size_t i = 0; i < generic_param_names.size(); ++i)
+                                                {
+                                                    const std::string &param = generic_param_names[i];
+                                                    const std::string &value = arg_names[i];
+
+                                                    // Replace standalone occurrences of the param with the value
+                                                    std::string result;
+                                                    size_t pos = 0;
+                                                    while (pos < return_annotation.length())
+                                                    {
+                                                        size_t found = return_annotation.find(param, pos);
+                                                        if (found == std::string::npos)
+                                                        {
+                                                            result += return_annotation.substr(pos);
+                                                            break;
+                                                        }
+
+                                                        bool is_start = (found == 0 ||
+                                                                         (!std::isalnum(static_cast<unsigned char>(return_annotation[found - 1])) &&
+                                                                          return_annotation[found - 1] != '_'));
+                                                        bool is_end = (found + param.length() >= return_annotation.length() ||
+                                                                       (!std::isalnum(static_cast<unsigned char>(return_annotation[found + param.length()])) &&
+                                                                        return_annotation[found + param.length()] != '_'));
+
+                                                        if (is_start && is_end)
+                                                        {
+                                                            result += return_annotation.substr(pos, found - pos);
+                                                            result += value;
+                                                            pos = found + param.length();
+                                                        }
+                                                        else
+                                                        {
+                                                            result += return_annotation.substr(pos, found - pos + param.length());
+                                                            pos = found + param.length();
+                                                        }
+                                                    }
+                                                    return_annotation = result;
+                                                }
+
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_method_by_name: Substituted annotation: '{}'", return_annotation);
+
+                                                // Now resolve the substituted annotation to LLVM type
+                                                return_type = types().resolve_and_map(return_annotation);
+                                                if (return_type)
+                                                {
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                              "resolve_method_by_name: Resolved substituted annotation to LLVM type");
+                                                }
+                                            }
+
+                                            // Fallback to pointer if substitution didn't work
+                                            if (!return_type)
+                                            {
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_method_by_name: Substitution failed, using ptr fallback");
+                                                return_type = llvm::PointerType::get(llvm_ctx(), 0);
+                                            }
                                         }
                                         else
                                         {
@@ -713,13 +767,86 @@ namespace Cryo::Codegen
                                             }
                                         }
 
-                                        // Use pointer type as fallback when we have type arguments (even if some couldn't be resolved)
-                                        // This is safer than using void type which causes crashes
+                                        // Use annotation-based substitution when we have type arguments
                                         if (!arg_names.empty())
                                         {
-                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                      "resolve_method_by_name: Substituting {} type args in class method return type", type_args.size());
-                                            return_type = llvm::PointerType::get(llvm_ctx(), 0);
+                                            // Get the method's return type annotation string (e.g., "Option<T>")
+                                            std::string return_annotation;
+                                            if (method->return_type_annotation())
+                                            {
+                                                return_annotation = method->return_type_annotation()->to_string();
+                                            }
+
+                                            // Get the template's generic parameter names
+                                            std::vector<std::string> generic_param_names;
+                                            if (template_info && !template_info->metadata.generic_parameter_names.empty())
+                                            {
+                                                generic_param_names = template_info->metadata.generic_parameter_names;
+                                            }
+
+                                            // Perform substitution if we have both param names and annotation
+                                            if (!return_annotation.empty() && !generic_param_names.empty() &&
+                                                generic_param_names.size() == arg_names.size())
+                                            {
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_method_by_name: Substituting generic params in class method annotation '{}'",
+                                                          return_annotation);
+
+                                                for (size_t i = 0; i < generic_param_names.size(); ++i)
+                                                {
+                                                    const std::string &param = generic_param_names[i];
+                                                    const std::string &value = arg_names[i];
+
+                                                    std::string result;
+                                                    size_t pos = 0;
+                                                    while (pos < return_annotation.length())
+                                                    {
+                                                        size_t found = return_annotation.find(param, pos);
+                                                        if (found == std::string::npos)
+                                                        {
+                                                            result += return_annotation.substr(pos);
+                                                            break;
+                                                        }
+
+                                                        bool is_start = (found == 0 ||
+                                                                         (!std::isalnum(static_cast<unsigned char>(return_annotation[found - 1])) &&
+                                                                          return_annotation[found - 1] != '_'));
+                                                        bool is_end = (found + param.length() >= return_annotation.length() ||
+                                                                       (!std::isalnum(static_cast<unsigned char>(return_annotation[found + param.length()])) &&
+                                                                        return_annotation[found + param.length()] != '_'));
+
+                                                        if (is_start && is_end)
+                                                        {
+                                                            result += return_annotation.substr(pos, found - pos);
+                                                            result += value;
+                                                            pos = found + param.length();
+                                                        }
+                                                        else
+                                                        {
+                                                            result += return_annotation.substr(pos, found - pos + param.length());
+                                                            pos = found + param.length();
+                                                        }
+                                                    }
+                                                    return_annotation = result;
+                                                }
+
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_method_by_name: Substituted class method annotation: '{}'", return_annotation);
+
+                                                return_type = types().resolve_and_map(return_annotation);
+                                                if (return_type)
+                                                {
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                              "resolve_method_by_name: Resolved substituted class method annotation to LLVM type");
+                                                }
+                                            }
+
+                                            if (!return_type)
+                                            {
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_method_by_name: Class method substitution failed, using ptr fallback");
+                                                return_type = llvm::PointerType::get(llvm_ctx(), 0);
+                                            }
                                         }
                                         else
                                         {
@@ -784,19 +911,113 @@ namespace Cryo::Codegen
                               full_method_name, return_type_annotation.empty() ? "<not found>" : return_type_annotation);
                     if (!return_type_annotation.empty() && return_type_annotation != "void")
                     {
+                        // Substitute generic parameters in the annotation if we have type arguments
+                        // e.g., "Option<T>" with type_args_str="String" becomes "Option<String>"
+                        std::string resolved_annotation = return_type_annotation;
+                        if (!type_args_str.empty())
+                        {
+                            // Get the template's generic parameter names
+                            const Cryo::TemplateRegistry::TemplateInfo *tmpl_info = template_registry->find_template(simple_type_name);
+                            std::vector<std::string> generic_param_names;
+                            if (tmpl_info && !tmpl_info->metadata.generic_parameter_names.empty())
+                            {
+                                generic_param_names = tmpl_info->metadata.generic_parameter_names;
+                            }
+
+                            // Parse type arguments from type_args_str (handles nested generics)
+                            std::vector<std::string> type_arg_values;
+                            {
+                                size_t start = 0;
+                                int depth = 0;
+                                for (size_t i = 0; i <= type_args_str.length(); ++i)
+                                {
+                                    if (i == type_args_str.length() || (type_args_str[i] == ',' && depth == 0))
+                                    {
+                                        std::string arg = type_args_str.substr(start, i - start);
+                                        // Trim whitespace
+                                        while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.front())))
+                                            arg.erase(0, 1);
+                                        while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.back())))
+                                            arg.pop_back();
+                                        if (!arg.empty())
+                                            type_arg_values.push_back(arg);
+                                        start = i + 1;
+                                    }
+                                    else if (type_args_str[i] == '<')
+                                        depth++;
+                                    else if (type_args_str[i] == '>')
+                                        depth--;
+                                }
+                            }
+
+                            // Perform substitution: replace generic params with concrete types
+                            if (!generic_param_names.empty() && generic_param_names.size() == type_arg_values.size())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_method_by_name: Substituting {} generic params in annotation '{}'",
+                                          generic_param_names.size(), return_type_annotation);
+
+                                for (size_t i = 0; i < generic_param_names.size(); ++i)
+                                {
+                                    const std::string &param = generic_param_names[i];
+                                    const std::string &value = type_arg_values[i];
+
+                                    // Replace all occurrences of the generic param with the concrete type
+                                    // Be careful to only replace standalone type params, not substrings
+                                    // e.g., replace "T" but not "T" in "String"
+                                    std::string result;
+                                    size_t pos = 0;
+                                    while (pos < resolved_annotation.length())
+                                    {
+                                        size_t found = resolved_annotation.find(param, pos);
+                                        if (found == std::string::npos)
+                                        {
+                                            result += resolved_annotation.substr(pos);
+                                            break;
+                                        }
+
+                                        // Check if this is a standalone type parameter
+                                        // (not part of a larger identifier)
+                                        bool is_start = (found == 0 ||
+                                                         !std::isalnum(static_cast<unsigned char>(resolved_annotation[found - 1])) &&
+                                                             resolved_annotation[found - 1] != '_');
+                                        bool is_end = (found + param.length() >= resolved_annotation.length() ||
+                                                       !std::isalnum(static_cast<unsigned char>(resolved_annotation[found + param.length()])) &&
+                                                           resolved_annotation[found + param.length()] != '_');
+
+                                        if (is_start && is_end)
+                                        {
+                                            result += resolved_annotation.substr(pos, found - pos);
+                                            result += value;
+                                            pos = found + param.length();
+                                        }
+                                        else
+                                        {
+                                            result += resolved_annotation.substr(pos, found - pos + param.length());
+                                            pos = found + param.length();
+                                        }
+                                    }
+                                    resolved_annotation = result;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_method_by_name: After substituting {}={}: '{}'",
+                                              param, value, resolved_annotation);
+                                }
+                            }
+                        }
+
                         // Use TypeMapper to resolve the type annotation to LLVM type
-                        return_type = types().resolve_and_map(return_type_annotation);
+                        return_type = types().resolve_and_map(resolved_annotation);
                         if (return_type)
                         {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                       "resolve_method_by_name: Got return type from annotation for '{}': {} -> LLVM type",
-                                      full_method_name, return_type_annotation);
+                                      full_method_name, resolved_annotation);
                         }
                         else
                         {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                       "resolve_method_by_name: Failed to resolve annotation '{}' for '{}'",
-                                      return_type_annotation, full_method_name);
+                                      resolved_annotation, full_method_name);
                         }
                     }
                 }
