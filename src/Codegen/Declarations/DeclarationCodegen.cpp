@@ -52,6 +52,10 @@ namespace Cryo::Codegen
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping function declaration '{}' - param '{}' has error type '{}'",
                               node->name(), param->name(), ptype->display_name());
+                    // Emit actual error so it shows up in diagnostics
+                    report_error(ErrorCode::E0642_PARAM_TYPE_ERROR, node,
+                                "Function '" + node->name() + "' parameter '" + param->name() +
+                                "' has unresolved type: " + ptype->display_name());
                     return nullptr;
                 }
                 if (ptype->kind() == TypeKind::GenericParam)
@@ -84,6 +88,9 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Skipping function declaration '{}' - return type is error: '{}'",
                           node->name(), ret_type->display_name());
+                // Emit actual error so it shows up in diagnostics
+                report_error(ErrorCode::E0643_RETURN_TYPE_ERROR, node,
+                            "Function '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
                 return nullptr;
             }
             if (ret_type->kind() == TypeKind::GenericParam)
@@ -197,6 +204,10 @@ namespace Cryo::Codegen
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping function '{}' - param '{}' has error type '{}'",
                               node->name(), param->name(), ptype->display_name());
+                    // Emit actual error so it shows up in diagnostics
+                    report_error(ErrorCode::E0642_PARAM_TYPE_ERROR, node,
+                                "Function '" + node->name() + "' parameter '" + param->name() +
+                                "' has unresolved type: " + ptype->display_name());
                     return nullptr;
                 }
                 // Check for Generic type kind
@@ -231,6 +242,9 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Skipping function '{}' - return type is error: '{}'",
                           node->name(), ret_type->display_name());
+                // Emit actual error so it shows up in diagnostics
+                report_error(ErrorCode::E0643_RETURN_TYPE_ERROR, node,
+                            "Function '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
                 return nullptr;
             }
             if (ret_type->kind() == TypeKind::GenericParam)
@@ -308,6 +322,8 @@ namespace Cryo::Codegen
         if (llvm::verifyFunction(*fn, &llvm::errs()))
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function verification failed: {}", name);
+            report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
+                        "Function '" + name + "' failed LLVM verification");
             // Clear the builder's insert point before erasing the function
             // to prevent dangling pointers to the deleted basic blocks
             builder().ClearInsertionPoint();
@@ -363,6 +379,10 @@ namespace Cryo::Codegen
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping method '{}' - param '{}' has error type '{}'",
                               node->name(), param->name(), ptype.get()->display_name());
+                    // Emit actual error so it shows up in diagnostics
+                    report_error(ErrorCode::E0642_PARAM_TYPE_ERROR, node,
+                                "Method '" + node->name() + "' parameter '" + param->name() +
+                                "' has unresolved type: " + ptype.get()->display_name());
                     return nullptr;
                 }
                 // Check for Generic type kind or undefined struct/class types
@@ -437,6 +457,10 @@ namespace Cryo::Codegen
                     LOG_ERROR(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping method declaration '{}::{}' - return type is error '{}' with no annotation",
                               parent_type, node->name(), ret_type->display_name());
+                    // Emit actual error so it shows up in diagnostics
+                    report_error(ErrorCode::E0643_RETURN_TYPE_ERROR, node,
+                                "Method '" + parent_type + "::" + node->name() +
+                                "' has unresolved return type: " + ret_type->display_name());
                     return nullptr;
                 }
             }
@@ -2260,6 +2284,9 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Skipping method '{}' - return type is error: '{}'",
                           node->name(), ret_type->display_name());
+                // Emit actual error so it shows up in diagnostics
+                report_error(ErrorCode::E0643_RETURN_TYPE_ERROR, node,
+                            "Method '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
                 return;
             }
         }

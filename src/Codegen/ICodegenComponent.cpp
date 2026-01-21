@@ -813,6 +813,8 @@ namespace Cryo::Codegen
         if (!ptr->getType()->isPointerTy())
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "create_store called with non-pointer destination");
+            report_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                        "Internal error: create_store called with non-pointer destination");
             return;
         }
 
