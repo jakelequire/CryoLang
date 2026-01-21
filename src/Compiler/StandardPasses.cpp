@@ -177,6 +177,83 @@ namespace Cryo
     // Stage 4: Type Resolution Passes
     // ============================================================================
 
+    // ========================================================================
+    // Helper: Resolve variable types in function/method bodies
+    // ========================================================================
+
+    static void resolve_variable_types_in_statement(
+        StatementNode *stmt,
+        TypeResolver &resolver,
+        ResolutionContext &ctx,
+        size_t &resolved_count,
+        size_t &error_count)
+    {
+        if (!stmt)
+            return;
+
+        // Check if this is a variable declaration
+        if (auto *var_decl = dynamic_cast<VariableDeclarationNode *>(stmt))
+        {
+            const auto *ann = var_decl->type_annotation();
+            if (ann && (!var_decl->get_resolved_type().is_valid() || var_decl->get_resolved_type().is_error()))
+            {
+                TypeRef resolved = resolver.resolve(*ann, ctx);
+                if (!resolved.is_error())
+                {
+                    var_decl->set_resolved_type(resolved);
+                    resolved_count++;
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "TypeResolutionPass: Resolved local variable '{}' type to '{}'",
+                        var_decl->name(), resolved->display_name());
+                }
+                else
+                {
+                    error_count++;
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "TypeResolutionPass: Failed to resolve local variable '{}' type: {}",
+                        var_decl->name(), resolved->display_name());
+                }
+            }
+        }
+        // Recursively process block statements
+        else if (auto *block = dynamic_cast<BlockStatementNode *>(stmt))
+        {
+            for (const auto &child : block->statements())
+            {
+                resolve_variable_types_in_statement(child.get(), resolver, ctx, resolved_count, error_count);
+            }
+        }
+        // Process if statement branches
+        else if (auto *if_stmt = dynamic_cast<IfStatementNode *>(stmt))
+        {
+            if (if_stmt->then_statement())
+                resolve_variable_types_in_statement(if_stmt->then_statement(), resolver, ctx, resolved_count, error_count);
+            if (if_stmt->else_statement())
+                resolve_variable_types_in_statement(if_stmt->else_statement(), resolver, ctx, resolved_count, error_count);
+        }
+        // Process while loop body
+        else if (auto *while_stmt = dynamic_cast<WhileStatementNode *>(stmt))
+        {
+            if (while_stmt->body())
+                resolve_variable_types_in_statement(while_stmt->body(), resolver, ctx, resolved_count, error_count);
+        }
+        // Process for loop body
+        else if (auto *for_stmt = dynamic_cast<ForStatementNode *>(stmt))
+        {
+            if (for_stmt->body())
+                resolve_variable_types_in_statement(for_stmt->body(), resolver, ctx, resolved_count, error_count);
+        }
+        // Process match statement arms
+        else if (auto *match_stmt = dynamic_cast<MatchStatementNode *>(stmt))
+        {
+            for (const auto &arm : match_stmt->arms())
+            {
+                if (arm->body())
+                    resolve_variable_types_in_statement(arm->body(), resolver, ctx, resolved_count, error_count);
+            }
+        }
+    }
+
     TypeResolutionPass::TypeResolutionPass(CompilerInstance &compiler)
         : _compiler(compiler)
     {
@@ -275,7 +352,46 @@ namespace Cryo
             // Pre-register type aliases
             else if (auto *alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(stmt.get()))
             {
-                // Type aliases need to be resolved first, but we can at least log them
+                // Type aliases need to be resolved first, but we can register the base type name
+                // for enum variant resolution (e.g., IoResult -> Result so IoResult::Ok works)
+                std::string alias_name = alias_decl->alias_name();
+
+                // Extract base type name from target annotation or resolved type
+                std::string base_type_name;
+                if (alias_decl->has_target_type_annotation())
+                {
+                    std::string target_str = alias_decl->target_type_annotation()->to_string();
+                    // Handle qualified names (e.g., "std::Result<T, E>" -> "Result")
+                    size_t last_sep = target_str.rfind("::");
+                    if (last_sep != std::string::npos)
+                        base_type_name = target_str.substr(last_sep + 2);
+                    else
+                        base_type_name = target_str;
+
+                    // Remove generic parameters (e.g., "Result<T, IoError>" -> "Result")
+                    size_t angle_pos = base_type_name.find('<');
+                    if (angle_pos != std::string::npos)
+                        base_type_name = base_type_name.substr(0, angle_pos);
+                }
+                else if (alias_decl->has_resolved_target_type())
+                {
+                    TypeRef resolved = alias_decl->get_resolved_target_type();
+                    base_type_name = resolved->display_name();
+                    // Remove generic parameters
+                    size_t angle_pos = base_type_name.find('<');
+                    if (angle_pos != std::string::npos)
+                        base_type_name = base_type_name.substr(0, angle_pos);
+                }
+
+                // Register the base type name if we extracted it
+                if (!base_type_name.empty() && base_type_name != alias_name)
+                {
+                    module_registry.register_type_alias_base(alias_name, base_type_name);
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "TypeResolutionPass: Registered type alias base '{}' -> '{}'",
+                        alias_name, base_type_name);
+                }
+
                 LOG_DEBUG(LogComponent::GENERAL,
                     "TypeResolutionPass: Found type alias '{}' (will resolve in phase 2)",
                     alias_decl->alias_name());
@@ -593,6 +709,168 @@ namespace Cryo
                                 func->name(), param->name(), resolved->display_name());
                         }
                     }
+                }
+            }
+            // Handle type alias declarations - resolve target type annotation
+            else if (auto *alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(stmt.get()))
+            {
+                // If the alias has a deferred target type annotation, resolve it now
+                if (alias_decl->has_target_type_annotation() && !alias_decl->has_resolved_target_type())
+                {
+                    const TypeAnnotation *target_ann = alias_decl->target_type_annotation();
+
+                    // Create a resolution context, binding generic params if this is a generic alias
+                    ResolutionContext alias_ctx = res_ctx.child();
+                    const auto &generic_params = alias_decl->generic_params();
+                    if (!generic_params.empty())
+                    {
+                        for (size_t i = 0; i < generic_params.size(); ++i)
+                        {
+                            TypeRef param_type = arena.create_generic_param(generic_params[i], i);
+                            alias_ctx.bind_generic(generic_params[i], param_type);
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                "TypeResolutionPass: Bound generic param '{}' (index {}) for type alias '{}'",
+                                generic_params[i], i, alias_decl->alias_name());
+                        }
+                    }
+
+                    TypeRef resolved = resolver.resolve(*target_ann, alias_ctx);
+                    if (!resolved.is_error())
+                    {
+                        alias_decl->set_resolved_target_type(resolved);
+                        resolved_count++;
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Resolved type alias '{}' target to '{}'",
+                            alias_decl->alias_name(), resolved->display_name());
+
+                        // Register the resolved type under the alias name in the module registry
+                        module_registry.register_type(res_ctx.current_module, alias_decl->alias_name(), resolved);
+                    }
+                    else
+                    {
+                        error_count++;
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Failed to resolve type alias '{}' target: {}",
+                            alias_decl->alias_name(), resolved->display_name());
+                    }
+                }
+                else if (alias_decl->has_resolved_target_type())
+                {
+                    // Already resolved at parse time - register in module registry for cross-module access
+                    TypeRef target_type = alias_decl->get_resolved_target_type();
+                    module_registry.register_type(res_ctx.current_module, alias_decl->alias_name(), target_type);
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "TypeResolutionPass: Registered pre-resolved type alias '{}' -> '{}'",
+                        alias_decl->alias_name(), target_type->display_name());
+                }
+            }
+        }
+
+        // === PHASE 3: Resolve local variable types in function/method bodies ===
+        LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: Phase 3 - Resolving local variable types in function bodies");
+        for (auto &stmt : program->statements())
+        {
+            // Handle implement blocks
+            if (auto *impl = dynamic_cast<ImplementationBlockNode *>(stmt.get()))
+            {
+                // Create a child context for this implement block
+                ResolutionContext impl_ctx = res_ctx.child();
+
+                // Parse target type to extract generic parameters
+                const std::string &target = impl->target_type();
+                size_t angle_pos = target.find('<');
+                if (angle_pos != std::string::npos && target.back() == '>')
+                {
+                    std::string params_str = target.substr(angle_pos + 1, target.size() - angle_pos - 2);
+                    std::vector<std::string> param_names;
+                    size_t start = 0;
+                    for (size_t i = 0; i <= params_str.size(); ++i)
+                    {
+                        if (i == params_str.size() || params_str[i] == ',')
+                        {
+                            std::string param = params_str.substr(start, i - start);
+                            while (!param.empty() && (param.front() == ' ' || param.front() == '\t'))
+                                param.erase(0, 1);
+                            while (!param.empty() && (param.back() == ' ' || param.back() == '\t'))
+                                param.pop_back();
+                            if (!param.empty())
+                                param_names.push_back(param);
+                            start = i + 1;
+                        }
+                    }
+                    for (size_t i = 0; i < param_names.size(); ++i)
+                    {
+                        TypeRef param_type = arena.create_generic_param(param_names[i], i);
+                        impl_ctx.bind_generic(param_names[i], param_type);
+                    }
+                }
+
+                for (auto &method : impl->method_implementations())
+                {
+                    ResolutionContext method_ctx = impl_ctx.child();
+                    const auto &method_generic_params = method->generic_parameters();
+                    size_t impl_param_count = 0;
+                    for (const auto &[name, _] : impl_ctx.generic_bindings)
+                        impl_param_count++;
+
+                    for (size_t i = 0; i < method_generic_params.size(); ++i)
+                    {
+                        const std::string &param_name = method_generic_params[i]->name();
+                        TypeRef param_type = arena.create_generic_param(param_name, impl_param_count + i);
+                        method_ctx.bind_generic(param_name, param_type);
+                    }
+
+                    // Resolve variable types in method body
+                    if (method->body())
+                    {
+                        resolve_variable_types_in_statement(method->body(), resolver, method_ctx, resolved_count, error_count);
+                    }
+                }
+            }
+            // Handle struct declarations
+            else if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(stmt.get()))
+            {
+                ResolutionContext struct_ctx = res_ctx.child();
+                const auto &struct_generic_params = struct_decl->generic_parameters();
+                for (size_t i = 0; i < struct_generic_params.size(); ++i)
+                {
+                    TypeRef param_type = arena.create_generic_param(struct_generic_params[i]->name(), i);
+                    struct_ctx.bind_generic(struct_generic_params[i]->name(), param_type);
+                }
+
+                for (auto &method : struct_decl->methods())
+                {
+                    ResolutionContext method_ctx = struct_ctx.child();
+                    const auto &method_generic_params = method->generic_parameters();
+                    size_t base_index = struct_generic_params.size();
+                    for (size_t i = 0; i < method_generic_params.size(); ++i)
+                    {
+                        TypeRef param_type = arena.create_generic_param(method_generic_params[i]->name(), base_index + i);
+                        method_ctx.bind_generic(method_generic_params[i]->name(), param_type);
+                    }
+
+                    // Resolve variable types in method body
+                    if (method->body())
+                    {
+                        resolve_variable_types_in_statement(method->body(), resolver, method_ctx, resolved_count, error_count);
+                    }
+                }
+            }
+            // Handle function declarations
+            else if (auto *func = dynamic_cast<FunctionDeclarationNode *>(stmt.get()))
+            {
+                ResolutionContext func_ctx = res_ctx.child();
+                const auto &generic_params = func->generic_parameters();
+                for (size_t i = 0; i < generic_params.size(); ++i)
+                {
+                    TypeRef param_type = arena.create_generic_param(generic_params[i]->name(), i);
+                    func_ctx.bind_generic(generic_params[i]->name(), param_type);
+                }
+
+                // Resolve variable types in function body
+                if (func->body())
+                {
+                    resolve_variable_types_in_statement(func->body(), resolver, func_ctx, resolved_count, error_count);
                 }
             }
         }

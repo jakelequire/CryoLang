@@ -1382,6 +1382,63 @@ namespace Cryo
                 LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic trait template: {}", trait_decl->name());
             }
         }
+        // Handle type alias declarations
+        else if (auto alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(node))
+        {
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Processing type alias: {}", alias_decl->alias_name());
+
+            // Type aliases are transparent - the alias name is just another name for the target type
+            ModuleID current_module = _symbol_table->current_module();
+
+            // If the alias already has a resolved target type, use it directly
+            if (alias_decl->has_resolved_target_type())
+            {
+                TypeRef target_type = alias_decl->get_resolved_target_type();
+                // Register the target type under the alias name
+                _symbol_table->declare_type(alias_decl->alias_name(), target_type, alias_decl->location());
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered type alias '{}' -> '{}'",
+                          alias_decl->alias_name(), target_type->display_name());
+            }
+            else if (alias_decl->has_target_type_annotation())
+            {
+                // Type not resolved yet - create a placeholder struct that will be replaced in TypeResolutionPass
+                QualifiedTypeName placeholder_qname{current_module, alias_decl->alias_name()};
+                TypeRef placeholder = _ast_context->types().create_struct(placeholder_qname);
+                _symbol_table->declare_type(alias_decl->alias_name(), placeholder, alias_decl->location());
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered type alias '{}' with deferred resolution (target: '{}')",
+                          alias_decl->alias_name(), alias_decl->target_type_annotation()->to_string());
+            }
+            else
+            {
+                // Forward declaration (no target type)
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Type alias '{}' is a forward declaration (no target)",
+                          alias_decl->alias_name());
+            }
+
+            // Register generic type alias templates if this alias has generic parameters
+            if (alias_decl->is_generic() && _generic_registry)
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registering generic type alias template: {}", alias_decl->alias_name());
+
+                // Create a type alias type for the template
+                TypeRef alias_type = _ast_context->types().create_type_alias(
+                    QualifiedTypeName{_symbol_table->current_module(), alias_decl->alias_name()},
+                    TypeRef{}  // Target will be resolved during instantiation
+                );
+
+                std::vector<GenericParam> params;
+                for (size_t i = 0; i < alias_decl->generic_params().size(); ++i)
+                {
+                    const std::string &param_name = alias_decl->generic_params()[i];
+                    TypeRef param_type = _ast_context->types().create_generic_param(param_name, i);
+                    params.emplace_back(param_name, i, param_type);
+                }
+                _generic_registry->register_template(alias_type, params,
+                    _symbol_table->current_module(), alias_decl, alias_decl->alias_name());
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered generic type alias '{}' in GenericRegistry with {} params",
+                    alias_decl->alias_name(), params.size());
+            }
+        }
         // Handle import declarations (process in first pass since they affect symbol resolution)
         else if (auto import_decl = dynamic_cast<ImportDeclarationNode *>(node))
         {

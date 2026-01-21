@@ -915,6 +915,54 @@ namespace Cryo::Codegen
         std::string alias_name = node->alias_name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Generating type alias: {}", alias_name);
 
+        // Extract the base type name from the target type annotation for alias resolution
+        // e.g., "IoResult<T>" -> "Result<T, IoError>" -> base type "Result"
+        if (node->has_target_type_annotation())
+        {
+            std::string target_str = node->target_type_annotation()->to_string();
+            // Extract base type name (before any < or after last ::)
+            std::string base_type_name = target_str;
+
+            // Handle qualified names (e.g., "std::core::result::Result<T, E>" -> "Result")
+            size_t last_sep = target_str.rfind("::");
+            if (last_sep != std::string::npos)
+            {
+                base_type_name = target_str.substr(last_sep + 2);
+            }
+
+            // Remove generic parameters (e.g., "Result<T, IoError>" -> "Result")
+            size_t angle_pos = base_type_name.find('<');
+            if (angle_pos != std::string::npos)
+            {
+                base_type_name = base_type_name.substr(0, angle_pos);
+            }
+
+            if (!base_type_name.empty())
+            {
+                ctx().register_type_alias_base(alias_name, base_type_name);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered type alias '{}' -> base type '{}'",
+                          alias_name, base_type_name);
+            }
+        }
+        else if (node->has_resolved_target_type())
+        {
+            // If we have a resolved type, get its name
+            TypeRef target_type = node->get_resolved_target_type();
+            if (target_type.is_valid())
+            {
+                std::string base_type_name = target_type->display_name();
+                // Remove generic parameters if present
+                size_t angle_pos = base_type_name.find('<');
+                if (angle_pos != std::string::npos)
+                {
+                    base_type_name = base_type_name.substr(0, angle_pos);
+                }
+                ctx().register_type_alias_base(alias_name, base_type_name);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered type alias '{}' -> base type '{}'",
+                          alias_name, base_type_name);
+            }
+        }
+
         // Get the aliased type
         llvm::Type *aliased_type = nullptr;
 

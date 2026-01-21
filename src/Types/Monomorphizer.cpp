@@ -187,15 +187,29 @@ namespace Cryo
             return MonomorphResult::error("invalid generic type");
         }
 
+        // Normalize the generic_type to the registered template's TypeRef
+        // This handles cases where the same type was registered with a different module ID
+        TypeRef template_type = generic_type;
+        auto tmpl = _generics.get_template(generic_type);
+        if (!tmpl)
+        {
+            // TypeID mismatch - try looking up by name
+            tmpl = _generics.get_template_by_name(generic_type->display_name());
+            if (tmpl)
+            {
+                template_type = tmpl->generic_type;
+            }
+        }
+
         // Validate the instantiation
         std::string error_msg;
-        if (!_generics.validate_type_args(generic_type, type_args, &error_msg))
+        if (!_generics.validate_type_args(template_type, type_args, &error_msg))
         {
             return MonomorphResult::error(error_msg);
         }
 
         // Create the instantiated type via GenericRegistry
-        TypeRef instantiated = _generics.instantiate(generic_type, type_args, _arena);
+        TypeRef instantiated = _generics.instantiate(template_type, type_args, _arena);
 
         if (instantiated.is_error())
         {
@@ -205,20 +219,16 @@ namespace Cryo
 
         // If we have an AST specializer, invoke it
         ASTNode *specialized_ast = nullptr;
-        if (_ast_specializer)
+        if (_ast_specializer && tmpl)
         {
-            auto tmpl = _generics.get_template(generic_type);
-            if (tmpl)
-            {
-                TypeSubstitution subst = create_substitution(generic_type, type_args);
-                std::string specialized_name = generate_specialized_name(generic_type, type_args);
+            TypeSubstitution subst = create_substitution(template_type, type_args);
+            std::string specialized_name = generate_specialized_name(template_type, type_args);
 
-                specialized_ast = _ast_specializer(*tmpl, subst, specialized_name);
-            }
+            specialized_ast = _ast_specializer(*tmpl, subst, specialized_name);
         }
 
         // Mark as monomorphized in the registry
-        _generics.mark_monomorphized(generic_type, type_args);
+        _generics.mark_monomorphized(template_type, type_args);
 
         return MonomorphResult::ok(instantiated, specialized_ast);
     }

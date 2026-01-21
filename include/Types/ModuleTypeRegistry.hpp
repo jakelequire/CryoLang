@@ -132,6 +132,11 @@ namespace Cryo
                            std::unordered_map<std::string, TypeRef>,
                            ModuleID::Hash> _type_aliases;
 
+        // Global type alias base name mapping: alias_name -> base_type_name
+        // This is used to resolve type aliases during enum variant lookup
+        // For example: IoResult -> Result (so IoResult::Ok becomes Result::Ok)
+        std::unordered_map<std::string, std::string> _type_alias_base_names;
+
         // Next module ID to assign
         uint32_t _next_module_id = 2; // 0 = invalid, 1 = builtin
 
@@ -178,6 +183,38 @@ namespace Cryo
         void register_alias(ModuleID module,
                             const std::string &alias,
                             TypeRef target);
+
+        // Register type alias base name mapping (for enum variant resolution)
+        // For example: register_type_alias_base("IoResult", "Result")
+        void register_type_alias_base(const std::string &alias_name,
+                                      const std::string &base_type_name)
+        {
+            _type_alias_base_names[alias_name] = base_type_name;
+        }
+
+        // Get the base type name for a type alias
+        std::string get_type_alias_base(const std::string &alias_name) const
+        {
+            auto it = _type_alias_base_names.find(alias_name);
+            return it != _type_alias_base_names.end() ? it->second : "";
+        }
+
+        // Check if a name is a type alias
+        bool is_type_alias(const std::string &name) const
+        {
+            return _type_alias_base_names.find(name) != _type_alias_base_names.end();
+        }
+
+        // Resolve type alias to base type name (recursive for chained aliases)
+        std::string resolve_type_alias(const std::string &name) const
+        {
+            auto it = _type_alias_base_names.find(name);
+            if (it != _type_alias_base_names.end())
+            {
+                return resolve_type_alias(it->second); // Recursive for chained aliases
+            }
+            return name;
+        }
 
         // Unregister a type (rarely needed)
         void unregister_type(ModuleID module, const std::string &name);
