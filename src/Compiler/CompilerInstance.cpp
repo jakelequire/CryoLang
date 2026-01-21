@@ -79,6 +79,7 @@ namespace Cryo
         // Pass the main ASTContext to ensure all modules use the same TypeArena
         _module_loader = std::make_unique<ModuleLoader>(*_symbol_table, *_template_registry, *_ast_context);
         _module_loader->set_generic_registry(_generic_registry.get());
+        _module_loader->set_diagnostics(_diagnostics.get());
 
         // Note: TypeChecker doesn't have set_template_registry - template handling is done differently
 
@@ -195,7 +196,9 @@ namespace Cryo
             dump_ast();
         }
 
-        return success && !_diagnostics->has_errors();
+        // Return success from PassManager which now correctly tracks module-specific errors
+        // (not accumulated errors from previous modules in stdlib compilation mode)
+        return success;
     }
 
     bool CompilerInstance::parse_source(const std::string &source_code)
@@ -214,6 +217,9 @@ namespace Cryo
     bool CompilerInstance::parse_source_from_file(std::unique_ptr<File> file)
     {
         reset_state();
+
+        // Track error count at start to detect new errors (not accumulated from previous modules in stdlib mode)
+        size_t errors_at_start = _diagnostics ? _diagnostics->error_count() : 0;
 
         try
         {
@@ -280,8 +286,9 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "=== Compilation Completed ===");
             }
 
-            // Check if there were any errors during compilation
-            if (_diagnostics->has_errors())
+            // Check for NEW errors during this compilation (not accumulated from previous modules)
+            size_t errors_now = _diagnostics ? _diagnostics->error_count() : 0;
+            if (errors_now > errors_at_start)
             {
                 return false;
             }
@@ -453,6 +460,9 @@ namespace Cryo
             return false;
         }
 
+        // Track error count at start to detect new errors (not accumulated from previous modules)
+        size_t errors_at_start = _diagnostics ? _diagnostics->error_count() : 0;
+
         try
         {
             // Phase -1: Process directives first
@@ -483,12 +493,14 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Phase 1: Symbol and type analysis completed via symbol table population");
             }
 
-            // Type errors are now reported through DiagEmitter directly
-            if (_diagnostics->has_errors())
+            // Check for NEW type errors from this module only (not accumulated errors from previous modules)
+            size_t errors_now = _diagnostics ? _diagnostics->error_count() : 0;
+            if (errors_now > errors_at_start)
             {
                 if (_debug_mode)
                 {
-                    LOG_ERROR(Cryo::LogComponent::GENERAL, "Type checking failed with errors");
+                    LOG_ERROR(Cryo::LogComponent::GENERAL, "Type checking failed with {} new errors",
+                              errors_now - errors_at_start);
                 }
                 return false;
             }
@@ -1457,6 +1469,13 @@ namespace Cryo
             else
             {
                 LOG_ERROR(Cryo::LogComponent::GENERAL, "Failed to load import '{}': {}", import_decl->path(), result.error_message);
+                // Emit diagnostic for import failure (ModuleLoader should have already emitted, but this is a backup)
+                if (_diagnostics)
+                {
+                    _diagnostics->emit(
+                        Diag::error(ErrorCode::E0502_INVALID_IMPORT, result.error_message)
+                            .at(import_decl));
+                }
             }
         }
         // Handle global constants in first pass to prevent early reference issues
@@ -2631,13 +2650,18 @@ namespace Cryo
             return false;
         }
 
+        // Track error count before processing to detect new errors (not accumulated from previous modules)
+        size_t errors_before = _diagnostics ? _diagnostics->error_count() : 0;
+
         LOG_DEBUG(LogComponent::GENERAL, "Function body phase: Processing function bodies and references");
         populate_symbol_table_with_scope(_ast_root.get(), _symbol_table.get(), "Global");
 
-        // Check for type errors
-        if (_diagnostics->has_errors())
+        // Check for NEW type errors from this module only (not accumulated errors from previous modules)
+        size_t errors_after = _diagnostics ? _diagnostics->error_count() : 0;
+        if (errors_after > errors_before)
         {
-            LOG_ERROR(LogComponent::GENERAL, "Function body phase: Type checking failed with errors");
+            LOG_ERROR(LogComponent::GENERAL, "Function body phase: Type checking failed with {} new errors",
+                      errors_after - errors_before);
             return false;
         }
 

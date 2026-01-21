@@ -217,6 +217,10 @@ namespace Cryo
 
         _stats.clear();
 
+        // Track error count at start of this module's compilation
+        // This is critical for stdlib mode where errors accumulate across modules
+        size_t errors_at_start = ctx.current_error_count();
+
         for (auto *pass : _execution_order)
         {
             PassStats stats;
@@ -320,8 +324,10 @@ namespace Cryo
             }
         }
 
-        // Final check: return false if any errors were emitted
-        return !ctx.has_errors();
+        // Final check: return false if THIS module emitted any errors
+        // Use the count from start of run_all() to ignore accumulated errors from previous modules
+        size_t errors_this_module = ctx.current_error_count() - errors_at_start;
+        return errors_this_module == 0;
     }
 
     bool PassManager::run_until(PassContext &ctx, PassStage until_stage)

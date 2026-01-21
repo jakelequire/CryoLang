@@ -413,10 +413,16 @@ namespace Cryo::Codegen
         // Uses TemplateRegistry to dynamically look up the type's defining namespace
         {
             std::string base_type = type_name;
+            std::string type_args_str; // Store type arguments for generic substitution
             size_t angle_pos = type_name.find('<');
             if (angle_pos != std::string::npos)
             {
                 base_type = type_name.substr(0, angle_pos);
+                // Extract type arguments string (e.g., "String" from "Array<String>")
+                if (type_name.back() == '>')
+                {
+                    type_args_str = type_name.substr(angle_pos + 1, type_name.length() - angle_pos - 2);
+                }
             }
 
             // Try to get namespace from TemplateRegistry (dynamic lookup)
@@ -535,7 +541,95 @@ namespace Cryo::Codegen
                                 TypeRef method_return = method->get_resolved_return_type();
                                 if (method_return)
                                 {
-                                    return_type = types().get_type(method_return);
+                                    // Check if return type contains generic parameters that need substitution
+                                    // This happens when the template method returns something like Option<T>
+                                    if (!type_args_str.empty() && method_return->display_name().find("<error: unresolved generic") != std::string::npos)
+                                    {
+                                        // Parse type arguments and substitute
+                                        std::vector<TypeRef> type_args;
+                                        std::vector<std::string> arg_names;
+
+                                        // Parse comma-separated type arguments, handling nested generics
+                                        size_t start = 0;
+                                        int depth = 0;
+                                        for (size_t i = 0; i <= type_args_str.length(); ++i)
+                                        {
+                                            if (i == type_args_str.length() || (type_args_str[i] == ',' && depth == 0))
+                                            {
+                                                std::string arg = type_args_str.substr(start, i - start);
+                                                // Trim whitespace
+                                                while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.front())))
+                                                    arg.erase(0, 1);
+                                                while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.back())))
+                                                    arg.pop_back();
+                                                if (!arg.empty())
+                                                    arg_names.push_back(arg);
+                                                start = i + 1;
+                                            }
+                                            else if (type_args_str[i] == '<')
+                                                depth++;
+                                            else if (type_args_str[i] == '>')
+                                                depth--;
+                                        }
+
+                                        // Resolve each type argument to a TypeRef
+                                        bool all_resolved = true;
+                                        for (const auto &arg_name : arg_names)
+                                        {
+                                            TypeRef arg_type = types().arena().lookup_type_by_name(arg_name);
+                                            if (!arg_type.is_valid())
+                                            {
+                                                // Try with std:: prefix or other common namespaces
+                                                arg_type = types().arena().lookup_type_by_name("std::collections::string::" + arg_name);
+                                            }
+                                            if (!arg_type.is_valid())
+                                            {
+                                                // Try primitives and common types (case-insensitive for String)
+                                                if (arg_name == "i32" || arg_name == "int") arg_type = types().arena().get_i32();
+                                                else if (arg_name == "i64") arg_type = types().arena().get_i64();
+                                                else if (arg_name == "u32") arg_type = types().arena().get_u32();
+                                                else if (arg_name == "u64") arg_type = types().arena().get_u64();
+                                                else if (arg_name == "string" || arg_name == "String") arg_type = types().arena().get_string();
+                                                else if (arg_name == "bool" || arg_name == "boolean") arg_type = types().arena().get_bool();
+                                            }
+                                            if (arg_type.is_valid())
+                                            {
+                                                type_args.push_back(arg_type);
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_method_by_name: Resolved type argument '{}' successfully", arg_name);
+                                            }
+                                            else
+                                            {
+                                                // Even if we can't resolve the type, we know we have a generic that needs substitution
+                                                // Don't fail resolution - we'll use pointer type as fallback
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_method_by_name: Could not resolve type argument '{}', will use ptr fallback", arg_name);
+                                            }
+                                        }
+
+                                        // Use pointer type as fallback when we have type arguments (even if some couldn't be resolved)
+                                        // This is safer than using void type which causes crashes
+                                        if (!arg_names.empty())
+                                        {
+                                            // Substitute generic parameters in the return type
+                                            // Note: method_return might be an error type representing Option<T>
+                                            // We need to rebuild it with concrete types
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "resolve_method_by_name: Substituting {} type args in return type", type_args.size());
+
+                                            // For now, use ptr type as fallback for unresolved generics
+                                            // A proper fix would reconstruct the instantiated type
+                                            return_type = llvm::PointerType::get(llvm_ctx(), 0);
+                                        }
+                                        else
+                                        {
+                                            return_type = types().get_type(method_return);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        return_type = types().get_type(method_return);
+                                    }
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                               "resolve_method_by_name: Got return type from struct template method: {}",
                                               method_return->display_name());
@@ -562,7 +656,80 @@ namespace Cryo::Codegen
                                 TypeRef method_return = method->get_resolved_return_type();
                                 if (method_return)
                                 {
-                                    return_type = types().get_type(method_return);
+                                    // Check if return type contains generic parameters that need substitution
+                                    if (!type_args_str.empty() && method_return->display_name().find("<error: unresolved generic") != std::string::npos)
+                                    {
+                                        // Parse type arguments and substitute (same logic as struct template)
+                                        std::vector<TypeRef> type_args;
+                                        std::vector<std::string> arg_names;
+
+                                        size_t start = 0;
+                                        int depth = 0;
+                                        for (size_t i = 0; i <= type_args_str.length(); ++i)
+                                        {
+                                            if (i == type_args_str.length() || (type_args_str[i] == ',' && depth == 0))
+                                            {
+                                                std::string arg = type_args_str.substr(start, i - start);
+                                                while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.front())))
+                                                    arg.erase(0, 1);
+                                                while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.back())))
+                                                    arg.pop_back();
+                                                if (!arg.empty())
+                                                    arg_names.push_back(arg);
+                                                start = i + 1;
+                                            }
+                                            else if (type_args_str[i] == '<')
+                                                depth++;
+                                            else if (type_args_str[i] == '>')
+                                                depth--;
+                                        }
+
+                                        bool all_resolved = true;
+                                        for (const auto &arg_name : arg_names)
+                                        {
+                                            TypeRef arg_type = types().arena().lookup_type_by_name(arg_name);
+                                            if (!arg_type.is_valid())
+                                                arg_type = types().arena().lookup_type_by_name("std::collections::string::" + arg_name);
+                                            if (!arg_type.is_valid())
+                                            {
+                                                // Try primitives and common types (case-insensitive for String)
+                                                if (arg_name == "i32" || arg_name == "int") arg_type = types().arena().get_i32();
+                                                else if (arg_name == "i64") arg_type = types().arena().get_i64();
+                                                else if (arg_name == "u32") arg_type = types().arena().get_u32();
+                                                else if (arg_name == "u64") arg_type = types().arena().get_u64();
+                                                else if (arg_name == "string" || arg_name == "String") arg_type = types().arena().get_string();
+                                                else if (arg_name == "bool" || arg_name == "boolean") arg_type = types().arena().get_bool();
+                                            }
+                                            if (arg_type.is_valid())
+                                            {
+                                                type_args.push_back(arg_type);
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_method_by_name: Resolved type argument '{}' successfully", arg_name);
+                                            }
+                                            else
+                                            {
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_method_by_name: Could not resolve type argument '{}', will use ptr fallback", arg_name);
+                                            }
+                                        }
+
+                                        // Use pointer type as fallback when we have type arguments (even if some couldn't be resolved)
+                                        // This is safer than using void type which causes crashes
+                                        if (!arg_names.empty())
+                                        {
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "resolve_method_by_name: Substituting {} type args in class method return type", type_args.size());
+                                            return_type = llvm::PointerType::get(llvm_ctx(), 0);
+                                        }
+                                        else
+                                        {
+                                            return_type = types().get_type(method_return);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        return_type = types().get_type(method_return);
+                                    }
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                               "resolve_method_by_name: Got return type from class template method: {}",
                                               method_return->display_name());
