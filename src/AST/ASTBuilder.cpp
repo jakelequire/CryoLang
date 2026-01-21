@@ -379,11 +379,21 @@ namespace Cryo
             return node;
         }
 
-        // Resolve the target type string to a Type* object using the TypeArena
+        // Try to resolve the target type string to a Type* object using the TypeArena
         TypeRef resolved_target_type = lookup_type_by_name(target_type_str);
-        // If lookup fails, resolved_target_type will be invalid - type checker handles this
 
-        auto node = std::make_unique<TypeAliasDeclarationNode>(loc, std::move(alias_name), resolved_target_type, std::move(generic_params));
+        // If resolution succeeded, use the resolved type
+        if (resolved_target_type.is_valid() && !resolved_target_type.is_error())
+        {
+            auto node = std::make_unique<TypeAliasDeclarationNode>(loc, std::move(alias_name), resolved_target_type, std::move(generic_params));
+            node->set_source_file(_source_file);
+            return node;
+        }
+
+        // Resolution failed - store as TypeAnnotation for deferred resolution
+        // This handles complex types like Result<void*, AllocError> that can't be resolved at parse time
+        auto annotation = std::make_unique<TypeAnnotation>(TypeAnnotation::named(target_type_str, loc));
+        auto node = std::make_unique<TypeAliasDeclarationNode>(loc, std::move(alias_name), std::move(annotation), std::move(generic_params));
         node->set_source_file(_source_file);
         return node;
     }

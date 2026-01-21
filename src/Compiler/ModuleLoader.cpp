@@ -751,6 +751,43 @@ namespace Cryo
                     symbol.scope = module_name;
                     symbol_map[enum_decl->name()] = symbol;
                 }
+                else if (auto alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(decl))
+                {
+                    // Handle type aliases - the alias name refers to the target type
+                    // Type aliases are transparent: AllocResult is just another name for Result<void*, AllocError>
+                    TypeRef target_type{};
+
+                    if (alias_decl->has_resolved_target_type())
+                    {
+                        // If the target is already resolved, use it directly
+                        target_type = alias_decl->get_resolved_target_type();
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Type alias '{}' -> '{}'",
+                                  alias_decl->alias_name(), target_type->display_name());
+                    }
+                    else if (alias_decl->has_target_type_annotation())
+                    {
+                        // Target is deferred - will be resolved in TypeResolutionPass
+                        // For now, create a placeholder struct with the alias name
+                        // This will be replaced when the alias is resolved
+                        QualifiedTypeName placeholder_qname{module_id, alias_decl->alias_name()};
+                        target_type = type_arena.create_struct(placeholder_qname);
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Type alias '{}' has deferred target '{}', creating placeholder",
+                                  alias_decl->alias_name(), alias_decl->target_type_annotation()->to_string());
+                    }
+                    else
+                    {
+                        // Forward declaration - no target type
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Type alias '{}' is a forward declaration",
+                                  alias_decl->alias_name());
+                    }
+
+                    // Create type symbol for the alias
+                    Symbol symbol(alias_decl->alias_name(), SymbolKind::Type, target_type, module_id, alias_decl->location());
+                    symbol.scope = module_name;
+                    symbol_map[alias_decl->alias_name()] = symbol;
+                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added type alias '{}' to symbol map",
+                              alias_decl->alias_name());
+                }
                 else if (auto intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(decl))
                 {
                     // Create intrinsic symbol with proper type information (same as regular functions)
@@ -1248,6 +1285,31 @@ namespace Cryo
                             "imported_module"   // source_file (placeholder)
                         );
                         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic trait template: {} from module: {}", trait_decl->name(), module_name);
+                    }
+                }
+                else if (auto alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(decl))
+                {
+                    // Register generic type aliases as templates
+                    if (alias_decl->is_generic() && _generic_registry)
+                    {
+                        TypeArena &arena = _ast_context.types();
+                        // Create a type alias type for the template
+                        TypeRef alias_type = arena.create_type_alias(
+                            QualifiedTypeName{ModuleID::invalid(), alias_decl->alias_name()},
+                            TypeRef{}  // Target will be resolved during instantiation
+                        );
+
+                        std::vector<GenericParam> params;
+                        for (size_t i = 0; i < alias_decl->generic_params().size(); ++i)
+                        {
+                            const std::string &param_name = alias_decl->generic_params()[i];
+                            TypeRef param_type = arena.create_generic_param(param_name, i);
+                            params.emplace_back(param_name, i, param_type);
+                        }
+                        _generic_registry->register_template(alias_type, params,
+                            ModuleID::invalid(), alias_decl, alias_decl->alias_name());
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic type alias '{}' in GenericRegistry with {} params",
+                            alias_decl->alias_name(), params.size());
                     }
                 }
                 // Process implementation blocks to register method return types

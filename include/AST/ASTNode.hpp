@@ -1576,7 +1576,11 @@ namespace Cryo
         // Core type system - NO STRING OPERATIONS
         TypeRef _resolved_target_type; // Primary target type storage
 
+        // Type annotation for deferred resolution (like struct fields have)
+        std::unique_ptr<TypeAnnotation> _target_type_annotation;
+
     public:
+        // Constructor with resolved TypeRef (when type can be resolved at parse time)
         TypeAliasDeclarationNode(SourceLocation loc, std::string alias_name,
                                  TypeRef target_type = TypeRef{},
                                  std::vector<std::string> generic_params = {})
@@ -1584,9 +1588,26 @@ namespace Cryo
               _alias_name(std::move(alias_name)), _resolved_target_type(target_type),
               _generic_params(std::move(generic_params)) {}
 
+        // Constructor with TypeAnnotation for deferred resolution (preferred when type can't be resolved at parse time)
+        TypeAliasDeclarationNode(SourceLocation loc, std::string alias_name,
+                                 std::unique_ptr<TypeAnnotation> target_annotation,
+                                 std::vector<std::string> generic_params = {})
+            : DeclarationNode(NodeKind::TypeAliasDeclaration, loc),
+              _alias_name(std::move(alias_name)),
+              _target_type_annotation(std::move(target_annotation)),
+              _generic_params(std::move(generic_params)) {}
+
         const std::string &alias_name() const { return _alias_name; }
         const std::vector<std::string> &generic_params() const { return _generic_params; }
         bool is_generic() const { return !_generic_params.empty(); }
+
+        // Target type annotation access (for deferred resolution)
+        const TypeAnnotation *target_type_annotation() const { return _target_type_annotation.get(); }
+        bool has_target_type_annotation() const { return _target_type_annotation != nullptr; }
+        void set_target_type_annotation(std::unique_ptr<TypeAnnotation> annotation)
+        {
+            _target_type_annotation = std::move(annotation);
+        }
 
         // Core type system access - PREFERRED
         TypeRef get_resolved_target_type() const { return _resolved_target_type; }

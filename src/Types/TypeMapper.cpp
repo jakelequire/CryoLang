@@ -1209,6 +1209,25 @@ namespace Cryo
             return f64_type();
         if (name == "string")
             return string_type();
+        if (name == "i128")
+            return i128_type();
+        if (name == "u128")
+            return i128_type(); // u128 uses same LLVM type as i128
+
+        // Handle pointer types (e.g., "void*", "string*", "u8*", "WorkerData*")
+        if (name.size() > 1 && name.back() == '*')
+        {
+            std::string base_name = name.substr(0, name.size() - 1);
+            // For void*, string*, and other primitive pointer types, return opaque ptr
+            if (base_name == "void" || base_name == "string" || base_name == "u8" ||
+                base_name == "i8" || base_name == "char")
+            {
+                return ptr_type();
+            }
+            // For user-defined types like "WorkerData*", also return opaque ptr
+            // The actual type will be handled through struct lookup
+            return ptr_type();
+        }
 
         return nullptr;
     }

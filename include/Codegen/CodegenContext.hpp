@@ -422,6 +422,11 @@ namespace Cryo::Codegen
         // Value: return type as Cryo::Type*
         std::unordered_map<std::string, TypeRef> _method_return_types;
 
+        // Type alias to base type name mapping
+        // Key: alias name (e.g., "IoResult")
+        // Value: base type name (e.g., "Result")
+        std::unordered_map<std::string, std::string> _type_alias_base_map;
+
     public:
         //===================================================================
         // Struct Field Index API
@@ -514,6 +519,71 @@ namespace Cryo::Codegen
         bool has_method_return_type(const std::string &qualified_method_name) const
         {
             return _method_return_types.find(qualified_method_name) != _method_return_types.end();
+        }
+
+        //===================================================================
+        // Type Alias Resolution API
+        //===================================================================
+
+        /**
+         * @brief Register a type alias mapping to its base type
+         * @param alias_name The alias name (e.g., "IoResult")
+         * @param base_type_name The base type name (e.g., "Result")
+         */
+        void register_type_alias_base(const std::string &alias_name, const std::string &base_type_name)
+        {
+            _type_alias_base_map[alias_name] = base_type_name;
+        }
+
+        /**
+         * @brief Get the base type name for a type alias
+         * @param alias_name The alias name to look up
+         * @return The base type name, or empty string if not a known alias
+         */
+        std::string get_type_alias_base(const std::string &alias_name) const
+        {
+            // First check local map (from TypeCodegen)
+            auto it = _type_alias_base_map.find(alias_name);
+            if (it != _type_alias_base_map.end())
+                return it->second;
+            // Then check global ModuleTypeRegistry (from TypeResolutionPass)
+            return _symbols.modules().get_type_alias_base(alias_name);
+        }
+
+        /**
+         * @brief Check if a name is a registered type alias
+         * @param name The name to check
+         * @return true if it's a known type alias
+         */
+        bool is_type_alias(const std::string &name) const
+        {
+            // Check both local and global registries
+            return _type_alias_base_map.find(name) != _type_alias_base_map.end() ||
+                   _symbols.modules().is_type_alias(name);
+        }
+
+        /**
+         * @brief Resolve a type name through aliases to get the base type
+         * @param name The type name (may be an alias or base type)
+         * @return The resolved base type name (returns input if not an alias)
+         */
+        std::string resolve_type_alias(const std::string &name) const
+        {
+            // First check local map
+            auto it = _type_alias_base_map.find(name);
+            if (it != _type_alias_base_map.end())
+            {
+                // Recursively resolve in case of chained aliases
+                return resolve_type_alias(it->second);
+            }
+            // Then check global ModuleTypeRegistry
+            std::string global_result = _symbols.modules().resolve_type_alias(name);
+            if (global_result != name)
+            {
+                // Recursively resolve in case of chained aliases
+                return resolve_type_alias(global_result);
+            }
+            return name;
         }
     };
 

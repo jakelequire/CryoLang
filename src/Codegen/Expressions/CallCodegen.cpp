@@ -934,7 +934,16 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating enum variant: {}::{}", enum_name, variant_name);
 
-        std::string qualified_variant = enum_name + "::" + variant_name;
+        // Resolve type alias to base enum name (e.g., IoResult -> Result)
+        std::string resolved_enum_name = ctx().resolve_type_alias(enum_name);
+        if (resolved_enum_name != enum_name)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_enum_variant: Resolved type alias '{}' -> '{}'",
+                      enum_name, resolved_enum_name);
+        }
+
+        std::string qualified_variant = resolved_enum_name + "::" + variant_name;
 
         // Generate arguments
         auto args = generate_arguments(node->arguments());
@@ -970,8 +979,8 @@ namespace Cryo::Codegen
             }
         }
 
-        // Look up the enum type to check if it exists
-        llvm::Type *enum_type = ctx().get_type(enum_name);
+        // Look up the enum type to check if it exists (use resolved name)
+        llvm::Type *enum_type = ctx().get_type(resolved_enum_name);
 
         // For cross-module enum variant calls with payloads, create an extern declaration
         // This handles cases where the enum is defined in another module
@@ -1007,7 +1016,7 @@ namespace Cryo::Codegen
                 // Create tagged union: { i32 discriminant, [max_payload x i8] payload }
                 llvm::Type *disc_type = llvm::Type::getInt32Ty(llvm_ctx());
                 llvm::Type *payload_type = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload);
-                std::string struct_name = enum_name + "_placeholder";
+                std::string struct_name = resolved_enum_name + "_placeholder";
                 enum_type = llvm::StructType::create(llvm_ctx(), {disc_type, payload_type}, struct_name);
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1032,7 +1041,7 @@ namespace Cryo::Codegen
         if (!enum_type)
         {
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
-                         "Unknown enum type: " + enum_name);
+                         "Unknown enum type: " + resolved_enum_name);
             return nullptr;
         }
 
@@ -2368,6 +2377,16 @@ namespace Cryo::Codegen
 
     bool CallCodegen::is_enum_type(const std::string &name) const
     {
+        // First check if this is a type alias and resolve to base type
+        std::string resolved_name = ctx().resolve_type_alias(name);
+        if (resolved_name != name)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "is_enum_type: '{}' is alias for '{}', checking base type", name, resolved_name);
+            // Recursively check if the base type is an enum
+            return is_enum_type(resolved_name);
+        }
+
         // First try direct lookup in symbol table with the unqualified name
         Symbol *direct_sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(name);
         if (direct_sym && direct_sym->kind == SymbolKind::Type && direct_sym->type.is_valid())
