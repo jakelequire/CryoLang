@@ -20,6 +20,27 @@ namespace Cryo
 
         LOG_DEBUG(Cryo::LogComponent::AST, "Registering class template: {} from module: {}", base_name, module_namespace);
 
+        // Check if this template is already registered with a more specific namespace
+        // Templates from imported modules (with longer/more specific namespaces) take precedence
+        auto existing = _templates.find(base_name);
+        if (existing != _templates.end())
+        {
+            // If the existing template has a more specific namespace (contains more ::),
+            // don't overwrite it with a less specific one
+            size_t existing_depth = std::count(existing->second.module_namespace.begin(),
+                                               existing->second.module_namespace.end(), ':');
+            size_t new_depth = std::count(module_namespace.begin(), module_namespace.end(), ':');
+
+            if (existing_depth > new_depth)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST,
+                          "Skipping registration of class template '{}' with namespace '{}' - "
+                          "already registered with more specific namespace '{}'",
+                          base_name, module_namespace, existing->second.module_namespace);
+                return;
+            }
+        }
+
         // Extract generic parameter names to avoid pointer issues
         std::vector<std::string> param_names;
         for (const auto &param : template_node->generic_parameters())
@@ -89,6 +110,24 @@ namespace Cryo
 
         LOG_DEBUG(Cryo::LogComponent::AST, "Registering struct template: {} from module: {}", base_name, module_namespace);
 
+        // Check if this template is already registered with a more specific namespace
+        auto existing = _templates.find(base_name);
+        if (existing != _templates.end())
+        {
+            size_t existing_depth = std::count(existing->second.module_namespace.begin(),
+                                               existing->second.module_namespace.end(), ':');
+            size_t new_depth = std::count(module_namespace.begin(), module_namespace.end(), ':');
+
+            if (existing_depth > new_depth)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST,
+                          "Skipping registration of struct template '{}' with namespace '{}' - "
+                          "already registered with more specific namespace '{}'",
+                          base_name, module_namespace, existing->second.module_namespace);
+                return;
+            }
+        }
+
         // Extract parameter names before any potential pointer corruption
         std::vector<std::string> param_names;
         for (const auto &param : template_node->generic_parameters())
@@ -155,6 +194,24 @@ namespace Cryo
 
         LOG_DEBUG(Cryo::LogComponent::AST, "Registering enum template: {} from module: {}", base_name, module_namespace);
 
+        // Check if this template is already registered with a more specific namespace
+        auto existing = _templates.find(base_name);
+        if (existing != _templates.end())
+        {
+            size_t existing_depth = std::count(existing->second.module_namespace.begin(),
+                                               existing->second.module_namespace.end(), ':');
+            size_t new_depth = std::count(module_namespace.begin(), module_namespace.end(), ':');
+
+            if (existing_depth > new_depth)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST,
+                          "Skipping registration of enum template '{}' with namespace '{}' - "
+                          "already registered with more specific namespace '{}'",
+                          base_name, module_namespace, existing->second.module_namespace);
+                return;
+            }
+        }
+
         // Extract generic parameter names to avoid pointer issues
         std::vector<std::string> param_names;
         for (const auto &param : template_node->generic_parameters())
@@ -189,6 +246,24 @@ namespace Cryo
 
         LOG_DEBUG(Cryo::LogComponent::AST, "Registering function template: {} from module: {}", base_name, module_namespace);
 
+        // Check if this template is already registered with a more specific namespace
+        auto existing = _templates.find(base_name);
+        if (existing != _templates.end())
+        {
+            size_t existing_depth = std::count(existing->second.module_namespace.begin(),
+                                               existing->second.module_namespace.end(), ':');
+            size_t new_depth = std::count(module_namespace.begin(), module_namespace.end(), ':');
+
+            if (existing_depth > new_depth)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST,
+                          "Skipping registration of function template '{}' with namespace '{}' - "
+                          "already registered with more specific namespace '{}'",
+                          base_name, module_namespace, existing->second.module_namespace);
+                return;
+            }
+        }
+
         _templates[base_name] = std::move(TemplateInfo(template_node, module_namespace, source_file));
     }
 
@@ -207,6 +282,24 @@ namespace Cryo
         }
 
         LOG_DEBUG(Cryo::LogComponent::AST, "Registering trait template: {} from module: {}", base_name, module_namespace);
+
+        // Check if this template is already registered with a more specific namespace
+        auto existing = _templates.find(base_name);
+        if (existing != _templates.end())
+        {
+            size_t existing_depth = std::count(existing->second.module_namespace.begin(),
+                                               existing->second.module_namespace.end(), ':');
+            size_t new_depth = std::count(module_namespace.begin(), module_namespace.end(), ':');
+
+            if (existing_depth > new_depth)
+            {
+                LOG_DEBUG(Cryo::LogComponent::AST,
+                          "Skipping registration of trait template '{}' with namespace '{}' - "
+                          "already registered with more specific namespace '{}'",
+                          base_name, module_namespace, existing->second.module_namespace);
+                return;
+            }
+        }
 
         // Extract generic parameter names to avoid pointer issues
         std::vector<std::string> param_names;

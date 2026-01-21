@@ -1576,6 +1576,79 @@ namespace Cryo::Codegen
                                         }
                                     }
                                 }
+                                // Handle nested member access (e.g., this.args in this.args.get())
+                                else if (auto *nested_member = dynamic_cast<MemberAccessNode *>(inner_callee->object()))
+                                {
+                                    std::string nested_field_name = nested_member->member();
+                                    std::string nested_parent_type;
+
+                                    // Get the parent object's type (e.g., 'this' -> Command)
+                                    if (auto *nested_parent_id = dynamic_cast<IdentifierNode *>(nested_member->object()))
+                                    {
+                                        if (nested_parent_id->name() == "this")
+                                        {
+                                            nested_parent_type = ctx().current_type_name();
+                                        }
+                                        else
+                                        {
+                                            auto &var_types = ctx().variable_types_map();
+                                            auto it = var_types.find(nested_parent_id->name());
+                                            if (it != var_types.end() && it->second.is_valid())
+                                            {
+                                                nested_parent_type = it->second->display_name();
+                                                if (!nested_parent_type.empty() && nested_parent_type.back() == '*')
+                                                {
+                                                    nested_parent_type.pop_back();
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Look up the field type using TemplateRegistry
+                                    if (!nested_parent_type.empty())
+                                    {
+                                        auto type_candidates = generate_lookup_candidates(nested_parent_type, Cryo::SymbolKind::Type);
+                                        if (auto *template_reg = ctx().template_registry())
+                                        {
+                                            for (const auto &candidate : type_candidates)
+                                            {
+                                                const TemplateRegistry::StructFieldInfo *field_info = template_reg->get_struct_field_types(candidate);
+                                                if (field_info)
+                                                {
+                                                    for (size_t i = 0; i < field_info->field_names.size(); ++i)
+                                                    {
+                                                        if (field_info->field_names[i] == nested_field_name && i < field_info->field_types.size())
+                                                        {
+                                                            TypeRef field_type = field_info->field_types[i];
+                                                            if (field_type.is_valid())
+                                                            {
+                                                                inner_receiver_type = field_type->display_name();
+                                                                if (field_type->kind() == Cryo::TypeKind::Pointer)
+                                                                {
+                                                                    auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(field_type.get());
+                                                                    if (ptr_type && ptr_type->pointee().is_valid())
+                                                                    {
+                                                                        inner_receiver_type = ptr_type->pointee()->display_name();
+                                                                    }
+                                                                }
+                                                                else if (!inner_receiver_type.empty() && inner_receiver_type.back() == '*')
+                                                                {
+                                                                    inner_receiver_type.pop_back();
+                                                                }
+                                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                                          "Chained call: resolved nested member '{}.{}' to type '{}'",
+                                                                          nested_parent_type, nested_field_name, inner_receiver_type);
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                    if (!inner_receiver_type.empty())
+                                                        break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 else if (inner_callee->object()->has_resolved_type())
                                 {
                                     TypeRef inner_obj_type = inner_callee->object()->get_resolved_type();
@@ -1639,6 +1712,79 @@ namespace Cryo::Codegen
                                               "Chained call fallback: Could not find inner method '{}.{}'",
                                               inner_receiver_type, inner_method_name);
                                 }
+                            }
+                        }
+                        // Handle static method calls (e.g., Instant::now() in Instant::now().ge())
+                        else if (auto *scope_callee = dynamic_cast<ScopeResolutionNode *>(call_expr->callee()))
+                        {
+                            std::string static_type_name = scope_callee->scope_name();
+                            std::string static_method_name = scope_callee->member_name();
+
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Chained call: inner call is static method {}::{}",
+                                      static_type_name, static_method_name);
+
+                            // Try to find the static method's LLVM function
+                            llvm::Function *static_method = resolve_method_by_name(static_type_name, static_method_name);
+                            if (static_method)
+                            {
+                                llvm::Type *ret_type = static_method->getReturnType();
+                                if (ret_type && !ret_type->isVoidTy())
+                                {
+                                    if (ret_type->isStructTy())
+                                    {
+                                        llvm::StructType *struct_type = llvm::cast<llvm::StructType>(ret_type);
+                                        if (struct_type->hasName())
+                                        {
+                                            type_name = struct_type->getName().str();
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "Resolved static method return type from LLVM: {}::{}() -> {}",
+                                                      static_type_name, static_method_name, type_name);
+                                        }
+                                    }
+                                    else if (ret_type->isPointerTy())
+                                    {
+                                        // For pointer returns, the type name is the static type itself
+                                        // (static methods returning Self* or similar)
+                                        type_name = static_type_name;
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "Chained call: static method returns pointer, using type '{}'",
+                                                  type_name);
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                // Try template registry as fallback
+                                auto *template_reg = ctx().template_registry();
+                                if (template_reg)
+                                {
+                                    // Generate candidates for the static type
+                                    auto type_candidates = generate_lookup_candidates(static_type_name, Cryo::SymbolKind::Type);
+                                    for (const auto &candidate : type_candidates)
+                                    {
+                                        const TemplateRegistry::TemplateMethodInfo *method_info =
+                                            template_reg->get_template_method_info(static_type_name);
+                                        if (method_info)
+                                        {
+                                            const TemplateRegistry::MethodMetadata *meta =
+                                                template_reg->find_template_method(static_type_name, static_method_name);
+                                            if (meta && !meta->return_type_annotation.empty())
+                                            {
+                                                // The return type annotation tells us what type is returned
+                                                type_name = meta->return_type_annotation;
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "Resolved static method return from template: {}::{}() -> {}",
+                                                          static_type_name, static_method_name, type_name);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "Chained call: Could not find static method {}::{}",
+                                          static_type_name, static_method_name);
                             }
                         }
                     }
