@@ -231,7 +231,60 @@ namespace Cryo
         size_t resolved_count = 0;
         size_t error_count = 0;
 
-        // Walk the AST and resolve type annotations
+        // === PHASE 1: Pre-register ALL types in ModuleTypeRegistry ===
+        // This ensures forward references work (e.g., Layout using LayoutExtend before it's defined)
+        LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: Phase 1 - Pre-registering all types for forward reference support");
+        for (auto &stmt : program->statements())
+        {
+            // Pre-register struct types
+            if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(stmt.get()))
+            {
+                TypeRef struct_type = symbols->lookup_struct_type(struct_decl->name());
+                if (struct_type.is_valid())
+                {
+                    module_registry.register_type(res_ctx.current_module, struct_decl->name(), struct_type);
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "TypeResolutionPass: Pre-registered struct '{}' in module registry",
+                        struct_decl->name());
+                }
+            }
+            // Pre-register class types
+            else if (auto *class_decl = dynamic_cast<ClassDeclarationNode *>(stmt.get()))
+            {
+                TypeRef class_type = symbols->lookup_class_type(class_decl->name());
+                if (class_type.is_valid())
+                {
+                    module_registry.register_type(res_ctx.current_module, class_decl->name(), class_type);
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "TypeResolutionPass: Pre-registered class '{}' in module registry",
+                        class_decl->name());
+                }
+            }
+            // Pre-register enum types
+            else if (auto *enum_decl = dynamic_cast<EnumDeclarationNode *>(stmt.get()))
+            {
+                TypeRef enum_type = symbols->lookup_enum_type(enum_decl->name());
+                if (enum_type.is_valid())
+                {
+                    module_registry.register_type(res_ctx.current_module, enum_decl->name(), enum_type);
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "TypeResolutionPass: Pre-registered enum '{}' in module registry",
+                        enum_decl->name());
+                }
+            }
+            // Pre-register type aliases
+            else if (auto *alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(stmt.get()))
+            {
+                // Type aliases need to be resolved first, but we can at least log them
+                LOG_DEBUG(LogComponent::GENERAL,
+                    "TypeResolutionPass: Found type alias '{}' (will resolve in phase 2)",
+                    alias_decl->alias_name());
+            }
+        }
+        LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: Phase 1 complete - all types pre-registered");
+
+        // === PHASE 2: Resolve all type annotations ===
+        LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: Phase 2 - Resolving type annotations");
         for (auto &stmt : program->statements())
         {
             // Handle implement blocks
