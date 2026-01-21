@@ -171,6 +171,9 @@ namespace Cryo
     X(E0639_INVALID_CLASS_INSTANTIATION, 639)       \
     X(E0640_INVALID_ENUM_VARIANT_ACCESS, 640)       \
     X(E0641_NULL_CAST_EXPRESSION, 641)              \
+    X(E0642_PARAM_TYPE_ERROR, 642)                  \
+    X(E0643_RETURN_TYPE_ERROR, 643)                 \
+    X(E0644_FIELD_TYPE_ERROR, 644)                  \
                                                     \
     /* Linker Errors (E0700-E0799) */               \
     X(E0700_LINK_ERROR, 700)                        \

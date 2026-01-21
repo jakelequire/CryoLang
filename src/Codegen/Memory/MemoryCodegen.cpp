@@ -151,6 +151,8 @@ namespace Cryo::Codegen
         if (!malloc_fn)
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "create_heap_alloc: could not get malloc");
+            report_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                        "Internal error: could not get malloc function for heap allocation");
             return nullptr;
         }
 
@@ -178,6 +180,8 @@ namespace Cryo::Codegen
         if (!malloc_fn)
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "create_heap_array_alloc: could not get malloc");
+            report_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                        "Internal error: could not get malloc function for array allocation");
             return nullptr;
         }
 
@@ -196,6 +200,8 @@ namespace Cryo::Codegen
         if (!free_fn)
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "create_heap_free: could not get free");
+            report_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                        "Internal error: could not get free function for heap deallocation");
             return;
         }
 
@@ -216,6 +222,8 @@ namespace Cryo::Codegen
         if (!realloc_fn)
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "create_heap_realloc: could not get realloc");
+            report_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                        "Internal error: could not get realloc function for heap reallocation");
             return nullptr;
         }
 

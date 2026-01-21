@@ -72,6 +72,8 @@ namespace Cryo::Codegen
         if (!base)
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unknown generic base type: {}", base_type);
+            report_error(ErrorCode::E0637_INVALID_GENERIC_INSTANTIATION,
+                        "Unknown generic base type: " + base_type);
             return nullptr;
         }
 
@@ -591,6 +593,10 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "TypeCodegen: Skipping struct '{}' - field '{}' has error type: '{}'",
                           name, field->name(), field_type->display_name());
+                // Emit actual error so it shows up in diagnostics
+                report_error(ErrorCode::E0644_FIELD_TYPE_ERROR, node,
+                            "Struct '" + name + "' field '" + field->name() +
+                            "' has unresolved type: " + field_type->display_name());
                 return nullptr;
             }
         }

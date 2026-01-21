@@ -2726,6 +2726,8 @@ namespace Cryo::Codegen
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
                       "Unknown runtime function '{}' - cannot create declaration", unqualified_name);
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                        "Unknown runtime function '" + unqualified_name + "' - cannot create declaration");
             return nullptr;
         }
 
