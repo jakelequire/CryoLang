@@ -2973,6 +2973,8 @@ namespace Cryo::Codegen
             if (!initializer || !initializer->value())
             {
                 LOG_WARN(Cryo::LogComponent::CODEGEN, "Null field initializer at index {}", i);
+                report_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION, node,
+                            "Null field initializer at index " + std::to_string(i) + " in struct '" + type_name + "'");
                 continue;
             }
 
@@ -2984,6 +2986,8 @@ namespace Cryo::Codegen
             {
                 LOG_WARN(Cryo::LogComponent::CODEGEN,
                          "Field '{}' not found in struct '{}', skipping", field_name, type_name);
+                report_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION, node,
+                            "Field '" + field_name + "' not found in struct '" + type_name + "'");
                 continue;
             }
 
@@ -2993,6 +2997,9 @@ namespace Cryo::Codegen
                 LOG_WARN(Cryo::LogComponent::CODEGEN,
                          "Field index {} out of bounds for struct '{}' with {} elements",
                          field_idx, type_name, st->getNumElements());
+                report_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION, node,
+                            "Field index " + std::to_string(field_idx) + " out of bounds for struct '" +
+                            type_name + "' with " + std::to_string(st->getNumElements()) + " elements");
                 continue;
             }
 
@@ -3001,6 +3008,8 @@ namespace Cryo::Codegen
             {
                 LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to generate struct field {}",
                          field_name);
+                report_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION, node,
+                            "Failed to generate value for field '" + field_name + "' in struct '" + type_name + "'");
                 continue;
             }
 

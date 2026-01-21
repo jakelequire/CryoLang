@@ -322,8 +322,10 @@ namespace Cryo::Codegen
         if (!target || !value_node)
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                     "Assignment: Null target or value_node: target={}, value_node={}", 
+                     "Assignment: Null target or value_node: target={}, value_node={}",
                      (void*)target, (void*)value_node);
+            report_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                        "Assignment generation received null target or value node");
             return nullptr;
         }
 
