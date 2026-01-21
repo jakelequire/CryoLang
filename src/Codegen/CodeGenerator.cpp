@@ -175,6 +175,12 @@ namespace Cryo::Codegen
     {
         _has_errors = true;
         _last_error = message;
+        // Emit to central diagnostic system
+        if (_diagnostics)
+        {
+            _diagnostics->emit(Diag::error(ErrorCode::E0600_CODEGEN_FAILED, message));
+        }
+        LOG_ERROR(Cryo::LogComponent::CODEGEN, "CodeGenerator error: {}", message);
     }
 
     //===================================================================

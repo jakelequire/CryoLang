@@ -18,6 +18,7 @@ namespace Cryo
     class CompilerInstance;
     class ASTContext;
     class GenericRegistry;
+    class DiagEmitter;
 
     /**
      * @brief Handles module loading and import resolution for the Cryo compiler
@@ -44,6 +45,7 @@ namespace Cryo
         TemplateRegistry &_template_registry;                          // Reference to template registry for cross-module templates
         ASTContext &_ast_context;                                      // Reference to main AST context for type consistency
         GenericRegistry *_generic_registry = nullptr;                  // Optional reference to new type system generic registry
+        DiagEmitter *_diagnostics = nullptr;                           // Optional reference to diagnostic emitter for error reporting
 
         // Storage for imported ASTs to keep them alive for template registration
         std::unordered_map<std::string, std::unique_ptr<ProgramNode>> _imported_asts;
@@ -69,6 +71,12 @@ namespace Cryo
          * @param registry Pointer to the GenericRegistry
          */
         void set_generic_registry(GenericRegistry *registry) { _generic_registry = registry; }
+
+        /**
+         * @brief Set the diagnostic emitter for error reporting
+         * @param diagnostics Pointer to the DiagEmitter
+         */
+        void set_diagnostics(DiagEmitter *diagnostics) { _diagnostics = diagnostics; }
 
         /**
          * @brief Auto-detect and set the standard library root directory

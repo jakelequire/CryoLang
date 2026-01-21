@@ -59,11 +59,10 @@ namespace Cryo
         // Update the PassContext with the newly created AST root
         ctx.set_ast_root(_compiler.ast_root());
 
-        // Check if parsing produced any errors
-        if (ctx.has_errors())
-        {
-            return PassResult::failure();
-        }
+        // Note: We don't check ctx.has_errors() here because in stdlib compilation mode,
+        // errors accumulate across modules. If THIS module's parsing failed,
+        // run_parsing_phase() already returned false above. Checking has_errors()
+        // would cause all modules after the first failure to fail immediately.
 
         LOG_DEBUG(LogComponent::GENERAL, "ParsingPass: AST successfully created");
         return PassResult::ok({PassProvides::AST});

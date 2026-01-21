@@ -1270,8 +1270,8 @@ namespace Cryo::Codegen
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
                       "Binary generation returned null! File: {}, Line: {} : {}, Operator: {}",
                       node.source_file(), node.location().line(), node.location().column(),
-                        node.operator_token().text());
-            report_error("Binary expression generation failed for operator '" + node.operator_token().text() + "'", &node);
+                      node.operator_token().text());
+            report_error("Binary expression generation failed for operator '" + std::string(node.operator_token().text()) + "'", &node);
         }
     }
 
@@ -1501,6 +1501,8 @@ namespace Cryo::Codegen
         _last_error = message;
         _errors.push_back(message);
         LOG_ERROR(Cryo::LogComponent::CODEGEN, "CodegenVisitor error: {}", message);
+        // Emit to central diagnostic system
+        _ctx->report_error(ErrorCode::E0600_CODEGEN_FAILED, message);
     }
 
     void CodegenVisitor::report_error(const std::string &message, Cryo::ASTNode *node)

@@ -10,6 +10,7 @@
 #include "Types/UserDefinedTypes.hpp"
 #include "Types/GenericRegistry.hpp"
 #include "Types/GenericTypes.hpp"
+#include "Diagnostics/Diag.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -239,6 +240,10 @@ namespace Cryo
             ImportResult result;
             result.success = false;
             result.error_message = "Circular import dependency detected for: " + import_path;
+            if (_diagnostics)
+            {
+                _diagnostics->emit(Diag::error(ErrorCode::E0501_CIRCULAR_IMPORT, result.error_message));
+            }
             return result;
         }
 
@@ -342,6 +347,10 @@ namespace Cryo
         {
             result.success = false;
             result.error_message = "Import file not found: " + import_path + " (resolved to: " + file_path + ")";
+            if (_diagnostics)
+            {
+                _diagnostics->emit(Diag::error(ErrorCode::E0500_MODULE_NOT_FOUND, result.error_message));
+            }
             return result;
         }
 
@@ -355,6 +364,10 @@ namespace Cryo
             {
                 result.success = false;
                 result.error_message = "Failed to create File object for: " + file_path;
+                if (_diagnostics)
+                {
+                    _diagnostics->emit(Diag::error(ErrorCode::E0502_INVALID_IMPORT, result.error_message));
+                }
                 return result;
             }
 
@@ -379,6 +392,10 @@ namespace Cryo
             {
                 result.success = false;
                 result.error_message = "Failed to parse import file: " + import_path;
+                if (_diagnostics)
+                {
+                    _diagnostics->emit(Diag::error(ErrorCode::E0502_INVALID_IMPORT, result.error_message));
+                }
                 return result;
             }
 
@@ -433,6 +450,10 @@ namespace Cryo
         {
             result.success = false;
             result.error_message = "Exception while loading import '" + import_path + "': " + e.what();
+            if (_diagnostics)
+            {
+                _diagnostics->emit(Diag::error(ErrorCode::E0502_INVALID_IMPORT, result.error_message));
+            }
             return result;
         }
     }
