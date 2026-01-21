@@ -171,7 +171,9 @@ namespace Cryo
             {
                 result.errors_emitted = diag->error_count() - errors_before;
                 result.warnings_emitted = diag->warning_count() - warnings_before;
-                result.success = !diag->has_errors();
+                // Check if THIS pass emitted errors, not total accumulated errors
+                // This is critical for stdlib compilation where errors accumulate across modules
+                result.success = (result.errors_emitted == 0);
             }
             else
             {
