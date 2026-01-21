@@ -358,7 +358,15 @@ namespace Cryo
         auto tmpl = get_template(generic_type);
         if (!tmpl)
         {
-            return TypeSubstitution();
+            // TypeID mismatch - try looking up by name instead
+            if (generic_type.is_valid())
+            {
+                tmpl = get_template_by_name(generic_type->display_name());
+            }
+            if (!tmpl)
+            {
+                return TypeSubstitution();
+            }
         }
 
         return TypeSubstitution(*tmpl, type_args);
@@ -378,11 +386,20 @@ namespace Cryo
         auto tmpl = get_template(generic_type);
         if (!tmpl)
         {
-            if (error_msg)
+            // TypeID mismatch - try looking up by name instead
+            // This handles cases where the same type was registered with a different module ID
+            if (generic_type.is_valid())
             {
-                *error_msg = "not a generic type";
+                tmpl = get_template_by_name(generic_type->display_name());
             }
-            return false;
+            if (!tmpl)
+            {
+                if (error_msg)
+                {
+                    *error_msg = "not a generic type";
+                }
+                return false;
+            }
         }
 
         // Check argument count

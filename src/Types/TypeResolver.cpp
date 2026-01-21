@@ -7,10 +7,12 @@
 #include "Types/PrimitiveTypes.hpp"
 #include "Types/CompoundTypes.hpp"
 #include "Types/UserDefinedTypes.hpp"
+#include "AST/ASTNode.hpp"
 #include "Utils/Logger.hpp"
 
 #include <sstream>
 #include <cctype>
+#include <regex>
 
 namespace Cryo
 {
@@ -401,14 +403,82 @@ namespace Cryo
         }
 
         // Check if base is a registered generic template
-        if (!_generic_registry.is_template(base_type))
+        // First try direct ID lookup
+        std::string base_name = base_type->display_name();
+        std::optional<GenericTemplate> template_info;
+
+        if (_generic_registry.is_template(base_type))
         {
-            return make_error("'" + base_type->display_name() + "' is not a generic type",
-                              ctx.current_location);
+            template_info = _generic_registry.get_template(base_type);
+        }
+        else
+        {
+            // TypeID mismatch - try looking up by name instead
+            // This handles cases where the same type was registered with a different module ID
+            // (e.g., registered with ModuleID::invalid() but resolved with actual module ID)
+            template_info = _generic_registry.get_template_by_name(base_name);
+            if (template_info)
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                    "TypeResolver: Found template '{}' by name lookup (TypeID mismatch)", base_name);
+            }
+            else
+            {
+                return make_error("'" + base_name + "' is not a generic type",
+                                  ctx.current_location);
+            }
         }
 
-        // Instantiate the generic type
-        return _generic_registry.instantiate(base_type, std::move(type_args), _arena);
+        // Check if this is a generic type alias - handle specially
+        // Only check if the generic_type is a TypeAlias kind (avoids dangerous dynamic_cast on potentially invalid pointers)
+        if (template_info && template_info->generic_type.is_valid() &&
+            template_info->generic_type->kind() == TypeKind::TypeAlias)
+        {
+            // Safe to check ast_node now since we know it's a type alias template
+            if (template_info->ast_node)
+            {
+                auto *alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(template_info->ast_node);
+                if (alias_decl && alias_decl->has_target_type_annotation())
+                {
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "TypeResolver: '{}' is a generic type alias, performing substitution", base_name);
+
+                    const TypeAnnotation *target_ann = alias_decl->target_type_annotation();
+                    std::string target_str = target_ann->to_string();
+
+                    // Substitute type parameters in the target string
+                    const auto &param_names = alias_decl->generic_params();
+                    if (param_names.size() != type_args.size())
+                    {
+                        return make_error("'" + base_name + "' expects " +
+                            std::to_string(param_names.size()) + " type argument(s), got " +
+                            std::to_string(type_args.size()), ctx.current_location);
+                    }
+
+                    // Perform substitution: replace each type parameter with its concrete type
+                    for (size_t i = 0; i < param_names.size(); ++i)
+                    {
+                        const std::string &param = param_names[i];
+                        std::string replacement = type_args[i]->display_name();
+
+                        // Replace whole-word occurrences of the parameter
+                        // Use regex for proper word boundary matching
+                        std::regex param_regex("\\b" + param + "\\b");
+                        target_str = std::regex_replace(target_str, param_regex, replacement);
+                    }
+
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "TypeResolver: Substituted type alias target: '{}'", target_str);
+
+                    // Resolve the substituted string as a type
+                    return resolve_named(target_str, ctx);
+                }
+            }
+        }
+
+        // For non-alias templates, use standard instantiation
+        TypeRef template_base = template_info ? template_info->generic_type : base_type;
+        return _generic_registry.instantiate(template_base, std::move(type_args), _arena);
     }
 
     bool TypeResolver::is_primitive_name(const std::string &name) const
