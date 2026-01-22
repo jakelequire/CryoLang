@@ -5,6 +5,7 @@
 
 #include "Types/TypeMapper.hpp"
 #include "Types/GenericRegistry.hpp"
+#include "Utils/Logger.hpp"
 
 #include <sstream>
 
@@ -905,7 +906,7 @@ namespace Cryo
             return existing;
         }
 
-        // Try instantiation callback
+        // Try instantiation callback (takes TypeRef base)
         if (_instantiation_callback)
         {
             TypeRef base = type->generic_base();
@@ -919,9 +920,23 @@ namespace Cryo
             }
         }
 
-        // Handle based on the generic base type
+        // Try generic instantiator callback (takes string name)
+        // This is wired to GenericCodegen::get_instantiated_type in CodegenVisitor
         TypeRef base = type->generic_base();
         const std::vector<TypeRef> &args = type->type_args();
+
+        if (_generic_instantiator && base.is_valid())
+        {
+            std::string base_name = base->display_name();
+            llvm::StructType *result = _generic_instantiator(base_name, args);
+            if (result && !result->isOpaque())
+            {
+                _struct_cache[name] = result;
+                return result;
+            }
+        }
+
+        // Handle based on the generic base type
 
         if (base.is_valid())
         {
@@ -1027,6 +1042,14 @@ namespace Cryo
         if (!field_types.empty())
         {
             st->setBody(field_types, false);
+            LOG_DEBUG(LogComponent::CODEGEN, "TypeMapper::map_instantiated_struct: Set body for '{}' with {} fields",
+                      name, field_types.size());
+        }
+        else
+        {
+            // Log warning - struct will remain opaque which will cause "GEP into unsized type" errors
+            LOG_WARN(LogComponent::CODEGEN, "TypeMapper::map_instantiated_struct: No fields found for '{}' - base_struct has {} fields, struct will remain opaque",
+                     name, base_struct->fields().size());
         }
 
         return st;

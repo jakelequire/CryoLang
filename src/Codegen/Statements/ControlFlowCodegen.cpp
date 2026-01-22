@@ -998,12 +998,53 @@ namespace Cryo::Codegen
         // Get pointer to payload (index 1 in the enum struct)
         llvm::Value *payload_ptr = builder().CreateStructGEP(struct_type, base_ptr, 1, "payload_ptr");
 
+        // Look up the EnumType to get the variant's actual payload types
+        std::vector<TypeRef> payload_types;
+        std::string enum_name = enum_pattern->enum_name();
+        std::string variant_name = enum_pattern->variant_name();
+
+        TypeRef enum_type_ref = ctx().symbols().arena().lookup_type_by_name(enum_name);
+        if (enum_type_ref.is_valid() && enum_type_ref->kind() == TypeKind::Enum)
+        {
+            auto *enum_type = static_cast<const EnumType *>(enum_type_ref.get());
+            if (const EnumVariant *variant = enum_type->get_variant(variant_name))
+            {
+                payload_types = variant->payload_types;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "bind_enum_pattern_variables: Found variant {}::{} with {} payload types",
+                          enum_name, variant_name, payload_types.size());
+            }
+        }
+        // Also check for instantiated enums like Option<Entry<String, i32>>
+        else if (enum_type_ref.is_valid() && enum_type_ref->kind() == TypeKind::InstantiatedType)
+        {
+            auto *inst_type = static_cast<const InstantiatedType *>(enum_type_ref.get());
+            TypeRef base = inst_type->generic_base();
+            if (base.is_valid() && base->kind() == TypeKind::Enum)
+            {
+                auto *enum_type = static_cast<const EnumType *>(base.get());
+                if (const EnumVariant *variant = enum_type->get_variant(variant_name))
+                {
+                    // Substitute generic params in payload types
+                    const auto &type_args = inst_type->type_args();
+                    for (const auto &pt : variant->payload_types)
+                    {
+                        TypeRef substituted = ctx().types().substitute_generic_param(pt, type_args);
+                        payload_types.push_back(substituted);
+                    }
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "bind_enum_pattern_variables: Found instantiated variant {}::{} with {} substituted payload types",
+                              enum_name, variant_name, payload_types.size());
+                }
+            }
+        }
+
         // Extract fields from payload for each binding
         // The payload is typically a byte array, and fields are at specific offsets
-        // For simplicity, we'll treat each binding as extracting from the payload sequentially
 
         size_t offset = 0;
         size_t binding_index = 0;
+        size_t payload_index = 0;
 
         for (const auto &element : elements)
         {
@@ -1014,7 +1055,30 @@ namespace Cryo::Codegen
                 {
                     // Skip wildcards
                     offset += 8; // Default pointer size
+                    payload_index++;
                     continue;
+                }
+
+                // Get the payload type for this binding if available
+                TypeRef payload_type_ref;
+                llvm::Type *field_type = nullptr;
+
+                if (payload_index < payload_types.size())
+                {
+                    payload_type_ref = payload_types[payload_index];
+                    field_type = ctx().types().map(payload_type_ref);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "bind_enum_pattern_variables: Binding '{}' has type '{}'",
+                              var_name, payload_type_ref.is_valid() ? payload_type_ref->display_name() : "unknown");
+                }
+
+                // Default to i64 if we couldn't determine the type
+                if (!field_type)
+                {
+                    field_type = llvm::Type::getInt64Ty(llvm_ctx());
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "bind_enum_pattern_variables: Binding '{}' defaulting to i64 (no type info)",
+                              var_name);
                 }
 
                 // Calculate pointer to this field in payload
@@ -1022,15 +1086,8 @@ namespace Cryo::Codegen
                 llvm::Type *i8_type = llvm::Type::getInt8Ty(llvm_ctx());
                 llvm::Value *field_ptr = builder().CreateConstGEP1_32(i8_type, payload_ptr, offset, var_name + "_ptr");
 
-                // For now, assume payload fields are pointer-sized (8 bytes) as a reasonable default
-                // A more complete implementation would look up the actual variant field types
-                llvm::Type *field_type = llvm::Type::getInt64Ty(llvm_ctx());
-
-                // Cast to pointer of the assumed type
-                llvm::Value *typed_ptr = field_ptr;
-
                 // Load the value
-                llvm::Value *field_value = builder().CreateLoad(field_type, typed_ptr, var_name + "_val");
+                llvm::Value *field_value = builder().CreateLoad(field_type, field_ptr, var_name + "_val");
 
                 // Create alloca and store
                 llvm::AllocaInst *alloca = create_entry_alloca(field_type, var_name);
@@ -1038,17 +1095,39 @@ namespace Cryo::Codegen
                 {
                     builder().CreateStore(field_value, alloca);
                     values().set_value(var_name, alloca, alloca, field_type);
+
+                    // Also register the TypeRef in variable_types_map for member resolution
+                    if (payload_type_ref.is_valid())
+                    {
+                        ctx().variable_types_map()[var_name] = payload_type_ref;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "bind_enum_pattern_variables: Registered TypeRef for '{}': {}",
+                                  var_name, payload_type_ref->display_name());
+                    }
+
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "bind_enum_pattern_variables: Bound '{}' from payload at offset {}",
                               var_name, offset);
                 }
 
-                offset += 8; // Default pointer/i64 size
+                // Compute offset for next field based on field type size
+                size_t field_size = field_type ? ctx().types().size_of(field_type) : 8;
+                offset += field_size;
+                payload_index++;
             }
             else if (element.is_wildcard())
             {
                 // Wildcard - skip this position
-                offset += 8;
+                if (payload_index < payload_types.size())
+                {
+                    llvm::Type *field_type = ctx().types().map(payload_types[payload_index]);
+                    offset += field_type ? ctx().types().size_of(field_type) : 8;
+                }
+                else
+                {
+                    offset += 8;
+                }
+                payload_index++;
             }
             else if (element.is_literal())
             {

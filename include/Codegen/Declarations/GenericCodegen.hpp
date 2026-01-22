@@ -276,6 +276,18 @@ namespace Cryo::Codegen
          * @return Substituted function type
          */
         llvm::FunctionType *create_substituted_function_type(Cryo::FunctionDeclarationNode *node);
+
+        /**
+         * @brief Ensure all dependent generic types are instantiated
+         *
+         * This recursively processes a type and triggers instantiation for any
+         * InstantiatedType it contains (including through pointers, references,
+         * arrays, etc.). This is necessary because LLVM 15+ opaque pointers don't
+         * trigger pointee type instantiation.
+         *
+         * @param type Type to process for dependent instantiations
+         */
+        void ensure_dependent_types_instantiated(TypeRef type);
     };
 
 } // namespace Cryo::Codegen

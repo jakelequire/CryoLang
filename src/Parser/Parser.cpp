@@ -1477,7 +1477,8 @@ namespace Cryo
 
         // Parse required colon and type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after variable name");
-        TypeRef var_type = parse_type_annotation();
+        std::string type_string;
+        TypeRef var_type = parse_type_annotation(&type_string);
 
         // Parse optional initializer
         std::unique_ptr<ExpressionNode> initializer = nullptr;
@@ -1492,7 +1493,13 @@ namespace Cryo
         // Determine if this is a global variable based on current scope
         bool is_global = is_global_scope();
 
-        auto var_decl = _builder.create_variable_declaration(start_loc, var_name, var_type, std::move(initializer), is_mutable, is_global);
+        // Create the variable declaration with the TypeAnnotation to preserve type info for resolution
+        auto type_annotation = std::make_unique<TypeAnnotation>(
+            TypeAnnotation::named(type_string, start_loc));
+        auto var_decl = _builder.create_variable_declaration(start_loc, var_name, std::move(type_annotation), std::move(initializer), is_mutable, is_global);
+
+        // Also set the resolved type (may be an error type for generic types, will be resolved later)
+        var_decl->set_resolved_type(var_type);
 
         // Debug: Log created variable declaration
         LOG_DEBUG(Cryo::LogComponent::PARSER, "VARDECL_DEBUG: Created VariableDeclarationNode for name='{}', node_ptr={}, stored_name='{}'",
@@ -1600,14 +1607,24 @@ namespace Cryo
 
         // Parse return type
         TypeRef return_type = _context.types().get_void();
+        std::string return_type_string = "void"; // Track the type string for TypeAnnotation
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
-            return_type = parse_type_annotation();
+            return_type = parse_type_annotation(&return_type_string);
         }
 
         // Update return type in the already created function declaration
         func_decl->set_resolved_return_type(return_type);
+
+        // Set the return type annotation from the captured type string
+        // This preserves the original type annotation (e.g., "Result<i8,ConversionError>") for later phases
+        if (!return_type_string.empty())
+        {
+            auto annotation = std::make_unique<TypeAnnotation>(
+                TypeAnnotation::named(return_type_string, start_loc));
+            func_decl->set_return_type_annotation(std::move(annotation));
+        }
 
         // Parse optional where clause
         if (_current_token.is(TokenKind::TK_KW_WHERE))
@@ -1682,14 +1699,24 @@ namespace Cryo
 
         // Parse return type
         TypeRef return_type = _context.types().get_void();
+        std::string return_type_string = "void"; // Track the type string for TypeAnnotation
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
-            return_type = parse_type_annotation();
+            return_type = parse_type_annotation(&return_type_string);
         }
 
         // Create function declaration with type information (extern functions are public by default)
         auto func_decl = _builder.create_function_declaration(start_loc, func_name, return_type, true);
+
+        // Set the return type annotation from the captured type string
+        // This preserves the original type annotation (e.g., "Result<i8,ConversionError>") for later phases
+        if (!return_type_string.empty())
+        {
+            auto annotation = std::make_unique<TypeAnnotation>(
+                TypeAnnotation::named(return_type_string, start_loc));
+            func_decl->set_return_type_annotation(std::move(annotation));
+        }
 
         // Attach documentation if available
         attach_documentation(func_decl.get());
@@ -3563,7 +3590,8 @@ namespace Cryo
             std::string var_name = std::string(name_token.text());
 
             consume(TokenKind::TK_COLON, "Expected ':' after variable name");
-            TypeRef var_type = parse_type_annotation();
+            std::string type_string;
+            TypeRef var_type = parse_type_annotation(&type_string);
 
             std::unique_ptr<ExpressionNode> initializer = nullptr;
             if (_current_token.is(TokenKind::TK_EQUAL))
@@ -3575,7 +3603,12 @@ namespace Cryo
             consume(TokenKind::TK_SEMICOLON, "Expected ';' after for-loop initializer");
 
             // For-loop variables are implicitly mutable
-            init = _builder.create_variable_declaration(var_loc, var_name, var_type, std::move(initializer), true, false);
+            // Create with TypeAnnotation to preserve type info for resolution
+            auto type_annotation = std::make_unique<TypeAnnotation>(
+                TypeAnnotation::named(type_string, var_loc));
+            init = _builder.create_variable_declaration(var_loc, var_name, std::move(type_annotation), std::move(initializer), true, false);
+            // Also set the resolved type (may be an error type for generic types)
+            init->set_resolved_type(var_type);
         }
         else
         {
@@ -3782,7 +3815,9 @@ namespace Cryo
                     else if (_current_token.is(TokenKind::TK_KW_IF) ||
                              _current_token.is(TokenKind::TK_KW_WHILE) ||
                              _current_token.is(TokenKind::TK_KW_FOR) ||
-                             _current_token.is(TokenKind::TK_KW_LOOP))
+                             _current_token.is(TokenKind::TK_KW_LOOP) ||
+                             _current_token.is(TokenKind::TK_KW_BREAK) ||
+                             _current_token.is(TokenKind::TK_KW_CONTINUE))
                     {
                         // Control flow statement - parse as statement
                         auto stmt = parse_statement();
@@ -4154,10 +4189,18 @@ namespace Cryo
 
         // Parse type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after parameter name");
-        TypeRef param_type = parse_type_annotation();
+        std::string type_string;
+        TypeRef param_type = parse_type_annotation(&type_string);
 
         // Create parameter as variable declaration (without initializer)
-        return _builder.create_variable_declaration(name_token.location(), param_name, param_type);
+        // Use TypeAnnotation to preserve type info for resolution
+        auto type_annotation = std::make_unique<TypeAnnotation>(
+            TypeAnnotation::named(type_string, name_token.location()));
+        // Parameters: loc, name, type_annotation, init (nullptr), is_mutable (true for params), is_global (false)
+        auto param_decl = _builder.create_variable_declaration(name_token.location(), param_name, std::move(type_annotation), nullptr, true, false);
+        // Also set the resolved type (may be an error type for generic types)
+        param_decl->set_resolved_type(param_type);
+        return param_decl;
     }
 
     bool Parser::is_this_parameter()
@@ -5334,10 +5377,11 @@ namespace Cryo
 
                     // Parse return type
                     TypeRef return_type = _context.types().get_void(); // Default to void
+                    std::string return_type_string = "void"; // Track the type string for TypeAnnotation
                     if (_current_token.is(TokenKind::TK_ARROW))
                     {
                         advance(); // consume '->'
-                        return_type = parse_type_annotation();
+                        return_type = parse_type_annotation(&return_type_string);
                     }
 
                     consume(TokenKind::TK_SEMICOLON, "Expected ';' after trait method signature");
@@ -5345,6 +5389,15 @@ namespace Cryo
                     // Create a function declaration (trait methods are just signatures)
                     auto method_decl = _builder.create_function_declaration(
                         _current_token.location(), method_name, return_type, true); // traits are public
+
+                    // Set the return type annotation from the captured type string
+                    // This preserves the original type annotation for later phases
+                    if (!return_type_string.empty())
+                    {
+                        auto annotation = std::make_unique<TypeAnnotation>(
+                            TypeAnnotation::named(return_type_string, _current_token.location()));
+                        method_decl->set_return_type_annotation(std::move(annotation));
+                    }
 
                     // Add parameters to the function declaration
                     for (auto &param : params)

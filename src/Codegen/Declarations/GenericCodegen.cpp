@@ -2,6 +2,8 @@
 #include "Codegen/Declarations/DeclarationCodegen.hpp"
 #include "Codegen/Declarations/TypeCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
+#include "Types/CompoundTypes.hpp"
+#include "Types/GenericTypes.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -197,12 +199,54 @@ namespace Cryo::Codegen
                     // Enter function scope
                     values().enter_scope(fn->getName().str());
 
-                    // Allocate parameters
+                    // Allocate parameters and register their types
+                    const auto &ast_params = method->parameters();
+                    unsigned param_idx = 0;
                     for (auto &arg : fn->args())
                     {
-                        llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
+                        std::string param_name = arg.getName().str();
+                        llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
                         create_store(&arg, alloca);
-                        values().set_value(arg.getName().str(), nullptr, alloca);
+                        values().set_value(param_name, nullptr, alloca);
+
+                        // Register parameter type in variable_types_map for method resolution
+                        // Skip 'this' parameter (first param for instance methods)
+                        if (param_name == "this")
+                        {
+                            // 'this' is a pointer to the current type
+                            TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
+                            if (this_type.is_valid())
+                            {
+                                TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
+                                ctx().variable_types_map()[param_name] = this_ptr;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "GenericCodegen: Registered 'this' type: {}",
+                                          this_ptr->display_name());
+                            }
+                        }
+                        else if (param_idx < ast_params.size() + 1)
+                        {
+                            // Get AST parameter (accounting for implicit 'this')
+                            size_t ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
+                            if (ast_idx < ast_params.size())
+                            {
+                                TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
+                                // Apply type substitution (T -> string, etc.)
+                                TypeRef substituted = substitute_type_params(param_type);
+                                if (substituted.is_valid())
+                                {
+                                    // Ensure dependent types are instantiated (e.g., &HashSet<string> needs HashSet<string>)
+                                    ensure_dependent_types_instantiated(substituted);
+                                    ctx().variable_types_map()[param_name] = substituted;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "GenericCodegen: Registered param '{}' type: {} -> {}",
+                                              param_name,
+                                              param_type.is_valid() ? param_type->display_name() : "null",
+                                              substituted->display_name());
+                                }
+                            }
+                        }
+                        param_idx++;
                     }
 
                     // Generate method body - type params are still active so T->int works
@@ -446,12 +490,50 @@ namespace Cryo::Codegen
                     // Enter function scope
                     values().enter_scope(fn->getName().str());
 
-                    // Allocate parameters
+                    // Allocate parameters and register their types
+                    const auto &ast_params = method->parameters();
+                    unsigned param_idx = 0;
                     for (auto &arg : fn->args())
                     {
-                        llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), arg.getName().str());
+                        std::string param_name = arg.getName().str();
+                        llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
                         create_store(&arg, alloca);
-                        values().set_value(arg.getName().str(), nullptr, alloca);
+                        values().set_value(param_name, nullptr, alloca);
+
+                        // Register parameter type in variable_types_map for method resolution
+                        if (param_name == "this")
+                        {
+                            TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
+                            if (this_type.is_valid())
+                            {
+                                TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
+                                ctx().variable_types_map()[param_name] = this_ptr;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "GenericCodegen: Registered 'this' type: {}",
+                                          this_ptr->display_name());
+                            }
+                        }
+                        else if (param_idx < ast_params.size() + 1)
+                        {
+                            size_t ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
+                            if (ast_idx < ast_params.size())
+                            {
+                                TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
+                                TypeRef substituted = substitute_type_params(param_type);
+                                if (substituted.is_valid())
+                                {
+                                    // Ensure dependent types are instantiated (e.g., &HashSet<string> needs HashSet<string>)
+                                    ensure_dependent_types_instantiated(substituted);
+                                    ctx().variable_types_map()[param_name] = substituted;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "GenericCodegen: Registered param '{}' type: {} -> {}",
+                                              param_name,
+                                              param_type.is_valid() ? param_type->display_name() : "null",
+                                              substituted->display_name());
+                                }
+                            }
+                        }
+                        param_idx++;
                     }
 
                     // Generate method body - type params are still active
@@ -732,15 +814,105 @@ namespace Cryo::Codegen
         if (!type.is_valid())
             return TypeRef{};
 
-        // If type is a type parameter, resolve it
-        std::string type_name = type.get()->display_name();
-        if (TypeRef resolved = resolve_type_param(type_name))
+        // If type is a direct type parameter (e.g., "T"), resolve it
+        if (type->kind() == TypeKind::GenericParam)
         {
-            return resolved;
+            std::string type_name = type.get()->display_name();
+            if (TypeRef resolved = resolve_type_param(type_name))
+            {
+                return resolved;
+            }
         }
 
-        // TODO: Handle generic types with nested type parameters
-        // e.g., Array<T> where T is a type parameter
+        // Handle pointer types - substitute the pointee
+        if (type->kind() == TypeKind::Pointer)
+        {
+            auto *ptr_type = static_cast<const PointerType *>(type.get());
+            TypeRef pointee = ptr_type->pointee();
+            TypeRef substituted_pointee = substitute_type_params(pointee);
+
+            // If pointee was substituted, create a new pointer type
+            if (substituted_pointee != pointee && substituted_pointee.is_valid())
+            {
+                TypeRef new_ptr = symbols().arena().get_pointer_to(substituted_pointee);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Substituted pointer type {} -> {}",
+                          type->display_name(), new_ptr->display_name());
+                return new_ptr;
+            }
+            return type;
+        }
+
+        // Handle reference types - substitute the referent
+        if (type->kind() == TypeKind::Reference)
+        {
+            auto *ref_type = static_cast<const ReferenceType *>(type.get());
+            TypeRef referent = ref_type->referent();
+            TypeRef substituted_referent = substitute_type_params(referent);
+
+            // If referent was substituted, create a new reference type
+            if (substituted_referent != referent && substituted_referent.is_valid())
+            {
+                TypeRef new_ref = symbols().arena().get_reference_to(substituted_referent, ref_type->mutability());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Substituted reference type {} -> {}",
+                          type->display_name(), new_ref->display_name());
+                return new_ref;
+            }
+            return type;
+        }
+
+        // Handle instantiated types (e.g., HashSet<T>) - substitute type arguments
+        if (type->kind() == TypeKind::InstantiatedType)
+        {
+            auto *inst_type = static_cast<const InstantiatedType *>(type.get());
+            TypeRef generic_base = inst_type->generic_base();
+            const std::vector<TypeRef> &type_args = inst_type->type_args();
+
+            // Substitute each type argument
+            std::vector<TypeRef> substituted_args;
+            bool any_substituted = false;
+
+            for (const auto &arg : type_args)
+            {
+                TypeRef substituted_arg = substitute_type_params(arg);
+                if (substituted_arg != arg)
+                {
+                    any_substituted = true;
+                }
+                substituted_args.push_back(substituted_arg.is_valid() ? substituted_arg : arg);
+            }
+
+            // If any argument was substituted, create a new instantiated type
+            if (any_substituted)
+            {
+                TypeRef new_inst = symbols().arena().create_instantiation(generic_base, substituted_args);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Substituted instantiated type {} -> {}",
+                          type->display_name(), new_inst->display_name());
+                return new_inst;
+            }
+            return type;
+        }
+
+        // Handle array types - substitute element type
+        if (type->kind() == TypeKind::Array)
+        {
+            auto *arr_type = static_cast<const ArrayType *>(type.get());
+            TypeRef element = arr_type->element();
+            TypeRef substituted_element = substitute_type_params(element);
+
+            // If element was substituted, create a new array type
+            if (substituted_element != element && substituted_element.is_valid())
+            {
+                TypeRef new_arr = symbols().arena().get_array_of(substituted_element, arr_type->size());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Substituted array type {} -> {}",
+                          type->display_name(), new_arr->display_name());
+                return new_arr;
+            }
+            return type;
+        }
 
         return type;
     }
@@ -864,6 +1036,11 @@ namespace Cryo::Codegen
             TypeRef field_type = field->get_resolved_type();
             TypeRef substituted = substitute_type_params(field_type);
 
+            // Ensure any dependent generic types are instantiated before mapping
+            // This is necessary because LLVM 15+ opaque pointers don't trigger
+            // pointee type instantiation when mapping pointer types
+            ensure_dependent_types_instantiated(substituted);
+
             llvm::Type *llvm_type = get_llvm_type(substituted);
             if (llvm_type)
             {
@@ -874,6 +1051,79 @@ namespace Cryo::Codegen
         return result;
     }
 
+    void GenericCodegen::ensure_dependent_types_instantiated(TypeRef type)
+    {
+        if (!type.is_valid())
+            return;
+
+        // Handle pointer types - ensure the pointee is instantiated
+        if (type->kind() == TypeKind::Pointer)
+        {
+            auto *ptr_type = static_cast<const PointerType *>(type.get());
+            ensure_dependent_types_instantiated(ptr_type->pointee());
+            return;
+        }
+
+        // Handle reference types - ensure the referent is instantiated
+        if (type->kind() == TypeKind::Reference)
+        {
+            auto *ref_type = static_cast<const ReferenceType *>(type.get());
+            ensure_dependent_types_instantiated(ref_type->referent());
+            return;
+        }
+
+        // Handle array types - ensure the element type is instantiated
+        if (type->kind() == TypeKind::Array)
+        {
+            auto *arr_type = static_cast<const ArrayType *>(type.get());
+            ensure_dependent_types_instantiated(arr_type->element());
+            return;
+        }
+
+        // Handle instantiated types - trigger instantiation
+        if (type->kind() == TypeKind::InstantiatedType)
+        {
+            auto *inst_type = static_cast<const InstantiatedType *>(type.get());
+            TypeRef generic_base = inst_type->generic_base();
+            const std::vector<TypeRef> &type_args = inst_type->type_args();
+
+            // First, ensure type arguments are also instantiated
+            for (const auto &arg : type_args)
+            {
+                ensure_dependent_types_instantiated(arg);
+            }
+
+            // Then trigger instantiation of this type
+            if (generic_base.is_valid())
+            {
+                std::string base_name = generic_base->display_name();
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Ensuring dependent type {} is instantiated",
+                          type->display_name());
+
+                // Check if it's a struct or class and instantiate accordingly
+                Cryo::ASTNode *def = get_generic_type_def(base_name);
+                if (def)
+                {
+                    if (dynamic_cast<StructDeclarationNode *>(def))
+                    {
+                        instantiate_struct(base_name, type_args);
+                    }
+                    else if (dynamic_cast<ClassDeclarationNode *>(def))
+                    {
+                        instantiate_class(base_name, type_args);
+                    }
+                }
+                else
+                {
+                    // Fallback: Try get_instantiated_type which handles both
+                    get_instantiated_type(base_name, type_args);
+                }
+            }
+        }
+    }
+
     llvm::FunctionType *GenericCodegen::create_substituted_function_type(
         Cryo::FunctionDeclarationNode *node)
     {
@@ -882,6 +1132,8 @@ namespace Cryo::Codegen
 
         // Substitute return type
         TypeRef ret_type = substitute_type_params(node->get_resolved_return_type());
+        // Ensure dependent types in return type are instantiated
+        ensure_dependent_types_instantiated(ret_type);
         llvm::Type *llvm_ret = get_llvm_type(ret_type);
         if (!llvm_ret)
         {
@@ -898,6 +1150,8 @@ namespace Cryo::Codegen
             for (const auto &param : node->parameters())
             {
                 TypeRef param_type = substitute_type_params(param->get_resolved_type());
+                // Ensure dependent types in parameter types are instantiated
+                ensure_dependent_types_instantiated(param_type);
                 llvm::Type *llvm_param = get_llvm_type(param_type);
                 if (llvm_param)
                 {

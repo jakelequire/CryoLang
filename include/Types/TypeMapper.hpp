@@ -220,6 +220,15 @@ namespace Cryo
         uint64_t align_of(llvm::Type *type);
 
         /**
+         * @brief Substitute generic params in a type with concrete type args
+         * @param type Type potentially containing generic parameters
+         * @param type_args Concrete type arguments to substitute
+         * @return Type with generic params substituted with concrete types
+         */
+        TypeRef substitute_generic_param(TypeRef type,
+                                          const std::vector<TypeRef> &type_args);
+
+        /**
          * @brief Get null/zero value for type
          */
         llvm::Constant *null_value(llvm::Type *type);
@@ -362,12 +371,6 @@ namespace Cryo
         llvm::Type *map_instantiated_struct(const InstantiatedType *inst,
                                              const StructType *base_struct,
                                              const std::vector<TypeRef> &type_args);
-
-        /**
-         * @brief Substitute generic params in a type with concrete type args
-         */
-        TypeRef substitute_generic_param(TypeRef type,
-                                          const std::vector<TypeRef> &type_args);
 
         /**
          * @brief Try to parse and instantiate a generic type from string
