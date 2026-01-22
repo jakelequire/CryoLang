@@ -405,6 +405,9 @@ namespace Cryo
         // Check if base is a registered generic template
         // First try direct ID lookup
         std::string base_name = base_type->display_name();
+        LOG_DEBUG(LogComponent::GENERAL,
+            "TypeResolver: resolve_generic base_name='{}' from annotation '{}'",
+            base_name, base.to_string());
         std::optional<GenericTemplate> template_info;
 
         if (_generic_registry.is_template(base_type))
@@ -431,6 +434,15 @@ namespace Cryo
 
         // Check if this is a generic type alias - handle specially
         // Only check if the generic_type is a TypeAlias kind (avoids dangerous dynamic_cast on potentially invalid pointers)
+        if (template_info)
+        {
+            LOG_DEBUG(LogComponent::GENERAL,
+                "TypeResolver: template_info for '{}': generic_type.valid={}, kind={}, ast_node={}",
+                base_name,
+                template_info->generic_type.is_valid(),
+                template_info->generic_type.is_valid() ? static_cast<int>(template_info->generic_type->kind()) : -1,
+                template_info->ast_node ? "yes" : "no");
+        }
         if (template_info && template_info->generic_type.is_valid() &&
             template_info->generic_type->kind() == TypeKind::TypeAlias)
         {
@@ -445,6 +457,15 @@ namespace Cryo
 
                     const TypeAnnotation *target_ann = alias_decl->target_type_annotation();
                     std::string target_str = target_ann->to_string();
+
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "TypeResolver: target_str='{}', type_args.size()={}", target_str, type_args.size());
+                    for (size_t dbg_i = 0; dbg_i < type_args.size(); ++dbg_i)
+                    {
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolver: type_args[{}] = '{}'", dbg_i,
+                            type_args[dbg_i].is_valid() ? type_args[dbg_i]->display_name() : "<invalid>");
+                    }
 
                     // Substitute type parameters in the target string
                     const auto &param_names = alias_decl->generic_params();

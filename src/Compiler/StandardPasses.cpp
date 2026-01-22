@@ -743,8 +743,12 @@ namespace Cryo
                             "TypeResolutionPass: Resolved type alias '{}' target to '{}'",
                             alias_decl->alias_name(), resolved->display_name());
 
-                        // Register the resolved type under the alias name in the module registry
-                        module_registry.register_type(res_ctx.current_module, alias_decl->alias_name(), resolved);
+                        // Only register non-generic type aliases in the module registry
+                        // Generic type aliases are handled by the GenericRegistry
+                        if (!alias_decl->is_generic())
+                        {
+                            module_registry.register_type(res_ctx.current_module, alias_decl->alias_name(), resolved);
+                        }
                     }
                     else
                     {
@@ -757,11 +761,15 @@ namespace Cryo
                 else if (alias_decl->has_resolved_target_type())
                 {
                     // Already resolved at parse time - register in module registry for cross-module access
-                    TypeRef target_type = alias_decl->get_resolved_target_type();
-                    module_registry.register_type(res_ctx.current_module, alias_decl->alias_name(), target_type);
-                    LOG_DEBUG(LogComponent::GENERAL,
-                        "TypeResolutionPass: Registered pre-resolved type alias '{}' -> '{}'",
-                        alias_decl->alias_name(), target_type->display_name());
+                    // But only for non-generic type aliases
+                    if (!alias_decl->is_generic())
+                    {
+                        TypeRef target_type = alias_decl->get_resolved_target_type();
+                        module_registry.register_type(res_ctx.current_module, alias_decl->alias_name(), target_type);
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Registered pre-resolved type alias '{}' -> '{}'",
+                            alias_decl->alias_name(), target_type->display_name());
+                    }
                 }
             }
         }
