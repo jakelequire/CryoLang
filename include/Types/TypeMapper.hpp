@@ -299,6 +299,7 @@ namespace Cryo
         llvm::Module *module() { return _module; }
         TypeArena &arena() { return _arena; }
         const TypeArena &arena() const { return _arena; }
+        GenericRegistry *generic_registry() { return _generics; }
 
         // ====================================================================
         // Error Handling
