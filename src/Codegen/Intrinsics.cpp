@@ -657,7 +657,66 @@ namespace Cryo::Codegen
             return generate_atomic_fetch_add_u64(args);
         else if (intrinsic_name == "atomic_fetch_sub_u64")
             return generate_atomic_fetch_sub_u64(args);
-        
+
+        // Integer type conversion intrinsics
+        else if (intrinsic_name == "i8_to_i16")
+            return generate_int_conversion(args, 8, 16, true, true);
+        else if (intrinsic_name == "i8_to_i32")
+            return generate_int_conversion(args, 8, 32, true, true);
+        else if (intrinsic_name == "i8_to_i64")
+            return generate_int_conversion(args, 8, 64, true, true);
+        else if (intrinsic_name == "i16_to_i32")
+            return generate_int_conversion(args, 16, 32, true, true);
+        else if (intrinsic_name == "i16_to_i64")
+            return generate_int_conversion(args, 16, 64, true, true);
+        else if (intrinsic_name == "i32_to_i64")
+            return generate_int_conversion(args, 32, 64, true, true);
+        else if (intrinsic_name == "i64_to_i32")
+            return generate_int_conversion(args, 64, 32, true, true);
+        else if (intrinsic_name == "i64_to_i16")
+            return generate_int_conversion(args, 64, 16, true, true);
+        else if (intrinsic_name == "i64_to_i8")
+            return generate_int_conversion(args, 64, 8, true, true);
+        else if (intrinsic_name == "i32_to_i16")
+            return generate_int_conversion(args, 32, 16, true, true);
+        else if (intrinsic_name == "i32_to_i8")
+            return generate_int_conversion(args, 32, 8, true, true);
+        else if (intrinsic_name == "i16_to_i8")
+            return generate_int_conversion(args, 16, 8, true, true);
+        else if (intrinsic_name == "u8_to_u16")
+            return generate_int_conversion(args, 8, 16, false, false);
+        else if (intrinsic_name == "u8_to_u32")
+            return generate_int_conversion(args, 8, 32, false, false);
+        else if (intrinsic_name == "u8_to_u64")
+            return generate_int_conversion(args, 8, 64, false, false);
+        else if (intrinsic_name == "u16_to_u32")
+            return generate_int_conversion(args, 16, 32, false, false);
+        else if (intrinsic_name == "u16_to_u64")
+            return generate_int_conversion(args, 16, 64, false, false);
+        else if (intrinsic_name == "u32_to_u64")
+            return generate_int_conversion(args, 32, 64, false, false);
+        else if (intrinsic_name == "u64_to_u32")
+            return generate_int_conversion(args, 64, 32, false, false);
+        else if (intrinsic_name == "u64_to_u16")
+            return generate_int_conversion(args, 64, 16, false, false);
+        else if (intrinsic_name == "u64_to_u8")
+            return generate_int_conversion(args, 64, 8, false, false);
+        else if (intrinsic_name == "u32_to_u16")
+            return generate_int_conversion(args, 32, 16, false, false);
+        else if (intrinsic_name == "u32_to_u8")
+            return generate_int_conversion(args, 32, 8, false, false);
+        else if (intrinsic_name == "u16_to_u8")
+            return generate_int_conversion(args, 16, 8, false, false);
+        // Sign conversions
+        else if (intrinsic_name == "i32_to_u32")
+            return generate_int_conversion(args, 32, 32, true, false);
+        else if (intrinsic_name == "u32_to_i32")
+            return generate_int_conversion(args, 32, 32, false, true);
+        else if (intrinsic_name == "i64_to_u64")
+            return generate_int_conversion(args, 64, 64, true, false);
+        else if (intrinsic_name == "u64_to_i64")
+            return generate_int_conversion(args, 64, 64, false, true);
+
         else
         {
             report_unimplemented_intrinsic(intrinsic_name, node);
@@ -6327,6 +6386,80 @@ namespace Cryo::Codegen
     llvm::Value *Intrinsics::generate_atomic_fetch_sub_u64(const std::vector<llvm::Value *> &args)
     {
         return generate_atomic_fetch_sub_64(args);  // Delegate to existing implementation
+    }
+
+    // ========================================
+    // Integer Type Conversion Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_int_conversion(
+        const std::vector<llvm::Value *> &args,
+        unsigned from_bits, unsigned to_bits,
+        bool from_signed, bool to_signed)
+    {
+        if (args.size() != 1)
+        {
+            report_error("Integer conversion intrinsic requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *val = args[0];
+        llvm::Type *from_type = llvm::Type::getIntNTy(context, from_bits);
+        llvm::Type *to_type = llvm::Type::getIntNTy(context, to_bits);
+
+        // If the value is a pointer, load it first (handles &this case)
+        if (val->getType()->isPointerTy())
+        {
+            val = builder.CreateLoad(from_type, val, "conv.load");
+        }
+
+        // Ensure the input is the expected width
+        if (val->getType() != from_type)
+        {
+            // Try to adapt the value to the expected input type
+            if (val->getType()->isIntegerTy())
+            {
+                unsigned actual_bits = val->getType()->getIntegerBitWidth();
+                if (actual_bits < from_bits)
+                {
+                    // Extend
+                    if (from_signed)
+                        val = builder.CreateSExt(val, from_type, "conv.sext.in");
+                    else
+                        val = builder.CreateZExt(val, from_type, "conv.zext.in");
+                }
+                else if (actual_bits > from_bits)
+                {
+                    // Truncate
+                    val = builder.CreateTrunc(val, from_type, "conv.trunc.in");
+                }
+            }
+        }
+
+        // Same size, different signedness - just a bitcast/reinterpret
+        if (from_bits == to_bits)
+        {
+            return val;  // No actual conversion needed at LLVM IR level
+        }
+
+        // Widening conversion
+        if (from_bits < to_bits)
+        {
+            if (from_signed)
+            {
+                return builder.CreateSExt(val, to_type, "conv.sext");
+            }
+            else
+            {
+                return builder.CreateZExt(val, to_type, "conv.zext");
+            }
+        }
+
+        // Narrowing conversion (truncation)
+        return builder.CreateTrunc(val, to_type, "conv.trunc");
     }
 
 } // namespace Cryo::Codegen

@@ -372,6 +372,13 @@ namespace Cryo::Codegen
             return generate_null_literal(node->get_resolved_type());
         }
 
+        case TokenKind::TK_KW_VOID:
+        {
+            // Void/unit literal () - return a void type (represented as empty struct or i8 zero)
+            // In LLVM, void cannot be used as a value, so we use an empty struct or i8
+            return llvm::Constant::getNullValue(llvm::Type::getInt8Ty(llvm_ctx()));
+        }
+
         default:
             break;
         }
