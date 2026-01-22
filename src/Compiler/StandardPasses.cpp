@@ -215,6 +215,34 @@ namespace Cryo
                 }
             }
         }
+        // Handle declaration statements (variable declarations wrapped in statement nodes)
+        else if (auto *decl_stmt = dynamic_cast<DeclarationStatementNode *>(stmt))
+        {
+            // Extract the inner declaration and process if it's a variable declaration
+            if (auto *var_decl = dynamic_cast<VariableDeclarationNode *>(decl_stmt->declaration()))
+            {
+                const auto *ann = var_decl->type_annotation();
+                if (ann && (!var_decl->get_resolved_type().is_valid() || var_decl->get_resolved_type().is_error()))
+                {
+                    TypeRef resolved = resolver.resolve(*ann, ctx);
+                    if (!resolved.is_error())
+                    {
+                        var_decl->set_resolved_type(resolved);
+                        resolved_count++;
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Resolved local variable '{}' type to '{}'",
+                            var_decl->name(), resolved->display_name());
+                    }
+                    else
+                    {
+                        error_count++;
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Failed to resolve local variable '{}' type: {}",
+                            var_decl->name(), resolved->display_name());
+                    }
+                }
+            }
+        }
         // Recursively process block statements
         else if (auto *block = dynamic_cast<BlockStatementNode *>(stmt))
         {

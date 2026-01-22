@@ -6,6 +6,8 @@
 #include "AST/ASTVisitor.hpp"
 #include "AST/TemplateRegistry.hpp"
 #include "Types/UserDefinedTypes.hpp"
+#include "Types/TypeKind.hpp"
+#include "Types/CompoundTypes.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -506,6 +508,89 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        case CallKind::IndirectCall:
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "IndirectCall: Generating indirect call through function pointer '{}'", function_name);
+
+            // Get the function pointer from the variable
+            llvm::AllocaInst *fn_alloca = values().get_alloca(function_name);
+            if (!fn_alloca)
+            {
+                report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
+                             "Function pointer variable not found: " + function_name);
+                return nullptr;
+            }
+
+            // Load the function pointer
+            llvm::Value *fn_ptr = builder().CreateLoad(
+                llvm::PointerType::get(llvm_ctx(), 0), fn_alloca, function_name + ".ptr");
+
+            // Generate arguments
+            auto args = generate_arguments(node->arguments());
+
+            // Try to get the function type from the variable_types_map (Cryo TypeRef)
+            llvm::Type *return_type = llvm::Type::getVoidTy(llvm_ctx());
+            std::vector<llvm::Type *> param_types;
+
+            auto &var_types = ctx().variable_types_map();
+            auto type_it = var_types.find(function_name);
+            if (type_it != var_types.end() && type_it->second.is_valid())
+            {
+                TypeRef var_type = type_it->second;
+                if (var_type->kind() == TypeKind::Function)
+                {
+                    // We have the actual Cryo FunctionType - use it
+                    const auto *func_type = static_cast<const Cryo::FunctionType *>(var_type.get());
+
+                    // Map return type
+                    TypeRef ret_type_ref = func_type->return_type();
+                    if (ret_type_ref.is_valid())
+                    {
+                        return_type = types().map(ret_type_ref);
+                        if (!return_type)
+                        {
+                            return_type = llvm::Type::getVoidTy(llvm_ctx());
+                        }
+                    }
+
+                    // Map parameter types
+                    for (const auto &param_type_ref : func_type->param_types())
+                    {
+                        if (param_type_ref.is_valid())
+                        {
+                            llvm::Type *param_llvm = types().map(param_type_ref);
+                            if (param_llvm)
+                            {
+                                param_types.push_back(param_llvm);
+                            }
+                        }
+                    }
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "IndirectCall: Using FunctionType for '{}' with {} params, return: {}",
+                              function_name, param_types.size(),
+                              return_type->isVoidTy() ? "void" : "non-void");
+                }
+            }
+
+            // If we couldn't get param types from FunctionType, infer from arguments
+            if (param_types.empty())
+            {
+                for (auto *arg : args)
+                {
+                    param_types.push_back(arg->getType());
+                }
+            }
+
+            llvm::FunctionType *fn_type = llvm::FunctionType::get(return_type, param_types, false);
+
+            // Create the indirect call
+            llvm::Value *result = builder().CreateCall(fn_type, fn_ptr, args, "indirect.call");
+
+            return result;
+        }
+
         default:
             report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Unhandled call kind for: " + function_name);
@@ -571,6 +656,35 @@ namespace Cryo::Codegen
             if (name.find('<') != std::string::npos || node->has_generic_args())
             {
                 return CallKind::GenericInstantiation;
+            }
+
+            // Check if it's a function pointer variable (e.g., parameter with function type)
+            // This handles cases like: fn for_each(f: (T) -> void) where f(x) is called
+            // Check the variable_types_map for TypeRef information
+            auto &var_types = ctx().variable_types_map();
+            auto type_it = var_types.find(name);
+            if (type_it != var_types.end())
+            {
+                TypeRef var_type = type_it->second;
+                if (var_type.is_valid() && var_type->kind() == TypeKind::Function)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "classify_call: '{}' has FunctionType, treating as IndirectCall", name);
+                    return CallKind::IndirectCall;
+                }
+            }
+
+            // Fallback: If there's an alloca but no LLVM function, likely an indirect call
+            llvm::AllocaInst *alloca = values().get_alloca(name);
+            if (alloca)
+            {
+                llvm::Function *fn = resolve_function(name);
+                if (!fn)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "classify_call: '{}' is a variable with no function, treating as IndirectCall", name);
+                    return CallKind::IndirectCall;
+                }
             }
 
             // Default to free function
@@ -1321,8 +1435,8 @@ namespace Cryo::Codegen
             if (obj_type.is_valid())
             {
                 type_name = obj_type->display_name();
-                // Strip pointer suffix if present
-                if (!type_name.empty() && type_name.back() == '*')
+                // Strip pointer/reference suffix if present
+                if (!type_name.empty() && (type_name.back() == '*' || type_name.back() == '&'))
                 {
                     type_name.pop_back();
                 }
@@ -1333,6 +1447,15 @@ namespace Cryo::Codegen
                     if (ptr_type && ptr_type->pointee().is_valid())
                     {
                         type_name = ptr_type->pointee()->display_name();
+                    }
+                }
+                // Handle reference types explicitly
+                else if (obj_type->kind() == Cryo::TypeKind::Reference)
+                {
+                    auto *ref_type = dynamic_cast<const Cryo::ReferenceType *>(obj_type.get());
+                    if (ref_type && ref_type->referent().is_valid())
+                    {
+                        type_name = ref_type->referent()->display_name();
                     }
                 }
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1348,11 +1471,40 @@ namespace Cryo::Codegen
                     auto it = var_types.find(id->name());
                     if (it != var_types.end() && it->second.is_valid())
                     {
-                        type_name = it->second->display_name();
-                        // Strip pointer suffix if present
-                        if (!type_name.empty() && type_name.back() == '*')
+                        TypeRef var_type = it->second;
+                        // Handle pointer types
+                        if (var_type->kind() == Cryo::TypeKind::Pointer)
                         {
-                            type_name.pop_back();
+                            auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(var_type.get());
+                            if (ptr_type && ptr_type->pointee().is_valid())
+                            {
+                                type_name = ptr_type->pointee()->display_name();
+                            }
+                            else
+                            {
+                                type_name = var_type->display_name();
+                                if (!type_name.empty() && type_name.back() == '*')
+                                    type_name.pop_back();
+                            }
+                        }
+                        // Handle reference types
+                        else if (var_type->kind() == Cryo::TypeKind::Reference)
+                        {
+                            auto *ref_type = dynamic_cast<const Cryo::ReferenceType *>(var_type.get());
+                            if (ref_type && ref_type->referent().is_valid())
+                            {
+                                type_name = ref_type->referent()->display_name();
+                            }
+                            else
+                            {
+                                type_name = var_type->display_name();
+                                if (!type_name.empty() && type_name.back() == '&')
+                                    type_name.pop_back();
+                            }
+                        }
+                        else
+                        {
+                            type_name = var_type->display_name();
                         }
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Instance method receiver type from variable map: {}", type_name);

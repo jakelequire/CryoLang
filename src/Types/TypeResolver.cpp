@@ -449,6 +449,9 @@ namespace Cryo
             // Safe to check ast_node now since we know it's a type alias template
             if (template_info->ast_node)
             {
+                LOG_DEBUG(LogComponent::GENERAL,
+                    "TypeResolver: About to dynamic_cast ast_node for type alias '{}', ast_node ptr={}",
+                    base_name, (void*)template_info->ast_node);
                 auto *alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(template_info->ast_node);
                 if (alias_decl && alias_decl->has_target_type_annotation())
                 {

@@ -94,6 +94,15 @@ namespace Cryo::Codegen
                             "Function '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
                 return nullptr;
             }
+            // Try to substitute type parameters if we're in a generic instantiation scope
+            if (ret_type->kind() == TypeKind::GenericParam && _generics)
+            {
+                TypeRef substituted = _generics->substitute_type_params(ret_type);
+                if (substituted.is_valid() && substituted->kind() != TypeKind::GenericParam)
+                {
+                    ret_type = substituted;
+                }
+            }
             if (ret_type->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -248,6 +257,15 @@ namespace Cryo::Codegen
                             "Function '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
                 return nullptr;
             }
+            // Try to substitute type parameters if we're in a generic instantiation scope
+            if (ret_type->kind() == TypeKind::GenericParam && _generics)
+            {
+                TypeRef substituted = _generics->substitute_type_params(ret_type);
+                if (substituted.is_valid() && substituted->kind() != TypeKind::GenericParam)
+                {
+                    ret_type = substituted;
+                }
+            }
             if (ret_type->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -387,6 +405,20 @@ namespace Cryo::Codegen
                     return nullptr;
                 }
                 // Check for Generic type kind or undefined struct/class types
+                // First, try to substitute type parameters if we're in a generic instantiation scope
+                if (ptype->kind() == TypeKind::GenericParam && _generics)
+                {
+                    TypeRef substituted = _generics->substitute_type_params(ptype);
+                    if (substituted.is_valid() && substituted->kind() != TypeKind::GenericParam)
+                    {
+                        // Successfully substituted, use the concrete type
+                        ptype = substituted;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Substituted param '{}' type '{}' -> '{}'",
+                                  param->name(), param->get_resolved_type()->display_name(),
+                                  substituted->display_name());
+                    }
+                }
                 if (ptype->kind() == TypeKind::GenericParam)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -420,6 +452,15 @@ namespace Cryo::Codegen
         if (resolved_ret.is_valid())
         {
             TypeRef ret_type = resolved_ret;
+            // Try to substitute type parameters if we're in a generic instantiation scope
+            if (ret_type->kind() == TypeKind::GenericParam && _generics)
+            {
+                TypeRef substituted = _generics->substitute_type_params(ret_type);
+                if (substituted.is_valid() && substituted->kind() != TypeKind::GenericParam)
+                {
+                    ret_type = substituted;
+                }
+            }
             if (ret_type->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -431,7 +472,17 @@ namespace Cryo::Codegen
             if (ret_type->kind() == TypeKind::Pointer)
             {
                 auto *ptr_type = static_cast<const PointerType *>(ret_type.get());
-                if (ptr_type->pointee().is_valid() && ptr_type->pointee()->kind() == TypeKind::GenericParam)
+                TypeRef pointee = ptr_type->pointee();
+                // Try to substitute the pointee type
+                if (pointee.is_valid() && pointee->kind() == TypeKind::GenericParam && _generics)
+                {
+                    TypeRef substituted_pointee = _generics->substitute_type_params(pointee);
+                    if (substituted_pointee.is_valid() && substituted_pointee->kind() != TypeKind::GenericParam)
+                    {
+                        pointee = substituted_pointee;
+                    }
+                }
+                if (pointee.is_valid() && pointee->kind() == TypeKind::GenericParam)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping method declaration '{}' - return type is pointer to generic",
@@ -954,6 +1005,15 @@ namespace Cryo::Codegen
 
         // Register the variable type in variable_types_map for Array<T> detection
         TypeRef resolved_type = node->get_resolved_type();
+        // Apply type substitution if we're in a generic instantiation scope
+        if (resolved_type.is_valid() && _generics)
+        {
+            TypeRef substituted = _generics->substitute_type_params(resolved_type);
+            if (substituted.is_valid())
+            {
+                resolved_type = substituted;
+            }
+        }
         if (resolved_type)
         {
             ctx().variable_types_map()[name] = resolved_type;
@@ -1555,6 +1615,18 @@ namespace Cryo::Codegen
         // Get return type
         TypeRef resolved_type = node->get_resolved_return_type();
 
+        // Try to substitute type parameters if we're in a generic instantiation scope
+        if (resolved_type.is_valid() && resolved_type->kind() == TypeKind::GenericParam && _generics)
+        {
+            TypeRef substituted = _generics->substitute_type_params(resolved_type);
+            if (substituted.is_valid() && substituted->kind() != TypeKind::GenericParam)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Substituted return type '{}' -> '{}'",
+                          resolved_type->display_name(), substituted->display_name());
+                resolved_type = substituted;
+            }
+        }
+
         // Check for corrupted or invalid type pointer
         if (resolved_type.is_valid())
         {
@@ -1638,8 +1710,19 @@ namespace Cryo::Codegen
                     {
                         continue;
                     }
-                    TypeRef param_type = param->get_resolved_type();
-                    llvm::Type *llvm_param = get_llvm_type(param_type);
+                    TypeRef param_cryo_type = param->get_resolved_type();
+
+                    // Try to substitute type parameters if we're in a generic instantiation scope
+                    if (param_cryo_type.is_valid() && param_cryo_type->kind() == TypeKind::GenericParam && _generics)
+                    {
+                        TypeRef substituted = _generics->substitute_type_params(param_cryo_type);
+                        if (substituted.is_valid() && substituted->kind() != TypeKind::GenericParam)
+                        {
+                            param_cryo_type = substituted;
+                        }
+                    }
+
+                    llvm::Type *llvm_param = get_llvm_type(param_cryo_type);
                     if (llvm_param)
                     {
                         param_types.push_back(llvm_param);
@@ -1735,7 +1818,21 @@ namespace Cryo::Codegen
                     continue;
                 }
 
-                llvm::Type *param_type = get_llvm_type(param->get_resolved_type());
+                TypeRef param_cryo_type = param->get_resolved_type();
+
+                // Try to substitute type parameters if we're in a generic instantiation scope
+                if (param_cryo_type.is_valid() && param_cryo_type->kind() == TypeKind::GenericParam && _generics)
+                {
+                    TypeRef substituted = _generics->substitute_type_params(param_cryo_type);
+                    if (substituted.is_valid() && substituted->kind() != TypeKind::GenericParam)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Substituted param '{}' type '{}' -> '{}'",
+                                  param->name(), param_cryo_type->display_name(), substituted->display_name());
+                        param_cryo_type = substituted;
+                    }
+                }
+
+                llvm::Type *param_type = get_llvm_type(param_cryo_type);
                 if (param_type)
                 {
                     param_types.push_back(param_type);
@@ -1888,6 +1985,15 @@ namespace Cryo::Codegen
             if (param_idx < ast_params.size())
             {
                 TypeRef param_type = ast_params[param_idx]->get_resolved_type();
+                // Apply type substitution if we're in a generic instantiation scope
+                if (param_type.is_valid() && _generics)
+                {
+                    TypeRef substituted = _generics->substitute_type_params(param_type);
+                    if (substituted.is_valid())
+                    {
+                        param_type = substituted;
+                    }
+                }
                 if (param_type)
                 {
                     std::string param_name = arg.getName().str();
@@ -2244,6 +2350,16 @@ namespace Cryo::Codegen
             if (param && param->get_resolved_type())
             {
                 TypeRef ptype = param->get_resolved_type();
+                // Try to substitute type parameters if we're in a generic instantiation scope
+                if (ptype->kind() == TypeKind::GenericParam && _generics)
+                {
+                    TypeRef substituted = _generics->substitute_type_params(ptype);
+                    if (substituted.is_valid() && substituted->kind() != TypeKind::GenericParam)
+                    {
+                        // Successfully substituted, use the concrete type
+                        ptype = substituted;
+                    }
+                }
                 if (ptype->kind() == TypeKind::GenericParam)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -2269,6 +2385,15 @@ namespace Cryo::Codegen
         if (node->get_resolved_return_type())
         {
             TypeRef ret_type = node->get_resolved_return_type();
+            // Try to substitute type parameters if we're in a generic instantiation scope
+            if (ret_type->kind() == TypeKind::GenericParam && _generics)
+            {
+                TypeRef substituted = _generics->substitute_type_params(ret_type);
+                if (substituted.is_valid() && substituted->kind() != TypeKind::GenericParam)
+                {
+                    ret_type = substituted;
+                }
+            }
             if (ret_type->kind() == TypeKind::GenericParam)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -2280,7 +2405,17 @@ namespace Cryo::Codegen
             if (ret_type->kind() == TypeKind::Pointer)
             {
                 auto *ptr_type = static_cast<const PointerType *>(ret_type.get());
-                if (ptr_type->pointee().is_valid() && ptr_type->pointee()->kind() == TypeKind::GenericParam)
+                TypeRef pointee = ptr_type->pointee();
+                // Try to substitute the pointee type
+                if (pointee.is_valid() && pointee->kind() == TypeKind::GenericParam && _generics)
+                {
+                    TypeRef substituted_pointee = _generics->substitute_type_params(pointee);
+                    if (substituted_pointee.is_valid() && substituted_pointee->kind() != TypeKind::GenericParam)
+                    {
+                        pointee = substituted_pointee;
+                    }
+                }
+                if (pointee.is_valid() && pointee->kind() == TypeKind::GenericParam)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: Skipping method '{}' - return type is pointer to generic",
@@ -2393,6 +2528,15 @@ namespace Cryo::Codegen
                 if (param_idx < ast_params.size())
                 {
                     TypeRef param_type = ast_params[param_idx]->get_resolved_type();
+                    // Apply type substitution if we're in a generic instantiation scope
+                    if (param_type.is_valid() && _generics)
+                    {
+                        TypeRef substituted = _generics->substitute_type_params(param_type);
+                        if (substituted.is_valid())
+                        {
+                            param_type = substituted;
+                        }
+                    }
                     if (param_type.is_valid())
                     {
                         std::string param_name = arg.getName().str();
@@ -2648,6 +2792,15 @@ namespace Cryo::Codegen
                         if (param_idx < ast_params.size())
                         {
                             TypeRef param_type = ast_params[param_idx]->get_resolved_type();
+                            // Apply type substitution if we're in a generic instantiation scope
+                            if (param_type.is_valid() && _generics)
+                            {
+                                TypeRef substituted = _generics->substitute_type_params(param_type);
+                                if (substituted.is_valid())
+                                {
+                                    param_type = substituted;
+                                }
+                            }
                             if (param_type.is_valid())
                             {
                                 std::string param_name = arg.getName().str();

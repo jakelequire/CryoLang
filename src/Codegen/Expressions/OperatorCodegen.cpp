@@ -2059,8 +2059,60 @@ namespace Cryo::Codegen
         {
             std::string member_name = member->member();
 
-            // Generate the object expression to get the base pointer
-            llvm::Value *object = generate_operand(member->object());
+            // Get a pointer to the struct object
+            // For identifiers, we need special handling:
+            // - If the identifier holds a pointer (like 'this'), load to get the pointer value
+            // - If the identifier holds a by-value struct, use the alloca address directly
+            llvm::Value *object = nullptr;
+
+            if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(member->object()))
+            {
+                std::string var_name = identifier->name();
+
+                // Get the alloca for the identifier
+                llvm::AllocaInst *alloca = values().get_alloca(var_name);
+                if (alloca)
+                {
+                    // Check what type the alloca holds
+                    llvm::Type *alloca_type = alloca->getAllocatedType();
+
+                    if (alloca_type->isPointerTy())
+                    {
+                        // The alloca stores a pointer (like 'this') - load to get the pointer value
+                        object = create_load(alloca, alloca_type, var_name + ".load");
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "get_lvalue_address: Loaded pointer from alloca for '{}'", var_name);
+                    }
+                    else if (alloca_type->isStructTy())
+                    {
+                        // The alloca stores a by-value struct - use alloca address directly
+                        object = alloca;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "get_lvalue_address: Using alloca address for by-value struct '{}'", var_name);
+                    }
+                    else
+                    {
+                        // Other types - load the value
+                        object = create_load(alloca, alloca_type, var_name + ".load");
+                    }
+                }
+                else
+                {
+                    // Fallback to generate_operand for globals etc.
+                    object = generate_operand(member->object());
+                }
+            }
+            else if (auto *nested_member = dynamic_cast<Cryo::MemberAccessNode *>(member->object()))
+            {
+                // For nested member access (obj.a.b), get the address of the inner member
+                object = get_lvalue_address(nested_member);
+            }
+            else
+            {
+                // For other expressions, generate the value and hope it's a pointer
+                object = generate_operand(member->object());
+            }
+
             if (!object)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -2072,7 +2124,8 @@ namespace Cryo::Codegen
             if (!object->getType()->isPointerTy())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "get_lvalue_address: Member access object is not a pointer type");
+                          "get_lvalue_address: Member access object is not a pointer type (type: {})",
+                          object->getType()->isStructTy() ? "struct" : "other");
                 return nullptr;
             }
 

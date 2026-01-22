@@ -54,25 +54,49 @@ namespace Cryo
 
     TypeRef TypeArena::lookup_type_by_name(const std::string &name) const
     {
+        // Helper to check if a key matches the name (keys are "module_id::name")
+        auto matches_name = [&name](const std::string &key) -> bool
+        {
+            // Try exact match first
+            if (key == name)
+                return true;
+            // Check if key ends with "::name"
+            std::string suffix = "::" + name;
+            if (key.size() >= suffix.size() &&
+                key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0)
+            {
+                return true;
+            }
+            return false;
+        };
+
         // Try struct types
-        auto struct_it = _struct_types.find(name);
-        if (struct_it != _struct_types.end())
-            return struct_it->second;
+        for (const auto &[key, ref] : _struct_types)
+        {
+            if (matches_name(key))
+                return ref;
+        }
 
         // Try enum types
-        auto enum_it = _enum_types.find(name);
-        if (enum_it != _enum_types.end())
-            return enum_it->second;
+        for (const auto &[key, ref] : _enum_types)
+        {
+            if (matches_name(key))
+                return ref;
+        }
 
         // Try class types
-        auto class_it = _class_types.find(name);
-        if (class_it != _class_types.end())
-            return class_it->second;
+        for (const auto &[key, ref] : _class_types)
+        {
+            if (matches_name(key))
+                return ref;
+        }
 
         // Try trait types
-        auto trait_it = _trait_types.find(name);
-        if (trait_it != _trait_types.end())
-            return trait_it->second;
+        for (const auto &[key, ref] : _trait_types)
+        {
+            if (matches_name(key))
+                return ref;
+        }
 
         return TypeRef{}; // Invalid/not found
     }

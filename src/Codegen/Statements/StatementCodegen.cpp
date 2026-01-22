@@ -134,6 +134,9 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "StatementCodegen: Generating block with {} statements",
                   node->statements().size());
 
+        // Enter a new scope for this block - variables declared here should be isolated
+        values().enter_scope("block");
+
         // Generate each statement in the block
         for (const auto &stmt : node->statements())
         {
@@ -149,6 +152,9 @@ namespace Cryo::Codegen
                 break;
             }
         }
+
+        // Exit block scope - cleans up local variables
+        values().exit_scope();
     }
 
     void StatementCodegen::generate_statement_list(

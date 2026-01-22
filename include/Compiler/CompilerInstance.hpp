@@ -92,6 +92,11 @@ namespace Cryo
         // Results
         std::unique_ptr<ProgramNode> _ast_root;
 
+        // Storage for compiled ASTs to prevent dangling ast_node pointers in GenericRegistry
+        // When in stdlib compilation mode, ASTs are moved here instead of destroyed
+        // so that templates registered with ast_node pointers remain valid
+        std::vector<std::unique_ptr<ProgramNode>> _compiled_asts;
+
         // Loaded source file (for pass-based compilation)
         std::unique_ptr<File> _loaded_file;
         std::string _loaded_file_path;

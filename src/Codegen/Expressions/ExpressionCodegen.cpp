@@ -695,8 +695,60 @@ namespace Cryo::Codegen
 
         std::string member_name = node->member();
 
-        // Generate object expression
-        llvm::Value *object = generate(node->object());
+        // Get a pointer to the struct object
+        // For identifiers, we need special handling:
+        // - If the identifier holds a pointer (like 'this'), load to get the pointer value
+        // - If the identifier holds a by-value struct, use the alloca address directly
+        llvm::Value *object = nullptr;
+
+        if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(node->object()))
+        {
+            std::string var_name = identifier->name();
+
+            // Get the alloca for the identifier
+            llvm::AllocaInst *alloca = values().get_alloca(var_name);
+            if (alloca)
+            {
+                // Check what type the alloca holds
+                llvm::Type *alloca_type = alloca->getAllocatedType();
+
+                if (alloca_type->isPointerTy())
+                {
+                    // The alloca stores a pointer (like 'this') - load to get the pointer value
+                    object = create_load(alloca, alloca_type, var_name + ".load");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_member_address: Loaded pointer from alloca for '{}'", var_name);
+                }
+                else if (alloca_type->isStructTy())
+                {
+                    // The alloca stores a by-value struct - use alloca address directly
+                    object = alloca;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_member_address: Using alloca address for by-value struct '{}'", var_name);
+                }
+                else
+                {
+                    // Other types - load the value
+                    object = create_load(alloca, alloca_type, var_name + ".load");
+                }
+            }
+            else
+            {
+                // Fallback to generate for globals etc.
+                object = generate(node->object());
+            }
+        }
+        else if (auto *nested_member = dynamic_cast<Cryo::MemberAccessNode *>(node->object()))
+        {
+            // For nested member access (obj.a.b), get the address of the inner member
+            object = generate_member_address(nested_member);
+        }
+        else
+        {
+            // For other expressions, generate the value and hope it's a pointer
+            object = generate(node->object());
+        }
+
         if (!object)
         {
             report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
@@ -3399,6 +3451,21 @@ namespace Cryo::Codegen
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "ExpressionCodegen: Found '{}' as '{}'", qualified_name, scoped_candidate);
+                return result;
+            }
+        }
+
+        // Try generating candidates for just the enum name (scope_name) and append the variant
+        // This handles cross-module enum lookups where Ordering is from std::sync::atomic
+        auto scope_candidates = generate_lookup_candidates(node->scope_name(), Cryo::SymbolKind::Type);
+        for (const auto &scope_candidate : scope_candidates)
+        {
+            // Build full qualified enum variant name: namespace::EnumName::Variant
+            std::string full_variant_name = scope_candidate + "::" + node->member_name();
+            if (llvm::Value *result = try_find(full_variant_name))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "ExpressionCodegen: Found '{}' via scope lookup as '{}'", qualified_name, full_variant_name);
                 return result;
             }
         }
