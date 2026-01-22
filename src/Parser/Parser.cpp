@@ -4237,12 +4237,39 @@ namespace Cryo
                 lookup_name = lookup_name.substr(0, angle_pos);
             }
 
-            // Look up the struct/class type from the symbol table
-            // It was pre-registered when we started parsing the struct/class declaration
-            const Symbol *sym = _context.symbols().lookup(lookup_name);
-            TypeRef base_type = sym ? sym->type : TypeRef{};
+            // First, check if this is a primitive type (e.g., impl i32 { ... })
+            // Primitive types aren't in the symbol table - they're built-in to TypeArena
+            TypeRef base_type;
+            if (lookup_name == "void") base_type = _context.types().get_void();
+            else if (lookup_name == "boolean") base_type = _context.types().get_bool();
+            else if (lookup_name == "i8") base_type = _context.types().get_i8();
+            else if (lookup_name == "i16") base_type = _context.types().get_i16();
+            else if (lookup_name == "i32") base_type = _context.types().get_i32();
+            else if (lookup_name == "i64") base_type = _context.types().get_i64();
+            else if (lookup_name == "i128") base_type = _context.types().get_i128();
+            else if (lookup_name == "int") base_type = _context.types().get_i32();
+            else if (lookup_name == "u8") base_type = _context.types().get_u8();
+            else if (lookup_name == "u16") base_type = _context.types().get_u16();
+            else if (lookup_name == "u32") base_type = _context.types().get_u32();
+            else if (lookup_name == "u64") base_type = _context.types().get_u64();
+            else if (lookup_name == "u128") base_type = _context.types().get_u128();
+            else if (lookup_name == "uint") base_type = _context.types().get_u32();
+            else if (lookup_name == "f32") base_type = _context.types().get_f32();
+            else if (lookup_name == "f64") base_type = _context.types().get_f64();
+            else if (lookup_name == "float") base_type = _context.types().get_f32();
+            else if (lookup_name == "double") base_type = _context.types().get_f64();
+            else if (lookup_name == "char") base_type = _context.types().get_char();
+            else if (lookup_name == "string") base_type = _context.types().get_string();
+            else if (lookup_name == "never") base_type = _context.types().get_never();
+            else
+            {
+                // Not a primitive - look up the struct/class type from the symbol table
+                // It was pre-registered when we started parsing the struct/class declaration
+                const Symbol *sym = _context.symbols().lookup(lookup_name);
+                base_type = sym ? sym->type : TypeRef{};
+            }
 
-            if (sym && base_type.is_valid() && !base_type.is_error())
+            if (base_type.is_valid() && !base_type.is_error())
             {
                 if (is_reference)
                 {

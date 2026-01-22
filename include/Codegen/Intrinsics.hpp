@@ -335,6 +335,11 @@ namespace Cryo::Codegen
         llvm::Value* generate_atomic_fetch_add_u64(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_atomic_fetch_sub_u64(const std::vector<llvm::Value*>& args);
 
+        // Integer type conversion intrinsics
+        llvm::Value* generate_int_conversion(const std::vector<llvm::Value*>& args,
+                                              unsigned from_bits, unsigned to_bits,
+                                              bool from_signed, bool to_signed);
+
         // Threading intrinsics (stubs for now - not fully implemented)
         // pthread, atomic, etc. would require much more complex implementation
 
