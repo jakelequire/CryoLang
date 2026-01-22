@@ -967,7 +967,21 @@ namespace Cryo
         // that was created during parsing. Order matters for proper cleanup.
         _codegen.reset();
 
-        _ast_root.reset();
+        // In stdlib compilation mode, preserve the AST instead of destroying it.
+        // Templates registered in GenericRegistry have ast_node pointers that
+        // reference nodes in the AST. If we destroy the AST, those pointers become
+        // dangling, causing crashes when accessing them later (e.g., during type alias resolution).
+        if (_stdlib_compilation_mode && _ast_root)
+        {
+            _compiled_asts.push_back(std::move(_ast_root));
+            LOG_DEBUG(LogComponent::GENERAL, "CompilerInstance: Preserved AST for stdlib mode (total: {} ASTs)",
+                _compiled_asts.size());
+        }
+        else
+        {
+            _ast_root.reset();
+        }
+
         // Don't clear diagnostics during stdlib compilation - we want to accumulate
         // errors from all modules so they can be reported together at the end
         if (_diagnostics && !_stdlib_compilation_mode)
@@ -1317,16 +1331,25 @@ namespace Cryo
                 {
                     for (size_t i = 0; i < variant_names.size(); ++i)
                     {
-                        std::string qualified_name = enum_decl->name() + "::" + variant_names[i];
-
                         // Create integer constant for this variant
                         llvm::Constant *variant_const = llvm::ConstantInt::get(
                             llvm::Type::getInt32Ty(visitor->context().llvm_context()),
                             static_cast<uint64_t>(i));
 
-                        // Register in enum_variants_map
-                        enum_variants_map[qualified_name] = variant_const;
-                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registered enum variant: {} = {}", qualified_name, i);
+                        // Build unqualified name (EnumName::Variant)
+                        std::string unqualified_name = enum_decl->name() + "::" + variant_names[i];
+
+                        // Always register with unqualified name for same-module lookups
+                        enum_variants_map[unqualified_name] = variant_const;
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registered enum variant: {} = {}", unqualified_name, i);
+
+                        // Also register with fully qualified name for cross-module lookups
+                        if (!_current_namespace.empty())
+                        {
+                            std::string fully_qualified_name = _current_namespace + "::" + unqualified_name;
+                            enum_variants_map[fully_qualified_name] = variant_const;
+                            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registered enum variant (qualified): {} = {}", fully_qualified_name, i);
+                        }
                     }
                 }
             }
@@ -1471,6 +1494,45 @@ namespace Cryo
                         _imported_namespaces.push_back(result.namespace_alias); // Track for enhanced resolution
                         LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered namespace alias '{}' with {} symbols",
                                   result.namespace_alias, result.symbol_map.size());
+
+                        // Register enum variants from namespace alias imports
+                        if (_codegen && _codegen->ensure_visitor_initialized())
+                        {
+                            auto *visitor = _codegen->get_visitor();
+                            auto &enum_variants_map = visitor->context().enum_variants_map();
+
+                            for (const auto &[symbol_name, symbol] : result.symbol_map)
+                            {
+                                // Check if this is an enum type
+                                if (symbol.kind == SymbolKind::Type && symbol.type.is_valid() &&
+                                    symbol.type->kind() == TypeKind::Enum)
+                                {
+                                    auto *enum_type = static_cast<const EnumType *>(symbol.type.get());
+                                    if (enum_type->is_complete())
+                                    {
+                                        for (const auto &variant : enum_type->variants())
+                                        {
+                                            // Create integer constant for this variant
+                                            llvm::Constant *variant_const = llvm::ConstantInt::get(
+                                                llvm::Type::getInt32Ty(visitor->context().llvm_context()),
+                                                static_cast<uint64_t>(variant.tag_value));
+
+                                            // Register with unqualified name (EnumName::Variant)
+                                            std::string unqualified_name = symbol_name + "::" + variant.name;
+                                            enum_variants_map[unqualified_name] = variant_const;
+
+                                            // Register with namespace alias (alias::EnumName::Variant)
+                                            std::string aliased_name = result.namespace_alias + "::" + unqualified_name;
+                                            enum_variants_map[aliased_name] = variant_const;
+
+                                            LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                                      "Registered namespace alias enum variant: {} (also as {})",
+                                                      unqualified_name, aliased_name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     else
                     {
@@ -1482,6 +1544,45 @@ namespace Cryo
                             // Register each symbol directly in the current scope
                             _symbol_table->declare_symbol(symbol_name, symbol.kind, symbol.location, symbol.type, scope_name);
                             LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered specific symbol: {}", symbol_name);
+                        }
+
+                        // Register enum variants from specific imports for cross-module enum variant resolution
+                        if (_codegen && _codegen->ensure_visitor_initialized())
+                        {
+                            auto *visitor = _codegen->get_visitor();
+                            auto &enum_variants_map = visitor->context().enum_variants_map();
+
+                            for (const auto &[symbol_name, symbol] : result.symbol_map)
+                            {
+                                // Check if this is an enum type
+                                if (symbol.kind == SymbolKind::Type && symbol.type.is_valid() &&
+                                    symbol.type->kind() == TypeKind::Enum)
+                                {
+                                    auto *enum_type = static_cast<const EnumType *>(symbol.type.get());
+                                    if (enum_type->is_complete())
+                                    {
+                                        for (const auto &variant : enum_type->variants())
+                                        {
+                                            // Create integer constant for this variant
+                                            llvm::Constant *variant_const = llvm::ConstantInt::get(
+                                                llvm::Type::getInt32Ty(visitor->context().llvm_context()),
+                                                static_cast<uint64_t>(variant.tag_value));
+
+                                            // Register with unqualified name (EnumName::Variant)
+                                            std::string unqualified_name = symbol_name + "::" + variant.name;
+                                            enum_variants_map[unqualified_name] = variant_const;
+
+                                            // Also register with module name for qualified lookups
+                                            std::string qualified_name = result.module_name + "::" + unqualified_name;
+                                            enum_variants_map[qualified_name] = variant_const;
+
+                                            LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                                      "Registered specific imported enum variant: {} (also as {})",
+                                                      unqualified_name, qualified_name);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1512,6 +1613,45 @@ namespace Cryo
                             // Register each symbol directly in the current scope for unqualified access
                             _symbol_table->declare_symbol(symbol_name, symbol.kind, symbol.location, symbol.type, scope_name);
                             LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered wildcard symbol for unqualified access: {}", symbol_name);
+                        }
+
+                        // Register enum variants from imported enums for cross-module enum variant resolution
+                        if (_codegen && _codegen->ensure_visitor_initialized())
+                        {
+                            auto *visitor = _codegen->get_visitor();
+                            auto &enum_variants_map = visitor->context().enum_variants_map();
+
+                            for (const auto &[symbol_name, symbol] : result.symbol_map)
+                            {
+                                // Check if this is an enum type
+                                if (symbol.kind == SymbolKind::Type && symbol.type.is_valid() &&
+                                    symbol.type->kind() == TypeKind::Enum)
+                                {
+                                    auto *enum_type = static_cast<const EnumType *>(symbol.type.get());
+                                    if (enum_type->is_complete())
+                                    {
+                                        for (const auto &variant : enum_type->variants())
+                                        {
+                                            // Create integer constant for this variant
+                                            llvm::Constant *variant_const = llvm::ConstantInt::get(
+                                                llvm::Type::getInt32Ty(visitor->context().llvm_context()),
+                                                static_cast<uint64_t>(variant.tag_value));
+
+                                            // Register with unqualified name (EnumName::Variant)
+                                            std::string unqualified_name = symbol_name + "::" + variant.name;
+                                            enum_variants_map[unqualified_name] = variant_const;
+
+                                            // Register with namespace-qualified name (namespace::EnumName::Variant)
+                                            std::string qualified_name = namespace_name + "::" + unqualified_name;
+                                            enum_variants_map[qualified_name] = variant_const;
+
+                                            LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                                      "Registered imported enum variant: {} (also as {})",
+                                                      unqualified_name, qualified_name);
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered namespace '{}' with {} symbols (qualified and unqualified access)",

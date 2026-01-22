@@ -74,6 +74,7 @@ namespace Cryo::Codegen
             InstanceMethod,       // obj.method(args)
             FreeFunction,         // function(args)
             GenericInstantiation, // Array<int>::new()
+            IndirectCall,         // f(args) where f is a function pointer parameter
             Unknown
         };
 

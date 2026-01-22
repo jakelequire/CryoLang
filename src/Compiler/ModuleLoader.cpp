@@ -426,20 +426,31 @@ namespace Cryo
             mark_declarations_as_imported(*ast, result.module_name);
 
             // Do ALL processing on the original AST and keep it alive
-            // 1. Register generic templates from the original AST
-            register_templates_from_ast(*ast, result.module_name);
-
-            // 2. Extract symbols from the original AST
-            result.exported_symbols = extract_exported_symbols(*ast);
-            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Found {} exported symbols", result.exported_symbols.size());
-
-            // 3. Create symbol map from the original AST
+            // 1. Create symbol map from the original AST FIRST
+            //    This creates the StructType/ClassType/EnumType with field/variant info
             result.symbol_map = create_symbol_map(*ast, result.module_name);
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created symbol map with {} symbols", result.symbol_map.size());
+
+            // 2. Register generic templates from the original AST
+            //    This must happen AFTER create_symbol_map so it can reuse the types with fields
+            register_templates_from_ast(*ast, result.module_name);
+
+            // 3. Extract symbols from the original AST
+            result.exported_symbols = extract_exported_symbols(*ast);
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Found {} exported symbols", result.exported_symbols.size());
 
             // Keep the AST alive for template access by storing it
             // Note: Template registry has raw pointers to nodes in this AST
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Storing AST to keep template nodes alive");
+
+            // Check if we're about to overwrite an existing AST - this would cause dangling pointers!
+            auto existing_ast_it = _imported_asts.find(result.module_name);
+            if (existing_ast_it != _imported_asts.end())
+            {
+                LOG_ERROR(LogComponent::GENERAL, "ModuleLoader: WARNING - About to overwrite existing AST for module '{}'. "
+                    "This could cause dangling ast_node pointers in GenericRegistry!", result.module_name);
+            }
+
             _imported_asts[result.module_name] = std::move(ast); // Move is necessary to transfer ownership
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Stored AST successfully. Map now has {} entries", _imported_asts.size());
 
@@ -561,11 +572,105 @@ namespace Cryo
                 else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(decl))
                 {
                     TypeRef struct_type{};
+                    bool is_generic = !struct_decl->generic_parameters().empty();
 
-                    // Skip generic struct templates - they'll be instantiated when used with concrete types
-                    if (!struct_decl->generic_parameters().empty())
+                    // For generic structs, we still need to create the StructType with field info
+                    // so that map_instantiated_struct can substitute type parameters later
+                    if (is_generic)
                     {
-                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Skipping generic struct template '{}' in create_symbol_map", struct_decl->name());
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing generic struct template '{}' with {} type parameters",
+                                  struct_decl->name(), struct_decl->generic_parameters().size());
+
+                        // Create a StructType for the generic template
+                        QualifiedTypeName struct_qname{module_id, struct_decl->name()};
+                        struct_type = type_arena.create_struct(struct_qname);
+
+                        // Build a mapping from type parameter names to GenericParam types
+                        std::unordered_map<std::string, TypeRef> param_types;
+                        for (size_t i = 0; i < struct_decl->generic_parameters().size(); ++i)
+                        {
+                            const auto &param = struct_decl->generic_parameters()[i];
+                            TypeRef param_type = type_arena.create_generic_param(param->name(), i);
+                            param_types[param->name()] = param_type;
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created GenericParam '{}' at index {} for struct '{}'",
+                                      param->name(), i, struct_decl->name());
+                        }
+
+                        // Build field information with GenericParam types for generic fields
+                        if (struct_type.is_valid() && !struct_decl->fields().empty())
+                        {
+                            std::vector<FieldInfo> fields;
+                            for (const auto &field : struct_decl->fields())
+                            {
+                                if (field)
+                                {
+                                    TypeRef field_type = field->get_resolved_type();
+
+                                    // If field type is a generic parameter, use the GenericParam type
+                                    if (!field_type.is_valid() && field->has_type_annotation())
+                                    {
+                                        std::string type_str = field->type_annotation()->to_string();
+
+                                        // Check if it's a direct generic parameter
+                                        auto it = param_types.find(type_str);
+                                        if (it != param_types.end())
+                                        {
+                                            field_type = it->second;
+                                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved field '{}' to GenericParam '{}' in struct '{}'",
+                                                      field->name(), type_str, struct_decl->name());
+                                        }
+                                        // Check if it's a pointer to a generic parameter (e.g., *T, &T)
+                                        else if (type_str.size() > 1 && (type_str[0] == '*' || type_str[0] == '&'))
+                                        {
+                                            std::string inner = type_str.substr(1);
+                                            auto inner_it = param_types.find(inner);
+                                            if (inner_it != param_types.end())
+                                            {
+                                                // Create a pointer type to the generic param
+                                                bool is_mut = type_str[0] == '*';
+                                                field_type = type_arena.get_pointer_to(inner_it->second);
+                                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved field '{}' to {}GenericParam '{}' in struct '{}'",
+                                                          field->name(), is_mut ? "*" : "&", inner, struct_decl->name());
+                                            }
+                                            else
+                                            {
+                                                // Try to resolve as regular type
+                                                field_type = resolve_primitive_type(type_str, type_arena);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            // Try to resolve as regular type
+                                            field_type = resolve_primitive_type(type_str, type_arena);
+                                        }
+                                    }
+
+                                    if (field_type.is_valid())
+                                    {
+                                        fields.push_back(FieldInfo(field->name(), field_type, 0, true, field->is_mutable()));
+                                    }
+                                    else
+                                    {
+                                        // For complex generic field types like Array<T>, create a placeholder
+                                        // that will be substituted during instantiation
+                                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' in generic struct '{}' has complex/unresolved type",
+                                                  field->name(), struct_decl->name());
+                                    }
+                                }
+                            }
+
+                            // Set fields on the struct type
+                            if (!fields.empty())
+                            {
+                                auto *struct_ptr = const_cast<StructType *>(dynamic_cast<const StructType *>(struct_type.get()));
+                                if (struct_ptr)
+                                {
+                                    struct_ptr->set_fields(std::move(fields));
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created generic StructType for '{}' with {} fields",
+                                              struct_decl->name(), struct_decl->fields().size());
+                                }
+                            }
+                        }
                     }
                     else
                     {
@@ -632,11 +737,103 @@ namespace Cryo
                 else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(decl))
                 {
                     TypeRef class_type{};
+                    bool is_generic = !class_decl->generic_parameters().empty();
 
-                    // Skip generic class templates - they'll be instantiated when used with concrete types
-                    if (!class_decl->generic_parameters().empty())
+                    // For generic classes, we still need to create the ClassType with field info
+                    // so that map_instantiated_struct can substitute type parameters later
+                    if (is_generic)
                     {
-                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Skipping generic class template '{}' in create_symbol_map", class_decl->name());
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing generic class template '{}' with {} type parameters",
+                                  class_decl->name(), class_decl->generic_parameters().size());
+
+                        // Create a ClassType for the generic template
+                        QualifiedTypeName class_qname{module_id, class_decl->name()};
+                        class_type = type_arena.create_class(class_qname);
+
+                        // Build a mapping from type parameter names to GenericParam types
+                        std::unordered_map<std::string, TypeRef> param_types;
+                        for (size_t i = 0; i < class_decl->generic_parameters().size(); ++i)
+                        {
+                            const auto &param = class_decl->generic_parameters()[i];
+                            TypeRef param_type = type_arena.create_generic_param(param->name(), i);
+                            param_types[param->name()] = param_type;
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created GenericParam '{}' at index {} for class '{}'",
+                                      param->name(), i, class_decl->name());
+                        }
+
+                        // Build field information with GenericParam types for generic fields
+                        if (class_type.is_valid() && !class_decl->fields().empty())
+                        {
+                            std::vector<FieldInfo> fields;
+                            for (const auto &field : class_decl->fields())
+                            {
+                                if (field)
+                                {
+                                    TypeRef field_type = field->get_resolved_type();
+
+                                    // If field type is a generic parameter, use the GenericParam type
+                                    if (!field_type.is_valid() && field->has_type_annotation())
+                                    {
+                                        std::string type_str = field->type_annotation()->to_string();
+
+                                        // Check if it's a direct generic parameter
+                                        auto it = param_types.find(type_str);
+                                        if (it != param_types.end())
+                                        {
+                                            field_type = it->second;
+                                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved field '{}' to GenericParam '{}' in class '{}'",
+                                                      field->name(), type_str, class_decl->name());
+                                        }
+                                        // Check if it's a pointer to a generic parameter (e.g., *T, &T)
+                                        else if (type_str.size() > 1 && (type_str[0] == '*' || type_str[0] == '&'))
+                                        {
+                                            std::string inner = type_str.substr(1);
+                                            auto inner_it = param_types.find(inner);
+                                            if (inner_it != param_types.end())
+                                            {
+                                                // Create a pointer type to the generic param
+                                                bool is_mut = type_str[0] == '*';
+                                                field_type = type_arena.get_pointer_to(inner_it->second);
+                                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Resolved field '{}' to {}GenericParam '{}' in class '{}'",
+                                                          field->name(), is_mut ? "*" : "&", inner, class_decl->name());
+                                            }
+                                            else
+                                            {
+                                                // Try to resolve as regular type
+                                                field_type = resolve_primitive_type(type_str, type_arena);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            // Try to resolve as regular type
+                                            field_type = resolve_primitive_type(type_str, type_arena);
+                                        }
+                                    }
+
+                                    if (field_type.is_valid())
+                                    {
+                                        fields.push_back(FieldInfo(field->name(), field_type, 0, true, field->is_mutable()));
+                                    }
+                                    else
+                                    {
+                                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Field '{}' in generic class '{}' has complex/unresolved type",
+                                                  field->name(), class_decl->name());
+                                    }
+                                }
+                            }
+
+                            // Set fields on the class type
+                            if (!fields.empty())
+                            {
+                                auto *class_ptr = const_cast<ClassType *>(dynamic_cast<const ClassType *>(class_type.get()));
+                                if (class_ptr)
+                                {
+                                    class_ptr->set_fields(std::move(fields));
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created generic ClassType for '{}' with {} fields",
+                                              class_decl->name(), class_decl->fields().size());
+                                }
+                            }
+                        }
                     }
                     else
                     {
@@ -1026,20 +1223,44 @@ namespace Cryo
                         // Also register in GenericRegistry for the new type system
                         if (_generic_registry)
                         {
-                            TypeArena &arena = _ast_context.types();
-                            TypeRef class_type = arena.create_class(QualifiedTypeName{ModuleID::invalid(), class_decl->name()});
-
-                            std::vector<GenericParam> params;
-                            for (size_t i = 0; i < class_decl->generic_parameters().size(); ++i)
+                            // Skip if template is already registered - don't overwrite existing one with fields
+                            if (_generic_registry->get_template_by_name(class_decl->name()))
                             {
-                                auto &param_node = class_decl->generic_parameters()[i];
-                                TypeRef param_type = arena.create_generic_param(param_node->name(), i);
-                                params.emplace_back(param_node->name(), i, param_type);
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Template '{}' already registered in GenericRegistry, skipping to preserve field info",
+                                    class_decl->name());
                             }
-                            _generic_registry->register_template(class_type, params,
-                                ModuleID::invalid(), class_decl, class_decl->name());
-                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered class '{}' in GenericRegistry with {} params",
-                                class_decl->name(), params.size());
+                            else
+                            {
+                                TypeArena &arena = _ast_context.types();
+
+                                // Look up the existing ClassType created by create_symbol_map (which has fields)
+                                // instead of creating a new empty one
+                                TypeRef class_type = arena.lookup_type_by_name(class_decl->name());
+                                if (!class_type.is_valid())
+                                {
+                                    // Fallback: create a new one if not found (shouldn't happen normally)
+                                    class_type = arena.create_class(QualifiedTypeName{ModuleID::invalid(), class_decl->name()});
+                                    LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Had to create new ClassType for '{}' - fields may be missing",
+                                        class_decl->name());
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Using existing ClassType for '{}' with fields",
+                                        class_decl->name());
+                                }
+
+                                std::vector<GenericParam> params;
+                                for (size_t i = 0; i < class_decl->generic_parameters().size(); ++i)
+                                {
+                                    auto &param_node = class_decl->generic_parameters()[i];
+                                    TypeRef param_type = arena.create_generic_param(param_node->name(), i);
+                                    params.emplace_back(param_node->name(), i, param_type);
+                                }
+                                _generic_registry->register_template(class_type, params,
+                                    ModuleID::invalid(), class_decl, class_decl->name());
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered class '{}' in GenericRegistry with {} params",
+                                    class_decl->name(), params.size());
+                            }
                         }
                     }
 
@@ -1102,21 +1323,44 @@ namespace Cryo
                         // Also register in GenericRegistry for the new type system
                         if (_generic_registry)
                         {
-                            TypeArena &arena = _ast_context.types();
-                            // Create the enum type if it doesn't exist
-                            TypeRef enum_type = arena.create_enum(QualifiedTypeName{ModuleID::invalid(), enum_decl->name()});
-
-                            std::vector<GenericParam> params;
-                            for (size_t i = 0; i < enum_decl->generic_parameters().size(); ++i)
+                            // Skip if template is already registered - don't overwrite existing one with variants
+                            if (_generic_registry->get_template_by_name(enum_decl->name()))
                             {
-                                auto &param_node = enum_decl->generic_parameters()[i];
-                                TypeRef param_type = arena.create_generic_param(param_node->name(), i);
-                                params.emplace_back(param_node->name(), i, param_type);
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Template '{}' already registered in GenericRegistry, skipping to preserve variant info",
+                                    enum_decl->name());
                             }
-                            _generic_registry->register_template(enum_type, params,
-                                ModuleID::invalid(), enum_decl, enum_decl->name());
-                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered enum '{}' in GenericRegistry with {} params",
-                                enum_decl->name(), params.size());
+                            else
+                            {
+                                TypeArena &arena = _ast_context.types();
+
+                                // Look up the existing EnumType created by create_symbol_map (which has variant info)
+                                // instead of creating a new empty one
+                                TypeRef enum_type = arena.lookup_type_by_name(enum_decl->name());
+                                if (!enum_type.is_valid())
+                                {
+                                    // Fallback: create a new one if not found (shouldn't happen normally)
+                                    enum_type = arena.create_enum(QualifiedTypeName{ModuleID::invalid(), enum_decl->name()});
+                                    LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Had to create new EnumType for '{}' - variants may be missing",
+                                        enum_decl->name());
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Using existing EnumType for '{}' with variants",
+                                        enum_decl->name());
+                                }
+
+                                std::vector<GenericParam> params;
+                                for (size_t i = 0; i < enum_decl->generic_parameters().size(); ++i)
+                                {
+                                    auto &param_node = enum_decl->generic_parameters()[i];
+                                    TypeRef param_type = arena.create_generic_param(param_node->name(), i);
+                                    params.emplace_back(param_node->name(), i, param_type);
+                                }
+                                _generic_registry->register_template(enum_type, params,
+                                    ModuleID::invalid(), enum_decl, enum_decl->name());
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered enum '{}' in GenericRegistry with {} params",
+                                    enum_decl->name(), params.size());
+                            }
                         }
                     }
                 }
@@ -1136,20 +1380,44 @@ namespace Cryo
                         // Also register in GenericRegistry for the new type system
                         if (_generic_registry)
                         {
-                            TypeArena &arena = _ast_context.types();
-                            TypeRef struct_type = arena.create_struct(QualifiedTypeName{ModuleID::invalid(), struct_decl->name()});
-
-                            std::vector<GenericParam> params;
-                            for (size_t i = 0; i < struct_decl->generic_parameters().size(); ++i)
+                            // Skip if template is already registered - don't overwrite existing one with fields
+                            if (_generic_registry->get_template_by_name(struct_decl->name()))
                             {
-                                auto &param_node = struct_decl->generic_parameters()[i];
-                                TypeRef param_type = arena.create_generic_param(param_node->name(), i);
-                                params.emplace_back(param_node->name(), i, param_type);
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Template '{}' already registered in GenericRegistry, skipping to preserve field info",
+                                    struct_decl->name());
                             }
-                            _generic_registry->register_template(struct_type, params,
-                                ModuleID::invalid(), struct_decl, struct_decl->name());
-                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered struct '{}' in GenericRegistry with {} params",
-                                struct_decl->name(), params.size());
+                            else
+                            {
+                                TypeArena &arena = _ast_context.types();
+
+                                // Look up the existing StructType created by create_symbol_map (which has fields)
+                                // instead of creating a new empty one
+                                TypeRef struct_type = arena.lookup_type_by_name(struct_decl->name());
+                                if (!struct_type.is_valid())
+                                {
+                                    // Fallback: create a new one if not found (shouldn't happen normally)
+                                    struct_type = arena.create_struct(QualifiedTypeName{ModuleID::invalid(), struct_decl->name()});
+                                    LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Had to create new StructType for '{}' - fields may be missing",
+                                        struct_decl->name());
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Using existing StructType for '{}' with fields",
+                                        struct_decl->name());
+                                }
+
+                                std::vector<GenericParam> params;
+                                for (size_t i = 0; i < struct_decl->generic_parameters().size(); ++i)
+                                {
+                                    auto &param_node = struct_decl->generic_parameters()[i];
+                                    TypeRef param_type = arena.create_generic_param(param_node->name(), i);
+                                    params.emplace_back(param_node->name(), i, param_type);
+                                }
+                                _generic_registry->register_template(struct_type, params,
+                                    ModuleID::invalid(), struct_decl, struct_decl->name());
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered struct '{}' in GenericRegistry with {} params",
+                                    struct_decl->name(), params.size());
+                            }
                         }
                     }
                     else
@@ -1292,24 +1560,35 @@ namespace Cryo
                     // Register generic type aliases as templates
                     if (alias_decl->is_generic() && _generic_registry)
                     {
-                        TypeArena &arena = _ast_context.types();
-                        // Create a type alias type for the template
-                        TypeRef alias_type = arena.create_type_alias(
-                            QualifiedTypeName{ModuleID::invalid(), alias_decl->alias_name()},
-                            TypeRef{}  // Target will be resolved during instantiation
-                        );
-
-                        std::vector<GenericParam> params;
-                        for (size_t i = 0; i < alias_decl->generic_params().size(); ++i)
+                        // Skip if template is already registered - don't overwrite existing one
+                        // This prevents dangling ast_node pointers when the same type alias
+                        // is defined in multiple modules
+                        if (_generic_registry->get_template_by_name(alias_decl->alias_name()))
                         {
-                            const std::string &param_name = alias_decl->generic_params()[i];
-                            TypeRef param_type = arena.create_generic_param(param_name, i);
-                            params.emplace_back(param_name, i, param_type);
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Type alias template '{}' already registered in GenericRegistry, skipping to preserve ast_node",
+                                alias_decl->alias_name());
                         }
-                        _generic_registry->register_template(alias_type, params,
-                            ModuleID::invalid(), alias_decl, alias_decl->alias_name());
-                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic type alias '{}' in GenericRegistry with {} params",
-                            alias_decl->alias_name(), params.size());
+                        else
+                        {
+                            TypeArena &arena = _ast_context.types();
+                            // Create a type alias type for the template
+                            TypeRef alias_type = arena.create_type_alias(
+                                QualifiedTypeName{ModuleID::invalid(), alias_decl->alias_name()},
+                                TypeRef{}  // Target will be resolved during instantiation
+                            );
+
+                            std::vector<GenericParam> params;
+                            for (size_t i = 0; i < alias_decl->generic_params().size(); ++i)
+                            {
+                                const std::string &param_name = alias_decl->generic_params()[i];
+                                TypeRef param_type = arena.create_generic_param(param_name, i);
+                                params.emplace_back(param_name, i, param_type);
+                            }
+                            _generic_registry->register_template(alias_type, params,
+                                ModuleID::invalid(), alias_decl, alias_decl->alias_name());
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic type alias '{}' in GenericRegistry with {} params",
+                                alias_decl->alias_name(), params.size());
+                        }
                     }
                 }
                 // Process implementation blocks to register method return types
