@@ -3,6 +3,7 @@
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Types/ErrorType.hpp"
+#include "Types/GenericRegistry.hpp"
 #include "Utils/Logger.hpp"
 
 #include <llvm/IR/Verifier.h>
@@ -1427,10 +1428,19 @@ namespace Cryo::Codegen
             std::string variant_name = name + "::" + variant->name();
             llvm::Constant *discriminant = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), index);
 
-            // Register discriminant value
+            // Register discriminant value with simple name
             ctx().register_enum_variant(variant_name, discriminant);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Registered enum variant: {} = {}",
                       variant_name, index);
+
+            // Also register with fully-qualified name (namespace::EnumName::Variant)
+            if (!ns_context.empty())
+            {
+                std::string qualified_variant = ns_context + "::" + variant_name;
+                ctx().register_enum_variant(qualified_variant, discriminant);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Also registered enum variant as: {}", qualified_variant);
+            }
 
             // Register variant field types for pattern matching
             if (!variant->is_simple_variant())
@@ -3010,6 +3020,21 @@ namespace Cryo::Codegen
                 resolved = ctx().symbols().lookup_enum_type(qualified);
                 if (resolved.is_valid() && !resolved.is_error())
                     return resolved;
+            }
+
+            // Check if this is a generic template type (e.g., Array, Option, Result)
+            // Generic templates aren't stored in the symbol table as regular types,
+            // they're registered in the GenericRegistry
+            GenericRegistry *generics = types().generic_registry();
+            if (generics)
+            {
+                auto template_info = generics->get_template_by_name(name);
+                if (template_info)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_type_annotation: Found generic template '{}' in GenericRegistry", name);
+                    return template_info->generic_type;
+                }
             }
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
