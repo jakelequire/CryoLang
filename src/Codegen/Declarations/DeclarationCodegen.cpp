@@ -1298,12 +1298,32 @@ namespace Cryo::Codegen
 
         // Collect field types
         std::vector<llvm::Type *> field_types;
-        for (const auto &field : node->fields())
+        for (size_t i = 0; i < node->fields().size(); ++i)
         {
-            llvm::Type *field_type = get_llvm_type(field->get_resolved_type());
+            const auto &field = node->fields()[i];
+            Cryo::TypeRef cryo_field_type = field->get_resolved_type();
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Struct '{}' field[{}] '{}': Cryo TypeID={}, type={} (kind={})",
+                      name, i, field->name(),
+                      cryo_field_type ? cryo_field_type.id().id : 0,
+                      cryo_field_type ? cryo_field_type->display_name() : "<null>",
+                      cryo_field_type ? static_cast<int>(cryo_field_type->kind()) : -1);
+
+            llvm::Type *field_type = get_llvm_type(cryo_field_type);
+
             if (field_type)
             {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Struct '{}' field[{}] '{}': LLVM type ID = {}",
+                          name, i, field->name(), field_type->getTypeID());
                 field_types.push_back(field_type);
+            }
+            else
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Struct '{}' field[{}] '{}': FAILED to get LLVM type!",
+                          name, i, field->name());
             }
         }
 

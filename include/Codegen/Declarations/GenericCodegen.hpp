@@ -74,6 +74,18 @@ namespace Cryo::Codegen
                                              const std::vector<TypeRef> &type_args);
 
         /**
+         * @brief Instantiate a generic enum type
+         * @param generic_name Base generic enum name (e.g., "Option")
+         * @param type_args Type arguments (e.g., [string])
+         * @return Instantiated enum type (as struct for tagged unions, or i32 for simple enums)
+         *
+         * This function creates the LLVM type for the instantiated enum and
+         * registers all variants with the instantiated name (e.g., Option_string::None)
+         */
+        llvm::Type *instantiate_enum(const std::string &generic_name,
+                                      const std::vector<TypeRef> &type_args);
+
+        /**
          * @brief Get or create instantiated type
          * @param generic_name Generic type name
          * @param type_args Type arguments

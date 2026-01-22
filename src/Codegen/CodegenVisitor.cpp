@@ -973,6 +973,19 @@ namespace Cryo::Codegen
         NodeTracker tracker(*_ctx, &node);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting EnumDeclarationNode: {}", node.name());
 
+        // Check if this is a generic enum template
+        if (!node.generic_parameters().empty())
+        {
+            // Register with GenericCodegen for later instantiation
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "CodegenVisitor: Registering generic enum template: {} with {} type parameters",
+                      node.name(), node.generic_parameters().size());
+            _generics->register_generic_type(node.name(), &node);
+
+            // Don't generate the template directly - it will be instantiated when used
+            return;
+        }
+
         // Use DeclarationCodegen which properly handles complex enums with payloads
         // (generates tagged union types, constructor functions, and registers field types)
         _declarations->generate_enum_declaration(&node);

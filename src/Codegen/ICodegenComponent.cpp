@@ -356,6 +356,30 @@ namespace Cryo::Codegen
             {
                 base_type = type_name.substr(0, angle_pos);
             }
+            else
+            {
+                // Handle mangled type names like "Option_i64" -> "Option"
+                // Try to find a template that matches a prefix of the mangled name
+                Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+                if (template_registry)
+                {
+                    size_t underscore_pos = type_name.find('_');
+                    while (underscore_pos != std::string::npos)
+                    {
+                        std::string prefix = type_name.substr(0, underscore_pos);
+                        const Cryo::TemplateRegistry::TemplateInfo *template_info = template_registry->find_template(prefix);
+                        if (template_info)
+                        {
+                            base_type = prefix;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_method_by_name: Extracted base type '{}' from mangled name '{}'",
+                                      base_type, type_name);
+                            break;
+                        }
+                        underscore_pos = type_name.find('_', underscore_pos + 1);
+                    }
+                }
+            }
 
             // Build pattern suffix: "::BaseType::method"
             std::string pattern_suffix = "::" + base_type + "::" + method_name;
@@ -413,6 +437,30 @@ namespace Cryo::Codegen
             std::string type_namespace;
             std::string simple_type_name = base_type; // The type name without namespace
             Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+
+            // Handle mangled type names like "Option_i64" -> "Option"
+            // Try to find a template that matches a prefix of the mangled name
+            if (angle_pos == std::string::npos && template_registry)
+            {
+                size_t underscore_pos = type_name.find('_');
+                while (underscore_pos != std::string::npos)
+                {
+                    std::string prefix = type_name.substr(0, underscore_pos);
+                    const Cryo::TemplateRegistry::TemplateInfo *template_info = template_registry->find_template(prefix);
+                    if (template_info)
+                    {
+                        base_type = prefix;
+                        simple_type_name = prefix;
+                        // Extract type args from mangled name (everything after the base type)
+                        type_args_str = type_name.substr(underscore_pos + 1);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_method_by_name: Extracted base type '{}' from mangled name '{}' (type_args: '{}')",
+                                  base_type, type_name, type_args_str);
+                        break;
+                    }
+                    underscore_pos = type_name.find('_', underscore_pos + 1);
+                }
+            }
 
             // First check if the type name is already fully qualified (contains ::)
             // If so, extract namespace and simple name directly
@@ -1131,8 +1179,58 @@ namespace Cryo::Codegen
 
     llvm::AllocaInst *ICodegenComponent::create_entry_alloca(llvm::Function *fn, llvm::Type *type, const std::string &name)
     {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "create_entry_alloca: fn={}, type={}, name='{}'",
+                  fn ? "non-null" : "null", type ? "non-null" : "null", name);
+
         if (!fn || !type)
             return nullptr;
+
+        // Debug type info and validate struct types
+        if (auto *st = llvm::dyn_cast<llvm::StructType>(type))
+        {
+            if (st->isOpaque())
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                         "create_entry_alloca: REFUSING to alloca opaque struct type '{}' - this would crash LLVM",
+                         st->hasName() ? st->getName().str() : "<unnamed>");
+                return nullptr;
+            }
+
+            unsigned numElements = st->getNumElements();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "create_entry_alloca: Type is struct '{}', elements={}",
+                      st->hasName() ? st->getName().str() : "<unnamed>", numElements);
+
+            // Validate each element type to catch corruption early
+            for (unsigned i = 0; i < numElements; ++i)
+            {
+                llvm::Type *elemType = st->getElementType(i);
+                if (!elemType)
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                             "create_entry_alloca: Struct '{}' has null element at index {}",
+                             st->hasName() ? st->getName().str() : "<unnamed>", i);
+                    return nullptr;
+                }
+                // Check for nested opaque structs
+                if (auto *nestedSt = llvm::dyn_cast<llvm::StructType>(elemType))
+                {
+                    if (nestedSt->isOpaque())
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                 "create_entry_alloca: Struct '{}' has opaque nested struct at index {}",
+                                 st->hasName() ? st->getName().str() : "<unnamed>", i);
+                        return nullptr;
+                    }
+                }
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "create_entry_alloca: Element {} type ID: {}",
+                          i, elemType->getTypeID());
+            }
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "create_entry_alloca: Type is not a struct, type ID: {}",
+                      type->getTypeID());
+        }
 
         // Save current insertion point
         llvm::IRBuilder<> &b = builder();
@@ -1141,6 +1239,8 @@ namespace Cryo::Codegen
 
         // Get the entry block
         llvm::BasicBlock &entry = fn->getEntryBlock();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "create_entry_alloca: Got entry block, empty={}",
+                  entry.empty() ? "yes" : "no");
 
         // Insert at the beginning of entry block (after any existing allocas)
         if (entry.empty())
@@ -1158,8 +1258,10 @@ namespace Cryo::Codegen
             b.SetInsertPoint(&entry, insert_point);
         }
 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "create_entry_alloca: About to call CreateAlloca");
         // Create the alloca
         llvm::AllocaInst *alloca = b.CreateAlloca(type, nullptr, name);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "create_entry_alloca: CreateAlloca returned successfully");
 
         // Restore insertion point
         if (current_block)

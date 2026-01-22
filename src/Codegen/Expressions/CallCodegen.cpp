@@ -8,6 +8,7 @@
 #include "Types/UserDefinedTypes.hpp"
 #include "Types/TypeKind.hpp"
 #include "Types/CompoundTypes.hpp"
+#include "Types/GenericTypes.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -1057,25 +1058,81 @@ namespace Cryo::Codegen
                       enum_name, resolved_enum_name);
         }
 
-        std::string qualified_variant = resolved_enum_name + "::" + variant_name;
+        // Check if the call node has a resolved type (from TypeResolver)
+        // This is crucial for generic enums like Option<T> or Result<T, E>
+        TypeRef resolved_type_ref = node->get_resolved_type();
+        std::string instantiated_enum_name = resolved_enum_name;
+
+        if (resolved_type_ref.is_valid())
+        {
+            const Type *resolved = resolved_type_ref.get();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_enum_variant: Node has resolved type: {} (kind={})",
+                      resolved->display_name(), static_cast<int>(resolved->kind()));
+
+            // If it's an InstantiatedType, get the concrete resolved type
+            if (resolved->kind() == TypeKind::InstantiatedType)
+            {
+                const auto *inst = static_cast<const InstantiatedType *>(resolved);
+                if (inst->has_resolved_type())
+                {
+                    resolved = inst->resolved_type().get();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_enum_variant: Using resolved type from InstantiatedType: {}",
+                              resolved->display_name());
+                }
+                // Use the instantiated type's name (e.g., Option_string, Result_ptr_AllocError)
+                instantiated_enum_name = inst->display_name();
+            }
+            else if (resolved->kind() == TypeKind::Enum)
+            {
+                // Direct enum type, use its name
+                instantiated_enum_name = resolved->display_name();
+            }
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_enum_variant: Node has no resolved type, using base name: {}",
+                      resolved_enum_name);
+        }
+
+        // Use instantiated name for qualified variant lookup
+        std::string qualified_variant = instantiated_enum_name + "::" + variant_name;
+        // Also try with base name for non-generic enums
+        std::string base_qualified_variant = resolved_enum_name + "::" + variant_name;
 
         // Generate arguments
         auto args = generate_arguments(node->arguments());
 
         // Look for variant constructor function (for complex variants with payloads)
+        // Try instantiated name first (e.g., Option_string::Some)
         llvm::Function *ctor = module()->getFunction(qualified_variant);
+        if (!ctor && instantiated_enum_name != resolved_enum_name)
+        {
+            // Fallback to base name (e.g., Option::Some)
+            ctor = module()->getFunction(base_qualified_variant);
+        }
         if (ctor)
         {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_enum_variant: Found constructor function: {}",
+                      ctor->getName().str());
             return builder().CreateCall(ctor, args, variant_name);
         }
 
         // For simple enum variants (no payload), look up the registered constant value
         auto &enum_variants = ctx().enum_variants_map();
         auto it = enum_variants.find(qualified_variant);
+        if (it == enum_variants.end() && instantiated_enum_name != resolved_enum_name)
+        {
+            // Try base name
+            it = enum_variants.find(base_qualified_variant);
+        }
         if (it != enum_variants.end())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "Found simple enum variant: {} -> constant", qualified_variant);
+                      "Found simple enum variant: {} -> constant", it->first);
             return it->second;
         }
 
@@ -1085,6 +1142,11 @@ namespace Cryo::Codegen
         {
             std::string ns_qualified = current_ns + "::" + qualified_variant;
             it = enum_variants.find(ns_qualified);
+            if (it == enum_variants.end() && instantiated_enum_name != resolved_enum_name)
+            {
+                ns_qualified = current_ns + "::" + base_qualified_variant;
+                it = enum_variants.find(ns_qualified);
+            }
             if (it != enum_variants.end())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1093,8 +1155,16 @@ namespace Cryo::Codegen
             }
         }
 
-        // Look up the enum type to check if it exists (use resolved name)
-        llvm::Type *enum_type = ctx().get_type(resolved_enum_name);
+        // Look up the enum type - try instantiated name first, then base name
+        llvm::Type *enum_type = ctx().get_type(instantiated_enum_name);
+        if (!enum_type && instantiated_enum_name != resolved_enum_name)
+        {
+            enum_type = ctx().get_type(resolved_enum_name);
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "generate_enum_variant: Enum type lookup for '{}': {}",
+                  instantiated_enum_name, enum_type ? "found" : "not found");
 
         // For cross-module enum variant calls with payloads, create an extern declaration
         // This handles cases where the enum is defined in another module
@@ -1111,31 +1181,14 @@ namespace Cryo::Codegen
                 param_types.push_back(arg->getType());
             }
 
-            // If we don't have the enum type, create a simple tagged union placeholder
-            // The actual type will be resolved at link time
+            // If we don't have the enum type, fail - no placeholder types
+            // Generic enum types must be properly monomorphized before use
             if (!enum_type)
             {
-                // For Option/Result, create a standard tagged union: { i32, [payload_size x i8] }
-                size_t max_payload = 0;
-                for (auto *pt : param_types)
-                {
-                    if (pt->isSized())
-                    {
-                        size_t sz = module()->getDataLayout().getTypeAllocSize(pt);
-                        max_payload = std::max(max_payload, sz);
-                    }
-                }
-                max_payload = std::max(max_payload, static_cast<size_t>(8)); // Minimum 8 bytes
-
-                // Create tagged union: { i32 discriminant, [max_payload x i8] payload }
-                llvm::Type *disc_type = llvm::Type::getInt32Ty(llvm_ctx());
-                llvm::Type *payload_type = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload);
-                std::string struct_name = resolved_enum_name + "_placeholder";
-                enum_type = llvm::StructType::create(llvm_ctx(), {disc_type, payload_type}, struct_name);
-
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "generate_enum_variant: Created placeholder type '{}' with payload size {}",
-                          struct_name, max_payload);
+                report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
+                             "Unknown enum type for variant constructor: " + resolved_enum_name +
+                             " (generic enums must be instantiated before use)");
+                return nullptr;
             }
 
             // Create function type: (...payload_types) -> enum_type

@@ -9,6 +9,7 @@
 #include "Types/TypeChecker.hpp"
 #include "Types/TypeResolver.hpp"
 #include "Types/GenericRegistry.hpp"
+#include "Types/GenericTypes.hpp"
 #include "Types/ModuleTypeRegistry.hpp"
 #include "Types/Monomorphizer.hpp"
 #include "Codegen/CodeGenerator.hpp"
@@ -178,6 +179,41 @@ namespace Cryo
     // ============================================================================
 
     // ========================================================================
+    // Helper: Propagate expected type to expression for type inference
+    // ========================================================================
+
+    static void propagate_type_to_expression(
+        ExpressionNode *expr,
+        TypeRef expected_type,
+        size_t &resolved_count)
+    {
+        if (!expr || !expected_type.is_valid())
+            return;
+
+        // If the expression already has a resolved type, don't override
+        if (expr->has_resolved_type())
+            return;
+
+        // Skip types that contain unresolved generic parameters (like Option<T>)
+        // These will be handled during generic instantiation when we know the concrete type
+        if (contains_generic_params(expected_type))
+        {
+            LOG_DEBUG(LogComponent::GENERAL,
+                "TypeResolutionPass: Skipping propagation of generic type '{}' (contains unresolved params)",
+                expected_type->display_name());
+            return;
+        }
+
+        // Set the resolved type on the expression
+        expr->set_resolved_type(expected_type);
+        resolved_count++;
+
+        LOG_DEBUG(LogComponent::GENERAL,
+            "TypeResolutionPass: Propagated type '{}' to expression (kind={})",
+            expected_type->display_name(), static_cast<int>(expr->kind()));
+    }
+
+    // ========================================================================
     // Helper: Resolve variable types in function/method bodies
     // ========================================================================
 
@@ -185,11 +221,22 @@ namespace Cryo
         StatementNode *stmt,
         TypeResolver &resolver,
         ResolutionContext &ctx,
+        TypeRef expected_return_type,
         size_t &resolved_count,
         size_t &error_count)
     {
         if (!stmt)
             return;
+
+        // Handle return statements - propagate function's return type to expression
+        if (auto *return_stmt = dynamic_cast<ReturnStatementNode *>(stmt))
+        {
+            if (return_stmt->expression() && expected_return_type.is_valid())
+            {
+                propagate_type_to_expression(return_stmt->expression(), expected_return_type, resolved_count);
+            }
+            return;
+        }
 
         // Check if this is a variable declaration
         if (auto *var_decl = dynamic_cast<VariableDeclarationNode *>(stmt))
@@ -248,28 +295,28 @@ namespace Cryo
         {
             for (const auto &child : block->statements())
             {
-                resolve_variable_types_in_statement(child.get(), resolver, ctx, resolved_count, error_count);
+                resolve_variable_types_in_statement(child.get(), resolver, ctx, expected_return_type, resolved_count, error_count);
             }
         }
         // Process if statement branches
         else if (auto *if_stmt = dynamic_cast<IfStatementNode *>(stmt))
         {
             if (if_stmt->then_statement())
-                resolve_variable_types_in_statement(if_stmt->then_statement(), resolver, ctx, resolved_count, error_count);
+                resolve_variable_types_in_statement(if_stmt->then_statement(), resolver, ctx, expected_return_type, resolved_count, error_count);
             if (if_stmt->else_statement())
-                resolve_variable_types_in_statement(if_stmt->else_statement(), resolver, ctx, resolved_count, error_count);
+                resolve_variable_types_in_statement(if_stmt->else_statement(), resolver, ctx, expected_return_type, resolved_count, error_count);
         }
         // Process while loop body
         else if (auto *while_stmt = dynamic_cast<WhileStatementNode *>(stmt))
         {
             if (while_stmt->body())
-                resolve_variable_types_in_statement(while_stmt->body(), resolver, ctx, resolved_count, error_count);
+                resolve_variable_types_in_statement(while_stmt->body(), resolver, ctx, expected_return_type, resolved_count, error_count);
         }
         // Process for loop body
         else if (auto *for_stmt = dynamic_cast<ForStatementNode *>(stmt))
         {
             if (for_stmt->body())
-                resolve_variable_types_in_statement(for_stmt->body(), resolver, ctx, resolved_count, error_count);
+                resolve_variable_types_in_statement(for_stmt->body(), resolver, ctx, expected_return_type, resolved_count, error_count);
         }
         // Process match statement arms
         else if (auto *match_stmt = dynamic_cast<MatchStatementNode *>(stmt))
@@ -277,7 +324,7 @@ namespace Cryo
             for (const auto &arm : match_stmt->arms())
             {
                 if (arm->body())
-                    resolve_variable_types_in_statement(arm->body(), resolver, ctx, resolved_count, error_count);
+                    resolve_variable_types_in_statement(arm->body(), resolver, ctx, expected_return_type, resolved_count, error_count);
             }
         }
     }
@@ -856,10 +903,11 @@ namespace Cryo
                         method_ctx.bind_generic(param_name, param_type);
                     }
 
-                    // Resolve variable types in method body
+                    // Resolve variable types in method body and propagate return type to return expressions
                     if (method->body())
                     {
-                        resolve_variable_types_in_statement(method->body(), resolver, method_ctx, resolved_count, error_count);
+                        TypeRef return_type = method->get_resolved_return_type();
+                        resolve_variable_types_in_statement(method->body(), resolver, method_ctx, return_type, resolved_count, error_count);
                     }
                 }
             }
@@ -885,10 +933,11 @@ namespace Cryo
                         method_ctx.bind_generic(method_generic_params[i]->name(), param_type);
                     }
 
-                    // Resolve variable types in method body
+                    // Resolve variable types in method body and propagate return type to return expressions
                     if (method->body())
                     {
-                        resolve_variable_types_in_statement(method->body(), resolver, method_ctx, resolved_count, error_count);
+                        TypeRef return_type = method->get_resolved_return_type();
+                        resolve_variable_types_in_statement(method->body(), resolver, method_ctx, return_type, resolved_count, error_count);
                     }
                 }
             }
@@ -903,10 +952,11 @@ namespace Cryo
                     func_ctx.bind_generic(generic_params[i]->name(), param_type);
                 }
 
-                // Resolve variable types in function body
+                // Resolve variable types in function body and propagate return type to return expressions
                 if (func->body())
                 {
-                    resolve_variable_types_in_statement(func->body(), resolver, func_ctx, resolved_count, error_count);
+                    TypeRef return_type = func->get_resolved_return_type();
+                    resolve_variable_types_in_statement(func->body(), resolver, func_ctx, return_type, resolved_count, error_count);
                 }
             }
         }
