@@ -54,8 +54,9 @@ namespace Cryo
         // Types components - GenericRegistry and TypeResolver must come before TypeChecker
         std::unique_ptr<GenericRegistry> _generic_registry;
         std::unique_ptr<TypeResolver> _type_resolver;
-        // SymbolTable needs arena and modules from ASTContext
-        std::unique_ptr<SymbolTable> _symbol_table;
+        // SymbolTable - use ASTContext's symbol table to ensure consistency with Parser
+        // This is a non-owning pointer to _ast_context->symbols()
+        SymbolTable* _symbol_table;
         // TypeChecker needs arena, resolver, modules, generics
         std::unique_ptr<TypeChecker> _type_checker;
         std::unique_ptr<Monomorphizer> _monomorphization_pass;
@@ -134,7 +135,7 @@ namespace Cryo
         Lexer *lexer() const { return _lexer.get(); }
         Parser *parser() const { return _parser.get(); }
         ASTContext *ast_context() const { return _ast_context.get(); }
-        SymbolTable *symbol_table() const { return _symbol_table.get(); }
+        SymbolTable *symbol_table() const { return _symbol_table; }
         DiagEmitter *diagnostics() const { return _diagnostics.get(); }
         TypeChecker *type_checker() const { return _type_checker.get(); }
         TypeResolver *type_resolver() const { return _type_resolver.get(); }

@@ -662,12 +662,15 @@ namespace Cryo::Codegen
             TypeRef cryo_field_type = field->get_resolved_type();
             if (cryo_field_type)
             {
-                LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Mapping field '{}' of type '{}' ===",
-                         field->name(), cryo_field_type.get()->display_name());
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Mapping field '{}' of type '{}' (TypeID={}, kind={}) ===",
+                         field->name(), cryo_field_type.get()->display_name(),
+                         cryo_field_type.id().id, static_cast<int>(cryo_field_type->kind()));
                 // Use the main type mapping method like the old implementation did
                 llvm::Type *field_type = types().map(cryo_field_type);
                 if (field_type)
                 {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Field '{}' -> LLVM type ID={} ===",
+                             field->name(), field_type->getTypeID());
                     // Check if the mapped type is opaque
                     if (auto st = llvm::dyn_cast<llvm::StructType>(field_type))
                     {

@@ -7,6 +7,8 @@
 #include "Types/GenericTypes.hpp"
 #include "Types/UserDefinedTypes.hpp"
 #include "Types/ErrorType.hpp"
+#include "Utils/Logger.hpp"
+#include "AST/ASTNode.hpp"
 
 #include <sstream>
 #include <algorithm>
@@ -217,13 +219,51 @@ namespace Cryo
             return MonomorphResult::error(err->reason());
         }
 
+        // Create type substitution for resolving generic params
+        TypeSubstitution subst = create_substitution(template_type, type_args);
+        std::string specialized_name = generate_specialized_name(template_type, type_args);
+
+        // Create concrete resolved type based on the base type's kind
+        TypeRef resolved_type;
+        const Type *base_type = template_type.get();
+
+        LOG_DEBUG(LogComponent::GENERAL, "Monomorphizer::specialize: {} base_type kind={}, specialized_name={}",
+                  template_type->display_name(), static_cast<int>(base_type->kind()), specialized_name);
+
+        if (base_type->kind() == TypeKind::Enum)
+        {
+            // Create concrete enum with substituted variants
+            // Use AST node to get variant info since EnumType may not have variants set for generics
+            auto *enum_type = static_cast<const EnumType *>(base_type);
+            LOG_DEBUG(LogComponent::GENERAL, "Monomorphizer::specialize: Enum {} has {} variants, is_complete={}",
+                      enum_type->name(), enum_type->variant_count(), enum_type->is_complete());
+
+            ASTNode *ast_node = tmpl ? tmpl->ast_node : nullptr;
+            resolved_type = create_concrete_enum(base_type, subst, specialized_name, type_args, ast_node);
+        }
+        else if (base_type->kind() == TypeKind::Struct)
+        {
+            // Create concrete struct with substituted fields
+            // Use AST node to get field info since StructType may not have fields set for generics
+            auto *struct_type = static_cast<const StructType *>(base_type);
+            LOG_DEBUG(LogComponent::GENERAL, "Monomorphizer::specialize: Struct {} has {} fields, is_complete={}",
+                      struct_type->name(), struct_type->field_count(), struct_type->is_complete());
+            ASTNode *ast_node = tmpl ? tmpl->ast_node : nullptr;
+            resolved_type = create_concrete_struct(base_type, subst, specialized_name, type_args, ast_node);
+        }
+
+        // Set the resolved type on the InstantiatedType
+        if (resolved_type.is_valid())
+        {
+            auto *inst_type = const_cast<InstantiatedType *>(
+                static_cast<const InstantiatedType *>(instantiated.get()));
+            inst_type->set_resolved_type(resolved_type);
+        }
+
         // If we have an AST specializer, invoke it
         ASTNode *specialized_ast = nullptr;
         if (_ast_specializer && tmpl)
         {
-            TypeSubstitution subst = create_substitution(template_type, type_args);
-            std::string specialized_name = generate_specialized_name(template_type, type_args);
-
             specialized_ast = _ast_specializer(*tmpl, subst, specialized_name);
         }
 
@@ -231,6 +271,253 @@ namespace Cryo
         _generics.mark_monomorphized(template_type, type_args);
 
         return MonomorphResult::ok(instantiated, specialized_ast);
+    }
+
+    TypeRef Monomorphizer::create_concrete_enum(const Type *base_enum_type,
+                                                 const TypeSubstitution &subst,
+                                                 const std::string &specialized_name,
+                                                 const std::vector<TypeRef> &type_args,
+                                                 ASTNode *ast_node)
+    {
+        auto *enum_type = static_cast<const EnumType *>(base_enum_type);
+
+        // Create a new qualified name for the concrete enum
+        QualifiedTypeName concrete_name;
+        concrete_name.name = specialized_name;
+        concrete_name.module = enum_type->module();
+
+        // Create the concrete enum type
+        TypeRef concrete_enum = _arena.create_enum(concrete_name);
+        if (!concrete_enum.is_valid())
+        {
+            return TypeRef{};
+        }
+
+        // Get the concrete enum type to set its variants
+        auto *concrete = const_cast<EnumType *>(
+            static_cast<const EnumType *>(concrete_enum.get()));
+
+        // Create substituted variants from AST if available (generic enums don't have variants in type system)
+        std::vector<EnumVariant> concrete_variants;
+
+        auto *enum_decl = ast_node ? dynamic_cast<EnumDeclarationNode *>(ast_node) : nullptr;
+        if (enum_decl)
+        {
+            // Get type parameters from the enum declaration
+            std::vector<std::string> type_params;
+            for (const auto &param : enum_decl->generic_parameters())
+            {
+                type_params.push_back(param->name());
+            }
+
+            LOG_DEBUG(LogComponent::GENERAL, "Monomorphizer::create_concrete_enum: {} with {} variants from AST",
+                      specialized_name, enum_decl->variants().size());
+
+            size_t tag = 0;
+            for (const auto &variant : enum_decl->variants())
+            {
+                std::vector<TypeRef> substituted_payload;
+
+                // Handle variant payload types (associated_types are strings like "T", "E", "i32")
+                for (const auto &type_name : variant->associated_types())
+                {
+                    TypeRef payload_type;
+
+                    // Check if it's a type parameter that needs substitution
+                    for (size_t i = 0; i < type_params.size(); ++i)
+                    {
+                        if (type_name == type_params[i] && i < type_args.size())
+                        {
+                            payload_type = type_args[i];
+                            break;
+                        }
+                    }
+
+                    // If not a type param, try to look it up as a named type
+                    if (!payload_type.is_valid())
+                    {
+                        payload_type = _arena.lookup_type_by_name(type_name);
+                    }
+
+                    if (payload_type.is_valid())
+                    {
+                        // Apply substitution in case it's a compound type with generic params
+                        TypeRef substituted = subst.apply(payload_type, _arena);
+                        substituted_payload.push_back(substituted);
+                    }
+                    else
+                    {
+                        LOG_WARN(LogComponent::GENERAL,
+                                 "Monomorphizer::create_concrete_enum: Could not resolve payload type '{}' for variant {}",
+                                 type_name, variant->name());
+                    }
+                }
+
+                EnumVariant concrete_variant(variant->name(), std::move(substituted_payload), tag++);
+                concrete_variants.push_back(std::move(concrete_variant));
+
+                LOG_DEBUG(LogComponent::GENERAL, "Monomorphizer::create_concrete_enum: Added variant {} with {} payload types",
+                          variant->name(), concrete_variants.back().payload_types.size());
+            }
+        }
+        else if (enum_type->variant_count() > 0)
+        {
+            // Fallback to type system variants if available
+            for (const auto &orig_variant : enum_type->variants())
+            {
+                std::vector<TypeRef> substituted_payload;
+                for (const auto &payload_type : orig_variant.payload_types)
+                {
+                    TypeRef substituted = subst.apply(payload_type, _arena);
+                    substituted_payload.push_back(substituted);
+                }
+
+                EnumVariant concrete_variant(orig_variant.name, std::move(substituted_payload), orig_variant.tag_value);
+                concrete_variants.push_back(std::move(concrete_variant));
+            }
+        }
+
+        // Set the variants to complete the enum type
+        if (!concrete_variants.empty())
+        {
+            concrete->set_variants(std::move(concrete_variants));
+            LOG_DEBUG(LogComponent::GENERAL, "Monomorphizer::create_concrete_enum: Completed {} with {} variants",
+                      specialized_name, concrete->variant_count());
+        }
+
+        return concrete_enum;
+    }
+
+    TypeRef Monomorphizer::create_concrete_struct(const Type *base_struct_type,
+                                                   const TypeSubstitution &subst,
+                                                   const std::string &specialized_name,
+                                                   const std::vector<TypeRef> &type_args,
+                                                   ASTNode *ast_node)
+    {
+        auto *struct_type = static_cast<const StructType *>(base_struct_type);
+
+        // Create a new qualified name for the concrete struct
+        QualifiedTypeName concrete_name;
+        concrete_name.name = specialized_name;
+        concrete_name.module = struct_type->module();
+
+        // Create the concrete struct type
+        TypeRef concrete_struct = _arena.create_struct(concrete_name);
+        if (!concrete_struct.is_valid())
+        {
+            return TypeRef{};
+        }
+
+        // Get the concrete struct type to set its fields
+        auto *concrete = const_cast<StructType *>(
+            static_cast<const StructType *>(concrete_struct.get()));
+
+        // Create substituted fields from AST if available (generic structs don't have fields in type system)
+        std::vector<FieldInfo> concrete_fields;
+
+        auto *struct_decl = ast_node ? dynamic_cast<StructDeclarationNode *>(ast_node) : nullptr;
+        if (struct_decl)
+        {
+            // Get type parameters from the struct declaration
+            std::vector<std::string> type_params;
+            for (const auto &param : struct_decl->generic_parameters())
+            {
+                type_params.push_back(param->name());
+            }
+
+            LOG_DEBUG(LogComponent::GENERAL, "Monomorphizer::create_concrete_struct: {} with {} fields from AST",
+                      specialized_name, struct_decl->fields().size());
+
+            for (const auto &field : struct_decl->fields())
+            {
+                TypeRef field_type;
+
+                // First try to get the resolved type from the field
+                if (field->has_resolved_type())
+                {
+                    field_type = field->get_resolved_type();
+                }
+                // Otherwise, try to resolve from type annotation
+                else if (field->has_type_annotation())
+                {
+                    std::string type_name = field->type_annotation()->name;
+
+                    // Check if it's a type parameter that needs substitution
+                    for (size_t i = 0; i < type_params.size(); ++i)
+                    {
+                        if (type_name == type_params[i] && i < type_args.size())
+                        {
+                            field_type = type_args[i];
+                            break;
+                        }
+                    }
+
+                    // If not a type param, try to look it up as a named type
+                    if (!field_type.is_valid())
+                    {
+                        field_type = _arena.lookup_type_by_name(type_name);
+                    }
+                }
+
+                if (field_type.is_valid())
+                {
+                    // Apply substitution in case it's a compound type with generic params
+                    TypeRef substituted = subst.apply(field_type, _arena);
+
+                    FieldInfo concrete_field(
+                        field->name(),
+                        substituted,
+                        0, // Offset will be recomputed by set_fields
+                        field->visibility() == Visibility::Public,
+                        true); // is_mutable
+                    concrete_fields.push_back(std::move(concrete_field));
+
+                    LOG_DEBUG(LogComponent::GENERAL, "Monomorphizer::create_concrete_struct: Added field {} with type {}",
+                              field->name(), substituted->display_name());
+                }
+                else
+                {
+                    LOG_WARN(LogComponent::GENERAL,
+                             "Monomorphizer::create_concrete_struct: Could not resolve field type for {} in {}",
+                             field->name(), specialized_name);
+                }
+            }
+        }
+        else if (struct_type->field_count() > 0)
+        {
+            // Fallback to type system fields if available
+            LOG_DEBUG(LogComponent::GENERAL, "Monomorphizer::create_concrete_struct: {} with {} fields from type system",
+                      specialized_name, struct_type->field_count());
+
+            for (const auto &orig_field : struct_type->fields())
+            {
+                TypeRef substituted_type = subst.apply(orig_field.type, _arena);
+
+                FieldInfo concrete_field(
+                    orig_field.name,
+                    substituted_type,
+                    0, // Offset will be recomputed by set_fields
+                    orig_field.is_public,
+                    orig_field.is_mutable);
+                concrete_fields.push_back(std::move(concrete_field));
+            }
+        }
+        else
+        {
+            LOG_WARN(LogComponent::GENERAL,
+                     "Monomorphizer::create_concrete_struct: No fields found for {} (no AST, no type system fields)",
+                     specialized_name);
+        }
+
+        // Set the fields to complete the struct type
+        if (!concrete_fields.empty())
+        {
+            concrete->set_fields(std::move(concrete_fields));
+            LOG_DEBUG(LogComponent::GENERAL, "Monomorphizer::create_concrete_struct: Completed {} with {} fields",
+                      specialized_name, concrete->field_count());
+        }
+
+        return concrete_struct;
     }
 
     // ========================================================================

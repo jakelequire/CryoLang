@@ -9,6 +9,7 @@
 #include "Types/UserDefinedTypes.hpp"
 #include "Types/GenericTypes.hpp"
 #include "Types/ErrorType.hpp"
+#include "Utils/Logger.hpp"
 
 #include <sstream>
 #include <cassert>
@@ -500,13 +501,39 @@ namespace Cryo
         auto it = _struct_types.find(key);
         if (it != _struct_types.end())
         {
+            LOG_DEBUG(LogComponent::TYPECHECKER,
+                      "TypeArena::create_struct: CACHE HIT for '{}' (module={}) -> TypeID={}",
+                      name.name, name.module.id, it->second.id().id);
             return it->second;
+        }
+
+        // Check if a struct with this name already exists under a different module ID
+        // This helps detect module ID mismatches
+        for (const auto &[existing_key, existing_ref] : _struct_types)
+        {
+            // Check if the name portion matches (key format is "module_id::name")
+            size_t pos = existing_key.find("::");
+            if (pos != std::string::npos)
+            {
+                std::string existing_name = existing_key.substr(pos + 2);
+                if (existing_name == name.name)
+                {
+                    LOG_ERROR(LogComponent::TYPECHECKER,
+                              "TypeArena::create_struct: WARNING - Creating duplicate struct '{}' with module={} "
+                              "but already exists with key='{}' TypeID={}",
+                              name.name, name.module.id, existing_key, existing_ref.id().id);
+                }
+            }
         }
 
         // Create new struct type
         TypeID id = allocate_id();
         auto type = std::make_unique<StructType>(id, name);
         TypeRef ref = register_type(std::move(type));
+
+        LOG_DEBUG(LogComponent::TYPECHECKER,
+                  "TypeArena::create_struct: CREATED '{}' (module={}) -> TypeID={}",
+                  name.name, name.module.id, id.id);
 
         // Cache and return
         _struct_types[key] = ref;

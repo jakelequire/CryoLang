@@ -37,13 +37,6 @@ namespace Cryo
             return nullptr;
         }
 
-        // Check cache first
-        auto cached = lookup_cached(type);
-        if (cached)
-        {
-            return cached;
-        }
-
         const Type *t = type.get();
         if (!t)
         {
@@ -51,8 +44,22 @@ namespace Cryo
             return nullptr;
         }
 
-        llvm::Type *result = nullptr;
         TypeKind kind = t->kind();
+        LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
+                  "TypeMapper::map: TypeID={}, kind={}, name='{}'",
+                  type.id().id, static_cast<int>(kind), t->display_name());
+
+        // Check cache first
+        auto cached = lookup_cached(type);
+        if (cached)
+        {
+            LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
+                      "TypeMapper::map: CACHE HIT for TypeID={}, LLVM type ID={}",
+                      type.id().id, cached->getTypeID());
+            return cached;
+        }
+
+        llvm::Type *result = nullptr;
 
         switch (kind)
         {
@@ -148,6 +155,12 @@ namespace Cryo
             report_error("Unknown type kind: " + std::to_string(static_cast<int>(kind)));
             return nullptr;
         }
+
+        // Log the result
+        LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
+                  "TypeMapper::map: TypeID={} '{}' -> LLVM type ID={}",
+                  type.id().id, t->display_name(),
+                  result ? result->getTypeID() : -1);
 
         // Cache the result
         if (result)
@@ -693,12 +706,23 @@ namespace Cryo
         {
             std::vector<llvm::Type *> llvm_fields;
             llvm_fields.reserve(fields.size());
+            bool has_invalid_field = false;
 
             for (const auto &field : fields)
             {
                 llvm::Type *mapped = map(field.type);
                 if (mapped)
                 {
+                    // Check if the mapped type is void - this indicates an unresolved/error type
+                    // We should NOT set the body with void fields - let TypeCodegen handle it later
+                    if (mapped->isVoidTy())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
+                                  "TypeMapper::map_struct: Field '{}' of struct '{}' mapped to void, deferring to TypeCodegen",
+                                  field.name, name);
+                        has_invalid_field = true;
+                        break;
+                    }
                     llvm_fields.push_back(mapped);
                 }
                 else
@@ -707,7 +731,11 @@ namespace Cryo
                 }
             }
 
-            st->setBody(llvm_fields);
+            // Only set the body if all fields have valid (non-void) types
+            if (!has_invalid_field)
+            {
+                st->setBody(llvm_fields);
+            }
         }
 
         return st;
@@ -758,6 +786,7 @@ namespace Cryo
         {
             std::vector<llvm::Type *> llvm_fields;
             llvm_fields.reserve(fields.size());
+            bool has_invalid_field = false;
 
             // TODO: Add vtable pointer if class has virtual methods
 
@@ -766,6 +795,16 @@ namespace Cryo
                 llvm::Type *mapped = map(field.type);
                 if (mapped)
                 {
+                    // Check if the mapped type is void - this indicates an unresolved/error type
+                    // We should NOT set the body with void fields - let TypeCodegen handle it later
+                    if (mapped->isVoidTy())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
+                                  "TypeMapper::map_class: Field '{}' of class '{}' mapped to void, deferring to TypeCodegen",
+                                  field.name, name);
+                        has_invalid_field = true;
+                        break;
+                    }
                     llvm_fields.push_back(mapped);
                 }
                 else
@@ -774,7 +813,11 @@ namespace Cryo
                 }
             }
 
-            st->setBody(llvm_fields);
+            // Only set the body if all fields have valid (non-void) types
+            if (!has_invalid_field)
+            {
+                st->setBody(llvm_fields);
+            }
         }
 
         return st;
@@ -891,13 +934,20 @@ namespace Cryo
         if (!type)
             return nullptr;
 
+        std::string name = type->display_name();
+        LOG_DEBUG(LogComponent::CODEGEN, "TypeMapper::map_instantiated: '{}' has_resolved_type={}",
+                  name, type->has_resolved_type());
+
         // If we have a resolved concrete type, use that directly
         if (type->has_resolved_type())
         {
+            LOG_DEBUG(LogComponent::CODEGEN, "TypeMapper::map_instantiated: '{}' using resolved_type '{}'",
+                      name, type->resolved_type().get()->display_name());
             return map(type->resolved_type());
         }
 
-        std::string name = type->display_name();
+        LOG_DEBUG(LogComponent::CODEGEN, "TypeMapper::map_instantiated: '{}' has NO resolved_type, falling through",
+                  name);
 
         // Check if already exists and is complete
         auto existing = lookup_struct(name);

@@ -605,6 +605,253 @@ namespace Cryo::Codegen
         return class_type;
     }
 
+    llvm::Type *GenericCodegen::instantiate_enum(const std::string &generic_name,
+                                                   const std::vector<TypeRef> &type_args)
+    {
+        // Check if any type arguments are uninstantiated type parameters
+        for (const auto &arg : type_args)
+        {
+            if (!arg)
+                continue;
+
+            if (arg->kind() == TypeKind::GenericParam)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Skipping enum instantiation of {} - type arg '{}' is a generic parameter",
+                          generic_name, arg.get()->display_name());
+                return nullptr;
+            }
+
+            if (arg->kind() == TypeKind::Struct || arg->kind() == TypeKind::Class)
+            {
+                llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), arg.get()->display_name());
+                if (!existing || existing->isOpaque())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Skipping enum instantiation of {} - type arg '{}' is undefined/opaque",
+                              generic_name, arg.get()->display_name());
+                    return nullptr;
+                }
+            }
+        }
+
+        std::string mangled = mangle_type_name(generic_name, type_args);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Instantiating enum {} -> {}",
+                  generic_name, mangled);
+
+        // Check cache
+        if (has_type_instantiation(mangled))
+        {
+            return get_cached_type(mangled);
+        }
+
+        // Check LLVM context for existing type
+        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
+        {
+            if (!existing->isOpaque())
+            {
+                _type_cache[mangled] = existing;
+                return existing;
+            }
+        }
+
+        // Get generic definition
+        Cryo::ASTNode *generic_def = get_generic_type_def(generic_name);
+        if (!generic_def)
+        {
+            report_error(ErrorCode::E0632_TYPE_RESOLUTION_ERROR,
+                         "Unknown generic enum: " + generic_name);
+            return nullptr;
+        }
+
+        auto *enum_decl = dynamic_cast<EnumDeclarationNode *>(generic_def);
+        if (!enum_decl)
+        {
+            return nullptr;
+        }
+
+        // Get type parameters from definition
+        std::vector<std::string> type_params;
+        for (const auto &param : enum_decl->generic_parameters())
+        {
+            type_params.push_back(param->name());
+        }
+
+        // Begin type parameter scope for substitution
+        begin_type_params(type_params, type_args);
+
+        // Check if this is a simple enum (all variants are simple with no payloads)
+        bool is_simple = enum_decl->is_simple_enum();
+
+        llvm::Type *enum_type = nullptr;
+
+        if (is_simple)
+        {
+            // Simple enums are just integers
+            enum_type = llvm::Type::getInt32Ty(llvm_ctx());
+        }
+        else
+        {
+            // Complex enums are tagged unions: { i32 discriminant, [payload_size x i8] }
+            // Calculate the maximum payload size by substituting type parameters
+            size_t max_payload_size = 0;
+
+            for (const auto &variant : enum_decl->variants())
+            {
+                if (!variant->is_simple_variant())
+                {
+                    size_t variant_size = 0;
+                    for (const auto &type_name : variant->associated_types())
+                    {
+                        // Try to substitute type parameters
+                        TypeRef payload_type;
+
+                        // Check if it's a type parameter
+                        for (size_t i = 0; i < type_params.size(); ++i)
+                        {
+                            if (type_name == type_params[i] && i < type_args.size())
+                            {
+                                payload_type = type_args[i];
+                                break;
+                            }
+                        }
+
+                        // If not a type param, try to look it up
+                        if (!payload_type.is_valid())
+                        {
+                            payload_type = symbols().arena().lookup_type_by_name(type_name);
+                        }
+
+                        if (payload_type.is_valid())
+                        {
+                            llvm::Type *llvm_type = types().map(payload_type);
+                            if (llvm_type && llvm_type->isSized())
+                            {
+                                variant_size += module()->getDataLayout().getTypeAllocSize(llvm_type);
+                            }
+                            else
+                            {
+                                variant_size += 8; // Default to pointer size
+                            }
+                        }
+                        else
+                        {
+                            variant_size += 8; // Default to pointer size for unknown types
+                        }
+                    }
+                    max_payload_size = std::max(max_payload_size, variant_size);
+                }
+            }
+
+            // Ensure minimum payload size
+            max_payload_size = std::max(max_payload_size, static_cast<size_t>(8));
+
+            // Create tagged union type
+            llvm::Type *discriminant_type = llvm::Type::getInt32Ty(llvm_ctx());
+            llvm::Type *payload_type = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload_size);
+
+            llvm::StructType *enum_struct = llvm::StructType::create(llvm_ctx(), mangled);
+            enum_struct->setBody({discriminant_type, payload_type}, false);
+            enum_type = enum_struct;
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Created tagged union for enum '{}': payload size = {} bytes",
+                      mangled, max_payload_size);
+        }
+
+        // Cache and register type
+        _type_cache[mangled] = enum_type;
+        ctx().register_type(mangled, enum_type);
+
+        // Register type's namespace
+        std::string base_namespace = ctx().get_type_namespace(generic_name);
+        if (base_namespace.empty())
+        {
+            base_namespace = ctx().namespace_context();
+        }
+        if (!base_namespace.empty())
+        {
+            ctx().register_type_namespace(mangled, base_namespace);
+        }
+
+        // Register enum variants with instantiated names
+        // This is CRITICAL for codegen to find Option_string::None, Option_string::Some, etc.
+        int32_t index = 0;
+        for (const auto &variant : enum_decl->variants())
+        {
+            std::string variant_name = mangled + "::" + variant->name();
+            llvm::Constant *discriminant = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), index);
+
+            // Register variant discriminant
+            ctx().register_enum_variant(variant_name, discriminant);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Registered instantiated enum variant: {} = {}", variant_name, index);
+
+            // Also register with namespace prefix if applicable
+            if (!base_namespace.empty())
+            {
+                std::string qualified_variant = base_namespace + "::" + variant_name;
+                ctx().register_enum_variant(qualified_variant, discriminant);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Also registered enum variant as: {}", qualified_variant);
+            }
+
+            // Register variant field types for pattern matching (with substituted types)
+            if (!variant->is_simple_variant())
+            {
+                std::vector<std::string> substituted_types;
+                for (const auto &type_name : variant->associated_types())
+                {
+                    // Substitute type parameters
+                    std::string substituted_name = type_name;
+                    for (size_t i = 0; i < type_params.size(); ++i)
+                    {
+                        if (type_name == type_params[i] && i < type_args.size() && type_args[i].is_valid())
+                        {
+                            substituted_name = type_args[i]->display_name();
+                            break;
+                        }
+                    }
+                    substituted_types.push_back(substituted_name);
+                }
+                ctx().register_enum_variant_fields(variant_name, substituted_types);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Registered {} field types for variant {}",
+                          substituted_types.size(), variant_name);
+            }
+
+            index++;
+        }
+
+        // End type parameter scope
+        end_type_params();
+
+        // Also register with unmangled name for lookup consistency
+        std::string instantiated_name = generic_name + "<";
+        for (size_t i = 0; i < type_args.size(); ++i)
+        {
+            if (i > 0)
+                instantiated_name += ", ";
+            if (type_args[i])
+            {
+                instantiated_name += type_args[i].get()->display_name();
+            }
+        }
+        instantiated_name += ">";
+
+        if (auto *st = llvm::dyn_cast<llvm::StructType>(enum_type))
+        {
+            types().register_struct(instantiated_name, st);
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "GenericCodegen: Registered enum {} (also as {}) with {} variants",
+                  mangled, instantiated_name, enum_decl->variants().size());
+
+        return enum_type;
+    }
+
     llvm::Type *GenericCodegen::get_instantiated_type(const std::string &generic_name,
                                                         const std::vector<TypeRef> &type_args)
     {
@@ -630,6 +877,10 @@ namespace Cryo::Codegen
         else if (dynamic_cast<ClassDeclarationNode *>(def))
         {
             return instantiate_class(generic_name, type_args);
+        }
+        else if (dynamic_cast<EnumDeclarationNode *>(def))
+        {
+            return instantiate_enum(generic_name, type_args);
         }
 
         return nullptr;

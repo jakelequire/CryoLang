@@ -2912,7 +2912,11 @@ namespace Cryo::Codegen
                   type_name);
 
         // Look up struct type
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Looking up type '{}'", type_name);
         llvm::Type *struct_type = ctx().get_type(type_name);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: ctx().get_type returned {}",
+                  struct_type ? "non-null" : "null");
+
         if (!struct_type || !struct_type->isStructTy())
         {
             report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
@@ -2921,6 +2925,8 @@ namespace Cryo::Codegen
         }
 
         auto *st = llvm::cast<llvm::StructType>(struct_type);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Struct '{}' has {} elements, isOpaque={}",
+                  type_name, st->getNumElements(), st->isOpaque());
 
         // CRITICAL: Check if struct is opaque (unsized) before proceeding
         // This can happen if the struct body hasn't been set yet due to order-of-operations issues
@@ -2968,33 +2974,43 @@ namespace Cryo::Codegen
         }
 
         // Check if we're in a constructor - constructors should allocate on heap
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Checking constructor status");
         bool is_constructor = false;
-        llvm::Function *current_fn = builder().GetInsertBlock()
-                                         ? builder().GetInsertBlock()->getParent()
-                                         : nullptr;
+        llvm::BasicBlock *insert_block = builder().GetInsertBlock();
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Insert block is {}",
+                  insert_block ? "non-null" : "null");
+        llvm::Function *current_fn = insert_block ? insert_block->getParent() : nullptr;
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Current function is {}",
+                  current_fn ? "non-null" : "null");
+
         if (current_fn)
         {
             std::string fn_name = current_fn->getName().str();
             // Simple heuristic: if function returns a pointer and the name contains the struct type
             // it's likely a constructor
             llvm::Type *ret_type = current_fn->getReturnType();
-            is_constructor = ret_type && ret_type->isPointerTy() && 
-                           fn_name.find(type_name) != std::string::npos;
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, 
-                     "Function '{}' constructor check: {} (return type: {}, contains '{}': {})", 
-                     fn_name, is_constructor ? "yes" : "no", 
-                     ret_type->isPointerTy() ? "pointer" : "non-pointer",
-                     type_name, fn_name.find(type_name) != std::string::npos ? "yes" : "no");
+            if (ret_type)
+            {
+                is_constructor = ret_type->isPointerTy() &&
+                               fn_name.find(type_name) != std::string::npos;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                         "Function '{}' constructor check: {} (return type: {}, contains '{}': {})",
+                         fn_name, is_constructor ? "yes" : "no",
+                         ret_type->isPointerTy() ? "pointer" : "non-pointer",
+                         type_name, fn_name.find(type_name) != std::string::npos ? "yes" : "no");
+            }
         }
 
         llvm::Value *struct_storage = nullptr;
-        
+
         if (is_constructor)
         {
             // For constructors: allocate on heap using malloc
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Constructor path - calling getDataLayout");
             const llvm::DataLayout &DL = module()->getDataLayout();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Calling getTypeAllocSize");
             llvm::Value *size = llvm::ConstantInt::get(
-                llvm::Type::getInt64Ty(llvm_ctx()), 
+                llvm::Type::getInt64Ty(llvm_ctx()),
                 DL.getTypeAllocSize(struct_type));
             
             // Get or declare malloc function
@@ -3019,7 +3035,10 @@ namespace Cryo::Codegen
         else
         {
             // For non-constructors: allocate on stack
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Non-constructor path - calling create_entry_alloca");
             struct_storage = create_entry_alloca(struct_type, type_name + ".literal");
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: create_entry_alloca returned {}",
+                      struct_storage ? "non-null" : "null");
         }
 
         // Initialize fields from field initializers
@@ -3482,19 +3501,10 @@ namespace Cryo::Codegen
             }
         }
 
-        // In generic contexts, create a placeholder value instead of failing completely
-        // This prevents segmentation faults when generic enum variants can't be resolved
-        if (qualified_name.find("Option::None") != std::string::npos ||
-            qualified_name.find("Result::Err") != std::string::npos ||
-            qualified_name.find("Result::Ok") != std::string::npos)
-        {
-            LOG_WARN(Cryo::LogComponent::CODEGEN, "Creating placeholder for unresolved generic enum variant: {}", qualified_name);
-            // Return a null pointer as placeholder - this will be handled by the calling code
-            return llvm::ConstantPointerNull::get(llvm::PointerType::get(llvm_ctx(), 0));
-        }
-
+        // Report error for unresolved enum variants (no placeholders - fail early and clearly)
         report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, node,
-                     "Cannot resolve: " + qualified_name);
+                     "Cannot resolve enum variant: " + qualified_name +
+                     " (generic enum variants must be instantiated before use)");
         return nullptr;
     }
 

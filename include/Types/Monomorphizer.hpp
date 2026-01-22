@@ -319,6 +319,34 @@ namespace Cryo
         {
             return _in_progress.find(key) != _in_progress.end();
         }
+
+        /**
+         * @brief Create a concrete enum type with substituted variant types
+         * @param base_enum_type The generic enum type
+         * @param subst Type substitution map
+         * @param specialized_name Mangled name for the concrete type
+         * @param type_args Concrete type arguments
+         * @param ast_node AST node for the enum declaration (contains variants)
+         */
+        TypeRef create_concrete_enum(const Type *base_enum_type,
+                                      const TypeSubstitution &subst,
+                                      const std::string &specialized_name,
+                                      const std::vector<TypeRef> &type_args,
+                                      ASTNode *ast_node);
+
+        /**
+         * @brief Create a concrete struct type with substituted field types
+         * @param base_struct_type The generic struct type
+         * @param subst Type substitution map
+         * @param specialized_name Mangled name for the concrete type
+         * @param type_args Concrete type arguments
+         * @param ast_node AST node for the struct declaration (contains fields)
+         */
+        TypeRef create_concrete_struct(const Type *base_struct_type,
+                                        const TypeSubstitution &subst,
+                                        const std::string &specialized_name,
+                                        const std::vector<TypeRef> &type_args,
+                                        ASTNode *ast_node);
     };
 
 } // namespace Cryo
