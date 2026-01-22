@@ -2,6 +2,7 @@
 #include "Compiler/StandardPasses.hpp"
 #include "Types/TypeMapper.hpp"
 #include "Types/GenericTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "AST/DirectiveProcessors.hpp"
 #include "AST/DirectiveWalker.hpp"
@@ -53,10 +54,9 @@ namespace Cryo
             *_generic_registry,
             _diagnostics.get());
 
-        // 3. SymbolTable (needs arena, modules)
-        _symbol_table = std::make_unique<SymbolTable>(
-            _ast_context->types(),
-            _ast_context->modules());
+        // 3. SymbolTable - use ASTContext's symbol table to ensure Parser and CompilerInstance
+        // share the same symbol table and module context
+        _symbol_table = &_ast_context->symbols();
 
         // 4. TypeChecker (needs arena, resolver, modules, generics)
         _type_checker = std::make_unique<TypeChecker>(
@@ -999,12 +999,12 @@ namespace Cryo
     void CompilerInstance::populate_symbol_table(ASTNode *node)
     {
         // Inject auto-imports before processing user imports
-        inject_auto_imports(_symbol_table.get(), "Global");
+        inject_auto_imports(_symbol_table, "Global");
 
         // Two-pass approach for proper forward reference resolution:
         // Pass 1: Collect all declarations (functions, structs, enums, traits) first
         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pass 1: Collecting declarations...");
-        collect_declarations_pass(node, _symbol_table.get(), "Global");
+        collect_declarations_pass(node, _symbol_table, "Global");
 
         // Pre-register functions in LLVM to prevent forward declaration conflicts
         if (_codegen)
@@ -1037,7 +1037,7 @@ namespace Cryo
 
         // Pass 2: Process function bodies and other code that can reference the symbols
         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pass 2: Processing function bodies and references...");
-        populate_symbol_table_with_scope(node, _symbol_table.get(), "Global");
+        populate_symbol_table_with_scope(node, _symbol_table, "Global");
     }
 
     void CompilerInstance::collect_declarations_pass(ASTNode *node, SymbolTable *current_scope, const std::string &scope_name)
@@ -1134,10 +1134,83 @@ namespace Cryo
             TypeRef struct_type = _symbol_table->lookup_struct_type(struct_decl->name());
             if (!struct_type.is_valid())
             {
+                // Also check if the type exists in the TypeArena (might have been registered with a different module)
+                // This prevents creating duplicate types with different module IDs
+                struct_type = _ast_context->types().lookup_type_by_name(struct_decl->name());
+            }
+            if (!struct_type.is_valid())
+            {
                 // Type wasn't pre-registered, create and register it now
                 ModuleID current_module = _symbol_table->current_module();
                 struct_type = _ast_context->types().create_struct(QualifiedTypeName{current_module, struct_decl->name()});
                 _symbol_table->declare_type(struct_decl->name(), struct_type, struct_decl->location());
+            }
+
+            // Populate struct fields on the TypeRef type (critical for generic instantiation)
+            // This ensures TypeMapper::map_instantiated_struct can find field information
+            if (struct_type.is_valid() && !struct_decl->fields().empty())
+            {
+                auto *struct_ptr = const_cast<StructType *>(dynamic_cast<const StructType *>(struct_type.get()));
+                if (struct_ptr && !struct_ptr->is_complete())
+                {
+                    std::vector<FieldInfo> fields;
+                    bool is_generic = !struct_decl->generic_parameters().empty();
+
+                    for (const auto &field : struct_decl->fields())
+                    {
+                        if (field)
+                        {
+                            TypeRef field_type = field->get_resolved_type();
+
+                            // For generic structs, field types may contain generic params (T, U, etc.)
+                            // These will be substituted during instantiation
+                            if (!field_type.is_valid() && field->has_type_annotation())
+                            {
+                                std::string type_str = field->type_annotation()->to_string();
+
+                                // Check if this is a generic parameter reference
+                                if (is_generic)
+                                {
+                                    // Look for the generic param in the struct's type parameters
+                                    for (size_t i = 0; i < struct_decl->generic_parameters().size(); ++i)
+                                    {
+                                        if (struct_decl->generic_parameters()[i]->name() == type_str)
+                                        {
+                                            field_type = _ast_context->types().create_generic_param(type_str, i);
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // If still not resolved, try as primitive type
+                                if (!field_type.is_valid())
+                                {
+                                    field_type = _type_resolver->resolve_primitive(type_str);
+                                }
+                            }
+
+                            if (field_type.is_valid())
+                            {
+                                fields.emplace_back(field->name(), field_type, 0, true, field->is_mutable());
+                            }
+                            else
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                          "CompilerInstance: Field '{}' in struct '{}' has unresolved type (annotation: '{}')",
+                                          field->name(), struct_decl->name(),
+                                          field->has_type_annotation() ? field->type_annotation()->to_string() : "none");
+                            }
+                        }
+                    }
+
+                    if (!fields.empty())
+                    {
+                        struct_ptr->set_fields(std::move(fields));
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                  "CompilerInstance: Set {} fields on struct '{}' (generic={})",
+                                  struct_decl->fields().size(), struct_decl->name(), is_generic);
+                    }
+                }
             }
 
             // Register struct methods with fully qualified names
@@ -1220,6 +1293,69 @@ namespace Cryo
                 ModuleID current_module = _symbol_table->current_module();
                 class_type = _ast_context->types().create_class(QualifiedTypeName{current_module, class_decl->name()});
                 _symbol_table->declare_type(class_decl->name(), class_type, class_decl->location());
+            }
+
+            // Populate class fields on the TypeRef type (critical for generic instantiation)
+            if (class_type.is_valid() && !class_decl->fields().empty())
+            {
+                auto *class_ptr = const_cast<ClassType *>(dynamic_cast<const ClassType *>(class_type.get()));
+                if (class_ptr && !class_ptr->is_complete())
+                {
+                    std::vector<FieldInfo> fields;
+                    bool is_generic = !class_decl->generic_parameters().empty();
+
+                    for (const auto &field : class_decl->fields())
+                    {
+                        if (field)
+                        {
+                            TypeRef field_type = field->get_resolved_type();
+
+                            // For generic classes, field types may contain generic params
+                            if (!field_type.is_valid() && field->has_type_annotation())
+                            {
+                                std::string type_str = field->type_annotation()->to_string();
+
+                                // Check if this is a generic parameter reference
+                                if (is_generic)
+                                {
+                                    for (size_t i = 0; i < class_decl->generic_parameters().size(); ++i)
+                                    {
+                                        if (class_decl->generic_parameters()[i]->name() == type_str)
+                                        {
+                                            field_type = _ast_context->types().create_generic_param(type_str, i);
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // If still not resolved, try as primitive type
+                                if (!field_type.is_valid())
+                                {
+                                    field_type = _type_resolver->resolve_primitive(type_str);
+                                }
+                            }
+
+                            if (field_type.is_valid())
+                            {
+                                fields.emplace_back(field->name(), field_type, 0, true, field->is_mutable());
+                            }
+                            else
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                          "CompilerInstance: Field '{}' in class '{}' has unresolved type",
+                                          field->name(), class_decl->name());
+                            }
+                        }
+                    }
+
+                    if (!fields.empty())
+                    {
+                        class_ptr->set_fields(std::move(fields));
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                  "CompilerInstance: Set {} fields on class '{}' (generic={})",
+                                  class_decl->fields().size(), class_decl->name(), is_generic);
+                    }
+                }
             }
 
             // Register class methods with fully qualified names
@@ -2812,7 +2948,7 @@ namespace Cryo
         if (!_stdlib_compilation_mode && _auto_imports_enabled)
         {
             LOG_DEBUG(LogComponent::GENERAL, "Auto-import phase: Injecting auto-imports");
-            inject_auto_imports(_symbol_table.get(), "Global");
+            inject_auto_imports(_symbol_table, "Global");
         }
         else
         {
@@ -2829,7 +2965,7 @@ namespace Cryo
         }
 
         LOG_DEBUG(LogComponent::GENERAL, "Declaration collection phase: Collecting declarations");
-        collect_declarations_pass(_ast_root.get(), _symbol_table.get(), "Global");
+        collect_declarations_pass(_ast_root.get(), _symbol_table, "Global");
     }
 
     bool CompilerInstance::run_directive_processing_phase()
@@ -2851,7 +2987,7 @@ namespace Cryo
         size_t errors_before = _diagnostics ? _diagnostics->error_count() : 0;
 
         LOG_DEBUG(LogComponent::GENERAL, "Function body phase: Processing function bodies and references");
-        populate_symbol_table_with_scope(_ast_root.get(), _symbol_table.get(), "Global");
+        populate_symbol_table_with_scope(_ast_root.get(), _symbol_table, "Global");
 
         // Check for NEW type errors from this module only (not accumulated errors from previous modules)
         size_t errors_after = _diagnostics ? _diagnostics->error_count() : 0;
