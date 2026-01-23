@@ -6,6 +6,8 @@
 #include "Codegen/CodegenVisitor.hpp"
 #include "Lexer/lexer.hpp"
 #include "AST/ASTNode.hpp"
+#include "Types/GenericTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
 #include "Utils/Logger.hpp"
 
 #include <stdexcept>
@@ -3411,6 +3413,25 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating scope resolution {}::{}",
                   node->scope_name(), node->member_name());
 
+        // Check if the node has a resolved type from the GenericExpressionResolutionPass
+        // This handles generic enum variants like Option::None when the concrete type is known
+        if (node->has_resolved_type())
+        {
+            TypeRef resolved_type = node->get_resolved_type();
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ExpressionCodegen: ScopeResolution has resolved type: {}",
+                      resolved_type->display_name());
+
+            // Try to generate the enum variant using the resolved type information
+            llvm::Value *result = generate_enum_variant_from_resolved_type(
+                node, resolved_type, node->scope_name(), node->member_name());
+            if (result)
+            {
+                return result;
+            }
+            // Fall through to normal lookup if resolved type didn't help
+        }
+
         // Build fully qualified name
         std::string qualified_name = node->scope_name() + "::" + node->member_name();
 
@@ -3505,6 +3526,153 @@ namespace Cryo::Codegen
         report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, node,
                      "Cannot resolve enum variant: " + qualified_name +
                      " (generic enum variants must be instantiated before use)");
+        return nullptr;
+    }
+
+    llvm::Value *ExpressionCodegen::generate_enum_variant_from_resolved_type(
+        Cryo::ScopeResolutionNode *node,
+        TypeRef resolved_type,
+        const std::string &scope_name,
+        const std::string &member_name)
+    {
+        if (!resolved_type.is_valid())
+            return nullptr;
+
+        // Get the display name of the resolved type for variant lookup
+        std::string type_name = resolved_type->display_name();
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "ExpressionCodegen: Trying to resolve {}::{} with type '{}'",
+                  scope_name, member_name, type_name);
+
+        // For InstantiatedType, try to get the resolved (monomorphized) type
+        if (resolved_type->kind() == TypeKind::InstantiatedType)
+        {
+            auto *inst_type = static_cast<const InstantiatedType *>(resolved_type.get());
+            if (inst_type->has_resolved_type())
+            {
+                resolved_type = inst_type->resolved_type();
+                type_name = resolved_type->display_name();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "ExpressionCodegen: Using monomorphized type '{}'", type_name);
+            }
+        }
+
+        // Check if the resolved type is an enum
+        if (resolved_type->kind() != TypeKind::Enum)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ExpressionCodegen: Resolved type '{}' is not an enum (kind={})",
+                      type_name, static_cast<int>(resolved_type->kind()));
+            return nullptr;
+        }
+
+        auto *enum_type = static_cast<const EnumType *>(resolved_type.get());
+
+        // Verify the variant exists
+        auto variant_idx = enum_type->variant_index(member_name);
+        if (!variant_idx.has_value())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ExpressionCodegen: Variant '{}' not found in enum '{}'",
+                      member_name, type_name);
+            return nullptr;
+        }
+
+        // Build the fully qualified variant name for lookup
+        // The enum variant should be registered as "TypeName::VariantName"
+        std::string qualified_variant = type_name + "::" + member_name;
+
+        // Try to find the variant in the enum_variants_map
+        auto &enum_variants = ctx().enum_variants_map();
+        auto it = enum_variants.find(qualified_variant);
+        if (it != enum_variants.end())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ExpressionCodegen: Found enum variant '{}'", qualified_variant);
+            return it->second;
+        }
+
+        // Also try without any template parameters in the name
+        // e.g., "Option<Duration>::None" might be stored as "Option::None"
+        std::string base_variant = scope_name + "::" + member_name;
+        it = enum_variants.find(base_variant);
+        if (it != enum_variants.end())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ExpressionCodegen: Found enum variant via base name '{}'", base_variant);
+            return it->second;
+        }
+
+        // Try looking up in various namespace forms
+        auto candidates = generate_lookup_candidates(qualified_variant, Cryo::SymbolKind::Type);
+        for (const auto &candidate : candidates)
+        {
+            it = enum_variants.find(candidate);
+            if (it != enum_variants.end())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "ExpressionCodegen: Found enum variant via candidate '{}'", candidate);
+                return it->second;
+            }
+        }
+
+        // If the variant is a simple tag (no payload), we can generate the discriminant value directly
+        const auto &variant = enum_type->variants()[*variant_idx];
+        if (!variant.has_payload())
+        {
+            // Simple variant - just return the discriminant value
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "ExpressionCodegen: Generating discriminant {} for simple variant '{}'",
+                      *variant_idx, member_name);
+
+            // Get or create the LLVM type for this enum
+            llvm::Type *llvm_enum_type = types().map(resolved_type);
+            if (!llvm_enum_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "ExpressionCodegen: Failed to map enum type '{}'", type_name);
+                return nullptr;
+            }
+
+            // For simple enums, return the discriminant value
+            // The discriminant is typically an integer (i32)
+            llvm::Value *discriminant = llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(llvm_ctx()), *variant_idx);
+
+            // If the enum type is more complex (struct with discriminant + payload),
+            // we need to create a struct with the discriminant and zeroed payload
+            if (llvm_enum_type->isStructTy())
+            {
+                auto *struct_type = llvm::cast<llvm::StructType>(llvm_enum_type);
+
+                // Create alloca for the struct
+                llvm::Value *alloca = builder().CreateAlloca(struct_type, nullptr, member_name + ".tmp");
+
+                // Store the discriminant (first field)
+                llvm::Value *disc_gep = builder().CreateStructGEP(struct_type, alloca, 0, "disc.ptr");
+                builder().CreateStore(discriminant, disc_gep);
+
+                // Zero-initialize the payload area if it exists
+                if (struct_type->getNumElements() > 1)
+                {
+                    llvm::Value *payload_gep = builder().CreateStructGEP(struct_type, alloca, 1, "payload.ptr");
+                    llvm::Type *payload_type = struct_type->getElementType(1);
+                    llvm::Constant *zero_payload = llvm::Constant::getNullValue(payload_type);
+                    builder().CreateStore(zero_payload, payload_gep);
+                }
+
+                // Load and return the struct
+                return builder().CreateLoad(struct_type, alloca, member_name + ".val");
+            }
+
+            // For simple integer-based enums, just return the discriminant
+            return discriminant;
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "ExpressionCodegen: Cannot resolve variant '{}' with payload - needs constructor call",
+                  member_name);
         return nullptr;
     }
 
