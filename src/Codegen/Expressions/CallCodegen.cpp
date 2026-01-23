@@ -1077,12 +1077,21 @@ namespace Cryo::Codegen
                 if (inst->has_resolved_type())
                 {
                     resolved = inst->resolved_type().get();
+                    // Use the resolved type's name (mangled name like Option_SystemTime)
+                    // This is the name used to register the type in the context
+                    instantiated_enum_name = resolved->display_name();
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "generate_enum_variant: Using resolved type from InstantiatedType: {}",
-                              resolved->display_name());
+                              instantiated_enum_name);
                 }
-                // Use the instantiated type's name (e.g., Option_string, Result_ptr_AllocError)
-                instantiated_enum_name = inst->display_name();
+                else
+                {
+                    // Fallback to InstantiatedType's display_name if no resolved type
+                    instantiated_enum_name = inst->display_name();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_enum_variant: Using InstantiatedType display name (no resolved type): {}",
+                              instantiated_enum_name);
+                }
             }
             else if (resolved->kind() == TypeKind::Enum)
             {
@@ -1155,11 +1164,25 @@ namespace Cryo::Codegen
             }
         }
 
-        // Look up the enum type - try instantiated name first, then base name
-        llvm::Type *enum_type = ctx().get_type(instantiated_enum_name);
-        if (!enum_type && instantiated_enum_name != resolved_enum_name)
+        // Look up the enum type - use TypeMapper for proper caching
+        // First try using the resolved TypeRef if available (most reliable)
+        llvm::Type *enum_type = nullptr;
+        if (resolved_type_ref.is_valid())
         {
-            enum_type = ctx().get_type(resolved_enum_name);
+            enum_type = types().map(resolved_type_ref);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_enum_variant: Mapped enum type from TypeRef: {}",
+                      enum_type ? "success" : "failed");
+        }
+
+        // Fallback to name-based lookup if TypeRef mapping failed
+        if (!enum_type)
+        {
+            enum_type = types().get_type(instantiated_enum_name);
+            if (!enum_type && instantiated_enum_name != resolved_enum_name)
+            {
+                enum_type = types().get_type(resolved_enum_name);
+            }
         }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
