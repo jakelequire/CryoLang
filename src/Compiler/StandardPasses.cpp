@@ -215,6 +215,62 @@ namespace Cryo
     }
 
     // ========================================================================
+    // Helper: Check if a type needs resolution
+    // A type needs resolution if:
+    // 1. It's not valid
+    // 2. It's an error type (unresolved generic, undefined type, etc.)
+    // 3. It's a placeholder struct that was created for a type alias but hasn't been
+    //    resolved to the actual underlying type yet
+    // ========================================================================
+
+    static bool type_needs_resolution(TypeRef current_type, const TypeAnnotation *ann)
+    {
+        // No type at all - definitely needs resolution
+        if (!current_type.is_valid())
+            return true;
+
+        // Error types always need resolution
+        if (current_type.is_error())
+            return true;
+
+        // If we have an annotation, check if the current type is a placeholder
+        // that matches the annotation name (meaning it's a type alias that
+        // hasn't been resolved to its target type yet)
+        if (ann && current_type->kind() == TypeKind::Struct)
+        {
+            std::string current_name = current_type->display_name();
+            std::string ann_name = ann->name;
+
+            // Check for generic annotation names too (e.g., "Option<Layout>")
+            if (ann->kind == TypeAnnotationKind::Generic && ann->inner)
+            {
+                ann_name = ann->inner->name;
+            }
+
+            // If the annotation is a generic type (e.g., "IoResult<PathBuf>")
+            // extract the base name
+            size_t angle_pos = ann_name.find('<');
+            if (angle_pos != std::string::npos)
+            {
+                ann_name = ann_name.substr(0, angle_pos);
+            }
+
+            // If the current type name matches the annotation name exactly,
+            // it's likely a placeholder struct that needs resolution
+            // (A properly resolved type alias would have the target type, not the alias name)
+            if (current_name == ann->name || current_name == ann_name)
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                    "TypeResolutionPass: Type '{}' appears to be a placeholder for annotation '{}', needs resolution",
+                    current_name, ann->to_string());
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // ========================================================================
     // Helper: Resolve variable types in function/method bodies
     // ========================================================================
 
@@ -475,8 +531,77 @@ namespace Cryo
         }
         LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: Phase 1 complete - all types pre-registered");
 
-        // === PHASE 2: Resolve all type annotations ===
-        LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: Phase 2 - Resolving type annotations");
+        // === PHASE 2a: Resolve type aliases FIRST ===
+        // This ensures that when we resolve function return types later, the type aliases
+        // are already available in the module registry. This is critical for forward references
+        // where a function uses a type alias defined later in the file.
+        LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: Phase 2a - Resolving type aliases first");
+        for (auto &stmt : program->statements())
+        {
+            if (auto *alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(stmt.get()))
+            {
+                // If the alias has a deferred target type annotation, resolve it now
+                if (alias_decl->has_target_type_annotation() && !alias_decl->has_resolved_target_type())
+                {
+                    const TypeAnnotation *target_ann = alias_decl->target_type_annotation();
+
+                    // Create a resolution context, binding generic params if this is a generic alias
+                    ResolutionContext alias_ctx = res_ctx.child();
+                    const auto &generic_params = alias_decl->generic_params();
+                    if (!generic_params.empty())
+                    {
+                        for (size_t i = 0; i < generic_params.size(); ++i)
+                        {
+                            TypeRef param_type = arena.create_generic_param(generic_params[i], i);
+                            alias_ctx.bind_generic(generic_params[i], param_type);
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                "TypeResolutionPass: (2a) Bound generic param '{}' (index {}) for type alias '{}'",
+                                generic_params[i], i, alias_decl->alias_name());
+                        }
+                    }
+
+                    TypeRef resolved = resolver.resolve(*target_ann, alias_ctx);
+                    if (!resolved.is_error())
+                    {
+                        alias_decl->set_resolved_target_type(resolved);
+                        resolved_count++;
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: (2a) Resolved type alias '{}' target to '{}'",
+                            alias_decl->alias_name(), resolved->display_name());
+
+                        // Only register non-generic type aliases in the module registry
+                        // Generic type aliases are handled by the GenericRegistry
+                        if (!alias_decl->is_generic())
+                        {
+                            module_registry.register_type(res_ctx.current_module, alias_decl->alias_name(), resolved);
+                        }
+                    }
+                    else
+                    {
+                        error_count++;
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: (2a) Failed to resolve type alias '{}' target: {}",
+                            alias_decl->alias_name(), resolved->display_name());
+                    }
+                }
+                // Handle already-resolved type aliases (register in module registry)
+                else if (alias_decl->has_resolved_target_type())
+                {
+                    if (!alias_decl->is_generic())
+                    {
+                        TypeRef target_type = alias_decl->get_resolved_target_type();
+                        module_registry.register_type(res_ctx.current_module, alias_decl->alias_name(), target_type);
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: (2a) Registered pre-resolved type alias '{}' -> '{}'",
+                            alias_decl->alias_name(), target_type->display_name());
+                    }
+                }
+            }
+        }
+        LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: Phase 2a complete - type aliases resolved");
+
+        // === PHASE 2b: Resolve all other type annotations ===
+        LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: Phase 2b - Resolving other type annotations");
         for (auto &stmt : program->statements())
         {
             // Handle implement blocks
@@ -548,7 +673,7 @@ namespace Cryo
 
                     // Resolve return type
                     auto *ann = method->return_type_annotation();
-                    if (ann && method->get_resolved_return_type().is_error())
+                    if (ann && type_needs_resolution(method->get_resolved_return_type(), ann))
                     {
                         TypeRef resolved = resolver.resolve(*ann, method_ctx);
                         if (!resolved.is_error())
@@ -651,7 +776,7 @@ namespace Cryo
 
                     // Resolve return type
                     auto *ann = method->return_type_annotation();
-                    if (ann && method->get_resolved_return_type().is_error())
+                    if (ann && type_needs_resolution(method->get_resolved_return_type(), ann))
                     {
                         LOG_DEBUG(LogComponent::GENERAL,
                             "TypeResolutionPass: Attempting to resolve '{}::{}' annotation='{}' kind={}",
@@ -752,7 +877,7 @@ namespace Cryo
 
                 // Resolve return type
                 auto *ann = func->return_type_annotation();
-                if (ann && func->get_resolved_return_type().is_error())
+                if (ann && type_needs_resolution(func->get_resolved_return_type(), ann))
                 {
                     TypeRef resolved = resolver.resolve(*ann, func_ctx);
                     if (!resolved.is_error())
@@ -787,66 +912,10 @@ namespace Cryo
                     }
                 }
             }
-            // Handle type alias declarations - resolve target type annotation
-            else if (auto *alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(stmt.get()))
+            // Type alias declarations are handled in Phase 2a - skip them here
+            else if (dynamic_cast<TypeAliasDeclarationNode *>(stmt.get()))
             {
-                // If the alias has a deferred target type annotation, resolve it now
-                if (alias_decl->has_target_type_annotation() && !alias_decl->has_resolved_target_type())
-                {
-                    const TypeAnnotation *target_ann = alias_decl->target_type_annotation();
-
-                    // Create a resolution context, binding generic params if this is a generic alias
-                    ResolutionContext alias_ctx = res_ctx.child();
-                    const auto &generic_params = alias_decl->generic_params();
-                    if (!generic_params.empty())
-                    {
-                        for (size_t i = 0; i < generic_params.size(); ++i)
-                        {
-                            TypeRef param_type = arena.create_generic_param(generic_params[i], i);
-                            alias_ctx.bind_generic(generic_params[i], param_type);
-                            LOG_DEBUG(LogComponent::GENERAL,
-                                "TypeResolutionPass: Bound generic param '{}' (index {}) for type alias '{}'",
-                                generic_params[i], i, alias_decl->alias_name());
-                        }
-                    }
-
-                    TypeRef resolved = resolver.resolve(*target_ann, alias_ctx);
-                    if (!resolved.is_error())
-                    {
-                        alias_decl->set_resolved_target_type(resolved);
-                        resolved_count++;
-                        LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Resolved type alias '{}' target to '{}'",
-                            alias_decl->alias_name(), resolved->display_name());
-
-                        // Only register non-generic type aliases in the module registry
-                        // Generic type aliases are handled by the GenericRegistry
-                        if (!alias_decl->is_generic())
-                        {
-                            module_registry.register_type(res_ctx.current_module, alias_decl->alias_name(), resolved);
-                        }
-                    }
-                    else
-                    {
-                        error_count++;
-                        LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Failed to resolve type alias '{}' target: {}",
-                            alias_decl->alias_name(), resolved->display_name());
-                    }
-                }
-                else if (alias_decl->has_resolved_target_type())
-                {
-                    // Already resolved at parse time - register in module registry for cross-module access
-                    // But only for non-generic type aliases
-                    if (!alias_decl->is_generic())
-                    {
-                        TypeRef target_type = alias_decl->get_resolved_target_type();
-                        module_registry.register_type(res_ctx.current_module, alias_decl->alias_name(), target_type);
-                        LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Registered pre-resolved type alias '{}' -> '{}'",
-                            alias_decl->alias_name(), target_type->display_name());
-                    }
-                }
+                // Already handled in Phase 2a
             }
         }
 
@@ -1273,6 +1342,9 @@ namespace Cryo
                     if (resolved.is_valid())
                     {
                         scope_res->set_resolved_type(resolved);
+                        // Also set the resolved type on the CallExpressionNode itself
+                        // This is crucial because codegen reads from the call node, not the callee
+                        call->set_resolved_type(resolved);
                         LOG_DEBUG(LogComponent::GENERAL,
                                   "GenericExpressionResolutionPass: Resolved {}::{} call to type '{}'",
                                   scope_res->scope_name(),
@@ -1386,6 +1458,21 @@ namespace Cryo
         if (!generics)
             return TypeRef{};
 
+        // Resolve type alias if applicable (e.g., IoResult -> Result)
+        std::string resolved_scope_name = scope_name;
+        auto *ast_ctx = _compiler.ast_context();
+        if (ast_ctx)
+        {
+            ModuleTypeRegistry &module_registry = ast_ctx->modules();
+            resolved_scope_name = module_registry.resolve_type_alias(scope_name);
+            if (resolved_scope_name != scope_name)
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "resolve_generic_enum_variant: Resolved type alias '{}' -> '{}'",
+                          scope_name, resolved_scope_name);
+            }
+        }
+
         // Check if expected_type is an instantiated generic type
         if (expected_type->kind() != TypeKind::InstantiatedType)
         {
@@ -1393,12 +1480,18 @@ namespace Cryo
             if (expected_type->kind() == TypeKind::Enum)
             {
                 auto *enum_type = static_cast<const EnumType *>(expected_type.get());
-                if (enum_type->name() == scope_name)
+                if (enum_type->name() == resolved_scope_name)
                 {
                     // Direct match - the expected type IS the concrete enum
                     return expected_type;
                 }
             }
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "resolve_generic_enum_variant: expected_type is not InstantiatedType (kind={}, name='{}'), scope='{}', member='{}'",
+                      static_cast<int>(expected_type->kind()),
+                      expected_type->display_name(),
+                      resolved_scope_name,
+                      member_name);
             return TypeRef{};
         }
 
@@ -1423,8 +1516,13 @@ namespace Cryo
             base_name = base_name.substr(last_colon + 2);
         }
 
-        if (base_name != scope_name)
+        if (base_name != resolved_scope_name)
+        {
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "resolve_generic_enum_variant: base_name mismatch: '{}' != '{}' (scope='{}')",
+                      base_name, resolved_scope_name, scope_name);
             return TypeRef{};
+        }
 
         // Verify the member_name is a valid variant of this enum
         // First check if base_type is an enum
