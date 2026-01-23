@@ -10,6 +10,7 @@
 #include "Types/TypeResolver.hpp"
 #include "Types/GenericRegistry.hpp"
 #include "Types/GenericTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
 #include "Types/ModuleTypeRegistry.hpp"
 #include "Types/Monomorphizer.hpp"
 #include "Codegen/CodeGenerator.hpp"
@@ -1051,6 +1052,338 @@ namespace Cryo
     }
 
     // ============================================================================
+    // Pass 6.2: Generic Expression Resolution
+    // ============================================================================
+
+    GenericExpressionResolutionPass::GenericExpressionResolutionPass(CompilerInstance &compiler)
+        : _compiler(compiler)
+    {
+    }
+
+    PassResult GenericExpressionResolutionPass::run(PassContext &ctx)
+    {
+        auto *ast_root = _compiler.ast_root();
+        if (!ast_root)
+        {
+            LOG_WARN(LogComponent::GENERAL, "GenericExpressionResolutionPass: No AST root available");
+            return PassResult::ok({PassProvides::GENERIC_EXPRESSIONS_RESOLVED});
+        }
+
+        LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Resolving generic enum variants in expressions");
+
+        // Walk all declarations in the program
+        for (auto &decl : ast_root->statements())
+        {
+            if (auto *func = dynamic_cast<FunctionDeclarationNode *>(decl.get()))
+            {
+                resolve_function_body(func, ctx);
+            }
+            else if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(decl.get()))
+            {
+                // Process struct methods
+                for (auto &method : struct_decl->methods())
+                {
+                    resolve_function_body(method.get(), ctx);
+                }
+            }
+            // Note: EnumDeclarationNode doesn't have methods in this AST design
+        }
+
+        LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Complete");
+        return PassResult::ok({PassProvides::GENERIC_EXPRESSIONS_RESOLVED});
+    }
+
+    void GenericExpressionResolutionPass::resolve_function_body(FunctionDeclarationNode *func, PassContext &ctx)
+    {
+        if (!func || !func->body())
+            return;
+
+        // Get the function's return type - this is the context for return statements
+        TypeRef return_type = func->get_resolved_return_type();
+
+        LOG_DEBUG(LogComponent::GENERAL,
+                  "GenericExpressionResolutionPass: Processing function '{}' with return type '{}'",
+                  func->name(),
+                  return_type.is_valid() ? return_type->display_name() : "void");
+
+        // Resolve expressions in the function body
+        resolve_statement(func->body(), return_type, ctx);
+    }
+
+    void GenericExpressionResolutionPass::resolve_statement(StatementNode *stmt, TypeRef expected_type, PassContext &ctx)
+    {
+        if (!stmt)
+            return;
+
+        switch (stmt->kind())
+        {
+        case NodeKind::ReturnStatement:
+        {
+            auto *ret = static_cast<ReturnStatementNode *>(stmt);
+            if (ret->expression())
+            {
+                // Return expressions inherit the function's return type as expected type
+                resolve_expression(ret->expression(), expected_type, ctx);
+            }
+            break;
+        }
+        case NodeKind::BlockStatement:
+        {
+            auto *block = static_cast<BlockStatementNode *>(stmt);
+            for (auto &child_stmt : block->statements())
+            {
+                resolve_statement(child_stmt.get(), expected_type, ctx);
+            }
+            break;
+        }
+        case NodeKind::IfStatement:
+        {
+            auto *if_stmt = static_cast<IfStatementNode *>(stmt);
+            resolve_expression(if_stmt->condition(), TypeRef{}, ctx); // Conditions have no expected type
+            resolve_statement(if_stmt->then_statement(), expected_type, ctx);
+            if (if_stmt->else_statement())
+            {
+                resolve_statement(if_stmt->else_statement(), expected_type, ctx);
+            }
+            break;
+        }
+        case NodeKind::WhileStatement:
+        {
+            auto *while_stmt = static_cast<WhileStatementNode *>(stmt);
+            resolve_expression(while_stmt->condition(), TypeRef{}, ctx);
+            resolve_statement(while_stmt->body(), expected_type, ctx);
+            break;
+        }
+        case NodeKind::ForStatement:
+        {
+            auto *for_stmt = static_cast<ForStatementNode *>(stmt);
+            // For loop init is a VariableDeclarationNode - resolve its initializer
+            if (for_stmt->init() && for_stmt->init()->initializer())
+            {
+                TypeRef init_type = for_stmt->init()->get_resolved_type();
+                resolve_expression(for_stmt->init()->initializer(), init_type, ctx);
+            }
+            if (for_stmt->condition())
+                resolve_expression(for_stmt->condition(), TypeRef{}, ctx);
+            if (for_stmt->update())
+                resolve_expression(for_stmt->update(), TypeRef{}, ctx);
+            resolve_statement(for_stmt->body(), expected_type, ctx);
+            break;
+        }
+        case NodeKind::DeclarationStatement:
+        {
+            auto *decl_stmt = static_cast<DeclarationStatementNode *>(stmt);
+            if (auto *var_decl = dynamic_cast<VariableDeclarationNode *>(decl_stmt->declaration()))
+            {
+                // Variable declarations: the expected type is the variable's declared type
+                TypeRef var_type = var_decl->get_resolved_type();
+                if (var_decl->initializer())
+                {
+                    resolve_expression(var_decl->initializer(), var_type, ctx);
+                }
+            }
+            break;
+        }
+        case NodeKind::ExpressionStatement:
+        {
+            auto *expr_stmt = static_cast<ExpressionStatementNode *>(stmt);
+            resolve_expression(expr_stmt->expression(), TypeRef{}, ctx);
+            break;
+        }
+        case NodeKind::MatchStatement:
+        {
+            auto *match_stmt = static_cast<MatchStatementNode *>(stmt);
+            resolve_expression(match_stmt->expr(), TypeRef{}, ctx);
+            for (auto &arm : match_stmt->arms())
+            {
+                resolve_statement(arm->body(), expected_type, ctx);
+            }
+            break;
+        }
+        default:
+            // Other statement types - continue walking
+            break;
+        }
+    }
+
+    void GenericExpressionResolutionPass::resolve_expression(ExpressionNode *expr, TypeRef expected_type, PassContext &ctx)
+    {
+        if (!expr)
+            return;
+
+        switch (expr->kind())
+        {
+        case NodeKind::ScopeResolution:
+        {
+            auto *scope_res = static_cast<ScopeResolutionNode *>(expr);
+
+            // Skip if already resolved
+            if (scope_res->has_resolved_type())
+                return;
+
+            // Try to resolve as a generic enum variant
+            TypeRef resolved = resolve_generic_enum_variant(
+                scope_res->scope_name(),
+                scope_res->member_name(),
+                expected_type,
+                ctx);
+
+            if (resolved.is_valid())
+            {
+                scope_res->set_resolved_type(resolved);
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "GenericExpressionResolutionPass: Resolved {}::{} to type '{}'",
+                          scope_res->scope_name(),
+                          scope_res->member_name(),
+                          resolved->display_name());
+            }
+            break;
+        }
+        case NodeKind::CallExpression:
+        {
+            auto *call = static_cast<CallExpressionNode *>(expr);
+
+            // Check if this is an enum variant constructor like Option::Some(value)
+            if (auto *scope_res = dynamic_cast<ScopeResolutionNode *>(call->callee()))
+            {
+                if (!scope_res->has_resolved_type())
+                {
+                    TypeRef resolved = resolve_generic_enum_variant(
+                        scope_res->scope_name(),
+                        scope_res->member_name(),
+                        expected_type,
+                        ctx);
+
+                    if (resolved.is_valid())
+                    {
+                        scope_res->set_resolved_type(resolved);
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "GenericExpressionResolutionPass: Resolved {}::{} call to type '{}'",
+                                  scope_res->scope_name(),
+                                  scope_res->member_name(),
+                                  resolved->display_name());
+                    }
+                }
+            }
+
+            // Resolve arguments (no expected type for now - could be improved with function signature lookup)
+            for (auto &arg : call->arguments())
+            {
+                resolve_expression(arg.get(), TypeRef{}, ctx);
+            }
+            break;
+        }
+        case NodeKind::BinaryExpression:
+        {
+            auto *binary = static_cast<BinaryExpressionNode *>(expr);
+            // For assignments, RHS inherits expected type from LHS
+            if (binary->operator_token().kind() == TokenKind::TK_EQUAL)
+            {
+                TypeRef lhs_type = binary->left()->get_resolved_type();
+                resolve_expression(binary->left(), TypeRef{}, ctx);
+                resolve_expression(binary->right(), lhs_type.is_valid() ? lhs_type : expected_type, ctx);
+            }
+            else
+            {
+                resolve_expression(binary->left(), TypeRef{}, ctx);
+                resolve_expression(binary->right(), TypeRef{}, ctx);
+            }
+            break;
+        }
+        case NodeKind::StructLiteral:
+        {
+            auto *struct_lit = static_cast<StructLiteralNode *>(expr);
+            // Field initializers could benefit from expected type based on struct field types
+            // For now, just walk without expected type
+            for (auto &field : struct_lit->field_initializers())
+            {
+                resolve_expression(field->value(), TypeRef{}, ctx);
+            }
+            break;
+        }
+        default:
+            // For other expressions, continue walking child expressions
+            break;
+        }
+    }
+
+    TypeRef GenericExpressionResolutionPass::resolve_generic_enum_variant(
+        const std::string &scope_name,
+        const std::string &member_name,
+        TypeRef expected_type,
+        PassContext &ctx)
+    {
+        if (!expected_type.is_valid())
+            return TypeRef{};
+
+        auto *generics = _compiler.generic_registry();
+        if (!generics)
+            return TypeRef{};
+
+        // Check if expected_type is an instantiated generic type
+        if (expected_type->kind() != TypeKind::InstantiatedType)
+        {
+            // Could also be a monomorphized enum directly - check if scope_name matches
+            if (expected_type->kind() == TypeKind::Enum)
+            {
+                auto *enum_type = static_cast<const EnumType *>(expected_type.get());
+                if (enum_type->name() == scope_name)
+                {
+                    // Direct match - the expected type IS the concrete enum
+                    return expected_type;
+                }
+            }
+            return TypeRef{};
+        }
+
+        auto *inst_type = static_cast<const InstantiatedType *>(expected_type.get());
+        TypeRef base_type = inst_type->generic_base();
+
+        if (!base_type.is_valid())
+            return TypeRef{};
+
+        // Check if the base type name matches the scope_name
+        std::string base_name = base_type->display_name();
+        // Handle qualified names like "Option<T>" - extract just "Option"
+        size_t angle_pos = base_name.find('<');
+        if (angle_pos != std::string::npos)
+        {
+            base_name = base_name.substr(0, angle_pos);
+        }
+        // Handle namespace prefixes
+        size_t last_colon = base_name.rfind("::");
+        if (last_colon != std::string::npos)
+        {
+            base_name = base_name.substr(last_colon + 2);
+        }
+
+        if (base_name != scope_name)
+            return TypeRef{};
+
+        // Verify the member_name is a valid variant of this enum
+        // First check if base_type is an enum
+        if (base_type->kind() == TypeKind::Enum)
+        {
+            auto *base_enum = static_cast<const EnumType *>(base_type.get());
+            if (!base_enum->get_variant(member_name))
+            {
+                // Not a valid variant
+                return TypeRef{};
+            }
+        }
+
+        // The expected_type (the InstantiatedType) is the correct resolved type
+        // If it has a resolved_type (the monomorphized concrete enum), use that
+        if (inst_type->has_resolved_type())
+        {
+            return inst_type->resolved_type();
+        }
+
+        // Otherwise, use the InstantiatedType itself - it will be resolved during codegen
+        return expected_type;
+    }
+
+    // ============================================================================
     // Stage 7: Codegen Preparation Passes
     // ============================================================================
 
@@ -1151,6 +1484,7 @@ namespace Cryo
 
         // Stage 6: Specialization
         manager->register_pass(std::make_unique<MonomorphizationPass>(compiler));
+        manager->register_pass(std::make_unique<GenericExpressionResolutionPass>(compiler));
 
         // Stage 7: Codegen Preparation
         manager->register_pass(std::make_unique<TypeLoweringPass>(compiler));

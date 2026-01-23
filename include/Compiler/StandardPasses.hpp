@@ -9,6 +9,9 @@ namespace Cryo
     class CompilerInstance;
     class Lexer;
     class Parser;
+    class FunctionDeclarationNode;
+    class StatementNode;
+    class ExpressionNode;
 
     // ============================================================================
     // Stage 1: Frontend Passes
@@ -470,6 +473,65 @@ namespace Cryo
         CompilerInstance &_compiler;
     };
 
+    /**
+     * @brief Pass 6.2: Generic Expression Resolution
+     *
+     * Resolves generic enum variants (like Option::None, Result::Ok) in expressions
+     * by inferring the concrete type from context (return type, assignment target).
+     *
+     * This pass runs after monomorphization to ensure all concrete enum types exist,
+     * and before codegen so that expressions have their types resolved.
+     *
+     * Example: In a function returning Option<Duration>, `return Option::None;`
+     * will have the ScopeResolutionNode's resolved_type set to the concrete
+     * Option<Duration> enum type.
+     */
+    class GenericExpressionResolutionPass : public CompilerPass
+    {
+    public:
+        explicit GenericExpressionResolutionPass(CompilerInstance &compiler);
+
+        std::string name() const override { return "GenericExpressionResolution"; }
+        PassStage stage() const override { return PassStage::Specialization; }
+        int order() const override { return 2; }
+        PassScope scope() const override { return PassScope::PerModule; }
+
+        std::vector<PassDependency> dependencies() const override
+        {
+            return {PassDependency::required(PassProvides::MONOMORPHIZATION_COMPLETE)};
+        }
+
+        std::vector<std::string> provides() const override
+        {
+            return {PassProvides::GENERIC_EXPRESSIONS_RESOLVED};
+        }
+
+        std::string description() const override
+        {
+            return "Resolve generic enum variants in expressions";
+        }
+
+        PassResult run(PassContext &ctx) override;
+
+    private:
+        CompilerInstance &_compiler;
+
+        // Resolve generic enum variants in a function body
+        void resolve_function_body(FunctionDeclarationNode *func, PassContext &ctx);
+
+        // Resolve expressions within a statement, given an expected type context
+        void resolve_statement(StatementNode *stmt, TypeRef expected_type, PassContext &ctx);
+
+        // Resolve a single expression node
+        void resolve_expression(ExpressionNode *expr, TypeRef expected_type, PassContext &ctx);
+
+        // Check if scope_name is a generic enum and resolve against expected_type
+        TypeRef resolve_generic_enum_variant(const std::string &scope_name,
+                                              const std::string &member_name,
+                                              TypeRef expected_type,
+                                              PassContext &ctx);
+    };
+
     // ============================================================================
     // Stage 7: Codegen Preparation Passes
     // ============================================================================
@@ -491,7 +553,7 @@ namespace Cryo
 
         std::vector<PassDependency> dependencies() const override
         {
-            return {PassDependency::required(PassProvides::MONOMORPHIZATION_COMPLETE)};
+            return {PassDependency::required(PassProvides::GENERIC_EXPRESSIONS_RESOLVED)};
         }
 
         std::vector<std::string> provides() const override
