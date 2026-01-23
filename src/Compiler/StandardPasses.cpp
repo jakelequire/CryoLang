@@ -1086,6 +1086,22 @@ namespace Cryo
                     resolve_function_body(method.get(), ctx);
                 }
             }
+            else if (auto *class_decl = dynamic_cast<ClassDeclarationNode *>(decl.get()))
+            {
+                // Process class methods
+                for (auto &method : class_decl->methods())
+                {
+                    resolve_function_body(method.get(), ctx);
+                }
+            }
+            else if (auto *impl_block = dynamic_cast<ImplementationBlockNode *>(decl.get()))
+            {
+                // Process implementation block methods
+                for (auto &method : impl_block->method_implementations())
+                {
+                    resolve_function_body(method.get(), ctx);
+                }
+            }
             // Note: EnumDeclarationNode doesn't have methods in this AST design
         }
 
@@ -1280,6 +1296,38 @@ namespace Cryo
             if (binary->operator_token().kind() == TokenKind::TK_EQUAL)
             {
                 TypeRef lhs_type = binary->left()->get_resolved_type();
+
+                // If LHS is a member access (e.g., this.cwd), try to get the member type
+                if (!lhs_type.is_valid())
+                {
+                    if (auto *member_access = dynamic_cast<MemberAccessNode *>(binary->left()))
+                    {
+                        TypeRef obj_type = member_access->object()->get_resolved_type();
+                        if (obj_type.is_valid())
+                        {
+                            // Try to get the member type from struct/class
+                            if (obj_type->kind() == TypeKind::Struct)
+                            {
+                                auto *struct_type = static_cast<const StructType *>(obj_type.get());
+                                auto field_type_opt = struct_type->field_type(member_access->member());
+                                if (field_type_opt)
+                                {
+                                    lhs_type = *field_type_opt;
+                                }
+                            }
+                            else if (obj_type->kind() == TypeKind::Class)
+                            {
+                                auto *class_type = static_cast<const ClassType *>(obj_type.get());
+                                auto field_type_opt = class_type->field_type(member_access->member());
+                                if (field_type_opt)
+                                {
+                                    lhs_type = *field_type_opt;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 resolve_expression(binary->left(), TypeRef{}, ctx);
                 resolve_expression(binary->right(), lhs_type.is_valid() ? lhs_type : expected_type, ctx);
             }
@@ -1293,11 +1341,29 @@ namespace Cryo
         case NodeKind::StructLiteral:
         {
             auto *struct_lit = static_cast<StructLiteralNode *>(expr);
-            // Field initializers could benefit from expected type based on struct field types
-            // For now, just walk without expected type
-            for (auto &field : struct_lit->field_initializers())
+            std::string struct_name = struct_lit->struct_type();
+
+            // Try to look up the struct type to get field types
+            TypeRef struct_type_ref = _compiler.symbol_table()->lookup_struct_type(struct_name);
+            const StructType *struct_type = nullptr;
+
+            if (struct_type_ref.is_valid() && struct_type_ref->kind() == TypeKind::Struct)
             {
-                resolve_expression(field->value(), TypeRef{}, ctx);
+                struct_type = static_cast<const StructType *>(struct_type_ref.get());
+            }
+
+            for (auto &field_init : struct_lit->field_initializers())
+            {
+                TypeRef field_type;
+                if (struct_type)
+                {
+                    auto field_type_opt = struct_type->field_type(field_init->field_name());
+                    if (field_type_opt)
+                    {
+                        field_type = *field_type_opt;
+                    }
+                }
+                resolve_expression(field_init->value(), field_type, ctx);
             }
             break;
         }
