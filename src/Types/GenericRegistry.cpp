@@ -7,6 +7,8 @@
 #include "Types/TypeArena.hpp"
 #include "Types/CompoundTypes.hpp"
 #include "Types/UserDefinedTypes.hpp"
+#include "Diagnostics/Diag.hpp"
+#include "Utils/Logger.hpp"
 
 #include <sstream>
 
@@ -358,15 +360,23 @@ namespace Cryo
         auto tmpl = get_template(generic_type);
         if (!tmpl)
         {
-            // TypeID mismatch - try looking up by name instead
-            if (generic_type.is_valid())
-            {
-                tmpl = get_template_by_name(generic_type->display_name());
-            }
-            if (!tmpl)
-            {
-                return TypeSubstitution();
-            }
+            // Template not found by TypeID - this is a bug in the type system.
+            // The type should have been registered with a consistent TypeID.
+            std::string type_name = generic_type.is_valid() ? generic_type->display_name() : "<invalid>";
+            std::string type_id_str = generic_type.is_valid() ? std::to_string(generic_type.id().id) : "invalid";
+
+            LOG_ERROR(LogComponent::GENERAL,
+                      "GenericRegistry::create_substitution: Template '{}' (TypeID={}) not found. "
+                      "This indicates a TypeID mismatch - the type was likely registered with a different TypeID.",
+                      type_name, type_id_str);
+
+            diag_emitter().emit(
+                Diag::error(ErrorCode::E0301_GENERIC_TYPE_RESOLUTION_FAILED,
+                            "generic template '" + type_name + "' not found (TypeID mismatch)")
+                    .with_note("The type was registered with a different TypeID than expected.")
+                    .help("Ensure the generic type is registered consistently across modules."));
+
+            return TypeSubstitution();
         }
 
         return TypeSubstitution(*tmpl, type_args);
@@ -386,20 +396,22 @@ namespace Cryo
         auto tmpl = get_template(generic_type);
         if (!tmpl)
         {
-            // TypeID mismatch - try looking up by name instead
-            // This handles cases where the same type was registered with a different module ID
-            if (generic_type.is_valid())
+            // Template not found by TypeID - this is a bug in the type system.
+            // Do NOT fall back to name-based lookup as that masks TypeID inconsistencies.
+            std::string type_name = generic_type.is_valid() ? generic_type->display_name() : "<invalid>";
+            std::string type_id_str = generic_type.is_valid() ? std::to_string(generic_type.id().id) : "invalid";
+
+            LOG_ERROR(LogComponent::GENERAL,
+                      "GenericRegistry::validate_type_args: Template '{}' (TypeID={}) not found. "
+                      "This indicates a TypeID mismatch - the type was likely registered with a different TypeID.",
+                      type_name, type_id_str);
+
+            if (error_msg)
             {
-                tmpl = get_template_by_name(generic_type->display_name());
+                *error_msg = "'" + type_name + "' is not a registered generic type (TypeID=" + type_id_str +
+                             ") - possible TypeID mismatch across modules";
             }
-            if (!tmpl)
-            {
-                if (error_msg)
-                {
-                    *error_msg = "not a generic type";
-                }
-                return false;
-            }
+            return false;
         }
 
         // Check argument count
@@ -430,6 +442,8 @@ namespace Cryo
 
         // TODO: Check bounds (trait constraints)
         // For now, we accept any types
+        // Traits are a future feature, and right now there is no way
+        // to specify or check them. DO NOT IMPLEMENT THIS YET OR ANYTIME SOON.
 
         return true;
     }

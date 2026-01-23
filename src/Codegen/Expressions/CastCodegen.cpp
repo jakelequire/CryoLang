@@ -53,17 +53,22 @@ namespace Cryo::Codegen
         }
         else if (node->target_type_annotation())
         {
-            // Fall back to type annotation if not resolved
+            // Type annotation is a secondary source - the type should be resolved beforehand
             target_type_name = node->target_type_annotation()->to_string();
             llvm_target = types().get_type(target_type_name);
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CastCodegen: Using type annotation: {}", target_type_name);
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "CastCodegen: Cast type was not resolved, using annotation '{}' - "
+                     "this indicates the type resolution pass may have missed this cast",
+                     target_type_name);
         }
 
         if (!llvm_target)
         {
             report_error(ErrorCode::E0641_NULL_CAST_EXPRESSION, node,
                          "CastCodegen: Unknown cast target type: " + target_type_name);
-            return value; // Return uncasted value as fallback
+            // Do NOT return uncasted value - that would silently produce incorrect code.
+            // Return nullptr to signal failure properly.
+            return nullptr;
         }
 
         return cast_to(value, llvm_target, "cast");
