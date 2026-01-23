@@ -354,6 +354,13 @@ namespace Cryo
             return result;
         }
 
+        // CRITICAL: Save the current module context before parsing the import.
+        // The Parser modifies the SymbolTable's current module when it encounters
+        // a namespace declaration. Without saving/restoring, the importing module's
+        // context gets corrupted, causing types to be registered with wrong module IDs.
+        // This must be declared before try block so it's accessible in catch block.
+        ModuleID saved_module = _symbol_table.current_module();
+
         try
         {
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Reading file {}", file_path);
@@ -380,6 +387,7 @@ namespace Cryo
             // Use the main ASTContext instead of creating a new one
             // This ensures all types use the same TypeContext and prevents corruption
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Using main ASTContext for type consistency");
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Saved current module context (id={})", saved_module.id);
 
             // Create parser with the lexer and main context
             Parser parser(std::move(lexer), _ast_context);
@@ -390,6 +398,10 @@ namespace Cryo
 
             if (!ast)
             {
+                // Restore module context before early return since Parser modified it
+                _symbol_table.set_current_module(saved_module);
+                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Restored current module context after parse failure (id={})", saved_module.id);
+
                 result.success = false;
                 result.error_message = "Failed to parse import file: " + import_path;
                 if (_diagnostics)
@@ -454,11 +466,21 @@ namespace Cryo
             _imported_asts[result.module_name] = std::move(ast); // Move is necessary to transfer ownership
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Stored AST successfully. Map now has {} entries", _imported_asts.size());
 
+            // CRITICAL: Restore the saved module context after import processing.
+            // This ensures the importing module's compilation continues with its own module ID,
+            // not the imported module's ID.
+            _symbol_table.set_current_module(saved_module);
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Restored current module context (id={})", saved_module.id);
+
             result.success = true;
             return result;
         }
         catch (const std::exception &e)
         {
+            // Restore module context even on exception to maintain consistency
+            _symbol_table.set_current_module(saved_module);
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Restored current module context after exception (id={})", saved_module.id);
+
             result.success = false;
             result.error_message = "Exception while loading import '" + import_path + "': " + e.what();
             if (_diagnostics)
