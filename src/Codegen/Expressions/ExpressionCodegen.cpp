@@ -8,6 +8,7 @@
 #include "AST/ASTNode.hpp"
 #include "Types/GenericTypes.hpp"
 #include "Types/UserDefinedTypes.hpp"
+#include "Types/CompoundTypes.hpp"
 #include "Utils/Logger.hpp"
 
 #include <stdexcept>
@@ -444,12 +445,57 @@ namespace Cryo::Codegen
         {
             if (in_global_context)
             {
-                LOG_WARN(Cryo::LogComponent::CODEGEN, 
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
                          "ExpressionCodegen: Attempted to reference local variable '{}' in global context", name);
                 return nullptr;
             }
             llvm::Type *loaded_type = alloca->getAllocatedType();
-            return create_load(alloca, loaded_type, name + ".load");
+            llvm::Value *loaded_value = create_load(alloca, loaded_type, name + ".load");
+
+            // Auto-dereference 'this' for primitive implement blocks.
+            // When a method has '&this' parameter on a primitive type (i8, i32, etc.),
+            // 'this' is stored as a pointer to the primitive. We need to load through
+            // that pointer to get the actual primitive value for use in expressions.
+            if (name == "this" && loaded_value && loaded_value->getType()->isPointerTy())
+            {
+                // Check if the pointee type is a primitive (integer or float)
+                // We use variable_types_map to get the semantic type information
+                auto &var_types = ctx().variable_types_map();
+                auto it = var_types.find("this");
+                if (it != var_types.end() && it->second)
+                {
+                    TypeRef this_type = it->second;
+                    // Check if it's a pointer/reference to a primitive
+                    if (this_type->kind() == Cryo::TypeKind::Pointer ||
+                        this_type->kind() == Cryo::TypeKind::Reference)
+                    {
+                        TypeRef pointee_type;
+                        if (auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(this_type.get()))
+                        {
+                            pointee_type = ptr_type->pointee();
+                        }
+                        else if (auto *ref_type = dynamic_cast<const Cryo::ReferenceType *>(this_type.get()))
+                        {
+                            pointee_type = ref_type->referent();
+                        }
+
+                        // If pointee is a primitive type, auto-dereference
+                        if (pointee_type.is_valid() && pointee_type->is_primitive())
+                        {
+                            llvm::Type *pointee_llvm_type = get_llvm_type(pointee_type);
+                            if (pointee_llvm_type)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "ExpressionCodegen: Auto-dereferencing 'this' for primitive type {}",
+                                          pointee_type->display_name());
+                                loaded_value = create_load(loaded_value, pointee_llvm_type, "this.deref");
+                            }
+                        }
+                    }
+                }
+            }
+
+            return loaded_value;
         }
 
         // If it's a global variable, handle based on context
