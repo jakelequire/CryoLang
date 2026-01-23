@@ -195,6 +195,24 @@ namespace Cryo::Codegen
          */
         llvm::Value *generate_scope_resolution(Cryo::ScopeResolutionNode *node);
 
+        /**
+         * @brief Generate enum variant value from a resolved type
+         *
+         * Used when GenericExpressionResolutionPass has resolved a generic enum variant
+         * (like Option::None) to its concrete type (like Option<Duration>).
+         *
+         * @param node The scope resolution node
+         * @param resolved_type The concrete enum type resolved from context
+         * @param scope_name The enum name (e.g., "Option")
+         * @param member_name The variant name (e.g., "None")
+         * @return The LLVM value for the enum variant, or nullptr if not found
+         */
+        llvm::Value *generate_enum_variant_from_resolved_type(
+            Cryo::ScopeResolutionNode *node,
+            TypeRef resolved_type,
+            const std::string &scope_name,
+            const std::string &member_name);
+
         //===================================================================
         // Identifier Expressions
         //===================================================================

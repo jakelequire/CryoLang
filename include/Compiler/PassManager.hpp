@@ -562,6 +562,7 @@ namespace Cryo
         // Stage 6: Specialization
         constexpr const char *INSTANTIATIONS_COLLECTED = "instantiations_collected";
         constexpr const char *MONOMORPHIZATION_COMPLETE = "monomorphization_complete";
+        constexpr const char *GENERIC_EXPRESSIONS_RESOLVED = "generic_expressions_resolved";
 
         // Stage 7: Codegen Preparation
         constexpr const char *TYPES_LOWERED = "types_lowered";
