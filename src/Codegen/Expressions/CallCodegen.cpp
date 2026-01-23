@@ -1175,9 +1175,24 @@ namespace Cryo::Codegen
                       enum_type ? "success" : "failed");
         }
 
-        // Fallback to name-based lookup if TypeRef mapping failed
+        // If TypeRef mapping failed, this indicates a type resolution issue
+        if (!enum_type && resolved_type_ref.is_valid())
+        {
+            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                      "generate_enum_variant: TypeRef mapping failed for '{}' (TypeID={}) - "
+                      "this indicates the enum type was not properly registered in TypeMapper",
+                      resolved_type_ref->display_name(),
+                      resolved_type_ref.id().id);
+        }
+
+        // Name-based lookup as last resort - this is brittle and may produce incorrect results
         if (!enum_type)
         {
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "generate_enum_variant: Using name-based lookup for '{}' - "
+                     "TypeRef mapping should have succeeded if types were properly registered",
+                     instantiated_enum_name);
+
             enum_type = types().get_type(instantiated_enum_name);
             if (!enum_type && instantiated_enum_name != resolved_enum_name)
             {

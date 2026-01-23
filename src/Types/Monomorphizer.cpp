@@ -7,6 +7,7 @@
 #include "Types/GenericTypes.hpp"
 #include "Types/UserDefinedTypes.hpp"
 #include "Types/ErrorType.hpp"
+#include "Diagnostics/Diag.hpp"
 #include "Utils/Logger.hpp"
 #include "AST/ASTNode.hpp"
 
@@ -189,18 +190,28 @@ namespace Cryo
             return MonomorphResult::error("invalid generic type");
         }
 
-        // Normalize the generic_type to the registered template's TypeRef
-        // This handles cases where the same type was registered with a different module ID
+        // Get the template by TypeID - do NOT fall back to name-based lookup
+        // as that masks TypeID inconsistencies that should be fixed properly
         TypeRef template_type = generic_type;
         auto tmpl = _generics.get_template(generic_type);
         if (!tmpl)
         {
-            // TypeID mismatch - try looking up by name
-            tmpl = _generics.get_template_by_name(generic_type->display_name());
-            if (tmpl)
-            {
-                template_type = tmpl->generic_type;
-            }
+            // Template not found by TypeID - this is a bug in the type system.
+            std::string type_name = generic_type->display_name();
+            std::string type_id_str = std::to_string(generic_type.id().id);
+
+            LOG_ERROR(LogComponent::GENERAL,
+                      "Monomorphizer::specialize: Template '{}' (TypeID={}) not found. "
+                      "This indicates a TypeID mismatch - the type was likely registered with a different TypeID.",
+                      type_name, type_id_str);
+
+            diag_emitter().emit(
+                Diag::error(ErrorCode::E0301_GENERIC_TYPE_RESOLUTION_FAILED,
+                            "cannot monomorphize '" + type_name + "': generic template not found (TypeID mismatch)")
+                    .with_note("TypeID=" + type_id_str + " is not registered as a generic template.")
+                    .help("Ensure the generic type is registered consistently across modules."));
+
+            return MonomorphResult::error("template '" + type_name + "' not found (TypeID=" + type_id_str + ")");
         }
 
         // Validate the instantiation

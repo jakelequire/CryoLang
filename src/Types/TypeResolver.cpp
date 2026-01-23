@@ -403,7 +403,8 @@ namespace Cryo
         }
 
         // Check if base is a registered generic template
-        // First try direct ID lookup
+        // Use TypeID-based lookup only - do NOT fall back to name-based lookup
+        // as that masks TypeID inconsistencies that should be fixed properly
         std::string base_name = base_type->display_name();
         LOG_DEBUG(LogComponent::GENERAL,
             "TypeResolver: resolve_generic base_name='{}' from annotation '{}'",
@@ -416,20 +417,18 @@ namespace Cryo
         }
         else
         {
-            // TypeID mismatch - try looking up by name instead
-            // This handles cases where the same type was registered with a different module ID
-            // (e.g., registered with ModuleID::invalid() but resolved with actual module ID)
-            template_info = _generic_registry.get_template_by_name(base_name);
-            if (template_info)
-            {
-                LOG_DEBUG(LogComponent::GENERAL,
-                    "TypeResolver: Found template '{}' by name lookup (TypeID mismatch)", base_name);
-            }
-            else
-            {
-                return make_error("'" + base_name + "' is not a generic type",
-                                  ctx.current_location);
-            }
+            // Template not found by TypeID - this is a bug in the type system.
+            // Do NOT fall back to name-based lookup as that masks TypeID inconsistencies.
+            std::string type_id_str = std::to_string(base_type.id().id);
+
+            LOG_ERROR(LogComponent::GENERAL,
+                "TypeResolver::resolve_generic: Template '{}' (TypeID={}) not found. "
+                "This indicates a TypeID mismatch - the type was likely registered with a different TypeID.",
+                base_name, type_id_str);
+
+            return make_error("'" + base_name + "' is not a registered generic type (TypeID=" +
+                              type_id_str + ") - possible TypeID mismatch across modules",
+                              ctx.current_location);
         }
 
         // Check if this is a generic type alias - handle specially
