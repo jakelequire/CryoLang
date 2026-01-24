@@ -97,7 +97,7 @@ type struct Output {
 // ============================================================================
 
 /// Configuration for a process's standard I/O.
-enum Stdio {
+enum StdioCfg {
     Inherit;    // Inherit from parent
     Piped;      // Create a pipe
     Null;       // Redirect to /dev/null
@@ -113,21 +113,21 @@ type struct Command {
     args: Array<String>;
     envs: StringHashMap<String>;
     cwd: Option<String>;
-    stdin: Stdio;
-    stdout: Stdio;
-    stderr: Stdio;
+    stdin:  StdioCfg;
+    stdout: StdioCfg;
+    stderr: StdioCfg;
     clear_env: boolean;
 
     /// Creates a new Command for the given program.
     static new(program: string) -> Command {
         return Command {
             program: String::from_cstr(program),
-            args: Array::new(),
+            args: Array<String>::new(),
             envs: StringHashMap::new(),
             cwd: Option::None,
-            stdin: Stdio::Inherit,
-            stdout: Stdio::Inherit,
-            stderr: Stdio::Inherit,
+            stdin: StdioCfg::Inherit,
+            stdout: StdioCfg::Inherit,
+            stderr: StdioCfg::Inherit,
             clear_env: false
         };
     }
@@ -174,19 +174,19 @@ type struct Command {
     }
 
     /// Sets the stdin configuration.
-    stdin(mut &this, stdin: Stdio) -> &mut Command {
+    stdin(mut &this, stdin: StdioCfg) -> &mut Command {
         this.stdin = stdin;
         return this;
     }
 
     /// Sets the stdout configuration.
-    stdout(mut &this, stdout: Stdio) -> &mut Command {
+    stdout(mut &this, stdout: StdioCfg) -> &mut Command {
         this.stdout = stdout;
         return this;
     }
 
     /// Sets the stderr configuration.
-    stderr(mut &this, stderr: Stdio) -> &mut Command {
+    stderr(mut &this, stderr: StdioCfg) -> &mut Command {
         this.stderr = stderr;
         return this;
     }
@@ -199,7 +199,7 @@ type struct Command {
         mut stderr_pipe: i32[2];
 
         match (this.stdin) {
-            Stdio::Piped => {
+            StdioCfg::Piped => {
                 if (pipe(&stdin_pipe[0]) != 0) {
                     return IoResult::Err(IoError::last_os_error());
                 }
@@ -208,7 +208,7 @@ type struct Command {
         }
 
         match (this.stdout) {
-            Stdio::Piped => {
+            StdioCfg::Piped => {
                 if (pipe(&stdout_pipe[0]) != 0) {
                     return IoResult::Err(IoError::last_os_error());
                 }
@@ -217,7 +217,7 @@ type struct Command {
         }
 
         match (this.stderr) {
-            Stdio::Piped => {
+            StdioCfg::Piped => {
                 if (pipe(&stderr_pipe[0]) != 0) {
                     return IoResult::Err(IoError::last_os_error());
                 }
@@ -240,30 +240,30 @@ type struct Command {
         // Parent process
         // Close unused ends of pipes
         match (this.stdin) {
-            Stdio::Piped => { close(stdin_pipe[0]); }
+            StdioCfg::Piped => { close(stdin_pipe[0]); }
             _ => {}
         }
         match (this.stdout) {
-            Stdio::Piped => { close(stdout_pipe[1]); }
+            StdioCfg::Piped => { close(stdout_pipe[1]); }
             _ => {}
         }
         match (this.stderr) {
-            Stdio::Piped => { close(stderr_pipe[1]); }
+            StdioCfg::Piped => { close(stderr_pipe[1]); }
             _ => {}
         }
 
         return IoResult::Ok(Child {
             pid: pid,
             stdin: match (this.stdin) {
-                Stdio::Piped => { Option::Some(ChildStdin { fd: stdin_pipe[1] }) }
+                StdioCfg::Piped => { Option::Some(ChildStdin { fd: stdin_pipe[1] }) }
                 _ => { Option::None }
             },
             stdout: match (this.stdout) {
-                Stdio::Piped => { Option::Some(ChildStdout { fd: stdout_pipe[0] }) }
+                StdioCfg::Piped => { Option::Some(ChildStdout { fd: stdout_pipe[0] }) }
                 _ => { Option::None }
             },
             stderr: match (this.stderr) {
-                Stdio::Piped => { Option::Some(ChildStderr { fd: stderr_pipe[0] }) }
+                StdioCfg::Piped => { Option::Some(ChildStderr { fd: stderr_pipe[0] }) }
                 _ => { Option::None }
             },
             exited: false
@@ -274,53 +274,53 @@ type struct Command {
     setup_child(&this, stdin_pipe: i32[2], stdout_pipe: i32[2], stderr_pipe: i32[2]) -> void {
         // Set up stdin
         match (this.stdin) {
-            Stdio::Piped => {
+            StdioCfg::Piped => {
                 close(stdin_pipe[1]);
                 dup2(stdin_pipe[0], 0);
                 close(stdin_pipe[0]);
             }
-            Stdio::Null => {
+            StdioCfg::Null => {
                 const fd: i32 = open_file("/dev/null", O_RDONLY, 0);
                 if (fd >= 0) {
                     dup2(fd, 0);
                     close(fd);
                 }
             }
-            Stdio::Inherit => {}
+            StdioCfg::Inherit => {}
         }
 
         // Set up stdout
         match (this.stdout) {
-            Stdio::Piped => {
+            StdioCfg::Piped => {
                 close(stdout_pipe[0]);
                 dup2(stdout_pipe[1], 1);
                 close(stdout_pipe[1]);
             }
-            Stdio::Null => {
+            StdioCfg::Null => {
                 const fd: i32 = open_file("/dev/null", O_WRONLY, 0);
                 if (fd >= 0) {
                     dup2(fd, 1);
                     close(fd);
                 }
             }
-            Stdio::Inherit => {}
+            StdioCfg::Inherit => {}
         }
 
         // Set up stderr
         match (this.stderr) {
-            Stdio::Piped => {
+            StdioCfg::Piped => {
                 close(stderr_pipe[0]);
                 dup2(stderr_pipe[1], 2);
                 close(stderr_pipe[1]);
             }
-            Stdio::Null => {
+            StdioCfg::Null => {
                 const fd: i32 = open_file("/dev/null", O_WRONLY, 0);
                 if (fd >= 0) {
                     dup2(fd, 2);
                     close(fd);
                 }
             }
-            Stdio::Inherit => {}
+            StdioCfg::Inherit => {}
         }
 
         // Change directory
@@ -368,8 +368,8 @@ type struct Command {
 
     /// Executes the command and waits for it to complete.
     output(mut &this) -> IoResult<Output> {
-        this.stdout = Stdio::Piped;
-        this.stderr = Stdio::Piped;
+        this.stdout = StdioCfg::Piped;
+        this.stderr = StdioCfg::Piped;
 
         const spawn_result: IoResult<Child> = this.spawn();
         match (spawn_result) {
