@@ -734,6 +734,19 @@ namespace Cryo::Codegen
                     return CallKind::InstanceMethod;
                 }
 
+                // Check if it's a generic template - treat as static method call
+                // This handles calls like HashSet.new() when inside HashSet<T> methods
+                {
+                    CodegenVisitor *visitor = ctx().visitor();
+                    GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
+                    if (generics && generics->is_generic_template(obj_name))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "classify_call: '{}' is a generic template, treating as StaticMethod", obj_name);
+                        return CallKind::StaticMethod;
+                    }
+                }
+
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "classify_call: '{}::{}' falling through to FreeFunction", obj_name, method_name);
 
@@ -760,6 +773,17 @@ namespace Cryo::Codegen
             // Check if it's a static method call
             if (is_struct_type(scope_name) || is_class_type(scope_name))
             {
+                return CallKind::StaticMethod;
+            }
+
+            // Check if it's a generic template - treat as static method call
+            // This handles calls like HashSet::new() when inside HashSet<T> methods
+            CodegenVisitor *visitor = ctx().visitor();
+            GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
+            if (generics && generics->is_generic_template(scope_name))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "classify_call: '{}' is a generic template, treating as StaticMethod", scope_name);
                 return CallKind::StaticMethod;
             }
 
@@ -1410,11 +1434,31 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating static method: {}::{}", type_name, method_name);
 
+        // Resolve generic template names to the current instantiated type
+        // This handles calls like HashSet::new() inside HashSet<T> methods
+        std::string resolved_type_name = type_name;
+        CodegenVisitor *visitor = ctx().visitor();
+        GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
+
+        if (generics && generics->is_generic_template(type_name))
+        {
+            std::string current_type = ctx().current_type_name();
+            // Check if we're inside an instantiated version of this generic type
+            // The current type name would be like "HashSet_string" for HashSet<T>
+            if (!current_type.empty() && current_type.find(type_name + "_") == 0)
+            {
+                resolved_type_name = current_type;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_static_method: Resolved generic template '{}' to current type '{}'",
+                          type_name, resolved_type_name);
+            }
+        }
+
         // Generate arguments
         auto args = generate_arguments(node->arguments());
 
         // 1. First try: resolve the static method directly
-        llvm::Function *method = resolve_method(type_name, method_name);
+        llvm::Function *method = resolve_method(resolved_type_name, method_name);
         if (method)
         {
             // Call with arguments (no implicit 'this')
@@ -1445,14 +1489,14 @@ namespace Cryo::Codegen
         if (method_name == "new")
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "Static new() not found for {}, trying constructor fallback", type_name);
+                      "Static new() not found for {}, trying constructor fallback", resolved_type_name);
 
             // Get the struct type first
-            llvm::Type *struct_type = resolve_type_by_name(type_name);
+            llvm::Type *struct_type = resolve_type_by_name(resolved_type_name);
             if (!struct_type || !struct_type->isStructTy())
             {
                 report_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED, node,
-                             "Unknown type for ::new(): " + type_name);
+                             "Unknown type for ::new(): " + resolved_type_name);
                 return nullptr;
             }
 
@@ -1462,14 +1506,14 @@ namespace Cryo::Codegen
             {
                 arg_types.push_back(arg->getType());
             }
-            llvm::Function *ctor = resolve_constructor(type_name, arg_types);
+            llvm::Function *ctor = resolve_constructor(resolved_type_name, arg_types);
 
             if (ctor)
             {
                 // Found a constructor - allocate and call it
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "Found constructor for {}, calling with {} args", type_name, args.size());
-                llvm::AllocaInst *alloca = create_entry_alloca(struct_type, type_name + ".instance");
+                          "Found constructor for {}, calling with {} args", resolved_type_name, args.size());
+                llvm::AllocaInst *alloca = create_entry_alloca(struct_type, resolved_type_name + ".instance");
                 std::vector<llvm::Value *> ctor_args;
                 ctor_args.push_back(alloca);
                 ctor_args.insert(ctor_args.end(), args.begin(), args.end());
@@ -1481,8 +1525,8 @@ namespace Cryo::Codegen
             if (args.empty())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "No constructor for {}, generating zero-initialized instance", type_name);
-                llvm::AllocaInst *alloca = create_entry_alloca(struct_type, type_name + ".instance");
+                          "No constructor for {}, generating zero-initialized instance", resolved_type_name);
+                llvm::AllocaInst *alloca = create_entry_alloca(struct_type, resolved_type_name + ".instance");
                 // Zero-initialize the struct
                 builder().CreateStore(llvm::Constant::getNullValue(struct_type), alloca);
                 return alloca;
@@ -1490,14 +1534,14 @@ namespace Cryo::Codegen
 
             // 2c. Has args but no matching constructor - error
             report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
-                         "No constructor found for " + type_name + " that accepts " +
+                         "No constructor found for " + resolved_type_name + " that accepts " +
                              std::to_string(args.size()) + " argument(s)");
             return nullptr;
         }
 
         // Not ::new(), regular static method not found - error
         report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
-                     "Static method not found: " + type_name + "::" + method_name);
+                     "Static method not found: " + resolved_type_name + "::" + method_name);
         return nullptr;
     }
 
