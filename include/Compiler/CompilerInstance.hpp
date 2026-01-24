@@ -249,6 +249,7 @@ namespace Cryo
         void populate_symbol_table(ASTNode *node);
         void populate_symbol_table_with_scope(ASTNode *node, SymbolTable *current_scope, const std::string &scope_name);
         void collect_declarations_pass(ASTNode *node, SymbolTable *current_scope, const std::string &scope_name);
+        void populate_type_fields_pass(ASTNode *node); // Phase 2: populate struct/class fields after all types are registered
         void register_ast_nodes_with_typemapper();
         void register_ast_nodes_recursive(ASTNode *node, TypeMapper *type_mapper);
         void process_struct_declarations_for_preregistration(ASTNode *node);
