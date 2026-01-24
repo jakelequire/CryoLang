@@ -1,7 +1,9 @@
 #pragma once
 
 #include "Compiler/PassManager.hpp"
+#include "Types/TypeID.hpp"
 #include <functional>
+#include <unordered_map>
 
 namespace Cryo
 {
@@ -12,6 +14,9 @@ namespace Cryo
     class FunctionDeclarationNode;
     class StatementNode;
     class ExpressionNode;
+    class MemberAccessNode;
+    class StructDeclarationNode;
+    class ClassDeclarationNode;
 
     // ============================================================================
     // Stage 1: Frontend Passes
@@ -351,6 +356,54 @@ namespace Cryo
         CompilerInstance &_compiler;
     };
 
+    /**
+     * @brief Pass 4.2: Struct Field Type Sync
+     *
+     * Synchronizes resolved field types from AST nodes back to StructType/ClassType.
+     * This pass runs AFTER TypeResolutionPass which resolves type annotations on AST nodes,
+     * but the StructType fields may have been populated earlier (in populate_type_fields_pass)
+     * with incomplete types. This pass ensures the StructType has the fully resolved field types.
+     *
+     * This is critical for generic types like Option<String> which can only be resolved
+     * after templates are registered but before codegen needs the field types.
+     */
+    class StructFieldTypeSyncPass : public CompilerPass
+    {
+    public:
+        explicit StructFieldTypeSyncPass(CompilerInstance &compiler);
+
+        std::string name() const override { return "StructFieldTypeSync"; }
+        PassStage stage() const override { return PassStage::TypeResolution; }
+        int order() const override { return 2; }
+        PassScope scope() const override { return PassScope::PerModule; }
+
+        std::vector<PassDependency> dependencies() const override
+        {
+            return {PassDependency::required(PassProvides::TYPES_RESOLVED)};
+        }
+
+        std::vector<std::string> provides() const override
+        {
+            return {"struct_fields_synced"};
+        }
+
+        std::string description() const override
+        {
+            return "Sync resolved field types to StructTypes";
+        }
+
+        PassResult run(PassContext &ctx) override;
+
+    private:
+        CompilerInstance &_compiler;
+
+        // Sync a single struct's fields from AST to StructType
+        void sync_struct_fields(StructDeclarationNode *struct_decl, PassContext &ctx);
+
+        // Sync a single class's fields from AST to ClassType
+        void sync_class_fields(ClassDeclarationNode *class_decl, PassContext &ctx);
+    };
+
     // ============================================================================
     // Stage 5: Semantic Analysis Passes
     // ============================================================================
@@ -372,7 +425,7 @@ namespace Cryo
 
         std::vector<PassDependency> dependencies() const override
         {
-            return {PassDependency::required(PassProvides::TYPES_RESOLVED)};
+            return {PassDependency::required("struct_fields_synced")};
         }
 
         std::vector<std::string> provides() const override
@@ -515,9 +568,11 @@ namespace Cryo
 
     private:
         CompilerInstance &_compiler;
+        TypeRef _current_struct_type; // Track the current struct/class type for 'this' resolution
+        std::unordered_map<std::string, TypeRef> _local_variable_types; // Track local variable types
 
         // Resolve generic enum variants in a function body
-        void resolve_function_body(FunctionDeclarationNode *func, PassContext &ctx);
+        void resolve_function_body(FunctionDeclarationNode *func, TypeRef struct_type, PassContext &ctx);
 
         // Resolve expressions within a statement, given an expected type context
         void resolve_statement(StatementNode *stmt, TypeRef expected_type, PassContext &ctx);
@@ -530,6 +585,12 @@ namespace Cryo
                                               const std::string &member_name,
                                               TypeRef expected_type,
                                               PassContext &ctx);
+
+        // Look up the concrete type for an InstantiatedType from monomorphized types
+        TypeRef lookup_concrete_type(TypeRef inst_type, PassContext &ctx);
+
+        // Resolve the type of a member access expression (e.g., this.field, var.field)
+        TypeRef resolve_member_access_type(MemberAccessNode *member_access, PassContext &ctx);
     };
 
     // ============================================================================

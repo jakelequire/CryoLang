@@ -19,6 +19,9 @@
 #include "Diagnostics/Diag.hpp"
 #include "Utils/Logger.hpp"
 
+#include <algorithm>
+#include <sstream>
+
 namespace Cryo
 {
     // ============================================================================
@@ -1039,6 +1042,221 @@ namespace Cryo
     }
 
     // ============================================================================
+    // Stage 4.2: Struct Field Type Sync Pass
+    // ============================================================================
+
+    StructFieldTypeSyncPass::StructFieldTypeSyncPass(CompilerInstance &compiler)
+        : _compiler(compiler)
+    {
+    }
+
+    PassResult StructFieldTypeSyncPass::run(PassContext &ctx)
+    {
+        auto *program = _compiler.ast_root();
+        if (!program)
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "StructFieldTypeSyncPass: No AST to process");
+            return PassResult::ok({"struct_fields_synced"});
+        }
+
+        LOG_DEBUG(LogComponent::GENERAL, "StructFieldTypeSyncPass: Syncing resolved field types to StructTypes/ClassTypes");
+
+        int synced_count = 0;
+
+        // Process all declarations in the AST
+        for (auto &decl : program->statements())
+        {
+            if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(decl.get()))
+            {
+                sync_struct_fields(struct_decl, ctx);
+                synced_count++;
+            }
+            else if (auto *class_decl = dynamic_cast<ClassDeclarationNode *>(decl.get()))
+            {
+                sync_class_fields(class_decl, ctx);
+                synced_count++;
+            }
+        }
+
+        LOG_DEBUG(LogComponent::GENERAL, "StructFieldTypeSyncPass: Synced {} struct/class types", synced_count);
+        return PassResult::ok({"struct_fields_synced"});
+    }
+
+    void StructFieldTypeSyncPass::sync_struct_fields(StructDeclarationNode *struct_decl, PassContext &ctx)
+    {
+        if (!struct_decl || struct_decl->fields().empty())
+            return;
+
+        // Don't sync generic structs - their fields contain type parameters
+        if (!struct_decl->generic_parameters().empty())
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "StructFieldTypeSyncPass: Skipping generic struct '{}'", struct_decl->name());
+            return;
+        }
+
+        // Look up the StructType
+        TypeRef struct_type = _compiler.symbol_table()->lookup_struct_type(struct_decl->name());
+        if (!struct_type.is_valid())
+        {
+            struct_type = _compiler.ast_context()->types().lookup_type_by_name(struct_decl->name());
+        }
+
+        if (!struct_type.is_valid())
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "StructFieldTypeSyncPass: Could not find StructType for '{}'", struct_decl->name());
+            return;
+        }
+
+        auto *struct_ptr = const_cast<StructType *>(dynamic_cast<const StructType *>(struct_type.get()));
+        if (!struct_ptr)
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "StructFieldTypeSyncPass: '{}' is not a StructType", struct_decl->name());
+            return;
+        }
+
+        // Build new field list from AST nodes with resolved types
+        std::vector<FieldInfo> new_fields;
+        bool has_changes = false;
+
+        for (const auto &field : struct_decl->fields())
+        {
+            if (!field)
+                continue;
+
+            TypeRef resolved_type = field->get_resolved_type();
+            if (resolved_type.is_valid() && !resolved_type.is_error())
+            {
+                new_fields.emplace_back(field->name(), resolved_type, 0, true, field->is_mutable());
+
+                // Check if this is a change from the current StructType
+                auto existing_field = struct_ptr->get_field(field->name());
+                if (!existing_field || !existing_field->type.is_valid() ||
+                    existing_field->type.id() != resolved_type.id())
+                {
+                    has_changes = true;
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "StructFieldTypeSyncPass: Updated field '{}::{}' type to '{}' (TypeID={})",
+                        struct_decl->name(), field->name(), resolved_type->display_name(),
+                        resolved_type.id().id);
+                }
+            }
+            else
+            {
+                // Keep the existing field type if resolution failed
+                auto existing_field = struct_ptr->get_field(field->name());
+                if (existing_field && existing_field->type.is_valid())
+                {
+                    new_fields.emplace_back(existing_field->name, existing_field->type,
+                                           existing_field->offset, existing_field->is_public,
+                                           existing_field->is_mutable);
+                }
+                else
+                {
+                    LOG_WARN(LogComponent::GENERAL,
+                        "StructFieldTypeSyncPass: Field '{}::{}' still unresolved after TypeResolutionPass",
+                        struct_decl->name(), field->name());
+                }
+            }
+        }
+
+        // Only update if we have changes and valid fields
+        if (has_changes && !new_fields.empty())
+        {
+            struct_ptr->set_fields(std::move(new_fields));
+            LOG_DEBUG(LogComponent::GENERAL,
+                "StructFieldTypeSyncPass: Updated StructType '{}' with {} fields",
+                struct_decl->name(), struct_decl->fields().size());
+        }
+    }
+
+    void StructFieldTypeSyncPass::sync_class_fields(ClassDeclarationNode *class_decl, PassContext &ctx)
+    {
+        if (!class_decl || class_decl->fields().empty())
+            return;
+
+        // Don't sync generic classes - their fields contain type parameters
+        if (!class_decl->generic_parameters().empty())
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "StructFieldTypeSyncPass: Skipping generic class '{}'", class_decl->name());
+            return;
+        }
+
+        // Look up the ClassType
+        TypeRef class_type = _compiler.symbol_table()->lookup_class_type(class_decl->name());
+        if (!class_type.is_valid())
+        {
+            class_type = _compiler.ast_context()->types().lookup_type_by_name(class_decl->name());
+        }
+
+        if (!class_type.is_valid())
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "StructFieldTypeSyncPass: Could not find ClassType for '{}'", class_decl->name());
+            return;
+        }
+
+        auto *class_ptr = const_cast<ClassType *>(dynamic_cast<const ClassType *>(class_type.get()));
+        if (!class_ptr)
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "StructFieldTypeSyncPass: '{}' is not a ClassType", class_decl->name());
+            return;
+        }
+
+        // Build new field list from AST nodes with resolved types
+        std::vector<FieldInfo> new_fields;
+        bool has_changes = false;
+
+        for (const auto &field : class_decl->fields())
+        {
+            if (!field)
+                continue;
+
+            TypeRef resolved_type = field->get_resolved_type();
+            if (resolved_type.is_valid() && !resolved_type.is_error())
+            {
+                new_fields.emplace_back(field->name(), resolved_type, 0, true, field->is_mutable());
+
+                // Check if this is a change from the current ClassType
+                auto existing_field = class_ptr->get_field(field->name());
+                if (!existing_field || !existing_field->type.is_valid() ||
+                    existing_field->type.id() != resolved_type.id())
+                {
+                    has_changes = true;
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "StructFieldTypeSyncPass: Updated field '{}::{}' type to '{}' (TypeID={})",
+                        class_decl->name(), field->name(), resolved_type->display_name(),
+                        resolved_type.id().id);
+                }
+            }
+            else
+            {
+                // Keep the existing field type if resolution failed
+                auto existing_field = class_ptr->get_field(field->name());
+                if (existing_field && existing_field->type.is_valid())
+                {
+                    new_fields.emplace_back(existing_field->name, existing_field->type,
+                                           existing_field->offset, existing_field->is_public,
+                                           existing_field->is_mutable);
+                }
+                else
+                {
+                    LOG_WARN(LogComponent::GENERAL,
+                        "StructFieldTypeSyncPass: Field '{}::{}' still unresolved after TypeResolutionPass",
+                        class_decl->name(), field->name());
+                }
+            }
+        }
+
+        // Only update if we have changes and valid fields
+        if (has_changes && !new_fields.empty())
+        {
+            class_ptr->set_fields(std::move(new_fields));
+            LOG_DEBUG(LogComponent::GENERAL,
+                "StructFieldTypeSyncPass: Updated ClassType '{}' with {} fields",
+                class_decl->name(), class_decl->fields().size());
+        }
+    }
+
+    // ============================================================================
     // Stage 5: Semantic Analysis Passes
     // ============================================================================
 
@@ -1140,36 +1358,61 @@ namespace Cryo
         }
 
         LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Resolving generic enum variants in expressions");
+        LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: AST has {} statements", ast_root->statements().size());
 
         // Walk all declarations in the program
         for (auto &decl : ast_root->statements())
         {
+            LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Processing declaration kind {}", static_cast<int>(decl->kind()));
+
             if (auto *func = dynamic_cast<FunctionDeclarationNode *>(decl.get()))
             {
-                resolve_function_body(func, ctx);
+                LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Found function '{}'", func->name());
+                resolve_function_body(func, TypeRef{}, ctx);
             }
             else if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(decl.get()))
             {
+                LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Found struct '{}' with {} methods",
+                          struct_decl->name(), struct_decl->methods().size());
+                // Look up the struct type for 'this' resolution in methods
+                TypeRef struct_type = _compiler.symbol_table()->lookup_struct_type(struct_decl->name());
+                LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Struct type lookup for '{}': {}",
+                          struct_decl->name(), struct_type.is_valid() ? "found" : "NOT FOUND");
                 // Process struct methods
                 for (auto &method : struct_decl->methods())
                 {
-                    resolve_function_body(method.get(), ctx);
+                    LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Processing struct method '{}'", method->name());
+                    resolve_function_body(method.get(), struct_type, ctx);
                 }
             }
             else if (auto *class_decl = dynamic_cast<ClassDeclarationNode *>(decl.get()))
             {
+                // Look up the class type for 'this' resolution in methods
+                TypeRef class_type = _compiler.symbol_table()->lookup_class_type(class_decl->name());
                 // Process class methods
                 for (auto &method : class_decl->methods())
                 {
-                    resolve_function_body(method.get(), ctx);
+                    resolve_function_body(method.get(), class_type, ctx);
                 }
             }
             else if (auto *impl_block = dynamic_cast<ImplementationBlockNode *>(decl.get()))
             {
+                LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Found impl block for '{}' with {} methods",
+                          impl_block->target_type(), impl_block->method_implementations().size());
+                // Look up the type for 'this' resolution in impl block methods
+                std::string type_name = impl_block->target_type();
+                TypeRef impl_type = _compiler.symbol_table()->lookup_struct_type(type_name);
+                if (!impl_type.is_valid())
+                {
+                    impl_type = _compiler.symbol_table()->lookup_class_type(type_name);
+                }
+                LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Impl type lookup for '{}': {}",
+                          type_name, impl_type.is_valid() ? "found" : "NOT FOUND");
                 // Process implementation block methods
                 for (auto &method : impl_block->method_implementations())
                 {
-                    resolve_function_body(method.get(), ctx);
+                    LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Processing impl method '{}'", method->name());
+                    resolve_function_body(method.get(), impl_type, ctx);
                 }
             }
             // Note: EnumDeclarationNode doesn't have methods in this AST design
@@ -1179,21 +1422,45 @@ namespace Cryo
         return PassResult::ok({PassProvides::GENERIC_EXPRESSIONS_RESOLVED});
     }
 
-    void GenericExpressionResolutionPass::resolve_function_body(FunctionDeclarationNode *func, PassContext &ctx)
+    void GenericExpressionResolutionPass::resolve_function_body(FunctionDeclarationNode *func, TypeRef struct_type, PassContext &ctx)
     {
         if (!func || !func->body())
             return;
+
+        // Store the struct type for 'this' resolution in member assignments
+        TypeRef previous_struct_type = _current_struct_type;
+        _current_struct_type = struct_type;
+
+        // Clear local variable tracking for this function scope
+        _local_variable_types.clear();
+
+        // Track function parameters as local variables
+        for (const auto &param : func->parameters())
+        {
+            if (param && !param->name().empty())
+            {
+                TypeRef param_type = param->get_resolved_type();
+                if (param_type.is_valid())
+                {
+                    _local_variable_types[param->name()] = param_type;
+                }
+            }
+        }
 
         // Get the function's return type - this is the context for return statements
         TypeRef return_type = func->get_resolved_return_type();
 
         LOG_DEBUG(LogComponent::GENERAL,
-                  "GenericExpressionResolutionPass: Processing function '{}' with return type '{}'",
+                  "GenericExpressionResolutionPass: Processing function '{}' with return type '{}', struct_type='{}'",
                   func->name(),
-                  return_type.is_valid() ? return_type->display_name() : "void");
+                  return_type.is_valid() ? return_type->display_name() : "void",
+                  struct_type.is_valid() ? struct_type->display_name() : "none");
 
         // Resolve expressions in the function body
         resolve_statement(func->body(), return_type, ctx);
+
+        // Restore previous struct type
+        _current_struct_type = previous_struct_type;
     }
 
     void GenericExpressionResolutionPass::resolve_statement(StatementNode *stmt, TypeRef expected_type, PassContext &ctx)
@@ -1263,6 +1530,13 @@ namespace Cryo
             {
                 // Variable declarations: the expected type is the variable's declared type
                 TypeRef var_type = var_decl->get_resolved_type();
+
+                // Track variable type for later member access resolution
+                if (var_type.is_valid() && !var_decl->name().empty())
+                {
+                    _local_variable_types[var_decl->name()] = var_type;
+                }
+
                 if (var_decl->initializer())
                 {
                     resolve_expression(var_decl->initializer(), var_type, ctx);
@@ -1463,33 +1737,27 @@ namespace Cryo
             {
                 TypeRef lhs_type = binary->left()->get_resolved_type();
 
-                // If LHS is a member access (e.g., this.cwd), try to get the member type
+                // If LHS is a member access (e.g., this.name), use our helper to resolve the type
                 if (!lhs_type.is_valid())
                 {
                     if (auto *member_access = dynamic_cast<MemberAccessNode *>(binary->left()))
                     {
-                        TypeRef obj_type = member_access->object()->get_resolved_type();
-                        if (obj_type.is_valid())
+                        lhs_type = resolve_member_access_type(member_access, ctx);
+
+                        if (lhs_type.is_valid())
                         {
-                            // Try to get the member type from struct/class
-                            if (obj_type->kind() == TypeKind::Struct)
-                            {
-                                auto *struct_type = static_cast<const StructType *>(obj_type.get());
-                                auto field_type_opt = struct_type->field_type(member_access->member());
-                                if (field_type_opt)
-                                {
-                                    lhs_type = *field_type_opt;
-                                }
-                            }
-                            else if (obj_type->kind() == TypeKind::Class)
-                            {
-                                auto *class_type = static_cast<const ClassType *>(obj_type.get());
-                                auto field_type_opt = class_type->field_type(member_access->member());
-                                if (field_type_opt)
-                                {
-                                    lhs_type = *field_type_opt;
-                                }
-                            }
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                      "GenericExpressionResolutionPass: Resolved member access '{}' to type '{}' (kind={}, generic_params={})",
+                                      member_access->member(),
+                                      lhs_type->display_name(),
+                                      static_cast<int>(lhs_type->kind()),
+                                      contains_generic_params(lhs_type) ? "yes" : "no");
+                        }
+                        else
+                        {
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                      "GenericExpressionResolutionPass: Could not resolve member access '{}'",
+                                      member_access->member());
                         }
                     }
                 }
@@ -1509,6 +1777,9 @@ namespace Cryo
             auto *struct_lit = static_cast<StructLiteralNode *>(expr);
             std::string struct_name = struct_lit->struct_type();
 
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "GenericExpressionResolutionPass: Processing struct literal for '{}'", struct_name);
+
             // Try to look up the struct type to get field types
             TypeRef struct_type_ref = _compiler.symbol_table()->lookup_struct_type(struct_name);
             const StructType *struct_type = nullptr;
@@ -1516,17 +1787,96 @@ namespace Cryo
             if (struct_type_ref.is_valid() && struct_type_ref->kind() == TypeKind::Struct)
             {
                 struct_type = static_cast<const StructType *>(struct_type_ref.get());
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "GenericExpressionResolutionPass: Found struct type '{}' with {} fields",
+                          struct_name, struct_type->field_count());
+            }
+            else
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "GenericExpressionResolutionPass: Could not find struct type '{}'", struct_name);
             }
 
             for (auto &field_init : struct_lit->field_initializers())
             {
                 TypeRef field_type;
+                const std::string &field_name = field_init->field_name();
+
                 if (struct_type)
                 {
-                    auto field_type_opt = struct_type->field_type(field_init->field_name());
+                    auto field_type_opt = struct_type->field_type(field_name);
                     if (field_type_opt)
                     {
                         field_type = *field_type_opt;
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "GenericExpressionResolutionPass: Field '{}' has type '{}' (kind={}, generic_params={})",
+                                  field_name,
+                                  field_type->display_name(),
+                                  static_cast<int>(field_type->kind()),
+                                  contains_generic_params(field_type) ? "yes" : "no");
+
+                        // If the field type is an InstantiatedType, try to get the concrete type
+                        if (field_type->kind() == TypeKind::InstantiatedType)
+                        {
+                            TypeRef concrete = lookup_concrete_type(field_type, ctx);
+                            if (concrete.is_valid())
+                            {
+                                LOG_DEBUG(LogComponent::GENERAL,
+                                          "GenericExpressionResolutionPass: Using concrete type '{}' for field '{}'",
+                                          concrete->display_name(), field_name);
+                                field_type = concrete;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "GenericExpressionResolutionPass: Field '{}' type not found in struct '{}', trying AST fallback",
+                                  field_name, struct_name);
+
+                        // Try to find the field type from AST annotation
+                        auto *program = _compiler.ast_root();
+                        if (program)
+                        {
+                            for (const auto &decl : program->statements())
+                            {
+                                if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(decl.get()))
+                                {
+                                    if (struct_decl->name() == struct_name)
+                                    {
+                                        for (const auto &field : struct_decl->fields())
+                                        {
+                                            if (field->name() == field_name && field->has_type_annotation())
+                                            {
+                                                ResolutionContext res_ctx(_compiler.symbol_table()->current_module());
+                                                TypeRef resolved = _compiler.type_resolver()->resolve(*field->type_annotation(), res_ctx);
+                                                if (resolved.is_valid() && !resolved.is_error())
+                                                {
+                                                    LOG_DEBUG(LogComponent::GENERAL,
+                                                              "GenericExpressionResolutionPass: Resolved field '{}' from AST to '{}'",
+                                                              field_name, resolved->display_name());
+
+                                                    field_type = resolved;
+                                                    if (field_type->kind() == TypeKind::InstantiatedType)
+                                                    {
+                                                        TypeRef concrete = lookup_concrete_type(field_type, ctx);
+                                                        if (concrete.is_valid())
+                                                        {
+                                                            LOG_DEBUG(LogComponent::GENERAL,
+                                                                      "GenericExpressionResolutionPass: Using concrete type '{}' for field '{}'",
+                                                                      concrete->display_name(), field_name);
+                                                            field_type = concrete;
+                                                        }
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 resolve_expression(field_init->value(), field_type, ctx);
@@ -1620,11 +1970,28 @@ namespace Cryo
             if (expected_type->kind() == TypeKind::Enum)
             {
                 auto *enum_type = static_cast<const EnumType *>(expected_type.get());
-                if (enum_type->name() == resolved_scope_name)
+                std::string enum_name = enum_type->name();
+
+                // Direct match
+                if (enum_name == resolved_scope_name)
                 {
-                    // Direct match - the expected type IS the concrete enum
                     return expected_type;
                 }
+
+                // Monomorphized name match (e.g., "Option_String" starts with "Option")
+                // Check if the enum name starts with the scope name followed by "_"
+                if (enum_name.size() > resolved_scope_name.size() &&
+                    enum_name.substr(0, resolved_scope_name.size()) == resolved_scope_name &&
+                    enum_name[resolved_scope_name.size()] == '_')
+                {
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "resolve_generic_enum_variant: Matched monomorphized enum '{}' to generic '{}'",
+                              enum_name, resolved_scope_name);
+                    return expected_type;
+                }
+
+                // Also check if the enum is a generic enum that needs resolution
+                // This handles cases where the EnumType is the base generic type
             }
             LOG_DEBUG(LogComponent::GENERAL,
                       "resolve_generic_enum_variant: expected_type is not InstantiatedType (kind={}, name='{}'), scope='{}', member='{}'",
@@ -1683,8 +2050,349 @@ namespace Cryo
             return inst_type->resolved_type();
         }
 
+        // Try to look up the concrete monomorphized type
+        TypeRef concrete = lookup_concrete_type(expected_type, ctx);
+        if (concrete.is_valid())
+        {
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "resolve_generic_enum_variant: Found concrete type '{}' for InstantiatedType '{}'",
+                      concrete->display_name(), expected_type->display_name());
+            return concrete;
+        }
+
         // Otherwise, use the InstantiatedType itself - it will be resolved during codegen
         return expected_type;
+    }
+
+    TypeRef GenericExpressionResolutionPass::lookup_concrete_type(TypeRef inst_type, PassContext &ctx)
+    {
+        if (!inst_type.is_valid() || inst_type->kind() != TypeKind::InstantiatedType)
+            return TypeRef{};
+
+        auto *inst = static_cast<const InstantiatedType *>(inst_type.get());
+
+        // If already has resolved type, return it
+        if (inst->has_resolved_type())
+            return inst->resolved_type();
+
+        TypeRef base = inst->generic_base();
+        if (!base.is_valid())
+            return TypeRef{};
+
+        // Try with generic registry's instantiation cache first - most reliable
+        auto *generics = _compiler.generic_registry();
+        if (generics)
+        {
+            auto cached = generics->get_cached_instantiation(base, inst->type_args());
+            if (cached && cached->is_valid())
+            {
+                if (cached->get()->kind() == TypeKind::InstantiatedType)
+                {
+                    auto *cached_inst = static_cast<const InstantiatedType *>(cached->get());
+                    if (cached_inst->has_resolved_type())
+                    {
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "lookup_concrete_type: Found in generic registry cache: '{}'",
+                                  cached_inst->resolved_type()->display_name());
+                        return cached_inst->resolved_type();
+                    }
+                }
+            }
+
+            // If not in cache with resolved_type, try to get the template and use monomorphizer
+            auto *mono = ctx.monomorphizer();
+            if (mono && generics->is_template(base))
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "lookup_concrete_type: Attempting direct monomorphization for '{}'",
+                          inst_type->display_name());
+
+                // Specialize the type using monomorphizer
+                auto result = mono->specialize(base, inst->type_args());
+                if (result.is_ok())
+                {
+                    TypeRef specialized = result.specialized_type;
+                    if (specialized.is_valid() && specialized->kind() == TypeKind::InstantiatedType)
+                    {
+                        auto *spec_inst = static_cast<const InstantiatedType *>(specialized.get());
+                        if (spec_inst->has_resolved_type())
+                        {
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                      "lookup_concrete_type: Monomorphization succeeded: '{}'",
+                                      spec_inst->resolved_type()->display_name());
+                            return spec_inst->resolved_type();
+                        }
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "lookup_concrete_type: Monomorphization failed for '{}': {}",
+                              inst_type->display_name(), result.error_message);
+                }
+            }
+        }
+
+        // Build the mangled name matching Monomorphizer's convention
+        // Monomorphizer uses: base.display_name() + "_" + arg1_name + "_" + arg2_name...
+        std::string base_display = base->display_name();
+
+        std::ostringstream oss;
+        oss << base_display;
+
+        if (!inst->type_args().empty())
+        {
+            oss << "_";
+            for (size_t i = 0; i < inst->type_args().size(); ++i)
+            {
+                if (i > 0)
+                    oss << "_";
+                const auto &arg = inst->type_args()[i];
+                if (arg.is_valid())
+                {
+                    // Use the same cleanup as Monomorphizer
+                    std::string arg_name = arg->display_name();
+                    std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                    std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                    std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                    std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                    std::replace(arg_name.begin(), arg_name.end(), ':', '_');
+                    oss << arg_name;
+                }
+                else
+                {
+                    oss << "unknown";
+                }
+            }
+        }
+
+        std::string mangled_name = oss.str();
+        LOG_DEBUG(LogComponent::GENERAL,
+                  "lookup_concrete_type: Looking for mangled name '{}' (base='{}')",
+                  mangled_name, base_display);
+
+        // Look up in symbol table (try enum first since we're typically dealing with generic enums)
+        TypeRef concrete = _compiler.symbol_table()->lookup_enum_type(mangled_name);
+        if (concrete.is_valid())
+        {
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "lookup_concrete_type: Found enum in symbol table: '{}'", concrete->display_name());
+            return concrete;
+        }
+
+        // Also try struct lookup in case it's a generic struct
+        concrete = _compiler.symbol_table()->lookup_struct_type(mangled_name);
+        if (concrete.is_valid())
+        {
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "lookup_concrete_type: Found struct in symbol table: '{}'", concrete->display_name());
+            return concrete;
+        }
+
+        // Try looking up in the AST context's type registry
+        concrete = _compiler.ast_context()->types().lookup_type_by_name(mangled_name);
+        if (concrete.is_valid())
+        {
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "lookup_concrete_type: Found in type registry: '{}'", concrete->display_name());
+            return concrete;
+        }
+
+        // Try with simplified base name (no angle brackets)
+        std::string simple_base = base_display;
+        size_t angle_pos = simple_base.find('<');
+        if (angle_pos != std::string::npos)
+            simple_base = simple_base.substr(0, angle_pos);
+
+        if (simple_base != base_display)
+        {
+            // Rebuild mangled name with simplified base
+            std::ostringstream simple_oss;
+            simple_oss << simple_base;
+            if (!inst->type_args().empty())
+            {
+                simple_oss << "_";
+                for (size_t i = 0; i < inst->type_args().size(); ++i)
+                {
+                    if (i > 0)
+                        simple_oss << "_";
+                    const auto &arg = inst->type_args()[i];
+                    if (arg.is_valid())
+                    {
+                        std::string arg_name = arg->display_name();
+                        std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                        std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                        std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                        std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                        std::replace(arg_name.begin(), arg_name.end(), ':', '_');
+                        oss << arg_name;
+                    }
+                    else
+                    {
+                        simple_oss << "unknown";
+                    }
+                }
+            }
+            std::string simple_mangled = simple_oss.str();
+
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "lookup_concrete_type: Trying simplified name '{}'", simple_mangled);
+
+            concrete = _compiler.symbol_table()->lookup_enum_type(simple_mangled);
+            if (concrete.is_valid())
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "lookup_concrete_type: Found with simplified name: '{}'", concrete->display_name());
+                return concrete;
+            }
+
+            concrete = _compiler.symbol_table()->lookup_struct_type(simple_mangled);
+            if (concrete.is_valid())
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "lookup_concrete_type: Found struct with simplified name: '{}'", concrete->display_name());
+                return concrete;
+            }
+
+            concrete = _compiler.ast_context()->types().lookup_type_by_name(simple_mangled);
+            if (concrete.is_valid())
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "lookup_concrete_type: Found in type registry with simplified name: '{}'",
+                          concrete->display_name());
+                return concrete;
+            }
+        }
+
+        LOG_DEBUG(LogComponent::GENERAL,
+                  "lookup_concrete_type: Could not find concrete type for '{}' or '{}'",
+                  mangled_name, simple_base + "_...");
+        return TypeRef{};
+    }
+
+    TypeRef GenericExpressionResolutionPass::resolve_member_access_type(MemberAccessNode *member_access, PassContext &ctx)
+    {
+        if (!member_access)
+            return TypeRef{};
+
+        // Get the object type
+        TypeRef obj_type = member_access->object()->get_resolved_type();
+
+        // Special case: if the object is 'this' without resolved type, use tracked struct type
+        if (!obj_type.is_valid())
+        {
+            if (auto *obj_id = dynamic_cast<IdentifierNode *>(member_access->object()))
+            {
+                if (obj_id->name() == "this" && _current_struct_type.is_valid())
+                {
+                    obj_type = _current_struct_type;
+                }
+                else
+                {
+                    // Try looking up in local variable types
+                    auto it = _local_variable_types.find(obj_id->name());
+                    if (it != _local_variable_types.end())
+                    {
+                        obj_type = it->second;
+                    }
+                }
+            }
+            // Handle nested member access (e.g., a.b.c)
+            else if (auto *nested_access = dynamic_cast<MemberAccessNode *>(member_access->object()))
+            {
+                obj_type = resolve_member_access_type(nested_access, ctx);
+            }
+        }
+
+        if (!obj_type.is_valid())
+            return TypeRef{};
+
+        const std::string &field_name = member_access->member();
+
+        // Look up the member type from the object type
+        if (obj_type->kind() == TypeKind::Struct)
+        {
+            auto *struct_type = static_cast<const StructType *>(obj_type.get());
+            auto field_type_opt = struct_type->field_type(field_name);
+            if (field_type_opt)
+            {
+                TypeRef field_type = *field_type_opt;
+                // If the field type is an InstantiatedType, try to get the concrete type
+                if (field_type->kind() == TypeKind::InstantiatedType)
+                {
+                    TypeRef concrete = lookup_concrete_type(field_type, ctx);
+                    if (concrete.is_valid())
+                        return concrete;
+                }
+                return field_type;
+            }
+
+            // Field type not found in StructType - try to resolve from AST annotation
+            // This handles cases where field type population failed during earlier passes
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "resolve_member_access_type: Field '{}' not found in StructType '{}', trying AST fallback",
+                      field_name, struct_type->name());
+
+            // Find the struct declaration AST to get the field annotation
+            auto *program = _compiler.ast_root();
+            if (program)
+            {
+                for (const auto &decl : program->statements())
+                {
+                    if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(decl.get()))
+                    {
+                        if (struct_decl->name() == struct_type->name())
+                        {
+                            // Found the struct declaration, look for the field
+                            for (const auto &field : struct_decl->fields())
+                            {
+                                if (field->name() == field_name && field->has_type_annotation())
+                                {
+                                    // Try to resolve the type annotation
+                                    ResolutionContext res_ctx(_compiler.symbol_table()->current_module());
+                                    TypeRef resolved = _compiler.type_resolver()->resolve(*field->type_annotation(), res_ctx);
+                                    if (resolved.is_valid() && !resolved.is_error())
+                                    {
+                                        LOG_DEBUG(LogComponent::GENERAL,
+                                                  "resolve_member_access_type: Resolved field '{}' from AST to '{}'",
+                                                  field_name, resolved->display_name());
+
+                                        // If it's an InstantiatedType, try to get the concrete type
+                                        if (resolved->kind() == TypeKind::InstantiatedType)
+                                        {
+                                            TypeRef concrete = lookup_concrete_type(resolved, ctx);
+                                            if (concrete.is_valid())
+                                                return concrete;
+                                        }
+                                        return resolved;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        else if (obj_type->kind() == TypeKind::Class)
+        {
+            auto *class_type = static_cast<const ClassType *>(obj_type.get());
+            auto field_type_opt = class_type->field_type(field_name);
+            if (field_type_opt)
+            {
+                TypeRef field_type = *field_type_opt;
+                // If the field type is an InstantiatedType, try to get the concrete type
+                if (field_type->kind() == TypeKind::InstantiatedType)
+                {
+                    TypeRef concrete = lookup_concrete_type(field_type, ctx);
+                    if (concrete.is_valid())
+                        return concrete;
+                }
+                return field_type;
+            }
+        }
+
+        return TypeRef{};
     }
 
     // ============================================================================
@@ -1781,6 +2489,7 @@ namespace Cryo
 
         // Stage 4: Type Resolution
         manager->register_pass(std::make_unique<TypeResolutionPass>(compiler));
+        manager->register_pass(std::make_unique<StructFieldTypeSyncPass>(compiler));
 
         // Stage 5: Semantic Analysis
         manager->register_pass(std::make_unique<DirectiveProcessingPass>(compiler));
@@ -1820,6 +2529,7 @@ namespace Cryo
 
         // Stage 4: Type Resolution
         manager->register_pass(std::make_unique<TypeResolutionPass>(compiler));
+        manager->register_pass(std::make_unique<StructFieldTypeSyncPass>(compiler));
 
         // Stage 5: Semantic Analysis (partial - for LSP)
         manager->register_pass(std::make_unique<DirectiveProcessingPass>(compiler));
