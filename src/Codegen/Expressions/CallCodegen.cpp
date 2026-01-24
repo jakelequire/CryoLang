@@ -237,7 +237,7 @@ namespace Cryo::Codegen
                 if (!receiver)
                 {
                     report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
-                                 "Failed to generate receiver for method call");
+                                 "Failed to generate receiver for method call for: " + function_name);
                     return nullptr;
                 }
 
@@ -1028,7 +1028,7 @@ namespace Cryo::Codegen
         {
             // Log the failure for debugging
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "No explicit constructor for {}, initializing fields directly", resolved_type_name);
+                      "No explicit constructor for {}, initializing fields directly", resolved_type_name);
 
             // Initialize fields as fallback
             auto *st = llvm::cast<llvm::StructType>(class_type);
@@ -1210,7 +1210,7 @@ namespace Cryo::Codegen
             {
                 report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
                              "Unknown enum type for variant constructor: " + resolved_enum_name +
-                             " (generic enums must be instantiated before use)");
+                                 " (generic enums must be instantiated before use)");
                 return nullptr;
             }
 
@@ -1476,7 +1476,7 @@ namespace Cryo::Codegen
             // 2c. Has args but no matching constructor - error
             report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "No constructor found for " + type_name + " that accepts " +
-                         std::to_string(args.size()) + " argument(s)");
+                             std::to_string(args.size()) + " argument(s)");
             return nullptr;
         }
 
@@ -2499,13 +2499,12 @@ namespace Cryo::Codegen
             std::vector<std::string> ctor_names = {
                 // Standard patterns
                 type_candidate + "::init",
-                type_candidate + "::new", 
+                type_candidate + "::new",
                 type_candidate + "::" + simple_name,
                 // Exact match for CryoRuntime
                 "std::Runtime::CryoRuntime::CryoRuntime",
                 // Also try the simple name directly
-                simple_name + "::" + simple_name
-            };
+                simple_name + "::" + simple_name};
 
             for (const auto &ctor_name : ctor_names)
             {
@@ -3012,7 +3011,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *CallCodegen::declare_runtime_function(const std::string &unqualified_name,
-                                                           const std::string &qualified_name)
+                                                          const std::string &qualified_name)
     {
         // Map of runtime function signatures
         // Format: function_name -> (return_type, {param_types}, is_variadic)
@@ -3140,7 +3139,7 @@ namespace Cryo::Codegen
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
                       "Unknown runtime function '{}' - cannot create declaration", unqualified_name);
             report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                        "Unknown runtime function '" + unqualified_name + "' - cannot create declaration");
+                         "Unknown runtime function '" + unqualified_name + "' - cannot create declaration");
             return nullptr;
         }
 
