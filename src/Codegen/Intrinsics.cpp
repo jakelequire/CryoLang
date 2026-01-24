@@ -716,6 +716,60 @@ namespace Cryo::Codegen
             return generate_int_conversion(args, 64, 64, true, false);
         else if (intrinsic_name == "u64_to_i64")
             return generate_int_conversion(args, 64, 64, false, true);
+        else if (intrinsic_name == "u8_to_i8")
+            return generate_int_conversion(args, 8, 8, false, true);
+        else if (intrinsic_name == "i8_to_u8")
+            return generate_int_conversion(args, 8, 8, true, false);
+
+        // Pointer arithmetic intrinsics
+        else if (intrinsic_name == "ptr_add")
+            return generate_ptr_add(args);
+        else if (intrinsic_name == "ptr_sub")
+            return generate_ptr_sub(args);
+        else if (intrinsic_name == "ptr_diff")
+            return generate_ptr_diff(args);
+
+        // Additional float math intrinsics
+        else if (intrinsic_name == "truncf")
+            return generate_truncf(args);
+        else if (intrinsic_name == "log10f")
+            return generate_log10f(args);
+        else if (intrinsic_name == "log2f")
+            return generate_log2f(args);
+
+        // Float to float conversions
+        else if (intrinsic_name == "f32_to_f64")
+            return generate_float_conversion(args, true);
+        else if (intrinsic_name == "f64_to_f32")
+            return generate_float_conversion(args, false);
+
+        // Int to float conversions
+        else if (intrinsic_name == "i32_to_f32")
+            return generate_int_to_float(args, 32, true, true);
+        else if (intrinsic_name == "i32_to_f64")
+            return generate_int_to_float(args, 32, true, false);
+        else if (intrinsic_name == "i64_to_f64")
+            return generate_int_to_float(args, 64, true, false);
+        else if (intrinsic_name == "u32_to_f32")
+            return generate_int_to_float(args, 32, false, true);
+        else if (intrinsic_name == "u32_to_f64")
+            return generate_int_to_float(args, 32, false, false);
+        else if (intrinsic_name == "u64_to_f64")
+            return generate_int_to_float(args, 64, false, false);
+
+        // Float to int conversions
+        else if (intrinsic_name == "f32_to_i32")
+            return generate_float_to_int(args, true, 32, true);
+        else if (intrinsic_name == "f64_to_i32")
+            return generate_float_to_int(args, false, 32, true);
+        else if (intrinsic_name == "f64_to_i64")
+            return generate_float_to_int(args, false, 64, true);
+        else if (intrinsic_name == "f32_to_u32")
+            return generate_float_to_int(args, true, 32, false);
+        else if (intrinsic_name == "f64_to_u32")
+            return generate_float_to_int(args, false, 32, false);
+        else if (intrinsic_name == "f64_to_u64")
+            return generate_float_to_int(args, false, 64, false);
 
         else
         {
@@ -1179,6 +1233,154 @@ namespace Cryo::Codegen
 
         // Calculate difference
         return builder.CreateSub(int_ptr1, int_ptr2, "ptr_diff_result");
+    }
+
+    // ========================================
+    // Float Math Intrinsics (f32 variants)
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_truncf(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("truncf requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+
+        llvm::Type *f32_type = llvm::Type::getFloatTy(context);
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(f32_type, {f32_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("truncf", fn_type);
+
+        llvm::Value *arg = ensure_type(args[0], f32_type, "truncf.arg");
+        return builder.CreateCall(fn, {arg}, "truncf.result");
+    }
+
+    llvm::Value *Intrinsics::generate_log10f(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("log10f requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *f32_type = llvm::Type::getFloatTy(context);
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(f32_type, {f32_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("log10f", fn_type);
+
+        llvm::Value *arg = ensure_type(args[0], f32_type, "log10f.arg");
+        return builder.CreateCall(fn, {arg}, "log10f.result");
+    }
+
+    llvm::Value *Intrinsics::generate_log2f(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("log2f requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *f32_type = llvm::Type::getFloatTy(context);
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(f32_type, {f32_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("log2f", fn_type);
+
+        llvm::Value *arg = ensure_type(args[0], f32_type, "log2f.arg");
+        return builder.CreateCall(fn, {arg}, "log2f.result");
+    }
+
+    // ========================================
+    // Float Conversion Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_float_conversion(const std::vector<llvm::Value *> &args, bool f32_to_f64)
+    {
+        if (args.size() != 1)
+        {
+            report_error("Float conversion requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *f32_type = llvm::Type::getFloatTy(context);
+        llvm::Type *f64_type = llvm::Type::getDoubleTy(context);
+
+        if (f32_to_f64)
+        {
+            // f32 -> f64: extend
+            llvm::Value *arg = ensure_type(args[0], f32_type, "f32_to_f64.arg");
+            return builder.CreateFPExt(arg, f64_type, "f32_to_f64.result");
+        }
+        else
+        {
+            // f64 -> f32: truncate
+            llvm::Value *arg = ensure_type(args[0], f64_type, "f64_to_f32.arg");
+            return builder.CreateFPTrunc(arg, f32_type, "f64_to_f32.result");
+        }
+    }
+
+    llvm::Value *Intrinsics::generate_int_to_float(const std::vector<llvm::Value *> &args,
+                                                   int from_bits, bool is_signed, bool to_f32)
+    {
+        if (args.size() != 1)
+        {
+            report_error("Int to float conversion requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getIntNTy(context, from_bits);
+        llvm::Type *float_type = to_f32 ? llvm::Type::getFloatTy(context) : llvm::Type::getDoubleTy(context);
+
+        llvm::Value *arg = ensure_type(args[0], int_type, "int_to_float.arg");
+
+        if (is_signed)
+        {
+            return builder.CreateSIToFP(arg, float_type, "int_to_float.result");
+        }
+        else
+        {
+            return builder.CreateUIToFP(arg, float_type, "int_to_float.result");
+        }
+    }
+
+    llvm::Value *Intrinsics::generate_float_to_int(const std::vector<llvm::Value *> &args,
+                                                   bool from_f32, int to_bits, bool is_signed)
+    {
+        if (args.size() != 1)
+        {
+            report_error("Float to int conversion requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *float_type = from_f32 ? llvm::Type::getFloatTy(context) : llvm::Type::getDoubleTy(context);
+        llvm::Type *int_type = llvm::Type::getIntNTy(context, to_bits);
+
+        llvm::Value *arg = ensure_type(args[0], float_type, "float_to_int.arg");
+
+        if (is_signed)
+        {
+            return builder.CreateFPToSI(arg, int_type, "float_to_int.result");
+        }
+        else
+        {
+            return builder.CreateFPToUI(arg, int_type, "float_to_int.result");
+        }
     }
 
     // ========================================

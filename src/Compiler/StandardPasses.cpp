@@ -10,6 +10,7 @@
 #include "Types/TypeResolver.hpp"
 #include "Types/GenericRegistry.hpp"
 #include "Types/GenericTypes.hpp"
+#include "Types/CompoundTypes.hpp"
 #include "Types/UserDefinedTypes.hpp"
 #include "Types/ModuleTypeRegistry.hpp"
 #include "Types/Monomorphizer.hpp"
@@ -1354,10 +1355,103 @@ namespace Cryo
                 }
             }
 
-            // Resolve arguments (no expected type for now - could be improved with function signature lookup)
-            for (auto &arg : call->arguments())
+            // Look up function signature to get parameter types for argument resolution
+            std::vector<TypeRef> param_types;
+
+            // Try to get function type from callee
+            if (auto *ident = dynamic_cast<IdentifierNode *>(call->callee()))
             {
-                resolve_expression(arg.get(), TypeRef{}, ctx);
+                // Simple function call: foo(arg)
+                const Symbol *func_sym = _compiler.symbol_table()->lookup(ident->name());
+                if (func_sym && func_sym->type.is_valid() && func_sym->type->kind() == TypeKind::Function)
+                {
+                    auto *func_type = static_cast<const FunctionType *>(func_sym->type.get());
+                    param_types = func_type->param_types();
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "GenericExpressionResolutionPass: Found function '{}' with {} params",
+                              ident->name(), param_types.size());
+                }
+            }
+            else if (auto *member = dynamic_cast<MemberAccessNode *>(call->callee()))
+            {
+                // Method call: obj.method(arg) - try to get method signature from receiver type
+                TypeRef receiver_type = member->object()->get_resolved_type();
+                if (receiver_type.is_valid())
+                {
+                    std::string method_name = member->member();
+                    // Try to find method in struct/class type
+                    if (receiver_type->kind() == TypeKind::Struct)
+                    {
+                        auto *struct_type = static_cast<const StructType *>(receiver_type.get());
+                        const MethodInfo *method_info = struct_type->get_method(method_name);
+                        if (method_info && method_info->function_type.is_valid() &&
+                            method_info->function_type->kind() == TypeKind::Function)
+                        {
+                            auto *func_type = static_cast<const FunctionType *>(method_info->function_type.get());
+                            param_types = func_type->param_types();
+                            // Skip 'self' parameter if present
+                            if (!param_types.empty())
+                            {
+                                param_types.erase(param_types.begin());
+                            }
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                      "GenericExpressionResolutionPass: Found method '{}.{}' with {} params",
+                                      receiver_type->display_name(), method_name, param_types.size());
+                        }
+                    }
+                    else if (receiver_type->kind() == TypeKind::Class)
+                    {
+                        auto *class_type = static_cast<const ClassType *>(receiver_type.get());
+                        const MethodInfo *method_info = class_type->get_method(method_name);
+                        if (method_info && method_info->function_type.is_valid() &&
+                            method_info->function_type->kind() == TypeKind::Function)
+                        {
+                            auto *func_type = static_cast<const FunctionType *>(method_info->function_type.get());
+                            param_types = func_type->param_types();
+                            // Skip 'self' parameter if present
+                            if (!param_types.empty())
+                            {
+                                param_types.erase(param_types.begin());
+                            }
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                      "GenericExpressionResolutionPass: Found method '{}.{}' with {} params",
+                                      receiver_type->display_name(), method_name, param_types.size());
+                        }
+                    }
+                }
+            }
+            else if (auto *scope_res_callee = dynamic_cast<ScopeResolutionNode *>(call->callee()))
+            {
+                // Static method call: Type::method(arg) - look up in symbol table
+                std::string qualified_name = scope_res_callee->scope_name() + "::" + scope_res_callee->member_name();
+                const Symbol *func_sym = _compiler.symbol_table()->lookup(qualified_name);
+                if (!func_sym)
+                {
+                    // Try just the member name for imported functions
+                    func_sym = _compiler.symbol_table()->lookup(scope_res_callee->member_name());
+                }
+                if (func_sym && func_sym->type.is_valid() && func_sym->type->kind() == TypeKind::Function)
+                {
+                    auto *func_type = static_cast<const FunctionType *>(func_sym->type.get());
+                    param_types = func_type->param_types();
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "GenericExpressionResolutionPass: Found static method '{}' with {} params",
+                              qualified_name, param_types.size());
+                }
+            }
+
+            // Resolve arguments with parameter types as expected types
+            auto &args = call->arguments();
+            for (size_t i = 0; i < args.size(); ++i)
+            {
+                TypeRef expected_arg_type = (i < param_types.size()) ? param_types[i] : TypeRef{};
+                if (expected_arg_type.is_valid())
+                {
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "GenericExpressionResolutionPass: Resolving arg {} with expected type '{}'",
+                              i, expected_arg_type->display_name());
+                }
+                resolve_expression(args[i].get(), expected_arg_type, ctx);
             }
             break;
         }
@@ -1436,6 +1530,52 @@ namespace Cryo
                     }
                 }
                 resolve_expression(field_init->value(), field_type, ctx);
+            }
+            break;
+        }
+        case NodeKind::MatchExpression:
+        {
+            // Handle match expressions - propagate expected type to arm bodies
+            // This is crucial for generic enum variants inside match arms like:
+            //   match (x) { Pattern => Option::None, ... }
+            // where Option::None needs the expected type to be resolved
+            auto *match_expr = static_cast<MatchExpressionNode *>(expr);
+
+            // Resolve the match expression itself (no expected type)
+            resolve_expression(match_expr->expression(), TypeRef{}, ctx);
+
+            // Propagate expected type to each arm's body
+            for (const auto &arm : match_expr->arms())
+            {
+                // Handle the arm body - it's a StatementNode (usually BlockStatementNode)
+                auto *body = arm->body();
+                if (body)
+                {
+                    // If the body is a block, process each statement
+                    if (body->kind() == NodeKind::BlockStatement)
+                    {
+                        auto *block = static_cast<BlockStatementNode *>(body);
+                        for (auto &stmt : block->statements())
+                        {
+                            // For expression statements, pass the expected type
+                            // This handles cases like: { Option::None } or { Option::Some(x) }
+                            if (stmt->kind() == NodeKind::ExpressionStatement)
+                            {
+                                auto *expr_stmt = static_cast<ExpressionStatementNode *>(stmt.get());
+                                resolve_expression(expr_stmt->expression(), expected_type, ctx);
+                            }
+                            else
+                            {
+                                resolve_statement(stmt.get(), expected_type, ctx);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Handle non-block body
+                        resolve_statement(body, expected_type, ctx);
+                    }
+                }
             }
             break;
         }

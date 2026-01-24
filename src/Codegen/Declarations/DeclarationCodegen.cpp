@@ -2511,6 +2511,35 @@ namespace Cryo::Codegen
                     {
                         this_type = ctx().symbols().lookup_class_type(parent_type);
                     }
+                    // Fallback: check for primitive types (implement f32/f64/i32/etc. blocks)
+                    if (!this_type.is_valid())
+                    {
+                        TypeArena &arena = ctx().symbols().arena();
+                        if (parent_type == "f32")
+                            this_type = arena.get_f32();
+                        else if (parent_type == "f64")
+                            this_type = arena.get_f64();
+                        else if (parent_type == "i8")
+                            this_type = arena.get_i8();
+                        else if (parent_type == "i16")
+                            this_type = arena.get_i16();
+                        else if (parent_type == "i32")
+                            this_type = arena.get_i32();
+                        else if (parent_type == "i64")
+                            this_type = arena.get_i64();
+                        else if (parent_type == "u8")
+                            this_type = arena.get_u8();
+                        else if (parent_type == "u16")
+                            this_type = arena.get_u16();
+                        else if (parent_type == "u32")
+                            this_type = arena.get_u32();
+                        else if (parent_type == "u64")
+                            this_type = arena.get_u64();
+                        else if (parent_type == "boolean" || parent_type == "bool")
+                            this_type = arena.get_bool();
+                        else if (parent_type == "char")
+                            this_type = arena.get_char();
+                    }
                     if (this_type.is_valid())
                     {
                         ctx().variable_types_map()["this"] = this_type;
@@ -2785,6 +2814,35 @@ namespace Cryo::Codegen
                             if (!this_type.is_valid())
                             {
                                 this_type = ctx().symbols().lookup_enum_type(type_name);
+                            }
+                            // Fallback: check for primitive types (implement f32/f64/i32/etc. blocks)
+                            if (!this_type.is_valid())
+                            {
+                                TypeArena &arena = ctx().symbols().arena();
+                                if (type_name == "f32")
+                                    this_type = arena.get_f32();
+                                else if (type_name == "f64")
+                                    this_type = arena.get_f64();
+                                else if (type_name == "i8")
+                                    this_type = arena.get_i8();
+                                else if (type_name == "i16")
+                                    this_type = arena.get_i16();
+                                else if (type_name == "i32")
+                                    this_type = arena.get_i32();
+                                else if (type_name == "i64")
+                                    this_type = arena.get_i64();
+                                else if (type_name == "u8")
+                                    this_type = arena.get_u8();
+                                else if (type_name == "u16")
+                                    this_type = arena.get_u16();
+                                else if (type_name == "u32")
+                                    this_type = arena.get_u32();
+                                else if (type_name == "u64")
+                                    this_type = arena.get_u64();
+                                else if (type_name == "boolean" || type_name == "bool")
+                                    this_type = arena.get_bool();
+                                else if (type_name == "char")
+                                    this_type = arena.get_char();
                             }
                             if (this_type.is_valid())
                             {
