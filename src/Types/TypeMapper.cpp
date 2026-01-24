@@ -5,6 +5,7 @@
 
 #include "Types/TypeMapper.hpp"
 #include "Types/GenericRegistry.hpp"
+#include "Diagnostics/Diag.hpp"
 #include "Utils/Logger.hpp"
 
 #include <sstream>
@@ -197,8 +198,9 @@ namespace Cryo
         std::vector<llvm::Type *> params;
         params.reserve(param_types.size());
 
-        for (const auto &param : param_types)
+        for (size_t i = 0; i < param_types.size(); ++i)
         {
+            const auto &param = param_types[i];
             llvm::Type *mapped = map(param);
             if (mapped)
             {
@@ -206,7 +208,21 @@ namespace Cryo
             }
             else
             {
-                // Fallback to pointer for failed mappings
+                // Report error - parameter type mapping failed
+                std::string param_name = param.is_valid() ? param->display_name() : "<invalid>";
+                LOG_ERROR(LogComponent::CODEGEN,
+                          "TypeMapper::map_function: Failed to map parameter {} type '{}' - "
+                          "this indicates a type resolution issue that should be fixed",
+                          i, param_name);
+
+                diag_emitter().emit(
+                    Diag::error(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                                "failed to map function parameter " + std::to_string(i) +
+                                    " type '" + param_name + "'")
+                        .with_note("Using pointer type as fallback - this may cause incorrect code generation")
+                        .help("Ensure the parameter type is properly resolved before codegen"));
+
+                report_error("Failed to map parameter type: " + param_name);
                 params.push_back(ptr_type());
             }
         }
@@ -599,6 +615,7 @@ namespace Cryo
         name_stream << "tuple(";
 
         bool first = true;
+        size_t elem_index = 0;
         for (const auto &elem : type->elements())
         {
             llvm::Type *mapped = map(elem);
@@ -608,13 +625,29 @@ namespace Cryo
             }
             else
             {
-                fields.push_back(ptr_type()); // Fallback
+                // Report error - tuple element type mapping failed
+                std::string elem_name = elem.is_valid() ? elem->display_name() : "<invalid>";
+                LOG_ERROR(LogComponent::CODEGEN,
+                          "TypeMapper::map_tuple: Failed to map element {} type '{}' - "
+                          "this indicates a type resolution issue that should be fixed",
+                          elem_index, elem_name);
+
+                diag_emitter().emit(
+                    Diag::error(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                                "failed to map tuple element " + std::to_string(elem_index) +
+                                    " type '" + elem_name + "'")
+                        .with_note("Using pointer type as fallback - this may cause incorrect code generation")
+                        .help("Ensure the tuple element type is properly resolved before codegen"));
+
+                report_error("Failed to map tuple element type: " + elem_name);
+                fields.push_back(ptr_type());
             }
 
             if (!first)
                 name_stream << ",";
             first = false;
             name_stream << elem.get()->display_name();
+            ++elem_index;
         }
         name_stream << ")";
 
@@ -1006,7 +1039,27 @@ namespace Cryo
             }
         }
 
-        // Fallback: create opaque struct
+        // Report error - instantiated type could not be properly mapped
+        // This means the generic base type is neither an enum nor a struct,
+        // or the base type reference is invalid
+        std::string base_name = base.is_valid() ? base->display_name() : "<invalid base>";
+        std::string base_kind = base.is_valid() ? std::to_string(static_cast<int>(base->kind())) : "invalid";
+
+        LOG_ERROR(LogComponent::CODEGEN,
+                  "TypeMapper::map_instantiated: Failed to map instantiated type '{}' - "
+                  "base type '{}' (kind={}) is not a struct or enum. "
+                  "This indicates incomplete monomorphization or type registration.",
+                  name, base_name, base_kind);
+
+        diag_emitter().emit(
+            Diag::error(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                        "failed to map instantiated type '" + name + "'")
+                .with_note("Base type '" + base_name + "' could not be mapped to a concrete type")
+                .help("Ensure the generic type is properly monomorphized before codegen"));
+
+        report_error("Failed to map instantiated type: " + name);
+
+        // Return opaque struct to prevent crashes, but error is tracked
         llvm::StructType *st = existing ? existing : get_or_create_struct(name);
         return st;
     }
