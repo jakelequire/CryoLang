@@ -181,6 +181,14 @@ namespace Cryo::Codegen
         llvm::Value* generate_modf(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_erf(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_erfc(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_truncf(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_log10f(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_log2f(const std::vector<llvm::Value*>& args);
+
+        // Float conversion intrinsics
+        llvm::Value* generate_float_conversion(const std::vector<llvm::Value*>& args, bool f32_to_f64);
+        llvm::Value* generate_int_to_float(const std::vector<llvm::Value*>& args, int from_bits, bool is_signed, bool to_f32);
+        llvm::Value* generate_float_to_int(const std::vector<llvm::Value*>& args, bool from_f32, int to_bits, bool is_signed);
 
         // Network intrinsics
         llvm::Value* generate_socket(const std::vector<llvm::Value*>& args);
