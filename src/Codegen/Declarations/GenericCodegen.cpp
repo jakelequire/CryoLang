@@ -6,6 +6,8 @@
 #include "Types/GenericTypes.hpp"
 #include "Utils/Logger.hpp"
 
+#include <unordered_set>
+
 namespace Cryo::Codegen
 {
     //===================================================================
@@ -103,8 +105,8 @@ namespace Cryo::Codegen
             }
         }
 
-        // Begin type parameter scope
-        begin_type_params(type_params, type_args);
+        // Begin type parameter scope - pass generic_name and mangled for scope resolution
+        begin_type_params(type_params, type_args, generic_name, mangled);
 
         // Create struct type
         llvm::StructType *struct_type = llvm::StructType::create(llvm_ctx(), mangled);
@@ -397,8 +399,8 @@ namespace Cryo::Codegen
             }
         }
 
-        // Begin substitution scope
-        begin_type_params(type_params, type_args);
+        // Begin substitution scope - pass generic_name and mangled for scope resolution
+        begin_type_params(type_params, type_args, generic_name, mangled);
 
         // Create class struct
         llvm::StructType *class_type = llvm::StructType::create(llvm_ctx(), mangled);
@@ -640,28 +642,64 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Instantiating enum {} -> {}",
                   generic_name, mangled);
 
-        // Check cache
-        if (has_type_instantiation(mangled))
+        // Check if methods have already been generated for this instantiation
+        // We track this separately from type caching because the LLVM type may exist
+        // (created by TypeMapper::map_enum) but methods may not be generated yet
+        static std::unordered_set<std::string> generated_enum_methods;
+        if (generated_enum_methods.count(mangled))
         {
-            return get_cached_type(mangled);
-        }
-
-        // Check LLVM context for existing type
-        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
-        {
-            if (!existing->isOpaque())
+            // Type and methods already generated, return cached type
+            if (has_type_instantiation(mangled))
+            {
+                return get_cached_type(mangled);
+            }
+            // Methods generated but type not in our cache - get from LLVM context
+            if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
             {
                 _type_cache[mangled] = existing;
                 return existing;
             }
         }
 
-        // Get generic definition
+        // Check if LLVM type already exists (created by TypeMapper)
+        // If so, we still need to generate methods, but can reuse the type
+        llvm::Type *enum_type = nullptr;
+        bool type_already_exists = false;
+        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
+        {
+            if (!existing->isOpaque())
+            {
+                enum_type = existing;
+                type_already_exists = true;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Found existing LLVM type for enum {}, will generate methods",
+                          mangled);
+            }
+        }
+
+        // Get generic definition - first check local registry, then TemplateRegistry
         Cryo::ASTNode *generic_def = get_generic_type_def(generic_name);
         if (!generic_def)
         {
-            report_error(ErrorCode::E0632_TYPE_RESOLUTION_ERROR,
-                         "Unknown generic enum: " + generic_name);
+            // Try to get from TemplateRegistry (for cross-module enums)
+            Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+            if (template_registry)
+            {
+                const Cryo::TemplateRegistry::TemplateInfo *tmpl_info = template_registry->find_template(generic_name);
+                if (tmpl_info && tmpl_info->enum_template)
+                {
+                    generic_def = tmpl_info->enum_template;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Got enum template '{}' from TemplateRegistry",
+                              generic_name);
+                }
+            }
+        }
+        if (!generic_def)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Cannot find enum template '{}' in either GenericCodegen or TemplateRegistry",
+                      generic_name);
             return nullptr;
         }
 
@@ -679,21 +717,24 @@ namespace Cryo::Codegen
         }
 
         // Begin type parameter scope for substitution
-        begin_type_params(type_params, type_args);
+        // Pass generic_name and mangled name so scope resolutions like Option::None
+        // get redirected to Option_voidp::None
+        begin_type_params(type_params, type_args, generic_name, mangled);
 
         // Check if this is a simple enum (all variants are simple with no payloads)
         bool is_simple = enum_decl->is_simple_enum();
 
-        llvm::Type *enum_type = nullptr;
-
-        if (is_simple)
+        // Only create the type if it doesn't already exist
+        if (!type_already_exists)
         {
-            // Simple enums are just integers
-            enum_type = llvm::Type::getInt32Ty(llvm_ctx());
-        }
-        else
-        {
-            // Complex enums are tagged unions: { i32 discriminant, [payload_size x i8] }
+            if (is_simple)
+            {
+                // Simple enums are just integers
+                enum_type = llvm::Type::getInt32Ty(llvm_ctx());
+            }
+            else
+            {
+                // Complex enums are tagged unions: { i32 discriminant, [payload_size x i8] }
             // Calculate the maximum payload size by substituting type parameters
             size_t max_payload_size = 0;
 
@@ -755,17 +796,38 @@ namespace Cryo::Codegen
             enum_struct->setBody({discriminant_type, payload_type}, false);
             enum_type = enum_struct;
 
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "GenericCodegen: Created tagged union for enum '{}': payload size = {} bytes",
-                      mangled, max_payload_size);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Created tagged union for enum '{}': payload size = {} bytes",
+                          mangled, max_payload_size);
+            }
+        } // end if (!type_already_exists)
+
+        // Cache and register type (only if we created it or need to update cache)
+        if (enum_type)
+        {
+            _type_cache[mangled] = enum_type;
+            ctx().register_type(mangled, enum_type);
         }
 
-        // Cache and register type
-        _type_cache[mangled] = enum_type;
-        ctx().register_type(mangled, enum_type);
-
-        // Register type's namespace
-        std::string base_namespace = ctx().get_type_namespace(generic_name);
+        // Register type's namespace - first check TemplateRegistry (for cross-module enums),
+        // then fall back to local context
+        Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+        std::string base_namespace;
+        if (template_registry)
+        {
+            const Cryo::TemplateRegistry::TemplateInfo *tmpl_info = template_registry->find_template(generic_name);
+            if (tmpl_info && !tmpl_info->module_namespace.empty())
+            {
+                base_namespace = tmpl_info->module_namespace;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Got namespace '{}' from template registry for enum '{}'",
+                          base_namespace, generic_name);
+            }
+        }
+        if (base_namespace.empty())
+        {
+            base_namespace = ctx().get_type_namespace(generic_name);
+        }
         if (base_namespace.empty())
         {
             base_namespace = ctx().namespace_context();
@@ -824,7 +886,159 @@ namespace Cryo::Codegen
             index++;
         }
 
-        // End type parameter scope
+        // Generate methods for the instantiated enum from its implementation block
+        // This allows generic enums like Option<T> to have methods like is_some() and is_none()
+        // Note: template_registry was already obtained above for namespace lookup
+        if (template_registry && _declarations)
+        {
+            // Look up the impl block for this generic enum
+            Cryo::ImplementationBlockNode *impl_block = template_registry->get_enum_impl_block(generic_name);
+            if (impl_block)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Generating {} methods for instantiated enum {} (namespace: {})",
+                          impl_block->method_implementations().size(), mangled, base_namespace);
+
+                // Save parent context before generating methods
+                auto saved_fn_ctx = ctx().release_current_function();
+                llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
+                std::string saved_type_name = ctx().current_type_name();
+                std::string saved_namespace = ctx().namespace_context();
+
+                // Set namespace context to the template's defining namespace
+                // This ensures methods are registered with the correct fully-qualified name
+                if (!base_namespace.empty())
+                {
+                    ctx().set_namespace_context(base_namespace);
+                }
+
+                for (const auto &method : impl_block->method_implementations())
+                {
+                    if (!method)
+                        continue;
+
+                    // Generate method with the mangled enum name as parent type
+                    llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
+                    if (fn && method->body() && fn->empty())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "GenericCodegen: Generating enum method body: {}::{}",
+                                  mangled, method->name());
+
+                        // Create entry block
+                        llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+                        builder().SetInsertPoint(entry);
+
+                        // Set up function context
+                        auto fn_ctx = std::make_unique<FunctionContext>(fn, method.get());
+                        fn_ctx->entry_block = entry;
+                        ctx().set_current_function(std::move(fn_ctx));
+
+                        // Set current type name for this.field resolution
+                        ctx().set_current_type_name(mangled);
+
+                        // Enter function scope
+                        values().enter_scope(fn->getName().str());
+
+                        // Allocate parameters and register their types
+                        const auto &ast_params = method->parameters();
+                        unsigned param_idx = 0;
+                        for (auto &arg : fn->args())
+                        {
+                            std::string param_name = arg.getName().str();
+                            llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
+                            create_store(&arg, alloca);
+                            values().set_value(param_name, nullptr, alloca);
+
+                            // Register parameter type in variable_types_map for method resolution
+                            // Skip 'this' parameter (first param for instance methods)
+                            if (param_name == "this")
+                            {
+                                // 'this' is a pointer to the current type
+                                TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
+                                if (this_type.is_valid())
+                                {
+                                    TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
+                                    ctx().variable_types_map()[param_name] = this_ptr;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "GenericCodegen: Registered enum 'this' type: {}",
+                                              this_ptr->display_name());
+                                }
+                            }
+                            else if (param_idx < ast_params.size() + 1)
+                            {
+                                // Get AST parameter (accounting for implicit 'this')
+                                size_t ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
+                                if (ast_idx < ast_params.size())
+                                {
+                                    TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
+                                    // Apply type substitution (T -> i64, etc.)
+                                    TypeRef substituted = substitute_type_params(param_type);
+                                    if (substituted.is_valid())
+                                    {
+                                        ensure_dependent_types_instantiated(substituted);
+                                        ctx().variable_types_map()[param_name] = substituted;
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "GenericCodegen: Registered enum param '{}' type: {} -> {}",
+                                                  param_name,
+                                                  param_type.is_valid() ? param_type->display_name() : "null",
+                                                  substituted->display_name());
+                                    }
+                                }
+                            }
+                            param_idx++;
+                        }
+
+                        // Generate method body - type params are still active so T->i64 works
+                        CodegenVisitor *visitor = ctx().visitor();
+                        if (visitor && method->body())
+                        {
+                            method->body()->accept(*visitor);
+                        }
+
+                        // Add implicit return if needed
+                        llvm::BasicBlock *current_block = builder().GetInsertBlock();
+                        if (current_block && !current_block->getTerminator())
+                        {
+                            if (fn->getReturnType()->isVoidTy())
+                            {
+                                builder().CreateRetVoid();
+                            }
+                            else
+                            {
+                                builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+                            }
+                        }
+
+                        // Clean up method scope
+                        values().exit_scope();
+                        ctx().set_result(nullptr);
+                    }
+                }
+
+                // Restore parent context after generating all methods
+                if (saved_fn_ctx)
+                {
+                    ctx().set_current_function(std::move(saved_fn_ctx));
+                }
+                if (saved_insert_block)
+                {
+                    builder().SetInsertPoint(saved_insert_block);
+                }
+                ctx().set_current_type_name(saved_type_name);
+                ctx().set_namespace_context(saved_namespace);
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: No impl block found for enum {}", generic_name);
+            }
+        }
+
+        // Mark methods as generated for this instantiation
+        generated_enum_methods.insert(mangled);
+
+        // End type parameter scope AFTER methods are generated
         end_type_params();
 
         // Also register with unmangled name for lookup consistency
@@ -863,8 +1077,26 @@ namespace Cryo::Codegen
             return get_cached_type(mangled);
         }
 
-        // Try to instantiate
+        // Try to instantiate - first check local registry, then TemplateRegistry
         Cryo::ASTNode *def = get_generic_type_def(generic_name);
+        if (!def)
+        {
+            // Try to get from TemplateRegistry (for cross-module types)
+            Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+            if (template_registry)
+            {
+                const Cryo::TemplateRegistry::TemplateInfo *tmpl_info = template_registry->find_template(generic_name);
+                if (tmpl_info)
+                {
+                    if (tmpl_info->enum_template)
+                        def = tmpl_info->enum_template;
+                    else if (tmpl_info->struct_template)
+                        def = tmpl_info->struct_template;
+                    else if (tmpl_info->class_template)
+                        def = tmpl_info->class_template;
+                }
+            }
+        }
         if (!def)
         {
             return nullptr;
@@ -1012,9 +1244,13 @@ namespace Cryo::Codegen
     //===================================================================
 
     void GenericCodegen::begin_type_params(const std::vector<std::string> &params,
-                                             const std::vector<TypeRef> &args)
+                                             const std::vector<TypeRef> &args,
+                                             const std::string &generic_base,
+                                             const std::string &instantiated_name)
     {
         TypeParamScope scope;
+        scope.generic_base = generic_base;
+        scope.instantiated_name = instantiated_name;
 
         size_t count = std::min(params.size(), args.size());
         for (size_t i = 0; i < count; ++i)
@@ -1024,12 +1260,32 @@ namespace Cryo::Codegen
                       params[i], args[i] ? args[i].get()->display_name() : "null");
         }
 
+        if (!generic_base.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Scope resolution mapping: {} -> {}",
+                      generic_base, instantiated_name);
+        }
+
         _type_param_stack.push_back(std::move(scope));
 
         // Set the type parameter resolver on TypeMapper so type lookups can resolve T, E, etc.
         types().set_type_param_resolver([this](const std::string &name) -> TypeRef {
             return this->resolve_type_param(name);
         });
+    }
+
+    std::string GenericCodegen::get_instantiated_scope_name(const std::string &generic_base) const
+    {
+        // Search from innermost to outermost scope
+        for (auto it = _type_param_stack.rbegin(); it != _type_param_stack.rend(); ++it)
+        {
+            if (it->generic_base == generic_base && !it->instantiated_name.empty())
+            {
+                return it->instantiated_name;
+            }
+        }
+        return "";
     }
 
     void GenericCodegen::end_type_params()

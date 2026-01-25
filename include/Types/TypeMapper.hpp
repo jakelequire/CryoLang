@@ -192,6 +192,7 @@ namespace Cryo
         // ====================================================================
 
         llvm::Type *void_type();
+        llvm::StructType *unit_type();
         llvm::IntegerType *bool_type();
         llvm::IntegerType *char_type();
         llvm::IntegerType *i8_type();
@@ -328,6 +329,7 @@ namespace Cryo
         // ====================================================================
 
         llvm::Type *map_void(const VoidType *type);
+        llvm::Type *map_unit(const UnitType *type);
         llvm::Type *map_bool(const BoolType *type);
         llvm::Type *map_int(const IntType *type);
         llvm::Type *map_float(const FloatType *type);

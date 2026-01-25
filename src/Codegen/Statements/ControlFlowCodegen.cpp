@@ -1211,15 +1211,17 @@ namespace Cryo::Codegen
                 // Cast return value to match function return type if needed
                 if (expected_ret_type && ret_val->getType() != expected_ret_type)
                 {
-                    // Special case: if function expects void but we have a struct, just return void
-                    if (expected_ret_type->isVoidTy() && ret_val->getType()->isStructTy())
+                    // Special case: if function expects void but we have a value, just return void
+                    // This handles cases like Result<void>::unwrap() where the return type becomes void
+                    // but the method body still tries to return the value
+                    if (expected_ret_type->isVoidTy())
                     {
-                        LOG_WARN(Cryo::LogComponent::CODEGEN,
-                                "Return type mismatch: expected void but got struct. Using void return.");
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                "Return type is void but expression produced a value. Using void return.");
                         builder().CreateRetVoid();
                         return;
                     }
-                    
+
                     // Special case: if function expects struct but we have void, create null value
                     if (expected_ret_type->isStructTy() && ret_val->getType()->isVoidTy())
                     {
@@ -1227,15 +1229,22 @@ namespace Cryo::Codegen
                                 "Return type mismatch: expected struct but got void. Using null struct.");
                         ret_val = llvm::Constant::getNullValue(expected_ret_type);
                     }
+                    // Special case: if function expects struct but we have a pointer, load the struct
+                    else if (expected_ret_type->isStructTy() && ret_val->getType()->isPointerTy())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                 "Return value is pointer but function expects struct by value. Loading struct.");
+                        ret_val = builder().CreateLoad(expected_ret_type, ret_val, "ret.load");
+                    }
                     else
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                  "Return type mismatch: expected {}, got {}. Attempting cast.",
                                  expected_ret_type->isVoidTy() ? "void" : "non-void",
                                  ret_val->getType()->isStructTy() ? "struct" : "non-struct");
-                        
+
                         ret_val = cast_if_needed(ret_val, expected_ret_type);
-                        
+
                         // If cast failed and returned null, use a default value instead
                         if (!ret_val)
                         {

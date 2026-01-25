@@ -319,6 +319,9 @@ namespace Cryo::Codegen
         /** @brief Get namespace context */
         const std::string &namespace_context() const { return _namespace_context; }
 
+        /** @brief Set namespace context (for cross-module method generation) */
+        void set_namespace_context(const std::string &ns) { _namespace_context = ns; }
+
         /** @brief Get current type being processed (for methods) */
         const std::string &current_type_name() const { return _current_type_name; }
 

@@ -146,6 +146,17 @@ namespace Cryo::Codegen
          */
         std::string build_constructor_name(const std::string &type_name);
 
+        /**
+         * @brief Convert a generic type display name to its mangled form
+         *
+         * Converts names like "Array<u64>" to "Array_u64" to match how
+         * generic type methods are named during monomorphization.
+         *
+         * @param display_name Type name in display format (e.g., "Array<u64>")
+         * @return Mangled name (e.g., "Array_u64"), or original if not generic
+         */
+        std::string mangle_generic_type_name(const std::string &display_name);
+
         //===================================================================
         // Common Memory Operations
         //===================================================================

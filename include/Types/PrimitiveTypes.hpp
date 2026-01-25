@@ -38,6 +38,32 @@ namespace Cryo
     };
 
     /**************************************************************************
+     * @brief Unit type - the type with exactly one value: ()
+     *
+     * Similar to Rust's () type. Unlike void (which means "no return value"),
+     * unit is a real type that can be:
+     * - Passed as a parameter
+     * - Stored in variables
+     * - Used as a type argument (e.g., Result<(), Error>)
+     *
+     * In LLVM, this is represented as an empty struct {} (zero-sized type).
+     **************************************************************************/
+    class UnitType : public Type
+    {
+    public:
+        explicit UnitType(TypeID id) : Type(id, TypeKind::Unit) {}
+
+        bool is_primitive() const override { return true; }
+
+        // Unit type is zero-sized
+        size_t size_bytes() const override { return 0; }
+        size_t alignment() const override { return 1; }
+
+        std::string display_name() const override { return "()"; }
+        std::string mangled_name() const override { return "unit"; }
+    };
+
+    /**************************************************************************
      * @brief Boolean type - true/false
      **************************************************************************/
     class BoolType : public Type

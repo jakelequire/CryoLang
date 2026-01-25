@@ -1620,13 +1620,28 @@ namespace Cryo
                     // Extract base type name (remove generics like "Option<T>" -> "Option")
                     std::string base_type_name = type_name;
                     size_t generic_start = type_name.find('<');
-                    if (generic_start != std::string::npos)
+                    bool is_generic = (generic_start != std::string::npos);
+                    if (is_generic)
                     {
                         base_type_name = type_name.substr(0, generic_start);
                     }
 
                     std::string qualified_type = module_name.empty() ? base_type_name : module_name + "::" + base_type_name;
                     LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing impl block for type: {} (qualified: {})", type_name, qualified_type);
+
+                    // If this is an impl block for a generic type, check if it's for an enum template
+                    // and register the impl block for use during monomorphization
+                    if (is_generic)
+                    {
+                        const TemplateRegistry::TemplateInfo *tmpl_info = _template_registry.find_template(base_type_name);
+                        if (tmpl_info && tmpl_info->enum_template)
+                        {
+                            _template_registry.register_enum_impl_block(base_type_name, impl_block, module_name);
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                      "ModuleLoader: Registered enum impl block for '{}' (base: {}) with {} methods",
+                                      type_name, base_type_name, impl_block->method_implementations().size());
+                        }
+                    }
 
                     for (const auto &method : impl_block->method_implementations())
                     {
