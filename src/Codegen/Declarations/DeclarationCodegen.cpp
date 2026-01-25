@@ -2542,10 +2542,25 @@ namespace Cryo::Codegen
                     }
                     if (this_type.is_valid())
                     {
-                        ctx().variable_types_map()["this"] = this_type;
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "Registered 'this' type for struct method: {} -> {}",
-                                  parent_type, this_type->display_name());
+                        // For primitive implement blocks, 'this' is passed by reference (&this),
+                        // so we need to store the reference type, not the primitive directly.
+                        // This allows the auto-dereference logic in ExpressionCodegen to work correctly.
+                        if (this_type->is_primitive())
+                        {
+                            TypeArena &type_arena = ctx().symbols().arena();
+                            TypeRef ref_type = type_arena.get_reference_to(this_type);
+                            ctx().variable_types_map()["this"] = ref_type;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Registered 'this' reference type for primitive implement block: {} -> {}",
+                                      parent_type, ref_type->display_name());
+                        }
+                        else
+                        {
+                            ctx().variable_types_map()["this"] = this_type;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Registered 'this' type for struct method: {} -> {}",
+                                      parent_type, this_type->display_name());
+                        }
                     }
                 }
             }
@@ -2846,10 +2861,25 @@ namespace Cryo::Codegen
                             }
                             if (this_type.is_valid())
                             {
-                                ctx().variable_types_map()["this"] = this_type;
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "Registered 'this' type for method: {} -> {}",
-                                          type_name, this_type->display_name());
+                                // For primitive implement blocks, 'this' is passed by reference (&this),
+                                // so we need to store the reference type, not the primitive directly.
+                                // This allows the auto-dereference logic in ExpressionCodegen to work correctly.
+                                if (this_type->is_primitive())
+                                {
+                                    TypeArena &arena = ctx().symbols().arena();
+                                    TypeRef ref_type = arena.get_reference_to(this_type);
+                                    ctx().variable_types_map()["this"] = ref_type;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Registered 'this' reference type for primitive implement block: {} -> {}",
+                                              type_name, ref_type->display_name());
+                                }
+                                else
+                                {
+                                    ctx().variable_types_map()["this"] = this_type;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Registered 'this' type for method: {} -> {}",
+                                              type_name, this_type->display_name());
+                                }
                             }
                         }
                     }
