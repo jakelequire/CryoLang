@@ -7124,10 +7124,11 @@ namespace Cryo
             // Extract the content inside parentheses
             std::string inner = type_str.substr(1, type_str.size() - 2);
 
-            // If inner is empty, this is unit/void type ()
+            // If inner is empty, this is the unit type ()
+            // The unit type is distinct from void - it's a real type that can be passed/stored
             if (inner.empty())
             {
-                return _context.types().get_void();
+                return _context.types().get_unit();
             }
 
             // Parse comma-separated types
