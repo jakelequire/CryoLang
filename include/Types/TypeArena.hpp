@@ -32,6 +32,7 @@ namespace Cryo
 {
     // Forward declarations for type classes
     class VoidType;
+    class UnitType;
     class BoolType;
     class IntType;
     class FloatType;
@@ -94,6 +95,7 @@ namespace Cryo
         struct PrimitiveCache
         {
             TypeRef void_type;
+            TypeRef unit_type;
             TypeRef bool_type;
             TypeRef char_type;
             TypeRef string_type;
@@ -242,6 +244,7 @@ namespace Cryo
         // ====================================================================
 
         TypeRef get_void();
+        TypeRef get_unit();
         TypeRef get_bool();
         TypeRef get_char();
         TypeRef get_string();

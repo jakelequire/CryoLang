@@ -118,6 +118,13 @@ namespace Cryo
             _primitives.void_type = register_type(std::move(type));
         }
 
+        // Unit - the () type, distinct from void
+        {
+            TypeID id = allocate_id();
+            auto type = std::make_unique<UnitType>(id);
+            _primitives.unit_type = register_type(std::move(type));
+        }
+
         // Bool
         {
             TypeID id = allocate_id();
@@ -220,6 +227,7 @@ namespace Cryo
     // ========================================================================
 
     TypeRef TypeArena::get_void() { return _primitives.void_type; }
+    TypeRef TypeArena::get_unit() { return _primitives.unit_type; }
     TypeRef TypeArena::get_bool() { return _primitives.bool_type; }
     TypeRef TypeArena::get_char() { return _primitives.char_type; }
     TypeRef TypeArena::get_string() { return _primitives.string_type; }
@@ -1009,6 +1017,8 @@ namespace Cryo
         {
         case TypeKind::Void:
             return get_void();
+        case TypeKind::Unit:
+            return get_unit();
         case TypeKind::Bool:
             return get_bool();
         case TypeKind::Char:

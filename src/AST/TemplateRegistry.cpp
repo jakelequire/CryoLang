@@ -520,4 +520,73 @@ namespace Cryo
         }
         return {false, false}; // Not found
     }
+
+    //===================================================================
+    // Enum Implementation Block Registry Implementation
+    //===================================================================
+
+    void TemplateRegistry::register_enum_impl_block(const std::string &base_enum_name,
+                                                    ImplementationBlockNode *impl_block,
+                                                    const std::string &module_namespace)
+    {
+        if (base_enum_name.empty() || !impl_block)
+            return;
+
+        _enum_impl_blocks[base_enum_name] = impl_block;
+        LOG_DEBUG(Cryo::LogComponent::AST,
+                  "Registered enum impl block: {} (namespace: {}, methods: {})",
+                  base_enum_name, module_namespace, impl_block->method_implementations().size());
+
+        // Also extract and store method metadata for cross-module access
+        TemplateMethodInfo method_info;
+        method_info.module_namespace = module_namespace;
+
+        for (const auto &method : impl_block->method_implementations())
+        {
+            if (!method)
+                continue;
+
+            MethodMetadata mm;
+            mm.name = method->name();
+            mm.return_type_annotation = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "void";
+            mm.is_static = method->is_static();
+
+            // Extract parameter info
+            const auto &params = method->parameters();
+            for (const auto &param : params)
+            {
+                if (param)
+                {
+                    mm.parameter_names.push_back(param->name());
+                    mm.parameter_type_annotations.push_back(param->type_annotation() ? param->type_annotation()->to_string() : "unknown");
+                }
+            }
+
+            method_info.methods.push_back(std::move(mm));
+            LOG_TRACE(Cryo::LogComponent::AST, "Extracted enum method metadata: {}::{} -> {}",
+                      base_enum_name, mm.name, mm.return_type_annotation);
+        }
+
+        _template_method_info[base_enum_name] = std::move(method_info);
+        LOG_DEBUG(Cryo::LogComponent::AST, "Stored {} method(s) metadata for enum template '{}'",
+                  _template_method_info[base_enum_name].methods.size(), base_enum_name);
+    }
+
+    ImplementationBlockNode *TemplateRegistry::get_enum_impl_block(const std::string &base_enum_name) const
+    {
+        auto it = _enum_impl_blocks.find(base_enum_name);
+        if (it != _enum_impl_blocks.end())
+        {
+            LOG_TRACE(Cryo::LogComponent::AST,
+                      "Found enum impl block: {} with {} methods",
+                      base_enum_name, it->second->method_implementations().size());
+            return it->second;
+        }
+        return nullptr;
+    }
+
+    bool TemplateRegistry::has_enum_impl_block(const std::string &base_enum_name) const
+    {
+        return _enum_impl_blocks.find(base_enum_name) != _enum_impl_blocks.end();
+    }
 }

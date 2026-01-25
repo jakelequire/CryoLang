@@ -156,7 +156,7 @@ namespace Cryo::Codegen
         // Try using registered type namespace from CodegenContext
         // This handles cross-module types like Option, Result, Array, etc.
         {
-            // Extract base type name for parameterized types (e.g., "Option" from "Option<i64>")
+            // Extract base type name for namespace lookup (e.g., "Option" from "Option<i64>")
             std::string base_type = type_name;
             size_t angle_pos = type_name.find('<');
             if (angle_pos != std::string::npos)
@@ -164,11 +164,24 @@ namespace Cryo::Codegen
                 base_type = type_name.substr(0, angle_pos);
             }
 
+            // Convert display name to mangled name for method lookup
+            // e.g., "Array<u64>" -> "Array_u64"
+            std::string mangled_type = mangle_generic_type_name(type_name);
+
+            // Try namespace lookup with base type first
             std::string type_namespace = ctx().get_type_namespace(base_type);
+
+            // Also try with mangled name if base type lookup fails
+            if (type_namespace.empty())
+            {
+                type_namespace = ctx().get_type_namespace(mangled_type);
+            }
+
             if (!type_namespace.empty())
             {
-                // Try fully qualified method name: namespace::Type::method
-                std::string qualified_method = type_namespace + "::" + base_type + "::" + method_name;
+                // Try fully qualified method name with MANGLED type name: namespace::MangledType::method
+                // e.g., "std::collections::array::Array_u64::push"
+                std::string qualified_method = type_namespace + "::" + mangled_type + "::" + method_name;
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "resolve_method_by_name: Trying type namespace lookup '{}'", qualified_method);
 
@@ -231,46 +244,16 @@ namespace Cryo::Codegen
                       "resolve_method_by_name: Primitive method '{}' not found", simple_method);
         }
 
-        // Pattern-based method lookup: scan module for functions matching *::BaseType::method
-        // NOTE: We no longer recursively call resolve_method_by_name with the base type,
-        // as that would strip the type arguments (e.g., "String" from "Array<String>")
-        // and create extern declarations with wrong return types for generic methods.
-        // The pattern-based lookup below already handles the base type extraction.
+        // Pattern-based method lookup: scan module for functions matching *::MangledType::method
         // This handles cross-module cases where we don't have the namespace info
         {
-            std::string base_type = type_name;
-            size_t angle_pos = type_name.find('<');
-            if (angle_pos != std::string::npos)
-            {
-                base_type = type_name.substr(0, angle_pos);
-            }
-            else
-            {
-                // Handle mangled type names like "Option_i64" -> "Option"
-                // Try to find a template that matches a prefix of the mangled name
-                Cryo::TemplateRegistry *template_registry = ctx().template_registry();
-                if (template_registry)
-                {
-                    size_t underscore_pos = type_name.find('_');
-                    while (underscore_pos != std::string::npos)
-                    {
-                        std::string prefix = type_name.substr(0, underscore_pos);
-                        const Cryo::TemplateRegistry::TemplateInfo *template_info = template_registry->find_template(prefix);
-                        if (template_info)
-                        {
-                            base_type = prefix;
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "resolve_method_by_name: Extracted base type '{}' from mangled name '{}'",
-                                      base_type, type_name);
-                            break;
-                        }
-                        underscore_pos = type_name.find('_', underscore_pos + 1);
-                    }
-                }
-            }
+            // Convert display name to mangled name for pattern matching
+            // e.g., "Array<u64>" -> "Array_u64"
+            std::string mangled_type = mangle_generic_type_name(type_name);
 
-            // Build pattern suffix: "::BaseType::method"
-            std::string pattern_suffix = "::" + base_type + "::" + method_name;
+            // Build pattern suffix using mangled type name: "::MangledType::method"
+            // e.g., "::Array_u64::push" instead of "::Array::push"
+            std::string pattern_suffix = "::" + mangled_type + "::" + method_name;
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "resolve_method_by_name: Scanning module for pattern '*{}'", pattern_suffix);
@@ -321,9 +304,13 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Convert display name to mangled name for method lookup
+            // e.g., "Array<u64>" -> "Array_u64"
+            std::string mangled_type = mangle_generic_type_name(type_name);
+
             // Try to get namespace from TemplateRegistry (dynamic lookup)
             std::string type_namespace;
-            std::string simple_type_name = base_type; // The type name without namespace
+            std::string simple_type_name = base_type; // The type name without namespace (for template lookup)
             Cryo::TemplateRegistry *template_registry = ctx().template_registry();
 
             // Handle mangled type names like "Option_i64" -> "Option"
@@ -394,10 +381,17 @@ namespace Cryo::Codegen
                 type_namespace = ctx().get_type_namespace(base_type);
             }
 
+            // Also try with mangled type name for namespace lookup
+            if (type_namespace.empty())
+            {
+                type_namespace = ctx().get_type_namespace(mangled_type);
+            }
+
             if (!type_namespace.empty())
             {
-                // Use simple_type_name (without namespace) when building the full method name
-                std::string full_method_name = type_namespace + "::" + simple_type_name + "::" + method_name;
+                // Use MANGLED type name (not simple_type_name) when building the full method name
+                // e.g., "std::collections::array::Array_u64::push" instead of "std::collections::array::Array::push"
+                std::string full_method_name = type_namespace + "::" + mangled_type + "::" + method_name;
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "resolve_method_by_name: Trying dynamically resolved method '{}'", full_method_name);
 
@@ -435,6 +429,22 @@ namespace Cryo::Codegen
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "resolve_method_by_name: Got is_static={} from registry for '{}'",
                                   is_static_method, full_method_name);
+                    }
+
+                    // Fallback: try with template name if instantiated name not found
+                    // e.g., try "Option::is_some" if "Option_i64::is_some" not found
+                    if (!found && simple_type_name != mangled_type)
+                    {
+                        std::string template_method_name = type_namespace + "::" + simple_type_name + "::" + method_name;
+                        auto [is_static_tmpl, found_tmpl] = template_registry->get_method_is_static(template_method_name);
+                        if (found_tmpl)
+                        {
+                            is_static_method = is_static_tmpl;
+                            found_is_static = true;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_method_by_name: Got is_static={} from template registry for '{}'",
+                                      is_static_method, template_method_name);
+                        }
                     }
                 }
 
@@ -829,6 +839,20 @@ namespace Cryo::Codegen
                         cryo_return_type = template_registry->get_method_return_type(full_method_name);
                     }
 
+                    // Fallback: try with template name if instantiated name not found
+                    // e.g., try "Option::is_some" if "Option_i64::is_some" not found
+                    if (!cryo_return_type && template_registry && simple_type_name != mangled_type)
+                    {
+                        std::string template_method_name = type_namespace + "::" + simple_type_name + "::" + method_name;
+                        cryo_return_type = template_registry->get_method_return_type(template_method_name);
+                        if (cryo_return_type)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_method_by_name: Got return type from template method registry for '{}': {}",
+                                      template_method_name, cryo_return_type->display_name());
+                        }
+                    }
+
                     if (cryo_return_type)
                     {
                         return_type = types().get_type(cryo_return_type);
@@ -845,6 +869,18 @@ namespace Cryo::Codegen
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "resolve_method_by_name: Annotation lookup for '{}': '{}'",
                               full_method_name, return_type_annotation.empty() ? "<not found>" : return_type_annotation);
+
+                    // If not found with instantiated name (e.g., Option_i64::is_some),
+                    // try with template name (e.g., Option::is_some) since annotations
+                    // are registered with the base template name
+                    if (return_type_annotation.empty() && simple_type_name != mangled_type)
+                    {
+                        std::string template_method_name = type_namespace + "::" + simple_type_name + "::" + method_name;
+                        return_type_annotation = template_registry->get_method_return_type_annotation(template_method_name);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_method_by_name: Fallback annotation lookup for '{}': '{}'",
+                                  template_method_name, return_type_annotation.empty() ? "<not found>" : return_type_annotation);
+                    }
                     if (!return_type_annotation.empty() && return_type_annotation != "void")
                     {
                         // Substitute generic parameters in the annotation if we have type arguments
@@ -1381,6 +1417,15 @@ namespace Cryo::Codegen
             return value;
         }
 
+        // Pointer to struct: load the struct from the pointer
+        // This handles cases where we have a pointer to a struct but need the struct by value
+        if (source_type->isPointerTy() && target_type->isStructTy())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                     "cast_if_needed: Loading struct from pointer");
+            return b.CreateLoad(target_type, value, "struct.load");
+        }
+
         // Boolean to integer (extend i1 to larger integer)
         if (source_type->isIntegerTy(1) && target_type->isIntegerTy())
         {
@@ -1441,6 +1486,106 @@ namespace Cryo::Codegen
     llvm::Value *ICodegenComponent::get_result()
     {
         return _ctx.get_result();
+    }
+
+    //===================================================================
+    // Generic Type Name Mangling
+    //===================================================================
+
+    std::string ICodegenComponent::mangle_generic_type_name(const std::string &display_name)
+    {
+        // Check if this is a generic type with angle brackets (e.g., "Array<u64>")
+        size_t angle_pos = display_name.find('<');
+        if (angle_pos == std::string::npos)
+        {
+            // Not a generic type in display format, return as-is
+            return display_name;
+        }
+
+        // Extract base name and type arguments
+        std::string base_name = display_name.substr(0, angle_pos);
+
+        // Find matching closing bracket
+        size_t close_pos = display_name.rfind('>');
+        if (close_pos == std::string::npos || close_pos <= angle_pos)
+        {
+            return display_name;
+        }
+
+        // Extract type arguments string (e.g., "u64" from "Array<u64>")
+        std::string args_str = display_name.substr(angle_pos + 1, close_pos - angle_pos - 1);
+
+        // Build mangled name: base_arg1_arg2_...
+        std::string mangled = base_name + "_";
+
+        // Parse type arguments (handle nested generics and multiple args)
+        std::string current_arg;
+        int depth = 0;
+        for (size_t i = 0; i < args_str.size(); ++i)
+        {
+            char c = args_str[i];
+            if (c == '<')
+            {
+                depth++;
+                current_arg += '_';  // Replace < with _
+            }
+            else if (c == '>')
+            {
+                depth--;
+                current_arg += '_';  // Replace > with _
+            }
+            else if (c == ',' && depth == 0)
+            {
+                // Argument separator at top level
+                // Trim whitespace from current_arg
+                size_t start = current_arg.find_first_not_of(" \t");
+                size_t end = current_arg.find_last_not_of(" \t");
+                if (start != std::string::npos)
+                {
+                    mangled += current_arg.substr(start, end - start + 1);
+                }
+                mangled += "_";
+                current_arg.clear();
+            }
+            else if (c == ' ')
+            {
+                // Skip spaces, they become _ separators if at boundaries
+                if (!current_arg.empty() && current_arg.back() != '_')
+                {
+                    current_arg += '_';
+                }
+            }
+            else if (c == '*')
+            {
+                current_arg += 'p';  // Pointer marker
+            }
+            else
+            {
+                current_arg += c;
+            }
+        }
+
+        // Add final argument
+        if (!current_arg.empty())
+        {
+            size_t start = current_arg.find_first_not_of(" \t_");
+            size_t end = current_arg.find_last_not_of(" \t_");
+            if (start != std::string::npos)
+            {
+                mangled += current_arg.substr(start, end - start + 1);
+            }
+        }
+
+        // Remove trailing underscores
+        while (!mangled.empty() && mangled.back() == '_')
+        {
+            mangled.pop_back();
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "mangle_generic_type_name: '{}' -> '{}'", display_name, mangled);
+
+        return mangled;
     }
 
 } // namespace Cryo::Codegen

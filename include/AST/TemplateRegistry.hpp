@@ -115,6 +115,11 @@ namespace Cryo
         // Used for cross-module extern declarations to know whether to add 'this' parameter
         std::unordered_map<std::string, bool> _method_is_static;
 
+        // Enum implementation blocks: base enum name -> impl block
+        // Stores references to implementation blocks for generic enums
+        // Used to generate methods during enum instantiation
+        std::unordered_map<std::string, ImplementationBlockNode *> _enum_impl_blocks;
+
     public:
         TemplateRegistry() = default;
         ~TemplateRegistry() = default;
@@ -308,5 +313,36 @@ namespace Cryo
          * @return true if registered
          */
         bool has_template_method_info(const std::string &template_name) const;
+
+        //===================================================================
+        // Enum Implementation Block Registry (for generic enum instantiation)
+        //===================================================================
+
+        /**
+         * @brief Register an implementation block for a generic enum
+         * @param base_enum_name Base name of the generic enum (e.g., "Option", "Result")
+         * @param impl_block Pointer to the implementation block node
+         * @param module_namespace Namespace where the impl block is defined
+         *
+         * This allows the monomorphizer to find and generate methods when
+         * instantiating generic enums like Option<i64>.
+         */
+        void register_enum_impl_block(const std::string &base_enum_name,
+                                      ImplementationBlockNode *impl_block,
+                                      const std::string &module_namespace);
+
+        /**
+         * @brief Get the implementation block for a generic enum
+         * @param base_enum_name Base name of the generic enum
+         * @return Pointer to ImplementationBlockNode, or nullptr if not registered
+         */
+        ImplementationBlockNode *get_enum_impl_block(const std::string &base_enum_name) const;
+
+        /**
+         * @brief Check if an implementation block is registered for a generic enum
+         * @param base_enum_name Base name of the generic enum
+         * @return true if registered
+         */
+        bool has_enum_impl_block(const std::string &base_enum_name) const;
     };
 }

@@ -24,7 +24,8 @@ namespace Cryo
         // ====================================================================
         // Primitive Types
         // ====================================================================
-        Void,   // void - no value
+        Void,   // void - no return value (only valid as function return type)
+        Unit,   // () - unit type, a type with exactly one value
         Bool,   // boolean - true/false
         Int,    // integer types (i8, i16, i32, i64, i128, u8, u16, u32, u64, u128)
         Float,  // floating point types (f32, f64)
@@ -109,6 +110,8 @@ namespace Cryo
         {
         case TypeKind::Void:
             return "Void";
+        case TypeKind::Unit:
+            return "Unit";
         case TypeKind::Bool:
             return "Bool";
         case TypeKind::Int:

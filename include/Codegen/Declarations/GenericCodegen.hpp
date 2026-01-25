@@ -126,9 +126,16 @@ namespace Cryo::Codegen
          * @brief Begin type parameter scope
          * @param params Type parameter names
          * @param args Corresponding type arguments
+         * @param generic_base Optional: the generic base name (e.g., "Option")
+         * @param instantiated_name Optional: the instantiated name (e.g., "Option_voidp")
+         *
+         * When generic_base and instantiated_name are provided, scope resolutions
+         * like "Option::None" will be redirected to "Option_voidp::None".
          */
         void begin_type_params(const std::vector<std::string> &params,
-                                const std::vector<TypeRef> &args);
+                                const std::vector<TypeRef> &args,
+                                const std::string &generic_base = "",
+                                const std::string &instantiated_name = "");
 
         /**
          * @brief End type parameter scope
@@ -170,6 +177,30 @@ namespace Cryo::Codegen
          */
         std::string mangle_function_name(const std::string &generic_name,
                                           const std::vector<TypeRef> &type_args);
+
+        //===================================================================
+        // Generic Scope Resolution Support
+        //===================================================================
+
+        /**
+         * @brief Get the instantiated name for a generic base name
+         *
+         * When inside a type parameter substitution scope (during method body
+         * generation), this returns the instantiated name for scope resolution.
+         * For example, if we're generating code for Option<void*>, and the AST
+         * contains "Option::None", this will return "Option_voidp" so we can
+         * look for "Option_voidp::None".
+         *
+         * @param generic_base The generic base name (e.g., "Option")
+         * @return The instantiated name (e.g., "Option_voidp"), or empty string if not in scope
+         */
+        std::string get_instantiated_scope_name(const std::string &generic_base) const;
+
+        /**
+         * @brief Check if currently inside a type parameter substitution scope
+         * @return true if inside a generic instantiation context
+         */
+        bool in_type_param_scope() const { return !_type_param_stack.empty(); }
 
         //===================================================================
         // Instantiation Cache
@@ -252,7 +283,9 @@ namespace Cryo::Codegen
 
         struct TypeParamScope
         {
-            std::unordered_map<std::string, TypeRef> bindings;
+            std::unordered_map<std::string, TypeRef> bindings;  // T -> void*
+            std::string generic_base;      // e.g., "Option" - the template name
+            std::string instantiated_name; // e.g., "Option_voidp" - the monomorphized name
         };
         std::vector<TypeParamScope> _type_param_stack;
 

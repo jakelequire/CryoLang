@@ -1697,6 +1697,56 @@ namespace Cryo
                 }
             }
         }
+        // Handle implementation blocks to register enum impl blocks for monomorphization
+        else if (auto impl_block = dynamic_cast<ImplementationBlockNode *>(node))
+        {
+            std::string type_name = impl_block->target_type();
+            // Extract base type name (remove generics like "Option<T>" -> "Option")
+            std::string base_type_name = type_name;
+            size_t generic_start = type_name.find('<');
+            bool is_generic = (generic_start != std::string::npos);
+            if (is_generic)
+            {
+                base_type_name = type_name.substr(0, generic_start);
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pass 1: Processing impl block for type: {} (base: {})", type_name, base_type_name);
+
+            // If this is an impl block for a generic enum, register it for monomorphization
+            if (is_generic && _template_registry)
+            {
+                const TemplateRegistry::TemplateInfo *tmpl_info = _template_registry->find_template(base_type_name);
+                if (tmpl_info && tmpl_info->enum_template)
+                {
+                    _template_registry->register_enum_impl_block(base_type_name, impl_block, _current_namespace);
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                              "Pass 1: Registered enum impl block for '{}' (base: {}) with {} methods",
+                              type_name, base_type_name, impl_block->method_implementations().size());
+                }
+            }
+
+            // Also register method return type annotations for cross-module lookups
+            std::string qualified_type = _current_namespace.empty() ? base_type_name : _current_namespace + "::" + base_type_name;
+            for (const auto &method : impl_block->method_implementations())
+            {
+                if (method && _template_registry)
+                {
+                    std::string return_type_str = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "void";
+                    std::string qualified_method_name = qualified_type + "::" + method->name();
+
+                    if (!return_type_str.empty() && return_type_str != "void")
+                    {
+                        _template_registry->register_method_return_type_annotation(qualified_method_name, return_type_str);
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                  "Pass 1: Registered method return type annotation: {} -> {}",
+                                  qualified_method_name, return_type_str);
+                    }
+
+                    // Register is_static flag
+                    _template_registry->register_method_is_static(qualified_method_name, method->is_static());
+                }
+            }
+        }
         // Handle global constants in first pass to prevent early reference issues
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {

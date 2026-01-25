@@ -377,9 +377,11 @@ namespace Cryo::Codegen
 
         case TokenKind::TK_KW_VOID:
         {
-            // Void/unit literal () - return a void type (represented as empty struct or i8 zero)
-            // In LLVM, void cannot be used as a value, so we use an empty struct or i8
-            return llvm::Constant::getNullValue(llvm::Type::getInt8Ty(llvm_ctx()));
+            // Unit literal () - return the unit type value (empty struct)
+            // This is distinct from void which means "no return value"
+            // The unit type can be passed as a value, stored, and used as a type argument
+            llvm::StructType *unit_ty = types().unit_type();
+            return llvm::ConstantStruct::get(unit_ty, {});
         }
 
         default:
@@ -2790,8 +2792,9 @@ namespace Cryo::Codegen
         const auto &elements = node->elements();
         if (elements.empty())
         {
-            // Empty tuple - return void/unit value
-            return llvm::Constant::getNullValue(llvm::Type::getInt8Ty(llvm_ctx()));
+            // Empty tuple () is the unit type - return unit value (empty struct)
+            llvm::StructType *unit_ty = types().unit_type();
+            return llvm::ConstantStruct::get(unit_ty, {});
         }
 
         // Generate each element and collect their types
@@ -3478,8 +3481,29 @@ namespace Cryo::Codegen
             // Fall through to normal lookup if resolved type didn't help
         }
 
+        // Check if we're inside a generic instantiation context and need to redirect
+        // the scope name. For example, if we're generating code for Option<void*> methods
+        // and the AST says "Option::None", we need to look for "Option_voidp::None".
+        std::string effective_scope_name = node->scope_name();
+        auto *visitor = ctx().visitor();
+        if (visitor)
+        {
+            auto *generics = visitor->get_generics();
+            if (generics && generics->in_type_param_scope())
+            {
+                std::string redirected = generics->get_instantiated_scope_name(effective_scope_name);
+                if (!redirected.empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "ExpressionCodegen: Redirecting scope {} -> {} in generic context",
+                              effective_scope_name, redirected);
+                    effective_scope_name = redirected;
+                }
+            }
+        }
+
         // Build fully qualified name
-        std::string qualified_name = node->scope_name() + "::" + node->member_name();
+        std::string qualified_name = effective_scope_name + "::" + node->member_name();
 
         // Helper lambda to try finding a qualified name
         auto try_find = [this](const std::string &name) -> llvm::Value *
@@ -3531,8 +3555,8 @@ namespace Cryo::Codegen
         auto member_candidates = generate_lookup_candidates(node->member_name(), Cryo::SymbolKind::Type);
         for (const auto &candidate : member_candidates)
         {
-            // Build candidate with original scope
-            std::string scoped_candidate = node->scope_name() + "::" + candidate;
+            // Build candidate with effective scope (may be redirected in generic context)
+            std::string scoped_candidate = effective_scope_name + "::" + candidate;
             if (llvm::Value *result = try_find(scoped_candidate))
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -3541,9 +3565,9 @@ namespace Cryo::Codegen
             }
         }
 
-        // Try generating candidates for just the enum name (scope_name) and append the variant
+        // Try generating candidates for just the enum name (effective_scope_name) and append the variant
         // This handles cross-module enum lookups where Ordering is from std::sync::atomic
-        auto scope_candidates = generate_lookup_candidates(node->scope_name(), Cryo::SymbolKind::Type);
+        auto scope_candidates = generate_lookup_candidates(effective_scope_name, Cryo::SymbolKind::Type);
         for (const auto &scope_candidate : scope_candidates)
         {
             // Build full qualified enum variant name: namespace::EnumName::Variant
