@@ -1000,10 +1000,57 @@ namespace Cryo::Codegen
 
         // Look up the EnumType to get the variant's actual payload types
         std::vector<TypeRef> payload_types;
-        std::string enum_name = enum_pattern->enum_name();
         std::string variant_name = enum_pattern->variant_name();
 
+        // Use the LLVM struct type's name for lookup - this gives us the instantiated name
+        // (e.g., "Option<(String,String)>" or "Option_u64") instead of just "Option"
+        std::string enum_name = struct_type->getName().str();
+
+        // Try lookup with the full instantiated name first
         TypeRef enum_type_ref = ctx().symbols().arena().lookup_type_by_name(enum_name);
+
+        // If not found, the name might be in a different format (mangled vs display)
+        // Try converting between formats
+        if (!enum_type_ref.is_valid())
+        {
+            // Try mangling the name if it has angle brackets
+            std::string mangled_name = enum_name;
+            size_t angle_pos = mangled_name.find('<');
+            if (angle_pos != std::string::npos)
+            {
+                // Convert "Option<T>" format to "Option_T" format
+                for (char &c : mangled_name)
+                {
+                    if (c == '<' || c == '>' || c == ',' || c == ' ')
+                        c = '_';
+                }
+                // Remove trailing underscores
+                while (!mangled_name.empty() && mangled_name.back() == '_')
+                    mangled_name.pop_back();
+                enum_type_ref = ctx().symbols().arena().lookup_type_by_name(mangled_name);
+                if (enum_type_ref.is_valid())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "bind_enum_pattern_variables: Found type via mangled name '{}' (original: '{}')",
+                              mangled_name, enum_name);
+                }
+            }
+        }
+
+        // Last resort: try the pattern's enum name (base name like "Option")
+        if (!enum_type_ref.is_valid())
+        {
+            std::string base_enum_name = enum_pattern->enum_name();
+            enum_type_ref = ctx().symbols().arena().lookup_type_by_name(base_enum_name);
+            if (enum_type_ref.is_valid())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "bind_enum_pattern_variables: Found type via base name '{}' (LLVM name was: '{}')",
+                          base_enum_name, enum_name);
+            }
+        }
+
+        // Handle non-generic enum types
         if (enum_type_ref.is_valid() && enum_type_ref->kind() == TypeKind::Enum)
         {
             auto *enum_type = static_cast<const EnumType *>(enum_type_ref.get());

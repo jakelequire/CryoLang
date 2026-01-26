@@ -656,6 +656,44 @@ namespace Cryo
         return register_type(std::move(type));
     }
 
+    void TypeArena::register_instantiated_by_name(TypeRef instantiated)
+    {
+        if (!instantiated.is_valid() || instantiated->kind() != TypeKind::InstantiatedType)
+            return;
+
+        auto *inst = static_cast<const InstantiatedType *>(instantiated.get());
+        TypeRef base = inst->generic_base();
+        if (!base.is_valid())
+            return;
+
+        // Get the display name of the instantiated type (e.g., "Option<(String, String)>")
+        std::string name = instantiated->display_name();
+
+        // Register in the appropriate cache based on the base type's kind
+        // This allows lookup_type_by_name() to find instantiated types
+        switch (base->kind())
+        {
+        case TypeKind::Enum:
+            _enum_types[name] = instantiated;
+            LOG_DEBUG(LogComponent::TYPECHECKER,
+                      "TypeArena: Registered instantiated enum '{}' in name cache", name);
+            break;
+        case TypeKind::Struct:
+            _struct_types[name] = instantiated;
+            LOG_DEBUG(LogComponent::TYPECHECKER,
+                      "TypeArena: Registered instantiated struct '{}' in name cache", name);
+            break;
+        case TypeKind::Class:
+            _class_types[name] = instantiated;
+            LOG_DEBUG(LogComponent::TYPECHECKER,
+                      "TypeArena: Registered instantiated class '{}' in name cache", name);
+            break;
+        default:
+            // For other types (traits, etc.), no name cache registration needed
+            break;
+        }
+    }
+
     // ========================================================================
     // Error type creation
     // ========================================================================
