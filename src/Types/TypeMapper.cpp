@@ -1581,6 +1581,8 @@ namespace Cryo
                 TypeRef instantiated = _arena.create_instantiation(base_type, type_args);
                 if (instantiated.is_valid() && !instantiated.is_error())
                 {
+                    // Register in name caches so lookup_type_by_name() can find it
+                    _arena.register_instantiated_by_name(instantiated);
                     return map(instantiated);
                 }
             }

@@ -338,6 +338,10 @@ namespace Cryo
         TypeRef create_instantiation(TypeRef generic_base,
                                      std::vector<TypeRef> type_args);
 
+        // Register an instantiated type in the name caches for lookup_type_by_name()
+        // This allows lookups like "Option<(String, String)>" to find the type
+        void register_instantiated_by_name(TypeRef instantiated);
+
         // ====================================================================
         // Error type creation
         // ====================================================================

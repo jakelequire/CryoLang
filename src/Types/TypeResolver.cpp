@@ -196,17 +196,18 @@ namespace Cryo
             // Parse the type arguments - handle nested generics
             std::string args_str = name.substr(angle_pos + 1, name.size() - angle_pos - 2);
 
-            // Split arguments by comma, respecting nesting
+            // Split arguments by comma, respecting nesting (both generics <> and tuples ())
             std::vector<std::string> arg_strings;
             int depth = 0;
             size_t start = 0;
             for (size_t i = 0; i < args_str.size(); ++i)
             {
-                if (args_str[i] == '<')
+                char c = args_str[i];
+                if (c == '<' || c == '(')
                     depth++;
-                else if (args_str[i] == '>')
+                else if (c == '>' || c == ')')
                     depth--;
-                else if (args_str[i] == ',' && depth == 0)
+                else if (c == ',' && depth == 0)
                 {
                     arg_strings.push_back(args_str.substr(start, i - start));
                     start = i + 1;
@@ -233,7 +234,59 @@ namespace Cryo
                 while (!trimmed.empty() && std::isspace(trimmed.back()))
                     trimmed.pop_back();
 
-                arg_anns.push_back(TypeAnnotation::named(trimmed, ctx.current_location));
+                // Parse the argument string into proper TypeAnnotation
+                // Handle tuple types: (A, B, C)
+                if (!trimmed.empty() && trimmed.front() == '(' && trimmed.back() == ')')
+                {
+                    // Parse tuple elements
+                    std::string tuple_content = trimmed.substr(1, trimmed.size() - 2);
+                    std::vector<std::string> tuple_elems;
+                    int depth = 0;
+                    size_t elem_start = 0;
+                    for (size_t i = 0; i < tuple_content.size(); ++i)
+                    {
+                        char c = tuple_content[i];
+                        if (c == '<' || c == '(')
+                            depth++;
+                        else if (c == '>' || c == ')')
+                            depth--;
+                        else if (c == ',' && depth == 0)
+                        {
+                            tuple_elems.push_back(tuple_content.substr(elem_start, i - elem_start));
+                            elem_start = i + 1;
+                        }
+                    }
+                    if (elem_start < tuple_content.size())
+                    {
+                        tuple_elems.push_back(tuple_content.substr(elem_start));
+                    }
+
+                    // Create tuple annotation with element annotations
+                    std::vector<TypeAnnotation> elem_anns;
+                    for (const auto &elem : tuple_elems)
+                    {
+                        std::string elem_trimmed = elem;
+                        while (!elem_trimmed.empty() && std::isspace(elem_trimmed.front()))
+                            elem_trimmed.erase(0, 1);
+                        while (!elem_trimmed.empty() && std::isspace(elem_trimmed.back()))
+                            elem_trimmed.pop_back();
+                        elem_anns.push_back(TypeAnnotation::named(elem_trimmed, ctx.current_location));
+                    }
+                    arg_anns.push_back(TypeAnnotation::tuple(std::move(elem_anns), ctx.current_location));
+                }
+                // Handle pointer types: A*
+                else if (!trimmed.empty() && trimmed.back() == '*')
+                {
+                    std::string inner = trimmed.substr(0, trimmed.size() - 1);
+                    while (!inner.empty() && std::isspace(inner.back()))
+                        inner.pop_back();
+                    arg_anns.push_back(TypeAnnotation::pointer(
+                        TypeAnnotation::named(inner, ctx.current_location), ctx.current_location));
+                }
+                else
+                {
+                    arg_anns.push_back(TypeAnnotation::named(trimmed, ctx.current_location));
+                }
             }
 
             return resolve_generic(base_ann, arg_anns, ctx);

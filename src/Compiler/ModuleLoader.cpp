@@ -951,7 +951,50 @@ namespace Cryo
                         size_t tag = 0;
                         for (const auto &variant : enum_decl->variants())
                         {
-                            variants.push_back(EnumVariant(variant->name(), {}, tag++));
+                            // Resolve payload types for this variant
+                            std::vector<TypeRef> payload_types;
+                            for (const std::string &type_str : variant->associated_types())
+                            {
+                                TypeRef payload_type;
+
+                                // Try to resolve as primitive first
+                                payload_type = resolve_primitive_type(type_str, type_arena);
+
+                                // If not primitive, try to look up user-defined type
+                                if (!payload_type.is_valid())
+                                {
+                                    payload_type = type_arena.lookup_type_by_name(type_str);
+                                }
+
+                                // If still not found, check symbol_map (for types in this module)
+                                if (!payload_type.is_valid())
+                                {
+                                    auto it = symbol_map.find(type_str);
+                                    if (it != symbol_map.end() && it->second.type.is_valid())
+                                    {
+                                        payload_type = it->second.type;
+                                    }
+                                }
+
+                                if (payload_type.is_valid())
+                                {
+                                    payload_types.push_back(payload_type);
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                              "ModuleLoader: Resolved enum variant payload type '{}' for {}::{}",
+                                              type_str, enum_decl->name(), variant->name());
+                                }
+                                else
+                                {
+                                    // Type not yet resolved - will need to be fixed up later
+                                    // For now, push an invalid ref as placeholder
+                                    payload_types.push_back(TypeRef{});
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                              "ModuleLoader: Deferred enum variant payload type '{}' for {}::{}",
+                                              type_str, enum_decl->name(), variant->name());
+                                }
+                            }
+
+                            variants.push_back(EnumVariant(variant->name(), std::move(payload_types), tag++));
                         }
 
                         // Set variants on the enum type (completes it)
