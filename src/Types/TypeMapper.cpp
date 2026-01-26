@@ -965,6 +965,21 @@ namespace Cryo
         if (!type)
             return nullptr;
 
+        // Try to resolve the generic parameter using the type_param_resolver
+        // This is set by GenericCodegen::begin_type_params during generic instantiation
+        if (_type_param_resolver)
+        {
+            std::string param_name = type->display_name();
+            TypeRef resolved = _type_param_resolver(param_name);
+            if (resolved.is_valid())
+            {
+                LOG_DEBUG(LogComponent::CODEGEN,
+                          "TypeMapper::map_generic_param: Resolved '{}' -> '{}'",
+                          param_name, resolved->display_name());
+                return map(resolved);
+            }
+        }
+
         // Generic parameters should be substituted before codegen
         // Return opaque pointer as fallback
         report_error("Unsubstituted generic parameter: " + type->display_name());
@@ -1016,6 +1031,20 @@ namespace Cryo
                     _generic_instantiator(base_name, args);
                 }
             }
+            // For structs, also trigger instantiation to generate methods
+            else if (resolved->kind() == TypeKind::Struct && _generic_instantiator)
+            {
+                TypeRef base = type->generic_base();
+                const std::vector<TypeRef> &args = type->type_args();
+                if (base.is_valid() && !args.empty())
+                {
+                    std::string base_name = base->display_name();
+                    LOG_DEBUG(LogComponent::CODEGEN,
+                              "TypeMapper::map_instantiated: Triggering method generation for struct '{}' (base: '{}')",
+                              name, base_name);
+                    _generic_instantiator(base_name, args);
+                }
+            }
 
             return map(resolved);
         }
@@ -1047,7 +1076,59 @@ namespace Cryo
         // Try generic instantiator callback (takes string name)
         // This is wired to GenericCodegen::get_instantiated_type in CodegenVisitor
         TypeRef base = type->generic_base();
-        const std::vector<TypeRef> &args = type->type_args();
+        std::vector<TypeRef> args = type->type_args();
+
+        // Substitute type parameters in the args using the resolver
+        // For example, if args contain T and we're in a context where T -> string,
+        // we need to resolve T to string before instantiating
+        if (_type_param_resolver)
+        {
+            std::vector<TypeRef> substituted_args;
+            bool any_substituted = false;
+            for (const auto &arg : args)
+            {
+                if (arg.is_valid() && arg->kind() == TypeKind::GenericParam)
+                {
+                    std::string param_name = arg->display_name();
+                    TypeRef resolved = _type_param_resolver(param_name);
+                    if (resolved.is_valid())
+                    {
+                        LOG_DEBUG(LogComponent::CODEGEN,
+                                  "TypeMapper::map_instantiated: Substituted type arg '{}' -> '{}'",
+                                  param_name, resolved->display_name());
+                        substituted_args.push_back(resolved);
+                        any_substituted = true;
+                        continue;
+                    }
+                }
+                substituted_args.push_back(arg);
+            }
+            if (any_substituted)
+            {
+                args = std::move(substituted_args);
+                // Recompute the name with substituted args for cache lookup
+                std::string substituted_name = base.is_valid() ? base->display_name() : "";
+                if (!args.empty())
+                {
+                    substituted_name += "<";
+                    for (size_t i = 0; i < args.size(); ++i)
+                    {
+                        if (i > 0) substituted_name += ", ";
+                        substituted_name += args[i]->display_name();
+                    }
+                    substituted_name += ">";
+                }
+                LOG_DEBUG(LogComponent::CODEGEN,
+                          "TypeMapper::map_instantiated: After substitution, looking for '{}'",
+                          substituted_name);
+                // Check if the substituted type already exists
+                auto substituted_existing = lookup_struct(substituted_name);
+                if (substituted_existing && !substituted_existing->isOpaque())
+                {
+                    return substituted_existing;
+                }
+            }
+        }
 
         if (_generic_instantiator && base.is_valid())
         {

@@ -189,6 +189,15 @@ namespace Cryo
         void mark_declarations_as_imported(ProgramNode &ast, const std::string &module_name);
 
         /**
+         * @brief Resolve 'this' parameters in impl blocks that have error types
+         * @param ast The parsed AST to process
+         *
+         * This must be called after create_symbol_map registers types, so that
+         * the base types for impl blocks can be looked up.
+         */
+        void resolve_this_parameters_in_ast(ProgramNode &ast);
+
+        /**
          * @brief Create a FunctionType from a FunctionDeclarationNode
          * @param func_decl The function declaration node
          * @param type_arena TypeArena for creating type objects
