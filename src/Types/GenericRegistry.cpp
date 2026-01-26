@@ -194,7 +194,9 @@ namespace Cryo
             {
                 return type;
             }
-            return arena.create_instantiation(inst->generic_base(), std::move(new_args));
+            TypeRef result = arena.create_instantiation(inst->generic_base(), std::move(new_args));
+            arena.register_instantiated_by_name(result);
+            return result;
         }
 
         default:
@@ -288,6 +290,9 @@ namespace Cryo
 
         // Create the instantiated type
         TypeRef instantiated = arena.create_instantiation(generic_type, type_args);
+
+        // Register in name caches so lookup_type_by_name() can find it
+        arena.register_instantiated_by_name(instantiated);
 
         // Cache it
         auto key = make_key(generic_type, type_args);

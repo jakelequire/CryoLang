@@ -1996,6 +1996,85 @@ namespace Cryo
                 }
             }
         }
+        // Handle enum declarations - populate variant payload types
+        else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(node))
+        {
+            // Skip generic enums - their variants are handled during monomorphization
+            if (!enum_decl->generic_parameters().empty())
+            {
+                return;
+            }
+
+            TypeRef enum_type = _symbol_table->lookup_enum_type(enum_decl->name());
+            if (!enum_type.is_valid())
+            {
+                enum_type = _ast_context->types().lookup_type_by_name(enum_decl->name());
+            }
+
+            if (enum_type.is_valid() && enum_type->kind() == TypeKind::Enum)
+            {
+                auto *enum_ptr = const_cast<EnumType *>(dynamic_cast<const EnumType *>(enum_type.get()));
+                if (enum_ptr)
+                {
+                    // Check if variants need payload type resolution
+                    // (they were created with placeholder types in ModuleLoader)
+                    bool needs_resolution = false;
+                    for (const auto &variant : enum_ptr->variants())
+                    {
+                        for (const auto &payload_type : variant.payload_types)
+                        {
+                            if (!payload_type.is_valid())
+                            {
+                                needs_resolution = true;
+                                break;
+                            }
+                        }
+                        if (needs_resolution) break;
+                    }
+
+                    if (needs_resolution)
+                    {
+                        std::vector<EnumVariant> resolved_variants;
+                        size_t variant_idx = 0;
+
+                        for (const auto &ast_variant : enum_decl->variants())
+                        {
+                            std::vector<TypeRef> payload_types;
+
+                            for (const std::string &type_str : ast_variant->associated_types())
+                            {
+                                ResolutionContext ctx(_symbol_table->current_module());
+                                TypeAnnotation ann = TypeAnnotation::named(type_str, ast_variant->location());
+                                TypeRef payload_type = _type_resolver->resolve(ann, ctx);
+
+                                if (payload_type.is_valid() && !payload_type.is_error())
+                                {
+                                    payload_types.push_back(payload_type);
+                                    LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                              "populate_type_fields_pass: Resolved enum variant payload '{}' for {}::{}",
+                                              type_str, enum_decl->name(), ast_variant->name());
+                                }
+                                else
+                                {
+                                    // Still couldn't resolve - use invalid ref
+                                    payload_types.push_back(TypeRef{});
+                                    LOG_WARN(Cryo::LogComponent::GENERAL,
+                                             "populate_type_fields_pass: Could not resolve enum variant payload '{}' for {}::{}",
+                                             type_str, enum_decl->name(), ast_variant->name());
+                                }
+                            }
+
+                            resolved_variants.push_back(EnumVariant(ast_variant->name(), std::move(payload_types), variant_idx++));
+                        }
+
+                        enum_ptr->set_variants(std::move(resolved_variants));
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                  "populate_type_fields_pass: Updated {} variants on enum '{}'",
+                                  enum_decl->variants().size(), enum_decl->name());
+                    }
+                }
+            }
+        }
         // Handle declaration statements - recurse
         else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
         {

@@ -3375,6 +3375,9 @@ namespace Cryo::Codegen
             // Create instantiated type
             TypeRef instantiated = arena.create_instantiation(base_type, std::move(type_args));
 
+            // Register in name caches so lookup_type_by_name() can find it
+            arena.register_instantiated_by_name(instantiated);
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "resolve_type_annotation: Created instantiation '{}' with {} type args",
                       instantiated.is_valid() ? instantiated->display_name() : "invalid",

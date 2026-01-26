@@ -1394,6 +1394,8 @@ namespace Cryo::Codegen
             if (any_substituted)
             {
                 TypeRef new_inst = symbols().arena().create_instantiation(generic_base, substituted_args);
+                // Register in name caches so lookup_type_by_name() can find it
+                symbols().arena().register_instantiated_by_name(new_inst);
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "GenericCodegen: Substituted instantiated type {} -> {}",
                           type->display_name(), new_inst->display_name());

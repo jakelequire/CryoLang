@@ -4306,10 +4306,22 @@ namespace Cryo
             else if (lookup_name == "never") base_type = _context.types().get_never();
             else
             {
-                // Not a primitive - look up the struct/class type from the symbol table
-                // It was pre-registered when we started parsing the struct/class declaration
+                // Not a primitive - try multiple lookup methods
+
+                // 1. Try symbol table first (for types pre-registered during parsing)
                 const Symbol *sym = _context.symbols().lookup(lookup_name);
                 base_type = sym ? sym->type : TypeRef{};
+
+                // 2. If not found, try TypeArena lookup (for types registered by ModuleLoader)
+                if (!base_type.is_valid())
+                {
+                    base_type = _context.types().lookup_type_by_name(lookup_name);
+                    if (base_type.is_valid())
+                    {
+                        LOG_DEBUG(LogComponent::PARSER, "Resolved 'this' type via TypeArena lookup: '{}'",
+                                  lookup_name);
+                    }
+                }
             }
 
             if (base_type.is_valid() && !base_type.is_error())
