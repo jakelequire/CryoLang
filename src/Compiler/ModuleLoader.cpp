@@ -92,12 +92,12 @@ namespace Cryo
             std::string cwd = os.get_working_directory();
 
             // Common development and project patterns - try new_stdlib first, then stdlib:
-            search_paths.push_back(os.join_path(cwd, "new_stdlib"));    // ./new_stdlib (new structure)
-            search_paths.push_back(os.join_path(cwd, "stdlib"));        // ./stdlib (legacy)
-            search_paths.push_back(os.join_path(cwd, "../new_stdlib")); // ../new_stdlib (for project dirs)
-            search_paths.push_back(os.join_path(cwd, "../stdlib"));     // ../stdlib (legacy)
+            search_paths.push_back(os.join_path(cwd, "new_stdlib"));       // ./new_stdlib (new structure)
+            search_paths.push_back(os.join_path(cwd, "stdlib"));           // ./stdlib (legacy)
+            search_paths.push_back(os.join_path(cwd, "../new_stdlib"));    // ../new_stdlib (for project dirs)
+            search_paths.push_back(os.join_path(cwd, "../stdlib"));        // ../stdlib (legacy)
             search_paths.push_back(os.join_path(cwd, "../../new_stdlib")); // ../../new_stdlib (for nested dirs)
-            search_paths.push_back(os.join_path(cwd, "../../stdlib")); // ../../stdlib (legacy)
+            search_paths.push_back(os.join_path(cwd, "../../stdlib"));     // ../../stdlib (legacy)
         }
         catch (const std::exception &)
         {
@@ -144,13 +144,13 @@ namespace Cryo
                 // Check for new stdlib structure first (prelude.cryo + core/_module.cryo)
                 std::filesystem::path prelude_file = stdlib_path / "prelude.cryo";
                 std::filesystem::path core_module = stdlib_path / "core" / "_module.cryo";
-                
+
                 if (std::filesystem::exists(prelude_file) && std::filesystem::exists(core_module))
                 {
                     LOG_DEBUG(LogComponent::GENERAL, "Found new stdlib structure at: {}", stdlib_path.string());
                     return stdlib_path.string();
                 }
-                
+
                 // Fallback to old stdlib structure (core/types.cryo + io/stdio.cryo)
                 std::filesystem::path core_types = stdlib_path / "core" / "types.cryo";
                 std::filesystem::path io_stdio = stdlib_path / "io" / "stdio.cryo";
@@ -306,21 +306,21 @@ namespace Cryo
     {
         auto &os = Cryo::Utils::OS::instance();
         std::string abs_path = os.absolute_path(module_path);
-        
+
         // First, check if the path points to a direct .cryo file
         std::string direct_file = abs_path + ".cryo";
         if (std::filesystem::exists(direct_file))
         {
             return direct_file;
         }
-        
+
         // Next, check if it's a module directory with _module.cryo
         std::string module_file = os.join_path(abs_path, "_module.cryo");
         if (std::filesystem::exists(module_file))
         {
             return module_file;
         }
-        
+
         // For backwards compatibility, try the old direct .cryo approach
         return direct_file;
     }
@@ -447,6 +447,10 @@ namespace Cryo
             //    This must happen AFTER create_symbol_map so it can reuse the types with fields
             register_templates_from_ast(*ast, result.module_name);
 
+            // 2.5. Resolve 'this' parameters that have error types
+            //      This must happen AFTER create_symbol_map registers types
+            resolve_this_parameters_in_ast(*ast);
+
             // 3. Extract symbols from the original AST
             result.exported_symbols = extract_exported_symbols(*ast);
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Found {} exported symbols", result.exported_symbols.size());
@@ -460,7 +464,8 @@ namespace Cryo
             if (existing_ast_it != _imported_asts.end())
             {
                 LOG_ERROR(LogComponent::GENERAL, "ModuleLoader: WARNING - About to overwrite existing AST for module '{}'. "
-                    "This could cause dangling ast_node pointers in GenericRegistry!", result.module_name);
+                                                 "This could cause dangling ast_node pointers in GenericRegistry!",
+                          result.module_name);
             }
 
             _imported_asts[result.module_name] = std::move(ast); // Move is necessary to transfer ownership
@@ -537,8 +542,7 @@ namespace Cryo
                         // Create a synthetic ImportDeclarationNode for the submodule
                         auto submodule_import = std::make_unique<ImportDeclarationNode>(
                             module_decl->location(),
-                            submodule_path
-                        );
+                            submodule_path);
 
                         // Load the submodule (will use cache if already loaded)
                         ImportResult submodule_result = load_import(*submodule_import);
@@ -755,6 +759,23 @@ namespace Cryo
                     Symbol symbol(struct_decl->name(), SymbolKind::Type, struct_type, module_id, struct_decl->location());
                     symbol.scope = module_name;
                     symbol_map[struct_decl->name()] = symbol;
+
+                    // Also register struct methods with qualified names (TypeName::methodName)
+                    for (const auto &method : struct_decl->methods())
+                    {
+                        if (method)
+                        {
+                            std::string qualified_method_name = struct_decl->name() + "::" + method->name();
+                            TypeRef method_type = create_function_type_from_declaration(method.get(), &type_arena);
+                            if (method_type.is_valid())
+                            {
+                                Symbol method_symbol(qualified_method_name, SymbolKind::Function, method_type, module_id, method->location());
+                                method_symbol.scope = module_name;
+                                symbol_map[qualified_method_name] = method_symbol;
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added struct method '{}' to symbol map", qualified_method_name);
+                            }
+                        }
+                    }
                 }
                 else if (auto class_decl = dynamic_cast<ClassDeclarationNode *>(decl))
                 {
@@ -918,6 +939,23 @@ namespace Cryo
                     Symbol symbol(class_decl->name(), SymbolKind::Type, class_type, module_id, class_decl->location());
                     symbol.scope = module_name;
                     symbol_map[class_decl->name()] = symbol;
+
+                    // Also register class methods with qualified names (TypeName::methodName)
+                    for (const auto &method : class_decl->methods())
+                    {
+                        if (method)
+                        {
+                            std::string qualified_method_name = class_decl->name() + "::" + method->name();
+                            TypeRef method_type = create_function_type_from_declaration(method.get(), &type_arena);
+                            if (method_type.is_valid())
+                            {
+                                Symbol method_symbol(qualified_method_name, SymbolKind::Function, method_type, module_id, method->location());
+                                method_symbol.scope = module_name;
+                                symbol_map[qualified_method_name] = method_symbol;
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added class method '{}' to symbol map", qualified_method_name);
+                            }
+                        }
+                    }
                 }
                 else if (auto enum_decl = dynamic_cast<EnumDeclarationNode *>(decl))
                 {
@@ -1065,7 +1103,7 @@ namespace Cryo
                     else
                     {
                         LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Skipping intrinsic '{}' - failed to create function type",
-                                    intrinsic_decl->name());
+                                 intrinsic_decl->name());
                     }
                 }
                 else if (auto module_decl = dynamic_cast<ModuleDeclarationNode *>(decl))
@@ -1080,8 +1118,7 @@ namespace Cryo
                         // Create a synthetic ImportDeclarationNode for the submodule
                         auto submodule_import = std::make_unique<ImportDeclarationNode>(
                             module_decl->location(),
-                            submodule_path
-                        );
+                            submodule_path);
 
                         // Recursively load the submodule
                         ImportResult submodule_result = load_import(*submodule_import);
@@ -1106,6 +1143,48 @@ namespace Cryo
                         {
                             LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Failed to load submodule '{}': {}",
                                      submodule_path, submodule_result.error_message);
+                        }
+                    }
+                }
+                else if (auto impl_block = dynamic_cast<ImplementationBlockNode *>(decl))
+                {
+                    // Process implementation blocks to register methods with qualified names
+                    std::string type_name = impl_block->target_type();
+
+                    // Extract base type name (remove generics like "Option<T>" -> "Option")
+                    std::string base_type_name = type_name;
+                    size_t generic_start = type_name.find('<');
+                    if (generic_start != std::string::npos)
+                    {
+                        base_type_name = type_name.substr(0, generic_start);
+                    }
+
+                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing impl block for '{}' (base: {}) with {} methods",
+                              type_name, base_type_name, impl_block->method_implementations().size());
+
+                    // Register each method with qualified name (TypeName::methodName)
+                    for (const auto &method : impl_block->method_implementations())
+                    {
+                        if (method)
+                        {
+                            std::string qualified_method_name = base_type_name + "::" + method->name();
+                            TypeRef method_type = create_function_type_from_declaration(method.get(), &type_arena);
+                            if (method_type.is_valid())
+                            {
+                                Symbol method_symbol(qualified_method_name, SymbolKind::Function, method_type, module_id, method->location());
+                                method_symbol.scope = module_name;
+                                symbol_map[qualified_method_name] = method_symbol;
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added impl method '{}' to symbol map", qualified_method_name);
+                            }
+                            else
+                            {
+                                // Method type creation failed, possibly due to unresolved generic types
+                                // Still add a placeholder symbol so the method is discoverable
+                                Symbol method_symbol(qualified_method_name, SymbolKind::Function, TypeRef{}, module_id, method->location());
+                                method_symbol.scope = module_name;
+                                symbol_map[qualified_method_name] = method_symbol;
+                                LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added impl method '{}' to symbol map (with placeholder type)", qualified_method_name);
+                            }
                         }
                     }
                 }
@@ -1196,7 +1275,7 @@ namespace Cryo
             else
             {
                 LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Failed to get resolved type for parameter '{}' in intrinsic '{}' - intrinsic will not be available",
-                            param->name(), intrinsic_name);
+                         param->name(), intrinsic_name);
                 return TypeRef{};
             }
         }
@@ -1292,7 +1371,7 @@ namespace Cryo
                             if (_generic_registry->get_template_by_name(class_decl->name()))
                             {
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Template '{}' already registered in GenericRegistry, skipping to preserve field info",
-                                    class_decl->name());
+                                          class_decl->name());
                             }
                             else
                             {
@@ -1306,12 +1385,12 @@ namespace Cryo
                                     // Fallback: create a new one if not found (shouldn't happen normally)
                                     class_type = arena.create_class(QualifiedTypeName{ModuleID::invalid(), class_decl->name()});
                                     LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Had to create new ClassType for '{}' - fields may be missing",
-                                        class_decl->name());
+                                             class_decl->name());
                                 }
                                 else
                                 {
                                     LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Using existing ClassType for '{}' with fields",
-                                        class_decl->name());
+                                              class_decl->name());
                                 }
 
                                 std::vector<GenericParam> params;
@@ -1322,9 +1401,9 @@ namespace Cryo
                                     params.emplace_back(param_node->name(), i, param_type);
                                 }
                                 _generic_registry->register_template(class_type, params,
-                                    ModuleID::invalid(), class_decl, class_decl->name());
+                                                                     ModuleID::invalid(), class_decl, class_decl->name());
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered class '{}' in GenericRegistry with {} params",
-                                    class_decl->name(), params.size());
+                                          class_decl->name(), params.size());
                             }
                         }
                     }
@@ -1392,7 +1471,7 @@ namespace Cryo
                             if (_generic_registry->get_template_by_name(enum_decl->name()))
                             {
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Template '{}' already registered in GenericRegistry, skipping to preserve variant info",
-                                    enum_decl->name());
+                                          enum_decl->name());
                             }
                             else
                             {
@@ -1406,12 +1485,12 @@ namespace Cryo
                                     // Fallback: create a new one if not found (shouldn't happen normally)
                                     enum_type = arena.create_enum(QualifiedTypeName{ModuleID::invalid(), enum_decl->name()});
                                     LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Had to create new EnumType for '{}' - variants may be missing",
-                                        enum_decl->name());
+                                             enum_decl->name());
                                 }
                                 else
                                 {
                                     LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Using existing EnumType for '{}' with variants",
-                                        enum_decl->name());
+                                              enum_decl->name());
                                 }
 
                                 std::vector<GenericParam> params;
@@ -1422,9 +1501,9 @@ namespace Cryo
                                     params.emplace_back(param_node->name(), i, param_type);
                                 }
                                 _generic_registry->register_template(enum_type, params,
-                                    ModuleID::invalid(), enum_decl, enum_decl->name());
+                                                                     ModuleID::invalid(), enum_decl, enum_decl->name());
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered enum '{}' in GenericRegistry with {} params",
-                                    enum_decl->name(), params.size());
+                                          enum_decl->name(), params.size());
                             }
                         }
                     }
@@ -1449,7 +1528,7 @@ namespace Cryo
                             if (_generic_registry->get_template_by_name(struct_decl->name()))
                             {
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Template '{}' already registered in GenericRegistry, skipping to preserve field info",
-                                    struct_decl->name());
+                                          struct_decl->name());
                             }
                             else
                             {
@@ -1463,12 +1542,12 @@ namespace Cryo
                                     // Fallback: create a new one if not found (shouldn't happen normally)
                                     struct_type = arena.create_struct(QualifiedTypeName{ModuleID::invalid(), struct_decl->name()});
                                     LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Had to create new StructType for '{}' - fields may be missing",
-                                        struct_decl->name());
+                                             struct_decl->name());
                                 }
                                 else
                                 {
                                     LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Using existing StructType for '{}' with fields",
-                                        struct_decl->name());
+                                              struct_decl->name());
                                 }
 
                                 std::vector<GenericParam> params;
@@ -1479,9 +1558,9 @@ namespace Cryo
                                     params.emplace_back(param_node->name(), i, param_type);
                                 }
                                 _generic_registry->register_template(struct_type, params,
-                                    ModuleID::invalid(), struct_decl, struct_decl->name());
+                                                                     ModuleID::invalid(), struct_decl, struct_decl->name());
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered struct '{}' in GenericRegistry with {} params",
-                                    struct_decl->name(), params.size());
+                                          struct_decl->name(), params.size());
                             }
                         }
                     }
@@ -1631,7 +1710,7 @@ namespace Cryo
                         if (_generic_registry->get_template_by_name(alias_decl->alias_name()))
                         {
                             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Type alias template '{}' already registered in GenericRegistry, skipping to preserve ast_node",
-                                alias_decl->alias_name());
+                                      alias_decl->alias_name());
                         }
                         else
                         {
@@ -1639,7 +1718,7 @@ namespace Cryo
                             // Create a type alias type for the template
                             TypeRef alias_type = arena.create_type_alias(
                                 QualifiedTypeName{ModuleID::invalid(), alias_decl->alias_name()},
-                                TypeRef{}  // Target will be resolved during instantiation
+                                TypeRef{} // Target will be resolved during instantiation
                             );
 
                             std::vector<GenericParam> params;
@@ -1650,9 +1729,9 @@ namespace Cryo
                                 params.emplace_back(param_name, i, param_type);
                             }
                             _generic_registry->register_template(alias_type, params,
-                                ModuleID::invalid(), alias_decl, alias_decl->alias_name());
+                                                                 ModuleID::invalid(), alias_decl, alias_decl->alias_name());
                             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered generic type alias '{}' in GenericRegistry with {} params",
-                                alias_decl->alias_name(), params.size());
+                                      alias_decl->alias_name(), params.size());
                         }
                     }
                 }
@@ -1895,6 +1974,195 @@ namespace Cryo
     const std::unordered_map<std::string, std::unique_ptr<ProgramNode>> &ModuleLoader::get_imported_asts() const
     {
         return _imported_asts;
+    }
+
+    void ModuleLoader::resolve_this_parameters_in_ast(ProgramNode &ast)
+    {
+        // After types are registered in create_symbol_map, we need to resolve any
+        // 'this' parameters that have error types (unresolved_this:X) because the
+        // Parser couldn't find the type at parse time.
+
+        TypeArena &arena = _ast_context.types();
+
+        for (auto &stmt : ast.statements())
+        {
+            // Check for implementation blocks
+            auto *impl = dynamic_cast<ImplementationBlockNode *>(stmt.get());
+            if (!impl)
+                continue;
+
+            // Extract base type name from impl target (e.g., "Option<T>" -> "Option")
+            const std::string &target = impl->target_type();
+            std::string base_name = target;
+            size_t angle_pos = target.find('<');
+            if (angle_pos != std::string::npos)
+            {
+                base_name = target.substr(0, angle_pos);
+            }
+
+            // Try to look up the base type
+            TypeRef base_type = arena.lookup_type_by_name(base_name);
+
+            // Fallback: try symbol table lookups
+            if (!base_type.is_valid() || base_type.is_error())
+            {
+                base_type = _symbol_table.lookup_enum_type(base_name);
+            }
+            if (!base_type.is_valid() || base_type.is_error())
+            {
+                base_type = _symbol_table.lookup_struct_type(base_name);
+            }
+            if (!base_type.is_valid() || base_type.is_error())
+            {
+                base_type = _symbol_table.lookup_class_type(base_name);
+            }
+
+            if (!base_type.is_valid() || base_type.is_error())
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "ModuleLoader: Could not resolve base type '{}' for impl block '{}'",
+                          base_name, target);
+                continue;
+            }
+
+            // Extract generic parameters from impl target (e.g., "Option<T>" -> ["T"])
+            std::vector<std::string> impl_generic_params;
+            if (angle_pos != std::string::npos && target.back() == '>')
+            {
+                std::string params_str = target.substr(angle_pos + 1, target.size() - angle_pos - 2);
+                size_t start = 0;
+                for (size_t i = 0; i <= params_str.size(); ++i)
+                {
+                    if (i == params_str.size() || params_str[i] == ',')
+                    {
+                        std::string param = params_str.substr(start, i - start);
+                        // Trim whitespace
+                        while (!param.empty() && (param.front() == ' ' || param.front() == '\t'))
+                            param.erase(0, 1);
+                        while (!param.empty() && (param.back() == ' ' || param.back() == '\t'))
+                            param.pop_back();
+                        if (!param.empty())
+                            impl_generic_params.push_back(param);
+                        start = i + 1;
+                    }
+                }
+            }
+
+            // Process each method in the impl block
+            for (auto &method : impl->method_implementations())
+            {
+                for (auto &param : method->parameters())
+                {
+                    if (param->name() == "this" && param->has_resolved_type())
+                    {
+                        TypeRef current_type = param->get_resolved_type();
+                        if (current_type.is_error())
+                        {
+                            // This is an unresolved 'this' parameter - fix it
+                            TypeRef this_type = arena.get_reference_to(base_type);
+                            param->set_resolved_type(this_type);
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                      "ModuleLoader: Resolved 'this' param for impl '{}::{}' to '{}'",
+                                      target, method->name(), this_type->display_name());
+                        }
+                    }
+                    else if (param->has_resolved_type())
+                    {
+                        // Check if this is an unresolved generic type that uses impl's generic params
+                        TypeRef current_type = param->get_resolved_type();
+                        if (current_type.is_error())
+                        {
+                            std::string error_name = current_type->display_name();
+                            // Check if it's an "unresolved generic" error
+                            const std::string prefix = "<error: unresolved generic: ";
+                            if (error_name.find(prefix) == 0 && error_name.back() == '>')
+                            {
+                                // Extract the type string (e.g., "Option<T>" from "<error: unresolved generic: Option<T>>")
+                                std::string type_str = error_name.substr(prefix.length(), error_name.length() - prefix.length() - 1);
+
+                                // Check if this type only uses generic params from the impl block
+                                // For now, we'll mark it as a valid generic type if the base type exists
+                                // and all type args are impl generic params
+                                size_t type_angle = type_str.find('<');
+                                if (type_angle != std::string::npos)
+                                {
+                                    std::string param_base = type_str.substr(0, type_angle);
+                                    std::string args_part = type_str.substr(type_angle + 1, type_str.size() - type_angle - 2);
+
+                                    // Check if base type is valid
+                                    TypeRef param_base_type = arena.lookup_type_by_name(param_base);
+                                    if (!param_base_type.is_valid() || param_base_type.is_error())
+                                    {
+                                        param_base_type = _symbol_table.lookup_enum_type(param_base);
+                                    }
+                                    if (!param_base_type.is_valid() || param_base_type.is_error())
+                                    {
+                                        param_base_type = _symbol_table.lookup_struct_type(param_base);
+                                    }
+
+                                    if (param_base_type.is_valid() && !param_base_type.is_error())
+                                    {
+                                        // Check if all type args are impl generic params
+                                        bool all_generic_params = true;
+                                        std::vector<std::string> type_args;
+                                        size_t arg_start = 0;
+                                        int depth = 0;
+                                        for (size_t i = 0; i <= args_part.size(); ++i)
+                                        {
+                                            if (i < args_part.size())
+                                            {
+                                                if (args_part[i] == '<' || args_part[i] == '(')
+                                                    depth++;
+                                                else if (args_part[i] == '>' || args_part[i] == ')')
+                                                    depth--;
+                                            }
+                                            if (i == args_part.size() || (args_part[i] == ',' && depth == 0))
+                                            {
+                                                std::string arg = args_part.substr(arg_start, i - arg_start);
+                                                while (!arg.empty() && std::isspace(arg.front()))
+                                                    arg.erase(0, 1);
+                                                while (!arg.empty() && std::isspace(arg.back()))
+                                                    arg.pop_back();
+                                                type_args.push_back(arg);
+                                                arg_start = i + 1;
+                                            }
+                                        }
+
+                                        for (const auto &arg : type_args)
+                                        {
+                                            bool found = false;
+                                            for (const auto &impl_param : impl_generic_params)
+                                            {
+                                                if (arg == impl_param)
+                                                {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if (!found)
+                                            {
+                                                all_generic_params = false;
+                                                break;
+                                            }
+                                        }
+
+                                        if (all_generic_params)
+                                        {
+                                            // This is a valid generic type using impl's generic params
+                                            // Set the base type - the generic params will be resolved at instantiation
+                                            param->set_resolved_type(param_base_type);
+                                            LOG_DEBUG(LogComponent::GENERAL,
+                                                      "ModuleLoader: Resolved generic param '{}' for impl '{}::{}' to base type '{}'",
+                                                      param->name(), target, method->name(), param_base_type->display_name());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
 } // namespace Cryo

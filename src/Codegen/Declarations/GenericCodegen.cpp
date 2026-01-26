@@ -64,29 +64,61 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Instantiating struct {} -> {}",
                   generic_name, mangled);
 
-        // Check cache
-        if (has_type_instantiation(mangled))
+        // Check if methods have already been generated for this instantiation
+        // We track this separately from type caching because the LLVM type may exist
+        // (created by Monomorphizer) but methods may not be generated yet
+        static std::unordered_set<std::string> generated_struct_methods;
+        if (generated_struct_methods.count(mangled))
         {
-            llvm::Type *cached = get_cached_type(mangled);
-            // Guard against null - dyn_cast asserts on null
-            if (cached)
+            // Type and methods already generated, return cached type
+            if (has_type_instantiation(mangled))
             {
-                if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(cached))
+                llvm::Type *cached = get_cached_type(mangled);
+                if (cached)
                 {
-                    return struct_type;
+                    if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(cached))
+                    {
+                        return struct_type;
+                    }
                 }
+            }
+            // Methods generated but type not in our cache - get from LLVM context
+            if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
+            {
+                _type_cache[mangled] = existing;
+                return existing;
             }
         }
 
-        // Check if already exists in LLVM context
-        if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
+        // Check if LLVM type already exists (created by Monomorphizer)
+        // If so, we still need to generate methods, but can reuse the type
+        llvm::StructType *existing_struct = llvm::StructType::getTypeByName(llvm_ctx(), mangled);
+        bool type_already_exists = (existing_struct && !existing_struct->isOpaque());
+        if (type_already_exists)
         {
-            _type_cache[mangled] = existing;
-            return existing;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Found existing LLVM type for struct {}, will generate methods",
+                      mangled);
         }
 
-        // Get generic type definition
+        // Get generic type definition - first check local registry, then TemplateRegistry
         Cryo::ASTNode *generic_def = get_generic_type_def(generic_name);
+        if (!generic_def)
+        {
+            // Try to get from TemplateRegistry (for cross-module structs)
+            Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+            if (template_registry)
+            {
+                const Cryo::TemplateRegistry::TemplateInfo *tmpl_info = template_registry->find_template(generic_name);
+                if (tmpl_info && tmpl_info->struct_template)
+                {
+                    generic_def = tmpl_info->struct_template;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Got struct template '{}' from TemplateRegistry",
+                              generic_name);
+                }
+            }
+        }
         if (!generic_def)
         {
             report_error(ErrorCode::E0632_TYPE_RESOLUTION_ERROR,
@@ -108,29 +140,51 @@ namespace Cryo::Codegen
         // Begin type parameter scope - pass generic_name and mangled for scope resolution
         begin_type_params(type_params, type_args, generic_name, mangled);
 
-        // Create struct type
-        llvm::StructType *struct_type = llvm::StructType::create(llvm_ctx(), mangled);
-
-        // Substitute type parameters in fields and collect field names
+        // Create struct type OR reuse existing one
+        llvm::StructType *struct_type = nullptr;
         std::vector<std::string> field_names;
-        if (struct_decl)
+
+        if (type_already_exists)
         {
-            std::vector<llvm::Type *> field_types = create_substituted_fields(struct_decl->fields());
-            struct_type->setBody(field_types);
-
-            // Collect field names for member access resolution
-            field_names.reserve(struct_decl->fields().size());
-            for (const auto &field : struct_decl->fields())
+            // Reuse existing type, just collect field names for method generation
+            struct_type = existing_struct;
+            if (struct_decl)
             {
-                field_names.push_back(field->name());
+                field_names.reserve(struct_decl->fields().size());
+                for (const auto &field : struct_decl->fields())
+                {
+                    field_names.push_back(field->name());
+                }
             }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Reusing existing LLVM type for struct {}",
+                      mangled);
         }
+        else
+        {
+            // Create new struct type
+            struct_type = llvm::StructType::create(llvm_ctx(), mangled);
 
-        // Cache and register in multiple places for consistency BEFORE generating methods
-        // This ensures the struct type is available for self-referential types
-        _type_cache[mangled] = struct_type;
-        ctx().register_type(mangled, struct_type);
-        types().register_struct(mangled, struct_type);
+            // Substitute type parameters in fields and collect field names
+            if (struct_decl)
+            {
+                std::vector<llvm::Type *> field_types = create_substituted_fields(struct_decl->fields());
+                struct_type->setBody(field_types);
+
+                // Collect field names for member access resolution
+                field_names.reserve(struct_decl->fields().size());
+                for (const auto &field : struct_decl->fields())
+                {
+                    field_names.push_back(field->name());
+                }
+            }
+
+            // Cache and register in multiple places for consistency BEFORE generating methods
+            // This ensures the struct type is available for self-referential types
+            _type_cache[mangled] = struct_type;
+            ctx().register_type(mangled, struct_type);
+            types().register_struct(mangled, struct_type);
+        }
 
         // Register type's namespace for cross-module method resolution
         // Use the base generic type's namespace if registered, otherwise use current context
@@ -317,6 +371,9 @@ namespace Cryo::Codegen
                   "GenericCodegen: Registered struct {} (also as {}) with {} fields",
                   mangled, instantiated_name, field_names.size());
 
+        // Mark methods as generated to prevent duplicate generation on next call
+        generated_struct_methods.insert(mangled);
+
         return struct_type;
     }
 
@@ -379,8 +436,24 @@ namespace Cryo::Codegen
             return existing;
         }
 
-        // Get generic definition
+        // Get generic definition - first check local registry, then TemplateRegistry
         Cryo::ASTNode *generic_def = get_generic_type_def(generic_name);
+        if (!generic_def)
+        {
+            // Try to get from TemplateRegistry (for cross-module classes)
+            Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+            if (template_registry)
+            {
+                const Cryo::TemplateRegistry::TemplateInfo *tmpl_info = template_registry->find_template(generic_name);
+                if (tmpl_info && tmpl_info->class_template)
+                {
+                    generic_def = tmpl_info->class_template;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Got class template '{}' from TemplateRegistry",
+                              generic_name);
+                }
+            }
+        }
         if (!generic_def)
         {
             report_error(ErrorCode::E0632_TYPE_RESOLUTION_ERROR,
@@ -1286,6 +1359,116 @@ namespace Cryo::Codegen
             }
         }
         return "";
+    }
+
+    std::string GenericCodegen::substitute_type_annotation(const std::string &type_annotation)
+    {
+        if (_type_param_stack.empty())
+            return "";
+
+        // Check if the type annotation contains generic angle brackets
+        size_t angle_pos = type_annotation.find('<');
+        if (angle_pos == std::string::npos)
+        {
+            // No angle brackets - check if it's a direct type parameter (like "T")
+            TypeRef resolved = resolve_type_param(type_annotation);
+            if (resolved.is_valid())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "substitute_type_annotation: Direct type param '{}' -> '{}'",
+                          type_annotation, resolved->display_name());
+                return resolved->display_name();
+            }
+            // Also check for exact base name match (handled by get_instantiated_scope_name)
+            return get_instantiated_scope_name(type_annotation);
+        }
+
+        // Parse the base name and type arguments
+        std::string base_name = type_annotation.substr(0, angle_pos);
+
+        // Find matching closing bracket
+        size_t close_pos = type_annotation.rfind('>');
+        if (close_pos == std::string::npos || close_pos <= angle_pos)
+            return "";
+
+        std::string args_str = type_annotation.substr(angle_pos + 1, close_pos - angle_pos - 1);
+
+        // Parse comma-separated type arguments (simple parsing, doesn't handle nested generics deeply)
+        std::vector<std::string> type_args;
+        std::string current_arg;
+        int depth = 0;
+        for (char c : args_str)
+        {
+            if (c == '<') depth++;
+            else if (c == '>') depth--;
+            else if (c == ',' && depth == 0)
+            {
+                // Trim whitespace
+                size_t start = current_arg.find_first_not_of(" \t");
+                size_t end = current_arg.find_last_not_of(" \t");
+                if (start != std::string::npos)
+                    type_args.push_back(current_arg.substr(start, end - start + 1));
+                current_arg.clear();
+                continue;
+            }
+            current_arg += c;
+        }
+        // Add last argument
+        size_t start = current_arg.find_first_not_of(" \t");
+        size_t end = current_arg.find_last_not_of(" \t");
+        if (start != std::string::npos)
+            type_args.push_back(current_arg.substr(start, end - start + 1));
+
+        // Substitute type parameters in each argument
+        std::vector<TypeRef> substituted_args;
+        bool any_substituted = false;
+        for (const auto &arg : type_args)
+        {
+            TypeRef resolved = resolve_type_param(arg);
+            if (resolved.is_valid())
+            {
+                substituted_args.push_back(resolved);
+                any_substituted = true;
+            }
+            else
+            {
+                // Try to look up the type by name in the arena
+                TypeRef type = symbols().arena().lookup_type_by_name(arg);
+                if (type.is_valid())
+                {
+                    substituted_args.push_back(type);
+                }
+                else
+                {
+                    // Unknown type - might be a nested generic or unresolved
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "substitute_type_annotation: Could not resolve type arg '{}'", arg);
+                    return "";
+                }
+            }
+        }
+
+        if (!any_substituted)
+            return "";
+
+        // Generate mangled name for the substituted type
+        std::string mangled = mangle_type_name(base_name, substituted_args);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "substitute_type_annotation: '{}' -> '{}'",
+                  type_annotation, mangled);
+
+        // Also ensure the dependent type is instantiated
+        llvm::Type *existing = get_cached_type(mangled);
+        if (!existing)
+        {
+            // Try to instantiate the dependent type
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "substitute_type_annotation: Instantiating dependent type '{}'", mangled);
+            instantiate_struct(base_name, substituted_args);
+        }
+
+        return mangled;
     }
 
     void GenericCodegen::end_type_params()

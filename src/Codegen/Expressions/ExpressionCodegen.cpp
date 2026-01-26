@@ -1678,11 +1678,43 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Get type name and check for generic context redirection
+        std::string type_name = node->type_name();
+        auto *visitor = ctx().visitor();
+        if (visitor)
+        {
+            auto *generics = visitor->get_generics();
+            if (generics && generics->in_type_param_scope())
+            {
+                // First try exact base name match
+                std::string redirected = generics->get_instantiated_scope_name(type_name);
+                if (!redirected.empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_sizeof: Redirecting type {} -> {} in generic context",
+                              type_name, redirected);
+                    type_name = redirected;
+                }
+                else
+                {
+                    // Try substituting type parameters in the annotation (e.g., "HashSetEntry<T>" -> "HashSetEntry_string")
+                    redirected = generics->substitute_type_annotation(type_name);
+                    if (!redirected.empty())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_sizeof: Substituted type annotation {} -> {} in generic context",
+                                  type_name, redirected);
+                        type_name = redirected;
+                    }
+                }
+            }
+        }
+
         // TODO: Get proper Cryo::Type* from node instead of string lookup
-        llvm::Type *llvm_type = types().get_type(node->type_name());
+        llvm::Type *llvm_type = types().get_type(type_name);
         if (!llvm_type)
         {
-            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Unknown type for sizeof: " + node->type_name());
+            report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Unknown type for sizeof: " + type_name);
             return nullptr;
         }
 
@@ -1691,7 +1723,7 @@ namespace Cryo::Codegen
         {
             LOG_WARN(Cryo::LogComponent::CODEGEN,
                      "ExpressionCodegen: sizeof called on unsized type '{}', returning 0",
-                     node->type_name());
+                     type_name);
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0);
         }
 
@@ -2476,6 +2508,39 @@ namespace Cryo::Codegen
             type_name.pop_back();
         }
 
+        // Check if we're inside a generic instantiation context and need to redirect
+        // the type name. For example, if we're generating code for HashSet<string> methods
+        // and the AST says "HashSet", we need to look for "HashSet_string".
+        auto *visitor = ctx().visitor();
+        if (visitor)
+        {
+            auto *generics = visitor->get_generics();
+            if (generics && generics->in_type_param_scope())
+            {
+                // First try exact base name match
+                std::string redirected = generics->get_instantiated_scope_name(type_name);
+                if (!redirected.empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_member_info: Redirecting type {} -> {} in generic context",
+                              type_name, redirected);
+                    type_name = redirected;
+                }
+                else
+                {
+                    // Try substituting type parameters in the annotation (e.g., "HashSetEntry<T>" -> "HashSetEntry_string")
+                    redirected = generics->substitute_type_annotation(type_name);
+                    if (!redirected.empty())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_member_info: Substituted type annotation {} -> {} in generic context",
+                                  type_name, redirected);
+                        type_name = redirected;
+                    }
+                }
+            }
+        }
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "resolve_member_info: Looking up type '{}' for member '{}'",
                   type_name, member_name);
@@ -2961,6 +3026,105 @@ namespace Cryo::Codegen
         std::string type_name = node->struct_type();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating struct literal for {}",
                   type_name);
+
+        // First, check if the node has a resolved type we can use directly
+        // This is especially important for struct literals inside generic methods where
+        // the literal type (e.g., "ArraySplit") is different from the containing generic type (e.g., "Array")
+        // The resolved type may be an InstantiatedType like "ArraySplit<T>" that we can substitute
+        TypeRef resolved_type = node->get_resolved_type();
+        if (resolved_type.is_valid())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_struct_literal: Node has resolved type: {} (kind={})",
+                      resolved_type->display_name(), static_cast<int>(resolved_type->kind()));
+
+            // If the resolved type is an InstantiatedType, try to get the mangled name
+            if (resolved_type->kind() == Cryo::TypeKind::InstantiatedType)
+            {
+                auto *inst_type = static_cast<const Cryo::InstantiatedType *>(resolved_type.get());
+
+                // First check if the InstantiatedType has an already-resolved concrete type
+                // This is set during monomorphization (e.g., CheckedResult<i32> -> CheckedResult_i32)
+                if (inst_type->has_resolved_type())
+                {
+                    TypeRef concrete_type = inst_type->resolved_type();
+                    if (concrete_type.is_valid())
+                    {
+                        type_name = concrete_type->display_name();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_struct_literal: Using InstantiatedType's resolved concrete type: {}",
+                                  type_name);
+                    }
+                }
+                else
+                {
+                    // No concrete resolved type yet - try to substitute type parameters if in generic scope
+                    auto *visitor = ctx().visitor();
+                    if (visitor)
+                    {
+                        auto *generics = visitor->get_generics();
+                        if (generics && generics->in_type_param_scope())
+                        {
+                            // The resolved type's display_name includes type params (e.g., "ArraySplit<T>")
+                            // Use substitute_type_annotation to get the mangled name
+                            std::string resolved_display = resolved_type->display_name();
+                            std::string substituted = generics->substitute_type_annotation(resolved_display);
+                            if (!substituted.empty())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_struct_literal: Using resolved type substitution {} -> {}",
+                                          resolved_display, substituted);
+                                type_name = substituted;
+                            }
+                        }
+                    }
+                }
+            }
+            else if (resolved_type->kind() == Cryo::TypeKind::Struct)
+            {
+                // Resolved to a concrete struct type, use its name directly
+                type_name = resolved_type->display_name();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_struct_literal: Using concrete resolved type name: {}",
+                          type_name);
+            }
+        }
+
+        // Check if we're inside a generic instantiation context and need to redirect
+        // the type name. For example, if we're generating code for HashSet<string> methods
+        // and the AST says "HashSet", we need to look for "HashSet_string".
+        // Also handle types with type parameters like "HashSetEntry<T>" -> "HashSetEntry_string".
+        auto *visitor = ctx().visitor();
+        if (visitor)
+        {
+            auto *generics = visitor->get_generics();
+            if (generics && generics->in_type_param_scope())
+            {
+                // First try exact base name match
+                std::string redirected = generics->get_instantiated_scope_name(type_name);
+                if (!redirected.empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_struct_literal: Redirecting type {} -> {} in generic context",
+                              type_name, redirected);
+                    type_name = redirected;
+                }
+                else if (type_name.find('_') == std::string::npos)
+                {
+                    // Only try substitution if we haven't already mangled the name
+                    // (mangled names contain underscores like "ArraySplit_string")
+                    // Try substituting type parameters in the annotation (e.g., "HashSetEntry<T>" -> "HashSetEntry_string")
+                    redirected = generics->substitute_type_annotation(type_name);
+                    if (!redirected.empty())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_struct_literal: Substituted type annotation {} -> {} in generic context",
+                                  type_name, redirected);
+                        type_name = redirected;
+                    }
+                }
+            }
+        }
 
         // Look up struct type
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Looking up type '{}'", type_name);

@@ -700,17 +700,104 @@ namespace Cryo
                     // Resolve parameter types
                     for (auto &param : method->parameters())
                     {
-                        const auto *param_ann = param->type_annotation();
-                        if (param_ann && (!param->has_resolved_type() || param->get_resolved_type().is_error()))
+                        // Special handling for 'this' parameter with unresolved type
+                        if (param->name() == "this" && param->has_resolved_type())
                         {
-                            TypeRef resolved = resolver.resolve(*param_ann, method_ctx);
-                            if (!resolved.is_error())
+                            TypeRef current_type = param->get_resolved_type();
+                            if (current_type.is_error())
                             {
-                                param->set_resolved_type(resolved);
-                                resolved_count++;
-                                LOG_DEBUG(LogComponent::GENERAL,
-                                    "TypeResolutionPass: Resolved impl param '{}::{}' type to '{}'",
-                                    method->name(), param->name(), resolved->display_name());
+                                // The parser created an error type - try to resolve using impl target
+                                const std::string &target = impl->target_type();
+                                std::string base_name = target;
+                                size_t angle_pos = target.find('<');
+                                if (angle_pos != std::string::npos)
+                                {
+                                    base_name = target.substr(0, angle_pos);
+                                }
+
+                                // Try multiple lookup strategies to find the base type
+                                TypeRef base_type;
+
+                                // Strategy 1: Try arena lookup by name
+                                base_type = arena.lookup_type_by_name(base_name);
+
+                                // Strategy 2: If arena lookup failed, try symbol table enum lookup
+                                if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                {
+                                    base_type = symbols->lookup_enum_type(base_name);
+                                    if (base_type.is_valid() && !base_type.is_error())
+                                    {
+                                        LOG_DEBUG(LogComponent::GENERAL,
+                                            "TypeResolutionPass: Found '{}' via symbol table enum lookup", base_name);
+                                    }
+                                }
+
+                                // Strategy 3: Try symbol table struct lookup
+                                if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                {
+                                    base_type = symbols->lookup_struct_type(base_name);
+                                    if (base_type.is_valid() && !base_type.is_error())
+                                    {
+                                        LOG_DEBUG(LogComponent::GENERAL,
+                                            "TypeResolutionPass: Found '{}' via symbol table struct lookup", base_name);
+                                    }
+                                }
+
+                                // Strategy 4: Try symbol table class lookup
+                                if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                {
+                                    base_type = symbols->lookup_class_type(base_name);
+                                    if (base_type.is_valid() && !base_type.is_error())
+                                    {
+                                        LOG_DEBUG(LogComponent::GENERAL,
+                                            "TypeResolutionPass: Found '{}' via symbol table class lookup", base_name);
+                                    }
+                                }
+
+                                // Strategy 5: Try direct Symbol lookup and extract type
+                                if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                {
+                                    const Symbol *sym = symbols->lookup(base_name);
+                                    if (sym && sym->type.is_valid() && !sym->type.is_error())
+                                    {
+                                        base_type = sym->type;
+                                        LOG_DEBUG(LogComponent::GENERAL,
+                                            "TypeResolutionPass: Found '{}' via direct symbol lookup", base_name);
+                                    }
+                                }
+
+                                if (base_type.is_valid() && !base_type.is_error())
+                                {
+                                    // Create a reference type for &this
+                                    TypeRef this_type = arena.get_reference_to(base_type);
+                                    param->set_resolved_type(this_type);
+                                    resolved_count++;
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                        "TypeResolutionPass: Resolved 'this' param for impl '{}::{}' to '{}'",
+                                        target, method->name(), this_type->display_name());
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                        "TypeResolutionPass: Could not resolve 'this' type for impl '{}::{}' (base '{}' not found in arena or symbol table)",
+                                        target, method->name(), base_name);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            const auto *param_ann = param->type_annotation();
+                            if (param_ann && (!param->has_resolved_type() || param->get_resolved_type().is_error()))
+                            {
+                                TypeRef resolved = resolver.resolve(*param_ann, method_ctx);
+                                if (!resolved.is_error())
+                                {
+                                    param->set_resolved_type(resolved);
+                                    resolved_count++;
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                        "TypeResolutionPass: Resolved impl param '{}::{}' type to '{}'",
+                                        method->name(), param->name(), resolved->display_name());
+                                }
                             }
                         }
                     }
