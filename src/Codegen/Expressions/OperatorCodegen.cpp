@@ -2373,8 +2373,48 @@ namespace Cryo::Codegen
         // Handle array access (e.g., arr[i])
         if (auto *array_access = dynamic_cast<Cryo::ArrayAccessNode *>(expr))
         {
-            // Generate array pointer
-            llvm::Value *array_val = generate_operand(array_access->array());
+            // For array access, we need a pointer to the array, not the array value
+            // Handle identifier arrays specially - get the alloca address
+            llvm::Value *array_val = nullptr;
+
+            if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(array_access->array()))
+            {
+                std::string array_name = identifier->name();
+
+                // Try to get the alloca for the array - this gives us a pointer to the array
+                llvm::AllocaInst *alloca = values().get_alloca(array_name);
+                if (alloca)
+                {
+                    llvm::Type *alloca_type = alloca->getAllocatedType();
+
+                    // If the alloca holds an array type, use the alloca directly as the base pointer
+                    if (alloca_type->isArrayTy())
+                    {
+                        array_val = alloca;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "get_lvalue_address: Using alloca for array '{}'", array_name);
+                    }
+                    // If the alloca holds a pointer (e.g., T*), load it to get the pointer value
+                    else if (alloca_type->isPointerTy())
+                    {
+                        array_val = create_load(alloca, alloca_type, array_name + ".load");
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "get_lvalue_address: Loaded pointer from alloca for '{}'", array_name);
+                    }
+                    else
+                    {
+                        // Other types - try generate_operand as fallback
+                        array_val = generate_operand(array_access->array());
+                    }
+                }
+            }
+
+            // Fallback to generate_operand for non-identifiers or if alloca not found
+            if (!array_val)
+            {
+                array_val = generate_operand(array_access->array());
+            }
+
             if (!array_val)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -2395,7 +2435,8 @@ namespace Cryo::Codegen
             if (!array_val->getType()->isPointerTy())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "get_lvalue_address: Array expression is not a pointer type");
+                          "get_lvalue_address: Array expression is not a pointer type (type ID: {})",
+                          array_val->getType()->getTypeID());
                 return nullptr;
             }
 
