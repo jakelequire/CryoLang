@@ -917,16 +917,113 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating struct constructor for: {}", type_name);
 
+        std::string effective_type_name = type_name;
+
+        // First, check if the node has a resolved type we can use directly
+        // This is especially important for constructor calls inside generic methods where
+        // the constructor type (e.g., "CheckedResult") is different from the containing generic type
+        TypeRef resolved_type = node->get_resolved_type();
+        if (resolved_type.is_valid())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_struct_constructor: Node has resolved type: {} (kind={})",
+                      resolved_type->display_name(), static_cast<int>(resolved_type->kind()));
+
+            // If the resolved type is an InstantiatedType, try to get the mangled name
+            if (resolved_type->kind() == Cryo::TypeKind::InstantiatedType)
+            {
+                auto *inst_type = static_cast<const Cryo::InstantiatedType *>(resolved_type.get());
+
+                // First check if the InstantiatedType has an already-resolved concrete type
+                // This is set during monomorphization (e.g., CheckedResult<i32> -> CheckedResult_i32)
+                if (inst_type->has_resolved_type())
+                {
+                    TypeRef concrete_type = inst_type->resolved_type();
+                    if (concrete_type.is_valid())
+                    {
+                        effective_type_name = concrete_type->display_name();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_struct_constructor: Using InstantiatedType's resolved concrete type: {}",
+                                  effective_type_name);
+                    }
+                }
+                else
+                {
+                    // No concrete resolved type yet - try to substitute type parameters if in generic scope
+                    auto *visitor = ctx().visitor();
+                    if (visitor)
+                    {
+                        auto *generics = visitor->get_generics();
+                        if (generics && generics->in_type_param_scope())
+                        {
+                            std::string resolved_display = resolved_type->display_name();
+                            std::string substituted = generics->substitute_type_annotation(resolved_display);
+                            if (!substituted.empty())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_struct_constructor: Using resolved type substitution {} -> {}",
+                                          resolved_display, substituted);
+                                effective_type_name = substituted;
+                            }
+                        }
+                    }
+                }
+            }
+            else if (resolved_type->kind() == Cryo::TypeKind::Struct)
+            {
+                // Resolved to a concrete struct type, use its name directly
+                effective_type_name = resolved_type->display_name();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_struct_constructor: Using concrete resolved type name: {}",
+                          effective_type_name);
+            }
+        }
+
+        // Check if we're inside a generic instantiation context and need to redirect
+        // the type name. For example, if we're generating code for HashSet<string> methods
+        // and the AST says "HashSet { ... }", we need to look for "HashSet_string".
+        // Also handle types with type parameters like "HashSetEntry<T>" -> "HashSetEntry_string".
+        auto *visitor = ctx().visitor();
+        if (visitor)
+        {
+            auto *generics = visitor->get_generics();
+            if (generics && generics->in_type_param_scope())
+            {
+                // First try exact base name match
+                std::string redirected = generics->get_instantiated_scope_name(effective_type_name);
+                if (!redirected.empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_struct_constructor: Redirecting type {} -> {} in generic context",
+                              effective_type_name, redirected);
+                    effective_type_name = redirected;
+                }
+                else if (effective_type_name.find('_') == std::string::npos)
+                {
+                    // Only try substitution if we haven't already mangled the name
+                    // Try substituting type parameters in the annotation (e.g., "HashSetEntry<T>" -> "HashSetEntry_string")
+                    redirected = generics->substitute_type_annotation(effective_type_name);
+                    if (!redirected.empty())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_struct_constructor: Substituted type annotation {} -> {} in generic context",
+                                  effective_type_name, redirected);
+                        effective_type_name = redirected;
+                    }
+                }
+            }
+        }
+
         // Use SRM-based type resolution to find the struct type
         // This handles: current namespace, imported namespaces, aliases, global scope
-        llvm::Type *struct_type = resolve_type_by_name(type_name);
+        llvm::Type *struct_type = resolve_type_by_name(effective_type_name);
 
         // Determine the resolved type name for constructor lookup
-        std::string resolved_type_name = type_name;
+        std::string resolved_type_name = effective_type_name;
         if (struct_type)
         {
             // Try to get the actual qualified name from the candidates
-            auto candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
+            auto candidates = generate_lookup_candidates(effective_type_name, Cryo::SymbolKind::Type);
             for (const auto &candidate : candidates)
             {
                 if (ctx().get_type(candidate) == struct_type ||
@@ -941,12 +1038,12 @@ namespace Cryo::Codegen
         if (!struct_type || !struct_type->isStructTy())
         {
             report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
-                         "Unknown struct type: " + type_name);
+                         "Unknown struct type: " + effective_type_name);
             return nullptr;
         }
 
         // Allocate on stack
-        llvm::AllocaInst *alloca = create_entry_alloca(struct_type, type_name + ".instance");
+        llvm::AllocaInst *alloca = create_entry_alloca(struct_type, effective_type_name + ".instance");
         if (!alloca)
         {
             report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
@@ -991,16 +1088,107 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating class constructor for: {}", type_name);
 
+        std::string effective_type_name = type_name;
+
+        // First, check if the node has a resolved type we can use directly
+        TypeRef resolved_type = node->get_resolved_type();
+        if (resolved_type.is_valid())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_class_constructor: Node has resolved type: {} (kind={})",
+                      resolved_type->display_name(), static_cast<int>(resolved_type->kind()));
+
+            if (resolved_type->kind() == Cryo::TypeKind::InstantiatedType)
+            {
+                auto *inst_type = static_cast<const Cryo::InstantiatedType *>(resolved_type.get());
+
+                // First check if the InstantiatedType has an already-resolved concrete type
+                if (inst_type->has_resolved_type())
+                {
+                    TypeRef concrete_type = inst_type->resolved_type();
+                    if (concrete_type.is_valid())
+                    {
+                        effective_type_name = concrete_type->display_name();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_class_constructor: Using InstantiatedType's resolved concrete type: {}",
+                                  effective_type_name);
+                    }
+                }
+                else
+                {
+                    // No concrete resolved type yet - try to substitute type parameters if in generic scope
+                    auto *visitor = ctx().visitor();
+                    if (visitor)
+                    {
+                        auto *generics = visitor->get_generics();
+                        if (generics && generics->in_type_param_scope())
+                        {
+                            std::string resolved_display = resolved_type->display_name();
+                            std::string substituted = generics->substitute_type_annotation(resolved_display);
+                            if (!substituted.empty())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_class_constructor: Using resolved type substitution {} -> {}",
+                                          resolved_display, substituted);
+                                effective_type_name = substituted;
+                            }
+                        }
+                    }
+                }
+            }
+            else if (resolved_type->kind() == Cryo::TypeKind::Class)
+            {
+                effective_type_name = resolved_type->display_name();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_class_constructor: Using concrete resolved type name: {}",
+                          effective_type_name);
+            }
+        }
+
+        // Check if we're inside a generic instantiation context and need to redirect
+        // the type name. For example, if we're generating code for MyClass<string> methods
+        // and the AST says "MyClass { ... }", we need to look for "MyClass_string".
+        // Also handle types with type parameters like "MyHelper<T>" -> "MyHelper_string".
+        auto *visitor = ctx().visitor();
+        if (visitor)
+        {
+            auto *generics = visitor->get_generics();
+            if (generics && generics->in_type_param_scope())
+            {
+                // First try exact base name match
+                std::string redirected = generics->get_instantiated_scope_name(effective_type_name);
+                if (!redirected.empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_class_constructor: Redirecting type {} -> {} in generic context",
+                              effective_type_name, redirected);
+                    effective_type_name = redirected;
+                }
+                else if (effective_type_name.find('_') == std::string::npos)
+                {
+                    // Try substituting type parameters in the annotation (e.g., "MyHelper<T>" -> "MyHelper_string")
+                    redirected = generics->substitute_type_annotation(effective_type_name);
+                    if (!redirected.empty())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_class_constructor: Substituted type annotation {} -> {} in generic context",
+                                  effective_type_name, redirected);
+                        effective_type_name = redirected;
+                    }
+                }
+            }
+        }
+
         // Use SRM-based type resolution to find the class type
         // This handles: current namespace, imported namespaces, aliases, global scope
-        llvm::Type *class_type = resolve_type_by_name(type_name);
+        llvm::Type *class_type = resolve_type_by_name(effective_type_name);
 
         // Determine the resolved type name for constructor lookup
-        std::string resolved_type_name = type_name;
+        std::string resolved_type_name = effective_type_name;
         if (class_type)
         {
             // Try to get the actual qualified name from the candidates
-            auto candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
+            auto candidates = generate_lookup_candidates(effective_type_name, Cryo::SymbolKind::Type);
             for (const auto &candidate : candidates)
             {
                 if (ctx().get_type(candidate) == class_type ||
@@ -1015,7 +1203,7 @@ namespace Cryo::Codegen
         if (!class_type || !class_type->isStructTy())
         {
             report_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED, node,
-                         "Unknown class type: " + type_name);
+                         "Unknown class type: " + effective_type_name);
             return nullptr;
         }
 
@@ -1025,7 +1213,7 @@ namespace Cryo::Codegen
         // new ClassName() creates pointer instance (heap allocated via cryo_alloc)
 
         // Allocate on stack (value semantics)
-        llvm::AllocaInst *alloca = create_entry_alloca(class_type, type_name + ".instance");
+        llvm::AllocaInst *alloca = create_entry_alloca(class_type, effective_type_name + ".instance");
         if (!alloca)
         {
             report_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED, node,
@@ -1434,13 +1622,63 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating static method: {}::{}", type_name, method_name);
 
-        // Resolve generic template names to the current instantiated type
-        // This handles calls like HashSet::new() inside HashSet<T> methods
         std::string resolved_type_name = type_name;
         CodegenVisitor *visitor = ctx().visitor();
         GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
 
-        if (generics && generics->is_generic_template(type_name))
+        // First, check if the call expression has a resolved type we can use
+        // This is crucial for generic static methods like Array::new() where the return type
+        // tells us which instantiation to use (e.g., Array<u8> -> Array_u8)
+        TypeRef call_resolved_type = node->get_resolved_type();
+        if (call_resolved_type.is_valid())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_static_method: Call has resolved type: {} (kind={})",
+                      call_resolved_type->display_name(), static_cast<int>(call_resolved_type->kind()));
+
+            if (call_resolved_type->kind() == Cryo::TypeKind::InstantiatedType)
+            {
+                auto *inst_type = static_cast<const Cryo::InstantiatedType *>(call_resolved_type.get());
+
+                // Check if the InstantiatedType has a resolved concrete type
+                if (inst_type->has_resolved_type())
+                {
+                    TypeRef concrete_type = inst_type->resolved_type();
+                    if (concrete_type.is_valid())
+                    {
+                        resolved_type_name = concrete_type->display_name();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_static_method: Using InstantiatedType's resolved concrete type: {}",
+                                  resolved_type_name);
+                    }
+                }
+                else if (generics && generics->in_type_param_scope())
+                {
+                    // Try to substitute type parameters
+                    std::string resolved_display = call_resolved_type->display_name();
+                    std::string substituted = generics->substitute_type_annotation(resolved_display);
+                    if (!substituted.empty())
+                    {
+                        resolved_type_name = substituted;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_static_method: Substituted type annotation {} -> {}",
+                                  resolved_display, resolved_type_name);
+                    }
+                }
+            }
+            else if (call_resolved_type->kind() == Cryo::TypeKind::Struct)
+            {
+                // Already a concrete struct type
+                resolved_type_name = call_resolved_type->display_name();
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_static_method: Using concrete resolved type: {}",
+                          resolved_type_name);
+            }
+        }
+
+        // Fallback: Resolve generic template names to the current instantiated type
+        // This handles calls like HashSet::new() inside HashSet<T> methods
+        if (resolved_type_name == type_name && generics && generics->is_generic_template(type_name))
         {
             std::string current_type = ctx().current_type_name();
             // Check if we're inside an instantiated version of this generic type

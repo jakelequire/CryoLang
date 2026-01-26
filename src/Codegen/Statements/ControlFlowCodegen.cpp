@@ -1,5 +1,6 @@
 #include "Codegen/Statements/ControlFlowCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
+#include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -886,9 +887,97 @@ namespace Cryo::Codegen
             return nullptr;
 
         case Cryo::PatternNode::PatternType::Enum:
-            // Enum pattern - would need to compare enum discriminant
-            // For now, treat as wildcard
-            return nullptr;
+        {
+            // Enum pattern - compare discriminant
+            auto *enum_pattern = dynamic_cast<Cryo::EnumPatternNode *>(pattern);
+            if (!enum_pattern)
+                return nullptr;
+
+            std::string enum_name = enum_pattern->enum_name();
+            std::string variant_name = enum_pattern->variant_name();
+
+            // Check if we're inside a generic instantiation context and need to redirect
+            // the enum type name. For example, "Option" -> "Option_string"
+            auto *visitor = ctx().visitor();
+            if (visitor)
+            {
+                auto *generics = visitor->get_generics();
+                if (generics && generics->in_type_param_scope())
+                {
+                    std::string redirected = generics->get_instantiated_scope_name(enum_name);
+                    if (!redirected.empty())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_pattern_match: Redirecting enum type {} -> {} in generic context",
+                                  enum_name, redirected);
+                        enum_name = redirected;
+                    }
+                }
+            }
+
+            // Build candidate variant names for lookup
+            std::vector<std::string> variant_candidates = {
+                enum_name + "::" + variant_name,
+                variant_name,
+                enum_pattern->enum_name() + "::" + variant_name};
+
+            // Look up the expected discriminant value
+            llvm::Value *expected_discriminant = nullptr;
+            auto &variants_map = ctx().enum_variants_map();
+            for (const auto &candidate : variant_candidates)
+            {
+                auto it = variants_map.find(candidate);
+                if (it != variants_map.end())
+                {
+                    expected_discriminant = it->second;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_pattern_match: Found variant '{}' discriminant", candidate);
+                    break;
+                }
+            }
+
+            if (!expected_discriminant)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_pattern_match: Could not find discriminant for {}::{}",
+                          enum_name, variant_name);
+                return nullptr; // Fall back to wildcard
+            }
+
+            // Get the struct type and extract discriminant from the match value
+            llvm::Type *value_type = value->getType();
+            llvm::Value *discriminant_value = nullptr;
+
+            if (value_type->isStructTy())
+            {
+                // Value is by-value struct, extract element 0
+                discriminant_value = builder().CreateExtractValue(value, 0, "enum.discriminant");
+            }
+            else if (value_type->isPointerTy())
+            {
+                // Value is a pointer to struct, need to GEP and load
+                llvm::Type *resolved_type = ctx().get_type(enum_name);
+                if (!resolved_type || !resolved_type->isStructTy())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_pattern_match: Could not resolve struct type for '{}'", enum_name);
+                    return nullptr;
+                }
+
+                llvm::StructType *struct_type = llvm::cast<llvm::StructType>(resolved_type);
+                llvm::Value *discriminant_ptr = builder().CreateStructGEP(struct_type, value, 0, "discriminant.ptr");
+                discriminant_value = builder().CreateLoad(builder().getInt32Ty(), discriminant_ptr, "enum.discriminant");
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_pattern_match: Unexpected value type for enum match");
+                return nullptr;
+            }
+
+            // Compare discriminant with expected value
+            return builder().CreateICmpEQ(discriminant_value, expected_discriminant, "enum.match");
+        }
         }
 
         // Default: wildcard behavior
@@ -965,6 +1054,26 @@ namespace Cryo::Codegen
             // Try to get the struct type from the pointer
             // In opaque pointer mode, we need to look it up by name
             std::string type_name = enum_pattern->enum_name();
+
+            // Check if we're inside a generic instantiation context and need to redirect
+            // the type name. For example, "Option" -> "Option_string"
+            auto *visitor = ctx().visitor();
+            if (visitor)
+            {
+                auto *generics = visitor->get_generics();
+                if (generics && generics->in_type_param_scope())
+                {
+                    std::string redirected = generics->get_instantiated_scope_name(type_name);
+                    if (!redirected.empty())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "bind_enum_pattern_variables: Redirecting enum type {} -> {} in generic context",
+                                  type_name, redirected);
+                        type_name = redirected;
+                    }
+                }
+            }
+
             llvm::Type *resolved_type = ctx().get_type(type_name);
             if (resolved_type && resolved_type->isStructTy())
             {

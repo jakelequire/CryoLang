@@ -202,6 +202,20 @@ namespace Cryo::Codegen
          */
         bool in_type_param_scope() const { return !_type_param_stack.empty(); }
 
+        /**
+         * @brief Substitute type parameters in a type annotation string
+         *
+         * When inside a type parameter substitution scope, this substitutes
+         * type parameters in the annotation string and returns the mangled name.
+         * For example, if T -> string, "HashSetEntry<T>" becomes "HashSetEntry_string".
+         *
+         * This also handles instantiating dependent generic types if they don't exist.
+         *
+         * @param type_annotation The type annotation string (e.g., "HashSetEntry<T>")
+         * @return The substituted/mangled name (e.g., "HashSetEntry_string"), or empty if no substitution needed
+         */
+        std::string substitute_type_annotation(const std::string &type_annotation);
+
         //===================================================================
         // Instantiation Cache
         //===================================================================
