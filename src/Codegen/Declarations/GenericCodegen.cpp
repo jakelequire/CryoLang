@@ -249,8 +249,24 @@ namespace Cryo::Codegen
         }
 
         // Register type's namespace for cross-module method resolution
-        // Use the base generic type's namespace if registered, otherwise use current context
-        std::string base_namespace = ctx().get_type_namespace(generic_name);
+        // First check TemplateRegistry (for cross-module structs), then fall back to local context
+        Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+        std::string base_namespace;
+        if (template_registry)
+        {
+            const Cryo::TemplateRegistry::TemplateInfo *tmpl_info = template_registry->find_template(generic_name);
+            if (tmpl_info && !tmpl_info->module_namespace.empty())
+            {
+                base_namespace = tmpl_info->module_namespace;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Got namespace '{}' from template registry for struct '{}'",
+                          base_namespace, generic_name);
+            }
+        }
+        if (base_namespace.empty())
+        {
+            base_namespace = ctx().get_type_namespace(generic_name);
+        }
         if (base_namespace.empty())
         {
             base_namespace = ctx().namespace_context();
@@ -617,8 +633,24 @@ namespace Cryo::Codegen
         types().register_struct(mangled, class_type);
 
         // Register type's namespace for cross-module method resolution
-        // Use the base generic type's namespace if registered, otherwise use current context
-        std::string base_namespace = ctx().get_type_namespace(generic_name);
+        // First check TemplateRegistry (for cross-module classes), then fall back to local context
+        Cryo::TemplateRegistry *template_registry_cls = ctx().template_registry();
+        std::string base_namespace;
+        if (template_registry_cls)
+        {
+            const Cryo::TemplateRegistry::TemplateInfo *tmpl_info = template_registry_cls->find_template(generic_name);
+            if (tmpl_info && !tmpl_info->module_namespace.empty())
+            {
+                base_namespace = tmpl_info->module_namespace;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Got namespace '{}' from template registry for class '{}'",
+                          base_namespace, generic_name);
+            }
+        }
+        if (base_namespace.empty())
+        {
+            base_namespace = ctx().get_type_namespace(generic_name);
+        }
         if (base_namespace.empty())
         {
             base_namespace = ctx().namespace_context();
