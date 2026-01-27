@@ -5,6 +5,7 @@
 #include "Types/CompoundTypes.hpp"
 #include "Types/GenericTypes.hpp"
 #include "Types/UserDefinedTypes.hpp"
+#include "Types/TypeAnnotation.hpp"
 #include "Utils/Logger.hpp"
 
 #include <unordered_set>
@@ -996,6 +997,20 @@ namespace Cryo::Codegen
                             payload_type = symbols().arena().lookup_type_by_name(type_name);
                         }
 
+                        // Fallback: try LLVM context directly for types created by other modules
+                        if (!payload_type.is_valid())
+                        {
+                            llvm::StructType *llvm_st = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+                            if (llvm_st && !llvm_st->isOpaque() && llvm_st->isSized())
+                            {
+                                variant_size += module()->getDataLayout().getTypeAllocSize(llvm_st);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "GenericCodegen: Used LLVM context lookup for '{}': {} bytes",
+                                          type_name, module()->getDataLayout().getTypeAllocSize(llvm_st));
+                                continue; // Skip normal payload_type processing
+                            }
+                        }
+
                         if (payload_type.is_valid())
                         {
                             llvm::Type *llvm_type = types().map(payload_type);
@@ -1057,22 +1072,40 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Track whether we computed any real payload sizes before applying the minimum.
+            // If all variants produced 0 bytes, the types weren't available yet (this runs
+            // at Pass 6.2 before TypeLoweringPass). In that case, leave the struct opaque
+            // so TypeMapper can set the correct body during Pass 7.1.
+            bool payload_computed_successfully = (max_payload_size > 0);
+
             // Ensure minimum payload size
             max_payload_size = std::max(max_payload_size, static_cast<size_t>(8));
-
-            // Create tagged union type
-            llvm::Type *discriminant_type = llvm::Type::getInt32Ty(llvm_ctx());
-            llvm::Type *payload_type = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload_size);
 
             // Use existing opaque type if one exists, otherwise create a new one
             llvm::StructType *enum_struct = existing_opaque ? existing_opaque
                                                             : llvm::StructType::create(llvm_ctx(), mangled);
-            enum_struct->setBody({discriminant_type, payload_type}, false);
-            enum_type = enum_struct;
 
+            if (payload_computed_successfully)
+            {
+                // We got real sizes - safe to set the body
+                llvm::Type *discriminant_type = llvm::Type::getInt32Ty(llvm_ctx());
+                llvm::Type *payload_arr = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload_size);
+                enum_struct->setBody({discriminant_type, payload_arr}, false);
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "GenericCodegen: Created tagged union for enum '{}': payload size = {} bytes",
                           mangled, max_payload_size);
+            }
+            else
+            {
+                // Could not determine payload sizes (types not available yet at Pass 6.2).
+                // Leave the struct opaque - TypeMapper will set the body during TypeLoweringPass (Pass 7.1)
+                // when all struct LLVM types are available.
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Leaving enum '{}' opaque - payload types not available yet, "
+                          "TypeMapper will complete during type lowering",
+                          mangled);
+            }
+            enum_type = enum_struct;
             }
         } // end if (!type_already_exists)
 
@@ -1190,6 +1223,130 @@ namespace Cryo::Codegen
                 {
                     if (!method)
                         continue;
+
+                    // Skip methods whose `this` type is constrained in a way that's
+                    // incompatible with the current instantiation.
+                    // E.g., transpose(this: Result<Option<T>, E>) should NOT be generated
+                    // for Result<Duration, SystemTimeError> because Duration is not Option<...>.
+                    //
+                    // The parser creates Named annotations with the full type string
+                    // (e.g., "Result<Option<T>, E>"), not structured Generic annotations,
+                    // so we parse the string to extract type argument constraints.
+                    if (!method->is_static() && !method->parameters().empty())
+                    {
+                        const auto &this_param = method->parameters()[0];
+                        if (this_param->name() == "this" && this_param->has_type_annotation())
+                        {
+                            const TypeAnnotation *ann = this_param->type_annotation();
+                            if (ann && ann->kind == TypeAnnotationKind::Named)
+                            {
+                                const std::string &ann_name = ann->name;
+                                std::string prefix = generic_name + "<";
+
+                                // Check if annotation is "EnumName<...>" (constrained this type)
+                                if (ann_name.length() > prefix.length() &&
+                                    ann_name.compare(0, prefix.length(), prefix) == 0 &&
+                                    ann_name.back() == '>')
+                                {
+                                    // Extract type argument strings from e.g. "Result<Option<T>, E>"
+                                    // → ["Option<T>", "E"], respecting angle bracket nesting
+                                    std::string inner = ann_name.substr(
+                                        prefix.length(),
+                                        ann_name.length() - prefix.length() - 1);
+
+                                    std::vector<std::string> ann_type_args;
+                                    int depth = 0;
+                                    size_t start = 0;
+                                    for (size_t ci = 0; ci < inner.length(); ++ci)
+                                    {
+                                        if (inner[ci] == '<')
+                                            depth++;
+                                        else if (inner[ci] == '>')
+                                            depth--;
+                                        else if (inner[ci] == ',' && depth == 0)
+                                        {
+                                            std::string arg = inner.substr(start, ci - start);
+                                            size_t f = arg.find_first_not_of(" \t");
+                                            size_t l = arg.find_last_not_of(" \t");
+                                            if (f != std::string::npos)
+                                                ann_type_args.push_back(arg.substr(f, l - f + 1));
+                                            start = ci + 1;
+                                        }
+                                    }
+                                    // Last argument
+                                    std::string last_arg = inner.substr(start);
+                                    size_t f = last_arg.find_first_not_of(" \t");
+                                    size_t l = last_arg.find_last_not_of(" \t");
+                                    if (f != std::string::npos)
+                                        ann_type_args.push_back(last_arg.substr(f, l - f + 1));
+
+                                    // Check compatibility if we got the right number of type args
+                                    if (ann_type_args.size() == type_params.size())
+                                    {
+                                        bool compatible = true;
+                                        for (size_t pi = 0;
+                                             pi < type_params.size() && pi < type_args.size();
+                                             ++pi)
+                                        {
+                                            const std::string &constraint = ann_type_args[pi];
+
+                                            // Bare type parameter name (e.g., "T", "E") → no constraint
+                                            if (constraint == type_params[pi])
+                                                continue;
+
+                                            if (!type_args[pi].is_valid())
+                                            {
+                                                compatible = false;
+                                                break;
+                                            }
+
+                                            std::string actual = type_args[pi]->display_name();
+
+                                            // Generic wrapper constraint (e.g., "Option<T>")
+                                            size_t angle = constraint.find('<');
+                                            if (angle != std::string::npos)
+                                            {
+                                                std::string wrapper = constraint.substr(0, angle);
+                                                std::string exp_prefix = wrapper + "<";
+                                                if (actual.length() < exp_prefix.length() ||
+                                                    actual.compare(0, exp_prefix.length(),
+                                                                   exp_prefix) != 0)
+                                                {
+                                                    compatible = false;
+                                                    break;
+                                                }
+                                            }
+                                            // Pointer constraint (e.g., "T*")
+                                            else if (!constraint.empty() && constraint.back() == '*')
+                                            {
+                                                if (type_args[pi]->kind() != TypeKind::Pointer)
+                                                {
+                                                    compatible = false;
+                                                    break;
+                                                }
+                                            }
+                                            // Concrete type constraint
+                                            else if (actual != constraint)
+                                            {
+                                                compatible = false;
+                                                break;
+                                            }
+                                        }
+
+                                        if (!compatible)
+                                        {
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "GenericCodegen: Skipping method '{}::{}' - "
+                                                      "constrained this type '{}' incompatible with "
+                                                      "current instantiation",
+                                                      mangled, method->name(), ann_name);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // Generate method with the mangled enum name as parent type
                     llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
