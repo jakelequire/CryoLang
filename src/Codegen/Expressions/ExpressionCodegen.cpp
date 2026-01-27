@@ -2318,14 +2318,28 @@ namespace Cryo::Codegen
 
                     if (out_struct_type)
                     {
-                        int field_idx = ctx().get_struct_field_index(current_type, member_name);
-                        if (field_idx >= 0)
+                        // Safety check: ensure struct is not opaque (body is set)
+                        // This can happen during nested instantiation when struct A's fields
+                        // trigger instantiation of struct B, and B's methods reference A
+                        if (out_struct_type->isOpaque())
                         {
-                            out_field_idx = static_cast<unsigned>(field_idx);
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "resolve_member_info: Resolved this.{} to index {} via current_type_name",
-                                      member_name, out_field_idx);
-                            return true;
+                                      "resolve_member_info: Struct '{}' is opaque (being instantiated), skipping",
+                                      current_type);
+                            out_struct_type = nullptr;
+                            // Continue to fallback instead of returning
+                        }
+                        else
+                        {
+                            int field_idx = ctx().get_struct_field_index(current_type, member_name);
+                            if (field_idx >= 0)
+                            {
+                                out_field_idx = static_cast<unsigned>(field_idx);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_member_info: Resolved this.{} to index {} via current_type_name",
+                                          member_name, out_field_idx);
+                                return true;
+                            }
                         }
                     }
                 }
@@ -2367,14 +2381,25 @@ namespace Cryo::Codegen
 
                     if (out_struct_type)
                     {
-                        int field_idx = ctx().get_struct_field_index(this_type_name, member_name);
-                        if (field_idx >= 0)
+                        // Safety check: ensure struct is not opaque
+                        if (out_struct_type->isOpaque())
                         {
-                            out_field_idx = static_cast<unsigned>(field_idx);
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "resolve_member_info: Resolved this.{} to index {} via variable_types_map",
-                                      member_name, out_field_idx);
-                            return true;
+                                      "resolve_member_info: Struct '{}' is opaque via variable_types_map, skipping",
+                                      this_type_name);
+                            out_struct_type = nullptr;
+                        }
+                        else
+                        {
+                            int field_idx = ctx().get_struct_field_index(this_type_name, member_name);
+                            if (field_idx >= 0)
+                            {
+                                out_field_idx = static_cast<unsigned>(field_idx);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_member_info: Resolved this.{} to index {} via variable_types_map",
+                                          member_name, out_field_idx);
+                                return true;
+                            }
                         }
                     }
                 }
@@ -2560,6 +2585,15 @@ namespace Cryo::Codegen
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "resolve_member_info: Struct type '{}' not found", type_name);
+            return false;
+        }
+
+        // Safety check: ensure struct is not opaque (body is set)
+        if (out_struct_type->isOpaque())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_member_info: Struct type '{}' is opaque (being instantiated), cannot access members",
+                      type_name);
             return false;
         }
 

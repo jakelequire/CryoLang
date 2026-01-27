@@ -116,8 +116,10 @@ namespace Cryo::Codegen
          * @brief Bind pattern variables for an enum pattern match
          * @param value The matched enum value
          * @param pattern The enum pattern containing bound variables
+         * @param match_expr Optional: the match expression node to get resolved type from
          */
-        void bind_enum_pattern_variables(llvm::Value *value, Cryo::PatternNode *pattern);
+        void bind_enum_pattern_variables(llvm::Value *value, Cryo::PatternNode *pattern,
+                                         Cryo::ExpressionNode *match_expr = nullptr);
 
         //===================================================================
         // Jump Statements
