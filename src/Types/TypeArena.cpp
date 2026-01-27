@@ -694,6 +694,38 @@ namespace Cryo
         }
     }
 
+    void TypeArena::register_instantiated_by_name(TypeRef instantiated, const std::string &alias)
+    {
+        if (!instantiated.is_valid() || instantiated->kind() != TypeKind::InstantiatedType)
+            return;
+
+        auto *inst = static_cast<const InstantiatedType *>(instantiated.get());
+        TypeRef base = inst->generic_base();
+        if (!base.is_valid())
+            return;
+
+        switch (base->kind())
+        {
+        case TypeKind::Enum:
+            _enum_types[alias] = instantiated;
+            LOG_DEBUG(LogComponent::TYPECHECKER,
+                      "TypeArena: Registered instantiated enum alias '{}' in name cache", alias);
+            break;
+        case TypeKind::Struct:
+            _struct_types[alias] = instantiated;
+            LOG_DEBUG(LogComponent::TYPECHECKER,
+                      "TypeArena: Registered instantiated struct alias '{}' in name cache", alias);
+            break;
+        case TypeKind::Class:
+            _class_types[alias] = instantiated;
+            LOG_DEBUG(LogComponent::TYPECHECKER,
+                      "TypeArena: Registered instantiated class alias '{}' in name cache", alias);
+            break;
+        default:
+            break;
+        }
+    }
+
     // ========================================================================
     // Error type creation
     // ========================================================================
