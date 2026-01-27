@@ -342,6 +342,10 @@ namespace Cryo
         // This allows lookups like "Option<(String, String)>" to find the type
         void register_instantiated_by_name(TypeRef instantiated);
 
+        // Register an instantiated type under an explicit alias name
+        // Used by GenericCodegen to register under the mangled LLVM name (e.g., "Result_voidp_AllocError")
+        void register_instantiated_by_name(TypeRef instantiated, const std::string &alias);
+
         // ====================================================================
         // Error type creation
         // ====================================================================
