@@ -799,7 +799,7 @@ namespace Cryo::Codegen
             // Bind pattern variables before generating body
             if (pattern)
             {
-                bind_enum_pattern_variables(match_value, pattern);
+                bind_enum_pattern_variables(match_value, pattern, node->expr());
             }
 
             if (arm->body())
@@ -984,7 +984,8 @@ namespace Cryo::Codegen
         return nullptr;
     }
 
-    void ControlFlowCodegen::bind_enum_pattern_variables(llvm::Value *value, Cryo::PatternNode *pattern)
+    void ControlFlowCodegen::bind_enum_pattern_variables(llvm::Value *value, Cryo::PatternNode *pattern,
+                                                         Cryo::ExpressionNode *match_expr)
     {
         if (!value || !pattern)
             return;
@@ -1045,6 +1046,13 @@ namespace Cryo::Codegen
             struct_type = llvm::cast<llvm::StructType>(value_type);
             // Value is by-value, we need to create an alloca to get a pointer for GEP
             base_ptr = create_entry_alloca(struct_type, "enum_match_temp");
+            if (!base_ptr)
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "bind_enum_pattern_variables: Failed to create alloca for enum match temp (struct: {})",
+                          struct_type->hasName() ? struct_type->getName().str() : "<unnamed>");
+                return;
+            }
             builder().CreateStore(value, base_ptr);
         }
         else if (value_type->isPointerTy())
@@ -1053,28 +1061,103 @@ namespace Cryo::Codegen
             base_ptr = value;
             // Try to get the struct type from the pointer
             // In opaque pointer mode, we need to look it up by name
-            std::string type_name = enum_pattern->enum_name();
 
-            // Check if we're inside a generic instantiation context and need to redirect
-            // the type name. For example, "Option" -> "Option_string"
-            auto *visitor = ctx().visitor();
-            if (visitor)
+            std::string type_name;
+
+            // First, try to get the type name from the match expression's resolved type
+            // This gives us the correct instantiated name like "Result_i8_ConversionError"
+            if (match_expr)
             {
-                auto *generics = visitor->get_generics();
-                if (generics && generics->in_type_param_scope())
+                TypeRef resolved_type_ref = match_expr->get_resolved_type();
+                if (resolved_type_ref.is_valid())
                 {
-                    std::string redirected = generics->get_instantiated_scope_name(type_name);
-                    if (!redirected.empty())
+                    // Handle InstantiatedType - use the resolved (monomorphized) type
+                    if (resolved_type_ref->kind() == Cryo::TypeKind::InstantiatedType)
                     {
+                        auto *inst_type = static_cast<const Cryo::InstantiatedType *>(resolved_type_ref.get());
+                        if (inst_type->has_resolved_type())
+                        {
+                            TypeRef concrete_type = inst_type->resolved_type();
+                            if (concrete_type.is_valid())
+                            {
+                                type_name = concrete_type->display_name();
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "bind_enum_pattern_variables: Using InstantiatedType's resolved name: {}",
+                                          type_name);
+                            }
+                        }
+                        else
+                        {
+                            // No resolved_type, use display_name of InstantiatedType itself
+                            type_name = resolved_type_ref->display_name();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "bind_enum_pattern_variables: Using InstantiatedType display name: {}",
+                                      type_name);
+                        }
+                    }
+                    else
+                    {
+                        type_name = resolved_type_ref->display_name();
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "bind_enum_pattern_variables: Redirecting enum type {} -> {} in generic context",
-                                  type_name, redirected);
-                        type_name = redirected;
+                                  "bind_enum_pattern_variables: Using resolved type display name: {}",
+                                  type_name);
                     }
                 }
             }
 
+            // Fallback to pattern's enum name with generic redirection
+            if (type_name.empty())
+            {
+                type_name = enum_pattern->enum_name();
+
+                // Check if we're inside a generic instantiation context and need to redirect
+                // the type name. For example, "Option" -> "Option_string"
+                auto *visitor = ctx().visitor();
+                if (visitor)
+                {
+                    auto *generics = visitor->get_generics();
+                    if (generics && generics->in_type_param_scope())
+                    {
+                        std::string redirected = generics->get_instantiated_scope_name(type_name);
+                        if (!redirected.empty())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "bind_enum_pattern_variables: Redirecting enum type {} -> {} in generic context",
+                                      type_name, redirected);
+                            type_name = redirected;
+                        }
+                    }
+                }
+            }
+
+            // Convert type name format if needed (e.g., "Result<i8, ConversionError>" -> "Result_i8_ConversionError")
+            // First try exact match
             llvm::Type *resolved_type = ctx().get_type(type_name);
+            if (!resolved_type || !resolved_type->isStructTy())
+            {
+                // Try converting angle bracket format to underscore format
+                std::string mangled_name = type_name;
+                for (char &c : mangled_name)
+                {
+                    if (c == '<' || c == '>' || c == ',' || c == ' ')
+                        c = '_';
+                }
+                // Remove trailing underscores
+                while (!mangled_name.empty() && mangled_name.back() == '_')
+                    mangled_name.pop_back();
+
+                if (mangled_name != type_name)
+                {
+                    resolved_type = ctx().get_type(mangled_name);
+                    if (resolved_type && resolved_type->isStructTy())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "bind_enum_pattern_variables: Found type via mangled name '{}' (original: '{}')",
+                                  mangled_name, type_name);
+                    }
+                }
+            }
+
             if (resolved_type && resolved_type->isStructTy())
             {
                 struct_type = llvm::cast<llvm::StructType>(resolved_type);
@@ -1165,10 +1248,29 @@ namespace Cryo::Codegen
             auto *enum_type = static_cast<const EnumType *>(enum_type_ref.get());
             if (const EnumVariant *variant = enum_type->get_variant(variant_name))
             {
-                payload_types = variant->payload_types;
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "bind_enum_pattern_variables: Found variant {}::{} with {} payload types",
-                          enum_name, variant_name, payload_types.size());
+                // Check if we're in a generic context and need to substitute type parameters
+                auto *visitor = ctx().visitor();
+                auto *generics = visitor ? visitor->get_generics() : nullptr;
+
+                if (generics && generics->in_type_param_scope())
+                {
+                    // Substitute generic params using the current instantiation context
+                    for (const auto &pt : variant->payload_types)
+                    {
+                        TypeRef substituted = generics->substitute_type_params(pt);
+                        payload_types.push_back(substituted.is_valid() ? substituted : pt);
+                    }
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "bind_enum_pattern_variables: Found variant {}::{} with {} payload types (substituted in generic context)",
+                              enum_name, variant_name, payload_types.size());
+                }
+                else
+                {
+                    payload_types = variant->payload_types;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "bind_enum_pattern_variables: Found variant {}::{} with {} payload types",
+                              enum_name, variant_name, payload_types.size());
+                }
             }
         }
         // Also check for instantiated enums like Option<Entry<String, i32>>

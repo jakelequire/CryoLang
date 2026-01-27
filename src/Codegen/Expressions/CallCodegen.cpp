@@ -587,7 +587,16 @@ namespace Cryo::Codegen
             llvm::FunctionType *fn_type = llvm::FunctionType::get(return_type, param_types, false);
 
             // Create the indirect call
-            llvm::Value *result = builder().CreateCall(fn_type, fn_ptr, args, "indirect.call");
+            // Note: void calls cannot have a name in LLVM IR, so only provide name for non-void returns
+            llvm::Value *result;
+            if (return_type->isVoidTy())
+            {
+                result = builder().CreateCall(fn_type, fn_ptr, args);
+            }
+            else
+            {
+                result = builder().CreateCall(fn_type, fn_ptr, args, "indirect.call");
+            }
 
             return result;
         }
@@ -743,6 +752,26 @@ namespace Cryo::Codegen
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "classify_call: '{}' is a generic template, treating as StaticMethod", obj_name);
+                        return CallKind::StaticMethod;
+                    }
+                }
+
+                // Check if it's a registered type (including type aliases like PthreadMutex = void[40])
+                // If a type exists with this name, treat Type::method() as a static method call
+                if (ctx().get_type(obj_name) != nullptr)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "classify_call: '{}' is a registered type, treating as StaticMethod", obj_name);
+                    return CallKind::StaticMethod;
+                }
+
+                // Also check the type arena for type aliases that might not be in the LLVM type map yet
+                {
+                    TypeRef type_ref = ctx().symbols().arena().lookup_type_by_name(obj_name);
+                    if (type_ref.is_valid())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "classify_call: '{}' found in type arena, treating as StaticMethod", obj_name);
                         return CallKind::StaticMethod;
                     }
                 }
@@ -1316,6 +1345,176 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "generate_enum_variant: Node has no resolved type, using base name: {}",
                       resolved_enum_name);
+
+            // When inside a generic method being monomorphized (type param scope),
+            // we need to infer the instantiated enum type from context.
+            // For example, Option::Some(value) inside Result<T,E>::ok() -> Option<T>
+            // should become Option_i32::Some(value) when T=i32
+            CodegenVisitor *visitor = ctx().visitor();
+            GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
+
+            if (generics && generics->in_type_param_scope())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_enum_variant: In type param scope, attempting to infer instantiated enum type");
+
+                // First check if the enum name directly maps to an instantiated scope name
+                std::string redirected = generics->get_instantiated_scope_name(resolved_enum_name);
+                if (!redirected.empty())
+                {
+                    instantiated_enum_name = redirected;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_enum_variant: Redirected '{}' to '{}' via scope name",
+                              resolved_enum_name, instantiated_enum_name);
+                }
+                else
+                {
+                    // Check if the enum is a generic template - first local registry, then TemplateRegistry
+                    Cryo::ASTNode *enum_def = nullptr;
+                    bool is_generic = generics->is_generic_template(resolved_enum_name);
+
+                    if (is_generic)
+                    {
+                        enum_def = generics->get_generic_type_def(resolved_enum_name);
+                    }
+
+                    // Try TemplateRegistry for cross-module generic enums
+                    if (!enum_def)
+                    {
+                        Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+                        if (template_registry)
+                        {
+                            const Cryo::TemplateRegistry::TemplateInfo *tmpl_info =
+                                template_registry->find_template(resolved_enum_name);
+                            if (tmpl_info && tmpl_info->enum_template)
+                            {
+                                enum_def = tmpl_info->enum_template;
+                                is_generic = true;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_enum_variant: Found enum template '{}' in TemplateRegistry",
+                                          resolved_enum_name);
+                            }
+                        }
+                    }
+
+                    auto *enum_decl = enum_def ? dynamic_cast<Cryo::EnumDeclarationNode *>(enum_def) : nullptr;
+
+                    if (enum_decl && !enum_decl->generic_parameters().empty())
+                    {
+                        // Get the enum's type parameters (e.g., ["T"] for Option, ["T", "E"] for Result)
+                        std::vector<std::string> type_params;
+                        for (const auto &param : enum_decl->generic_parameters())
+                        {
+                            type_params.push_back(param->name());
+                        }
+
+                        // Find the variant being called
+                        const Cryo::EnumVariantNode *target_variant = nullptr;
+                        for (const auto &variant : enum_decl->variants())
+                        {
+                            if (variant->name() == variant_name)
+                            {
+                                target_variant = variant.get();
+                                break;
+                            }
+                        }
+
+                        // Build type arguments by mapping variant payload types to type parameters
+                        std::vector<TypeRef> inferred_type_args(type_params.size());
+                        bool all_inferred = false;
+
+                        if (target_variant && !target_variant->associated_types().empty())
+                        {
+                            // Variant has payload - infer type args from call arguments
+                            const auto &arg_nodes = node->arguments();
+                            const auto &assoc_types = target_variant->associated_types();
+
+                            for (size_t i = 0; i < assoc_types.size() && i < arg_nodes.size(); ++i)
+                            {
+                                const std::string &assoc_type = assoc_types[i];
+
+                                // Find which type parameter this payload corresponds to
+                                for (size_t j = 0; j < type_params.size(); ++j)
+                                {
+                                    if (assoc_type == type_params[j])
+                                    {
+                                        // Get the argument's resolved type
+                                        TypeRef arg_type = arg_nodes[i] ? arg_nodes[i]->get_resolved_type() : TypeRef{};
+
+                                        if (arg_type.is_valid())
+                                        {
+                                            // If it's a GenericParam, substitute it
+                                            if (arg_type->kind() == TypeKind::GenericParam)
+                                            {
+                                                TypeRef substituted = generics->resolve_type_param(arg_type->display_name());
+                                                if (substituted.is_valid())
+                                                {
+                                                    arg_type = substituted;
+                                                }
+                                            }
+                                            inferred_type_args[j] = arg_type;
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "generate_enum_variant: Inferred type param {} = {} from argument",
+                                                      type_params[j], arg_type->display_name());
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // For any type parameters not inferred from arguments, try the current scope bindings
+                        for (size_t i = 0; i < type_params.size(); ++i)
+                        {
+                            if (!inferred_type_args[i].is_valid())
+                            {
+                                TypeRef binding = generics->resolve_type_param(type_params[i]);
+                                if (binding.is_valid())
+                                {
+                                    inferred_type_args[i] = binding;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "generate_enum_variant: Inferred type param {} = {} from scope binding",
+                                              type_params[i], binding->display_name());
+                                }
+                            }
+                        }
+
+                        // Check if all type arguments were inferred
+                        all_inferred = true;
+                        for (const auto &arg : inferred_type_args)
+                        {
+                            if (!arg.is_valid())
+                            {
+                                all_inferred = false;
+                                break;
+                            }
+                        }
+
+                        if (all_inferred)
+                        {
+                            instantiated_enum_name = generics->mangle_type_name(resolved_enum_name, inferred_type_args);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "generate_enum_variant: Inferred instantiation '{}' for {}::{}",
+                                      instantiated_enum_name, resolved_enum_name, variant_name);
+
+                            // Ensure the enum type is instantiated
+                            if (!generics->has_type_instantiation(instantiated_enum_name))
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_enum_variant: Instantiating enum '{}'",
+                                          instantiated_enum_name);
+                                generics->instantiate_enum(resolved_enum_name, inferred_type_args);
+                            }
+                        }
+                        else
+                        {
+                            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                     "generate_enum_variant: Could not infer all type arguments for {}::{}",
+                                     resolved_enum_name, variant_name);
+                        }
+                    }
+                }
+            }
         }
 
         // Use instantiated name for qualified variant lookup
@@ -1729,44 +1928,50 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "Static new() not found for {}, trying constructor fallback", resolved_type_name);
 
-            // Get the struct type first
-            llvm::Type *struct_type = resolve_type_by_name(resolved_type_name);
-            if (!struct_type || !struct_type->isStructTy())
+            // Get the type (could be struct, array, or other)
+            llvm::Type *target_type = resolve_type_by_name(resolved_type_name);
+            if (!target_type)
             {
                 report_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED, node,
                              "Unknown type for ::new(): " + resolved_type_name);
                 return nullptr;
             }
 
-            // 2a. Try to find a matching constructor
-            std::vector<llvm::Type *> arg_types;
-            for (auto *arg : args)
+            // For struct types, try to find a constructor first
+            if (target_type->isStructTy())
             {
-                arg_types.push_back(arg->getType());
-            }
-            llvm::Function *ctor = resolve_constructor(resolved_type_name, arg_types);
+                // 2a. Try to find a matching constructor
+                std::vector<llvm::Type *> arg_types;
+                for (auto *arg : args)
+                {
+                    arg_types.push_back(arg->getType());
+                }
+                llvm::Function *ctor = resolve_constructor(resolved_type_name, arg_types);
 
-            if (ctor)
-            {
-                // Found a constructor - allocate and call it
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "Found constructor for {}, calling with {} args", resolved_type_name, args.size());
-                llvm::AllocaInst *alloca = create_entry_alloca(struct_type, resolved_type_name + ".instance");
-                std::vector<llvm::Value *> ctor_args;
-                ctor_args.push_back(alloca);
-                ctor_args.insert(ctor_args.end(), args.begin(), args.end());
-                builder().CreateCall(ctor, ctor_args);
-                return alloca;
+                if (ctor)
+                {
+                    // Found a constructor - allocate and call it
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Found constructor for {}, calling with {} args", resolved_type_name, args.size());
+                    llvm::AllocaInst *alloca = create_entry_alloca(target_type, resolved_type_name + ".instance");
+                    std::vector<llvm::Value *> ctor_args;
+                    ctor_args.push_back(alloca);
+                    ctor_args.insert(ctor_args.end(), args.begin(), args.end());
+                    builder().CreateCall(ctor, ctor_args);
+                    return alloca;
+                }
             }
 
-            // 2b. No constructor found - if no args, zero-initialize (only if type has NO constructors)
+            // 2b. No constructor found - if no args, zero-initialize
+            // This works for structs without constructors, arrays, and other types
             if (args.empty())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "No constructor for {}, generating zero-initialized instance", resolved_type_name);
-                llvm::AllocaInst *alloca = create_entry_alloca(struct_type, resolved_type_name + ".instance");
-                // Zero-initialize the struct
-                builder().CreateStore(llvm::Constant::getNullValue(struct_type), alloca);
+                          "No constructor for {}, generating zero-initialized instance (type ID: {})",
+                          resolved_type_name, target_type->getTypeID());
+                llvm::AllocaInst *alloca = create_entry_alloca(target_type, resolved_type_name + ".instance");
+                // Zero-initialize the type
+                builder().CreateStore(llvm::Constant::getNullValue(target_type), alloca);
                 return alloca;
             }
 

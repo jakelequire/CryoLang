@@ -1698,13 +1698,28 @@ namespace Cryo::Codegen
                       "get_function_type: Function '{}' has error return type, trying annotation '{}'",
                       node->name(), annotation_str);
 
-            // Try to get the LLVM type from the annotation string (handles generic instantiations)
-            llvm::Type *annotation_type = types().resolve_and_map(annotation_str);
+            // If we're in a type param scope, substitute type parameters in the annotation
+            // e.g., "Option<T>" -> "Option_Layout" when T is bound to Layout
+            std::string resolved_annotation = annotation_str;
+            if (_generics && _generics->in_type_param_scope())
+            {
+                std::string substituted = _generics->substitute_type_annotation(annotation_str);
+                if (!substituted.empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "get_function_type: Substituted annotation '{}' -> '{}' for '{}'",
+                              annotation_str, substituted, node->name());
+                    resolved_annotation = substituted;
+                }
+            }
+
+            // Try to get the LLVM type from the (possibly substituted) annotation string
+            llvm::Type *annotation_type = types().resolve_and_map(resolved_annotation);
             if (annotation_type)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "get_function_type: Successfully resolved return type from annotation '{}' for '{}'",
-                          annotation_str, node->name());
+                          "get_function_type: Successfully resolved return type from annotation '{}' (original: '{}') for '{}'",
+                          resolved_annotation, annotation_str, node->name());
                 llvm::Type *return_type = annotation_type;
 
                 // Collect parameter types
@@ -1768,8 +1783,8 @@ namespace Cryo::Codegen
             else
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "get_function_type: Could not resolve annotation '{}' - using opaque pointer for '{}'",
-                          annotation_str, node->name());
+                          "get_function_type: Could not resolve annotation '{}' (original: '{}') - using opaque pointer for '{}'",
+                          resolved_annotation, annotation_str, node->name());
                 // Use opaque pointer for now - the actual type will be resolved at call-time
                 resolved_type = TypeRef(); // Clear to trigger fallback
             }
