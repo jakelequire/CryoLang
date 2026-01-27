@@ -895,7 +895,18 @@ namespace Cryo
             return existing;
         }
 
-        // Calculate payload size from variants
+        // Also check LLVM context directly (GenericCodegen may have created the struct
+        // there without registering it in _struct_cache)
+        if (llvm::StructType *ctx_existing = llvm::StructType::getTypeByName(_llvm_ctx, name))
+        {
+            if (!ctx_existing->isOpaque())
+            {
+                _struct_cache[name] = ctx_existing;
+                return ctx_existing;
+            }
+        }
+
+        // Calculate payload size from variants, with Cryo type system fallback
         size_t max_payload = 0;
         for (const auto &variant : type->variants())
         {
@@ -903,10 +914,17 @@ namespace Cryo
             for (const auto &field : variant.payload_types)
             {
                 llvm::Type *mapped = map(field);
-                if (mapped)
+                size_t sz = 0;
+                if (mapped && mapped->isSized())
                 {
-                    variant_size += size_of(mapped);
+                    sz = size_of(mapped);
                 }
+                // Fallback to Cryo type system when LLVM type is opaque
+                if (sz == 0 && field.is_valid())
+                {
+                    sz = field->size_bytes();
+                }
+                variant_size += sz;
             }
             max_payload = std::max(max_payload, variant_size);
         }
@@ -1186,18 +1204,91 @@ namespace Cryo
         return st;
     }
 
+    /// @brief Convert a display name like "Option<()>" to the mangled form "Option_()"
+    /// used by GenericCodegen. This must match ICodegenComponent::mangle_generic_type_name().
+    static std::string mangle_display_name(const std::string &display_name)
+    {
+        size_t angle_pos = display_name.find('<');
+        if (angle_pos == std::string::npos)
+            return display_name;
+
+        std::string base_name = display_name.substr(0, angle_pos);
+        size_t close_pos = display_name.rfind('>');
+        if (close_pos == std::string::npos || close_pos <= angle_pos)
+            return display_name;
+
+        std::string args_str = display_name.substr(angle_pos + 1, close_pos - angle_pos - 1);
+
+        // Split by commas respecting angle bracket nesting, then mangle each arg
+        std::string mangled = base_name + "_";
+        int depth = 0;
+        std::string current_arg;
+        for (char c : args_str)
+        {
+            if (c == '<')
+            {
+                depth++;
+                current_arg += c;
+            }
+            else if (c == '>')
+            {
+                depth--;
+                current_arg += c;
+            }
+            else if (c == ',' && depth == 0)
+            {
+                // Recursively mangle nested generics
+                std::string trimmed;
+                size_t s = current_arg.find_first_not_of(" \t");
+                size_t e = current_arg.find_last_not_of(" \t");
+                if (s != std::string::npos)
+                    trimmed = current_arg.substr(s, e - s + 1);
+                mangled += mangle_display_name(trimmed) + "_";
+                current_arg.clear();
+            }
+            else if (c != ' ' || depth > 0)
+            {
+                current_arg += c;
+            }
+        }
+        // Add final argument
+        if (!current_arg.empty())
+        {
+            size_t s = current_arg.find_first_not_of(" \t");
+            size_t e = current_arg.find_last_not_of(" \t");
+            if (s != std::string::npos)
+                mangled += mangle_display_name(current_arg.substr(s, e - s + 1));
+        }
+        // Remove trailing underscores
+        while (!mangled.empty() && mangled.back() == '_')
+            mangled.pop_back();
+
+        return mangled;
+    }
+
     llvm::Type *TypeMapper::map_instantiated_enum(
         const InstantiatedType *inst,
         const EnumType *base_enum,
         const std::vector<TypeRef> &type_args)
     {
         std::string name = inst->display_name();
+        std::string mangled = mangle_display_name(name);
 
-        // Check if already complete
+        // Check if already complete under display name or mangled name
         auto existing = lookup_struct(name);
         if (existing && !existing->isOpaque())
         {
             return existing;
+        }
+        if (mangled != name)
+        {
+            auto mangled_existing = llvm::StructType::getTypeByName(_llvm_ctx, mangled);
+            if (mangled_existing && !mangled_existing->isOpaque())
+            {
+                _struct_cache[name] = mangled_existing;
+                _struct_cache[mangled] = mangled_existing;
+                return mangled_existing;
+            }
         }
 
         // Simple enum (no data) -> integer
@@ -1208,6 +1299,26 @@ namespace Cryo
 
         // Complex enum - compute payload size with substituted types
         size_t max_payload = 0;
+
+        // Helper: get size from LLVM type, falling back to Cryo type system
+        // when LLVM types are opaque (e.g., during Pass 6.2 before TypeLoweringPass)
+        auto get_size = [this](TypeRef cryo_type) -> size_t {
+            llvm::Type *mapped = map(cryo_type);
+            if (mapped && mapped->isSized())
+            {
+                size_t llvm_size = size_of(mapped);
+                if (llvm_size > 0)
+                    return llvm_size;
+            }
+            // LLVM type is opaque/unsized - use Cryo type system
+            if (cryo_type.is_valid())
+            {
+                size_t cryo_size = cryo_type->size_bytes();
+                if (cryo_size > 0)
+                    return cryo_size;
+            }
+            return 0;
+        };
 
         // First, check if the InstantiatedType has a resolved_type with proper variant info
         // The Monomorphizer creates a concrete EnumType with correctly substituted payload types
@@ -1222,11 +1333,7 @@ namespace Cryo
                     size_t variant_size = 0;
                     for (const auto &payload_type : variant.payload_types)
                     {
-                        llvm::Type *mapped = map(payload_type);
-                        if (mapped)
-                        {
-                            variant_size += size_of(mapped);
-                        }
+                        variant_size += get_size(payload_type);
                     }
                     max_payload = std::max(max_payload, variant_size);
                 }
@@ -1250,11 +1357,7 @@ namespace Cryo
                 {
                     // Substitute generic params with concrete type args
                     TypeRef concrete = substitute_generic_param(payload_type, type_args);
-                    llvm::Type *mapped = map(concrete);
-                    if (mapped)
-                    {
-                        variant_size += size_of(mapped);
-                    }
+                    variant_size += get_size(concrete);
                 }
                 max_payload = std::max(max_payload, variant_size);
             }
@@ -1268,19 +1371,13 @@ namespace Cryo
                       "TypeMapper::map_instantiated_enum: No variant info for '{}', computing from type_args",
                       name);
 
-            // For generic enums, the payload size is typically the largest type argument
-            // (e.g., Option<Duration> needs sizeof(Duration) for the Some variant)
             for (const auto &type_arg : type_args)
             {
-                llvm::Type *mapped = map(type_arg);
-                if (mapped)
-                {
-                    size_t arg_size = size_of(mapped);
-                    max_payload = std::max(max_payload, arg_size);
-                    LOG_DEBUG(LogComponent::CODEGEN,
-                              "TypeMapper::map_instantiated_enum: Type arg '{}' has size {}",
-                              type_arg->display_name(), arg_size);
-                }
+                size_t arg_size = get_size(type_arg);
+                max_payload = std::max(max_payload, arg_size);
+                LOG_DEBUG(LogComponent::CODEGEN,
+                          "TypeMapper::map_instantiated_enum: Type arg '{}' has size {}",
+                          type_arg->display_name(), arg_size);
             }
         }
 
@@ -1437,13 +1534,32 @@ namespace Cryo
                                                         size_t discriminant_size,
                                                         size_t payload_size)
     {
+        // Compute the mangled form of the name for GenericCodegen compatibility.
+        // GenericCodegen creates opaque structs with mangled names (e.g., "Option_()"),
+        // while TypeMapper uses display names (e.g., "Option<()>").
+        std::string mangled = mangle_display_name(name);
+        bool has_mangled = (mangled != name);
+
+        // Check for existing non-opaque struct under either name
         auto existing = lookup_struct(name);
         if (existing && !existing->isOpaque())
         {
             return existing;
         }
 
-        llvm::StructType *st = existing ? existing : get_or_create_struct(name);
+        // Also check for existing struct under the mangled name
+        llvm::StructType *mangled_st = nullptr;
+        if (has_mangled)
+        {
+            mangled_st = llvm::StructType::getTypeByName(_llvm_ctx, mangled);
+            if (mangled_st && !mangled_st->isOpaque())
+            {
+                // Already complete under mangled name - cache and return it
+                _struct_cache[name] = mangled_st;
+                _struct_cache[mangled] = mangled_st;
+                return mangled_st;
+            }
+        }
 
         llvm::Type *discriminant_type;
         switch (discriminant_size)
@@ -1463,9 +1579,38 @@ namespace Cryo
         }
 
         llvm::ArrayType *payload_type = llvm::ArrayType::get(i8_type(), payload_size);
-
         std::vector<llvm::Type *> fields = {discriminant_type, payload_type};
+
+        // If a mangled-name opaque struct exists (from GenericCodegen), fill it and use it
+        // as the canonical type. This ensures all GEP instructions from GenericCodegen
+        // reference a struct with the correct body.
+        if (mangled_st && mangled_st->isOpaque())
+        {
+            mangled_st->setBody(fields, false);
+            _struct_cache[name] = mangled_st;
+            _struct_cache[mangled] = mangled_st;
+            return mangled_st;
+        }
+
+        // Otherwise, fill the display-name struct as before
+        llvm::StructType *st = existing ? existing : get_or_create_struct(name);
+
+        // Don't overwrite a struct that already has a body (e.g., set by GenericCodegen
+        // with correct sizes from the Cryo type system). get_or_create_struct may find
+        // a non-opaque struct in the LLVM context that lookup_struct missed in _struct_cache.
+        if (!st->isOpaque())
+        {
+            _struct_cache[name] = st;
+            return st;
+        }
+
         st->setBody(fields, false);
+
+        // Also create/fill a mangled-name alias so GenericCodegen lookups succeed
+        if (has_mangled)
+        {
+            _struct_cache[mangled] = st;
+        }
 
         return st;
     }
