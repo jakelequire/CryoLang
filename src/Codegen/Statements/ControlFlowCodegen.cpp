@@ -1297,6 +1297,56 @@ namespace Cryo::Codegen
             }
         }
 
+        // Fallback: use variant field types registered by GenericCodegen during instantiation.
+        // This handles generic enum variants when no InstantiatedType is in the TypeArena
+        // and we're outside the generic type parameter scope (e.g., user code matching on Option<IoError>).
+        if (payload_types.empty())
+        {
+            std::string qualified_variant = enum_name + "::" + variant_name;
+            const auto *field_types = ctx().get_enum_variant_fields(qualified_variant);
+            if (field_types && !field_types->empty())
+            {
+                auto &arena = ctx().symbols().arena();
+                for (const auto &field_type_name : *field_types)
+                {
+                    // Try looking up as a user-defined type first
+                    TypeRef field_ref = arena.lookup_type_by_name(field_type_name);
+                    if (!field_ref.is_valid())
+                    {
+                        // Try common primitive types
+                        if (field_type_name == "i8") field_ref = arena.get_i8();
+                        else if (field_type_name == "i16") field_ref = arena.get_i16();
+                        else if (field_type_name == "i32" || field_type_name == "int") field_ref = arena.get_i32();
+                        else if (field_type_name == "i64") field_ref = arena.get_i64();
+                        else if (field_type_name == "i128") field_ref = arena.get_i128();
+                        else if (field_type_name == "u8") field_ref = arena.get_u8();
+                        else if (field_type_name == "u16") field_ref = arena.get_u16();
+                        else if (field_type_name == "u32") field_ref = arena.get_u32();
+                        else if (field_type_name == "u64") field_ref = arena.get_u64();
+                        else if (field_type_name == "u128") field_ref = arena.get_u128();
+                        else if (field_type_name == "f32" || field_type_name == "float") field_ref = arena.get_f32();
+                        else if (field_type_name == "f64" || field_type_name == "double") field_ref = arena.get_f64();
+                        else if (field_type_name == "bool" || field_type_name == "boolean") field_ref = arena.get_bool();
+                        else if (field_type_name == "string") field_ref = arena.get_string();
+                        else if (field_type_name == "char") field_ref = arena.get_char();
+                        else if (field_type_name == "void") field_ref = arena.get_void();
+                        else if (field_type_name == "void*" || field_type_name == "voidp")
+                            field_ref = arena.get_pointer_to(arena.get_void());
+                    }
+                    if (field_ref.is_valid())
+                    {
+                        payload_types.push_back(field_ref);
+                    }
+                }
+                if (!payload_types.empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "bind_enum_pattern_variables: Found {} payload types for {}::{} via variant field registry",
+                              payload_types.size(), enum_name, variant_name);
+                }
+            }
+        }
+
         // Extract fields from payload for each binding
         // The payload is typically a byte array, and fields are at specific offsets
 
