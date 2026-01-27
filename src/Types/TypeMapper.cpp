@@ -1933,4 +1933,27 @@ namespace Cryo
         return ss.str();
     }
 
+    std::string TypeIDToString(llvm::Type::TypeID id) {
+        switch (id) {
+            case llvm::Type::VoidTyID: return "VoidTyID";
+            case llvm::Type::HalfTyID: return "HalfTyID";
+            case llvm::Type::FloatTyID: return "FloatTyID";
+            case llvm::Type::DoubleTyID: return "DoubleTyID";
+            case llvm::Type::X86_FP80TyID: return "X86_FP80TyID";
+            case llvm::Type::FP128TyID: return "FP128TyID";
+            case llvm::Type::PPC_FP128TyID: return "PPC_FP128TyID";
+            case llvm::Type::LabelTyID: return "LabelTyID";
+            case llvm::Type::MetadataTyID: return "MetadataTyID";
+            case llvm::Type::X86_AMXTyID: return "X86_AMXTyID";
+            case llvm::Type::IntegerTyID: return "IntegerTyID";
+            case llvm::Type::FunctionTyID: return "FunctionTyID";
+            case llvm::Type::StructTyID: return "StructTyID";
+            case llvm::Type::ArrayTyID: return "ArrayTyID";
+            case llvm::Type::PointerTyID: return "PointerTyID";
+            case llvm::Type::FixedVectorTyID: return "FixedVectorTyID";
+            case llvm::Type::ScalableVectorTyID: return "ScalableVectorTyID";
+            default: return "UnknownTypeID";
+        }
+    }
+
 } // namespace Cryo
