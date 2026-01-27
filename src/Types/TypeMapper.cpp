@@ -1207,27 +1207,89 @@ namespace Cryo
         }
 
         // Complex enum - compute payload size with substituted types
-        // Build a simple positional mapping: index 0 = first type arg, etc.
         size_t max_payload = 0;
 
-        for (const auto &variant : base_enum->variants())
+        // First, check if the InstantiatedType has a resolved_type with proper variant info
+        // The Monomorphizer creates a concrete EnumType with correctly substituted payload types
+        if (inst->has_resolved_type())
         {
-            size_t variant_size = 0;
-            for (const auto &payload_type : variant.payload_types)
+            TypeRef resolved = inst->resolved_type();
+            if (resolved.is_valid() && resolved->kind() == TypeKind::Enum)
             {
-                // Substitute generic params with concrete type args
-                TypeRef concrete = substitute_generic_param(payload_type, type_args);
-                llvm::Type *mapped = map(concrete);
-                if (mapped)
+                auto *resolved_enum = static_cast<const EnumType *>(resolved.get());
+                for (const auto &variant : resolved_enum->variants())
                 {
-                    variant_size += size_of(mapped);
+                    size_t variant_size = 0;
+                    for (const auto &payload_type : variant.payload_types)
+                    {
+                        llvm::Type *mapped = map(payload_type);
+                        if (mapped)
+                        {
+                            variant_size += size_of(mapped);
+                        }
+                    }
+                    max_payload = std::max(max_payload, variant_size);
+                }
+
+                if (max_payload > 0)
+                {
+                    LOG_DEBUG(LogComponent::CODEGEN,
+                              "TypeMapper::map_instantiated_enum: Using resolved_type for '{}', max_payload={}",
+                              name, max_payload);
                 }
             }
-            max_payload = std::max(max_payload, variant_size);
+        }
+
+        // If we couldn't get payload size from resolved_type, try the base_enum's variants
+        if (max_payload == 0 && base_enum->variant_count() > 0)
+        {
+            for (const auto &variant : base_enum->variants())
+            {
+                size_t variant_size = 0;
+                for (const auto &payload_type : variant.payload_types)
+                {
+                    // Substitute generic params with concrete type args
+                    TypeRef concrete = substitute_generic_param(payload_type, type_args);
+                    llvm::Type *mapped = map(concrete);
+                    if (mapped)
+                    {
+                        variant_size += size_of(mapped);
+                    }
+                }
+                max_payload = std::max(max_payload, variant_size);
+            }
+        }
+
+        // If still no payload size (generic enum without variant info), compute from type args directly
+        // This handles cases like Option<T> where the payload is simply T
+        if (max_payload == 0 && !type_args.empty())
+        {
+            LOG_DEBUG(LogComponent::CODEGEN,
+                      "TypeMapper::map_instantiated_enum: No variant info for '{}', computing from type_args",
+                      name);
+
+            // For generic enums, the payload size is typically the largest type argument
+            // (e.g., Option<Duration> needs sizeof(Duration) for the Some variant)
+            for (const auto &type_arg : type_args)
+            {
+                llvm::Type *mapped = map(type_arg);
+                if (mapped)
+                {
+                    size_t arg_size = size_of(mapped);
+                    max_payload = std::max(max_payload, arg_size);
+                    LOG_DEBUG(LogComponent::CODEGEN,
+                              "TypeMapper::map_instantiated_enum: Type arg '{}' has size {}",
+                              type_arg->display_name(), arg_size);
+                }
+            }
         }
 
         // Ensure minimum payload size
         max_payload = std::max(max_payload, static_cast<size_t>(8));
+
+        LOG_DEBUG(LogComponent::CODEGEN,
+                  "TypeMapper::map_instantiated_enum: Creating tagged union for '{}' with payload size {}",
+                  name, max_payload);
 
         return create_tagged_union(name, 4, max_payload);
     }
@@ -1691,6 +1753,60 @@ namespace Cryo
             return existing;
         }
 
+        // Helper lambda to compute type size, falling back to Cryo type info for opaque LLVM types
+        auto compute_type_size = [this](const std::string &type_name) -> size_t {
+            llvm::Type *llvm_type = resolve_and_map(type_name);
+            if (llvm_type && llvm_type->isSized())
+            {
+                return size_of(llvm_type);
+            }
+
+            // LLVM type is opaque or not available - try to compute from Cryo type info
+            TypeRef cryo_type = resolve_type_from_string(type_name);
+            if (!cryo_type.is_valid())
+            {
+                LOG_DEBUG(LogComponent::CODEGEN,
+                          "TypeMapper: Cannot resolve type '{}' for size computation",
+                          type_name);
+                return 0;
+            }
+
+            if (cryo_type->kind() == TypeKind::Struct)
+            {
+                auto *struct_type = static_cast<const StructType *>(cryo_type.get());
+                size_t total_size = 0;
+                for (const auto &field : struct_type->fields())
+                {
+                    llvm::Type *field_llvm = map(field.type);
+                    if (field_llvm && field_llvm->isSized())
+                    {
+                        total_size += _module->getDataLayout().getTypeAllocSize(field_llvm);
+                    }
+                    else
+                    {
+                        // Can't determine field size, use pointer size as default
+                        total_size += 8;
+                    }
+                }
+                LOG_DEBUG(LogComponent::CODEGEN,
+                          "TypeMapper: Computed struct '{}' size from fields: {} bytes",
+                          type_name, total_size);
+                return total_size;
+            }
+
+            // For other types, try to map and get size
+            llvm::Type *mapped = map(cryo_type);
+            if (mapped && mapped->isSized())
+            {
+                return _module->getDataLayout().getTypeAllocSize(mapped);
+            }
+
+            LOG_DEBUG(LogComponent::CODEGEN,
+                      "TypeMapper: Cannot determine size for type '{}'",
+                      type_name);
+            return 0;
+        };
+
         // Compute the payload size based on type arguments
         size_t max_payload = 0;
 
@@ -1700,11 +1816,7 @@ namespace Cryo
             // Payload is just T
             if (arg_names.size() >= 1)
             {
-                llvm::Type *t_type = resolve_and_map(arg_names[0]);
-                if (t_type)
-                {
-                    max_payload = size_of(t_type);
-                }
+                max_payload = compute_type_size(arg_names[0]);
             }
         }
         else if (base_name == "Result")
@@ -1713,24 +1825,20 @@ namespace Cryo
             // Payload is max(sizeof(T), sizeof(E))
             if (arg_names.size() >= 1)
             {
-                llvm::Type *t_type = resolve_and_map(arg_names[0]);
-                if (t_type)
-                {
-                    max_payload = std::max(max_payload, static_cast<size_t>(size_of(t_type)));
-                }
+                max_payload = std::max(max_payload, compute_type_size(arg_names[0]));
             }
             if (arg_names.size() >= 2)
             {
-                llvm::Type *e_type = resolve_and_map(arg_names[1]);
-                if (e_type)
-                {
-                    max_payload = std::max(max_payload, static_cast<size_t>(size_of(e_type)));
-                }
+                max_payload = std::max(max_payload, compute_type_size(arg_names[1]));
             }
         }
 
         // Ensure minimum payload size
         max_payload = std::max(max_payload, static_cast<size_t>(8));
+
+        LOG_DEBUG(LogComponent::CODEGEN,
+                  "TypeMapper: Creating enum '{}' with payload size {} bytes",
+                  full_name, max_payload);
 
         // Create the tagged union type
         return create_tagged_union(full_name, 4, max_payload);

@@ -4,6 +4,7 @@
 #include "Codegen/CodegenVisitor.hpp"
 #include "Types/CompoundTypes.hpp"
 #include "Types/GenericTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
 #include "Utils/Logger.hpp"
 
 #include <unordered_set>
@@ -90,15 +91,60 @@ namespace Cryo::Codegen
             }
         }
 
+        // Track structs that are currently being instantiated to detect nested instantiation.
+        // If we're already in the middle of instantiating this struct (detected via recursion
+        // through create_substituted_fields -> ensure_dependent_types_instantiated), we should
+        // return the existing (possibly opaque) struct without trying to generate methods.
+        static std::unordered_set<std::string> structs_being_instantiated;
+        bool is_nested_instantiation = structs_being_instantiated.count(mangled) > 0;
+        if (is_nested_instantiation)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Detected nested instantiation of '{}', returning existing/opaque type",
+                      mangled);
+            // Return existing type if any (might be opaque, callers should handle that)
+            if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
+            {
+                return existing;
+            }
+            // No type exists yet - this shouldn't happen, but return nullptr to be safe
+            return nullptr;
+        }
+
+        // Add to tracking set - will be removed when we exit this function
+        structs_being_instantiated.insert(mangled);
+
+        // RAII guard to ensure we remove from tracking set even on early returns
+        struct InstantiationGuard
+        {
+            std::string name;
+            std::unordered_set<std::string> &set;
+            InstantiationGuard(const std::string &n, std::unordered_set<std::string> &s) : name(n), set(s) {}
+            ~InstantiationGuard() { set.erase(name); }
+        } guard(mangled, structs_being_instantiated);
+
         // Check if LLVM type already exists (created by Monomorphizer)
         // If so, we still need to generate methods, but can reuse the type
         llvm::StructType *existing_struct = llvm::StructType::getTypeByName(llvm_ctx(), mangled);
-        bool type_already_exists = (existing_struct && !existing_struct->isOpaque());
-        if (type_already_exists)
+        llvm::StructType *existing_opaque_struct = nullptr;
+        bool type_already_exists = false;
+        if (existing_struct)
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "GenericCodegen: Found existing LLVM type for struct {}, will generate methods",
-                      mangled);
+            if (!existing_struct->isOpaque())
+            {
+                type_already_exists = true;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Found existing complete LLVM type for struct {}, will generate methods",
+                          mangled);
+            }
+            else
+            {
+                // Type exists but is opaque - we'll set its body later
+                existing_opaque_struct = existing_struct;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Found existing opaque LLVM type for struct {}, will set body",
+                          mangled);
+            }
         }
 
         // Get generic type definition - first check local registry, then TemplateRegistry
@@ -162,8 +208,9 @@ namespace Cryo::Codegen
         }
         else
         {
-            // Create new struct type
-            struct_type = llvm::StructType::create(llvm_ctx(), mangled);
+            // Use existing opaque struct type if one exists, otherwise create new
+            struct_type = existing_opaque_struct ? existing_opaque_struct
+                                                 : llvm::StructType::create(llvm_ctx(), mangled);
 
             // Substitute type parameters in fields and collect field names
             if (struct_decl)
@@ -176,6 +223,21 @@ namespace Cryo::Codegen
                 for (const auto &field : struct_decl->fields())
                 {
                     field_names.push_back(field->name());
+                }
+
+                // Safety check: verify struct body has correct number of elements
+                if (struct_type->getNumElements() != field_names.size())
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Struct '{}' body has {} elements but {} field names! "
+                              "This will cause field access errors.",
+                              mangled, struct_type->getNumElements(), field_names.size());
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Struct '{}' body set with {} elements",
+                              mangled, struct_type->getNumElements());
                 }
             }
 
@@ -430,11 +492,51 @@ namespace Cryo::Codegen
         }
 
         // Check LLVM context
+        llvm::StructType *existing_opaque_class = nullptr;
         if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
         {
-            _type_cache[mangled] = existing;
-            return existing;
+            if (!existing->isOpaque())
+            {
+                _type_cache[mangled] = existing;
+                return existing;
+            }
+            else
+            {
+                // Type exists but is opaque - we'll set its body later
+                existing_opaque_class = existing;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Found existing opaque LLVM type for class {}, will set body",
+                          mangled);
+            }
         }
+
+        // Track classes that are currently being instantiated to detect nested instantiation.
+        // Uses the same tracking set as structs since classes are represented as structs in LLVM.
+        static std::unordered_set<std::string> classes_being_instantiated;
+        bool is_nested_instantiation = classes_being_instantiated.count(mangled) > 0;
+        if (is_nested_instantiation)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: Detected nested instantiation of class '{}', returning existing/opaque type",
+                      mangled);
+            if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
+            {
+                return existing;
+            }
+            return nullptr;
+        }
+
+        // Add to tracking set
+        classes_being_instantiated.insert(mangled);
+
+        // RAII guard to ensure we remove from tracking set even on early returns
+        struct ClassInstantiationGuard
+        {
+            std::string name;
+            std::unordered_set<std::string> &set;
+            ClassInstantiationGuard(const std::string &n, std::unordered_set<std::string> &s) : name(n), set(s) {}
+            ~ClassInstantiationGuard() { set.erase(name); }
+        } class_guard(mangled, classes_being_instantiated);
 
         // Get generic definition - first check local registry, then TemplateRegistry
         Cryo::ASTNode *generic_def = get_generic_type_def(generic_name);
@@ -475,8 +577,9 @@ namespace Cryo::Codegen
         // Begin substitution scope - pass generic_name and mangled for scope resolution
         begin_type_params(type_params, type_args, generic_name, mangled);
 
-        // Create class struct
-        llvm::StructType *class_type = llvm::StructType::create(llvm_ctx(), mangled);
+        // Use existing opaque class type if one exists, otherwise create new
+        llvm::StructType *class_type = existing_opaque_class ? existing_opaque_class
+                                                             : llvm::StructType::create(llvm_ctx(), mangled);
 
         // Substitute type parameters in fields and collect field names
         std::vector<std::string> field_names;
@@ -490,6 +593,21 @@ namespace Cryo::Codegen
             for (const auto &field : class_decl->fields())
             {
                 field_names.push_back(field->name());
+            }
+
+            // Safety check: verify class body has correct number of elements
+            if (class_type->getNumElements() != field_names.size())
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Class '{}' body has {} elements but {} field names! "
+                          "This will cause field access errors.",
+                          mangled, class_type->getNumElements(), field_names.size());
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Class '{}' body set with {} elements",
+                          mangled, class_type->getNumElements());
             }
         }
 
@@ -738,6 +856,7 @@ namespace Cryo::Codegen
         // If so, we still need to generate methods, but can reuse the type
         llvm::Type *enum_type = nullptr;
         bool type_already_exists = false;
+        llvm::StructType *existing_opaque = nullptr;
         if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
         {
             if (!existing->isOpaque())
@@ -745,7 +864,15 @@ namespace Cryo::Codegen
                 enum_type = existing;
                 type_already_exists = true;
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "GenericCodegen: Found existing LLVM type for enum {}, will generate methods",
+                          "GenericCodegen: Found existing complete LLVM type for enum {}, will generate methods",
+                          mangled);
+            }
+            else
+            {
+                // Type exists but is opaque - we'll set its body later
+                existing_opaque = existing;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Found existing opaque LLVM type for enum {}, will set body",
                           mangled);
             }
         }
@@ -846,7 +973,47 @@ namespace Cryo::Codegen
                             }
                             else
                             {
-                                variant_size += 8; // Default to pointer size
+                                // LLVM type is opaque or not sized - try to compute size from Cryo type
+                                // This handles imported struct types that haven't been fully mapped yet
+                                size_t cryo_size = 0;
+                                bool size_computed = false;
+
+                                if (payload_type->kind() == TypeKind::Struct)
+                                {
+                                    auto *struct_type = static_cast<const StructType *>(payload_type.get());
+                                    for (const auto &field : struct_type->fields())
+                                    {
+                                        llvm::Type *field_llvm = types().map(field.type);
+                                        if (field_llvm && field_llvm->isSized())
+                                        {
+                                            cryo_size += module()->getDataLayout().getTypeAllocSize(field_llvm);
+                                        }
+                                        else
+                                        {
+                                            // Can't compute field size, use default
+                                            cryo_size += 8;
+                                        }
+                                    }
+                                    if (struct_type->fields().size() > 0)
+                                    {
+                                        size_computed = true;
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "GenericCodegen: Computed struct '{}' size from fields: {} bytes",
+                                                  payload_type->display_name(), cryo_size);
+                                    }
+                                }
+
+                                if (size_computed)
+                                {
+                                    variant_size += cryo_size;
+                                }
+                                else
+                                {
+                                    LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                             "GenericCodegen: Cannot determine size of '{}', defaulting to 8 bytes",
+                                             payload_type->display_name());
+                                    variant_size += 8; // Default to pointer size
+                                }
                             }
                         }
                         else
@@ -865,7 +1032,9 @@ namespace Cryo::Codegen
             llvm::Type *discriminant_type = llvm::Type::getInt32Ty(llvm_ctx());
             llvm::Type *payload_type = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload_size);
 
-            llvm::StructType *enum_struct = llvm::StructType::create(llvm_ctx(), mangled);
+            // Use existing opaque type if one exists, otherwise create a new one
+            llvm::StructType *enum_struct = existing_opaque ? existing_opaque
+                                                            : llvm::StructType::create(llvm_ctx(), mangled);
             enum_struct->setBody({discriminant_type, payload_type}, false);
             enum_type = enum_struct;
 
@@ -1465,7 +1634,7 @@ namespace Cryo::Codegen
             // Try to instantiate the dependent type
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "substitute_type_annotation: Instantiating dependent type '{}'", mangled);
-            instantiate_struct(base_name, substituted_args);
+            get_instantiated_type(base_name, substituted_args);
         }
 
         return mangled;
@@ -1728,6 +1897,12 @@ namespace Cryo::Codegen
             TypeRef field_type = field->get_resolved_type();
             TypeRef substituted = substitute_type_params(field_type);
 
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "create_substituted_fields: Field '{}' type '{}' -> substituted '{}'",
+                      field->name(),
+                      field_type ? field_type->display_name() : "<null>",
+                      substituted ? substituted->display_name() : "<null>");
+
             // Ensure any dependent generic types are instantiated before mapping
             // This is necessary because LLVM 15+ opaque pointers don't trigger
             // pointee type instantiation when mapping pointer types
@@ -1736,7 +1911,25 @@ namespace Cryo::Codegen
             llvm::Type *llvm_type = get_llvm_type(substituted);
             if (llvm_type)
             {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "create_substituted_fields: Field '{}' mapped to LLVM type ID {}",
+                          field->name(), llvm_type->getTypeID());
                 result.push_back(llvm_type);
+            }
+            else
+            {
+                // CRITICAL: We must not skip fields or the struct body will have
+                // fewer elements than the field registry, causing assertion failures
+                // when accessing fields by index. Use a fallback type.
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "create_substituted_fields: Failed to get LLVM type for field '{}' "
+                          "(type: '{}'), using ptr fallback",
+                          field->name(),
+                          substituted ? substituted->display_name() : "<null>");
+
+                // Use opaque pointer as fallback - this ensures field indices stay aligned
+                // even if the type couldn't be fully resolved
+                result.push_back(llvm::PointerType::get(llvm_ctx(), 0));
             }
         }
 
@@ -1794,24 +1987,7 @@ namespace Cryo::Codegen
                           "GenericCodegen: Ensuring dependent type {} is instantiated",
                           type->display_name());
 
-                // Check if it's a struct or class and instantiate accordingly
-                Cryo::ASTNode *def = get_generic_type_def(base_name);
-                if (def)
-                {
-                    if (dynamic_cast<StructDeclarationNode *>(def))
-                    {
-                        instantiate_struct(base_name, type_args);
-                    }
-                    else if (dynamic_cast<ClassDeclarationNode *>(def))
-                    {
-                        instantiate_class(base_name, type_args);
-                    }
-                }
-                else
-                {
-                    // Fallback: Try get_instantiated_type which handles both
-                    get_instantiated_type(base_name, type_args);
-                }
+                get_instantiated_type(base_name, type_args);
             }
         }
     }
