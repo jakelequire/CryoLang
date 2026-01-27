@@ -968,144 +968,66 @@ namespace Cryo::Codegen
             else
             {
                 // Complex enums are tagged unions: { i32 discriminant, [payload_size x i8] }
-            // Calculate the maximum payload size by substituting type parameters
-            size_t max_payload_size = 0;
+                // Compute payload size using Cryo type system's size_bytes() which is
+                // available at any pass (computed during ModuleLoader from field types).
+                // We do NOT use LLVM types here because struct LLVM bodies aren't set
+                // until Pass 7.1, but GenericCodegen runs at Pass 6.2.
+                size_t max_payload_size = 0;
 
-            for (const auto &variant : enum_decl->variants())
-            {
-                if (!variant->is_simple_variant())
+                for (const auto &variant : enum_decl->variants())
                 {
-                    size_t variant_size = 0;
-                    for (const auto &type_name : variant->associated_types())
+                    if (!variant->is_simple_variant())
                     {
-                        // Try to substitute type parameters
-                        TypeRef payload_type;
-
-                        // Check if it's a type parameter
-                        for (size_t i = 0; i < type_params.size(); ++i)
+                        size_t variant_size = 0;
+                        for (const auto &type_name : variant->associated_types())
                         {
-                            if (type_name == type_params[i] && i < type_args.size())
+                            TypeRef payload_type;
+
+                            // Check if it's a type parameter → substitute with type arg
+                            for (size_t i = 0; i < type_params.size(); ++i)
                             {
-                                payload_type = type_args[i];
-                                break;
+                                if (type_name == type_params[i] && i < type_args.size())
+                                {
+                                    payload_type = type_args[i];
+                                    break;
+                                }
                             }
-                        }
 
-                        // If not a type param, try to look it up
-                        if (!payload_type.is_valid())
-                        {
-                            payload_type = symbols().arena().lookup_type_by_name(type_name);
-                        }
-
-                        // Fallback: try LLVM context directly for types created by other modules
-                        if (!payload_type.is_valid())
-                        {
-                            llvm::StructType *llvm_st = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
-                            if (llvm_st && !llvm_st->isOpaque() && llvm_st->isSized())
+                            // If not a type param, look up in the type arena
+                            if (!payload_type.is_valid())
                             {
-                                variant_size += module()->getDataLayout().getTypeAllocSize(llvm_st);
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "GenericCodegen: Used LLVM context lookup for '{}': {} bytes",
-                                          type_name, module()->getDataLayout().getTypeAllocSize(llvm_st));
-                                continue; // Skip normal payload_type processing
+                                payload_type = symbols().arena().lookup_type_by_name(type_name);
                             }
-                        }
 
-                        if (payload_type.is_valid())
-                        {
-                            llvm::Type *llvm_type = types().map(payload_type);
-                            if (llvm_type && llvm_type->isSized())
+                            if (payload_type.is_valid())
                             {
-                                variant_size += module()->getDataLayout().getTypeAllocSize(llvm_type);
+                                size_t sz = payload_type->size_bytes();
+                                variant_size += (sz > 0) ? sz : 8; // pointer-size fallback
                             }
                             else
                             {
-                                // LLVM type is opaque or not sized - try to compute size from Cryo type
-                                // This handles imported struct types that haven't been fully mapped yet
-                                size_t cryo_size = 0;
-                                bool size_computed = false;
-
-                                if (payload_type->kind() == TypeKind::Struct)
-                                {
-                                    auto *struct_type = static_cast<const StructType *>(payload_type.get());
-                                    for (const auto &field : struct_type->fields())
-                                    {
-                                        llvm::Type *field_llvm = types().map(field.type);
-                                        if (field_llvm && field_llvm->isSized())
-                                        {
-                                            cryo_size += module()->getDataLayout().getTypeAllocSize(field_llvm);
-                                        }
-                                        else
-                                        {
-                                            // Can't compute field size, use default
-                                            cryo_size += 8;
-                                        }
-                                    }
-                                    if (struct_type->fields().size() > 0)
-                                    {
-                                        size_computed = true;
-                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                  "GenericCodegen: Computed struct '{}' size from fields: {} bytes",
-                                                  payload_type->display_name(), cryo_size);
-                                    }
-                                }
-
-                                if (size_computed)
-                                {
-                                    variant_size += cryo_size;
-                                }
-                                else
-                                {
-                                    LOG_WARN(Cryo::LogComponent::CODEGEN,
-                                             "GenericCodegen: Cannot determine size of '{}', defaulting to 8 bytes",
-                                             payload_type->display_name());
-                                    variant_size += 8; // Default to pointer size
-                                }
+                                variant_size += 8; // pointer-size fallback for unknown types
                             }
                         }
-                        else
-                        {
-                            variant_size += 8; // Default to pointer size for unknown types
-                        }
+                        max_payload_size = std::max(max_payload_size, variant_size);
                     }
-                    max_payload_size = std::max(max_payload_size, variant_size);
                 }
-            }
 
-            // Track whether we computed any real payload sizes before applying the minimum.
-            // If all variants produced 0 bytes, the types weren't available yet (this runs
-            // at Pass 6.2 before TypeLoweringPass). In that case, leave the struct opaque
-            // so TypeMapper can set the correct body during Pass 7.1.
-            bool payload_computed_successfully = (max_payload_size > 0);
+                // Ensure minimum payload size
+                max_payload_size = std::max(max_payload_size, static_cast<size_t>(8));
 
-            // Ensure minimum payload size
-            max_payload_size = std::max(max_payload_size, static_cast<size_t>(8));
-
-            // Use existing opaque type if one exists, otherwise create a new one
-            llvm::StructType *enum_struct = existing_opaque ? existing_opaque
-                                                            : llvm::StructType::create(llvm_ctx(), mangled);
-
-            if (payload_computed_successfully)
-            {
-                // We got real sizes - safe to set the body
+                llvm::StructType *enum_struct = existing_opaque ? existing_opaque
+                                                                : llvm::StructType::create(llvm_ctx(), mangled);
                 llvm::Type *discriminant_type = llvm::Type::getInt32Ty(llvm_ctx());
-                llvm::Type *payload_arr = llvm::ArrayType::get(llvm::Type::getInt8Ty(llvm_ctx()), max_payload_size);
+                llvm::Type *payload_arr = llvm::ArrayType::get(
+                    llvm::Type::getInt8Ty(llvm_ctx()), max_payload_size);
                 enum_struct->setBody({discriminant_type, payload_arr}, false);
+
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "GenericCodegen: Created tagged union for enum '{}': payload size = {} bytes",
+                          "GenericCodegen: Created tagged union for enum '{}': "
+                          "payload size = {} bytes (from Cryo type system)",
                           mangled, max_payload_size);
-            }
-            else
-            {
-                // Could not determine payload sizes (types not available yet at Pass 6.2).
-                // Leave the struct opaque - TypeMapper will set the body during TypeLoweringPass (Pass 7.1)
-                // when all struct LLVM types are available.
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "GenericCodegen: Leaving enum '{}' opaque - payload types not available yet, "
-                          "TypeMapper will complete during type lowering",
-                          mangled);
-            }
-            enum_type = enum_struct;
+                enum_type = enum_struct;
             }
         } // end if (!type_already_exists)
 
