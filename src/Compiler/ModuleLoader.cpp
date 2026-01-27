@@ -977,6 +977,62 @@ namespace Cryo
                             enum_type = type_arena.create_enum(enum_qname);
                             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Created enum type for generic enum '{}'", enum_decl->name());
                         }
+
+                        // Build variants for generic enums too, using GenericParamType for type parameters.
+                        // This allows TypeMapper to compute correct payload sizes via substitute_generic_param().
+                        if (enum_type.is_valid())
+                        {
+                            auto *enum_ptr = const_cast<EnumType *>(dynamic_cast<const EnumType *>(enum_type.get()));
+                            if (enum_ptr && enum_ptr->variant_count() == 0)
+                            {
+                                // Collect generic parameter names for identification
+                                std::vector<std::string> generic_param_names;
+                                for (const auto &gp : enum_decl->generic_parameters())
+                                    generic_param_names.push_back(gp->name());
+
+                                std::vector<EnumVariant> variants;
+                                size_t tag = 0;
+                                for (const auto &variant : enum_decl->variants())
+                                {
+                                    std::vector<TypeRef> payload_types;
+                                    for (const std::string &type_str : variant->associated_types())
+                                    {
+                                        TypeRef payload_type;
+
+                                        // Check if this is a generic type parameter (e.g., "T", "E")
+                                        for (size_t i = 0; i < generic_param_names.size(); ++i)
+                                        {
+                                            if (type_str == generic_param_names[i])
+                                            {
+                                                payload_type = type_arena.create_generic_param(type_str, i);
+                                                break;
+                                            }
+                                        }
+
+                                        // If not a type param, resolve as concrete type
+                                        if (!payload_type.is_valid())
+                                            payload_type = resolve_primitive_type(type_str, type_arena);
+                                        if (!payload_type.is_valid())
+                                            payload_type = type_arena.lookup_type_by_name(type_str);
+                                        if (!payload_type.is_valid())
+                                        {
+                                            auto it = symbol_map.find(type_str);
+                                            if (it != symbol_map.end() && it->second.type.is_valid())
+                                                payload_type = it->second.type;
+                                        }
+
+                                        payload_types.push_back(payload_type.is_valid() ? payload_type : TypeRef{});
+                                    }
+
+                                    variants.push_back(EnumVariant(variant->name(), std::move(payload_types), tag++));
+                                }
+
+                                enum_ptr->set_variants(std::move(variants));
+                                LOG_DEBUG(LogComponent::GENERAL,
+                                          "ModuleLoader: Built {} variants for generic enum '{}'",
+                                          enum_ptr->variant_count(), enum_decl->name());
+                            }
+                        }
                     }
                     else
                     {
