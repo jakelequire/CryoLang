@@ -416,5 +416,7 @@ namespace Cryo
      **************************************************************************/
     std::string mangle_instantiation_name(TypeRef base,
                                           const std::vector<TypeRef> &type_args);
+    
 
+    std::string TypeIDToString(llvm::Type::TypeID id);
 } // namespace Cryo

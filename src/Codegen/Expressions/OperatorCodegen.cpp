@@ -1267,8 +1267,11 @@ namespace Cryo::Codegen
                       "generate_comparison: Types are incompatible and cannot be converted. "
                       "lhs type ID = {}, rhs type ID = {}",
                       lhs->getType()->getTypeID(), rhs->getType()->getTypeID());
+            std::string e = "Incompatible types for comparison: " +
+                                TypeIDToString(lhs->getType()->getTypeID()) + " and " +
+                                TypeIDToString(rhs->getType()->getTypeID());
             report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
-                         "Cannot compare values of incompatible types");
+                         e.c_str());
             return nullptr;
         }
 

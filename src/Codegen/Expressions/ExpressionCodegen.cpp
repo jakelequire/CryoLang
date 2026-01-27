@@ -3697,6 +3697,61 @@ namespace Cryo::Codegen
                               effective_scope_name, redirected);
                     effective_scope_name = redirected;
                 }
+                else
+                {
+                    // Cross-type generic enum resolution: when referencing a generic enum OTHER
+                    // than the one currently being instantiated (e.g., Option::None inside a
+                    // Result<T,E> method body). We resolve the template's type params using the
+                    // current scope's bindings, compute the mangled name, and ensure the enum
+                    // is instantiated so its variants are registered.
+                    auto *template_registry = ctx().template_registry();
+                    if (template_registry)
+                    {
+                        const auto *tmpl_info = template_registry->find_template(effective_scope_name);
+                        if (tmpl_info && tmpl_info->enum_template)
+                        {
+                            const auto &generic_params = tmpl_info->enum_template->generic_parameters();
+                            std::vector<TypeRef> resolved_args;
+                            bool all_resolved = true;
+
+                            for (const auto &param : generic_params)
+                            {
+                                TypeRef resolved = generics->resolve_type_param(param->name());
+                                if (resolved.is_valid())
+                                {
+                                    resolved_args.push_back(resolved);
+                                }
+                                else
+                                {
+                                    all_resolved = false;
+                                    break;
+                                }
+                            }
+
+                            if (all_resolved && !resolved_args.empty())
+                            {
+                                // Build display name and mangle it (e.g., "Option<void*>" -> "Option_voidp")
+                                std::string generic_display = effective_scope_name + "<";
+                                for (size_t i = 0; i < resolved_args.size(); ++i)
+                                {
+                                    if (i > 0)
+                                        generic_display += ", ";
+                                    generic_display += resolved_args[i]->display_name();
+                                }
+                                generic_display += ">";
+                                std::string mangled = mangle_generic_type_name(generic_display);
+
+                                // Ensure the enum is instantiated (creates LLVM type + registers variants)
+                                generics->instantiate_enum(effective_scope_name, resolved_args);
+
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "ExpressionCodegen: Cross-type generic resolution {} -> {} in generic context",
+                                          effective_scope_name, mangled);
+                                effective_scope_name = mangled;
+                            }
+                        }
+                    }
+                }
             }
         }
 
