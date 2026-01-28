@@ -140,7 +140,38 @@ namespace Cryo::Codegen
             return generate_arithmetic(op, lhs, rhs, node->get_resolved_type());
 
         case BinaryOpClass::Comparison:
-            return generate_comparison(op, lhs, rhs, node->left()->get_resolved_type());
+        {
+            TypeRef left_type = node->left()->get_resolved_type();
+            TypeRef right_type = node->right()->get_resolved_type();
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Comparison dispatch: left_type valid={}, right_type valid={}, "
+                      "left_is_enum={}, right_is_enum={}, "
+                      "lhs llvm_type={}, rhs llvm_type={}",
+                      (bool)left_type, (bool)right_type,
+                      (left_type ? left_type->is_enum() : false),
+                      (right_type ? right_type->is_enum() : false),
+                      lhs->getType()->getTypeID(), rhs->getType()->getTypeID());
+
+            if (left_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Comparison left_type kind={}", (int)left_type->kind());
+            }
+            if (right_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Comparison right_type kind={}", (int)right_type->kind());
+            }
+
+            // Extract enum discriminants before comparison
+            if (left_type && left_type->is_enum())
+                lhs = extract_enum_discriminant(lhs, left_type);
+            if (right_type && right_type->is_enum())
+                rhs = extract_enum_discriminant(rhs, right_type);
+
+            return generate_comparison(op, lhs, rhs, left_type);
+        }
 
         case BinaryOpClass::Bitwise:
             return generate_bitwise(op, lhs, rhs);
@@ -2728,6 +2759,43 @@ namespace Cryo::Codegen
         }
 
         return nullptr;
+    }
+
+    llvm::Value *OperatorCodegen::extract_enum_discriminant(llvm::Value *val, TypeRef enum_type)
+    {
+        if (!val || !enum_type || !enum_type->is_enum())
+            return val;
+
+        llvm::Type *llvm_ty = val->getType();
+
+        // Already an integer (simple enum or already-extracted discriminant)
+        if (llvm_ty->isIntegerTy())
+            return val;
+
+        // By-value struct: extract element 0 (the discriminant)
+        if (llvm_ty->isStructTy())
+        {
+            return builder().CreateExtractValue(val, 0, "enum.disc");
+        }
+
+        // Pointer to struct: GEP + load
+        if (llvm_ty->isPointerTy())
+        {
+            auto *et = dynamic_cast<const Cryo::EnumType *>(enum_type.get());
+            if (!et)
+                return val;
+
+            std::string type_name = et->name();
+            llvm::Type *resolved = ctx().get_type(type_name);
+            if (!resolved || !resolved->isStructTy())
+                return val;
+
+            llvm::StructType *st = llvm::cast<llvm::StructType>(resolved);
+            llvm::Value *gep = builder().CreateStructGEP(st, val, 0, "disc.ptr");
+            return builder().CreateLoad(builder().getInt32Ty(), gep, "enum.disc");
+        }
+
+        return val;
     }
 
 } // namespace Cryo::Codegen

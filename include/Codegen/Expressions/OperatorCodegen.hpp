@@ -448,6 +448,14 @@ namespace Cryo::Codegen
          */
         llvm::Value *get_increment_value(llvm::Type *type);
 
+        /**
+         * @brief Extract the i32 discriminant from an enum value
+         * @param val LLVM value (struct, pointer, or already i32)
+         * @param enum_type Cryo semantic type (must be EnumType)
+         * @return i32 discriminant value, or val unchanged if not an enum
+         */
+        llvm::Value *extract_enum_discriminant(llvm::Value *val, TypeRef enum_type);
+
         // Cached function pointers
         llvm::Function *_string_concat_fn = nullptr;
         llvm::Function *_string_char_concat_fn = nullptr;
