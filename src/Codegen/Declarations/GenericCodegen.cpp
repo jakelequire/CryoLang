@@ -1701,14 +1701,12 @@ namespace Cryo::Codegen
 
         // Substitute type parameters in each argument
         std::vector<TypeRef> substituted_args;
-        bool any_substituted = false;
         for (const auto &arg : type_args)
         {
             TypeRef resolved = resolve_type_param(arg);
             if (resolved.is_valid())
             {
                 substituted_args.push_back(resolved);
-                any_substituted = true;
             }
             else
             {
@@ -1727,9 +1725,6 @@ namespace Cryo::Codegen
                 }
             }
         }
-
-        if (!any_substituted)
-            return "";
 
         // Generate mangled name for the substituted type
         std::string mangled = mangle_type_name(base_name, substituted_args);

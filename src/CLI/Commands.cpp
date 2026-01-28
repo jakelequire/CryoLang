@@ -101,6 +101,7 @@ namespace Cryo::CLI::Commands
         argument(CLIArgument("wasm-exports", "Comma-separated list of functions to export to JavaScript", false));
         argument(CLIArgument("enable-js-interop", "Enable JavaScript interoperability", false).flag());
         argument(CLIArgument("lsp", "LSP compilation mode (frontend only, no executable generation)", false).flag());
+        argument(CLIArgument("raw", "Compile without standard library/runtime, no main->_user_main_ transform", false).flag());
     }
 
     int CompileCommand::execute(const ParsedArgs &args)
@@ -221,6 +222,17 @@ namespace Cryo::CLI::Commands
             compiler->set_show_ast_before_ir(true);
         }
 
+        // Check for raw mode
+        bool raw_mode = args.get_flag("raw");
+        if (raw_mode)
+        {
+            compiler->set_raw_mode(true);
+            if (verbose || debug)
+            {
+                std::cout << "[RAW] Raw mode enabled - no stdlib linking or main transform" << std::endl;
+            }
+        }
+
         // Check for LSP mode
         bool lsp_mode = args.get_flag("lsp");
 
@@ -336,6 +348,77 @@ namespace Cryo::CLI::Commands
                     }
                     return 1;
                 }
+            }
+
+            // Handle raw mode output generation
+            if (raw_mode)
+            {
+                std::string output_path = args.output_file();
+                
+                if (!output_path.empty())
+                {
+                    // Determine output type based on extension
+                    std::string extension = "";
+                    size_t dot_pos = output_path.find_last_of('.');
+                    if (dot_pos != std::string::npos)
+                    {
+                        extension = output_path.substr(dot_pos + 1);
+                        std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+                    }
+
+                    std::cout << "\n[RAW] Generating raw output to: " << output_path << std::endl;
+
+                    bool output_success = false;
+                    if (extension == "ll")
+                    {
+                        // Generate LLVM IR text
+                        output_success = compiler->codegen() && compiler->codegen()->emit_llvm_ir(output_path);
+                    }
+                    else if (extension == "bc")
+                    {
+                        // Generate LLVM bitcode
+                        output_success = compiler->codegen() && compiler->codegen()->emit_llvm_ir(output_path);
+                    }
+                    else if (extension == "o" || extension == "obj")
+                    {
+                        // Generate object file using linker
+                        auto target = Cryo::Linker::CryoLinker::LinkTarget::ObjectFile;
+                        output_success = compiler->generate_output(output_path, target);
+                    }
+                    else if (extension == "asm" || extension == "s")
+                    {
+                        // Generate assembly file using linker
+                        output_success = compiler->linker() && compiler->linker()->generate_assembly_file(compiler->codegen()->get_module(), output_path);
+                    }
+                    else
+                    {
+                        // Default to object file for unknown extensions
+                        std::cout << "[RAW] Unknown extension '" << extension << "', defaulting to object file" << std::endl;
+                        auto target = Cryo::Linker::CryoLinker::LinkTarget::ObjectFile;
+                        output_success = compiler->generate_output(output_path, target);
+                    }
+
+                    if (output_success)
+                    {
+                        std::cout << "✓ Raw output generated successfully: " << output_path << std::endl;
+                    }
+                    else
+                    {
+                        std::cerr << "❌ Failed to generate raw output" << std::endl;
+                        if (compiler->codegen())
+                        {
+                            std::cerr << "Error: " << compiler->codegen()->get_last_error() << std::endl;
+                        }
+                        return 1;
+                    }
+                }
+                else
+                {
+                    std::cout << "\n[RAW] Raw mode enabled but no output file specified. Use -o flag to specify output file." << std::endl;
+                    std::cout << "[RAW] Supported extensions: .o/.obj (object file), .ll (LLVM IR), .bc (LLVM bitcode), .asm/.s (assembly)" << std::endl;
+                }
+                
+                return 0; // Raw mode doesn't need executable generation, exit early
             }
 
             return 0;
