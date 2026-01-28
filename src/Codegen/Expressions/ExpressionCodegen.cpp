@@ -2643,6 +2643,14 @@ namespace Cryo::Codegen
                     candidates.push_back(simple_name);
                 }
 
+                // Try base template name (e.g., "HashSetEntry" from "HashSetEntry_string")
+                size_t underscore_pos = type_name.find('_');
+                if (underscore_pos != std::string::npos)
+                {
+                    std::string base_name = type_name.substr(0, underscore_pos);
+                    candidates.push_back(base_name);
+                }
+
                 for (const auto &candidate : candidates)
                 {
                     const TemplateRegistry::StructFieldInfo *field_info = template_reg->get_struct_field_types(candidate);
