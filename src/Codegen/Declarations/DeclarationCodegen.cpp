@@ -2997,6 +2997,10 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Pre-registering functions from symbol table");
 
+        // Skip generic instantiation (method body generation) while mapping types
+        // for extern declarations. We only need struct layouts, not methods.
+        types().set_skip_generic_instantiation(true);
+
         size_t registered_count = 0;
         size_t skipped_generic = 0;
         size_t skipped_existing = 0;
@@ -3141,6 +3145,9 @@ namespace Cryo::Codegen
 
             registered_count++;
         });
+
+        // Re-enable generic instantiation for subsequent type mapping
+        types().set_skip_generic_instantiation(false);
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "DeclarationCodegen: Pre-registration complete — "

@@ -1032,35 +1032,36 @@ namespace Cryo
             LOG_DEBUG(LogComponent::CODEGEN, "TypeMapper::map_instantiated: '{}' using resolved_type '{}'",
                       name, resolved.get()->display_name());
 
-            // For enums, trigger method generation through GenericCodegen::instantiate_enum
-            // even though the type already exists. instantiate_enum handles caching internally.
-            if (resolved->kind() == TypeKind::Enum && _generic_instantiator)
+            // Trigger method generation through GenericCodegen — but only when
+            // not in "skip" mode (skip is set during pre_register_functions to
+            // avoid generating method bodies for cross-module generic types).
+            if (!_skip_generic_instantiation && _generic_instantiator)
             {
-                TypeRef base = type->generic_base();
-                const std::vector<TypeRef> &args = type->type_args();
-                if (base.is_valid())
+                if (resolved->kind() == TypeKind::Enum)
                 {
-                    std::string base_name = base->display_name();
-                    LOG_DEBUG(LogComponent::CODEGEN,
-                              "TypeMapper::map_instantiated: Triggering method generation for enum '{}' (base: '{}')",
-                              name, base_name);
-                    // This will call GenericCodegen::get_instantiated_type -> instantiate_enum
-                    // which generates the enum methods. Even if type is cached, methods will be generated.
-                    _generic_instantiator(base_name, args);
+                    TypeRef base = type->generic_base();
+                    const std::vector<TypeRef> &args = type->type_args();
+                    if (base.is_valid())
+                    {
+                        std::string base_name = base->display_name();
+                        LOG_DEBUG(LogComponent::CODEGEN,
+                                  "TypeMapper::map_instantiated: Triggering method generation for enum '{}' (base: '{}')",
+                                  name, base_name);
+                        _generic_instantiator(base_name, args);
+                    }
                 }
-            }
-            // For structs, also trigger instantiation to generate methods
-            else if (resolved->kind() == TypeKind::Struct && _generic_instantiator)
-            {
-                TypeRef base = type->generic_base();
-                const std::vector<TypeRef> &args = type->type_args();
-                if (base.is_valid() && !args.empty())
+                else if (resolved->kind() == TypeKind::Struct)
                 {
-                    std::string base_name = base->display_name();
-                    LOG_DEBUG(LogComponent::CODEGEN,
-                              "TypeMapper::map_instantiated: Triggering method generation for struct '{}' (base: '{}')",
-                              name, base_name);
-                    _generic_instantiator(base_name, args);
+                    TypeRef base = type->generic_base();
+                    const std::vector<TypeRef> &args = type->type_args();
+                    if (base.is_valid() && !args.empty())
+                    {
+                        std::string base_name = base->display_name();
+                        LOG_DEBUG(LogComponent::CODEGEN,
+                                  "TypeMapper::map_instantiated: Triggering method generation for struct '{}' (base: '{}')",
+                                  name, base_name);
+                        _generic_instantiator(base_name, args);
+                    }
                 }
             }
 
@@ -1148,7 +1149,7 @@ namespace Cryo
             }
         }
 
-        if (_generic_instantiator && base.is_valid())
+        if (!_skip_generic_instantiation && _generic_instantiator && base.is_valid())
         {
             std::string base_name = base->display_name();
             llvm::StructType *result = _generic_instantiator(base_name, args);
