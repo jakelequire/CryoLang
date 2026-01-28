@@ -1126,6 +1126,26 @@ namespace Cryo::Codegen
             return generate_pointer_arithmetic(op, lhs, rhs, element_type);
         }
 
+        // Extract enum discriminant if operand is a tagged union struct
+        if (lhs->getType()->isStructTy())
+        {
+            auto *st = llvm::cast<llvm::StructType>(lhs->getType());
+            if (!st->isOpaque() && st->getNumElements() >= 1 &&
+                st->getElementType(0)->isIntegerTy())
+            {
+                lhs = builder().CreateExtractValue(lhs, 0, "enum.disc");
+            }
+        }
+        if (rhs->getType()->isStructTy())
+        {
+            auto *st = llvm::cast<llvm::StructType>(rhs->getType());
+            if (!st->isOpaque() && st->getNumElements() >= 1 &&
+                st->getElementType(0)->isIntegerTy())
+            {
+                rhs = builder().CreateExtractValue(rhs, 0, "enum.disc");
+            }
+        }
+
         // Ensure compatible types for non-pointer arithmetic
         ensure_compatible_types(lhs, rhs);
 
@@ -1285,6 +1305,28 @@ namespace Cryo::Codegen
     {
         if (!lhs || !rhs)
             return nullptr;
+
+        // Extract enum discriminants from tagged union structs ({ i32, [N x i8] })
+        // so that enum values can be compared by their discriminant integer.
+        // This mirrors the approach used in pattern matching (ControlFlowCodegen.cpp).
+        if (lhs->getType()->isStructTy())
+        {
+            auto *st = llvm::cast<llvm::StructType>(lhs->getType());
+            if (!st->isOpaque() && st->getNumElements() >= 1 &&
+                st->getElementType(0)->isIntegerTy())
+            {
+                lhs = builder().CreateExtractValue(lhs, 0, "enum.disc");
+            }
+        }
+        if (rhs->getType()->isStructTy())
+        {
+            auto *st = llvm::cast<llvm::StructType>(rhs->getType());
+            if (!st->isOpaque() && st->getNumElements() >= 1 &&
+                st->getElementType(0)->isIntegerTy())
+            {
+                rhs = builder().CreateExtractValue(rhs, 0, "enum.disc");
+            }
+        }
 
         // Log type information for debugging
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -2419,10 +2461,61 @@ namespace Cryo::Codegen
             int field_idx_signed = ctx().get_struct_field_index(type_name, member_name);
             if (field_idx_signed < 0)
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "get_lvalue_address: Field '{}' not found in struct '{}'",
-                          member_name, type_name);
-                return nullptr;
+                // Fallback: try TemplateRegistry for cross-module struct field lookup
+                if (auto *template_reg = ctx().template_registry())
+                {
+                    std::vector<std::string> candidates = {type_name};
+
+                    // Add LLVM struct type name as candidate
+                    if (struct_type && struct_type->hasName())
+                    {
+                        std::string llvm_name = struct_type->getName().str();
+                        if (llvm_name != type_name)
+                            candidates.push_back(llvm_name);
+                    }
+
+                    // Add namespace prefix
+                    if (!ctx().namespace_context().empty())
+                        candidates.push_back(ctx().namespace_context() + "::" + type_name);
+
+                    // Add type_namespace_map lookup
+                    std::string type_ns = ctx().get_type_namespace(type_name);
+                    if (!type_ns.empty())
+                        candidates.push_back(type_ns + "::" + type_name);
+
+                    // Try base template name (e.g., "HashSetEntry" from "HashSetEntry_string")
+                    size_t underscore_pos = type_name.find('_');
+                    if (underscore_pos != std::string::npos)
+                        candidates.push_back(type_name.substr(0, underscore_pos));
+
+                    for (const auto &candidate : candidates)
+                    {
+                        const TemplateRegistry::StructFieldInfo *field_info =
+                            template_reg->get_struct_field_types(candidate);
+                        if (field_info && !field_info->field_names.empty())
+                        {
+                            for (size_t i = 0; i < field_info->field_names.size(); ++i)
+                            {
+                                if (field_info->field_names[i] == member_name)
+                                {
+                                    field_idx_signed = static_cast<int>(i);
+                                    ctx().register_struct_fields(type_name, field_info->field_names);
+                                    break;
+                                }
+                            }
+                            if (field_idx_signed >= 0)
+                                break;
+                        }
+                    }
+                }
+
+                if (field_idx_signed < 0)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "get_lvalue_address: Field '{}' not found in struct '{}'",
+                              member_name, type_name);
+                    return nullptr;
+                }
             }
             field_idx = static_cast<unsigned>(field_idx_signed);
 
@@ -2753,6 +2846,18 @@ namespace Cryo::Codegen
         if (lhs_type->isPointerTy() && rhs_type->isPointerTy())
         {
             // Opaque pointers in LLVM 15+ are compatible
+            return true;
+        }
+
+        // Integer-to-pointer comparison (e.g., ptr == null where null is integer 0)
+        if (lhs_type->isIntegerTy() && rhs_type->isPointerTy())
+        {
+            lhs = builder().CreateIntToPtr(lhs, rhs_type, "int2ptr");
+            return true;
+        }
+        if (lhs_type->isPointerTy() && rhs_type->isIntegerTy())
+        {
+            rhs = builder().CreateIntToPtr(rhs, lhs_type, "int2ptr");
             return true;
         }
 
