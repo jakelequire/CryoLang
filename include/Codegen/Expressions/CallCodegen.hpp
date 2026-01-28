@@ -68,7 +68,7 @@ namespace Cryo::Codegen
             StructConstructor,    // MyStruct(args...)
             ClassConstructor,     // new MyClass(args...)
             EnumVariant,          // Option::Some(value)
-            Intrinsic,            // __malloc__(size)
+            Intrinsic,            // malloc(size)
             RuntimeFunction,      // cryo_alloc(...)
             StaticMethod,         // Type::method(args)
             InstanceMethod,       // obj.method(args)
@@ -130,7 +130,7 @@ namespace Cryo::Codegen
         /**
          * @brief Generate intrinsic function call
          * @param node Call expression
-         * @param intrinsic_name Intrinsic name (e.g., "__malloc__")
+         * @param intrinsic_name Intrinsic name (e.g., "malloc")
          * @return Result value
          */
         llvm::Value *generate_intrinsic(Cryo::CallExpressionNode *node,

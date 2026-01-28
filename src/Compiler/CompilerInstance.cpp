@@ -98,7 +98,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Runtime auto-import: loaded core/types with {} symbols", core_types_result.symbol_map.size());
             }
             
-            // Import intrinsics for __malloc__, __free__, etc.
+            // Import intrinsics for malloc, free, etc.
             auto intrinsics_import = std::make_unique<ImportDeclarationNode>(
                 SourceLocation(0, 0), "core::intrinsics");
             auto intrinsics_result = _module_loader->load_import(*intrinsics_import);
