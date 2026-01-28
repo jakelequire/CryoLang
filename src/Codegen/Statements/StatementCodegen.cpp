@@ -353,6 +353,7 @@ namespace Cryo::Codegen
 
         // Use visitor pattern through context
         CodegenVisitor *visitor = ctx().visitor();
+        ctx().set_result(nullptr);
         expr->accept(*visitor);
         return get_result();
     }

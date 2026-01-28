@@ -1451,9 +1451,15 @@ namespace Cryo::Codegen
         if (!lhs)
             return nullptr;
 
-        // Convert to bool if needed
+        // Convert to bool if needed — guard against struct types which can't be compared with ICmp
         if (!lhs->getType()->isIntegerTy(1))
         {
+            if (!lhs->getType()->isIntegerTy() && !lhs->getType()->isPointerTy() && !lhs->getType()->isFloatingPointTy())
+            {
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
+                             "Cannot convert struct/aggregate type to boolean for logical AND");
+                return nullptr;
+            }
             lhs = b.CreateICmpNE(lhs, llvm::Constant::getNullValue(lhs->getType()), "tobool");
         }
 
@@ -1470,6 +1476,12 @@ namespace Cryo::Codegen
 
         if (!rhs->getType()->isIntegerTy(1))
         {
+            if (!rhs->getType()->isIntegerTy() && !rhs->getType()->isPointerTy() && !rhs->getType()->isFloatingPointTy())
+            {
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
+                             "Cannot convert struct/aggregate type to boolean for logical AND");
+                return nullptr;
+            }
             rhs = b.CreateICmpNE(rhs, llvm::Constant::getNullValue(rhs->getType()), "tobool");
         }
 
@@ -1515,9 +1527,15 @@ namespace Cryo::Codegen
         if (!lhs)
             return nullptr;
 
-        // Convert to bool if needed
+        // Convert to bool if needed — guard against struct types which can't be compared with ICmp
         if (!lhs->getType()->isIntegerTy(1))
         {
+            if (!lhs->getType()->isIntegerTy() && !lhs->getType()->isPointerTy() && !lhs->getType()->isFloatingPointTy())
+            {
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
+                             "Cannot convert struct/aggregate type to boolean for logical OR");
+                return nullptr;
+            }
             lhs = b.CreateICmpNE(lhs, llvm::Constant::getNullValue(lhs->getType()), "tobool");
         }
 
@@ -1534,6 +1552,12 @@ namespace Cryo::Codegen
 
         if (!rhs->getType()->isIntegerTy(1))
         {
+            if (!rhs->getType()->isIntegerTy() && !rhs->getType()->isPointerTy() && !rhs->getType()->isFloatingPointTy())
+            {
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
+                             "Cannot convert struct/aggregate type to boolean for logical OR");
+                return nullptr;
+            }
             rhs = b.CreateICmpNE(rhs, llvm::Constant::getNullValue(rhs->getType()), "tobool");
         }
 
@@ -2041,6 +2065,11 @@ namespace Cryo::Codegen
                          "CodegenVisitor not available for expression generation");
             return nullptr;
         }
+
+        // Clear stale result before visiting so that if the expression generation
+        // fails (returns nullptr without calling set_result), we return nullptr
+        // instead of a stale value from a previous expression.
+        ctx().set_result(nullptr);
 
         // Visit the expression to generate its value
         expr->accept(*visitor);

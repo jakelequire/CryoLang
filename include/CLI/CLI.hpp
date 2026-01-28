@@ -98,6 +98,7 @@ namespace Cryo::CLI
         bool show_symbols() const { return get_flag("symbols") || get_flag("show-symbols"); }
         bool show_ir() const { return get_flag("ir") || get_flag("show-ir"); }
         bool compile_only() const { return get_flag("c") || get_flag("compile-only"); }
+        bool raw_mode() const { return get_flag("raw"); }
         std::string output_file() const { return get_arg("o", get_arg("output", "")); }
         std::string input_file() const { return positional().empty() ? "" : positional()[0]; }
     };

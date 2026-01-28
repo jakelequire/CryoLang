@@ -495,6 +495,80 @@ namespace Cryo::Linker
         return true;
     }
 
+    bool CryoLinker::generate_assembly_file(llvm::Module *module, const std::string &output_path)
+    {
+        llvm::InitializeAllTargetInfos();
+        llvm::InitializeAllTargets();
+        llvm::InitializeAllTargetMCs();
+        llvm::InitializeAllAsmParsers();
+        llvm::InitializeAllAsmPrinters();
+
+        std::string error;
+        auto target_triple = _target_triple; // Use our configured target triple
+        module->setTargetTriple(target_triple);
+
+        auto target = llvm::TargetRegistry::lookupTarget(target_triple, error);
+        if (!target)
+        {
+            report_error("Failed to lookup target: " + error);
+            return false;
+        }
+
+        auto cpu = "generic";
+        auto features = "";
+        llvm::TargetOptions opt;
+
+        // Use PIC relocation model for compatibility
+        auto rm = std::make_optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
+
+        // Use Large code model on Windows to avoid relocation truncation errors
+        // (IMAGE_REL_AMD64_ADDR32 against '.rdata')
+        // On other platforms, use Small code model for efficiency
+        std::optional<llvm::CodeModel::Model> code_model;
+        if (target_triple.find("windows") != std::string::npos ||
+            target_triple.find("win32") != std::string::npos ||
+            target_triple.find("mingw") != std::string::npos ||
+            target_triple.find("msvc") != std::string::npos)
+        {
+            // Windows x64 needs Large code model to handle addresses > 2GB
+            code_model = llvm::CodeModel::Large;
+            LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                     "CryoLinker: Using Large code model for Windows target: {}", target_triple);
+        }
+        else
+        {
+            // Other platforms can use Small code model
+            code_model = llvm::CodeModel::Small;
+        }
+
+        auto target_machine = std::unique_ptr<llvm::TargetMachine>(
+            target->createTargetMachine(target_triple, cpu, features, opt, rm, code_model));
+
+        module->setDataLayout(target_machine->createDataLayout());
+
+        std::error_code ec;
+        llvm::raw_fd_ostream dest(output_path, ec, llvm::sys::fs::OF_None);
+        if (ec)
+        {
+            report_error("Could not open file: " + ec.message());
+            return false;
+        }
+
+        llvm::legacy::PassManager pass;
+        auto file_type = llvm::CodeGenFileType::AssemblyFile; // This is the key difference
+
+        if (target_machine->addPassesToEmitFile(pass, dest, nullptr, file_type))
+        {
+            report_error("TargetMachine can't emit assembly file for this target");
+            return false;
+        }
+
+        pass.run(*module);
+        dest.flush();
+
+        return true;
+    }
+
     //===================================================================
     // Cross-Platform Support
     //===================================================================

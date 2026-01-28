@@ -85,6 +85,7 @@ namespace Cryo
         bool _auto_imports_enabled;                    // Control whether to automatically import core types
         bool _lsp_mode;                                // LSP compilation mode
         bool _frontend_only;                           // Frontend-only compilation mode
+        bool _raw_mode;                                // Raw mode compilation (no stdlib, no main transform)
         bool _dump_symbols;                            // Dump symbol tables for each module to debug files
         std::string _dump_symbols_output_dir;          // Output directory for symbol dumps
         std::string _current_namespace;                // Current namespace context
@@ -176,6 +177,17 @@ namespace Cryo
 
         void set_auto_imports_enabled(bool enable) { _auto_imports_enabled = enable; }
         bool auto_imports_enabled() const { return _auto_imports_enabled; }
+
+        // Raw mode control (no stdlib, no main transform)
+        void set_raw_mode(bool enable) { 
+            _raw_mode = enable; 
+            if (enable) {
+                // Raw mode implies no stdlib linking and no auto imports
+                _stdlib_linking_enabled = false;
+                _auto_imports_enabled = false;
+            }
+        }
+        bool raw_mode() const { return _raw_mode; }
 
         // Symbol dump control
         void set_dump_symbols(bool enable, const std::string &output_dir = "") { _dump_symbols = enable; _dump_symbols_output_dir = output_dir; }

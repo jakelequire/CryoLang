@@ -1548,7 +1548,7 @@ namespace Cryo
         }
 
         // Runtime function name transformation: main -> _user_main_
-        // Only transform if this is not a stdlib module (not in "std" namespace)
+        // Only transform if this is not a stdlib module (not in "std" namespace) AND not in raw mode
         bool is_in_std_namespace = false;
         if (_srm_context)
         {
@@ -1564,7 +1564,7 @@ namespace Cryo
 
         if (func_name == "main")
         {
-            if (!is_in_std_namespace)
+            if (!is_in_std_namespace && !_raw_mode)
             {
                 func_name = "_user_main_";
             }

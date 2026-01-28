@@ -18,7 +18,7 @@
 namespace Cryo
 {
     CompilerInstance::CompilerInstance()
-        : _debug_mode(false), _show_ast_before_ir(false), _stdlib_linking_enabled(true), _stdlib_compilation_mode(false), _auto_imports_enabled(true), _lsp_mode(false), _frontend_only(false), _dump_symbols(false), _dump_symbols_output_dir(""), _current_namespace("")
+        : _debug_mode(false), _show_ast_before_ir(false), _stdlib_linking_enabled(true), _stdlib_compilation_mode(false), _auto_imports_enabled(true), _lsp_mode(false), _frontend_only(false), _raw_mode(false), _dump_symbols(false), _dump_symbols_output_dir(""), _current_namespace("")
     {
         initialize_components();
     }
@@ -236,6 +236,7 @@ namespace Cryo
             // Phase 2: Create parser with lexer and AST context
             _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostics.get(), file_path);
             _parser->set_directive_registry(_directive_registry.get());
+            _parser->set_raw_mode(_raw_mode);
 
             // Phase 3: Parse the program
             if (!parse())
@@ -3174,6 +3175,7 @@ namespace Cryo
             // Create parser with lexer and AST context
             _parser = std::make_unique<Parser>(std::move(_lexer), *_ast_context, _diagnostics.get(), _loaded_file_path);
             _parser->set_directive_registry(_directive_registry.get());
+            _parser->set_raw_mode(_raw_mode);
 
             // Parse the program
             _ast_root = _parser->parse_program();

@@ -429,6 +429,21 @@ namespace Cryo::Codegen
                                  llvm::StructType *&out_struct_type,
                                  unsigned &out_field_idx);
 
+        /**
+         * @brief Wrap a raw i32 discriminant in a tagged union struct
+         *
+         * When an enum variant (e.g., Option::None) is stored as a raw i32 discriminant
+         * but the enum's LLVM type is a tagged union struct { i32, [N x i8] }, this method
+         * constructs the full struct with the discriminant at index 0 and zeroed payload.
+         *
+         * @param discriminant The i32 discriminant value
+         * @param struct_type The target tagged union struct type
+         * @param name Label prefix for IR instructions
+         * @return The loaded struct value, or the original discriminant if wrapping fails
+         */
+        llvm::Value *wrap_discriminant_in_tagged_union(
+            llvm::Value *discriminant, llvm::StructType *struct_type, const std::string &name);
+
         // String literal cache
         std::unordered_map<std::string, llvm::GlobalVariable *> _string_cache;
     };

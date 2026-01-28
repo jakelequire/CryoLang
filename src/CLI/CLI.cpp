@@ -117,6 +117,7 @@ namespace Cryo::CLI
                              flag_name == "help" || flag_name == "h" ||
                              flag_name == "version" || flag_name == "v" ||
                              flag_name == "no-std" || flag_name == "stdlib-mode" ||
+                             flag_name == "raw" ||
                              flag_name == "debug" || flag_name == "d" ||
                              flag_name == "verbose" ||
                              flag_name == "trace" ||
@@ -467,6 +468,13 @@ namespace Cryo::CLI
             std::cout << "[INFO] Standard library compilation mode enabled" << std::endl;
         }
 
+        // Set raw mode (no stdlib, no main transform)
+        if (args.get_flag("raw"))
+        {
+            compiler->set_raw_mode(true);
+            std::cout << "[INFO] Raw mode enabled - no stdlib linking or main transform" << std::endl;
+        }
+
         bool compilation_success = compiler->compile_file(file_path);
 
         if (compilation_success)
@@ -547,19 +555,81 @@ namespace Cryo::CLI
             // Generate executable if output file is specified and not compile-only mode
             if (!args.output_file().empty() && !args.compile_only())
             {
-                std::cout << "\nGenerating executable: " << args.output_file() << std::endl;
-
-                auto target = Cryo::Linker::CryoLinker::LinkTarget::Executable;
-
-                if (compiler->generate_output(args.output_file(), target))
+                if (args.get_flag("raw"))
                 {
-                    std::cout << "Executable generated successfully: " << args.output_file() << std::endl;
+                    // Raw mode: generate appropriate output based on file extension
+                    std::string output_path = args.output_file();
+                    std::string extension = "";
+                    size_t dot_pos = output_path.find_last_of('.');
+                    if (dot_pos != std::string::npos)
+                    {
+                        extension = output_path.substr(dot_pos + 1);
+                        std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+                    }
+
+                    std::cout << "\n[RAW] Generating raw output: " << output_path << std::endl;
+
+                    bool output_success = false;
+                    if (extension == "ll")
+                    {
+                        // Generate LLVM IR text
+                        output_success = compiler->codegen() && compiler->codegen()->emit_llvm_ir(output_path);
+                    }
+                    else if (extension == "bc")
+                    {
+                        // Generate LLVM bitcode
+                        output_success = compiler->codegen() && compiler->codegen()->emit_llvm_ir(output_path);
+                    }
+                    else if (extension == "o" || extension == "obj")
+                    {
+                        // Generate object file using linker
+                        auto target = Cryo::Linker::CryoLinker::LinkTarget::ObjectFile;
+                        output_success = compiler->generate_output(output_path, target);
+                    }
+                    else if (extension == "asm" || extension == "s")
+                    {
+                        // Generate assembly file using linker
+                        output_success = compiler->linker() && compiler->linker()->generate_assembly_file(compiler->codegen()->get_module(), output_path);
+                    }
+                    else
+                    {
+                        // Default to object file for unknown extensions
+                        std::cout << "[RAW] Unknown extension '" << extension << "', defaulting to object file" << std::endl;
+                        auto target = Cryo::Linker::CryoLinker::LinkTarget::ObjectFile;
+                        output_success = compiler->generate_output(output_path, target);
+                    }
+
+                    if (output_success)
+                    {
+                        std::cout << "✓ Raw output generated successfully: " << output_path << std::endl;
+                    }
+                    else
+                    {
+                        std::cerr << "\n❌ Failed to generate raw output" << std::endl;
+                        if (compiler->codegen())
+                        {
+                            std::cerr << "Error: " << compiler->codegen()->get_last_error() << std::endl;
+                        }
+                        return 1;
+                    }
                 }
                 else
                 {
-                    std::cerr << "\n<!> Executable generation failed!" << std::endl;
-                    compiler->print_diagnostics();
-                    return 1;
+                    // Normal mode: generate executable
+                    std::cout << "\nGenerating executable: " << args.output_file() << std::endl;
+
+                    auto target = Cryo::Linker::CryoLinker::LinkTarget::Executable;
+
+                    if (compiler->generate_output(args.output_file(), target))
+                    {
+                        std::cout << "Executable generated successfully: " << args.output_file() << std::endl;
+                    }
+                    else
+                    {
+                        std::cerr << "\n<!> Executable generation failed!" << std::endl;
+                        compiler->print_diagnostics();
+                        return 1;
+                    }
                 }
             }
 
