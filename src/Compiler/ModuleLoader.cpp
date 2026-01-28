@@ -1247,6 +1247,18 @@ namespace Cryo
             }
         }
 
+        // Register all type symbols in the ModuleTypeRegistry under their module ID.
+        // This ensures resolve_with_imports can find types from imported modules.
+        for (const auto &[name, sym] : symbol_map)
+        {
+            if (sym.kind == SymbolKind::Type && sym.type.is_valid() && !sym.type.is_error())
+            {
+                _ast_context.modules().register_type(module_id, name, sym.type);
+            }
+        }
+        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered types from '{}' in ModuleTypeRegistry (module_id={})",
+                  module_name, module_id.id);
+
         return symbol_map;
     }
 

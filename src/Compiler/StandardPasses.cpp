@@ -429,16 +429,42 @@ namespace Cryo
         LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: GenericRegistry has {} templates",
             generic_registry.template_count());
 
-        // Set up resolution context
+        // Set up resolution context with the actual module identity
         ResolutionContext res_ctx;
-        res_ctx.current_module = ModuleID::invalid(); // Use default for now
-
-        // Collect imports from the symbol table
         auto *symbols = _compiler.symbol_table();
         if (symbols)
         {
-            // The symbol table should have the imports
-            // For now, we'll rely on the module registry
+            res_ctx.current_module = symbols->current_module();
+            LOG_DEBUG(LogComponent::GENERAL,
+                "TypeResolutionPass: Using module ID {} from SymbolTable",
+                res_ctx.current_module.id);
+        }
+
+        // Register all imported type symbols from the SymbolTable into the
+        // ModuleTypeRegistry under the current module. This makes imported
+        // non-generic types (e.g., IoError, PathBuf) discoverable by
+        // resolve_with_imports which checks the current module first.
+        // Generic templates (e.g., IoResult<T>, Option<T>) are intentionally
+        // skipped — they are resolved via GenericRegistry::get_template_by_name.
+        if (symbols && res_ctx.current_module.is_valid())
+        {
+            size_t registered_imports = 0;
+            symbols->for_each_symbol([&](const Symbol &sym) {
+                if (sym.kind == SymbolKind::Type && sym.type.is_valid() && !sym.type.is_error())
+                {
+                    // Skip types that are generic templates — those are handled
+                    // by the GenericRegistry and must use its TypeRef to avoid
+                    // TypeID mismatches with is_template().
+                    if (generic_registry.get_template_by_name(sym.name))
+                        return;
+
+                    module_registry.register_type(res_ctx.current_module, sym.name, sym.type);
+                    registered_imports++;
+                }
+            });
+            LOG_DEBUG(LogComponent::GENERAL,
+                "TypeResolutionPass: Registered {} imported type symbols in module {}",
+                registered_imports, res_ctx.current_module.id);
         }
 
         size_t resolved_count = 0;
