@@ -983,6 +983,18 @@ namespace Cryo
             _ast_root.reset();
         }
 
+        // Clear per-module generic instantiation state to prevent specializations
+        // from earlier modules leaking into later modules. Template definitions
+        // persist (they're needed cross-module), but instantiation caches are per-module.
+        if (_generic_registry)
+        {
+            _generic_registry->clear_module_state();
+        }
+        if (_monomorphization_pass)
+        {
+            _monomorphization_pass->clear_module_state();
+        }
+
         // Don't clear diagnostics during stdlib compilation - we want to accumulate
         // errors from all modules so they can be reported together at the end
         if (_diagnostics && !_stdlib_compilation_mode)

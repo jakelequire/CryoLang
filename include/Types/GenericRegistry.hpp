@@ -297,6 +297,15 @@ namespace Cryo
         size_t instantiation_count() const { return _instantiations.size(); }
         size_t pending_count() const { return _pending_instantiations.size(); }
 
+        // Clear per-module state (instantiation caches) while preserving template definitions.
+        // Call between module compilations to prevent specializations leaking across modules.
+        void clear_module_state()
+        {
+            _instantiations.clear();
+            _pending_instantiations.clear();
+            _monomorphized.clear();
+        }
+
     private:
         // Create instantiation key
         InstantiationKey make_key(TypeRef base, const std::vector<TypeRef> &args) const;

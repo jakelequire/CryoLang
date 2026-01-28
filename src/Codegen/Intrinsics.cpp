@@ -37,7 +37,7 @@ namespace Cryo::Codegen
             return generate_free(args);
         else if (intrinsic_name == "aligned_alloc")
             return generate_aligned_alloc(args);
-        
+
         // Memory operations intrinsics
         else if (intrinsic_name == "memcpy")
             return generate_memcpy(args);
@@ -49,7 +49,7 @@ namespace Cryo::Codegen
             return generate_memcmp(args);
         else if (intrinsic_name == "memchr")
             return generate_memchr(args);
-        
+
         // String intrinsics
         else if (intrinsic_name == "strlen")
             return generate_strlen(args);
@@ -71,7 +71,7 @@ namespace Cryo::Codegen
             return generate_strstr(args);
         else if (intrinsic_name == "strdup")
             return generate_strdup(args);
-        
+
         // I/O intrinsics
         else if (intrinsic_name == "printf")
             return generate_printf(args);
@@ -83,7 +83,7 @@ namespace Cryo::Codegen
             return generate_putchar(args);
         else if (intrinsic_name == "puts")
             return generate_puts(args);
-        
+
         // File I/O intrinsics
         else if (intrinsic_name == "fopen")
             return generate_fopen(args);
@@ -103,7 +103,7 @@ namespace Cryo::Codegen
             return generate_feof(args);
         else if (intrinsic_name == "ferror")
             return generate_ferror(args);
-        
+
         // Low-level file descriptor I/O
         else if (intrinsic_name == "read")
             return generate_read(args);
@@ -123,7 +123,7 @@ namespace Cryo::Codegen
             return generate_pipe(args);
         else if (intrinsic_name == "fcntl")
             return generate_fcntl(args);
-        
+
         // Filesystem intrinsics
         else if (intrinsic_name == "stat")
             return generate_stat(args);
@@ -163,7 +163,7 @@ namespace Cryo::Codegen
             return generate_readdir(args);
         else if (intrinsic_name == "closedir")
             return generate_closedir(args);
-        
+
         // Process intrinsics
         else if (intrinsic_name == "exit")
             return generate_exit(args);
@@ -195,7 +195,7 @@ namespace Cryo::Codegen
             return generate_raise(args);
         else if (intrinsic_name == "signal")
             return generate_signal(args);
-        
+
         // Math intrinsics
         else if (intrinsic_name == "sqrt")
             return generate_sqrt(args);
@@ -301,7 +301,7 @@ namespace Cryo::Codegen
             return generate_erf(args);
         else if (intrinsic_name == "erfc")
             return generate_erfc(args);
-        
+
         // Network intrinsics
         else if (intrinsic_name == "socket")
             return generate_socket(args);
@@ -341,7 +341,7 @@ namespace Cryo::Codegen
             return generate_htonl(args);
         else if (intrinsic_name == "ntohl")
             return generate_ntohl(args);
-        
+
         // Time intrinsics
         else if (intrinsic_name == "time")
             return generate_time(args);
@@ -355,7 +355,7 @@ namespace Cryo::Codegen
             return generate_sleep(args);
         else if (intrinsic_name == "usleep")
             return generate_usleep(args);
-        
+
         // Threading intrinsics (pthread)
         else if (intrinsic_name == "pthread_create")
             return generate_pthread_create(args);
@@ -371,7 +371,7 @@ namespace Cryo::Codegen
             return generate_pthread_equal(args);
         else if (intrinsic_name == "sched_yield")
             return generate_sched_yield(args);
-        
+
         // Mutex intrinsics
         else if (intrinsic_name == "pthread_mutex_init")
             return generate_pthread_mutex_init(args);
@@ -383,7 +383,7 @@ namespace Cryo::Codegen
             return generate_pthread_mutex_trylock(args);
         else if (intrinsic_name == "pthread_mutex_unlock")
             return generate_pthread_mutex_unlock(args);
-        
+
         // Condition variable intrinsics
         else if (intrinsic_name == "pthread_cond_init")
             return generate_pthread_cond_init(args);
@@ -397,7 +397,7 @@ namespace Cryo::Codegen
             return generate_pthread_cond_signal(args);
         else if (intrinsic_name == "pthread_cond_broadcast")
             return generate_pthread_cond_broadcast(args);
-        
+
         // Read-write lock intrinsics
         else if (intrinsic_name == "pthread_rwlock_init")
             return generate_pthread_rwlock_init(args);
@@ -413,7 +413,7 @@ namespace Cryo::Codegen
             return generate_pthread_rwlock_trywrlock(args);
         else if (intrinsic_name == "pthread_rwlock_unlock")
             return generate_pthread_rwlock_unlock(args);
-        
+
         // Thread-local storage intrinsics
         else if (intrinsic_name == "pthread_key_create")
             return generate_pthread_key_create(args);
@@ -423,7 +423,7 @@ namespace Cryo::Codegen
             return generate_pthread_getspecific(args);
         else if (intrinsic_name == "pthread_setspecific")
             return generate_pthread_setspecific(args);
-        
+
         // Atomic intrinsics
         else if (intrinsic_name == "atomic_load_8")
             return generate_atomic_load_8(args);
@@ -473,7 +473,7 @@ namespace Cryo::Codegen
             return generate_atomic_fetch_xor_64(args);
         else if (intrinsic_name == "atomic_fence")
             return generate_atomic_fence(args);
-        
+
         // Enhanced network intrinsics
         else if (intrinsic_name == "listen")
             return generate_listen(args);
@@ -501,7 +501,7 @@ namespace Cryo::Codegen
             return generate_getpeername(args);
         else if (intrinsic_name == "poll")
             return generate_poll(args);
-        
+
         // Atomic intrinsics
         else if (intrinsic_name == "atomic_load_8")
             return generate_atomic_load_8(args);
@@ -551,7 +551,7 @@ namespace Cryo::Codegen
             return generate_atomic_fetch_xor_64(args);
         else if (intrinsic_name == "atomic_fence")
             return generate_atomic_fence(args);
-        
+
         // Additional 8-bit atomic operations
         else if (intrinsic_name == "atomic_swap_8")
             return generate_atomic_swap_8(args);
@@ -567,7 +567,7 @@ namespace Cryo::Codegen
             return generate_atomic_fetch_xor_8(args);
         else if (intrinsic_name == "atomic_fetch_nand_8")
             return generate_atomic_fetch_nand_8(args);
-        
+
         // Typed atomic load/store functions
         else if (intrinsic_name == "atomic_load_u8")
             return generate_atomic_load_u8(args);
@@ -585,7 +585,7 @@ namespace Cryo::Codegen
             return generate_atomic_fetch_xor_u8(args);
         else if (intrinsic_name == "atomic_fetch_nand_u8")
             return generate_atomic_fetch_nand_u8(args);
-        
+
         // Signed 32-bit atomic operations
         else if (intrinsic_name == "atomic_load_i32")
             return generate_atomic_load_i32(args);
@@ -609,7 +609,7 @@ namespace Cryo::Codegen
             return generate_atomic_fetch_max_i32(args);
         else if (intrinsic_name == "atomic_fetch_min_i32")
             return generate_atomic_fetch_min_i32(args);
-        
+
         // Unsigned 32-bit atomic operations
         else if (intrinsic_name == "atomic_load_u32")
             return generate_atomic_load_u32(args);
@@ -629,7 +629,7 @@ namespace Cryo::Codegen
             return generate_atomic_fetch_or_u32(args);
         else if (intrinsic_name == "atomic_fetch_xor_u32")
             return generate_atomic_fetch_xor_u32(args);
-        
+
         // Signed 64-bit atomic operations
         else if (intrinsic_name == "atomic_load_i64")
             return generate_atomic_load_i64(args);
@@ -643,7 +643,7 @@ namespace Cryo::Codegen
             return generate_atomic_fetch_add_i64(args);
         else if (intrinsic_name == "atomic_fetch_sub_i64")
             return generate_atomic_fetch_sub_i64(args);
-        
+
         // Unsigned 64-bit atomic operations
         else if (intrinsic_name == "atomic_load_u64")
             return generate_atomic_load_u64(args);
@@ -1703,7 +1703,7 @@ namespace Cryo::Codegen
     {
         if (args.empty())
         {
-            report_error("__printf__ requires at least 1 argument (format)");
+            report_error("printf requires at least 1 argument (format)");
             return nullptr;
         }
 
@@ -1727,7 +1727,7 @@ namespace Cryo::Codegen
         // Ensure format argument is a pointer
         if (!args[0]->getType()->isPointerTy())
         {
-            report_error("__printf__ format argument must be a pointer");
+            report_error("printf format argument must be a pointer");
             return nullptr;
         }
 
@@ -2324,7 +2324,7 @@ namespace Cryo::Codegen
         {
             function_name = "std::Runtime::" + name;
         }
-        
+
         // System functions use their original names (printf, malloc, etc.)
         // The namespace qualification in DeclarationCodegen ensures stdlib functions
         // like std::IO::printf don't conflict with these system function names
@@ -2901,9 +2901,9 @@ namespace Cryo::Codegen
 
         // Prepare arguments
         std::vector<llvm::Value *> call_args;
-        call_args.push_back(args[0]); // buffer
+        call_args.push_back(args[0]);                                            // buffer
         call_args.push_back(ensure_type(args[1], size_t_type, "snprintf.size")); // size
-        call_args.push_back(args[2]); // format
+        call_args.push_back(args[2]);                                            // format
 
         // Add remaining variadic arguments
         for (size_t i = 3; i < args.size(); ++i)
@@ -2995,7 +2995,7 @@ namespace Cryo::Codegen
     }
 
     // ========================================
-    // File I/O Intrinsics  
+    // File I/O Intrinsics
     // ========================================
 
     llvm::Value *Intrinsics::generate_fopen(const std::vector<llvm::Value *> &args)
@@ -3057,14 +3057,14 @@ namespace Cryo::Codegen
             size_t_type, {void_ptr_type, size_t_type, size_t_type, void_ptr_type}, false);
 
         llvm::Function *fread_func = get_or_create_libc_function("fread", fread_type);
-        
+
         std::vector<llvm::Value *> call_args = {
             args[0], // buffer
             ensure_type(args[1], size_t_type, "fread.size"),
             ensure_type(args[2], size_t_type, "fread.count"),
             args[3] // file
         };
-        
+
         return builder.CreateCall(fread_func, call_args, "fread.result");
     }
 
@@ -3086,14 +3086,14 @@ namespace Cryo::Codegen
             size_t_type, {void_ptr_type, size_t_type, size_t_type, void_ptr_type}, false);
 
         llvm::Function *fwrite_func = get_or_create_libc_function("fwrite", fwrite_type);
-        
+
         std::vector<llvm::Value *> call_args = {
             args[0], // buffer
             ensure_type(args[1], size_t_type, "fwrite.size"),
             ensure_type(args[2], size_t_type, "fwrite.count"),
             args[3] // file
         };
-        
+
         return builder.CreateCall(fwrite_func, call_args, "fwrite.result");
     }
 
@@ -3116,13 +3116,12 @@ namespace Cryo::Codegen
             int_type, {void_ptr_type, long_type, int_type}, false);
 
         llvm::Function *fseek_func = get_or_create_libc_function("fseek", fseek_type);
-        
+
         std::vector<llvm::Value *> call_args = {
             args[0], // file
             ensure_type(args[1], long_type, "fseek.offset"),
-            ensure_type(args[2], int_type, "fseek.whence")
-        };
-        
+            ensure_type(args[2], int_type, "fseek.whence")};
+
         return builder.CreateCall(fseek_func, call_args, "fseek.result");
     }
 
@@ -3230,13 +3229,12 @@ namespace Cryo::Codegen
             ssize_t_type, {int_type, void_ptr_type, size_t_type}, false);
 
         llvm::Function *read_func = get_or_create_libc_function("read", read_type);
-        
+
         std::vector<llvm::Value *> call_args = {
             ensure_type(args[0], int_type, "read.fd"),
             args[1], // buffer
-            ensure_type(args[2], size_t_type, "read.count")
-        };
-        
+            ensure_type(args[2], size_t_type, "read.count")};
+
         return builder.CreateCall(read_func, call_args, "read.result");
     }
 
@@ -3260,13 +3258,12 @@ namespace Cryo::Codegen
             ssize_t_type, {int_type, void_ptr_type, size_t_type}, false);
 
         llvm::Function *write_func = get_or_create_libc_function("write", write_type);
-        
+
         std::vector<llvm::Value *> call_args = {
             ensure_type(args[0], int_type, "write.fd"),
             args[1], // buffer
-            ensure_type(args[2], size_t_type, "write.count")
-        };
-        
+            ensure_type(args[2], size_t_type, "write.count")};
+
         return builder.CreateCall(write_func, call_args, "write.result");
     }
 
@@ -3288,13 +3285,12 @@ namespace Cryo::Codegen
             int_type, {char_ptr_type, int_type, int_type}, false);
 
         llvm::Function *open_func = get_or_create_libc_function("open", open_type);
-        
+
         std::vector<llvm::Value *> call_args = {
             args[0], // path
             ensure_type(args[1], int_type, "open.flags"),
-            ensure_type(args[2], int_type, "open.mode")
-        };
-        
+            ensure_type(args[2], int_type, "open.mode")};
+
         return builder.CreateCall(open_func, call_args, "open.result");
     }
 
@@ -3335,13 +3331,12 @@ namespace Cryo::Codegen
             off_t_type, {int_type, off_t_type, int_type}, false);
 
         llvm::Function *lseek_func = get_or_create_libc_function("lseek", lseek_type);
-        
+
         std::vector<llvm::Value *> call_args = {
             ensure_type(args[0], int_type, "lseek.fd"),
             ensure_type(args[1], off_t_type, "lseek.offset"),
-            ensure_type(args[2], int_type, "lseek.whence")
-        };
-        
+            ensure_type(args[2], int_type, "lseek.whence")};
+
         return builder.CreateCall(lseek_func, call_args, "lseek.result");
     }
 
@@ -3380,12 +3375,11 @@ namespace Cryo::Codegen
         llvm::FunctionType *dup2_type = llvm::FunctionType::get(int_type, {int_type, int_type}, false);
 
         llvm::Function *dup2_func = get_or_create_libc_function("dup2", dup2_type);
-        
+
         std::vector<llvm::Value *> call_args = {
             ensure_type(args[0], int_type, "dup2.oldfd"),
-            ensure_type(args[1], int_type, "dup2.newfd")
-        };
-        
+            ensure_type(args[1], int_type, "dup2.newfd")};
+
         return builder.CreateCall(dup2_func, call_args, "dup2.result");
     }
 
@@ -3426,13 +3420,12 @@ namespace Cryo::Codegen
             int_type, {int_type, int_type, int_type}, false);
 
         llvm::Function *fcntl_func = get_or_create_libc_function("fcntl", fcntl_type);
-        
+
         std::vector<llvm::Value *> call_args = {
             ensure_type(args[0], int_type, "fcntl.fd"),
             ensure_type(args[1], int_type, "fcntl.cmd"),
-            ensure_type(args[2], int_type, "fcntl.arg")
-        };
-        
+            ensure_type(args[2], int_type, "fcntl.arg")};
+
         return builder.CreateCall(fcntl_func, call_args, "fcntl.result");
     }
 
@@ -3886,11 +3879,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *waitpid_type = llvm::FunctionType::get(int_type, {int_type, int_ptr_type, int_type}, false);
 
         llvm::Function *waitpid_func = get_or_create_libc_function("waitpid", waitpid_type);
-        return builder.CreateCall(waitpid_func, {
-            ensure_type(args[0], int_type, "waitpid.pid"),
-            args[1],
-            ensure_type(args[2], int_type, "waitpid.options")
-        }, "waitpid.result");
+        return builder.CreateCall(waitpid_func, {ensure_type(args[0], int_type, "waitpid.pid"), args[1], ensure_type(args[2], int_type, "waitpid.options")}, "waitpid.result");
     }
 
     llvm::Value *Intrinsics::generate_getppid(const std::vector<llvm::Value *> &args)
@@ -3998,10 +3987,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *kill_type = llvm::FunctionType::get(int_type, {int_type, int_type}, false);
 
         llvm::Function *kill_func = get_or_create_libc_function("kill", kill_type);
-        return builder.CreateCall(kill_func, {
-            ensure_type(args[0], int_type, "kill.pid"),
-            ensure_type(args[1], int_type, "kill.sig")
-        }, "kill.result");
+        return builder.CreateCall(kill_func, {ensure_type(args[0], int_type, "kill.pid"), ensure_type(args[1], int_type, "kill.sig")}, "kill.result");
     }
 
     llvm::Value *Intrinsics::generate_raise(const std::vector<llvm::Value *> &args)
@@ -4038,10 +4024,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *signal_type = llvm::FunctionType::get(void_ptr_type, {int_type, void_ptr_type}, false);
 
         llvm::Function *signal_func = get_or_create_libc_function("signal", signal_type);
-        return builder.CreateCall(signal_func, {
-            ensure_type(args[0], int_type, "signal.signum"),
-            args[1]
-        }, "signal.result");
+        return builder.CreateCall(signal_func, {ensure_type(args[0], int_type, "signal.signum"), args[1]}, "signal.result");
     }
 
     // ========================================
@@ -4362,45 +4345,45 @@ namespace Cryo::Codegen
     // Additional Math Functions (using libc)
     // ========================================
 
-    #define DEFINE_MATH_FUNC_DOUBLE(name) \
-    llvm::Value *Intrinsics::generate_##name(const std::vector<llvm::Value *> &args) \
-    { \
-        if (args.size() != 1) \
-        { \
-            report_error(#name " requires exactly 1 argument"); \
-            return nullptr; \
-        } \
-        \
-        auto &builder = _context_manager.get_builder(); \
-        auto &context = _context_manager.get_context(); \
-        \
-        llvm::Type *double_type = llvm::Type::getDoubleTy(context); \
+#define DEFINE_MATH_FUNC_DOUBLE(name)                                                               \
+    llvm::Value *Intrinsics::generate_##name(const std::vector<llvm::Value *> &args)                \
+    {                                                                                               \
+        if (args.size() != 1)                                                                       \
+        {                                                                                           \
+            report_error(#name " requires exactly 1 argument");                                     \
+            return nullptr;                                                                         \
+        }                                                                                           \
+                                                                                                    \
+        auto &builder = _context_manager.get_builder();                                             \
+        auto &context = _context_manager.get_context();                                             \
+                                                                                                    \
+        llvm::Type *double_type = llvm::Type::getDoubleTy(context);                                 \
         llvm::FunctionType *func_type = llvm::FunctionType::get(double_type, {double_type}, false); \
-        \
-        llvm::Function *func = get_or_create_libc_function(#name, func_type); \
-        llvm::Value *x = ensure_type(args[0], double_type, #name ".x"); \
-        return builder.CreateCall(func, {x}, #name ".result"); \
+                                                                                                    \
+        llvm::Function *func = get_or_create_libc_function(#name, func_type);                       \
+        llvm::Value *x = ensure_type(args[0], double_type, #name ".x");                             \
+        return builder.CreateCall(func, {x}, #name ".result");                                      \
     }
 
-    #define DEFINE_MATH_FUNC_DOUBLE_2ARG(name) \
-    llvm::Value *Intrinsics::generate_##name(const std::vector<llvm::Value *> &args) \
-    { \
-        if (args.size() != 2) \
-        { \
-            report_error(#name " requires exactly 2 arguments"); \
-            return nullptr; \
-        } \
-        \
-        auto &builder = _context_manager.get_builder(); \
-        auto &context = _context_manager.get_context(); \
-        \
-        llvm::Type *double_type = llvm::Type::getDoubleTy(context); \
+#define DEFINE_MATH_FUNC_DOUBLE_2ARG(name)                                                                       \
+    llvm::Value *Intrinsics::generate_##name(const std::vector<llvm::Value *> &args)                             \
+    {                                                                                                            \
+        if (args.size() != 2)                                                                                    \
+        {                                                                                                        \
+            report_error(#name " requires exactly 2 arguments");                                                 \
+            return nullptr;                                                                                      \
+        }                                                                                                        \
+                                                                                                                 \
+        auto &builder = _context_manager.get_builder();                                                          \
+        auto &context = _context_manager.get_context();                                                          \
+                                                                                                                 \
+        llvm::Type *double_type = llvm::Type::getDoubleTy(context);                                              \
         llvm::FunctionType *func_type = llvm::FunctionType::get(double_type, {double_type, double_type}, false); \
-        \
-        llvm::Function *func = get_or_create_libc_function(#name, func_type); \
-        llvm::Value *x = ensure_type(args[0], double_type, #name ".x"); \
-        llvm::Value *y = ensure_type(args[1], double_type, #name ".y"); \
-        return builder.CreateCall(func, {x, y}, #name ".result"); \
+                                                                                                                 \
+        llvm::Function *func = get_or_create_libc_function(#name, func_type);                                    \
+        llvm::Value *x = ensure_type(args[0], double_type, #name ".x");                                          \
+        llvm::Value *y = ensure_type(args[1], double_type, #name ".y");                                          \
+        return builder.CreateCall(func, {x, y}, #name ".result");                                                \
     }
 
     DEFINE_MATH_FUNC_DOUBLE(asin)
@@ -4429,24 +4412,24 @@ namespace Cryo::Codegen
     DEFINE_MATH_FUNC_DOUBLE(erf)
     DEFINE_MATH_FUNC_DOUBLE(erfc)
 
-    #define DEFINE_MATH_FUNC_FLOAT(name, fname) \
-    llvm::Value *Intrinsics::generate_##name(const std::vector<llvm::Value *> &args) \
-    { \
-        if (args.size() != 1) \
-        { \
-            report_error(#name " requires exactly 1 argument"); \
-            return nullptr; \
-        } \
-        \
-        auto &builder = _context_manager.get_builder(); \
-        auto &context = _context_manager.get_context(); \
-        \
-        llvm::Type *float_type = llvm::Type::getFloatTy(context); \
+#define DEFINE_MATH_FUNC_FLOAT(name, fname)                                                       \
+    llvm::Value *Intrinsics::generate_##name(const std::vector<llvm::Value *> &args)              \
+    {                                                                                             \
+        if (args.size() != 1)                                                                     \
+        {                                                                                         \
+            report_error(#name " requires exactly 1 argument");                                   \
+            return nullptr;                                                                       \
+        }                                                                                         \
+                                                                                                  \
+        auto &builder = _context_manager.get_builder();                                           \
+        auto &context = _context_manager.get_context();                                           \
+                                                                                                  \
+        llvm::Type *float_type = llvm::Type::getFloatTy(context);                                 \
         llvm::FunctionType *func_type = llvm::FunctionType::get(float_type, {float_type}, false); \
-        \
-        llvm::Function *func = get_or_create_libc_function(fname, func_type); \
-        llvm::Value *x = ensure_type(args[0], float_type, #name ".x"); \
-        return builder.CreateCall(func, {x}, #name ".result"); \
+                                                                                                  \
+        llvm::Function *func = get_or_create_libc_function(fname, func_type);                     \
+        llvm::Value *x = ensure_type(args[0], float_type, #name ".x");                            \
+        return builder.CreateCall(func, {x}, #name ".result");                                    \
     }
 
     DEFINE_MATH_FUNC_FLOAT(fabsf, "fabsf")
@@ -4476,7 +4459,7 @@ namespace Cryo::Codegen
         llvm::Value *x = ensure_type(args[0], double_type, "fma.x");
         llvm::Value *y = ensure_type(args[1], double_type, "fma.y");
         llvm::Value *z = ensure_type(args[2], double_type, "fma.z");
-        
+
         return builder.CreateCall(fma_intrinsic, {x, y, z}, "fma.result");
     }
 
@@ -4544,7 +4527,7 @@ namespace Cryo::Codegen
     // ========================================
     // Network Intrinsics (Stub implementations - require platform-specific headers)
     // ========================================
-    
+
     llvm::Value *Intrinsics::generate_socket(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 3)
@@ -4560,11 +4543,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *socket_type = llvm::FunctionType::get(int_type, {int_type, int_type, int_type}, false);
 
         llvm::Function *socket_func = get_or_create_libc_function("socket", socket_type);
-        return builder.CreateCall(socket_func, {
-            ensure_type(args[0], int_type, "socket.domain"),
-            ensure_type(args[1], int_type, "socket.type"),
-            ensure_type(args[2], int_type, "socket.protocol")
-        }, "socket.result");
+        return builder.CreateCall(socket_func, {ensure_type(args[0], int_type, "socket.domain"), ensure_type(args[1], int_type, "socket.type"), ensure_type(args[2], int_type, "socket.protocol")}, "socket.result");
     }
 
     llvm::Value *Intrinsics::generate_bind(const std::vector<llvm::Value *> &args)
@@ -4584,23 +4563,22 @@ namespace Cryo::Codegen
         llvm::FunctionType *bind_type = llvm::FunctionType::get(int_type, {int_type, void_ptr_type, uint32_type}, false);
 
         llvm::Function *bind_func = get_or_create_libc_function("bind", bind_type);
-        return builder.CreateCall(bind_func, {
-            ensure_type(args[0], int_type, "bind.sockfd"),
-            args[1], // addr
-            ensure_type(args[2], uint32_type, "bind.addrlen")
-        }, "bind.result");
+        return builder.CreateCall(bind_func, {ensure_type(args[0], int_type, "bind.sockfd"),
+                                              args[1], // addr
+                                              ensure_type(args[2], uint32_type, "bind.addrlen")},
+                                  "bind.result");
     }
 
     // Additional network functions would follow similar pattern...
     // For brevity, I'll add stub implementations that return -1 (not implemented)
-    
-    #define DEFINE_NETWORK_STUB(name, arg_count) \
+
+#define DEFINE_NETWORK_STUB(name, arg_count)                                         \
     llvm::Value *Intrinsics::generate_##name(const std::vector<llvm::Value *> &args) \
-    { \
-        report_error(#name " intrinsic not yet fully implemented"); \
-        auto &builder = _context_manager.get_builder(); \
-        auto &context = _context_manager.get_context(); \
-        return llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), -1); \
+    {                                                                                \
+        report_error(#name " intrinsic not yet fully implemented");                  \
+        auto &builder = _context_manager.get_builder();                              \
+        auto &context = _context_manager.get_context();                              \
+        return llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), -1);          \
     }
 
     // Network stubs for functions not yet fully implemented
@@ -4745,10 +4723,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *clock_gettime_type = llvm::FunctionType::get(int_type, {int_type, void_ptr_type}, false);
 
         llvm::Function *clock_gettime_func = get_or_create_libc_function("clock_gettime", clock_gettime_type);
-        return builder.CreateCall(clock_gettime_func, {
-            ensure_type(args[0], int_type, "clock_gettime.clk_id"),
-            args[1]
-        }, "clock_gettime.result");
+        return builder.CreateCall(clock_gettime_func, {ensure_type(args[0], int_type, "clock_gettime.clk_id"), args[1]}, "clock_gettime.result");
     }
 
     llvm::Value *Intrinsics::generate_nanosleep(const std::vector<llvm::Value *> &args)
@@ -4822,7 +4797,7 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        // pthread_create(pthread_t *thread, const pthread_attr_t *attr, 
+        // pthread_create(pthread_t *thread, const pthread_attr_t *attr,
         //                void *(*start_routine)(void*), void *arg)
         llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
@@ -5178,25 +5153,25 @@ namespace Cryo::Codegen
     // Read-Write Lock Intrinsics
     // ========================================
 
-    #define DEFINE_PTHREAD_RWLOCK_FUNC(name, arg_count) \
+#define DEFINE_PTHREAD_RWLOCK_FUNC(name, arg_count)                                                 \
     llvm::Value *Intrinsics::generate_pthread_rwlock_##name(const std::vector<llvm::Value *> &args) \
-    { \
-        if (args.size() != arg_count) \
-        { \
-            report_error("pthread_rwlock_" #name " requires exactly " #arg_count " argument(s)"); \
-            return nullptr; \
-        } \
-        \
-        auto &builder = _context_manager.get_builder(); \
-        auto &context = _context_manager.get_context(); \
-        \
-        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0); \
-        llvm::Type *int_type = llvm::Type::getInt32Ty(context); \
-        std::vector<llvm::Type *> arg_types(arg_count, void_ptr_type); \
-        llvm::FunctionType *func_type = llvm::FunctionType::get(int_type, arg_types, false); \
-        \
-        llvm::Function *func = get_or_create_libc_function("pthread_rwlock_" #name, func_type); \
-        return builder.CreateCall(func, args, "pthread_rwlock_" #name ".result"); \
+    {                                                                                               \
+        if (args.size() != arg_count)                                                               \
+        {                                                                                           \
+            report_error("pthread_rwlock_" #name " requires exactly " #arg_count " argument(s)");   \
+            return nullptr;                                                                         \
+        }                                                                                           \
+                                                                                                    \
+        auto &builder = _context_manager.get_builder();                                             \
+        auto &context = _context_manager.get_context();                                             \
+                                                                                                    \
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);                             \
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);                                     \
+        std::vector<llvm::Type *> arg_types(arg_count, void_ptr_type);                              \
+        llvm::FunctionType *func_type = llvm::FunctionType::get(int_type, arg_types, false);        \
+                                                                                                    \
+        llvm::Function *func = get_or_create_libc_function("pthread_rwlock_" #name, func_type);     \
+        return builder.CreateCall(func, args, "pthread_rwlock_" #name ".result");                   \
     }
 
     DEFINE_PTHREAD_RWLOCK_FUNC(init, 2)
@@ -5548,7 +5523,7 @@ namespace Cryo::Codegen
         llvm::Value *val_i32 = ensure_type(val, i32_type, "atomic_exchange_32.val");
 
         // Create atomic exchange instruction
-        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_i32, 
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_i32,
                                        llvm::MaybeAlign(4), llvm::AtomicOrdering::SequentiallyConsistent);
     }
 
@@ -5575,7 +5550,7 @@ namespace Cryo::Codegen
         llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
         llvm::Value *val_i64 = ensure_type(val, i64_type, "atomic_exchange_64.val");
 
-        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_i64, 
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_i64,
                                        llvm::MaybeAlign(8), llvm::AtomicOrdering::SequentiallyConsistent);
     }
 
@@ -5602,7 +5577,7 @@ namespace Cryo::Codegen
         llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
         llvm::Value *val_i64 = ensure_type(val, i64_type, "atomic_swap_64.val");
 
-        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_i64, 
+        return builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, ptr, val_i64,
                                        llvm::MaybeAlign(8), llvm::AtomicOrdering::SequentiallyConsistent);
     }
 
@@ -5639,7 +5614,7 @@ namespace Cryo::Codegen
 
         // Extract the success flag
         llvm::Value *success = builder.CreateExtractValue(cmpxchg, 1, "success");
-        
+
         // Store the actual value back to expected pointer
         llvm::Value *actual = builder.CreateExtractValue(cmpxchg, 0, "actual");
         builder.CreateStore(actual, expected_ptr);
@@ -5684,32 +5659,32 @@ namespace Cryo::Codegen
         return success;
     }
 
-    // Define atomic fetch operations using a macro for efficiency
-    #define DEFINE_ATOMIC_FETCH_OP(op_name, llvm_op, bit_size) \
-    llvm::Value *Intrinsics::generate_atomic_fetch_##op_name##_##bit_size(const std::vector<llvm::Value *> &args) \
-    { \
-        if (args.size() != 3) \
-        { \
-            report_error("atomic_fetch_" #op_name "_" #bit_size " requires exactly 3 arguments (ptr, val, order)"); \
-            return nullptr; \
-        } \
-        \
-        auto &builder = _context_manager.get_builder(); \
-        auto &context = _context_manager.get_context(); \
-        \
-        llvm::Value *ptr = args[0]; \
-        llvm::Value *val = args[1]; \
-        \
-        if (!ptr->getType()->isPointerTy()) \
-        { \
-            report_error("atomic_fetch_" #op_name "_" #bit_size ": first argument must be a pointer"); \
-            return nullptr; \
-        } \
-        \
-        llvm::Type *int_type = llvm::Type::getInt##bit_size##Ty(context); \
-        llvm::Value *val_typed = ensure_type(val, int_type, "atomic_fetch_" #op_name "_" #bit_size ".val"); \
-        \
-        return builder.CreateAtomicRMW(llvm_op, ptr, val_typed, \
+// Define atomic fetch operations using a macro for efficiency
+#define DEFINE_ATOMIC_FETCH_OP(op_name, llvm_op, bit_size)                                                            \
+    llvm::Value *Intrinsics::generate_atomic_fetch_##op_name##_##bit_size(const std::vector<llvm::Value *> &args)     \
+    {                                                                                                                 \
+        if (args.size() != 3)                                                                                         \
+        {                                                                                                             \
+            report_error("atomic_fetch_" #op_name "_" #bit_size " requires exactly 3 arguments (ptr, val, order)");   \
+            return nullptr;                                                                                           \
+        }                                                                                                             \
+                                                                                                                      \
+        auto &builder = _context_manager.get_builder();                                                               \
+        auto &context = _context_manager.get_context();                                                               \
+                                                                                                                      \
+        llvm::Value *ptr = args[0];                                                                                   \
+        llvm::Value *val = args[1];                                                                                   \
+                                                                                                                      \
+        if (!ptr->getType()->isPointerTy())                                                                           \
+        {                                                                                                             \
+            report_error("atomic_fetch_" #op_name "_" #bit_size ": first argument must be a pointer");                \
+            return nullptr;                                                                                           \
+        }                                                                                                             \
+                                                                                                                      \
+        llvm::Type *int_type = llvm::Type::getInt##bit_size##Ty(context);                                             \
+        llvm::Value *val_typed = ensure_type(val, int_type, "atomic_fetch_" #op_name "_" #bit_size ".val");           \
+                                                                                                                      \
+        return builder.CreateAtomicRMW(llvm_op, ptr, val_typed,                                                       \
                                        llvm::MaybeAlign(bit_size / 8), llvm::AtomicOrdering::SequentiallyConsistent); \
     }
 
@@ -5761,10 +5736,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *listen_type = llvm::FunctionType::get(int_type, {int_type, int_type}, false);
 
         llvm::Function *listen_func = get_or_create_libc_function("listen", listen_type);
-        return builder.CreateCall(listen_func, {
-            ensure_type(args[0], int_type, "listen.sockfd"),
-            ensure_type(args[1], int_type, "listen.backlog")
-        }, "listen.result");
+        return builder.CreateCall(listen_func, {ensure_type(args[0], int_type, "listen.sockfd"), ensure_type(args[1], int_type, "listen.backlog")}, "listen.result");
     }
 
     llvm::Value *Intrinsics::generate_accept(const std::vector<llvm::Value *> &args)
@@ -5786,10 +5758,11 @@ namespace Cryo::Codegen
 
         llvm::Function *accept_func = get_or_create_libc_function("accept", accept_type);
         return builder.CreateCall(accept_func, {
-            ensure_type(args[0], int_type, "accept.sockfd"),
-            args[1], // addr
-            args[2]  // addrlen
-        }, "accept.result");
+                                                   ensure_type(args[0], int_type, "accept.sockfd"),
+                                                   args[1], // addr
+                                                   args[2]  // addrlen
+                                               },
+                                  "accept.result");
     }
 
     llvm::Value *Intrinsics::generate_connect(const std::vector<llvm::Value *> &args)
@@ -5810,11 +5783,10 @@ namespace Cryo::Codegen
             int_type, {int_type, void_ptr_type, uint32_type}, false);
 
         llvm::Function *connect_func = get_or_create_libc_function("connect", connect_type);
-        return builder.CreateCall(connect_func, {
-            ensure_type(args[0], int_type, "connect.sockfd"),
-            args[1], // addr
-            ensure_type(args[2], uint32_type, "connect.addrlen")
-        }, "connect.result");
+        return builder.CreateCall(connect_func, {ensure_type(args[0], int_type, "connect.sockfd"),
+                                                 args[1], // addr
+                                                 ensure_type(args[2], uint32_type, "connect.addrlen")},
+                                  "connect.result");
     }
 
     llvm::Value *Intrinsics::generate_send(const std::vector<llvm::Value *> &args)
@@ -5836,12 +5808,10 @@ namespace Cryo::Codegen
             ssize_t_type, {int_type, void_ptr_type, size_t_type, int_type}, false);
 
         llvm::Function *send_func = get_or_create_libc_function("send", send_type);
-        return builder.CreateCall(send_func, {
-            ensure_type(args[0], int_type, "send.sockfd"),
-            args[1], // buf
-            ensure_type(args[2], size_t_type, "send.len"),
-            ensure_type(args[3], int_type, "send.flags")
-        }, "send.result");
+        return builder.CreateCall(send_func, {ensure_type(args[0], int_type, "send.sockfd"),
+                                              args[1], // buf
+                                              ensure_type(args[2], size_t_type, "send.len"), ensure_type(args[3], int_type, "send.flags")},
+                                  "send.result");
     }
 
     llvm::Value *Intrinsics::generate_recv(const std::vector<llvm::Value *> &args)
@@ -5863,12 +5833,10 @@ namespace Cryo::Codegen
             ssize_t_type, {int_type, void_ptr_type, size_t_type, int_type}, false);
 
         llvm::Function *recv_func = get_or_create_libc_function("recv", recv_type);
-        return builder.CreateCall(recv_func, {
-            ensure_type(args[0], int_type, "recv.sockfd"),
-            args[1], // buf
-            ensure_type(args[2], size_t_type, "recv.len"),
-            ensure_type(args[3], int_type, "recv.flags")
-        }, "recv.result");
+        return builder.CreateCall(recv_func, {ensure_type(args[0], int_type, "recv.sockfd"),
+                                              args[1], // buf
+                                              ensure_type(args[2], size_t_type, "recv.len"), ensure_type(args[3], int_type, "recv.flags")},
+                                  "recv.result");
     }
 
     // Note: sendto, recvfrom, shutdown, setsockopt, getsockopt, getsockname, getpeername, and poll
@@ -6061,7 +6029,7 @@ namespace Cryo::Codegen
 
     llvm::Value *Intrinsics::generate_atomic_swap_u8(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_swap_8(args);  // Same implementation
+        return generate_atomic_swap_8(args); // Same implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_cmpxchg_u8(const std::vector<llvm::Value *> &args)
@@ -6243,27 +6211,27 @@ namespace Cryo::Codegen
     // Define i32 atomic fetch operations
     llvm::Value *Intrinsics::generate_atomic_fetch_add_i32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_add_32(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_add_32(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_fetch_sub_i32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_sub_32(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_sub_32(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_fetch_and_i32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_and_32(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_and_32(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_fetch_or_i32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_or_32(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_or_32(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_fetch_xor_i32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_xor_32(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_xor_32(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_fetch_max_i32(const std::vector<llvm::Value *> &args)
@@ -6326,12 +6294,12 @@ namespace Cryo::Codegen
 
     llvm::Value *Intrinsics::generate_atomic_load_u32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_load_32(args);  // Delegate to existing implementation
+        return generate_atomic_load_32(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_store_u32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_store_32(args);  // Delegate to existing implementation
+        return generate_atomic_store_32(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_swap_u32(const std::vector<llvm::Value *> &args)
@@ -6397,27 +6365,27 @@ namespace Cryo::Codegen
 
     llvm::Value *Intrinsics::generate_atomic_fetch_add_u32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_add_32(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_add_32(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_fetch_sub_u32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_sub_32(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_sub_32(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_fetch_and_u32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_and_32(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_and_32(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_fetch_or_u32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_or_32(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_or_32(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_fetch_xor_u32(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_xor_32(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_xor_32(args); // Delegate to existing implementation
     }
 
     // ========================================
@@ -6426,12 +6394,12 @@ namespace Cryo::Codegen
 
     llvm::Value *Intrinsics::generate_atomic_load_i64(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_load_64(args);  // Delegate to existing implementation
+        return generate_atomic_load_64(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_store_i64(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_store_64(args);  // Delegate to existing implementation
+        return generate_atomic_store_64(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_swap_i64(const std::vector<llvm::Value *> &args)
@@ -6497,12 +6465,12 @@ namespace Cryo::Codegen
 
     llvm::Value *Intrinsics::generate_atomic_fetch_add_i64(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_add_64(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_add_64(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_fetch_sub_i64(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_sub_64(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_sub_64(args); // Delegate to existing implementation
     }
 
     // ========================================
@@ -6511,12 +6479,12 @@ namespace Cryo::Codegen
 
     llvm::Value *Intrinsics::generate_atomic_load_u64(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_load_64(args);  // Delegate to existing implementation
+        return generate_atomic_load_64(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_store_u64(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_store_64(args);  // Delegate to existing implementation
+        return generate_atomic_store_64(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_swap_u64(const std::vector<llvm::Value *> &args)
@@ -6582,12 +6550,12 @@ namespace Cryo::Codegen
 
     llvm::Value *Intrinsics::generate_atomic_fetch_add_u64(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_add_64(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_add_64(args); // Delegate to existing implementation
     }
 
     llvm::Value *Intrinsics::generate_atomic_fetch_sub_u64(const std::vector<llvm::Value *> &args)
     {
-        return generate_atomic_fetch_sub_64(args);  // Delegate to existing implementation
+        return generate_atomic_fetch_sub_64(args); // Delegate to existing implementation
     }
 
     // ========================================
@@ -6644,7 +6612,7 @@ namespace Cryo::Codegen
         // Same size, different signedness - just a bitcast/reinterpret
         if (from_bits == to_bits)
         {
-            return val;  // No actual conversion needed at LLVM IR level
+            return val; // No actual conversion needed at LLVM IR level
         }
 
         // Widening conversion
