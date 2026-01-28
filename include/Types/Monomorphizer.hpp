@@ -297,6 +297,15 @@ namespace Cryo
         GenericRegistry &generics() { return _generics; }
         ModuleTypeRegistry &modules() { return _modules; }
 
+        // Clear per-module state while preserving references to arena/registry/modules.
+        // Call between module compilations to prevent specializations leaking across modules.
+        void clear_module_state()
+        {
+            _pending_requests.clear();
+            _specializations.clear();
+            _in_progress.clear();
+        }
+
         // ====================================================================
         // Statistics
         // ====================================================================

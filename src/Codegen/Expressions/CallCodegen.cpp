@@ -1718,28 +1718,28 @@ namespace Cryo::Codegen
             intrinsic_name == "IO::printf" || intrinsic_name == "std::IO::printf")
         {
             // Use the full intrinsic system with Windows ABI fixes
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "[STDLIB REDIRECT] Redirecting {} to __printf__ intrinsic", intrinsic_name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "[STDLIB REDIRECT] Redirecting {} to printf intrinsic", intrinsic_name);
 
             // Generate arguments
             auto args = generate_arguments(node->arguments());
 
             // Delegate to the proper intrinsic system that handles Windows ABI
             Intrinsics intrinsic_gen(ctx().llvm_manager(), ctx().diagnostics());
-            return intrinsic_gen.generate_intrinsic_call(node, "__printf__", args);
+            return intrinsic_gen.generate_intrinsic_call(node, "printf", args);
         }
 
-        if (intrinsic_name == "__float32_to_string__")
+        if (intrinsic_name == "float32_to_string")
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating __float32_to_string__ intrinsic");
             Intrinsics intrinsic_gen(ctx().llvm_manager(), ctx().diagnostics());
-            return intrinsic_gen.generate_intrinsic_call(node, "__float32_to_string__", args);
+            return intrinsic_gen.generate_intrinsic_call(node, "float32_to_string", args);
         }
 
-        if (intrinsic_name == "__float64_to_string__")
+        if (intrinsic_name == "float64_to_string")
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating __float64_to_string__ intrinsic");
             Intrinsics intrinsic_gen(ctx().llvm_manager(), ctx().diagnostics());
-            return intrinsic_gen.generate_intrinsic_call(node, "__float64_to_string__", args);
+            return intrinsic_gen.generate_intrinsic_call(node, "float64_to_string", args);
         }
 
         // Other intrinsics would be handled similarly

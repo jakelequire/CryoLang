@@ -86,6 +86,11 @@ namespace Cryo
         // Generic instantiator callback
         std::function<llvm::StructType *(const std::string &, const std::vector<TypeRef> &)> _generic_instantiator;
 
+        // When true, map_instantiated() will skip _generic_instantiator calls
+        // (used during pre_register_functions to avoid generating method bodies
+        // for cross-module generic types)
+        bool _skip_generic_instantiation = false;
+
         // Error state
         bool _has_error = false;
         std::string _last_error;
@@ -137,6 +142,13 @@ namespace Cryo
         {
             _generic_instantiator = std::move(instantiator);
         }
+
+        /**
+         * @brief Skip generic instantiation (method generation) during type mapping.
+         * When set, map_instantiated() will map struct/enum types without triggering
+         * method generation through _generic_instantiator.
+         */
+        void set_skip_generic_instantiation(bool skip) { _skip_generic_instantiation = skip; }
 
         // ====================================================================
         // Primary Interface
