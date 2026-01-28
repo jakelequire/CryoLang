@@ -771,6 +771,9 @@ namespace Cryo::Codegen
         else if (intrinsic_name == "f64_to_u64")
             return generate_float_to_int(args, false, 64, false);
 
+        else if (intrinsic_name == "panic")
+            return generate_panic(args);
+
         else
         {
             report_unimplemented_intrinsic(intrinsic_name, node);
@@ -786,7 +789,7 @@ namespace Cryo::Codegen
     {
         if (args.size() != 1)
         {
-            report_error("__malloc__ requires exactly 1 argument (size)");
+            report_error("malloc requires exactly 1 argument (size)");
             return nullptr;
         }
 
@@ -814,7 +817,7 @@ namespace Cryo::Codegen
     {
         if (args.size() != 1)
         {
-            report_error("__free__ requires exactly 1 argument (ptr)");
+            report_error("free requires exactly 1 argument (ptr)");
             return nullptr;
         }
 
@@ -834,7 +837,7 @@ namespace Cryo::Codegen
         llvm::Value *ptr_arg = args[0];
         if (!ptr_arg->getType()->isPointerTy())
         {
-            report_error("__free__ argument must be a pointer");
+            report_error("free argument must be a pointer");
             return nullptr;
         }
 
@@ -980,7 +983,7 @@ namespace Cryo::Codegen
     {
         if (args.size() != 3)
         {
-            report_error("__memcpy__ requires exactly 3 arguments (dest, src, n)");
+            report_error("memcpy requires exactly 3 arguments (dest, src, n)");
             return nullptr;
         }
 
@@ -1003,7 +1006,7 @@ namespace Cryo::Codegen
 
         if (!dest->getType()->isPointerTy() || !src->getType()->isPointerTy())
         {
-            report_error("__memcpy__ first two arguments must be pointers");
+            report_error("memcpy first two arguments must be pointers");
             return nullptr;
         }
 
@@ -1859,30 +1862,47 @@ namespace Cryo::Codegen
 
     llvm::Value *Intrinsics::generate_panic(const std::vector<llvm::Value *> &args)
     {
-        // __panic__ can be called with 0 args (just panic) or 1 arg (panic with message)
+        // __panic__ can be called with:
+        //   0 args: just panic
+        //   1 arg:  panic with message
+        //   3 args: panic with message, file, line (stdlib convention)
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        if (args.size() > 1)
+        if (args.size() != 0 && args.size() != 1 && args.size() != 3)
         {
-            report_error("__panic__ requires 0 or 1 arguments (optional message)");
+            report_error("__panic__ requires 0, 1, or 3 arguments (message, file, line)");
             return nullptr;
         }
 
-        if (!args.empty())
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+        if (args.size() == 3)
         {
-            // If message provided, print it first
-            llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
-            llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+            // 3-arg form: panic(message, file, line)
+            // Print: "panic: <message> at <file>:<line>\n"
             llvm::FunctionType *printf_type = llvm::FunctionType::get(
                 int_type, {char_ptr_type}, true); // variadic
+            llvm::Function *printf_func = get_or_create_libc_function("printf", printf_type);
 
+            llvm::Module *module = _context_manager.get_module();
+            llvm::Constant *fmt = builder.CreateGlobalStringPtr("panic: %s at %s:%u\n", "panic.fmt", 0, module);
+
+            builder.CreateCall(printf_func, {fmt, args[0], args[1], args[2]}, "panic.print");
+        }
+        else if (args.size() == 1)
+        {
+            // 1-arg form: panic(message)
+            llvm::FunctionType *printf_type = llvm::FunctionType::get(
+                int_type, {char_ptr_type}, true); // variadic
             llvm::Function *printf_func = get_or_create_libc_function("printf", printf_type);
 
             if (args[0]->getType()->isPointerTy())
             {
-                // Print the panic message
-                builder.CreateCall(printf_func, args, "panic.print");
+                llvm::Module *module = _context_manager.get_module();
+                llvm::Constant *fmt = builder.CreateGlobalStringPtr("panic: %s\n", "panic.fmt1", 0, module);
+                builder.CreateCall(printf_func, {fmt, args[0]}, "panic.print");
             }
         }
 

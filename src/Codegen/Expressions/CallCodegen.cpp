@@ -29,15 +29,15 @@ namespace Cryo::Codegen
         "cryo_panic", "cryo_assert"};
 
     const std::unordered_set<std::string> CallCodegen::_intrinsic_functions = {
-        "__malloc__", "__free__", "__realloc__", "__calloc__",
-        "__memcpy__", "__memset__", "__memcmp__", "__memmove__",
-        "__ptr_add__", "__ptr_sub__", "__ptr_diff__",
-        "__strlen__", "__strcmp__", "__strcpy__", "__strcat__",
-        "__printf__", "__sprintf__", "__fprintf__",
-        "__sqrt__", "__pow__", "__sin__", "__cos__",
-        "__syscall_write__", "__syscall_read__", "__syscall_exit__",
-        "__syscall_open__", "__syscall_close__", "__syscall_lseek__",
-        "__panic__", "__float32_to_string__", "__float64_to_string__"};
+        "malloc", "free", "realloc", "calloc",
+        "memcpy", "memset", "memcmp", "memmove",
+        "ptr_add", "ptr_sub", "ptr_diff",
+        "strlen", "strcmp", "strcpy", "strcat",
+        "printf", "sprintf", "fprintf",
+        "sqrt", "pow", "sin", "cos",
+        "syscall_write", "syscall_read", "syscall_exit",
+        "syscall_open", "syscall_close", "syscall_lseek",
+        "panic", "float32_to_string", "float64_to_string"};
 
     //===================================================================
     // Construction
@@ -1677,11 +1677,11 @@ namespace Cryo::Codegen
         // Delegate to the Intrinsics class via context if available
         // For now, handle common intrinsics inline
 
-        if (intrinsic_name == "__malloc__")
+        if (intrinsic_name == "malloc")
         {
             if (args.empty())
             {
-                report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node, "__malloc__ requires size argument");
+                report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node, "malloc requires size argument");
                 return nullptr;
             }
             llvm::Function *malloc_fn = module()->getFunction("malloc");
@@ -1696,11 +1696,11 @@ namespace Cryo::Codegen
             return builder().CreateCall(malloc_fn, {size}, "malloc_result");
         }
 
-        if (intrinsic_name == "__free__")
+        if (intrinsic_name == "free")
         {
             if (args.empty())
             {
-                report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node, "__free__ requires pointer argument");
+                report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node, "free requires pointer argument");
                 return nullptr;
             }
             llvm::Function *free_fn = module()->getFunction("free");
@@ -1742,10 +1742,25 @@ namespace Cryo::Codegen
             return intrinsic_gen.generate_intrinsic_call(node, "float64_to_string", args);
         }
 
-        // Other intrinsics would be handled similarly
-        report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
-                     "Unhandled intrinsic: " + intrinsic_name);
-        return nullptr;
+        if (intrinsic_name == "memcpy")
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating memcpy intrinsic");
+            Intrinsics intrinsic_gen(ctx().llvm_manager(), ctx().diagnostics());
+            return intrinsic_gen.generate_intrinsic_call(node, "memcpy", args);
+        }
+
+        // Delegate to the comprehensive Intrinsics class
+        // Strip namespace prefixes (e.g., "intrinsics::malloc" → "malloc")
+        std::string bare_name = intrinsic_name;
+        size_t last_sep = bare_name.rfind("::");
+        if (last_sep != std::string::npos)
+        {
+            bare_name = bare_name.substr(last_sep + 2);
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Delegating intrinsic '{}' to Intrinsics class (bare name: '{}')", intrinsic_name, bare_name);
+        Intrinsics intrinsic_gen(ctx().llvm_manager(), ctx().diagnostics());
+        return intrinsic_gen.generate_intrinsic_call(node, bare_name, args);
     }
 
     llvm::Value *CallCodegen::generate_runtime_call(Cryo::CallExpressionNode *node,
