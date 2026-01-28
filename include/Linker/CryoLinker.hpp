@@ -241,6 +241,14 @@ namespace Cryo::Linker
          */
         bool generate_object_file(llvm::Module *module, const std::string &output_path);
 
+        /**
+         * @brief Generate assembly file
+         * @param module LLVM module to compile
+         * @param output_path Output assembly file path
+         * @return Success status
+         */
+        bool generate_assembly_file(llvm::Module *module, const std::string &output_path);
+
         //===================================================================
         // Cross-Platform Support
         //===================================================================

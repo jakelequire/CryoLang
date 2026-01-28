@@ -66,6 +66,9 @@ namespace Cryo
         std::unique_ptr<Cryo::SRM::SymbolResolutionContext> _srm_context;
         std::unique_ptr<Cryo::SRM::SymbolResolutionManager> _srm_manager;
 
+        // Compilation mode flags
+        bool _raw_mode = false; // Raw mode compilation (no stdlib, no main transform)
+
     public:
         Parser(std::unique_ptr<Lexer> lexer, ASTContext &context);
         Parser(std::unique_ptr<Lexer> lexer, ASTContext &context, DiagEmitter *diagnostics, const std::string &source_file);
@@ -98,6 +101,10 @@ namespace Cryo
 
         // Directive system
         void set_directive_registry(DirectiveRegistry *registry) { _directive_registry = registry; }
+
+        // Compilation mode flags
+        void set_raw_mode(bool enable) { _raw_mode = enable; }
+        bool raw_mode() const { return _raw_mode; }
 
         // SRM Helper Methods for standardized naming during parsing
         std::string generate_qualified_namespace_name(const std::string &namespace_name);

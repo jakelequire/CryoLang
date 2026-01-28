@@ -2259,6 +2259,7 @@ namespace Cryo::Codegen
 
         // Use visitor pattern through context
         CodegenVisitor *visitor = ctx().visitor();
+        ctx().set_result(nullptr);
         expr->accept(*visitor);
         return get_result();
     }
@@ -3906,6 +3907,13 @@ namespace Cryo::Codegen
         // The enum variant should be registered as "TypeName::VariantName"
         std::string qualified_variant = type_name + "::" + member_name;
 
+        // Pre-compute the LLVM type for this enum so we can wrap raw discriminants
+        // when the enum is a tagged union struct (e.g., Option<T> = { i32, [N x i8] })
+        llvm::Type *llvm_enum_type_for_wrap = types().map(resolved_type);
+        llvm::StructType *enum_struct_type = nullptr;
+        if (llvm_enum_type_for_wrap && llvm_enum_type_for_wrap->isStructTy())
+            enum_struct_type = llvm::cast<llvm::StructType>(llvm_enum_type_for_wrap);
+
         // Try to find the variant in the enum_variants_map
         auto &enum_variants = ctx().enum_variants_map();
         auto it = enum_variants.find(qualified_variant);
@@ -3913,6 +3921,8 @@ namespace Cryo::Codegen
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "ExpressionCodegen: Found enum variant '{}'", qualified_variant);
+            if (enum_struct_type && it->second->getType()->isIntegerTy())
+                return wrap_discriminant_in_tagged_union(it->second, enum_struct_type, member_name);
             return it->second;
         }
 
@@ -3924,6 +3934,8 @@ namespace Cryo::Codegen
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "ExpressionCodegen: Found enum variant via base name '{}'", base_variant);
+            if (enum_struct_type && it->second->getType()->isIntegerTy())
+                return wrap_discriminant_in_tagged_union(it->second, enum_struct_type, member_name);
             return it->second;
         }
 
@@ -3936,6 +3948,8 @@ namespace Cryo::Codegen
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "ExpressionCodegen: Found enum variant via candidate '{}'", candidate);
+                if (enum_struct_type && it->second->getType()->isIntegerTy())
+                    return wrap_discriminant_in_tagged_union(it->second, enum_struct_type, member_name);
                 return it->second;
             }
         }
@@ -3997,6 +4011,43 @@ namespace Cryo::Codegen
                   "ExpressionCodegen: Cannot resolve variant '{}' with payload - needs constructor call",
                   member_name);
         return nullptr;
+    }
+
+    llvm::Value *ExpressionCodegen::wrap_discriminant_in_tagged_union(
+        llvm::Value *discriminant, llvm::StructType *struct_type, const std::string &name)
+    {
+        if (!discriminant || !struct_type)
+            return discriminant;
+
+        // Create alloca for the struct
+        llvm::Value *alloca = builder().CreateAlloca(struct_type, nullptr, name + ".tmp");
+
+        // Store the discriminant (first field)
+        llvm::Value *disc_gep = builder().CreateStructGEP(struct_type, alloca, 0, "disc.ptr");
+
+        // Cast discriminant to the struct's first element type if needed
+        llvm::Type *disc_field_type = struct_type->getElementType(0);
+        llvm::Value *cast_disc = discriminant;
+        if (discriminant->getType() != disc_field_type)
+        {
+            if (discriminant->getType()->isIntegerTy() && disc_field_type->isIntegerTy())
+                cast_disc = builder().CreateIntCast(discriminant, disc_field_type, true, "disc.cast");
+            else
+                return discriminant; // Can't cast — return original
+        }
+        builder().CreateStore(cast_disc, disc_gep);
+
+        // Zero-initialize the payload area if it exists
+        if (struct_type->getNumElements() > 1)
+        {
+            llvm::Value *payload_gep = builder().CreateStructGEP(struct_type, alloca, 1, "payload.ptr");
+            llvm::Type *payload_type = struct_type->getElementType(1);
+            llvm::Constant *zero_payload = llvm::Constant::getNullValue(payload_type);
+            builder().CreateStore(zero_payload, payload_gep);
+        }
+
+        // Load and return the struct
+        return builder().CreateLoad(struct_type, alloca, name + ".val");
     }
 
 } // namespace Cryo::Codegen

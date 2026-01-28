@@ -1426,6 +1426,33 @@ namespace Cryo::Codegen
             return b.CreateLoad(target_type, value, "struct.load");
         }
 
+        // Integer to struct (tagged union): wrap discriminant in tagged union struct
+        // This handles cases where an enum variant is stored as a raw i32 discriminant
+        // but the function return type expects the full tagged union struct { i32, [N x i8] }
+        if (source_type->isIntegerTy() && target_type->isStructTy())
+        {
+            auto *struct_type = llvm::cast<llvm::StructType>(target_type);
+            if (struct_type->getNumElements() > 0 &&
+                struct_type->getElementType(0)->isIntegerTy())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                         "cast_if_needed: Wrapping integer discriminant in tagged union struct");
+                llvm::Value *alloca = b.CreateAlloca(struct_type, nullptr, "enum.cast.tmp");
+                llvm::Value *disc_gep = b.CreateStructGEP(struct_type, alloca, 0, "disc.ptr");
+                llvm::Value *cast_disc = value;
+                llvm::Type *disc_field_type = struct_type->getElementType(0);
+                if (source_type != disc_field_type)
+                    cast_disc = b.CreateIntCast(value, disc_field_type, true, "disc.cast");
+                b.CreateStore(cast_disc, disc_gep);
+                if (struct_type->getNumElements() > 1)
+                {
+                    llvm::Value *payload_gep = b.CreateStructGEP(struct_type, alloca, 1, "payload.ptr");
+                    b.CreateStore(llvm::Constant::getNullValue(struct_type->getElementType(1)), payload_gep);
+                }
+                return b.CreateLoad(struct_type, alloca, "enum.cast.val");
+            }
+        }
+
         // Boolean to integer (extend i1 to larger integer)
         if (source_type->isIntegerTy(1) && target_type->isIntegerTy())
         {

@@ -55,6 +55,28 @@ namespace Cryo
 
     TypeRef TypeArena::lookup_type_by_name(const std::string &name) const
     {
+        // Try primitive types first (cheap string comparisons)
+        if (_primitives_initialized)
+        {
+            if (name == "void")    return _primitives.void_type;
+            if (name == "bool" || name == "boolean") return _primitives.bool_type;
+            if (name == "char")    return _primitives.char_type;
+            if (name == "string")  return _primitives.string_type;
+            if (name == "never")   return _primitives.never_type;
+            if (name == "i8")      return _primitives.i8_type;
+            if (name == "i16")     return _primitives.i16_type;
+            if (name == "i32" || name == "int") return _primitives.i32_type;
+            if (name == "i64")     return _primitives.i64_type;
+            if (name == "i128")    return _primitives.i128_type;
+            if (name == "u8")      return _primitives.u8_type;
+            if (name == "u16")     return _primitives.u16_type;
+            if (name == "u32" || name == "uint") return _primitives.u32_type;
+            if (name == "u64")     return _primitives.u64_type;
+            if (name == "u128")    return _primitives.u128_type;
+            if (name == "f32" || name == "float")  return _primitives.f32_type;
+            if (name == "f64" || name == "double") return _primitives.f64_type;
+        }
+
         // Helper to check if a key matches the name (keys are "module_id::name")
         auto matches_name = [&name](const std::string &key) -> bool
         {
