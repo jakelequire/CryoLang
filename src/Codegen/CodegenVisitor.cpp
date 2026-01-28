@@ -1294,8 +1294,8 @@ namespace Cryo::Codegen
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
                       "Binary generation returned null! File: {}, Line: {} : {}, Operator: {}",
                       node.source_file(), node.location().line(), node.location().column(),
-                      node.operator_token().text());
-            report_error("Binary expression generation failed for operator '" + std::string(node.operator_token().text()) + "'", &node);
+                      TokenKindToString(node.operator_token().kind()));
+            report_error("Binary expression generation failed for operator '" + TokenKindToString(node.operator_token().kind()) + "'", &node);
         }
     }
 
