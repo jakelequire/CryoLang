@@ -2997,8 +2997,157 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Pre-registering functions from symbol table");
 
-        // This would iterate through the symbol table and pre-declare all functions
-        // For now, this is a no-op - functions are declared on first use
+        size_t registered_count = 0;
+        size_t skipped_generic = 0;
+        size_t skipped_existing = 0;
+        size_t skipped_map_fail = 0;
+        size_t type_ns_count = 0;
+
+        // Phase 1: Register type namespaces so resolve_method_by_name() can
+        // construct fully-qualified method names for imported types.
+        symbols().for_each_symbol([&](const Cryo::Symbol &sym) {
+            if (sym.kind != Cryo::SymbolKind::Type)
+                return;
+
+            size_t last_sep = sym.name.rfind("::");
+            if (last_sep == std::string::npos)
+                return;
+
+            std::string ns_prefix = sym.name.substr(0, last_sep);
+            std::string simple_name = sym.name.substr(last_sep + 2);
+
+            if (simple_name.empty() || !ctx().get_type_namespace(simple_name).empty())
+                return;
+
+            ctx().register_type_namespace(simple_name, ns_prefix);
+            type_ns_count++;
+        });
+
+        // Phase 2: Create LLVM extern declarations for all imported callable symbols.
+        // This replicates the pattern from CallCodegen::create_forward_declaration_from_symbol()
+        // but does it proactively for all symbols rather than on-demand.
+        symbols().for_each_symbol([&](const Cryo::Symbol &sym) {
+            bool is_function = (sym.kind == Cryo::SymbolKind::Function);
+            bool is_method = (sym.kind == Cryo::SymbolKind::Method);
+            bool is_intrinsic = (sym.kind == Cryo::SymbolKind::Intrinsic);
+
+            if (!is_function && !is_method && !is_intrinsic)
+                return;
+
+            if (!sym.type.is_valid())
+                return;
+
+            const Cryo::FunctionType *func_type =
+                dynamic_cast<const Cryo::FunctionType *>(sym.type.get());
+            if (!func_type)
+                return;
+
+            // Skip functions whose types contain unresolved generic parameters —
+            // these cannot be mapped to LLVM types.
+            if (Cryo::contains_generic_params(func_type->return_type()))
+            {
+                skipped_generic++;
+                return;
+            }
+            for (const auto &param : func_type->param_types())
+            {
+                if (Cryo::contains_generic_params(param))
+                {
+                    skipped_generic++;
+                    return;
+                }
+            }
+
+            // Determine the LLVM function name.
+            // Intrinsics use their simple C name (e.g. "malloc", not "std::core::intrinsics::malloc")
+            // so they link against the actual C library symbols.
+            // Regular functions/methods use the fully-qualified name from the symbol table.
+            std::string llvm_name;
+            if (is_intrinsic)
+            {
+                size_t last_sep = sym.name.rfind("::");
+                llvm_name = (last_sep != std::string::npos)
+                                ? sym.name.substr(last_sep + 2)
+                                : sym.name;
+            }
+            else
+            {
+                llvm_name = sym.name;
+            }
+
+            // Skip if already declared in the LLVM module or context registry.
+            if (module()->getFunction(llvm_name) || ctx().get_function(llvm_name))
+            {
+                skipped_existing++;
+                return;
+            }
+
+            // Map return type.  If the return type is a FunctionType (not first-class
+            // in LLVM), it must be lowered to an opaque pointer.
+            llvm::Type *ret = types().map(func_type->return_type());
+            if (!ret)
+            {
+                skipped_map_fail++;
+                return;
+            }
+            if (ret->isFunctionTy())
+                ret = llvm::PointerType::get(llvm_ctx(), 0);
+
+            // Map parameter types.  LLVM requires all function parameters to be
+            // first-class types.  FunctionType and VoidType are not first-class,
+            // so we lower them to opaque pointers (function pointers) or skip.
+            std::vector<llvm::Type *> params;
+            bool all_mapped = true;
+            for (const auto &p : func_type->param_types())
+            {
+                llvm::Type *pt = types().map(p);
+                if (!pt)
+                {
+                    all_mapped = false;
+                    break;
+                }
+                // Function types are not first-class in LLVM — use opaque ptr.
+                if (pt->isFunctionTy())
+                    pt = llvm::PointerType::get(llvm_ctx(), 0);
+                // Void is not a valid parameter type — skip this function.
+                if (pt->isVoidTy())
+                {
+                    all_mapped = false;
+                    break;
+                }
+                params.push_back(pt);
+            }
+            if (!all_mapped)
+            {
+                skipped_map_fail++;
+                return;
+            }
+
+            // Create the extern declaration.
+            llvm::FunctionType *fn_type =
+                llvm::FunctionType::get(ret, params, func_type->is_variadic());
+            llvm::Function *fn = llvm::Function::Create(
+                fn_type, llvm::Function::ExternalLinkage, llvm_name, module());
+
+            // Register under the symbol's full name (for SRM-based lookups).
+            ctx().register_function(sym.name, fn);
+
+            // For intrinsics, also register under the simple C name so both
+            // qualified and unqualified lookups succeed.
+            if (is_intrinsic && sym.name != llvm_name)
+            {
+                ctx().register_function(llvm_name, fn);
+            }
+
+            registered_count++;
+        });
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "DeclarationCodegen: Pre-registration complete — "
+                  "{} registered, {} type namespaces, {} skipped (generic), "
+                  "{} skipped (existing), {} skipped (type map failed)",
+                  registered_count, type_ns_count, skipped_generic,
+                  skipped_existing, skipped_map_fail);
     }
 
     void DeclarationCodegen::import_specialized_methods(const Cryo::TypeChecker &type_checker)
