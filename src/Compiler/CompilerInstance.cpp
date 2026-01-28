@@ -2889,8 +2889,8 @@ namespace Cryo
                 }
             }
 
-            // Always try to emit LLVM IR file (for debugging purposes)
-            if (_codegen)
+            // Emit LLVM IR file for successfully compiled modules
+            if (module_success && _codegen)
             {
                 LOG_DEBUG(LogComponent::GENERAL, "Emitting LLVM IR for module '{}' to: {}", module_name, bc_output);
                 if (_codegen->emit_llvm_ir(bc_output))
