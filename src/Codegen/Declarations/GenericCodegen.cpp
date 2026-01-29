@@ -361,8 +361,13 @@ namespace Cryo::Codegen
                         }
                         else if (param_idx < ast_params.size() + 1)
                         {
-                            // Get AST parameter (accounting for implicit 'this')
-                            size_t ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
+                            // Get AST parameter - check if AST has explicit 'this' parameter
+                            // If AST includes 'this' explicitly, use param_idx directly
+                            // Otherwise, subtract 1 to account for implicit 'this' added by codegen
+                            bool ast_has_explicit_this = !ast_params.empty() &&
+                                ast_params[0]->name() == "this";
+                            size_t ast_idx = ast_has_explicit_this ? param_idx :
+                                (param_idx > 0 ? param_idx - 1 : param_idx);
                             if (ast_idx < ast_params.size())
                             {
                                 TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
@@ -741,7 +746,11 @@ namespace Cryo::Codegen
                         }
                         else if (param_idx < ast_params.size() + 1)
                         {
-                            size_t ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
+                            // Check if AST has explicit 'this' parameter
+                            bool ast_has_explicit_this = !ast_params.empty() &&
+                                ast_params[0]->name() == "this";
+                            size_t ast_idx = ast_has_explicit_this ? param_idx :
+                                (param_idx > 0 ? param_idx - 1 : param_idx);
                             if (ast_idx < ast_params.size())
                             {
                                 TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
@@ -1320,8 +1329,13 @@ namespace Cryo::Codegen
                             }
                             else if (param_idx < ast_params.size() + 1)
                             {
-                                // Get AST parameter (accounting for implicit 'this')
-                                size_t ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
+                                // Get AST parameter - check if AST has explicit 'this' parameter
+                                // If AST includes 'this' explicitly, use param_idx directly
+                                // Otherwise, subtract 1 to account for implicit 'this' added by codegen
+                                bool ast_has_explicit_this = !ast_params.empty() &&
+                                    ast_params[0]->name() == "this";
+                                size_t ast_idx = ast_has_explicit_this ? param_idx :
+                                    (param_idx > 0 ? param_idx - 1 : param_idx);
                                 if (ast_idx < ast_params.size())
                                 {
                                     TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
@@ -1877,6 +1891,45 @@ namespace Cryo::Codegen
                           "GenericCodegen: Substituted array type {} -> {}",
                           type->display_name(), new_arr->display_name());
                 return new_arr;
+            }
+            return type;
+        }
+
+        // Handle function types - substitute parameter and return types
+        if (type->kind() == TypeKind::Function)
+        {
+            auto *fn_type = static_cast<const FunctionType *>(type.get());
+            TypeRef return_type = fn_type->return_type();
+            const std::vector<TypeRef> &param_types = fn_type->param_types();
+
+            // Substitute return type
+            TypeRef substituted_return = substitute_type_params(return_type);
+
+            // Substitute parameter types
+            std::vector<TypeRef> substituted_params;
+            bool any_substituted = (substituted_return != return_type);
+
+            for (const auto &param : param_types)
+            {
+                TypeRef substituted_param = substitute_type_params(param);
+                if (substituted_param != param)
+                {
+                    any_substituted = true;
+                }
+                substituted_params.push_back(substituted_param.is_valid() ? substituted_param : param);
+            }
+
+            // If anything was substituted, create a new function type
+            if (any_substituted)
+            {
+                TypeRef new_fn = symbols().arena().get_function(
+                    substituted_return.is_valid() ? substituted_return : return_type,
+                    substituted_params,
+                    fn_type->is_variadic());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Substituted function type {} -> {}",
+                          type->display_name(), new_fn->display_name());
+                return new_fn;
             }
             return type;
         }

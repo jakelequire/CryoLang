@@ -40,6 +40,15 @@ namespace Cryo::Codegen
         "panic", "float32_to_string", "float64_to_string"};
 
     //===================================================================
+    // Forward Declarations
+    //===================================================================
+
+    // Helper function to parse type arguments from a string into TypeRefs
+    static std::vector<TypeRef> parse_type_args_from_string(
+        const std::string &type_args_str,
+        Cryo::SymbolTable &symbols);
+
+    //===================================================================
     // Construction
     //===================================================================
 
@@ -666,6 +675,26 @@ namespace Cryo::Codegen
             if (name.find('<') != std::string::npos || node->has_generic_args())
             {
                 return CallKind::GenericInstantiation;
+            }
+
+            // Check if this is a scope-qualified call like "Array::new" or "HashMap::with_capacity"
+            // where the left part is a generic template
+            size_t scope_sep = name.rfind("::");
+            if (scope_sep != std::string::npos && scope_sep > 0)
+            {
+                std::string type_part = name.substr(0, scope_sep);
+                std::string method_part = name.substr(scope_sep + 2);
+
+                // Check if the type part is a generic template
+                CodegenVisitor *visitor = ctx().visitor();
+                GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
+                if (generics && generics->is_generic_template(type_part))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "classify_call: '{}' is a static method on generic template '{}', treating as StaticMethod",
+                              name, type_part);
+                    return CallKind::StaticMethod;
+                }
             }
 
             // Check if it's a function pointer variable (e.g., parameter with function type)
@@ -1935,6 +1964,113 @@ namespace Cryo::Codegen
 
             std::string result_name = method->getReturnType()->isVoidTy() ? "" : method_name + ".result";
             return builder().CreateCall(method, coerced_args, result_name);
+        }
+
+        // 1b. On-demand instantiation fallback for generic types
+        // If the type name contains '<' (e.g., "Array<u8>"), try to instantiate it first
+        if (!method && resolved_type_name.find('<') != std::string::npos)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_static_method: Method not found, trying on-demand instantiation for generic type '{}'",
+                      resolved_type_name);
+
+            // Parse: "Array<u8>" -> base_name="Array", type_args_str="u8"
+            size_t angle_pos = resolved_type_name.find('<');
+            size_t close_pos = resolved_type_name.rfind('>');
+
+            if (angle_pos != std::string::npos && close_pos != std::string::npos && close_pos > angle_pos)
+            {
+                std::string base_name = resolved_type_name.substr(0, angle_pos);
+                std::string type_args_str = resolved_type_name.substr(angle_pos + 1, close_pos - angle_pos - 1);
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_static_method: Parsed generic - base='{}', type_args='{}'",
+                          base_name, type_args_str);
+
+                // Get the GenericCodegen component
+                CodegenVisitor *visitor = ctx().visitor();
+                GenericCodegen *gen_codegen = visitor ? visitor->get_generics() : nullptr;
+
+                // Check if base is a registered generic template
+                if (gen_codegen && gen_codegen->is_generic_template(base_name))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_static_method: '{}' is a registered generic template, triggering instantiation",
+                              base_name);
+
+                    // Parse type arguments from string
+                    std::vector<TypeRef> type_args = parse_type_args_from_string(type_args_str, symbols());
+
+                    if (!type_args.empty())
+                    {
+                        // Trigger on-demand instantiation
+                        llvm::StructType *instantiated = gen_codegen->instantiate_struct(base_name, type_args);
+
+                        if (instantiated)
+                        {
+                            // Get the mangled name and retry method lookup
+                            std::string mangled_name = gen_codegen->mangle_type_name(base_name, type_args);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "generate_static_method: Instantiated struct '{}', retrying method lookup with mangled name '{}'",
+                                      instantiated->getName().str(), mangled_name);
+
+                            // Retry method resolution with the mangled type name
+                            method = resolve_method(mangled_name, method_name);
+
+                            if (method)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_static_method: Found method after instantiation: {}::{}",
+                                          mangled_name, method_name);
+
+                                // Call with arguments (no implicit 'this')
+                                std::vector<llvm::Value *> coerced_args;
+                                llvm::FunctionType *fn_type = method->getFunctionType();
+
+                                for (size_t i = 0; i < args.size() && i < fn_type->getNumParams(); ++i)
+                                {
+                                    llvm::Value *arg = args[i];
+                                    llvm::Type *param_type = fn_type->getParamType(i);
+
+                                    // Handle struct-to-pointer conversion
+                                    if (arg && param_type->isPointerTy() && arg->getType()->isStructTy())
+                                    {
+                                        llvm::AllocaInst *temp = create_entry_alloca(arg->getType(), "struct.arg.tmp");
+                                        builder().CreateStore(arg, temp);
+                                        arg = temp;
+                                    }
+
+                                    coerced_args.push_back(cast_if_needed(arg, param_type));
+                                }
+
+                                std::string result_name = method->getReturnType()->isVoidTy() ? "" : method_name + ".result";
+                                return builder().CreateCall(method, coerced_args, result_name);
+                            }
+                            else
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_static_method: Method still not found after instantiation: {}::{}",
+                                          mangled_name, method_name);
+                            }
+                        }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "generate_static_method: Failed to instantiate generic struct '{}'", base_name);
+                        }
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_static_method: Failed to parse type arguments from '{}'", type_args_str);
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_static_method: '{}' is not a registered generic template", base_name);
+                }
+            }
         }
 
         // 2. Fallback for ::new() - try constructor, then zero-init (Option C)
@@ -3671,6 +3807,118 @@ namespace Cryo::Codegen
                   "Created runtime function declaration: {}", qualified_name);
 
         return fn;
+    }
+
+    //===================================================================
+    // Helper: Parse Type Arguments from String
+    //===================================================================
+
+    /**
+     * @brief Parse type arguments from a string into TypeRefs
+     *
+     * Handles nested generics like "HashMap<string, Array<u8>>" by tracking
+     * bracket depth. Returns a vector of resolved TypeRefs.
+     *
+     * @param type_args_str The type arguments string (e.g., "u8" or "string, Array<u8>")
+     * @return Vector of resolved TypeRefs (may be empty if resolution fails)
+     */
+    static std::vector<TypeRef> parse_type_args_from_string(
+        const std::string &type_args_str,
+        Cryo::SymbolTable &symbols)
+    {
+        std::vector<TypeRef> type_args;
+
+        if (type_args_str.empty())
+        {
+            return type_args;
+        }
+
+        // Parse comma-separated type arguments, handling nested generics
+        std::vector<std::string> arg_names;
+        size_t start = 0;
+        int depth = 0;
+
+        for (size_t i = 0; i <= type_args_str.length(); ++i)
+        {
+            if (i == type_args_str.length() || (type_args_str[i] == ',' && depth == 0))
+            {
+                std::string arg = type_args_str.substr(start, i - start);
+                // Trim whitespace
+                while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.front())))
+                    arg.erase(0, 1);
+                while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.back())))
+                    arg.pop_back();
+                if (!arg.empty())
+                    arg_names.push_back(arg);
+                start = i + 1;
+            }
+            else if (type_args_str[i] == '<')
+                depth++;
+            else if (type_args_str[i] == '>')
+                depth--;
+        }
+
+        // Resolve each type argument to a TypeRef
+        for (const auto &arg_name : arg_names)
+        {
+            TypeRef arg_type{};
+
+            // Try looking up in symbol table first
+            Symbol *type_sym = symbols.lookup_symbol(arg_name);
+            if (type_sym && type_sym->kind == SymbolKind::Type && type_sym->type.is_valid())
+            {
+                arg_type = type_sym->type;
+            }
+
+            // Try common primitive types
+            if (!arg_type.is_valid())
+            {
+                if (arg_name == "int" || arg_name == "i32")
+                    arg_type = symbols.arena().get_i32();
+                else if (arg_name == "i8")
+                    arg_type = symbols.arena().get_i8();
+                else if (arg_name == "i16")
+                    arg_type = symbols.arena().get_i16();
+                else if (arg_name == "i64")
+                    arg_type = symbols.arena().get_i64();
+                else if (arg_name == "u8")
+                    arg_type = symbols.arena().get_u8();
+                else if (arg_name == "u16")
+                    arg_type = symbols.arena().get_u16();
+                else if (arg_name == "u32")
+                    arg_type = symbols.arena().get_u32();
+                else if (arg_name == "u64")
+                    arg_type = symbols.arena().get_u64();
+                else if (arg_name == "f32" || arg_name == "float")
+                    arg_type = symbols.arena().get_f32();
+                else if (arg_name == "f64" || arg_name == "double")
+                    arg_type = symbols.arena().get_f64();
+                else if (arg_name == "string" || arg_name == "String")
+                    arg_type = symbols.arena().get_string();
+                else if (arg_name == "bool" || arg_name == "boolean")
+                    arg_type = symbols.arena().get_bool();
+            }
+
+            // Try looking up by name in TypeArena
+            if (!arg_type.is_valid())
+            {
+                arg_type = symbols.arena().lookup_type_by_name(arg_name);
+            }
+
+            if (arg_type.is_valid())
+            {
+                type_args.push_back(arg_type);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "parse_type_args_from_string: Resolved type argument '{}' successfully", arg_name);
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "parse_type_args_from_string: Could not resolve type argument '{}'", arg_name);
+            }
+        }
+
+        return type_args;
     }
 
 } // namespace Cryo::Codegen
