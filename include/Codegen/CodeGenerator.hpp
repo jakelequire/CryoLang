@@ -64,6 +64,23 @@ namespace Cryo::Codegen
             const std::string &namespace_name = "",
             Cryo::DiagEmitter* diagnostics = nullptr);
 
+        /**
+         * @brief Construct CodeGenerator with externally-owned shared LLVMContextManager
+         * @param target_config Target-specific compilation settings
+         * @param ast_context Reference to the AST context from frontend
+         * @param symbol_table Reference to populated symbol table
+         * @param shared_context_manager Shared LLVM context that outlives this CodeGenerator
+         * @param namespace_name Optional namespace name for LLVM module
+         * @param diagnostics Optional diagnostic emitter
+         */
+        CodeGenerator(
+            std::unique_ptr<TargetConfig> target_config,
+            Cryo::ASTContext &ast_context,
+            Cryo::SymbolTable &symbol_table,
+            std::shared_ptr<LLVMContextManager> shared_context_manager,
+            const std::string &namespace_name = "",
+            Cryo::DiagEmitter* diagnostics = nullptr);
+
         ~CodeGenerator();
 
         // No copy/move for now - manage LLVM resources carefully
@@ -214,8 +231,10 @@ namespace Cryo::Codegen
         // Private Implementation
         //===================================================================
 
-        // Core components
-        std::unique_ptr<LLVMContextManager> _context_manager;
+        // Core components - context manager can be owned or shared
+        std::unique_ptr<LLVMContextManager> _owned_context_manager;
+        std::shared_ptr<LLVMContextManager> _shared_context_manager;
+        LLVMContextManager *_context_manager = nullptr; // points to either owned or shared
         std::unique_ptr<CodegenVisitor> _visitor;
         std::unique_ptr<TargetConfig> _target_config;
         std::unique_ptr<OptimizationManager> _optimization_manager;
@@ -323,5 +342,21 @@ namespace Cryo::Codegen
         const std::string &target_triple,
         Cryo::ASTContext &ast_context,
         Cryo::SymbolTable &symbol_table);
+
+    /**
+     * @brief Create a CodeGenerator with a shared LLVMContextManager
+     * @param ast_context Reference to AST context
+     * @param symbol_table Reference to symbol table
+     * @param shared_context Shared LLVM context manager (survives across modules)
+     * @param namespace_name Module namespace name
+     * @param diagnostics Diagnostic manager for error reporting
+     * @return Unique pointer to CodeGenerator instance
+     */
+    std::unique_ptr<CodeGenerator> create_shared_context_codegen(
+        Cryo::ASTContext &ast_context,
+        Cryo::SymbolTable &symbol_table,
+        std::shared_ptr<LLVMContextManager> shared_context,
+        const std::string &namespace_name,
+        Cryo::DiagEmitter* diagnostics);
 
 } // namespace Cryo::Codegen

@@ -15,6 +15,8 @@
 #include "Types/TypeResolver.hpp"
 #include "Diagnostics/Diag.hpp"
 #include "Codegen/CodeGenerator.hpp"
+#include "Codegen/LLVMContext.hpp"
+#include <unordered_map>
 #include "Utils/SymbolResolutionManager.hpp"
 #include "Linker/CryoLinker.hpp"
 #include "Utils/File.hpp"
@@ -98,6 +100,26 @@ namespace Cryo
         // When in stdlib compilation mode, ASTs are moved here instead of destroyed
         // so that templates registered with ast_node pointers remain valid
         std::vector<std::unique_ptr<ProgramNode>> _compiled_asts;
+
+        // Cross-module function registry for stdlib compilation.
+        // Stores lightweight type descriptors from completed modules so that
+        // later modules can create ExternalLinkage declarations without sharing
+        // the LLVMContext (which causes struct type collisions).
+        struct SimpleTypeDesc
+        {
+            enum Kind : uint8_t { Void, Int, Float, Double, Ptr, NamedStruct, Other };
+            Kind kind = Other;
+            unsigned int_width = 0;    // for Int
+            std::string struct_name;   // for NamedStruct
+        };
+        struct CrossModuleFnEntry
+        {
+            SimpleTypeDesc return_type;
+            std::vector<SimpleTypeDesc> param_types;
+            bool is_var_arg = false;
+            unsigned calling_conv = 0;
+        };
+        std::unordered_map<std::string, CrossModuleFnEntry> _cross_module_functions;
 
         // Loaded source file (for pass-based compilation)
         std::unique_ptr<File> _loaded_file;
@@ -276,6 +298,12 @@ namespace Cryo
         void initialize_directive_system();
         bool process_directives();
         bool validate_directive_effects();
+
+        // Cross-module function resolution for stdlib compilation
+        void save_cross_module_functions();
+        void declare_cross_module_functions();
+        static SimpleTypeDesc llvm_type_to_desc(llvm::Type *t);
+        static llvm::Type *desc_to_llvm_type(const SimpleTypeDesc &desc, llvm::LLVMContext &ctx);
 
         // Dynamic path resolution
         std::string find_bin_directory() const;
