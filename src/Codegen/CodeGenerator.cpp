@@ -33,10 +33,32 @@ namespace Cryo::Codegen
         // Store the target config
         _target_config = std::move(target_config);
 
-        // Initialize LLVM context manager
-        _context_manager = std::make_unique<LLVMContextManager>(_module_name);
+        // Create owned context manager
+        _owned_context_manager = std::make_unique<LLVMContextManager>(_module_name);
+        _context_manager = _owned_context_manager.get();
 
         // Components will be initialized later
+        _visitor = nullptr;
+        _optimization_manager = nullptr;
+        _module = nullptr;
+        _builder = nullptr;
+        _target_machine = nullptr;
+    }
+
+    CodeGenerator::CodeGenerator(
+        std::unique_ptr<TargetConfig> target_config,
+        ASTContext &ast_context, SymbolTable &symbol_table,
+        std::shared_ptr<LLVMContextManager> shared_context_manager,
+        const std::string &namespace_name, Cryo::DiagEmitter *diagnostics)
+        : _ast_context(ast_context), _symbol_table(symbol_table), _diagnostics(diagnostics),
+          _has_errors(false), _debug_enabled(false), _stdlib_compilation_mode(false),
+          _optimization_level(2), _functions_generated(0), _types_generated(0),
+          _globals_generated(0),
+          _module_name(namespace_name.empty() ? "cryo_program" : namespace_name)
+    {
+        _target_config = std::move(target_config);
+        _shared_context_manager = shared_context_manager;
+        _context_manager = _shared_context_manager.get();
         _visitor = nullptr;
         _optimization_manager = nullptr;
         _module = nullptr;
@@ -110,6 +132,11 @@ namespace Cryo::Codegen
     CodegenVisitor *CodeGenerator::get_visitor() const
     {
         return _visitor.get();
+    }
+
+    LLVMContextManager *CodeGenerator::get_context_manager() const
+    {
+        return _context_manager;
     }
 
     bool CodeGenerator::ensure_visitor_initialized()
@@ -194,15 +221,23 @@ namespace Cryo::Codegen
             return true; // Already initialized
         }
 
-        // Initialize the context manager
+        // Initialize the context manager (no-op if already initialized in shared mode)
         if (!_context_manager->initialize())
         {
             report_error("Failed to initialize LLVM context manager: " + _context_manager->get_last_error());
             return false;
         }
 
-        // Get references to LLVM components from context manager
-        _module = _context_manager->get_module();
+        // In shared mode, create a new module within the shared context
+        if (_shared_context_manager)
+        {
+            _module = _context_manager->create_module(_module_name);
+        }
+        else
+        {
+            _module = _context_manager->get_module();
+        }
+
         _builder = &_context_manager->get_builder();
         _target_machine = _context_manager->get_target_machine();
 
@@ -523,6 +558,17 @@ namespace Cryo::Codegen
         auto target_config = std::make_unique<TargetConfig>();
 
         return std::make_unique<CodeGenerator>(std::move(target_config), ast_context, symbol_table, namespace_name, diagnostics);
+    }
+
+    std::unique_ptr<CodeGenerator> create_shared_context_codegen(
+        ASTContext &ast_context, SymbolTable &symbol_table,
+        std::shared_ptr<LLVMContextManager> shared_context,
+        const std::string &namespace_name, DiagEmitter *diagnostics)
+    {
+        auto target_config = std::make_unique<TargetConfig>();
+        return std::make_unique<CodeGenerator>(
+            std::move(target_config), ast_context, symbol_table,
+            shared_context, namespace_name, diagnostics);
     }
 
 } // namespace Cryo::Codegen
