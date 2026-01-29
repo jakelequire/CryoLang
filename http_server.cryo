@@ -1,0 +1,245 @@
+// This file will be compiled with `--raw` which will disable standard library features.
+namespace HttpServer;
+
+intrinsic function socket(domain: i32, type_: i32, protocol: i32) -> i32;
+intrinsic function bind(sockfd: i32, addr: SockAddrIn*, addrlen: i32) -> i32;
+intrinsic function listen(sockfd: i32, backlog: i32) -> i32;
+intrinsic function accept(sockfd: i32, addr: SockAddrIn*, addrlen: i32*) -> i32;
+intrinsic function recv(sockfd: i32, buf: u8*, len: i32, flags: i32) -> i32;
+intrinsic function send(sockfd: i32, buf: u8*, len: i32, flags: i32) -> i32;
+intrinsic function close(sockfd: i32) -> i32;
+intrinsic function setsockopt(sockfd: i32, level: i32, optname: i32, optval: i32*, optlen: i32) -> i32;
+intrinsic function htons(hostshort: u16) -> u16;
+intrinsic function htonl(hostlong: u32) -> u32;
+intrinsic function snprintf(str: u8*, size: i32, format: string, args...) -> i32;
+intrinsic function strcmp(s1: string, s2: string) -> i32;
+intrinsic function strrchr(s: string, c: i32) -> string;
+intrinsic function open(path: string, flags: i32) -> i32;
+intrinsic function read(fd: i32, buf: u8*, count: i32) -> i32;
+intrinsic function fclose(fd: i32) -> i32;
+intrinsic function fseek(fd: i32, offset: i32, whence: i32) -> i32;
+intrinsic function ftell(fd: i32) -> i32;
+intrinsic function exit(status: i32) -> void;
+
+type struct SockAddrIn {
+    sin_family: u16;
+    sin_port: u16;
+    sin_addr: u32;
+    sin_zero: u8[8];
+}
+
+
+const SOCK_STREAM: i32 = 1;
+const IPPROTO_TCP: i32 = 6;
+const INADDR_ANY: u32 = 0;
+const O_RDONLY: i32 = 0;
+
+
+function main() -> i32 {
+    mut server_fd: i32;
+    mut client_fd: i32;
+    mut opt: i32 = 1;
+
+    // Create the socket
+    server_fd = socket(2, SOCK_STREAM, IPPROTO_TCP);
+    if (server_fd < 0) {
+        puts("Socket creation failed");
+        exit(1);
+    }
+
+    // Set socket options to reuse address and port
+    if (setsockopt(server_fd, 1, 2, &opt, sizeof(i32)) < 0) {
+        puts("Set socket options failed");
+        exit(1);
+    }
+
+    mut address: SockAddrIn = SockAddrIn {
+        sin_family: 2 as u16,
+        sin_port: htons(8080),
+        sin_addr: htonl(INADDR_ANY),
+        sin_zero: [0, 0, 0, 0, 0, 0, 0, 0],
+    };
+
+    // Bind the socket
+    if (bind(server_fd, &address, sizeof(SockAddrIn)) < 0) {
+        puts("Bind failed");
+        close(server_fd);
+        exit(1);
+    }
+
+    // Listen for incoming connections
+    if (listen(server_fd, 3) < 0) {
+        puts("Listen failed");
+        close(server_fd);
+        exit(1);
+    }
+
+    printf("HTTP Server listening on port %d\n", 8080);
+
+    // Main accept loop
+    loop {
+        mut addrlen: i32 = sizeof(SockAddrIn);
+        client_fd = accept(server_fd, &address, &addrlen);
+        if (client_fd < 0) {
+            puts("Accept failed");
+            continue;
+        }
+
+        handle_client(client_fd);
+
+        close(client_fd);
+    }
+
+    // Close the server socket (unreachable code in this example)
+    close(server_fd);
+    return 0;
+}
+
+
+function handle_client(client_fd: i32) -> void {
+    mut buffer: u8[4096];
+    mut _method: u8[16];
+    mut path: u8[4096];
+    mut version: u8[16];
+
+    // Read the request
+    const valread: i32 = recv(client_fd, &buffer, 4096 - 1, 0);
+    if (valread <= 0) {
+        puts("Receive failed or connection closed");
+        return;
+    }
+
+    buffer[valread] = '\0'; // Null-terminate the buffer
+
+    // Parse the request line
+    mut i: i32 = 0;
+    mut j: i32 = 0;
+
+    while (buffer[i] != ' ' && buffer[i] != '\0' && i < valread) {
+        _method[j] = buffer[i];
+        i++;
+        j++;
+    }
+    path[j] = '\0';
+
+    printf("Request: %s %s\n", _method, path);
+
+    // Only handle GET for simplicity
+    if (strcmp(_method, "GET") != 0) {
+        send_error(client_fd, 405, "Method Not Allowed");
+        return;
+    }
+    
+    // Handle root path
+    if (strcmp(path, "/") == 0) {
+        send_response(client_fd, 200, "text/html", 
+            "<html><body><h1>Hello from Cryo!</h1></body></html>");
+        return;
+    }
+    
+    // Handle /status endpoint
+    if (strcmp(path, "/status") == 0) {
+        send_response(client_fd, 200, "application/json",
+            "{\"status\": \"ok\", \"server\": \"cryo-http\"}");
+        return;
+    }
+
+    // If we reach here, the path was not found
+    server_file(client_fd, path);
+
+    return;
+}
+
+function send_response(client_fd: i32, status_code: i32, content_type: string, body: string) -> void {
+    mut response: u8[4096];
+
+    const status_text: string = match (status_code) {
+        200 => "OK"
+        404 => "Not Found"
+        405 => "Method Not Allowed"
+        _ => "Internal Server Error"
+    };
+
+    const body_len: i32 = strlen(body);
+
+    const response_len: i32 = snprintf(response, 4096,
+        "HTTP/1.1 %d %s\r\n
+        Content-Type: %s\r\n
+        Content-Length: %d\r\n
+        Connection: close\r\n
+        \r\n
+        %s",
+        status_code, status_text, content_type, body_len, body);
+    
+    // Send the header
+    send(client_fd, &response, response_len, 0);
+    // Send the body
+    send(client_fd, &body, body_len, 0);
+
+    return;
+
+}
+
+function send_error(client_fd: i32, status_code: i32, message: string) -> void {
+    const body: string = snprintf("<html><body><h1>%d %s</h1></body></html>", status_code, message);
+    send_response(client_fd, status_code, "text/html", body);
+    return;
+}
+
+function server_file(client_fd: i32, path: string) -> void {
+    mut file_path: u8[4096];
+    mut buffer: u8[4096];
+    mut header: u8[4096];
+
+    snprintf(file_path, 4096, "./public%s", path);
+
+    if (path == "..") {
+        send_error(client_fd, 403, "Forbidden");
+        return;
+    }
+
+    const file: i32 = open(file_path, O_RDONLY);
+    if (file < 0) {
+        send_error(client_fd, 404, "Not Found");
+        return;
+    }
+
+    fseek(file, 0, 2); // Seek to end SEEK_END = 2
+    const file_size: i32 = ftell(file);
+    fseek(file, 0, 0); // Seek back to start SEEK_SET = 0
+
+    const content_type: string = get_content_type(file_path);
+    const header_len: i32 = snprintf(header, 4096,
+        "HTTP/1.1 200 OK\r\n
+        Content-Type: %s\r\n
+        Content-Length: %d\r\n
+        Connection: close\r\n
+        \r\n",
+        content_type, file_size);
+
+    send(client_fd, &header, header_len, 0);
+
+    mut bytes_read: i32 = 0;
+    loop {
+        bytes_read = read(file, &buffer, 4096);
+        if (bytes_read <= 0) {
+            break;
+        }
+        send(client_fd, &buffer, bytes_read, 0);
+    }
+
+    fclose(file);
+}
+
+function get_content_type(file_path: string) -> string {
+    match (strrchr(file_path, '.')) {
+        ".html" => { return "text/html"; }
+        ".css"  => { return "text/css"; }
+        ".js"   => { return "application/javascript"; }
+        ".json" => { return "application/json"; }
+        ".png"  => { return "image/png"; }
+        ".jpg"  => { return "image/jpeg"; }
+        ".gif"  => { return "image/gif"; }
+        _       => { return "application/octet-stream"; }
+    }
+}
