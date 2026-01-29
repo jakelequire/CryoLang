@@ -2116,6 +2116,24 @@ namespace Cryo
                 }
             }
 
+            // For generic impl blocks, create the full generic type (e.g., Option<T>)
+            TypeRef impl_type = base_type;
+            if (!impl_generic_params.empty())
+            {
+                // Create GenericParamTypes for each parameter and construct an InstantiatedType
+                std::vector<TypeRef> type_args;
+                for (size_t i = 0; i < impl_generic_params.size(); ++i)
+                {
+                    TypeRef param_type = arena.create_generic_param(impl_generic_params[i], i);
+                    type_args.push_back(param_type);
+                }
+                // Create an instantiated type: Option<T> where T is a GenericParamType
+                impl_type = arena.create_instantiation(base_type, type_args);
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "ModuleLoader: Created generic impl type '{}' for impl block '{}'",
+                          impl_type->display_name(), target);
+            }
+
             // Process each method in the impl block
             for (auto &method : impl->method_implementations())
             {
@@ -2126,8 +2144,8 @@ namespace Cryo
                         TypeRef current_type = param->get_resolved_type();
                         if (current_type.is_error())
                         {
-                            // This is an unresolved 'this' parameter - fix it
-                            TypeRef this_type = arena.get_reference_to(base_type);
+                            // This is an unresolved 'this' parameter - fix it using the full impl type
+                            TypeRef this_type = arena.get_reference_to(impl_type);
                             param->set_resolved_type(this_type);
                             LOG_DEBUG(LogComponent::GENERAL,
                                       "ModuleLoader: Resolved 'this' param for impl '{}::{}' to '{}'",

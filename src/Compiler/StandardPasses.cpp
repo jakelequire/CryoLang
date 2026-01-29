@@ -8,6 +8,7 @@
 #include "Types/SymbolTable.hpp"
 #include "Types/TypeChecker.hpp"
 #include "Types/TypeResolver.hpp"
+#include "Types/TypeAnnotation.hpp"
 #include "Types/GenericRegistry.hpp"
 #include "Types/GenericTypes.hpp"
 #include "Types/CompoundTypes.hpp"
@@ -735,78 +736,133 @@ namespace Cryo
                                 // The parser created an error type - try to resolve using impl target
                                 const std::string &target = impl->target_type();
                                 std::string base_name = target;
+                                std::vector<std::string> generic_arg_names;
                                 size_t angle_pos = target.find('<');
-                                if (angle_pos != std::string::npos)
+                                if (angle_pos != std::string::npos && target.back() == '>')
                                 {
                                     base_name = target.substr(0, angle_pos);
-                                }
-
-                                // Try multiple lookup strategies to find the base type
-                                TypeRef base_type;
-
-                                // Strategy 1: Try arena lookup by name
-                                base_type = arena.lookup_type_by_name(base_name);
-
-                                // Strategy 2: If arena lookup failed, try symbol table enum lookup
-                                if ((!base_type.is_valid() || base_type.is_error()) && symbols)
-                                {
-                                    base_type = symbols->lookup_enum_type(base_name);
-                                    if (base_type.is_valid() && !base_type.is_error())
+                                    // Extract generic argument names (e.g., "T", "E" from "Result<T, E>")
+                                    std::string params_str = target.substr(angle_pos + 1, target.size() - angle_pos - 2);
+                                    size_t start = 0;
+                                    for (size_t i = 0; i <= params_str.size(); ++i)
                                     {
-                                        LOG_DEBUG(LogComponent::GENERAL,
-                                            "TypeResolutionPass: Found '{}' via symbol table enum lookup", base_name);
+                                        if (i == params_str.size() || params_str[i] == ',')
+                                        {
+                                            std::string arg = params_str.substr(start, i - start);
+                                            // Trim whitespace
+                                            while (!arg.empty() && (arg.front() == ' ' || arg.front() == '\t'))
+                                                arg.erase(0, 1);
+                                            while (!arg.empty() && (arg.back() == ' ' || arg.back() == '\t'))
+                                                arg.pop_back();
+                                            if (!arg.empty())
+                                                generic_arg_names.push_back(arg);
+                                            start = i + 1;
+                                        }
                                     }
                                 }
 
-                                // Strategy 3: Try symbol table struct lookup
-                                if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                // For generic impl blocks, construct a TypeAnnotation and resolve it
+                                // This ensures we get Option<T> (with T as GenericParamType), not just Option
+                                if (!generic_arg_names.empty())
                                 {
-                                    base_type = symbols->lookup_struct_type(base_name);
-                                    if (base_type.is_valid() && !base_type.is_error())
+                                    // Construct TypeAnnotation for the generic type
+                                    TypeAnnotation base_ann = TypeAnnotation::named(base_name, param->location());
+                                    std::vector<TypeAnnotation> arg_annotations;
+                                    for (const auto &arg_name : generic_arg_names)
+                                    {
+                                        arg_annotations.push_back(TypeAnnotation::named(arg_name, param->location()));
+                                    }
+                                    TypeAnnotation generic_ann = TypeAnnotation::generic(
+                                        std::move(base_ann), std::move(arg_annotations), param->location());
+
+                                    // Resolve the generic type using method_ctx (where T, E, etc. are bound)
+                                    TypeRef resolved_type = resolver.resolve(generic_ann, method_ctx);
+                                    if (resolved_type.is_valid() && !resolved_type.is_error())
+                                    {
+                                        // Create a reference type for &this
+                                        TypeRef this_type = arena.get_reference_to(resolved_type);
+                                        param->set_resolved_type(this_type);
+                                        resolved_count++;
+                                        LOG_DEBUG(LogComponent::GENERAL,
+                                            "TypeResolutionPass: Resolved generic 'this' param for impl '{}::{}' to '{}'",
+                                            target, method->name(), this_type->display_name());
+                                    }
+                                    else
                                     {
                                         LOG_DEBUG(LogComponent::GENERAL,
-                                            "TypeResolutionPass: Found '{}' via symbol table struct lookup", base_name);
+                                            "TypeResolutionPass: Could not resolve generic 'this' type for impl '{}::{}' (resolved to error: {})",
+                                            target, method->name(), resolved_type.is_valid() ? resolved_type->display_name() : "<invalid>");
                                     }
-                                }
-
-                                // Strategy 4: Try symbol table class lookup
-                                if ((!base_type.is_valid() || base_type.is_error()) && symbols)
-                                {
-                                    base_type = symbols->lookup_class_type(base_name);
-                                    if (base_type.is_valid() && !base_type.is_error())
-                                    {
-                                        LOG_DEBUG(LogComponent::GENERAL,
-                                            "TypeResolutionPass: Found '{}' via symbol table class lookup", base_name);
-                                    }
-                                }
-
-                                // Strategy 5: Try direct Symbol lookup and extract type
-                                if ((!base_type.is_valid() || base_type.is_error()) && symbols)
-                                {
-                                    const Symbol *sym = symbols->lookup(base_name);
-                                    if (sym && sym->type.is_valid() && !sym->type.is_error())
-                                    {
-                                        base_type = sym->type;
-                                        LOG_DEBUG(LogComponent::GENERAL,
-                                            "TypeResolutionPass: Found '{}' via direct symbol lookup", base_name);
-                                    }
-                                }
-
-                                if (base_type.is_valid() && !base_type.is_error())
-                                {
-                                    // Create a reference type for &this
-                                    TypeRef this_type = arena.get_reference_to(base_type);
-                                    param->set_resolved_type(this_type);
-                                    resolved_count++;
-                                    LOG_DEBUG(LogComponent::GENERAL,
-                                        "TypeResolutionPass: Resolved 'this' param for impl '{}::{}' to '{}'",
-                                        target, method->name(), this_type->display_name());
                                 }
                                 else
                                 {
-                                    LOG_DEBUG(LogComponent::GENERAL,
-                                        "TypeResolutionPass: Could not resolve 'this' type for impl '{}::{}' (base '{}' not found in arena or symbol table)",
-                                        target, method->name(), base_name);
+                                    // Non-generic impl block - use the existing lookup strategies
+                                    TypeRef base_type;
+
+                                    // Strategy 1: Try arena lookup by name
+                                    base_type = arena.lookup_type_by_name(base_name);
+
+                                    // Strategy 2: If arena lookup failed, try symbol table enum lookup
+                                    if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                    {
+                                        base_type = symbols->lookup_enum_type(base_name);
+                                        if (base_type.is_valid() && !base_type.is_error())
+                                        {
+                                            LOG_DEBUG(LogComponent::GENERAL,
+                                                "TypeResolutionPass: Found '{}' via symbol table enum lookup", base_name);
+                                        }
+                                    }
+
+                                    // Strategy 3: Try symbol table struct lookup
+                                    if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                    {
+                                        base_type = symbols->lookup_struct_type(base_name);
+                                        if (base_type.is_valid() && !base_type.is_error())
+                                        {
+                                            LOG_DEBUG(LogComponent::GENERAL,
+                                                "TypeResolutionPass: Found '{}' via symbol table struct lookup", base_name);
+                                        }
+                                    }
+
+                                    // Strategy 4: Try symbol table class lookup
+                                    if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                    {
+                                        base_type = symbols->lookup_class_type(base_name);
+                                        if (base_type.is_valid() && !base_type.is_error())
+                                        {
+                                            LOG_DEBUG(LogComponent::GENERAL,
+                                                "TypeResolutionPass: Found '{}' via symbol table class lookup", base_name);
+                                        }
+                                    }
+
+                                    // Strategy 5: Try direct Symbol lookup and extract type
+                                    if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                    {
+                                        const Symbol *sym = symbols->lookup(base_name);
+                                        if (sym && sym->type.is_valid() && !sym->type.is_error())
+                                        {
+                                            base_type = sym->type;
+                                            LOG_DEBUG(LogComponent::GENERAL,
+                                                "TypeResolutionPass: Found '{}' via direct symbol lookup", base_name);
+                                        }
+                                    }
+
+                                    if (base_type.is_valid() && !base_type.is_error())
+                                    {
+                                        // Create a reference type for &this
+                                        TypeRef this_type = arena.get_reference_to(base_type);
+                                        param->set_resolved_type(this_type);
+                                        resolved_count++;
+                                        LOG_DEBUG(LogComponent::GENERAL,
+                                            "TypeResolutionPass: Resolved 'this' param for impl '{}::{}' to '{}'",
+                                            target, method->name(), this_type->display_name());
+                                    }
+                                    else
+                                    {
+                                        LOG_DEBUG(LogComponent::GENERAL,
+                                            "TypeResolutionPass: Could not resolve 'this' type for impl '{}::{}' (base '{}' not found in arena or symbol table)",
+                                            target, method->name(), base_name);
+                                    }
                                 }
                             }
                         }
