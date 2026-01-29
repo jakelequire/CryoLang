@@ -10,6 +10,9 @@
 #include "Utils/Logger.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 #include "Utils/SymbolDumper.hpp"
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/Module.h>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -1043,6 +1046,12 @@ namespace Cryo
 
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Pre-registering functions in LLVM module...");
                 _codegen->get_visitor()->pre_register_functions_from_symbol_table();
+
+                // Declare functions from previously compiled modules (cross-module resolution)
+                if (_stdlib_compilation_mode && !_cross_module_functions.empty())
+                {
+                    declare_cross_module_functions();
+                }
             }
             else
             {
@@ -2723,6 +2732,181 @@ namespace Cryo
         }
     }
 
+    CompilerInstance::SimpleTypeDesc CompilerInstance::llvm_type_to_desc(llvm::Type *t)
+    {
+        SimpleTypeDesc desc;
+        if (t->isVoidTy())
+        {
+            desc.kind = SimpleTypeDesc::Void;
+        }
+        else if (t->isIntegerTy())
+        {
+            desc.kind = SimpleTypeDesc::Int;
+            desc.int_width = t->getIntegerBitWidth();
+        }
+        else if (t->isFloatTy())
+        {
+            desc.kind = SimpleTypeDesc::Float;
+        }
+        else if (t->isDoubleTy())
+        {
+            desc.kind = SimpleTypeDesc::Double;
+        }
+        else if (t->isPointerTy())
+        {
+            desc.kind = SimpleTypeDesc::Ptr;
+        }
+        else if (auto *st = llvm::dyn_cast<llvm::StructType>(t))
+        {
+            if (st->hasName())
+            {
+                desc.kind = SimpleTypeDesc::NamedStruct;
+                desc.struct_name = st->getName().str();
+            }
+        }
+        return desc;
+    }
+
+    llvm::Type *CompilerInstance::desc_to_llvm_type(const SimpleTypeDesc &desc,
+                                                     llvm::LLVMContext &ctx)
+    {
+        switch (desc.kind)
+        {
+        case SimpleTypeDesc::Void:
+            return llvm::Type::getVoidTy(ctx);
+        case SimpleTypeDesc::Int:
+            return llvm::IntegerType::get(ctx, desc.int_width);
+        case SimpleTypeDesc::Float:
+            return llvm::Type::getFloatTy(ctx);
+        case SimpleTypeDesc::Double:
+            return llvm::Type::getDoubleTy(ctx);
+        case SimpleTypeDesc::Ptr:
+            return llvm::PointerType::get(ctx, 0);
+        case SimpleTypeDesc::NamedStruct:
+        {
+            auto *existing = llvm::StructType::getTypeByName(ctx, desc.struct_name);
+            return existing; // nullptr if not found in this context
+        }
+        default:
+            return nullptr;
+        }
+    }
+
+    void CompilerInstance::save_cross_module_functions()
+    {
+        if (!_codegen)
+            return;
+
+        llvm::Module *module = _codegen->get_module();
+        if (!module)
+            return;
+
+        size_t saved = 0;
+        for (const llvm::Function &fn : *module)
+        {
+            if (fn.isDeclaration() || fn.isIntrinsic())
+                continue;
+
+            std::string fn_name = fn.getName().str();
+            if (fn_name.empty())
+                continue;
+
+            // Don't overwrite if already registered from a previous module
+            if (_cross_module_functions.count(fn_name))
+                continue;
+
+            CrossModuleFnEntry entry;
+            entry.calling_conv = fn.getCallingConv();
+            entry.is_var_arg = fn.isVarArg();
+
+            llvm::FunctionType *ft = fn.getFunctionType();
+            entry.return_type = llvm_type_to_desc(ft->getReturnType());
+            for (unsigned i = 0; i < ft->getNumParams(); ++i)
+            {
+                entry.param_types.push_back(llvm_type_to_desc(ft->getParamType(i)));
+            }
+
+            _cross_module_functions[fn_name] = std::move(entry);
+            saved++;
+        }
+
+        if (saved > 0)
+        {
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "Cross-module: saved {} function signatures (total registry: {})",
+                      saved, _cross_module_functions.size());
+        }
+    }
+
+    void CompilerInstance::declare_cross_module_functions()
+    {
+        if (!_codegen || _cross_module_functions.empty())
+            return;
+
+        if (!_codegen->ensure_visitor_initialized())
+            return;
+
+        llvm::Module *current_module = _codegen->get_module();
+        if (!current_module)
+            return;
+
+        llvm::LLVMContext &ctx = current_module->getContext();
+        size_t declared = 0;
+        size_t skipped = 0;
+
+        for (const auto &[fn_name, entry] : _cross_module_functions)
+        {
+            // Skip if already declared in current module
+            if (current_module->getFunction(fn_name))
+                continue;
+
+            // Reconstruct return type
+            llvm::Type *ret_type = desc_to_llvm_type(entry.return_type, ctx);
+            if (!ret_type)
+            {
+                skipped++;
+                continue;
+            }
+
+            // Reconstruct parameter types
+            std::vector<llvm::Type *> param_types;
+            bool valid = true;
+            for (const auto &pd : entry.param_types)
+            {
+                llvm::Type *pt = desc_to_llvm_type(pd, ctx);
+                if (!pt)
+                {
+                    valid = false;
+                    break;
+                }
+                param_types.push_back(pt);
+            }
+            if (!valid)
+            {
+                skipped++;
+                continue;
+            }
+
+            llvm::FunctionType *ft = llvm::FunctionType::get(ret_type, param_types, entry.is_var_arg);
+            llvm::Function *decl = llvm::Function::Create(
+                ft,
+                llvm::Function::ExternalLinkage,
+                fn_name,
+                current_module);
+            decl->setCallingConv(static_cast<llvm::CallingConv::ID>(entry.calling_conv));
+
+            _codegen->get_visitor()->context().register_function(fn_name, decl);
+            declared++;
+        }
+
+        if (declared > 0 || skipped > 0)
+        {
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "Cross-module: declared {} functions, skipped {} (incompatible types)",
+                      declared, skipped);
+        }
+    }
+
     bool CompilerInstance::compile_stdlib(const std::string &source_dir, const std::string &output_path)
     {
         LOG_INFO(LogComponent::GENERAL, "Starting stdlib compilation from directory: {}", source_dir);
@@ -2889,6 +3073,12 @@ namespace Cryo
                 }
             }
 
+            // Save function signatures from this module for cross-module resolution
+            if (module_success && _codegen)
+            {
+                save_cross_module_functions();
+            }
+
             // Emit LLVM IR file for successfully compiled modules
             if (module_success && _codegen)
             {
@@ -2977,6 +3167,9 @@ namespace Cryo
                 std::cout << "  ✗ No linker available for object file generation" << std::endl;
             }
         }
+
+        // Clear cross-module function registry after stdlib compilation is complete
+        _cross_module_functions.clear();
 
         if (compiled_modules.empty())
         {
