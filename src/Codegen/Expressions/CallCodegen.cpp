@@ -895,11 +895,15 @@ namespace Cryo::Codegen
             return CallKind::InstanceMethod;
         }
 
-        // Handle scope resolution (e.g., Shape::Circle for enum variants)
+        // Handle scope resolution (e.g., Shape::Circle for enum variants, Array<String>::new())
         if (auto *scope = dynamic_cast<ScopeResolutionNode *>(node->callee()))
         {
             std::string scope_name = scope->scope_name();
             std::string member_name = scope->member_name();
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "classify_call: ScopeResolution '{}::{}' has_generic_args={}",
+                      scope_name, member_name, scope->has_generic_args());
 
             // Check if it's an enum variant
             if (is_enum_type(scope_name))
@@ -910,6 +914,16 @@ namespace Cryo::Codegen
             // Check if it's a static method call
             if (is_struct_type(scope_name) || is_class_type(scope_name))
             {
+                return CallKind::StaticMethod;
+            }
+
+            // Check if it's a generic static method call with explicit type args
+            // This handles calls like Array<String>::new() where has_generic_args() is true
+            if (scope->has_generic_args())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "classify_call: '{}::{}' has generic args, treating as StaticMethod",
+                          scope_name, member_name);
                 return CallKind::StaticMethod;
             }
 

@@ -67,7 +67,7 @@ namespace Cryo
         std::unique_ptr<LambdaExpressionNode> create_lambda_expression(SourceLocation loc);
         std::unique_ptr<ArrayAccessNode> create_array_access(SourceLocation loc, std::unique_ptr<ExpressionNode> array, std::unique_ptr<ExpressionNode> index);
         std::unique_ptr<MemberAccessNode> create_member_access(SourceLocation loc, std::unique_ptr<ExpressionNode> object, std::string member);
-        std::unique_ptr<ScopeResolutionNode> create_scope_resolution(SourceLocation loc, std::string scope_name, std::string member_name);
+        std::unique_ptr<ScopeResolutionNode> create_scope_resolution(SourceLocation loc, std::string scope_name, std::string member_name, std::vector<std::string> generic_args = {});
         std::unique_ptr<IfStatementNode> create_if_statement(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<StatementNode> then_stmt, std::unique_ptr<StatementNode> else_stmt = nullptr);
         std::unique_ptr<IfExpressionNode> create_if_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> condition, std::unique_ptr<ExpressionNode> then_expr, std::unique_ptr<ExpressionNode> else_expr);
         std::unique_ptr<MatchExpressionNode> create_match_expression(SourceLocation loc, std::unique_ptr<ExpressionNode> expr);
