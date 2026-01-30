@@ -591,8 +591,14 @@ namespace Cryo::CLI
                         // Generate assembly file using linker
                         output_success = compiler->linker() && compiler->linker()->generate_assembly_file(compiler->codegen()->get_module(), output_path);
                     }
-                // Check for no exntension case (linux)
-                #if defined(__linux__) || defined(__APPLE__)
+                    else if (extension == "exe" || extension == "out")
+                    {
+                        // Generate executable binary
+                        auto target = Cryo::Linker::CryoLinker::LinkTarget::Executable;
+                        output_success = compiler->generate_output(output_path, target);
+                    }
+// Check for no exntension case (linux)
+#if defined(__linux__) || defined(__APPLE__)
                     else if (extension.empty())
                     {
                         // Assume executable output for no extension on Linux/Mac
@@ -600,7 +606,7 @@ namespace Cryo::CLI
                         auto target = Cryo::Linker::CryoLinker::LinkTarget::Executable;
                         output_success = compiler->generate_output(output_path, target);
                     }
-                #endif
+#endif
                     else
                     {
                         // Default to object file for unknown extensions

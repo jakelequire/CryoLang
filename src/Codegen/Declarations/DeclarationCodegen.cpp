@@ -3076,7 +3076,37 @@ namespace Cryo::Codegen
             }
             else
             {
-                llvm_name = sym.name;
+                // Use qualified_name if available, otherwise construct from scope + name
+                if (!sym.qualified_name.empty())
+                {
+                    llvm_name = sym.qualified_name;
+                }
+                else if (!sym.scope.empty())
+                {
+                    llvm_name = sym.scope + "::" + sym.name;
+                }
+                else
+                {
+                    llvm_name = sym.name;
+                }
+
+                // Skip unqualified function/method names if we're in a namespace context.
+                // These functions will be defined with qualified names during normal codegen,
+                // so pre-registering them with unqualified names would create mismatches.
+                // (e.g., pre-registering @handle_client when the definition will be @"HttpServer::handle_client")
+                if (llvm_name.find("::") == std::string::npos && (is_function || is_method))
+                {
+                    std::string ns_context = ctx().namespace_context();
+                    if (!ns_context.empty())
+                    {
+                        // This is an unqualified function name in a namespace context.
+                        // Skip it - the function definition will create the proper qualified declaration.
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "pre_register_functions: Skipping unqualified '{}' in namespace '{}' - will be defined with qualified name",
+                                  llvm_name, ns_context);
+                        return;
+                    }
+                }
             }
 
             // Skip if already declared in the LLVM module or context registry.

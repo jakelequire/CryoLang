@@ -65,6 +65,26 @@ namespace Cryo::Codegen
             }
         }
 
+        // Additional fallback: iterate all functions in module looking for matching suffix
+        // This helps when main (unqualified) calls functions in the same namespace
+        if (name.find("::") == std::string::npos)
+        {
+            std::string suffix = "::" + name;
+            for (auto &fn : module()->functions())
+            {
+                std::string fn_name = fn.getName().str();
+                // Check if function name ends with "::name"
+                if (fn_name.size() > suffix.size() &&
+                    fn_name.compare(fn_name.size() - suffix.size(), suffix.size(), suffix) == 0)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_function_by_name: Found '{}' via suffix match as '{}'",
+                              name, fn_name);
+                    return &fn;
+                }
+            }
+        }
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "resolve_function_by_name: '{}' not found after trying {} candidates",
                   name, candidates.size());

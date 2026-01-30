@@ -29,15 +29,94 @@ namespace Cryo::Codegen
         "cryo_panic", "cryo_assert"};
 
     const std::unordered_set<std::string> CallCodegen::_intrinsic_functions = {
-        "malloc", "free", "realloc", "calloc",
-        "memcpy", "memset", "memcmp", "memmove",
+        // Memory allocation
+        "malloc", "calloc", "realloc", "free", "aligned_alloc",
+        // Memory operations
+        "memcpy", "memmove", "memset", "memcmp", "memchr",
+        // Pointer arithmetic
         "ptr_add", "ptr_sub", "ptr_diff",
-        "strlen", "strcmp", "strcpy", "strcat",
-        "printf", "sprintf", "fprintf",
-        "sqrt", "pow", "sin", "cos",
+        // String operations
+        "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat",
+        "strchr", "strrchr", "strstr", "strdup",
+        // I/O operations
+        "printf", "snprintf", "sprintf", "fprintf", "getchar", "putchar", "puts",
+        // File I/O
+        "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush", "feof", "ferror",
+        // Low-level file descriptor I/O
+        "read", "write", "open", "close", "lseek", "dup", "dup2", "pipe", "fcntl",
+        // Filesystem operations
+        "stat", "fstat", "lstat", "access", "mkdir", "rmdir", "unlink", "rename",
+        "symlink", "readlink", "truncate", "ftruncate", "chmod", "chown",
+        "getcwd", "chdir", "opendir", "readdir", "closedir",
+        // Process management
+        "exit", "abort", "fork", "execvp", "wait", "waitpid",
+        "getpid", "getppid", "getuid", "getgid", "geteuid", "getegid",
+        "kill", "raise", "signal",
+        // Error handling
+        "errno",
+        // Math functions
+        "sqrt", "sqrtf", "pow", "powf", "exp", "expf", "exp2", "expm1",
+        "log", "logf", "log10", "log2", "log1p",
+        "sin", "sinf", "cos", "cosf", "tan", "tanf",
+        "asin", "acos", "atan", "atan2",
+        "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+        "cbrt", "hypot", "fabs", "fabsf", "floor", "floorf", "ceil", "ceilf",
+        "round", "roundf", "trunc", "fmod", "remainder", "fmin", "fmax", "fma",
+        "copysign", "nextafter", "frexp", "ldexp", "modf", "erf", "erfc",
+        // Network operations
+        "socket", "bind", "listen", "accept", "connect", "send", "recv",
+        "sendto", "recvfrom", "shutdown", "setsockopt", "getsockopt",
+        "getsockname", "getpeername", "poll",
+        "htons", "ntohs", "htonl", "ntohl",
+        // Windows socket initialization
+        "WSAStartup", "WSACleanup", "WSAGetLastError",
+        // Time operations
+        "time", "gettimeofday", "clock_gettime", "nanosleep", "sleep", "usleep",
+        // Threading (pthread)
+        "pthread_create", "pthread_join", "pthread_exit", "pthread_detach",
+        "pthread_self", "pthread_equal", "sched_yield",
+        // Mutex operations
+        "pthread_mutex_init", "pthread_mutex_destroy", "pthread_mutex_lock",
+        "pthread_mutex_trylock", "pthread_mutex_unlock",
+        // Condition variables
+        "pthread_cond_init", "pthread_cond_destroy", "pthread_cond_wait",
+        "pthread_cond_timedwait", "pthread_cond_signal", "pthread_cond_broadcast",
+        // Read-write locks
+        "pthread_rwlock_init", "pthread_rwlock_destroy", "pthread_rwlock_rdlock",
+        "pthread_rwlock_tryrdlock", "pthread_rwlock_wrlock", "pthread_rwlock_trywrlock",
+        "pthread_rwlock_unlock",
+        // Thread-local storage
+        "pthread_key_create", "pthread_key_delete", "pthread_getspecific", "pthread_setspecific",
+        // Atomic operations
+        "atomic_load_8", "atomic_load_16", "atomic_load_32", "atomic_load_64",
+        "atomic_store_8", "atomic_store_16", "atomic_store_32", "atomic_store_64",
+        "atomic_exchange_32", "atomic_exchange_64", "atomic_swap_64",
+        "atomic_compare_exchange_32", "atomic_compare_exchange_64",
+        "atomic_fetch_add_32", "atomic_fetch_add_64",
+        "atomic_fetch_sub_32", "atomic_fetch_sub_64",
+        "atomic_fetch_and_32", "atomic_fetch_and_64",
+        "atomic_fetch_or_32", "atomic_fetch_or_64",
+        "atomic_fetch_xor_32", "atomic_fetch_xor_64",
+        "atomic_fence",
+        "atomic_swap_8", "atomic_exchange_8", "atomic_compare_exchange_8",
+        "atomic_fetch_and_8", "atomic_fetch_or_8", "atomic_fetch_xor_8", "atomic_fetch_nand_8",
+        "atomic_load_u8", "atomic_store_u8", "atomic_swap_u8", "atomic_cmpxchg_u8",
+        "atomic_fetch_and_u8", "atomic_fetch_or_u8", "atomic_fetch_xor_u8", "atomic_fetch_nand_u8",
+        "atomic_load_i32", "atomic_store_i32", "atomic_swap_i32", "atomic_cmpxchg_i32",
+        "atomic_fetch_add_i32", "atomic_fetch_sub_i32", "atomic_fetch_and_i32",
+        "atomic_fetch_or_i32", "atomic_fetch_xor_i32", "atomic_fetch_max_i32", "atomic_fetch_min_i32",
+        "atomic_load_u32", "atomic_store_u32", "atomic_swap_u32", "atomic_cmpxchg_u32",
+        "atomic_fetch_add_u32", "atomic_fetch_sub_u32", "atomic_fetch_and_u32",
+        "atomic_fetch_or_u32", "atomic_fetch_xor_u32",
+        "atomic_load_i64", "atomic_store_i64", "atomic_swap_i64", "atomic_cmpxchg_i64",
+        "atomic_fetch_add_i64", "atomic_fetch_sub_i64",
+        "atomic_load_u64", "atomic_store_u64", "atomic_swap_u64", "atomic_cmpxchg_u64",
+        "atomic_fetch_add_u64", "atomic_fetch_sub_u64",
+        // Syscalls
         "syscall_write", "syscall_read", "syscall_exit",
         "syscall_open", "syscall_close", "syscall_lseek",
-        "panic", "float32_to_string", "float64_to_string"};
+        // Misc
+        "panic", "float32_to_string", "float64_to_string", "sizeof"};
 
     //===================================================================
     // Forward Declarations
@@ -2914,6 +2993,12 @@ namespace Cryo::Codegen
         // Generate lookup candidates using SRM (includes imported namespaces)
         auto candidates = generate_lookup_candidates(name, Cryo::SymbolKind::Function);
 
+        // First pass: prefer qualified candidates (those with ::)
+        // This ensures we create declarations with namespace-qualified names
+        // which will match the actual function definitions
+        Cryo::Symbol *found_symbol = nullptr;
+        std::string found_candidate;
+
         for (const auto &candidate : candidates)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -2941,69 +3026,156 @@ namespace Cryo::Codegen
 
             if (is_function_or_intrinsic)
             {
-                const Cryo::FunctionType *func_type = dynamic_cast<const Cryo::FunctionType *>(symbol->type.get());
-                if (func_type)
-                {
-                    bool is_intrinsic = (symbol->kind == Cryo::SymbolKind::Intrinsic);
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "create_forward_declaration_from_symbol: Found {} '{}' in symbol table",
-                              is_intrinsic ? "intrinsic" : "function", candidate);
+                // Prefer qualified candidates over unqualified ones
+                bool candidate_is_qualified = (candidate.find("::") != std::string::npos);
+                bool found_is_qualified = (found_candidate.find("::") != std::string::npos);
 
-                    // Build LLVM function type from Cryo function type
-                    llvm::Type *return_type = types().map(func_type->return_type());
-                    if (!return_type)
+                if (!found_symbol || (candidate_is_qualified && !found_is_qualified))
+                {
+                    found_symbol = symbol;
+                    found_candidate = candidate;
+
+                    // If we found a qualified candidate, use it immediately
+                    if (candidate_is_qualified)
+                        break;
+                }
+            }
+        }
+
+        if (found_symbol)
+        {
+            const Cryo::FunctionType *func_type = dynamic_cast<const Cryo::FunctionType *>(found_symbol->type.get());
+            if (func_type)
+            {
+                bool is_intrinsic = (found_symbol->kind == Cryo::SymbolKind::Intrinsic);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "create_forward_declaration_from_symbol: Found {} '{}' in symbol table",
+                          is_intrinsic ? "intrinsic" : "function", found_candidate);
+
+                // Build LLVM function type from Cryo function type
+                llvm::Type *return_type = types().map(func_type->return_type());
+                if (!return_type)
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                              "Failed to map return type for function '{}'", found_candidate);
+                    return nullptr;
+                }
+
+                std::vector<llvm::Type *> param_types;
+                for (const auto &param : func_type->param_types())
+                {
+                    llvm::Type *pt = types().map(param);
+                    if (!pt)
                     {
                         LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                                  "Failed to map return type for function '{}'", candidate);
-                        continue;
+                                  "Failed to map parameter type for function '{}'", found_candidate);
+                        return nullptr;
                     }
-
-                    std::vector<llvm::Type *> param_types;
-                    for (const auto &param : func_type->param_types())
-                    {
-                        llvm::Type *pt = types().map(param);
-                        if (!pt)
-                        {
-                            LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                                      "Failed to map parameter type for function '{}'", candidate);
-                            break;
-                        }
-                        param_types.push_back(pt);
-                    }
-
-                    if (param_types.size() != func_type->param_types().size())
-                    {
-                        continue; // Failed to map all parameter types
-                    }
-
-                    // Create the function type
-                    llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(
-                        return_type, param_types, func_type->is_variadic());
-
-                    // For intrinsics (like malloc, free, etc.), use the simple name as LLVM function name
-                    // since they map to actual C library functions. For regular functions, use qualified name.
-                    std::string llvm_name = is_intrinsic ? name : candidate;
-
-                    // Create the function declaration
-                    llvm::Function *fn = llvm::Function::Create(
-                        llvm_func_type,
-                        llvm::Function::ExternalLinkage,
-                        llvm_name,
-                        module());
-
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "create_forward_declaration_from_symbol: Created forward declaration for '{}' (LLVM name: '{}')",
-                              candidate, llvm_name);
-
-                    // Register in context for future lookups (using both qualified and simple names for intrinsics)
-                    ctx().register_function(candidate, fn);
-                    if (is_intrinsic && candidate != name)
-                    {
-                        ctx().register_function(name, fn);
-                    }
-
-                    return fn;
+                    param_types.push_back(pt);
                 }
+
+                // Create the function type
+                llvm::FunctionType *llvm_func_type = llvm::FunctionType::get(
+                    return_type, param_types, func_type->is_variadic());
+
+                // For intrinsics (like malloc, free, etc.), use the simple name as LLVM function name
+                // since they map to actual C library functions. For regular functions, use qualified name.
+                std::string llvm_name;
+                if (is_intrinsic)
+                {
+                    llvm_name = name;
+                }
+                else
+                {
+                    // Construct the qualified name the same way function definitions do:
+                    // Use the current namespace context from codegen (not from symbol table)
+                    // This ensures forward declarations match the actual function definitions.
+                    std::string ns_context = ctx().namespace_context();
+                    std::string simple_name = found_symbol->name;
+
+                    // If the symbol name contains ::, extract the simple name
+                    size_t last_sep = simple_name.rfind("::");
+                    if (last_sep != std::string::npos)
+                    {
+                        simple_name = simple_name.substr(last_sep + 2);
+                    }
+
+                    // Special case: main should never be namespace qualified
+                    if (simple_name == "main" || simple_name == "_user_main_")
+                    {
+                        llvm_name = simple_name;
+                    }
+                    else if (!ns_context.empty())
+                    {
+                        // Use the namespace context to qualify the name
+                        llvm_name = ns_context + "::" + simple_name;
+                    }
+                    else if (found_candidate.find("::") != std::string::npos)
+                    {
+                        // The candidate already has a namespace (e.g., from imported namespace)
+                        llvm_name = found_candidate;
+                    }
+                    else
+                    {
+                        llvm_name = simple_name;
+                    }
+                }
+
+                // IMPORTANT: Before creating a new declaration, check if a function with this name
+                // (or a qualified version of it) already exists in the module.
+                // This handles the case where the definition uses a qualified name (e.g., "HttpServer::handle_client")
+                // but we're looking up with an unqualified name.
+                if (llvm::Function *existing = module()->getFunction(llvm_name))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "create_forward_declaration_from_symbol: Found existing function '{}', reusing",
+                              llvm_name);
+                    ctx().register_function(found_candidate, existing);
+                    if (found_candidate != name)
+                        ctx().register_function(name, existing);
+                    return existing;
+                }
+
+                // If llvm_name is unqualified, check if a qualified version exists in the module
+                if (!is_intrinsic && llvm_name.find("::") == std::string::npos)
+                {
+                    std::string suffix = "::" + llvm_name;
+                    for (auto &fn_iter : module()->functions())
+                    {
+                        std::string fn_name = fn_iter.getName().str();
+                        if (fn_name.size() > suffix.size() &&
+                            fn_name.compare(fn_name.size() - suffix.size(), suffix.size(), suffix) == 0)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "create_forward_declaration_from_symbol: Found qualified function '{}' for '{}', reusing",
+                                      fn_name, llvm_name);
+                            ctx().register_function(found_candidate, &fn_iter);
+                            if (found_candidate != name)
+                                ctx().register_function(name, &fn_iter);
+                            return &fn_iter;
+                        }
+                    }
+                }
+
+                // Create the function declaration
+                llvm::Function *fn = llvm::Function::Create(
+                    llvm_func_type,
+                    llvm::Function::ExternalLinkage,
+                    llvm_name,
+                    module());
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "create_forward_declaration_from_symbol: Created forward declaration for '{}' (LLVM name: '{}')",
+                          found_candidate, llvm_name);
+
+                // Register in context for future lookups (using both qualified and simple names for intrinsics)
+                ctx().register_function(found_candidate, fn);
+                if (is_intrinsic && found_candidate != name)
+                {
+                    ctx().register_function(name, fn);
+                }
+
+                return fn;
             }
         }
 
@@ -3205,19 +3377,7 @@ namespace Cryo::Codegen
 
     bool CallCodegen::is_intrinsic(const std::string &name) const
     {
-        // Check static set
-        if (_intrinsic_functions.find(name) != _intrinsic_functions.end())
-        {
-            return true;
-        }
-
-        // Also check pattern: starts and ends with __
-        if (name.length() > 4 && name.substr(0, 2) == "__" && name.substr(name.length() - 2) == "__")
-        {
-            return true;
-        }
-
-        return false;
+        return _intrinsic_functions.find(name) != _intrinsic_functions.end();
     }
 
     bool CallCodegen::is_struct_type(const std::string &name) const
