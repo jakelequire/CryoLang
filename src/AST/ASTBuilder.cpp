@@ -234,9 +234,9 @@ namespace Cryo
         return node;
     }
 
-    std::unique_ptr<ScopeResolutionNode> ASTBuilder::create_scope_resolution(SourceLocation loc, std::string scope_name, std::string member_name)
+    std::unique_ptr<ScopeResolutionNode> ASTBuilder::create_scope_resolution(SourceLocation loc, std::string scope_name, std::string member_name, std::vector<std::string> generic_args)
     {
-        auto node = std::make_unique<ScopeResolutionNode>(loc, std::move(scope_name), std::move(member_name));
+        auto node = std::make_unique<ScopeResolutionNode>(loc, std::move(scope_name), std::move(member_name), std::move(generic_args));
         node->set_source_file(_source_file);
         return node;
     }

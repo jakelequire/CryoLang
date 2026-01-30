@@ -586,6 +586,11 @@ namespace Cryo
                                               TypeRef expected_type,
                                               PassContext &ctx);
 
+        // Resolve generic static method calls like Array<String>::new()
+        TypeRef resolve_generic_static_method(const std::string &scope_name,
+                                               const std::vector<std::string> &generic_args,
+                                               PassContext &ctx);
+
         // Look up the concrete type for an InstantiatedType from monomorphized types
         TypeRef lookup_concrete_type(TypeRef inst_type, PassContext &ctx);
 
