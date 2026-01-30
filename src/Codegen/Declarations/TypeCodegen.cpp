@@ -45,7 +45,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Type *TypeCodegen::resolve_generic_type(const std::string &base_type,
-                                                    const std::vector<TypeRef> &type_args)
+                                                  const std::vector<TypeRef> &type_args)
     {
         // Build cache key
         std::string cache_key = base_type + "<";
@@ -73,7 +73,7 @@ namespace Cryo::Codegen
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Unknown generic base type: {}", base_type);
             report_error(ErrorCode::E0637_INVALID_GENERIC_INSTANTIATION,
-                        "Unknown generic base type: " + base_type);
+                         "Unknown generic base type: " + base_type);
             return nullptr;
         }
 
@@ -109,7 +109,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::Value *TypeCodegen::cast_value(llvm::Value *value, llvm::Type *target_type,
-                                           const std::string &name)
+                                         const std::string &name)
     {
         if (!value || !target_type)
             return value;
@@ -171,7 +171,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *TypeCodegen::convert_integer(llvm::Value *value, llvm::Type *target_type,
-                                                bool is_signed)
+                                              bool is_signed)
     {
         if (!value || !target_type)
             return value;
@@ -236,7 +236,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *TypeCodegen::convert_int_float(llvm::Value *value, llvm::Type *target_type,
-                                                  bool source_signed)
+                                                bool source_signed)
     {
         if (!value || !target_type)
             return value;
@@ -502,8 +502,8 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::StructType *TypeCodegen::get_struct_type(const std::string &name,
-                                                     const std::vector<llvm::Type *> &field_types,
-                                                     bool packed)
+                                                   const std::vector<llvm::Type *> &field_types,
+                                                   bool packed)
     {
         // Check if already exists
         if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), name))
@@ -571,7 +571,6 @@ namespace Cryo::Codegen
             return nullptr;
 
         std::string name = node->name();
-        LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_TYPE_GEN: Generating struct type: '{}' ===", name);
 
         // CRITICAL: Do not generate struct types for generic templates
         // Generic templates should only be instantiated when used with concrete types
@@ -595,8 +594,8 @@ namespace Cryo::Codegen
                           name, field->name(), field_type->display_name());
                 // Emit actual error so it shows up in diagnostics
                 report_error(ErrorCode::E0644_FIELD_TYPE_ERROR, node,
-                            "Struct '" + name + "' field '" + field->name() +
-                            "' has unresolved type: " + field_type->display_name());
+                             "Struct '" + name + "' field '" + field->name() +
+                                 "' has unresolved type: " + field_type->display_name());
                 return nullptr;
             }
         }
@@ -663,21 +662,21 @@ namespace Cryo::Codegen
             if (cryo_field_type)
             {
                 LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Mapping field '{}' of type '{}' (TypeID={}, kind={}) ===",
-                         field->name(), cryo_field_type.get()->display_name(),
-                         cryo_field_type.id().id, static_cast<int>(cryo_field_type->kind()));
+                          field->name(), cryo_field_type.get()->display_name(),
+                          cryo_field_type.id().id, static_cast<int>(cryo_field_type->kind()));
                 // Use the main type mapping method like the old implementation did
                 llvm::Type *field_type = types().map(cryo_field_type);
                 if (field_type)
                 {
                     LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Field '{}' -> LLVM type ID={} ===",
-                             field->name(), field_type->getTypeID());
+                              field->name(), field_type->getTypeID());
                     // Check if the mapped type is opaque
                     if (auto st = llvm::dyn_cast<llvm::StructType>(field_type))
                     {
                         if (st->isOpaque())
                         {
                             LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: WARNING - Field '{}' mapped to OPAQUE struct '{}' ===",
-                                     field->name(), st->getName().str());
+                                      field->name(), st->getName().str());
                         }
                     }
                     field_types.push_back(field_type);
@@ -700,7 +699,7 @@ namespace Cryo::Codegen
         // Set struct body - always set even if empty to mark as non-opaque
         struct_type->setBody(field_types);
         LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== STRUCT_TYPE_GEN: Set struct '{}' body with {} fields (isOpaque after: {}) ===",
-                 name, field_types.size(), struct_type->isOpaque() ? "YES" : "NO");
+                  name, field_types.size(), struct_type->isOpaque() ? "YES" : "NO");
 
         // Register type in both context and TypeMapper cache for consistency
         ctx().register_type(name, struct_type);
@@ -816,15 +815,25 @@ namespace Cryo::Codegen
                 std::string type_kind_str = "unknown";
                 switch (cryo_field_type->kind())
                 {
-                    case Cryo::TypeKind::Class: type_kind_str = "Class"; break;
-                    case Cryo::TypeKind::Pointer: type_kind_str = "Pointer"; break;
-                    case Cryo::TypeKind::Struct: type_kind_str = "Struct"; break;
-                    case Cryo::TypeKind::Int: type_kind_str = "Integer"; break;
-                    default: type_kind_str = type_kind_to_string(cryo_field_type->kind()); break;
+                case Cryo::TypeKind::Class:
+                    type_kind_str = "Class";
+                    break;
+                case Cryo::TypeKind::Pointer:
+                    type_kind_str = "Pointer";
+                    break;
+                case Cryo::TypeKind::Struct:
+                    type_kind_str = "Struct";
+                    break;
+                case Cryo::TypeKind::Int:
+                    type_kind_str = "Integer";
+                    break;
+                default:
+                    type_kind_str = type_kind_to_string(cryo_field_type->kind());
+                    break;
                 }
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': type='{}', kind='{}'", 
-                         field->name(), cryo_field_type->display_name(), type_kind_str);
-                
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': type='{}', kind='{}'",
+                          field->name(), cryo_field_type->display_name(), type_kind_str);
+
                 // Use the main type mapping method like the old implementation did
                 llvm::Type *field_type = types().map(cryo_field_type);
                 if (field_type)
@@ -839,8 +848,8 @@ namespace Cryo::Codegen
             }
             else
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': resolved type is NULL", 
-                         field->name());
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': resolved type is NULL",
+                          field->name());
                 // Default to i64 for unresolved types
                 field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
             }

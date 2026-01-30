@@ -2187,12 +2187,13 @@ namespace Cryo
         void accept(ASTVisitor &visitor) override;
     };
 
-    // Array literal
+    // Array literal - supports both [a, b, c] and [value; count] syntax
     class ArrayLiteralNode : public ExpressionNode
     {
     private:
         std::vector<std::unique_ptr<ExpressionNode>> _elements;
         std::string _element_type; // Type of array elements
+        size_t _repeat_count = 0;  // If > 0, this is [expr; count] syntax
 
     public:
         ArrayLiteralNode(SourceLocation loc)
@@ -2200,7 +2201,18 @@ namespace Cryo
 
         const std::vector<std::unique_ptr<ExpressionNode>> &elements() const { return _elements; }
         const std::string &element_type() const { return _element_type; }
-        size_t size() const { return _elements.size(); }
+
+        /// Returns the effective size of the array (accounting for repeat syntax)
+        size_t size() const { return _repeat_count > 0 ? _repeat_count : _elements.size(); }
+
+        /// Returns true if this array uses [expr; count] repeat syntax
+        bool is_repeat_syntax() const { return _repeat_count > 0; }
+
+        /// Returns the repeat count (0 if not using repeat syntax)
+        size_t repeat_count() const { return _repeat_count; }
+
+        /// Sets the repeat count for [expr; count] syntax
+        void set_repeat_count(size_t count) { _repeat_count = count; }
 
         void add_element(std::unique_ptr<ExpressionNode> element)
         {
@@ -2214,7 +2226,9 @@ namespace Cryo
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "ArrayLiteral[" << _elements.size() << "]";
+            os << std::string(indent, ' ') << "ArrayLiteral[" << size() << "]";
+            if (_repeat_count > 0)
+                os << " (repeat " << _repeat_count << "x)";
             if (!_element_type.empty())
                 os << " (" << _element_type << ")";
             os << ":" << std::endl;

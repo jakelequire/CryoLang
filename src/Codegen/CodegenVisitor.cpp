@@ -181,60 +181,6 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "CodegenVisitor: Visiting ProgramNode with {} statements",
                   node.statements().size());
 
-        // DIAGNOSTIC: Dump all statement types
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "=== DIAGNOSTIC: Statement types in ProgramNode ===");
-        int stmt_idx = 0;
-        for (const auto &stmt : node.statements())
-        {
-            if (!stmt)
-            {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  [{}] nullptr", stmt_idx++);
-                continue;
-            }
-            std::string type_name = "Unknown";
-            if (dynamic_cast<Cryo::EnumDeclarationNode *>(stmt.get()))
-                type_name = "EnumDeclarationNode";
-            else if (auto *sm = dynamic_cast<Cryo::StructMethodNode *>(stmt.get()))
-                type_name = "StructMethodNode(" + sm->name() + ")";
-            else if (dynamic_cast<Cryo::StructDeclarationNode *>(stmt.get()))
-                type_name = "StructDeclarationNode";
-            else if (dynamic_cast<Cryo::ClassDeclarationNode *>(stmt.get()))
-                type_name = "ClassDeclarationNode";
-            else if (auto *var = dynamic_cast<Cryo::VariableDeclarationNode *>(stmt.get()))
-                type_name = "VariableDeclarationNode(" + var->name() + ")";
-            else if (auto *fn = dynamic_cast<Cryo::FunctionDeclarationNode *>(stmt.get()))
-                type_name = "FunctionDeclarationNode(" + fn->name() + ")";
-            else if (dynamic_cast<Cryo::ImplementationBlockNode *>(stmt.get()))
-                type_name = "ImplementationBlockNode";
-            else if (dynamic_cast<Cryo::ExternBlockNode *>(stmt.get()))
-                type_name = "ExternBlockNode";
-            else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
-            {
-                type_name = "DeclarationStatementNode";
-                if (decl_stmt->declaration())
-                {
-                    if (dynamic_cast<Cryo::EnumDeclarationNode *>(decl_stmt->declaration()))
-                        type_name += "(EnumDeclarationNode)";
-                    else if (dynamic_cast<Cryo::StructDeclarationNode *>(decl_stmt->declaration()))
-                        type_name += "(StructDeclarationNode)";
-                    else if (dynamic_cast<Cryo::ClassDeclarationNode *>(decl_stmt->declaration()))
-                        type_name += "(ClassDeclarationNode)";
-                    else if (auto *inner_var = dynamic_cast<Cryo::VariableDeclarationNode *>(decl_stmt->declaration()))
-                        type_name += "(VariableDeclarationNode:" + inner_var->name() + ")";
-                    else if (auto *inner_fn = dynamic_cast<Cryo::FunctionDeclarationNode *>(decl_stmt->declaration()))
-                        type_name += "(FunctionDeclarationNode:" + inner_fn->name() + ")";
-                    else if (auto *inner_sm = dynamic_cast<Cryo::StructMethodNode *>(decl_stmt->declaration()))
-                        type_name += "(StructMethodNode:" + inner_sm->name() + ")";
-                    else
-                        type_name += "(other)";
-                }
-            }
-            else if (dynamic_cast<Cryo::ImportDeclarationNode *>(stmt.get()))
-                type_name = "ImportDeclarationNode";
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "  [{}] {}", stmt_idx++, type_name);
-        }
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "=== END DIAGNOSTIC ===");
-
         // Multi-pass processing to ensure proper dependency order
         // Order is critical:
         //   Pass 0: Enums (so enum variants can be used in types and code)

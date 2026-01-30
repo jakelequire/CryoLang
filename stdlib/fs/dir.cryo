@@ -99,7 +99,7 @@ type struct ReadDir {
     static open(path: string) -> IoResult<ReadDir> {
         const dir: void* = opendir_syscall(path);
         if (dir == null) {
-            return IoResult::Err(IoError::from_raw_os_error(get_errno()));
+            return IoResult::Err(IoError::from_raw_os_error(errno()));
         }
 
         return IoResult::Ok(ReadDir {
@@ -121,7 +121,7 @@ type struct ReadDir {
         }
 
         loop {
-            const entry: DirentPtr = readdir_syscall(this.dir_ptr);
+            const entry: DirentPtr = intrinsics::readdir(this.dir_ptr);
             if (entry == null) {
                 this.closed = true;
                 return Option::None;
@@ -151,7 +151,7 @@ type struct ReadDir {
             return IoResult::Ok(());
         }
 
-        const result: i32 = closedir_syscall(this.dir_ptr);
+        const result: i32 = intrinsics::closedir(this.dir_ptr);
         this.closed = true;
 
         if (result < 0) {
@@ -163,7 +163,7 @@ type struct ReadDir {
     /// Drops the directory reader.
     drop(&this) -> void {
         if (!this.closed) {
-            closedir_syscall(this.dir_ptr);
+            intrinsics::closedir(this.dir_ptr);
         }
         this.base_path.drop();
     }
@@ -180,7 +180,7 @@ function read_dir(path: string) -> IoResult<ReadDir> {
 
 /// Creates a directory.
 function create_dir(path: string) -> IoResult<()> {
-    const result: i32 = mkdir_syscall(path, 0o755);
+    const result: i32 = intrinsics::mkdir(path, 0o755);
     if (result < 0) {
         return IoResult::Err(IoError::from_raw_os_error(-result));
     }
@@ -227,7 +227,7 @@ function create_dir_all(path: string) -> IoResult<()> {
 
 /// Removes an empty directory.
 function remove_dir(path: string) -> IoResult<()> {
-    const result: i32 = rmdir_syscall(path);
+    const result: i32 = intrinsics::rmdir(path);
     if (result < 0) {
         return IoResult::Err(IoError::from_raw_os_error(-result));
     }
@@ -286,13 +286,13 @@ function remove_dir_all(path: string) -> IoResult<()> {
 
 /// Returns true if a path exists.
 function exists(path: string) -> boolean {
-    return access_syscall(path, F_OK) == 0;
+    return intrinsics::access(path, F_OK) == 0;
 }
 
 /// Returns true if a path is a directory.
 function is_dir(path: string) -> boolean {
     const stat: StatBuf = StatBuf::new();
-    const result: i32 = stat_syscall(path, &stat);
+    const result: i32 = intrinsics::stat(path, &stat);
     if (result < 0) {
         return false;
     }
@@ -302,7 +302,7 @@ function is_dir(path: string) -> boolean {
 /// Returns true if a path is a file.
 function is_file(path: string) -> boolean {
     const stat: StatBuf = StatBuf::new();
-    const result: i32 = stat_syscall(path, &stat);
+    const result: i32 = intrinsics::stat(path, &stat);
     if (result < 0) {
         return false;
     }
@@ -311,7 +311,7 @@ function is_file(path: string) -> boolean {
 
 /// Removes a file.
 function remove_file(path: string) -> IoResult<()> {
-    const result: i32 = unlink_syscall(path);
+    const result: i32 = intrinsics::unlink(path);
     if (result < 0) {
         return IoResult::Err(IoError::from_raw_os_error(-result));
     }
@@ -320,7 +320,7 @@ function remove_file(path: string) -> IoResult<()> {
 
 /// Renames a file or directory.
 function rename(_from: string, to: string) -> IoResult<()> {
-    const result: i32 = rename_syscall(_from, to);
+    const result: i32 = intrinsics::rename(_from, to);
     if (result < 0) {
         return IoResult::Err(IoError::from_raw_os_error(-result));
     }
@@ -380,7 +380,7 @@ function copy(_from: string, to: string) -> IoResult<u64> {
 
 /// Creates a hard link.
 function hard_link(src: string, dst: string) -> IoResult<()> {
-    const result: i32 = link_syscall(src, dst);
+    const result: i32 = intrinsics::link(src, dst);
     if (result < 0) {
         return IoResult::Err(IoError::from_raw_os_error(-result));
     }
@@ -389,7 +389,7 @@ function hard_link(src: string, dst: string) -> IoResult<()> {
 
 /// Creates a symbolic link.
 function symlink(src: string, dst: string) -> IoResult<()> {
-    const result: i32 = symlink_syscall(src, dst);
+    const result: i32 = intrinsics::symlink(src, dst);
     if (result < 0) {
         return IoResult::Err(IoError::from_raw_os_error(-result));
     }
@@ -399,7 +399,7 @@ function symlink(src: string, dst: string) -> IoResult<()> {
 /// Reads a symbolic link.
 function read_link(path: string) -> IoResult<PathBuf> {
     mut buf: u8[4096];
-    const len: i64 = readlink_syscall(path, &buf[0], 4096);
+    const len: i64 = intrinsics::readlink(path, &buf[0], 4096);
     if (len < 0) {
         return IoResult::Err(IoError::from_raw_os_error(-len));
     }
@@ -410,9 +410,9 @@ function read_link(path: string) -> IoResult<PathBuf> {
 /// Returns the canonical path.
 function canonicalize(path: string) -> IoResult<PathBuf> {
     mut buf: u8[4096];
-    const result: string = realpath_syscall(path, &buf[0]);
+    const result: string = intrinsics::realpath(path, &buf[0]);
     if (result == null) {
-        return IoResult::Err(IoError::from_raw_os_error(get_errno()));
+        return IoResult::Err(IoError::from_raw_os_error(errno()));
     }
     return IoResult::Ok(PathBuf::from_str(result));
 }
@@ -420,16 +420,16 @@ function canonicalize(path: string) -> IoResult<PathBuf> {
 /// Returns the current working directory.
 function current_dir() -> IoResult<PathBuf> {
     mut buf: u8[4096];
-    const result: string = getcwd_syscall(&buf[0], 4096);
+    const result: string = intrinsics::getcwd(&buf[0], 4096);
     if (result == null) {
-        return IoResult::Err(IoError::from_raw_os_error(get_errno()));
+        return IoResult::Err(IoError::from_raw_os_error(errno()));
     }
     return IoResult::Ok(PathBuf::from_str(result));
 }
 
 /// Sets the current working directory.
 function set_current_dir(path: string) -> IoResult<()> {
-    const result: i32 = chdir_syscall(path);
+    const result: i32 = intrinsics::chdir(path);
     if (result < 0) {
         return IoResult::Err(IoError::from_raw_os_error(-result));
     }
