@@ -82,9 +82,13 @@ namespace Cryo::Codegen
         // Low-level file descriptor I/O
         llvm::Value* generate_read(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_write(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pread(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_pwrite(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_open(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_close(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_lseek(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_fsync(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_fdatasync(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_dup(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_dup2(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_pipe(const std::vector<llvm::Value*>& args);

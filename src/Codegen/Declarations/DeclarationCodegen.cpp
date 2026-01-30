@@ -55,8 +55,8 @@ namespace Cryo::Codegen
                               node->name(), param->name(), ptype->display_name());
                     // Emit actual error so it shows up in diagnostics
                     report_error(ErrorCode::E0642_PARAM_TYPE_ERROR, node,
-                                "Function '" + node->name() + "' parameter '" + param->name() +
-                                "' has unresolved type: " + ptype->display_name());
+                                 "Function '" + node->name() + "' parameter '" + param->name() +
+                                     "' has unresolved type: " + ptype->display_name());
                     return nullptr;
                 }
                 if (ptype->kind() == TypeKind::GenericParam)
@@ -91,7 +91,7 @@ namespace Cryo::Codegen
                           node->name(), ret_type->display_name());
                 // Emit actual error so it shows up in diagnostics
                 report_error(ErrorCode::E0643_RETURN_TYPE_ERROR, node,
-                            "Function '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
+                             "Function '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
                 return nullptr;
             }
             // Try to substitute type parameters if we're in a generic instantiation scope
@@ -172,7 +172,7 @@ namespace Cryo::Codegen
 
         // Register in context with the qualified name
         ctx().register_function(name, fn);
-        
+
         // Also register with the unqualified name for backward compatibility
         std::string unqualified_name = node->name();
         if (name != unqualified_name)
@@ -217,8 +217,8 @@ namespace Cryo::Codegen
                               node->name(), param->name(), ptype->display_name());
                     // Emit actual error so it shows up in diagnostics
                     report_error(ErrorCode::E0642_PARAM_TYPE_ERROR, node,
-                                "Function '" + node->name() + "' parameter '" + param->name() +
-                                "' has unresolved type: " + ptype->display_name());
+                                 "Function '" + node->name() + "' parameter '" + param->name() +
+                                     "' has unresolved type: " + ptype->display_name());
                     return nullptr;
                 }
                 // Check for Generic type kind
@@ -255,7 +255,7 @@ namespace Cryo::Codegen
                           node->name(), ret_type->display_name());
                 // Emit actual error so it shows up in diagnostics
                 report_error(ErrorCode::E0643_RETURN_TYPE_ERROR, node,
-                            "Function '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
+                             "Function '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
                 return nullptr;
             }
             // Try to substitute type parameters if we're in a generic instantiation scope
@@ -344,7 +344,7 @@ namespace Cryo::Codegen
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function verification failed: {}", name);
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
-                        "Function '" + name + "' failed LLVM verification");
+                         "Function '" + name + "' failed LLVM verification");
             // Clear the builder's insert point before erasing the function
             // to prevent dangling pointers to the deleted basic blocks
             builder().ClearInsertionPoint();
@@ -362,7 +362,7 @@ namespace Cryo::Codegen
             return nullptr;
 
         // Early trace to track which methods are being processed
-        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "DeclarationCodegen: TRACE ENTRY generate_method_declaration for '{}::{}' (return_type_annotation='{}')",
                   parent_type, node->name(),
                   node->return_type_annotation() ? node->return_type_annotation()->to_string() : "<none>");
@@ -402,8 +402,8 @@ namespace Cryo::Codegen
                               node->name(), param->name(), ptype.get()->display_name());
                     // Emit actual error so it shows up in diagnostics
                     report_error(ErrorCode::E0642_PARAM_TYPE_ERROR, node,
-                                "Method '" + node->name() + "' parameter '" + param->name() +
-                                "' has unresolved type: " + ptype.get()->display_name());
+                                 "Method '" + node->name() + "' parameter '" + param->name() +
+                                     "' has unresolved type: " + ptype.get()->display_name());
                     return nullptr;
                 }
                 // Check for Generic type kind or undefined struct/class types
@@ -506,8 +506,8 @@ namespace Cryo::Codegen
                               parent_type, node->name(), ret_type->display_name());
                     // Emit actual error so it shows up in diagnostics
                     report_error(ErrorCode::E0643_RETURN_TYPE_ERROR, node,
-                                "Method '" + parent_type + "::" + node->name() +
-                                "' has unresolved return type: " + ret_type->display_name());
+                                 "Method '" + parent_type + "::" + node->name() +
+                                     "' has unresolved return type: " + ret_type->display_name());
                     return nullptr;
                 }
             }
@@ -979,11 +979,11 @@ namespace Cryo::Codegen
                                   name, size);
 
                         builder().CreateMemCpy(
-                            alloca,                                                    // dest
-                            llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // dest align
-                            init_val,                                                  // src
-                            llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),   // src align
-                            size                                                       // size
+                            alloca,                                                  // dest
+                            llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)), // dest align
+                            init_val,                                                // src
+                            llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)), // src align
+                            size                                                     // size
                         );
                     }
                 }
@@ -1103,7 +1103,7 @@ namespace Cryo::Codegen
 
             // Get the type's name and look up the struct directly
             std::string type_name = cryo_type->display_name();
-            llvm::StructType* struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+            llvm::StructType *struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
             if (!struct_type)
             {
                 // Try with namespace context
@@ -1126,8 +1126,7 @@ namespace Cryo::Codegen
                     type_name,
                     "std::Runtime::" + type_name,
                     "std::runtime::" + type_name,
-                    "Runtime::" + type_name
-                };
+                    "Runtime::" + type_name};
                 for (const auto &candidate : candidates)
                 {
                     struct_type = llvm::StructType::getTypeByName(llvm_ctx(), candidate);
@@ -1646,7 +1645,8 @@ namespace Cryo::Codegen
         // Check for corrupted or invalid type pointer
         if (resolved_type.is_valid())
         {
-            try {
+            try
+            {
                 // Attempt to access the type safely
                 TypeKind kind = resolved_type->kind();
                 std::string type_name = resolved_type->display_name();
@@ -1656,15 +1656,15 @@ namespace Cryo::Codegen
             catch (...)
             {
                 LOG_ERROR(Cryo::LogComponent::CODEGEN, "get_function_type: CORRUPTED TYPE POINTER for function '{}' - this indicates a memory management bug in Monomorphizer", node->name());
-                throw std::runtime_error("Corrupted type pointer detected for function '" + node->name() + 
-                                       "' - this is a compiler bug in generic type substitution that must be fixed");
+                throw std::runtime_error("Corrupted type pointer detected for function '" + node->name() +
+                                         "' - this is a compiler bug in generic type substitution that must be fixed");
             }
         }
         else
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Function '{}' has NULL return type", node->name());
         }
-        
+
         // Special handling for constructors - if return type is void, fix it to pointer type
         // Only apply this fix for static methods named "new" (conventional constructor name)
         // Regular void-returning methods like reset(), drop() should stay void
@@ -1762,8 +1762,8 @@ namespace Cryo::Codegen
                         if (llvm_param->isVoidTy())
                         {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                     "get_function_type: Skipping void parameter '{}' in '{}'",
-                                     param->name(), node->name());
+                                      "get_function_type: Skipping void parameter '{}' in '{}'",
+                                      param->name(), node->name());
                             continue;
                         }
                         param_types.push_back(llvm_param);
@@ -1796,12 +1796,12 @@ namespace Cryo::Codegen
             // For generic methods, check if this is a template context where the return type
             // should be resolved during monomorphization rather than defaulting to void
             bool is_generic_context = !parent_type_name.empty() &&
-                                     (parent_type_name.find('<') != std::string::npos ||
-                                      parent_type_name.find('_') != std::string::npos); // e.g., Option_T
+                                      (parent_type_name.find('<') != std::string::npos ||
+                                       parent_type_name.find('_') != std::string::npos); // e.g., Option_T
 
             // Also check if we have an annotation for a generic return type
             bool has_generic_annotation = node->return_type_annotation() &&
-                                         node->return_type_annotation()->to_string().find('<') != std::string::npos;
+                                          node->return_type_annotation()->to_string().find('<') != std::string::npos;
 
             if ((is_generic_context && resolved_type && resolved_type->kind() == Cryo::TypeKind::GenericParam) ||
                 has_generic_annotation)
@@ -1882,8 +1882,8 @@ namespace Cryo::Codegen
                     if (param_type->isVoidTy())
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                 "get_function_type: Skipping void parameter '{}' in function",
-                                 param->name());
+                                  "get_function_type: Skipping void parameter '{}' in function",
+                                  param->name());
                         continue;
                     }
                     param_types.push_back(param_type);
@@ -2095,7 +2095,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *DeclarationCodegen::generate_default_constructor(const std::string &type_name,
-                                                                     llvm::StructType* struct_type)
+                                                                     llvm::StructType *struct_type)
     {
         std::string ctor_name = type_name + "::init";
 
@@ -2474,7 +2474,7 @@ namespace Cryo::Codegen
                           node->name(), ret_type->display_name());
                 // Emit actual error so it shows up in diagnostics
                 report_error(ErrorCode::E0643_RETURN_TYPE_ERROR, node,
-                            "Method '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
+                             "Method '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
                 return;
             }
         }
@@ -2497,13 +2497,13 @@ namespace Cryo::Codegen
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "DeclarationCodegen: Generating body for method: {}", fn->getName().str());
-                
-                // Special debug for main function
-                if (fn->getName().contains("main")) 
-                {
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                             "=== MAIN FUNCTION DEBUG: Starting body generation for '{}'", fn->getName().str());
-                }
+
+            // Special debug for main function
+            if (fn->getName().contains("main"))
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "=== MAIN FUNCTION DEBUG: Starting body generation for '{}'", fn->getName().str());
+            }
             llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
             builder().SetInsertPoint(entry);
 
@@ -3009,7 +3009,8 @@ namespace Cryo::Codegen
 
         // Phase 1: Register type namespaces so resolve_method_by_name() can
         // construct fully-qualified method names for imported types.
-        symbols().for_each_symbol([&](const Cryo::Symbol &sym) {
+        symbols().for_each_symbol([&](const Cryo::Symbol &sym)
+                                  {
             if (sym.kind != Cryo::SymbolKind::Type)
                 return;
 
@@ -3024,13 +3025,13 @@ namespace Cryo::Codegen
                 return;
 
             ctx().register_type_namespace(simple_name, ns_prefix);
-            type_ns_count++;
-        });
+            type_ns_count++; });
 
         // Phase 2: Create LLVM extern declarations for all imported callable symbols.
         // This replicates the pattern from CallCodegen::create_forward_declaration_from_symbol()
         // but does it proactively for all symbols rather than on-demand.
-        symbols().for_each_symbol([&](const Cryo::Symbol &sym) {
+        symbols().for_each_symbol([&](const Cryo::Symbol &sym)
+                                  {
             bool is_function = (sym.kind == Cryo::SymbolKind::Function);
             bool is_method = (sym.kind == Cryo::SymbolKind::Method);
             bool is_intrinsic = (sym.kind == Cryo::SymbolKind::Intrinsic);
@@ -3173,8 +3174,7 @@ namespace Cryo::Codegen
                 ctx().register_function(llvm_name, fn);
             }
 
-            registered_count++;
-        });
+            registered_count++; });
 
         // Re-enable generic instantiation for subsequent type mapping
         types().set_skip_generic_instantiation(false);
@@ -3230,14 +3230,14 @@ namespace Cryo::Codegen
         if (mod->getNamedGlobal("llvm.global_ctors"))
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "Global constructors already registered, skipping duplicate generation");
+                      "Global constructors already registered, skipping duplicate generation");
             return;
         }
 
         llvm::LLVMContext &ctx = llvm_ctx();
 
         // Check if we need global constructors (look for global variables with non-trivial types)
-        std::vector<llvm::GlobalVariable*> globals_needing_ctors;
+        std::vector<llvm::GlobalVariable *> globals_needing_ctors;
 
         for (auto &global : mod->globals())
         {
@@ -3267,15 +3267,15 @@ namespace Cryo::Codegen
                 {
                     globals_needing_ctors.push_back(&global);
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                             "Global '{}' has explicit initializer, will call constructor",
-                             global_name);
+                              "Global '{}' has explicit initializer, will call constructor",
+                              global_name);
                 }
             }
             else if (global.getValueType()->isStructTy())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                         "Global '{}' declared without initializer, skipping auto-construction",
-                         global_name);
+                          "Global '{}' declared without initializer, skipping auto-construction",
+                          global_name);
             }
         }
 
@@ -3289,7 +3289,7 @@ namespace Cryo::Codegen
         if (mod->getFunction("__cryo_global_constructors"))
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "Global constructor function already exists, skipping duplicate creation");
+                      "Global constructor function already exists, skipping duplicate creation");
             return;
         }
 
@@ -3312,7 +3312,7 @@ namespace Cryo::Codegen
         for (llvm::GlobalVariable *global : globals_needing_ctors)
         {
             llvm::Type *global_type = global->getValueType();
-            if (llvm::StructType* struct_type = llvm::dyn_cast<llvm::StructType>(global_type))
+            if (llvm::StructType *struct_type = llvm::dyn_cast<llvm::StructType>(global_type))
             {
                 std::string type_name = struct_type->hasName() ? struct_type->getName().str() : "unnamed_struct";
                 std::string global_name = global->getName().str();
@@ -3334,11 +3334,11 @@ namespace Cryo::Codegen
                 if (llvm::Function *ctor_func = mod->getFunction(ctor_name))
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                             "Calling constructor '{}' for global '{}'",
-                             ctor_name, global_name);
+                              "Calling constructor '{}' for global '{}'",
+                              ctor_name, global_name);
 
                     // Call constructor with global variable as 'this' pointer
-                    std::vector<llvm::Value*> ctor_args = { global };
+                    std::vector<llvm::Value *> ctor_args = {global};
                     local_builder.CreateCall(ctor_func, ctor_args);
                 }
                 else
@@ -3347,9 +3347,8 @@ namespace Cryo::Codegen
                     std::vector<std::string> alt_names = {
                         type_name + "::init",
                         type_name + "()",
-                        base_type_name + "::" + base_type_name,  // For non-namespaced lookup
-                        "std::Runtime::" + base_type_name + "::" + base_type_name
-                    };
+                        base_type_name + "::" + base_type_name, // For non-namespaced lookup
+                        "std::Runtime::" + base_type_name + "::" + base_type_name};
 
                     bool found = false;
                     for (const std::string &alt_name : alt_names)
@@ -3357,10 +3356,10 @@ namespace Cryo::Codegen
                         if (llvm::Function *alt_ctor = mod->getFunction(alt_name))
                         {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                     "Calling constructor '{}' for global '{}'",
-                                     alt_name, global_name);
+                                      "Calling constructor '{}' for global '{}'",
+                                      alt_name, global_name);
 
-                            std::vector<llvm::Value*> ctor_args = { global };
+                            std::vector<llvm::Value *> ctor_args = {global};
                             local_builder.CreateCall(alt_ctor, ctor_args);
                             found = true;
                             break;
@@ -3370,8 +3369,8 @@ namespace Cryo::Codegen
                     if (!found)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                 "No constructor found for type '{}' (tried multiple patterns)",
-                                 type_name);
+                                  "No constructor found for type '{}' (tried multiple patterns)",
+                                  type_name);
                     }
                 }
             }
@@ -3389,19 +3388,19 @@ namespace Cryo::Codegen
 
         // Create array type for global_ctors entry: { i32, ptr, ptr }
         // The standard @llvm.global_ctors format uses opaque pointers
-        std::vector<llvm::Type*> ctor_entry_types = {
-            i32_type,  // priority
-            ptr_type,  // constructor function pointer (opaque ptr)
-            ptr_type   // associated data (null)
+        std::vector<llvm::Type *> ctor_entry_types = {
+            i32_type, // priority
+            ptr_type, // constructor function pointer (opaque ptr)
+            ptr_type  // associated data (null)
         };
         llvm::StructType *ctor_entry_type = llvm::StructType::get(ctx, ctor_entry_types);
 
         // Create the global_ctors entry
         // Note: global_ctor (llvm::Function*) is already a Constant and pointer-compatible
-        std::vector<llvm::Constant*> ctor_entry_values = {
-            llvm::ConstantInt::get(i32_type, 65535),     // priority (default)
-            global_ctor,                                  // constructor function (Function* is a Constant*)
-            llvm::ConstantPointerNull::get(ptr_type)     // no associated data
+        std::vector<llvm::Constant *> ctor_entry_values = {
+            llvm::ConstantInt::get(i32_type, 65535), // priority (default)
+            global_ctor,                             // constructor function (Function* is a Constant*)
+            llvm::ConstantPointerNull::get(ptr_type) // no associated data
         };
         llvm::Constant *ctor_entry = llvm::ConstantStruct::get(ctor_entry_type, ctor_entry_values);
 
@@ -3411,11 +3410,11 @@ namespace Cryo::Codegen
 
         // Create the @llvm.global_ctors global variable
         new llvm::GlobalVariable(*mod, ctor_array_type, false,
-                                llvm::GlobalValue::AppendingLinkage, 
-                                ctor_array, "llvm.global_ctors");
+                                 llvm::GlobalValue::AppendingLinkage,
+                                 ctor_array, "llvm.global_ctors");
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                 "Global constructor function created and registered with @llvm.global_ctors");
+                  "Global constructor function created and registered with @llvm.global_ctors");
     }
 
     //===================================================================
@@ -3435,22 +3434,38 @@ namespace Cryo::Codegen
         {
             // Lookup primitive type in arena
             const std::string &name = annotation->name;
-            if (name == "void") return arena.get_void();
-            if (name == "bool") return arena.get_bool();
-            if (name == "char") return arena.get_char();
-            if (name == "string" || name == "String") return arena.get_string();
-            if (name == "i8") return arena.get_i8();
-            if (name == "i16") return arena.get_i16();
-            if (name == "i32" || name == "int") return arena.get_i32();
-            if (name == "i64") return arena.get_i64();
-            if (name == "i128") return arena.get_i128();
-            if (name == "u8") return arena.get_u8();
-            if (name == "u16") return arena.get_u16();
-            if (name == "u32" || name == "uint") return arena.get_u32();
-            if (name == "u64") return arena.get_u64();
-            if (name == "u128") return arena.get_u128();
-            if (name == "f32" || name == "float") return arena.get_f32();
-            if (name == "f64" || name == "double") return arena.get_f64();
+            if (name == "void")
+                return arena.get_void();
+            if (name == "bool")
+                return arena.get_bool();
+            if (name == "char")
+                return arena.get_char();
+            if (name == "string" || name == "String")
+                return arena.get_string();
+            if (name == "i8")
+                return arena.get_i8();
+            if (name == "i16")
+                return arena.get_i16();
+            if (name == "i32" || name == "int")
+                return arena.get_i32();
+            if (name == "i64")
+                return arena.get_i64();
+            if (name == "i128")
+                return arena.get_i128();
+            if (name == "u8")
+                return arena.get_u8();
+            if (name == "u16")
+                return arena.get_u16();
+            if (name == "u32" || name == "uint")
+                return arena.get_u32();
+            if (name == "u64")
+                return arena.get_u64();
+            if (name == "u128")
+                return arena.get_u128();
+            if (name == "f32" || name == "float")
+                return arena.get_f32();
+            if (name == "f64" || name == "double")
+                return arena.get_f64();
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "resolve_type_annotation: Unknown primitive type '{}'", name);
@@ -3518,7 +3533,8 @@ namespace Cryo::Codegen
             std::string qualified_name;
             for (size_t i = 0; i < annotation->qualified_path.size(); ++i)
             {
-                if (i > 0) qualified_name += "::";
+                if (i > 0)
+                    qualified_name += "::";
                 qualified_name += annotation->qualified_path[i];
             }
 
@@ -3609,7 +3625,7 @@ namespace Cryo::Codegen
                 return inner;
 
             return arena.get_reference_to(inner,
-                annotation->is_mutable ? RefMutability::Mutable : RefMutability::Immutable);
+                                          annotation->is_mutable ? RefMutability::Mutable : RefMutability::Immutable);
         }
 
         case TypeAnnotationKind::Array:

@@ -109,6 +109,10 @@ namespace Cryo::Codegen
             return generate_read(args);
         else if (intrinsic_name == "write")
             return generate_write(args);
+        else if (intrinsic_name == "pread")
+            return generate_pread(args);
+        else if (intrinsic_name == "pwrite")
+            return generate_pwrite(args);
         else if (intrinsic_name == "open")
             return generate_open(args);
         else if (intrinsic_name == "close")
@@ -123,6 +127,10 @@ namespace Cryo::Codegen
             return generate_pipe(args);
         else if (intrinsic_name == "fcntl")
             return generate_fcntl(args);
+        else if (intrinsic_name == "fsync")
+            return generate_fsync(args);
+        else if (intrinsic_name == "fdatasync")
+            return generate_fdatasync(args);
 
         // Filesystem intrinsics
         else if (intrinsic_name == "stat")
@@ -3333,6 +3341,68 @@ namespace Cryo::Codegen
         return builder.CreateCall(write_func, call_args, "write.result");
     }
 
+    llvm::Value *Intrinsics::generate_pread(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 4)
+        {
+            report_error("pread requires exactly 4 arguments (fd, buffer, count, offset)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create pread function type: ssize_t pread(int fd, void* buffer, size_t count, off_t offset)
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *ssize_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *off_t_type = llvm::Type::getInt64Ty(context);
+        llvm::FunctionType *pread_type = llvm::FunctionType::get(
+            ssize_t_type, {int_type, void_ptr_type, size_t_type, off_t_type}, false);
+
+        llvm::Function *pread_func = get_or_create_libc_function("pread", pread_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], int_type, "pread.fd"),
+            args[1], // buffer
+            ensure_type(args[2], size_t_type, "pread.count"),
+            ensure_type(args[3], off_t_type, "pread.offset")};
+
+        return builder.CreateCall(pread_func, call_args, "pread.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pwrite(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 4)
+        {
+            report_error("pwrite requires exactly 4 arguments (fd, buffer, count, offset)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create pwrite function type: ssize_t pwrite(int fd, const void* buffer, size_t count, off_t offset)
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *ssize_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *off_t_type = llvm::Type::getInt64Ty(context);
+        llvm::FunctionType *pwrite_type = llvm::FunctionType::get(
+            ssize_t_type, {int_type, void_ptr_type, size_t_type, off_t_type}, false);
+
+        llvm::Function *pwrite_func = get_or_create_libc_function("pwrite", pwrite_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], int_type, "pwrite.fd"),
+            args[1], // buffer
+            ensure_type(args[2], size_t_type, "pwrite.count"),
+            ensure_type(args[3], off_t_type, "pwrite.offset")};
+
+        return builder.CreateCall(pwrite_func, call_args, "pwrite.result");
+    }
+
     llvm::Value *Intrinsics::generate_open(const std::vector<llvm::Value *> &args)
     {
         if (args.size() < 2 || args.size() > 3)
@@ -3513,6 +3583,54 @@ namespace Cryo::Codegen
             ensure_type(args[2], int_type, "fcntl.arg")};
 
         return builder.CreateCall(fcntl_func, call_args, "fcntl.result");
+    }
+
+    llvm::Value *Intrinsics::generate_fsync(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("fsync requires exactly 1 argument (fd)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create fsync function type: int fsync(int fd)
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *fsync_type = llvm::FunctionType::get(
+            int_type, {int_type}, false);
+
+        llvm::Function *fsync_func = get_or_create_libc_function("fsync", fsync_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], int_type, "fsync.fd")};
+
+        return builder.CreateCall(fsync_func, call_args, "fsync.result");
+    }
+
+    llvm::Value *Intrinsics::generate_fdatasync(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("fdatasync requires exactly 1 argument (fd)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create fdatasync function type: int fdatasync(int fd)
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *fdatasync_type = llvm::FunctionType::get(
+            int_type, {int_type}, false);
+
+        llvm::Function *fdatasync_func = get_or_create_libc_function("fdatasync", fdatasync_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], int_type, "fdatasync.fd")};
+
+        return builder.CreateCall(fdatasync_func, call_args, "fdatasync.result");
     }
 
     // ========================================
