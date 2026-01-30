@@ -4283,7 +4283,6 @@ namespace Cryo
             // First, check if this is a primitive type (e.g., impl i32 { ... })
             // Primitive types aren't in the symbol table - they're built-in to TypeArena
             TypeRef base_type;
-            else if (lookup_name == "char") base_type = _context.types().get_char();
             if (lookup_name == "void")
                 base_type = _context.types().get_void();
             else if (lookup_name == "boolean")
