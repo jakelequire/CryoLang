@@ -354,7 +354,7 @@ namespace Cryo::CLI::Commands
             if (raw_mode)
             {
                 std::string output_path = args.output_file();
-                
+
                 if (!output_path.empty())
                 {
                     // Determine output type based on extension
@@ -390,6 +390,12 @@ namespace Cryo::CLI::Commands
                         // Generate assembly file using linker
                         output_success = compiler->linker() && compiler->linker()->generate_assembly_file(compiler->codegen()->get_module(), output_path);
                     }
+                    else if (extension == "exe" || extension == "out" || extension == "")
+                    {
+                        // Generate executable binary
+                        auto target = Cryo::Linker::CryoLinker::LinkTarget::Executable;
+                        output_success = compiler->generate_output(output_path, target);
+                    }
                     else
                     {
                         // Default to object file for unknown extensions
@@ -417,7 +423,7 @@ namespace Cryo::CLI::Commands
                     std::cout << "\n[RAW] Raw mode enabled but no output file specified. Use -o flag to specify output file." << std::endl;
                     std::cout << "[RAW] Supported extensions: .o/.obj (object file), .ll (LLVM IR), .bc (LLVM bitcode), .asm/.s (assembly)" << std::endl;
                 }
-                
+
                 return 0; // Raw mode doesn't need executable generation, exit early
             }
 
@@ -1135,10 +1141,13 @@ namespace Cryo::CLI::Commands
         // so skip the additional LLVM emission and linking steps
         if (is_stdlib)
         {
-            if (compilation_success) {
+            if (compilation_success)
+            {
                 std::cout << "✓ Stdlib compilation completed successfully" << std::endl;
                 std::cout << "  Individual module files generated in: " << config.output_dir << std::endl;
-            } else {
+            }
+            else
+            {
                 std::cout << "⚠ Stdlib compilation completed with errors" << std::endl;
                 std::cout << "  Partial results available in: " << config.output_dir << std::endl;
             }

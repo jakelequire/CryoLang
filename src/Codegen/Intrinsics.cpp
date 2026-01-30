@@ -196,6 +196,10 @@ namespace Cryo::Codegen
         else if (intrinsic_name == "signal")
             return generate_signal(args);
 
+        // Error handling intrinsics
+        else if (intrinsic_name == "errno")
+            return generate_errno(args);
+
         // Math intrinsics
         else if (intrinsic_name == "sqrt")
             return generate_sqrt(args);
@@ -341,6 +345,14 @@ namespace Cryo::Codegen
             return generate_htonl(args);
         else if (intrinsic_name == "ntohl")
             return generate_ntohl(args);
+
+        // Windows socket initialization intrinsics
+        else if (intrinsic_name == "WSAStartup")
+            return generate_WSAStartup(args);
+        else if (intrinsic_name == "WSACleanup")
+            return generate_WSACleanup(args);
+        else if (intrinsic_name == "WSAGetLastError")
+            return generate_WSAGetLastError(args);
 
         // Time intrinsics
         else if (intrinsic_name == "time")
@@ -1605,7 +1617,7 @@ namespace Cryo::Codegen
     {
         if (args.size() != 2)
         {
-            report_error("__strcmp__ requires exactly 2 arguments (str1, str2)");
+            report_error("strcmp requires exactly 2 arguments (str1, str2)");
             return nullptr;
         }
 
@@ -1624,9 +1636,32 @@ namespace Cryo::Codegen
         llvm::Value *str1_arg = args[0];
         llvm::Value *str2_arg = args[1];
 
+        // Handle array-to-pointer decay for both arguments
+        // If the argument is an array type, we need to get a pointer to the first element
+        if (str1_arg->getType()->isArrayTy())
+        {
+            // Create alloca for the array and get pointer to first element
+            llvm::Type *array_type = str1_arg->getType();
+            llvm::AllocaInst *alloca = builder.CreateAlloca(array_type, nullptr, "strcmp.arr1");
+            builder.CreateStore(str1_arg, alloca);
+            str1_arg = builder.CreateInBoundsGEP(array_type, alloca,
+                {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0),
+                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0)}, "strcmp.ptr1");
+        }
+
+        if (str2_arg->getType()->isArrayTy())
+        {
+            llvm::Type *array_type = str2_arg->getType();
+            llvm::AllocaInst *alloca = builder.CreateAlloca(array_type, nullptr, "strcmp.arr2");
+            builder.CreateStore(str2_arg, alloca);
+            str2_arg = builder.CreateInBoundsGEP(array_type, alloca,
+                {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0),
+                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0)}, "strcmp.ptr2");
+        }
+
         if (!str1_arg->getType()->isPointerTy() || !str2_arg->getType()->isPointerTy())
         {
-            report_error("__strcmp__ arguments must be pointers");
+            report_error("strcmp arguments must be pointers or arrays");
             return nullptr;
         }
 
@@ -2919,9 +2954,21 @@ namespace Cryo::Codegen
         // Get or create snprintf function
         llvm::Function *snprintf_func = get_or_create_libc_function("snprintf", snprintf_type);
 
+        // Handle buffer argument - may be an array that needs pointer decay
+        llvm::Value *buffer_arg = args[0];
+        if (buffer_arg->getType()->isArrayTy())
+        {
+            llvm::Type *array_type = buffer_arg->getType();
+            llvm::AllocaInst *alloca = builder.CreateAlloca(array_type, nullptr, "snprintf.buf.arr");
+            builder.CreateStore(buffer_arg, alloca);
+            buffer_arg = builder.CreateInBoundsGEP(array_type, alloca,
+                {llvm::ConstantInt::get(int_type, 0),
+                 llvm::ConstantInt::get(int_type, 0)}, "snprintf.buf.ptr");
+        }
+
         // Prepare arguments
         std::vector<llvm::Value *> call_args;
-        call_args.push_back(args[0]);                                            // buffer
+        call_args.push_back(buffer_arg);                                         // buffer (pointer)
         call_args.push_back(ensure_type(args[1], size_t_type, "snprintf.size")); // size
         call_args.push_back(args[2]);                                            // format
 
@@ -3043,20 +3090,20 @@ namespace Cryo::Codegen
     {
         if (args.size() != 1)
         {
-            report_error("fclose requires exactly 1 argument (file)");
+            report_error("fclose requires exactly 1 argument (file/fd)");
             return nullptr;
         }
 
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        // Create fclose function type: int fclose(FILE* file)
-        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        // Create fclose function type: int fclose(int fd)
+        // Using i32 for fd to match common user declarations (fd-style)
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType *fclose_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
+        llvm::FunctionType *fclose_type = llvm::FunctionType::get(int_type, {int_type}, false);
 
         llvm::Function *fclose_func = get_or_create_libc_function("fclose", fclose_type);
-        return builder.CreateCall(fclose_func, {args[0]}, "fclose.result");
+        return builder.CreateCall(fclose_func, {ensure_type(args[0], int_type, "fclose.fd")}, "fclose.result");
     }
 
     llvm::Value *Intrinsics::generate_fread(const std::vector<llvm::Value *> &args)
@@ -3121,25 +3168,25 @@ namespace Cryo::Codegen
     {
         if (args.size() != 3)
         {
-            report_error("fseek requires exactly 3 arguments (file, offset, whence)");
+            report_error("fseek requires exactly 3 arguments (file/fd, offset, whence)");
             return nullptr;
         }
 
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        // Create fseek function type: int fseek(FILE* file, long offset, int whence)
-        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type *long_type = llvm::Type::getInt64Ty(context);
+        // Create fseek function type: int fseek(int fd, int offset, int whence)
+        // Using i32 for all parameters to match common user declarations
+        // (user may be using fd-style fseek, similar to lseek)
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
         llvm::FunctionType *fseek_type = llvm::FunctionType::get(
-            int_type, {void_ptr_type, long_type, int_type}, false);
+            int_type, {int_type, int_type, int_type}, false);
 
         llvm::Function *fseek_func = get_or_create_libc_function("fseek", fseek_type);
 
         std::vector<llvm::Value *> call_args = {
-            args[0], // file
-            ensure_type(args[1], long_type, "fseek.offset"),
+            ensure_type(args[0], int_type, "fseek.fd"),
+            ensure_type(args[1], int_type, "fseek.offset"),
             ensure_type(args[2], int_type, "fseek.whence")};
 
         return builder.CreateCall(fseek_func, call_args, "fseek.result");
@@ -3149,20 +3196,20 @@ namespace Cryo::Codegen
     {
         if (args.size() != 1)
         {
-            report_error("ftell requires exactly 1 argument (file)");
+            report_error("ftell requires exactly 1 argument (file/fd)");
             return nullptr;
         }
 
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        // Create ftell function type: long ftell(FILE* file)
-        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type *long_type = llvm::Type::getInt64Ty(context);
-        llvm::FunctionType *ftell_type = llvm::FunctionType::get(long_type, {void_ptr_type}, false);
+        // Create ftell function type: int ftell(int fd)
+        // Using i32 for fd and return type to match common user declarations
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *ftell_type = llvm::FunctionType::get(int_type, {int_type}, false);
 
         llvm::Function *ftell_func = get_or_create_libc_function("ftell", ftell_type);
-        return builder.CreateCall(ftell_func, {args[0]}, "ftell.result");
+        return builder.CreateCall(ftell_func, {ensure_type(args[0], int_type, "ftell.fd")}, "ftell.result");
     }
 
     llvm::Value *Intrinsics::generate_fflush(const std::vector<llvm::Value *> &args)
@@ -3240,20 +3287,19 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        // Create read function type: ssize_t read(int fd, void* buffer, size_t count)
+        // Create read function type: int read(int fd, void* buffer, int count)
+        // Using i32 for count to match common user declarations
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
         llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
-        llvm::Type *ssize_t_type = llvm::Type::getInt64Ty(context);
         llvm::FunctionType *read_type = llvm::FunctionType::get(
-            ssize_t_type, {int_type, void_ptr_type, size_t_type}, false);
+            int_type, {int_type, void_ptr_type, int_type}, false);
 
         llvm::Function *read_func = get_or_create_libc_function("read", read_type);
 
         std::vector<llvm::Value *> call_args = {
             ensure_type(args[0], int_type, "read.fd"),
             args[1], // buffer
-            ensure_type(args[2], size_t_type, "read.count")};
+            ensure_type(args[2], int_type, "read.count")};
 
         return builder.CreateCall(read_func, call_args, "read.result");
     }
@@ -3289,28 +3335,48 @@ namespace Cryo::Codegen
 
     llvm::Value *Intrinsics::generate_open(const std::vector<llvm::Value *> &args)
     {
-        if (args.size() != 3)
+        if (args.size() < 2 || args.size() > 3)
         {
-            report_error("open requires exactly 3 arguments (path, flags, mode)");
+            report_error("open requires 2 or 3 arguments (path, flags[, mode])");
             return nullptr;
         }
 
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        // Create open function type: int open(const char* path, int flags, mode_t mode)
+        // Create open function type: int open(const char* path, int flags[, mode_t mode])
         llvm::Type *char_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType *open_type = llvm::FunctionType::get(
-            int_type, {char_ptr_type, int_type, int_type}, false);
+
+        // Handle path argument - may be an array that needs pointer decay
+        llvm::Value *path_arg = args[0];
+        if (path_arg->getType()->isArrayTy())
+        {
+            llvm::Type *array_type = path_arg->getType();
+            llvm::AllocaInst *alloca = builder.CreateAlloca(array_type, nullptr, "open.path.arr");
+            builder.CreateStore(path_arg, alloca);
+            path_arg = builder.CreateInBoundsGEP(array_type, alloca,
+                {llvm::ConstantInt::get(int_type, 0),
+                 llvm::ConstantInt::get(int_type, 0)}, "open.path.ptr");
+        }
+
+        std::vector<llvm::Value *> call_args;
+        call_args.push_back(path_arg);
+        call_args.push_back(ensure_type(args[1], int_type, "open.flags"));
+
+        llvm::FunctionType *open_type;
+        if (args.size() == 3)
+        {
+            open_type = llvm::FunctionType::get(int_type, {char_ptr_type, int_type, int_type}, false);
+            call_args.push_back(ensure_type(args[2], int_type, "open.mode"));
+        }
+        else
+        {
+            // 2-argument version - mode defaults to 0
+            open_type = llvm::FunctionType::get(int_type, {char_ptr_type, int_type}, false);
+        }
 
         llvm::Function *open_func = get_or_create_libc_function("open", open_type);
-
-        std::vector<llvm::Value *> call_args = {
-            args[0], // path
-            ensure_type(args[1], int_type, "open.flags"),
-            ensure_type(args[2], int_type, "open.mode")};
-
         return builder.CreateCall(open_func, call_args, "open.result");
     }
 
@@ -4048,6 +4114,57 @@ namespace Cryo::Codegen
     }
 
     // ========================================
+    // Error Handling Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_errno(const std::vector<llvm::Value *> &args)
+    {
+        if (!args.empty())
+        {
+            report_error("errno requires no arguments");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *int_ptr_type = llvm::PointerType::get(int_type, 0);
+
+        // errno is accessed differently on Windows vs POSIX:
+        // - Windows: _errno() returns int*
+        // - POSIX (Linux/macOS): __errno_location() returns int*
+        // We need to call the appropriate function and load the value.
+
+#if defined(_WIN32) || defined(_WIN64)
+        const char *errno_func_name = "_errno";
+#else
+        const char *errno_func_name = "__errno_location";
+#endif
+
+        // Function type: int* errno_func(void)
+        llvm::FunctionType *errno_func_type = llvm::FunctionType::get(int_ptr_type, false);
+
+        // Get or create the errno function
+        llvm::Function *errno_func = module->getFunction(errno_func_name);
+        if (!errno_func)
+        {
+            errno_func = llvm::Function::Create(
+                errno_func_type,
+                llvm::Function::ExternalLinkage,
+                errno_func_name,
+                module);
+        }
+
+        // Call the errno function to get the pointer to errno
+        llvm::Value *errno_ptr = builder.CreateCall(errno_func, {}, "errno.ptr");
+
+        // Load the errno value
+        return builder.CreateLoad(int_type, errno_ptr, "errno.value");
+    }
+
+    // ========================================
     // Math Intrinsics
     // ========================================
 
@@ -4602,15 +4719,43 @@ namespace Cryo::Codegen
     }
 
     // Network stubs for functions not yet fully implemented
-    // (listen, accept, connect, send, recv have full implementations below)
+    // (listen, accept, connect, send, recv, setsockopt have full implementations)
     DEFINE_NETWORK_STUB(sendto, 6)
     DEFINE_NETWORK_STUB(recvfrom, 6)
     DEFINE_NETWORK_STUB(shutdown, 2)
-    DEFINE_NETWORK_STUB(setsockopt, 5)
     DEFINE_NETWORK_STUB(getsockopt, 5)
     DEFINE_NETWORK_STUB(getsockname, 3)
     DEFINE_NETWORK_STUB(getpeername, 3)
     DEFINE_NETWORK_STUB(poll, 3)
+
+    llvm::Value *Intrinsics::generate_setsockopt(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 5)
+        {
+            report_error("setsockopt requires exactly 5 arguments (sockfd, level, optname, optval, optlen)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen)
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *setsockopt_type = llvm::FunctionType::get(
+            int_type, {int_type, int_type, int_type, void_ptr_type, int_type}, false);
+
+        llvm::Function *setsockopt_func = get_or_create_libc_function("setsockopt", setsockopt_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], int_type, "setsockopt.sockfd"),
+            ensure_type(args[1], int_type, "setsockopt.level"),
+            ensure_type(args[2], int_type, "setsockopt.optname"),
+            args[3], // optval (pointer)
+            ensure_type(args[4], int_type, "setsockopt.optlen")};
+
+        return builder.CreateCall(setsockopt_func, call_args, "setsockopt.result");
+    }
 
     // Network byte order functions
     llvm::Value *Intrinsics::generate_htons(const std::vector<llvm::Value *> &args)
@@ -4683,6 +4828,105 @@ namespace Cryo::Codegen
 
         llvm::Function *ntohl_func = get_or_create_libc_function("ntohl", ntohl_type);
         return builder.CreateCall(ntohl_func, {ensure_type(args[0], uint32_type, "ntohl.netlong")}, "ntohl.result");
+    }
+
+    // ========================================
+    // Windows Socket Initialization Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_WSAStartup(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("WSAStartup requires exactly 2 arguments (wVersionRequired, lpWSAData)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *uint16_type = llvm::Type::getInt16Ty(context);
+        llvm::Type *ptr_type = llvm::PointerType::get(context, 0);
+
+        // WSAStartup signature: int WSAStartup(WORD wVersionRequired, LPWSADATA lpWSAData)
+        llvm::FunctionType *wsa_startup_type = llvm::FunctionType::get(int_type, {uint16_type, ptr_type}, false);
+
+        llvm::Function *wsa_startup_func = module->getFunction("WSAStartup");
+        if (!wsa_startup_func)
+        {
+            wsa_startup_func = llvm::Function::Create(
+                wsa_startup_type,
+                llvm::Function::ExternalLinkage,
+                "WSAStartup",
+                module);
+        }
+
+        llvm::Value *version_arg = ensure_type(args[0], uint16_type, "WSAStartup.version");
+        llvm::Value *data_arg = args[1];
+
+        return builder.CreateCall(wsa_startup_func, {version_arg, data_arg}, "WSAStartup.result");
+    }
+
+    llvm::Value *Intrinsics::generate_WSACleanup(const std::vector<llvm::Value *> &args)
+    {
+        if (!args.empty())
+        {
+            report_error("WSACleanup requires no arguments");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+        // WSACleanup signature: int WSACleanup(void)
+        llvm::FunctionType *wsa_cleanup_type = llvm::FunctionType::get(int_type, false);
+
+        llvm::Function *wsa_cleanup_func = module->getFunction("WSACleanup");
+        if (!wsa_cleanup_func)
+        {
+            wsa_cleanup_func = llvm::Function::Create(
+                wsa_cleanup_type,
+                llvm::Function::ExternalLinkage,
+                "WSACleanup",
+                module);
+        }
+
+        return builder.CreateCall(wsa_cleanup_func, {}, "WSACleanup.result");
+    }
+
+    llvm::Value *Intrinsics::generate_WSAGetLastError(const std::vector<llvm::Value *> &args)
+    {
+        if (!args.empty())
+        {
+            report_error("WSAGetLastError requires no arguments");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+        // WSAGetLastError signature: int WSAGetLastError(void)
+        llvm::FunctionType *wsa_get_last_error_type = llvm::FunctionType::get(int_type, false);
+
+        llvm::Function *wsa_get_last_error_func = module->getFunction("WSAGetLastError");
+        if (!wsa_get_last_error_func)
+        {
+            wsa_get_last_error_func = llvm::Function::Create(
+                wsa_get_last_error_type,
+                llvm::Function::ExternalLinkage,
+                "WSAGetLastError",
+                module);
+        }
+
+        return builder.CreateCall(wsa_get_last_error_func, {}, "WSAGetLastError.result");
     }
 
     // ========================================
@@ -5822,15 +6066,15 @@ namespace Cryo::Codegen
 
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
         llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
-        llvm::Type *ssize_t_type = llvm::Type::getInt64Ty(context);
+        // Use i32 for len to match common declarations
         llvm::FunctionType *send_type = llvm::FunctionType::get(
-            ssize_t_type, {int_type, void_ptr_type, size_t_type, int_type}, false);
+            int_type, {int_type, void_ptr_type, int_type, int_type}, false);
 
         llvm::Function *send_func = get_or_create_libc_function("send", send_type);
         return builder.CreateCall(send_func, {ensure_type(args[0], int_type, "send.sockfd"),
                                               args[1], // buf
-                                              ensure_type(args[2], size_t_type, "send.len"), ensure_type(args[3], int_type, "send.flags")},
+                                              ensure_type(args[2], int_type, "send.len"),
+                                              ensure_type(args[3], int_type, "send.flags")},
                                   "send.result");
     }
 
@@ -5847,15 +6091,15 @@ namespace Cryo::Codegen
 
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
         llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
-        llvm::Type *ssize_t_type = llvm::Type::getInt64Ty(context);
+        // Use i32 for len to match common declarations
         llvm::FunctionType *recv_type = llvm::FunctionType::get(
-            ssize_t_type, {int_type, void_ptr_type, size_t_type, int_type}, false);
+            int_type, {int_type, void_ptr_type, int_type, int_type}, false);
 
         llvm::Function *recv_func = get_or_create_libc_function("recv", recv_type);
         return builder.CreateCall(recv_func, {ensure_type(args[0], int_type, "recv.sockfd"),
                                               args[1], // buf
-                                              ensure_type(args[2], size_t_type, "recv.len"), ensure_type(args[3], int_type, "recv.flags")},
+                                              ensure_type(args[2], int_type, "recv.len"),
+                                              ensure_type(args[3], int_type, "recv.flags")},
                                   "recv.result");
     }
 
