@@ -1750,12 +1750,21 @@ namespace Cryo
             if (scope_res->has_resolved_type())
                 return;
 
-            // Try to resolve as a generic enum variant
+            // Try to resolve as a generic enum variant first
             TypeRef resolved = resolve_generic_enum_variant(
                 scope_res->scope_name(),
                 scope_res->member_name(),
                 expected_type,
                 ctx);
+
+            // If that didn't work and we have generic args, try as generic static method
+            if (!resolved.is_valid() && scope_res->has_generic_args())
+            {
+                resolved = resolve_generic_static_method(
+                    scope_res->scope_name(),
+                    scope_res->generic_args(),
+                    ctx);
+            }
 
             if (resolved.is_valid())
             {
@@ -1773,15 +1782,26 @@ namespace Cryo
             auto *call = static_cast<CallExpressionNode *>(expr);
 
             // Check if this is an enum variant constructor like Option::Some(value)
+            // or a generic static method call like Array<String>::new()
             if (auto *scope_res = dynamic_cast<ScopeResolutionNode *>(call->callee()))
             {
                 if (!scope_res->has_resolved_type())
                 {
+                    // First try to resolve as generic enum variant
                     TypeRef resolved = resolve_generic_enum_variant(
                         scope_res->scope_name(),
                         scope_res->member_name(),
                         expected_type,
                         ctx);
+
+                    // If that didn't work and we have generic args, try as generic static method
+                    if (!resolved.is_valid() && scope_res->has_generic_args())
+                    {
+                        resolved = resolve_generic_static_method(
+                            scope_res->scope_name(),
+                            scope_res->generic_args(),
+                            ctx);
+                    }
 
                     if (resolved.is_valid())
                     {
@@ -2231,6 +2251,60 @@ namespace Cryo
 
         // Otherwise, use the InstantiatedType itself - it will be resolved during codegen
         return expected_type;
+    }
+
+    TypeRef GenericExpressionResolutionPass::resolve_generic_static_method(
+        const std::string &scope_name,
+        const std::vector<std::string> &generic_args,
+        PassContext &ctx)
+    {
+        if (generic_args.empty())
+            return TypeRef{};
+
+        auto *generics = _compiler.generic_registry();
+        auto *type_resolver = _compiler.type_resolver();
+        auto *ast_ctx = _compiler.ast_context();
+
+        if (!generics || !type_resolver || !ast_ctx)
+            return TypeRef{};
+
+        // 1. Look up generic template by name
+        auto tmpl = generics->get_template_by_name(scope_name);
+        if (!tmpl)
+        {
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "resolve_generic_static_method: No template found for '{}'",
+                      scope_name);
+            return TypeRef{};
+        }
+
+        // 2. Resolve string args to TypeRefs
+        TypeArena &arena = ast_ctx->types();
+        ResolutionContext res_ctx(_compiler.symbol_table()->current_module());
+
+        std::vector<TypeRef> type_args;
+        for (const std::string &arg_str : generic_args)
+        {
+            TypeRef arg_type = type_resolver->resolve_string(arg_str, res_ctx);
+            if (!arg_type.is_valid() || arg_type.is_error())
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "resolve_generic_static_method: Failed to resolve type arg '{}'",
+                          arg_str);
+                return TypeRef{};
+            }
+            type_args.push_back(arg_type);
+        }
+
+        // 3. Create InstantiatedType
+        TypeRef result = generics->instantiate(tmpl->generic_type, type_args, arena);
+        if (result.is_valid())
+        {
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "resolve_generic_static_method: Resolved {} to '{}'",
+                      scope_name, result->display_name());
+        }
+        return result;
     }
 
     TypeRef GenericExpressionResolutionPass::lookup_concrete_type(TypeRef inst_type, PassContext &ctx)

@@ -2395,25 +2395,40 @@ namespace Cryo
         void accept(ASTVisitor &visitor) override;
     };
 
-    // Scope resolution (for enum access like Color::RED)
+    // Scope resolution (for enum access like Color::RED or generic static methods like Array<String>::new)
     class ScopeResolutionNode : public ExpressionNode
     {
     private:
-        std::string _scope_name;  // e.g., "Color"
-        std::string _member_name; // e.g., "RED"
+        std::string _scope_name;               // e.g., "Color" or "Array"
+        std::string _member_name;              // e.g., "RED" or "new"
+        std::vector<std::string> _generic_args; // e.g., ["String"] for Array<String>::new()
 
     public:
-        ScopeResolutionNode(SourceLocation loc, std::string scope_name, std::string member_name)
+        ScopeResolutionNode(SourceLocation loc, std::string scope_name, std::string member_name,
+                            std::vector<std::string> generic_args = {})
             : ExpressionNode(NodeKind::ScopeResolution, loc),
-              _scope_name(std::move(scope_name)), _member_name(std::move(member_name)) {}
+              _scope_name(std::move(scope_name)), _member_name(std::move(member_name)),
+              _generic_args(std::move(generic_args)) {}
 
         const std::string &scope_name() const { return _scope_name; }
         const std::string &member_name() const { return _member_name; }
+        const std::vector<std::string> &generic_args() const { return _generic_args; }
+        bool has_generic_args() const { return !_generic_args.empty(); }
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "ScopeResolution: " << _scope_name
-               << "::" << _member_name << std::endl;
+            os << std::string(indent, ' ') << "ScopeResolution: " << _scope_name;
+            if (!_generic_args.empty())
+            {
+                os << "<";
+                for (size_t i = 0; i < _generic_args.size(); ++i)
+                {
+                    if (i > 0) os << ", ";
+                    os << _generic_args[i];
+                }
+                os << ">";
+            }
+            os << "::" << _member_name << std::endl;
         }
 
         void accept(ASTVisitor &visitor) override;

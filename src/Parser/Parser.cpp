@@ -2846,33 +2846,20 @@ namespace Cryo
                         }
                         else if (_current_token.is(TokenKind::TK_COLONCOLON))
                         {
-                            // Generic type with scope resolution: Option<T>::None
-                            // Create a generic type identifier using SRM utilities for consistency
-                            std::string generic_type_name;
-                            if (_srm_manager)
+                            // Generic type with scope resolution: Array<String>::new()
+                            advance(); // consume '::'
+
+                            if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
                             {
-                                auto namespace_parts = get_current_namespace_parts();
-                                // Pass empty template params - proper resolution happens in TypeResolver phase
-                                auto type_id = std::make_unique<Cryo::SRM::TypeIdentifier>(
-                                    namespace_parts, type_name, Cryo::TypeKind::Struct);
-                                generic_type_name = type_id->to_template_name();
-                            }
-                            else
-                            {
-                                // Fallback construction
-                                generic_type_name = type_name + "<";
-                                for (size_t i = 0; i < generic_args.size(); ++i)
-                                {
-                                    if (i > 0)
-                                        generic_type_name += ",";
-                                    generic_type_name += generic_args[i];
-                                }
-                                generic_type_name += ">";
+                                error("Expected identifier after '::'");
+                                return nullptr;
                             }
 
-                            // Create identifier with generic type name for scope resolution
-                            Token generic_token(TokenKind::TK_IDENTIFIER, generic_type_name, type_location);
-                            expr = _builder.create_identifier_node(generic_token);
+                            std::string member_name = std::string(_current_token.text());
+                            advance();
+
+                            // Create ScopeResolutionNode with generic_args for proper type resolution
+                            expr = _builder.create_scope_resolution(type_location, type_name, member_name, generic_args);
                         }
                         else if (_current_token.is(TokenKind::TK_L_BRACE))
                         {
