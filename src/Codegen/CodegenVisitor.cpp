@@ -247,7 +247,8 @@ namespace Cryo::Codegen
         _defer_method_generation = false;
 
         // Pass 2: Process all global variable/constant declarations (for identifier resolution)
-        // IMPORTANT: Clear any insert point to ensure globals are detected as global, not local
+        // IMPORTANT: Clear function context and insert point to ensure globals are detected as global, not local
+        _ctx->clear_current_function();
         llvm::BasicBlock *prev_block = _ctx->builder().GetInsertBlock();
         if (prev_block)
         {

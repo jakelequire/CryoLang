@@ -52,6 +52,24 @@ type struct String {
         };
     }
 
+    static with_capacity(capacity: u64) -> String {
+        if (capacity == 0) {
+            return String::new();
+        }
+
+        const data: u8* = malloc(capacity + 1); // +1 for null terminator
+        if (data == null) {
+            panic("allocation failed", FILE, LINE);
+        }
+        data[0] = 0;
+
+        return String {
+            data: data,
+            len: 0,
+            cap: capacity
+        };
+    }
+
     /// Creates a String from a C string.
     static from_cstr(s: string) -> String {
         if (s == null) {
@@ -95,6 +113,48 @@ type struct String {
         while (i < n) {
             str.push_char(c);
             i = i + 1;
+        }
+        return str;
+    }
+
+    static from_utf8_lossy(bytes: u8*, len: u64) -> String {
+        const str: String = String::new(len);
+        mut i: u64 = 0;
+        while (i < len) {
+            const b: u8 = bytes[i];
+            if ((b & 0x80) == 0) {
+                // ASCII
+                str.push_byte(b);
+                i = i + 1;
+            } else {
+                const char_len: u64 = str.utf8_char_len(b);
+                if (i + char_len <= len) {
+                    // Valid UTF-8 sequence
+                    mut valid: boolean = true;
+                    mut j: u64 = 1;
+                    while (j < char_len) {
+                        if ((bytes[i + j] & 0xC0) != 0x80) {
+                            valid = false;
+                            break;
+                        }
+                        j = j + 1;
+                    }
+                    if (valid) {
+                        memcpy(&str.data[str.len], &bytes[i], char_len);
+                        str.len = str.len + char_len;
+                        str.data[str.len] = 0;
+                        i = i + char_len;
+                    } else {
+                        // Invalid byte, replace with U+FFFD
+                        str.push_char(0xFFFD);
+                        i = i + 1;
+                    }
+                } else {
+                    // Incomplete sequence, replace with U+FFFD
+                    str.push_char(0xFFFD);
+                    i = i + 1;
+                }
+            }
         }
         return str;
     }
