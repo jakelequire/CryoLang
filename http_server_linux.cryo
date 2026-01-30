@@ -1,0 +1,277 @@
+namespace HttpServer;
+
+// Windows Winsock initialization structure
+type struct WSAData {
+    wVersion: u16;
+    wHighVersion: u16;
+    iMaxSockets: u16;
+    iMaxUdpDg: u16;
+    lpVendorInfo: string;
+    szDescription: u8[257];
+    szSystemStatus: u8[129];
+}
+
+
+type struct SockAddrIn {
+    sin_family: u16;
+    sin_port: u16;
+    sin_addr: u32;
+    sin_zero: u8[8];
+}
+
+const PORT: u16 = 8080;
+const WINSOCK_VERSION: u16 = 0x0202; // Version 2.2
+
+const SOCK_STREAM: i32 = 1;
+const IPPROTO_TCP: i32 = 6;
+const INADDR_ANY: u32 = 0;
+const O_RDONLY: i32 = 0;
+
+const SOL_SOCKET: i32 = 65535;   // 0xFFFF on Windows
+const SO_REUSEADDR: i32 = 4;     // Windows value
+
+
+function foo() -> Option<i32> {
+    return Option::Some(42);
+}
+
+
+function main() -> i32 {
+    const res: Option<i32> = foo();
+    match (res) {
+        Option::Some(value) => {
+            printf("Success! Value: %d\n", value);
+        }
+        Option::None => {
+            printf("No value returned.\n");
+        }
+    }
+
+    const res_value: i32 = res.unwrap_or(0);
+    printf("Result value (with default): %d\n", res_value);
+
+    // Initialize Winsock
+    mut wsaData: WSAData;
+    const wsaResult: i32 = WSAStartup(WINSOCK_VERSION, &wsaData);  // Request version 2.2
+    if (wsaResult != 0) {
+        printf("WSAStartup failed: %d\n", wsaResult);
+        return 1;
+    }
+
+    mut server_fd: i32;
+    mut client_fd: i32;
+    mut opt: i32 = 1;
+
+    // Create the socket
+    server_fd = socket(2, SOCK_STREAM, IPPROTO_TCP);
+    if (server_fd < 0) {
+        printf("Socket creation failed! Error code: %d\n", WSAGetLastError());
+        exit(1);
+    }
+
+    printf("Socket created successfully. FD: %d\n", server_fd);
+
+    // Set socket options to reuse address and port
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(i32)) < 0) {
+        printf("Set socket options failed! Error code: %d\n", WSAGetLastError());
+        exit(1);
+    }
+
+    mut address: SockAddrIn = SockAddrIn {
+        sin_family: 2 as u16,
+        sin_port: htons(PORT),
+        sin_addr: htonl(INADDR_ANY),
+        sin_zero: [0; 8],
+    };
+
+    // Bind the socket
+    if (bind(server_fd, &address, sizeof(SockAddrIn)) < 0) {
+        printf("Bind failed! Error code: %d\n", WSAGetLastError());
+        close(server_fd);
+        exit(1);
+    }
+
+    // Listen for incoming connections
+    if (listen(server_fd, 3) < 0) {
+        printf("Listen failed! Error code: %d\n", WSAGetLastError());
+        close(server_fd);
+        exit(1);
+    }
+
+    printf("Sucessfully listening on port: %d\n", PORT);
+
+    // Main accept loop
+    loop {
+        mut addrlen: i32 = sizeof(SockAddrIn);
+        client_fd = accept(server_fd, &address, &addrlen);
+        if (client_fd < 0) {
+            printf("Accept failed! Error code: %d\n", WSAGetLastError());
+            continue;
+        }
+
+        handle_client(client_fd);
+        close(client_fd);
+    }
+
+    // Close the server socket (unreachable code in this example)
+    close(server_fd);
+    return 0;
+}
+
+
+function handle_client(client_fd: i32) -> void {
+    mut buffer: char[4096];
+    mut _method: char[16];
+    mut path: char[4096];
+    mut version: char[16];
+
+    // Read the request
+    const valread: i32 = recv(client_fd, &buffer, 4096 - 1, 0);
+    if (valread <= 0) {
+        printf("Receive failed or connection closed! Error code: %d\n", WSAGetLastError());
+        return;
+    }
+
+    buffer[valread] = '\0';
+
+    // Parse the request line: "GET /path HTTP/1.1"
+    mut i: i32 = 0;
+    mut j: i32 = 0;
+
+    // Parse method (e.g., "GET")
+    while (buffer[i] != ' ' && buffer[i] != '\0' && i < valread && j < 15) {
+        _method[j] = buffer[i];
+        i++;
+        j++;
+    }
+    _method[j] = '\0';  // Null-terminate _method
+
+    // Skip the space
+    if (buffer[i] == ' ') {
+        i++;
+    }
+
+    // Parse path (e.g., "/path")
+    j = 0;
+    while (buffer[i] != ' ' && buffer[i] != '\0' && i < valread && j < 4095) {
+        path[j] = buffer[i];
+        i++;
+        j++;
+    }
+    path[j] = '\0';  // Null-terminate path
+
+    printf("Request: %s %s\n", &_method, &path);
+
+    // Only handle GET for simplicity
+    if (strcmp(&_method, "GET") != 0) {
+        send_error(client_fd, 405, "Method Not Allowed");
+        return;
+    }
+
+    // Handle root path
+    if (strcmp(&path, "/") == 0) {
+        send_response(client_fd, 200, "text/html",
+            "<html><body><h1>Hello from Cryo!</h1></body></html>");
+        return;
+    }
+
+    // Handle /status endpoint
+    if (strcmp(&path, "/status") == 0) {
+        send_response(client_fd, 200, "application/json",
+            "{\"status\": \"ok\", \"server\": \"cryo-http\"}");
+        return;
+    }
+
+    printf("No handler for path: %s, attempting to serve file.\n", &path);
+
+    // If we reach here, try to serve a file
+    server_file(client_fd, &path);
+
+    return;
+}
+
+function send_response(client_fd: i32, status_code: i32, content_type: string, body: string) -> void {
+    mut response: char[4096];
+
+    const status_text: string = match (status_code) {
+        200 => "OK"
+        404 => "Not Found"
+        405 => "Method Not Allowed"
+        _ => "Internal Server Error"
+    };
+
+    const body_len: i32 = strlen(body);
+
+    // Build HTTP response with proper \r\n line endings (no extra whitespace)
+    const response_len: i32 = snprintf(&response, 4096,
+        "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+        status_code, status_text, content_type, body_len, body);
+
+    printf("Sending response, length: %d\n", response_len);
+
+    // Send the complete response (headers + body already in response buffer)
+    send(client_fd, &response, response_len, 0);
+
+    return;
+}
+
+function send_error(client_fd: i32, status_code: i32, message: string) -> void {
+    mut body: char[512];
+    snprintf(&body, 512, "<html><body><h1>%d %s</h1></body></html>", status_code, message);
+    send_response(client_fd, status_code, "text/html", &body);
+    return;
+}
+
+function server_file(client_fd: i32, path: string) -> void {
+    mut file_path: char[4096];
+    mut buffer: char[4096];
+    mut header: char[4096];
+
+    snprintf(&file_path, 4096, "./public%s", path);
+
+    if (path == "..") {
+        send_error(client_fd, 403, "Forbidden");
+        return;
+    }
+
+    const file: i32 = open(&file_path, O_RDONLY);
+    if (file < 0) {
+        send_error(client_fd, 404, "Not Found");
+        return;
+    }
+
+    fseek(file, 0, 2); // Seek to end SEEK_END = 2
+    const file_size: i32 = ftell(file);
+    fseek(file, 0, 0); // Seek back to start SEEK_SET = 0
+
+    const content_type: string = get_content_type(&file_path);
+    const header_len: i32 = snprintf(&header, 4096,
+        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+        content_type, file_size);
+
+    send(client_fd, &header, header_len, 0);
+
+    mut bytes_read: i32 = 0;
+    loop {
+        bytes_read = read(file, &buffer, 4096);
+        if (bytes_read <= 0) {
+            break;
+        }
+        send(client_fd, &buffer, bytes_read, 0);
+    }
+
+    fclose(file);
+}
+
+function get_content_type(file_path: string) -> string {
+    match (strrchr(file_path, '.')) {
+        ".html" => { return "text/html"; }
+        ".css"  => { return "text/css"; }
+        ".js"   => { return "application/javascript"; }
+        ".json" => { return "application/json"; }
+        ".png"  => { return "image/png"; }
+        ".jpg"  => { return "image/jpeg"; }
+        ".gif"  => { return "image/gif"; }
+        _       => { return "application/octet-stream"; }
+    }
+}
