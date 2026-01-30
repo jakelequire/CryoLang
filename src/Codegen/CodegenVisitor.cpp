@@ -722,6 +722,17 @@ namespace Cryo::Codegen
                       node.name(), node.generic_parameters().size());
             _generics->register_generic_type(node.name(), &node);
 
+            // Also register the namespace for this generic type so instantiations
+            // can properly qualify methods
+            std::string ns_context = _ctx->namespace_context();
+            if (!ns_context.empty())
+            {
+                _ctx->register_type_namespace(node.name(), ns_context);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "CodegenVisitor: Registered generic struct '{}' namespace: {}",
+                          node.name(), ns_context);
+            }
+
             // Don't generate the template directly - it will be instantiated when used
             return;
         }
@@ -850,6 +861,17 @@ namespace Cryo::Codegen
                       "CodegenVisitor: Registering generic class template: {} with {} type parameters",
                       node.name(), node.generic_parameters().size());
             _generics->register_generic_type(node.name(), &node);
+
+            // Also register the namespace for this generic type so instantiations
+            // can properly qualify methods
+            std::string ns_context = _ctx->namespace_context();
+            if (!ns_context.empty())
+            {
+                _ctx->register_type_namespace(node.name(), ns_context);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "CodegenVisitor: Registered generic class '{}' namespace: {}",
+                          node.name(), ns_context);
+            }
 
             // Don't generate the template directly - it will be instantiated when used
             return;
@@ -992,6 +1014,17 @@ namespace Cryo::Codegen
                       "CodegenVisitor: Registering generic enum template: {} with {} type parameters",
                       node.name(), node.generic_parameters().size());
             _generics->register_generic_type(node.name(), &node);
+
+            // Also register the namespace for this generic type so instantiations
+            // can properly qualify methods and constructors
+            std::string ns_context = _ctx->namespace_context();
+            if (!ns_context.empty())
+            {
+                _ctx->register_type_namespace(node.name(), ns_context);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "CodegenVisitor: Registered generic enum '{}' namespace: {}",
+                          node.name(), ns_context);
+            }
 
             // Don't generate the template directly - it will be instantiated when used
             return;
