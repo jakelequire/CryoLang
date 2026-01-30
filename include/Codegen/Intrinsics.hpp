@@ -128,6 +128,9 @@ namespace Cryo::Codegen
         llvm::Value* generate_raise(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_signal(const std::vector<llvm::Value*>& args);
 
+        // Error handling intrinsics
+        llvm::Value* generate_errno(const std::vector<llvm::Value*>& args);
+
         // Math intrinsics
         llvm::Value* generate_sqrt(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_sqrtf(const std::vector<llvm::Value*>& args);
@@ -210,6 +213,11 @@ namespace Cryo::Codegen
         llvm::Value* generate_ntohs(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_htonl(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_ntohl(const std::vector<llvm::Value*>& args);
+
+        // Windows socket initialization intrinsics
+        llvm::Value* generate_WSAStartup(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_WSACleanup(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_WSAGetLastError(const std::vector<llvm::Value*>& args);
 
         // Time intrinsics
         llvm::Value* generate_time(const std::vector<llvm::Value*>& args);
@@ -410,7 +418,7 @@ namespace Cryo::Codegen
                                            Cryo::CallExpressionNode* node = nullptr);
         llvm::Value* create_syscall(llvm::Value* syscall_num, 
                                   const std::vector<llvm::Value*>& args);
-        llvm::Value* ensure_type(llvm::Value* value, llvm::Type* target_type, 
+        llvm::Value* ensure_type(llvm::Value* value, llvm::Type* target_type,
                                const std::string& name = "");
         llvm::Function* get_or_create_libc_function(const std::string& name,
                                                   llvm::FunctionType* type);

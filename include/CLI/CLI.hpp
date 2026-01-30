@@ -60,7 +60,7 @@ namespace Cryo::CLI
     private:
         std::map<std::string, std::string> _args;
         std::map<std::string, bool> _flags;
-        std::map<std::string, std::string> _defines;  // For -D flags
+        std::map<std::string, std::string> _defines; // For -D flags
         std::vector<std::string> _positional;
 
     public:
