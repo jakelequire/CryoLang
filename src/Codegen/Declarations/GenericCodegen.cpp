@@ -1098,9 +1098,10 @@ namespace Cryo::Codegen
             }
 
             // Register variant field types for pattern matching (with substituted types)
+            // Also collect substituted types for constructor generation
+            std::vector<std::string> substituted_types;
             if (!variant->is_simple_variant())
             {
-                std::vector<std::string> substituted_types;
                 for (const auto &type_name : variant->associated_types())
                 {
                     // Substitute type parameters
@@ -1119,6 +1120,88 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "GenericCodegen: Registered {} field types for variant {}",
                           substituted_types.size(), variant_name);
+            }
+
+            // Generate constructor function for complex variants (variants with payloads)
+            // This creates functions like Result_i32_string::Ok(i32) -> Result_i32_string
+            if (!is_simple && !variant->is_simple_variant() && enum_type && enum_type->isStructTy())
+            {
+                std::string ctor_name = mangled + "::" + variant->name();
+
+                // Check if constructor already exists
+                if (!module()->getFunction(ctor_name))
+                {
+                    // Build parameter types from substituted associated types
+                    std::vector<llvm::Type *> param_types;
+                    bool all_types_resolved = true;
+                    for (const auto &type_name : substituted_types)
+                    {
+                        llvm::Type *param_type = types().get_type(type_name);
+                        if (!param_type)
+                        {
+                            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                     "GenericCodegen: Unknown type '{}' in enum variant {}", type_name, ctor_name);
+                            all_types_resolved = false;
+                            break;
+                        }
+                        param_types.push_back(param_type);
+                    }
+
+                    if (all_types_resolved && !param_types.empty())
+                    {
+                        // Create function type: (...fields) -> EnumType
+                        llvm::FunctionType *ctor_type = llvm::FunctionType::get(enum_type, param_types, false);
+                        llvm::Function *ctor = llvm::Function::Create(
+                            ctor_type, llvm::Function::ExternalLinkage, ctor_name, module());
+
+                        // Create entry block
+                        llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", ctor);
+                        llvm::IRBuilder<> ctor_builder(entry);
+
+                        // Allocate the enum struct
+                        llvm::AllocaInst *enum_alloca = ctor_builder.CreateAlloca(enum_type, nullptr, "enum_val");
+
+                        // Store the discriminant
+                        llvm::Value *disc_ptr = ctor_builder.CreateStructGEP(enum_type, enum_alloca, 0, "disc_ptr");
+                        ctor_builder.CreateStore(
+                            llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), index),
+                            disc_ptr);
+
+                        // Store the payload fields
+                        llvm::Value *payload_ptr = ctor_builder.CreateStructGEP(enum_type, enum_alloca, 1, "payload_ptr");
+
+                        size_t offset = 0;
+                        for (auto &arg : ctor->args())
+                        {
+                            llvm::Type *arg_type = arg.getType();
+
+                            // Calculate pointer to this field in the payload
+                            llvm::Value *field_ptr = ctor_builder.CreateConstGEP1_32(
+                                llvm::Type::getInt8Ty(llvm_ctx()), payload_ptr, offset, "field_ptr");
+
+                            // Store the argument value
+                            ctor_builder.CreateStore(&arg, field_ptr);
+
+                            // Calculate size of argument type
+                            if (arg_type->isSized())
+                            {
+                                offset += module()->getDataLayout().getTypeAllocSize(arg_type);
+                            }
+                            else
+                            {
+                                offset += 8; // Default to pointer size for unsized types
+                            }
+                        }
+
+                        // Load and return the enum value
+                        llvm::Value *result = ctor_builder.CreateLoad(enum_type, enum_alloca, "result");
+                        ctor_builder.CreateRet(result);
+
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "GenericCodegen: Generated enum variant constructor: {} with {} parameters",
+                                  ctor_name, param_types.size());
+                    }
+                }
             }
 
             index++;

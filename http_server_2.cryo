@@ -1,0 +1,425 @@
+namespace HttpServer;
+
+// ============================================================================
+// Option Type
+// ============================================================================
+enum Option<T> {
+    Some(T);
+    None;
+}
+
+implement enum Option<T> {
+    is_some(&this) -> boolean {
+        match (&this) {
+            Option::Some(_) => { return true; }
+            Option::None => { return false; }
+        }
+    }
+    
+    is_none(&this) -> boolean {
+        match (&this) {
+            Option::Some(_) => { return false; }
+            Option::None => { return true; }
+        }
+    }
+    
+    contains(&this, value: T) -> boolean {
+        match (&this) {
+            Option::Some(v) => { return v == value; }
+            Option::None => { return false; }
+        }
+    }
+    
+    unwrap(&this) -> T {
+        match (&this) {
+            Option::Some(value) => { return value; }
+            Option::None => {
+                panic("called Option::unwrap() on a None value", FILE, LINE);
+            }
+        }
+    }
+    
+    expect(&this, msg: string) -> T {
+        match (&this) {
+            Option::Some(value) => { return value; }
+            Option::None => {
+                panic(msg, FILE, LINE);
+            }
+        }
+    }
+    
+    unwrap_or(&this, default_value: T) -> T {
+        match (&this) {
+            Option::Some(value) => { return value; }
+            Option::None => { return default_value; }
+        }
+    }
+}
+
+// ============================================================================
+// Result Type
+// ============================================================================
+enum Result<T, E> {
+    Ok(T);
+    Err(E);
+}
+
+implement enum Result<T, E> {
+    is_ok(&this) -> boolean {
+        match (&this) {
+            Result::Ok(_) => { return true; }
+            Result::Err(_) => { return false; }
+        }
+    }
+    
+    is_err(&this) -> boolean {
+        match (&this) {
+            Result::Ok(_) => { return false; }
+            Result::Err(_) => { return true; }
+        }
+    }
+    
+    unwrap(&this) -> T {
+        match (&this) {
+            Result::Ok(value) => { return value; }
+            Result::Err(_) => {
+                panic("called Result::unwrap() on an Err value", FILE, LINE);
+            }
+        }
+    }
+    
+    expect(&this, msg: string) -> T {
+        match (&this) {
+            Result::Ok(value) => { return value; }
+            Result::Err(_) => {
+                panic(msg, FILE, LINE);
+            }
+        }
+    }
+    
+    unwrap_or(&this, default_value: T) -> T {
+        match (&this) {
+            Result::Ok(value) => { return value; }
+            Result::Err(_) => { return default_value; }
+        }
+    }
+}
+
+// ============================================================================
+// Windows Winsock Types
+// ============================================================================
+type struct WSAData {
+    wVersion: u16;
+    wHighVersion: u16;
+    iMaxSockets: u16;
+    iMaxUdpDg: u16;
+    lpVendorInfo: string;
+    szDescription: u8[257];
+    szSystemStatus: u8[129];
+}
+
+type struct SockAddrIn {
+    sin_family: u16;
+    sin_port: u16;
+    sin_addr: u32;
+    sin_zero: u8[8];
+}
+
+// ============================================================================
+// HTTP Types
+// ============================================================================
+type struct HttpRequest {
+    method: char[16];
+    path: char[4096];
+    version: char[16];
+}
+
+type struct HttpResponse {
+    status_code: i32;
+    content_type: string;
+    body: string;
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+const PORT: u16 = 8080;
+const WINSOCK_VERSION: u16 = 0x0202;
+const SOCK_STREAM: i32 = 1;
+const IPPROTO_TCP: i32 = 6;
+const INADDR_ANY: u32 = 0;
+const O_RDONLY: i32 = 0;
+const SOL_SOCKET: i32 = 65535;
+const SO_REUSEADDR: i32 = 4;
+
+// ============================================================================
+// Server Structure with Builder Pattern
+// ============================================================================
+type struct Server {
+    socket_fd: i32;
+    port: u16;
+    address: SockAddrIn;
+    is_running: boolean;
+
+    /// Create a new server instance
+    static new(port: u16) -> Server {
+        const server: Server = Server {
+            socket_fd: -1,
+            port: port,
+            address: SockAddrIn {
+                sin_family: 2 as u16,
+                sin_port: 0,
+                sin_addr: 0,
+                sin_zero: [0, 0, 0, 0, 0, 0, 0, 0],
+            },
+            is_running: false,
+        };
+        
+        return server;
+    }
+    
+    /// Initialize Winsock - returns self for chaining
+    init_winsock(&mut this) -> &mut Server {
+        mut wsaData: WSAData;
+        const wsaResult: i32 = WSAStartup(WINSOCK_VERSION, &wsaData);
+        
+        if (wsaResult != 0) {
+            printf("WSAStartup failed: %d\n", wsaResult);
+            exit(1);
+        }
+        
+        printf("Winsock initialized successfully\n");
+        return this;
+    }
+    
+    /// Create and configure the socket - returns self for chaining
+    create_socket(&mut this) -> &mut Server {
+        this.socket_fd = socket(2, SOCK_STREAM, IPPROTO_TCP);
+        
+        if (this.socket_fd < 0) {
+            const error: i32 = WSAGetLastError();
+            printf("Socket creation failed! Error code: %d\n", error);
+            exit(1);
+        }
+        
+        printf("Socket created successfully. FD: %d\n", this.socket_fd);
+        
+        mut opt: i32 = 1;
+        if (setsockopt(this.socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(i32)) < 0) {
+            const error: i32 = WSAGetLastError();
+            printf("Set socket options failed! Error code: %d\n", error);
+            exit(1);
+        }
+        
+        return this;
+    }
+    
+    /// Bind the socket to the port - returns self for chaining
+    bind(&mut this) -> &mut Server {
+        this.address = SockAddrIn {
+            sin_family: 2 as u16,
+            sin_port: htons(this.port),
+            sin_addr: htonl(INADDR_ANY),
+            sin_zero: [0; 8],
+        };
+        
+        if (bind(this.socket_fd, &this.address, sizeof(SockAddrIn)) < 0) {
+            const error: i32 = WSAGetLastError();
+            printf("Bind failed! Error code: %d\n", error);
+            close(this.socket_fd);
+            exit(1);
+        }
+        
+        printf("Socket bound to port %d\n", this.port);
+        return this;
+    }
+    
+    /// Start listening for connections - returns self for chaining
+    listen(&mut this, backlog: i32) -> &mut Server {
+        if (listen(this.socket_fd, backlog) < 0) {
+            const error: i32 = WSAGetLastError();
+            printf("Listen failed! Error code: %d\n", error);
+            close(this.socket_fd);
+            exit(1);
+        }
+        
+        this.is_running = true;
+        printf("Successfully listening on port: %d\n", this.port);
+        return this;
+    }
+    
+    /// Accept a client connection
+    accept_client(&mut this) -> Option<i32> {
+        mut addrlen: i32 = sizeof(SockAddrIn);
+        const client_fd: i32 = accept(this.socket_fd, &this.address, &addrlen);
+        
+        if (client_fd < 0) {
+            printf("Accept failed! Error code: %d\n", WSAGetLastError());
+            return Option::None;
+        }
+        
+        return Option::Some(client_fd);
+    }
+    
+    /// Parse HTTP request from buffer
+    parse_request(&this, buffer: string, valread: i32) -> Option<HttpRequest> {
+        mut request: HttpRequest = HttpRequest {
+            method: ['\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0'],
+            path: ['\0'; 4096],
+            version: ['\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0'],
+        };
+        
+        mut i: i32 = 0;
+        mut j: i32 = 0;
+        
+        // Parse method
+        while (buffer[i] != ' ' && buffer[i] != '\0' && i < valread && j < 15) {
+            request.method[j] = buffer[i];
+            i++;
+            j++;
+        }
+        request.method[j] = '\0';
+        
+        if (buffer[i] == ' ') {
+            i++;
+        }
+        
+        // Parse path
+        j = 0;
+        while (buffer[i] != ' ' && buffer[i] != '\0' && i < valread && j < 4095) {
+            request.path[j] = buffer[i];
+            i++;
+            j++;
+        }
+        request.path[j] = '\0';
+        
+        return Option::Some(request);
+    }
+    
+    /// Route the request to the appropriate handler
+    route(&this, request: &HttpRequest) -> HttpResponse {
+        // Only handle GET requests
+        if (strcmp(&request.method, "GET") != 0) {
+            return HttpResponse {
+                status_code: 405,
+                content_type: "text/html",
+                body: "<html><body><h1>405 Method Not Allowed</h1></body></html>",
+            };
+        }
+        
+        // Handle root path
+        if (strcmp(&request.path, "/") == 0) {
+            return HttpResponse {
+                status_code: 200,
+                content_type: "text/html",
+                body: "<html><body><h1>Hello from Cryo!</h1></body></html>",
+            };
+        }
+        
+        // Handle /status endpoint
+        if (strcmp(&request.path, "/status") == 0) {
+            return HttpResponse {
+                status_code: 200,
+                content_type: "application/json",
+                body: "{\"status\": \"ok\", \"server\": \"cryo-http\"}",
+            };
+        }
+        
+        // Default: file not found
+        return HttpResponse {
+            status_code: 404,
+            content_type: "text/html",
+            body: "<html><body><h1>404 Not Found</h1></body></html>",
+        };
+    }
+    
+    /// Send HTTP response to client
+    send_response(&this, client_fd: i32, response: &HttpResponse) -> void {
+        mut buffer: char[4096];
+        
+        const status_text: string = match (response.status_code) {
+            200 => "OK"
+            404 => "Not Found"
+            405 => "Method Not Allowed"
+            _ => "Internal Server Error"
+        };
+        
+        const body_len: i32 = strlen(response.body);
+        const response_len: i32 = snprintf(&buffer, 4096,
+            "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+            response.status_code, status_text, response.content_type, body_len, response.body);
+        
+        printf("Sending response, length: %d\n", response_len);
+        send(client_fd, &buffer, response_len, 0);
+    }
+    
+    /// Handle a client connection
+    handle_client(&this, client_fd: i32) -> void {
+        mut buffer: char[4096];
+        
+        const valread: i32 = recv(client_fd, &buffer, 4096 - 1, 0);
+        if (valread <= 0) {
+            printf("Receive failed or connection closed! Error code: %d\n", WSAGetLastError());
+            return;
+        }
+        
+        buffer[valread] = '\0';
+        
+        const request_opt: Option<HttpRequest> = this.parse_request(&buffer, valread);
+        if (request_opt.is_none()) {
+            printf("Failed to parse request\n");
+            return;
+        }
+        
+        const request: HttpRequest = request_opt.unwrap();
+        printf("Request: %s %s\n", &request.method, &request.path);
+        
+        const response: HttpResponse = this.route(&request);
+        this.send_response(client_fd, &response);
+    }
+    
+    /// Run the server main loop
+    run(&mut this) -> void {
+        loop {
+            const client_opt: Option<i32> = this.accept_client();
+            
+            match (client_opt) {
+                Option::Some(client_fd) => {
+                    this.handle_client(client_fd);
+                    close(client_fd);
+                }
+                Option::None => {
+                    continue;
+                }
+            }
+        }
+    }
+    
+    /// Shutdown the server
+    shutdown(&mut this) -> void {
+        if (this.socket_fd >= 0) {
+            close(this.socket_fd);
+            this.is_running = false;
+            printf("Server shutdown complete\n");
+        }
+    }
+}
+
+// ============================================================================
+// Main Entry Point with Method Chaining
+// ============================================================================
+function main() -> i32 {
+    // Create and configure server with method chaining!
+    mut server: Server = Server::new(PORT);
+    
+    server.init_winsock()
+          .create_socket()
+          .bind()
+          .listen(3)
+          .run();
+    
+    // Shutdown (unreachable in this example)
+    server.shutdown();
+    
+    return 0;
+}

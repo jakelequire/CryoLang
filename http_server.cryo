@@ -1,5 +1,73 @@
 namespace HttpServer;
 
+
+enum Option<T> {
+    /// Some value of type T.
+    Some(T);
+
+    /// No value.
+    None;
+}
+
+// ============================================================================
+// Option Implementation
+// ============================================================================
+
+implement enum Option<T> {
+    /// Returns true if the option contains a value.
+    is_some(&this) -> boolean {
+        match (&this) {
+            Option::Some(_) => { return true; }
+            Option::None => { return false; }
+        }
+    }
+
+    /// Returns true if the option is None.
+    is_none(&this) -> boolean {
+        match (&this) {
+            Option::Some(_) => { return false; }
+            Option::None => { return true; }
+        }
+    }
+
+    /// Returns true if the option contains the given value.
+    contains(&this, value: T) -> boolean {
+        match (&this) {
+            Option::Some(v) => { return v == value; }
+            Option::None => { return false; }
+        }
+    }
+
+    /// Returns the contained value, panicking if None.
+    unwrap(&this) -> T {
+        match (&this) {
+            Option::Some(value) => { return value; }
+            Option::None => {
+                panic("called Option::unwrap() on a None value", FILE, LINE);
+            }
+        }
+    }
+
+    /// Returns the contained value, panicking with a custom message if None.
+    expect(&this, msg: string) -> T {
+        match (&this) {
+            Option::Some(value) => { return value; }
+            Option::None => {
+                panic(msg, FILE, LINE);
+            }
+        }
+    }
+
+    /// Returns the contained value or a default.
+    unwrap_or(&this, default_value: T) -> T {
+        match (&this) {
+            Option::Some(value) => { return value; }
+            Option::None => { return default_value; }
+        }
+    }
+}
+
+
 // Windows Winsock initialization structure
 type struct WSAData {
     wVersion: u16;
@@ -19,6 +87,8 @@ type struct SockAddrIn {
     sin_zero: u8[8];
 }
 
+const PORT: u16 = 8080;
+const WINSOCK_VERSION: u16 = 0x0202; // Version 2.2
 
 const SOCK_STREAM: i32 = 1;
 const IPPROTO_TCP: i32 = 6;
@@ -29,10 +99,28 @@ const SOL_SOCKET: i32 = 65535;   // 0xFFFF on Windows
 const SO_REUSEADDR: i32 = 4;     // Windows value
 
 
+function foo() -> Option<i32> {
+    return Option::Some(42);
+}
+
+
 function main() -> i32 {
+    const res: Option<i32> = foo();
+    match (res) {
+        Option::Some(value) => {
+            printf("Success! Value: %d\n", value);
+        }
+        Option::None => {
+            printf("No value returned.\n");
+        }
+    }
+
+    const res_value: i32 = res.unwrap_or(0);
+    printf("Result value (with default): %d\n", res_value);
+
     // Initialize Winsock
     mut wsaData: WSAData;
-    const wsaResult: i32 = WSAStartup(0x0202, &wsaData);  // Request version 2.2
+    const wsaResult: i32 = WSAStartup(WINSOCK_VERSION, &wsaData);  // Request version 2.2
     if (wsaResult != 0) {
         printf("WSAStartup failed: %d\n", wsaResult);
         return 1;
@@ -43,15 +131,9 @@ function main() -> i32 {
     mut opt: i32 = 1;
 
     // Create the socket
-    printf("Creating socket...\n");
-    printf("Size of SockAddrIn: %d\n", sizeof(SockAddrIn));
-    printf("SOCK_STREAM: %d\n", SOCK_STREAM);
-    printf("IPPROTO_TCP: %d\n", IPPROTO_TCP);
     server_fd = socket(2, SOCK_STREAM, IPPROTO_TCP);
     if (server_fd < 0) {
-        puts("Socket creation failed");
-        printf("Error code: %d\n", WSAGetLastError());
-        printf("Server FD: %d\n", server_fd);
+        printf("Socket creation failed! Error code: %d\n", WSAGetLastError());
         exit(1);
     }
 
@@ -59,50 +141,43 @@ function main() -> i32 {
 
     // Set socket options to reuse address and port
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(i32)) < 0) {
-        puts("Set socket options failed");
-        printf("Error code: %d\n", WSAGetLastError());
+        printf("Set socket options failed! Error code: %d\n", WSAGetLastError());
         exit(1);
     }
 
     mut address: SockAddrIn = SockAddrIn {
         sin_family: 2 as u16,
-        sin_port: htons(8080),
+        sin_port: htons(PORT),
         sin_addr: htonl(INADDR_ANY),
         sin_zero: [0, 0, 0, 0, 0, 0, 0, 0],
     };
 
     // Bind the socket
     if (bind(server_fd, &address, sizeof(SockAddrIn)) < 0) {
-        puts("Bind failed");
+        printf("Bind failed! Error code: %d\n", WSAGetLastError());
         close(server_fd);
         exit(1);
     }
 
     // Listen for incoming connections
     if (listen(server_fd, 3) < 0) {
-        puts("Listen failed");
+        printf("Listen failed! Error code: %d\n", WSAGetLastError());
         close(server_fd);
         exit(1);
     }
 
-    printf("HTTP Server listening on port %d\n", 8080);
+    printf("Sucessfully listening on port: %d\n", PORT);
 
     // Main accept loop
     loop {
-        printf("Waiting for a new connection...\n");
         mut addrlen: i32 = sizeof(SockAddrIn);
         client_fd = accept(server_fd, &address, &addrlen);
         if (client_fd < 0) {
-            puts("Accept failed");
+            printf("Accept failed! Error code: %d\n", WSAGetLastError());
             continue;
         }
 
-        printf("New connection accepted. Client FD: %d\n", client_fd);
-
         handle_client(client_fd);
-
-        printf("Closing connection. Client FD: %d\n", client_fd);
-
         close(client_fd);
     }
 
@@ -113,23 +188,19 @@ function main() -> i32 {
 
 
 function handle_client(client_fd: i32) -> void {
-    mut buffer: u8[4096];
-    mut _method: u8[16];
-    mut path: u8[4096];
-    mut version: u8[16];
-
-    printf("Handling client FD: %d\n", client_fd);
+    mut buffer: char[4096];
+    mut _method: char[16];
+    mut path: char[4096];
+    mut version: char[16];
 
     // Read the request
     const valread: i32 = recv(client_fd, &buffer, 4096 - 1, 0);
     if (valread <= 0) {
-        puts("Receive failed or connection closed");
+        printf("Receive failed or connection closed! Error code: %d\n", WSAGetLastError());
         return;
     }
 
-    printf("Received %d bytes from client FD: %d\n", valread, client_fd);
-
-    buffer[valread] = '\0'; // Null-terminate the buffer
+    buffer[valread] = '\0';
 
     // Parse the request line: "GET /path HTTP/1.1"
     mut i: i32 = 0;
@@ -137,15 +208,11 @@ function handle_client(client_fd: i32) -> void {
 
     // Parse method (e.g., "GET")
     while (buffer[i] != ' ' && buffer[i] != '\0' && i < valread && j < 15) {
-        printf("Parsing method char: %c\n", buffer[i]);
         _method[j] = buffer[i];
         i++;
         j++;
     }
-    printf("Finished parsing method at index %d\n", i);
     _method[j] = '\0';  // Null-terminate _method
-
-    printf("Parsed method: %s\n", &_method);
 
     // Skip the space
     if (buffer[i] == ' ') {
@@ -163,22 +230,14 @@ function handle_client(client_fd: i32) -> void {
 
     printf("Request: %s %s\n", &_method, &path);
 
-    // Debug: check strcmp results
-    printf("strcmp(_method, GET) = %d\n", strcmp(&_method, "GET"));
-    printf("strcmp(path, /) = %d\n", strcmp(&path, "/"));
-
     // Only handle GET for simplicity
     if (strcmp(&_method, "GET") != 0) {
-        printf("Method is not GET, sending 405\n");
         send_error(client_fd, 405, "Method Not Allowed");
         return;
     }
 
-    printf("Method is GET, checking path...\n");
-
     // Handle root path
     if (strcmp(&path, "/") == 0) {
-        printf("Path is /, sending response\n");
         send_response(client_fd, 200, "text/html",
             "<html><body><h1>Hello from Cryo!</h1></body></html>");
         return;
@@ -186,13 +245,12 @@ function handle_client(client_fd: i32) -> void {
 
     // Handle /status endpoint
     if (strcmp(&path, "/status") == 0) {
-        printf("Path is /status, sending response\n");
         send_response(client_fd, 200, "application/json",
             "{\"status\": \"ok\", \"server\": \"cryo-http\"}");
         return;
     }
 
-    printf("Path not matched, serving file: %s\n", &path);
+    printf("No handler for path: %s, attempting to serve file.\n", &path);
 
     // If we reach here, try to serve a file
     server_file(client_fd, &path);
@@ -201,7 +259,7 @@ function handle_client(client_fd: i32) -> void {
 }
 
 function send_response(client_fd: i32, status_code: i32, content_type: string, body: string) -> void {
-    mut response: u8[4096];
+    mut response: char[4096];
 
     const status_text: string = match (status_code) {
         200 => "OK"
@@ -226,16 +284,16 @@ function send_response(client_fd: i32, status_code: i32, content_type: string, b
 }
 
 function send_error(client_fd: i32, status_code: i32, message: string) -> void {
-    mut body: u8[512];
+    mut body: char[512];
     snprintf(&body, 512, "<html><body><h1>%d %s</h1></body></html>", status_code, message);
     send_response(client_fd, status_code, "text/html", &body);
     return;
 }
 
 function server_file(client_fd: i32, path: string) -> void {
-    mut file_path: u8[4096];
-    mut buffer: u8[4096];
-    mut header: u8[4096];
+    mut file_path: char[4096];
+    mut buffer: char[4096];
+    mut header: char[4096];
 
     snprintf(&file_path, 4096, "./public%s", path);
 

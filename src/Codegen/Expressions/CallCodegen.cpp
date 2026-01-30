@@ -21,7 +21,7 @@ namespace Cryo::Codegen
         "i8", "i16", "i32", "i64", "i128",
         "u8", "u16", "u32", "u64", "u128",
         "f32", "f64",
-        "bool", "char", "void", "string"};
+        "boolean", "char", "void", "string"};
 
     const std::unordered_set<std::string> CallCodegen::_runtime_functions = {
         "cryo_alloc", "cryo_free", "cryo_realloc",

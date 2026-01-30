@@ -4662,7 +4662,7 @@ namespace Cryo::Codegen
     }
 
     // ========================================
-    // Network Intrinsics (Stub implementations - require platform-specific headers)
+    // Network Intrinsics (Full implementations using libc functions)
     // ========================================
 
     llvm::Value *Intrinsics::generate_socket(const std::vector<llvm::Value *> &args)
@@ -4706,27 +4706,182 @@ namespace Cryo::Codegen
                                   "bind.result");
     }
 
-    // Additional network functions would follow similar pattern...
-    // For brevity, I'll add stub implementations that return -1 (not implemented)
+    // Additional network function implementations
 
-#define DEFINE_NETWORK_STUB(name, arg_count)                                         \
-    llvm::Value *Intrinsics::generate_##name(const std::vector<llvm::Value *> &args) \
-    {                                                                                \
-        report_error(#name " intrinsic not yet fully implemented");                  \
-        auto &builder = _context_manager.get_builder();                              \
-        auto &context = _context_manager.get_context();                              \
-        return llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), -1);          \
+    llvm::Value *Intrinsics::generate_sendto(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 6)
+        {
+            report_error("sendto requires exactly 6 arguments (sockfd, buf, len, flags, dest_addr, addrlen)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *sendto_type = llvm::FunctionType::get(
+            int_type, {int_type, void_ptr_type, int_type, int_type, void_ptr_type, int_type}, false);
+
+        llvm::Function *sendto_func = get_or_create_libc_function("sendto", sendto_type);
+        return builder.CreateCall(sendto_func, {
+            ensure_type(args[0], int_type, "sendto.sockfd"),
+            args[1], // buf
+            ensure_type(args[2], int_type, "sendto.len"),
+            ensure_type(args[3], int_type, "sendto.flags"),
+            args[4], // dest_addr
+            ensure_type(args[5], int_type, "sendto.addrlen")
+        }, "sendto.result");
     }
 
-    // Network stubs for functions not yet fully implemented
-    // (listen, accept, connect, send, recv, setsockopt have full implementations)
-    DEFINE_NETWORK_STUB(sendto, 6)
-    DEFINE_NETWORK_STUB(recvfrom, 6)
-    DEFINE_NETWORK_STUB(shutdown, 2)
-    DEFINE_NETWORK_STUB(getsockopt, 5)
-    DEFINE_NETWORK_STUB(getsockname, 3)
-    DEFINE_NETWORK_STUB(getpeername, 3)
-    DEFINE_NETWORK_STUB(poll, 3)
+    llvm::Value *Intrinsics::generate_recvfrom(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 6)
+        {
+            report_error("recvfrom requires exactly 6 arguments (sockfd, buf, len, flags, src_addr, addrlen)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *recvfrom_type = llvm::FunctionType::get(
+            int_type, {int_type, void_ptr_type, int_type, int_type, void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *recvfrom_func = get_or_create_libc_function("recvfrom", recvfrom_type);
+        return builder.CreateCall(recvfrom_func, {
+            ensure_type(args[0], int_type, "recvfrom.sockfd"),
+            args[1], // buf
+            ensure_type(args[2], int_type, "recvfrom.len"),
+            ensure_type(args[3], int_type, "recvfrom.flags"),
+            args[4], // src_addr
+            args[5]  // addrlen (pointer to socklen_t)
+        }, "recvfrom.result");
+    }
+
+    llvm::Value *Intrinsics::generate_shutdown(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("shutdown requires exactly 2 arguments (sockfd, how)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *shutdown_type = llvm::FunctionType::get(int_type, {int_type, int_type}, false);
+
+        llvm::Function *shutdown_func = get_or_create_libc_function("shutdown", shutdown_type);
+        return builder.CreateCall(shutdown_func, {
+            ensure_type(args[0], int_type, "shutdown.sockfd"),
+            ensure_type(args[1], int_type, "shutdown.how")
+        }, "shutdown.result");
+    }
+
+    llvm::Value *Intrinsics::generate_getsockopt(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 5)
+        {
+            report_error("getsockopt requires exactly 5 arguments (sockfd, level, optname, optval, optlen)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *getsockopt_type = llvm::FunctionType::get(
+            int_type, {int_type, int_type, int_type, void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *getsockopt_func = get_or_create_libc_function("getsockopt", getsockopt_type);
+        return builder.CreateCall(getsockopt_func, {
+            ensure_type(args[0], int_type, "getsockopt.sockfd"),
+            ensure_type(args[1], int_type, "getsockopt.level"),
+            ensure_type(args[2], int_type, "getsockopt.optname"),
+            args[3], // optval
+            args[4]  // optlen
+        }, "getsockopt.result");
+    }
+
+    llvm::Value *Intrinsics::generate_getsockname(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("getsockname requires exactly 3 arguments (sockfd, addr, addrlen)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *getsockname_type = llvm::FunctionType::get(
+            int_type, {int_type, void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *getsockname_func = get_or_create_libc_function("getsockname", getsockname_type);
+        return builder.CreateCall(getsockname_func, {
+            ensure_type(args[0], int_type, "getsockname.sockfd"),
+            args[1], // addr
+            args[2]  // addrlen
+        }, "getsockname.result");
+    }
+
+    llvm::Value *Intrinsics::generate_getpeername(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("getpeername requires exactly 3 arguments (sockfd, addr, addrlen)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *getpeername_type = llvm::FunctionType::get(
+            int_type, {int_type, void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *getpeername_func = get_or_create_libc_function("getpeername", getpeername_type);
+        return builder.CreateCall(getpeername_func, {
+            ensure_type(args[0], int_type, "getpeername.sockfd"),
+            args[1], // addr
+            args[2]  // addrlen
+        }, "getpeername.result");
+    }
+
+    llvm::Value *Intrinsics::generate_poll(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("poll requires exactly 3 arguments (fds, nfds, timeout)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        // poll(struct pollfd *fds, nfds_t nfds, int timeout)
+        llvm::FunctionType *poll_type = llvm::FunctionType::get(
+            int_type, {void_ptr_type, i64_type, int_type}, false);
+
+        llvm::Function *poll_func = get_or_create_libc_function("poll", poll_type);
+        return builder.CreateCall(poll_func, {
+            args[0], // fds
+            ensure_type(args[1], i64_type, "poll.nfds"),
+            ensure_type(args[2], int_type, "poll.timeout")
+        }, "poll.result");
+    }
 
     llvm::Value *Intrinsics::generate_setsockopt(const std::vector<llvm::Value *> &args)
     {
@@ -5670,7 +5825,7 @@ namespace Cryo::Codegen
         store->setAlignment(llvm::Align(1));
 
         // Return void (null constant)
-        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+        return nullptr;
     }
 
     llvm::Value *Intrinsics::generate_atomic_store_16(const std::vector<llvm::Value *> &args)
@@ -5700,7 +5855,7 @@ namespace Cryo::Codegen
         store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
         store->setAlignment(llvm::Align(2));
 
-        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+        return nullptr;
     }
 
     llvm::Value *Intrinsics::generate_atomic_store_32(const std::vector<llvm::Value *> &args)
@@ -5730,7 +5885,7 @@ namespace Cryo::Codegen
         store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
         store->setAlignment(llvm::Align(4));
 
-        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+        return nullptr;
     }
 
     llvm::Value *Intrinsics::generate_atomic_store_64(const std::vector<llvm::Value *> &args)
@@ -5760,7 +5915,7 @@ namespace Cryo::Codegen
         store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
         store->setAlignment(llvm::Align(8));
 
-        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+        return nullptr;
     }
 
     llvm::Value *Intrinsics::generate_atomic_exchange_32(const std::vector<llvm::Value *> &args)
@@ -5977,8 +6132,8 @@ namespace Cryo::Codegen
         // Create memory fence instruction
         builder.CreateFence(llvm::AtomicOrdering::SequentiallyConsistent);
 
-        // Return void
-        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+        // Return nullptr for void-returning intrinsics
+        return nullptr;
     }
 
     // ========================================
@@ -6103,8 +6258,7 @@ namespace Cryo::Codegen
                                   "recv.result");
     }
 
-    // Note: sendto, recvfrom, shutdown, setsockopt, getsockopt, getsockname, getpeername, and poll
-    // are implemented as stubs using DEFINE_NETWORK_STUB macro above
+    // All network intrinsics are now fully implemented above
 
     // ========================================
     // Additional 8-bit Atomic Intrinsics
@@ -6288,7 +6442,7 @@ namespace Cryo::Codegen
         store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
         store->setAlignment(llvm::Align(1));
 
-        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+        return nullptr;
     }
 
     llvm::Value *Intrinsics::generate_atomic_swap_u8(const std::vector<llvm::Value *> &args)
@@ -6408,7 +6562,7 @@ namespace Cryo::Codegen
         store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
         store->setAlignment(llvm::Align(4));
 
-        return llvm::Constant::getNullValue(llvm::Type::getVoidTy(context));
+        return nullptr;
     }
 
     llvm::Value *Intrinsics::generate_atomic_swap_i32(const std::vector<llvm::Value *> &args)
