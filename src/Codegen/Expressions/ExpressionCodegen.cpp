@@ -215,8 +215,18 @@ namespace Cryo::Codegen
                     }
                     else
                     {
-                        int64_t int_value = std::stoll(value_str, nullptr, 0);
-                        return generate_integer_literal(int_value, resolved_type);
+                        // Try signed first, fall back to unsigned for large hex values
+                        try
+                        {
+                            int64_t int_value = std::stoll(value_str, nullptr, 0);
+                            return generate_integer_literal(int_value, resolved_type);
+                        }
+                        catch (const std::out_of_range &)
+                        {
+                            // Value too large for signed int64_t, try as unsigned
+                            uint64_t uint_value = std::stoull(value_str, nullptr, 0);
+                            return generate_unsigned_integer_literal(uint_value, resolved_type);
+                        }
                     }
                 }
                 // Check if it contains a decimal point or scientific notation 'e'/'E' (but not hex 'E')
@@ -2720,6 +2730,15 @@ namespace Cryo::Codegen
             return llvm::ConstantPointerNull::get(llvm::PointerType::get(llvm_ctx(), 0));
         }
 
+        // Check for [value; count] repeat syntax
+        const bool is_repeat = node->is_repeat_syntax();
+        const size_t array_size = node->size(); // Uses repeat_count if repeat syntax
+
+        if (is_repeat)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Array literal uses repeat syntax [value; {}]", array_size);
+        }
+
         // Generate first element to determine type
         llvm::Value *first_elem = generate(elements[0].get());
         if (!first_elem)
@@ -2766,32 +2785,50 @@ namespace Cryo::Codegen
         }
 
         // Fallback to traditional C-style array for non-Array<T> types
-        llvm::ArrayType *array_type = llvm::ArrayType::get(elem_type, elements.size());
+        llvm::ArrayType *array_type = llvm::ArrayType::get(elem_type, array_size);
 
         // Allocate array on stack
         llvm::AllocaInst *array_alloca = create_entry_alloca(array_type, "array.literal");
 
-        // Store each element
-        for (size_t i = 0; i < elements.size(); ++i)
+        // Store elements
+        if (is_repeat)
         {
-            llvm::Value *elem_val = (i == 0) ? first_elem : generate(elements[i].get());
-            if (!elem_val)
+            // [value; count] syntax - store the same value into all slots
+            llvm::Value *elem_val = cast_if_needed(first_elem, elem_type);
+            for (size_t i = 0; i < array_size; ++i)
             {
-                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
-                             "Failed to generate array element at index " + std::to_string(i));
-                return nullptr;
+                llvm::Value *indices[] = {
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
+                llvm::Value *elem_ptr = builder().CreateInBoundsGEP(array_type, array_alloca, indices,
+                                                                    "elem." + std::to_string(i) + ".ptr");
+                builder().CreateStore(elem_val, elem_ptr);
             }
+        }
+        else
+        {
+            // Normal [a, b, c] syntax - store each element
+            for (size_t i = 0; i < elements.size(); ++i)
+            {
+                llvm::Value *elem_val = (i == 0) ? first_elem : generate(elements[i].get());
+                if (!elem_val)
+                {
+                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                 "Failed to generate array element at index " + std::to_string(i));
+                    return nullptr;
+                }
 
-            // Cast if needed
-            elem_val = cast_if_needed(elem_val, elem_type);
+                // Cast if needed
+                elem_val = cast_if_needed(elem_val, elem_type);
 
-            // Get pointer to element
-            llvm::Value *indices[] = {
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
-            llvm::Value *elem_ptr = builder().CreateInBoundsGEP(array_type, array_alloca, indices,
-                                                                "elem." + std::to_string(i) + ".ptr");
-            builder().CreateStore(elem_val, elem_ptr);
+                // Get pointer to element
+                llvm::Value *indices[] = {
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
+                llvm::Value *elem_ptr = builder().CreateInBoundsGEP(array_type, array_alloca, indices,
+                                                                    "elem." + std::to_string(i) + ".ptr");
+                builder().CreateStore(elem_val, elem_ptr);
+            }
         }
 
         return array_alloca;
@@ -2807,31 +2844,61 @@ namespace Cryo::Codegen
         elem_type->print(rso);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating Array<T> constructor call");
 
+        // Check for [value; count] repeat syntax
+        const bool is_repeat = node->is_repeat_syntax();
+        const size_t array_size = node->size(); // Uses repeat_count if repeat syntax
+
         // First, create a traditional C-style array to hold the elements
-        llvm::ArrayType *raw_array_type = llvm::ArrayType::get(elem_type, elements.size());
+        llvm::ArrayType *raw_array_type = llvm::ArrayType::get(elem_type, array_size);
         llvm::AllocaInst *elements_array = create_entry_alloca(raw_array_type, "array.elements");
 
-        // Store each element in the raw array
-        for (size_t i = 0; i < elements.size(); ++i)
+        // Store elements in the raw array
+        if (is_repeat)
         {
-            llvm::Value *elem_val = generate(elements[i].get());
+            // [value; count] syntax - generate value once and store into all slots
+            llvm::Value *elem_val = generate(elements[0].get());
             if (!elem_val)
             {
                 report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
-                             "Failed to generate array element at index " + std::to_string(i));
+                             "Failed to generate array repeat element");
                 return nullptr;
             }
-
-            // Cast if needed
             elem_val = cast_if_needed(elem_val, elem_type);
 
-            // Get pointer to element
-            llvm::Value *indices[] = {
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
-            llvm::Value *elem_ptr = builder().CreateInBoundsGEP(raw_array_type, elements_array, indices,
-                                                                "elem." + std::to_string(i) + ".ptr");
-            builder().CreateStore(elem_val, elem_ptr);
+            for (size_t i = 0; i < array_size; ++i)
+            {
+                llvm::Value *indices[] = {
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
+                llvm::Value *elem_ptr = builder().CreateInBoundsGEP(raw_array_type, elements_array, indices,
+                                                                    "elem." + std::to_string(i) + ".ptr");
+                builder().CreateStore(elem_val, elem_ptr);
+            }
+        }
+        else
+        {
+            // Normal [a, b, c] syntax - store each element
+            for (size_t i = 0; i < elements.size(); ++i)
+            {
+                llvm::Value *elem_val = generate(elements[i].get());
+                if (!elem_val)
+                {
+                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                 "Failed to generate array element at index " + std::to_string(i));
+                    return nullptr;
+                }
+
+                // Cast if needed
+                elem_val = cast_if_needed(elem_val, elem_type);
+
+                // Get pointer to element
+                llvm::Value *indices[] = {
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
+                llvm::Value *elem_ptr = builder().CreateInBoundsGEP(raw_array_type, elements_array, indices,
+                                                                    "elem." + std::to_string(i) + ".ptr");
+                builder().CreateStore(elem_val, elem_ptr);
+            }
         }
 
         // Get Array<T> struct type
@@ -2866,14 +2933,14 @@ namespace Cryo::Codegen
 
             // Set length field (field 1)
             llvm::Value *length_field_ptr = builder().CreateStructGEP(struct_type, array_instance, 1, "length.ptr");
-            llvm::Value *length_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), elements.size());
+            llvm::Value *length_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), array_size);
             builder().CreateStore(length_val, length_field_ptr);
 
             // Set capacity field (field 2) - same as length for array literals
             llvm::Value *capacity_field_ptr = builder().CreateStructGEP(struct_type, array_instance, 2, "capacity.ptr");
             builder().CreateStore(length_val, capacity_field_ptr);
 
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Created Array<T> instance with {} elements", elements.size());
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Created Array<T> instance with {} elements", array_size);
 
             // Load and return the struct value, not the alloca pointer
             // This is necessary because the caller will store this value into another alloca
