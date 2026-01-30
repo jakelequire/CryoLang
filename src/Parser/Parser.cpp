@@ -4283,27 +4283,49 @@ namespace Cryo
             // First, check if this is a primitive type (e.g., impl i32 { ... })
             // Primitive types aren't in the symbol table - they're built-in to TypeArena
             TypeRef base_type;
-            if (lookup_name == "void") base_type = _context.types().get_void();
-            else if (lookup_name == "boolean") base_type = _context.types().get_bool();
-            else if (lookup_name == "i8") base_type = _context.types().get_i8();
-            else if (lookup_name == "i16") base_type = _context.types().get_i16();
-            else if (lookup_name == "i32") base_type = _context.types().get_i32();
-            else if (lookup_name == "i64") base_type = _context.types().get_i64();
-            else if (lookup_name == "i128") base_type = _context.types().get_i128();
-            else if (lookup_name == "int") base_type = _context.types().get_i32();
-            else if (lookup_name == "u8") base_type = _context.types().get_u8();
-            else if (lookup_name == "u16") base_type = _context.types().get_u16();
-            else if (lookup_name == "u32") base_type = _context.types().get_u32();
-            else if (lookup_name == "u64") base_type = _context.types().get_u64();
-            else if (lookup_name == "u128") base_type = _context.types().get_u128();
-            else if (lookup_name == "uint") base_type = _context.types().get_u32();
-            else if (lookup_name == "f32") base_type = _context.types().get_f32();
-            else if (lookup_name == "f64") base_type = _context.types().get_f64();
-            else if (lookup_name == "float") base_type = _context.types().get_f32();
-            else if (lookup_name == "double") base_type = _context.types().get_f64();
             else if (lookup_name == "char") base_type = _context.types().get_char();
-            else if (lookup_name == "string") base_type = _context.types().get_string();
-            else if (lookup_name == "never") base_type = _context.types().get_never();
+            if (lookup_name == "void")
+                base_type = _context.types().get_void();
+            else if (lookup_name == "boolean")
+                base_type = _context.types().get_bool();
+            else if (lookup_name == "i8")
+                base_type = _context.types().get_i8();
+            else if (lookup_name == "i16")
+                base_type = _context.types().get_i16();
+            else if (lookup_name == "i32")
+                base_type = _context.types().get_i32();
+            else if (lookup_name == "i64")
+                base_type = _context.types().get_i64();
+            else if (lookup_name == "i128")
+                base_type = _context.types().get_i128();
+            else if (lookup_name == "int")
+                base_type = _context.types().get_i32();
+            else if (lookup_name == "u8")
+                base_type = _context.types().get_u8();
+            else if (lookup_name == "u16")
+                base_type = _context.types().get_u16();
+            else if (lookup_name == "u32")
+                base_type = _context.types().get_u32();
+            else if (lookup_name == "u64")
+                base_type = _context.types().get_u64();
+            else if (lookup_name == "u128")
+                base_type = _context.types().get_u128();
+            else if (lookup_name == "uint")
+                base_type = _context.types().get_u32();
+            else if (lookup_name == "f32")
+                base_type = _context.types().get_f32();
+            else if (lookup_name == "f64")
+                base_type = _context.types().get_f64();
+            else if (lookup_name == "float")
+                base_type = _context.types().get_f32();
+            else if (lookup_name == "double")
+                base_type = _context.types().get_f64();
+            else if (lookup_name == "char")
+                base_type = _context.types().get_char();
+            else if (lookup_name == "string")
+                base_type = _context.types().get_string();
+            else if (lookup_name == "never")
+                base_type = _context.types().get_never();
             else
             {
                 // Not a primitive - try multiple lookup methods
@@ -4948,10 +4970,10 @@ namespace Cryo
             // Add generic arguments if present
             if (!generic_args.empty() && call_expr)
             {
-                auto* call_node = dynamic_cast<CallExpressionNode*>(call_expr.get());
+                auto *call_node = dynamic_cast<CallExpressionNode *>(call_expr.get());
                 if (call_node)
                 {
-                    for (const auto& arg : generic_args)
+                    for (const auto &arg : generic_args)
                     {
                         call_node->add_generic_arg(arg);
                     }
@@ -5437,7 +5459,7 @@ namespace Cryo
 
                     // Parse return type
                     TypeRef return_type = _context.types().get_void(); // Default to void
-                    std::string return_type_string = "void"; // Track the type string for TypeAnnotation
+                    std::string return_type_string = "void";           // Track the type string for TypeAnnotation
                     if (_current_token.is(TokenKind::TK_ARROW))
                     {
                         advance(); // consume '->'
@@ -6160,7 +6182,7 @@ namespace Cryo
 
         // Parse return type (optional for constructors)
         TypeRef return_type = _context.types().get_void(); // Default to void
-        std::string return_type_string = "void"; // Track the type string for TypeAnnotation
+        std::string return_type_string = "void";           // Track the type string for TypeAnnotation
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
@@ -6505,9 +6527,9 @@ namespace Cryo
                 {
                     // Found matching '>'. Check if next token indicates a generic expression
                     Token next_tok = peek_next_n(pos + 1);
-                    return next_tok.is(TokenKind::TK_L_PAREN) ||   // Generic call: Type<T>()
-                           next_tok.is(TokenKind::TK_L_BRACE) ||   // Generic struct literal: Type<T> { ... }
-                           next_tok.is(TokenKind::TK_COLONCOLON);  // Generic scope resolution: Type<T>::method()
+                    return next_tok.is(TokenKind::TK_L_PAREN) ||  // Generic call: Type<T>()
+                           next_tok.is(TokenKind::TK_L_BRACE) ||  // Generic struct literal: Type<T> { ... }
+                           next_tok.is(TokenKind::TK_COLONCOLON); // Generic scope resolution: Type<T>::method()
                 }
             }
             else if (tok.is(TokenKind::TK_SEMICOLON) ||
