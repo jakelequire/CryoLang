@@ -360,6 +360,21 @@ namespace Cryo::Codegen
          * @return Resolved TypeRef, or invalid TypeRef on failure
          */
         TypeRef resolve_type_annotation(const TypeAnnotation *annotation);
+
+        /**
+         * @brief Validate that an existing function matches the expected type
+         *
+         * If the function exists but has a mismatched type (stale from a previous
+         * generic instantiation), it is removed so a fresh one can be created.
+         *
+         * @param existing The existing LLVM function (may be nullptr)
+         * @param expected_type The expected function type
+         * @param fn_name The function name (for logging)
+         * @return The existing function if types match, nullptr otherwise
+         */
+        llvm::Function *validate_existing_function(llvm::Function *existing,
+                                                    llvm::FunctionType *expected_type,
+                                                    const std::string &fn_name);
     };
 
 } // namespace Cryo::Codegen
