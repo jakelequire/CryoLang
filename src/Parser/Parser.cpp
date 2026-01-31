@@ -4663,8 +4663,19 @@ namespace Cryo
 
         consume(TokenKind::TK_L_PAREN, "Expected '(' after 'sizeof'");
 
-        // Parse type annotation (handles pointer types, arrays, etc.)
-        std::string type_name = parse_type_annotation()->display_name();
+        // Parse type annotation - use out_type_string to get the original annotation
+        // instead of display_name(), which would include error messages for unresolved generics.
+        // For sizeof(HashSetEntry<T>), we need to preserve "HashSetEntry<T>" so that
+        // during codegen, the type parameter T can be properly substituted.
+        std::string type_name;
+        TypeRef resolved = parse_type_annotation(&type_name);
+
+        // If we didn't get a type string (shouldn't happen), fall back to display_name
+        if (type_name.empty() && resolved.is_valid())
+        {
+            type_name = resolved->display_name();
+        }
+
         if (type_name.empty())
         {
             error("Expected type name in sizeof expression");
@@ -4683,8 +4694,17 @@ namespace Cryo
 
         consume(TokenKind::TK_L_PAREN, "Expected '(' after 'alignof'");
 
-        // Parse type annotation (handles pointer types, arrays, etc.)
-        std::string type_name = parse_type_annotation()->display_name();
+        // Parse type annotation - use out_type_string to get the original annotation
+        // instead of display_name(), which would include error messages for unresolved generics.
+        std::string type_name;
+        TypeRef resolved = parse_type_annotation(&type_name);
+
+        // If we didn't get a type string (shouldn't happen), fall back to display_name
+        if (type_name.empty() && resolved.is_valid())
+        {
+            type_name = resolved->display_name();
+        }
+
         if (type_name.empty())
         {
             error("Expected type name in alignof expression");

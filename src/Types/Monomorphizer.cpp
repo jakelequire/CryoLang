@@ -354,6 +354,10 @@ namespace Cryo
                     {
                         // Apply substitution in case it's a compound type with generic params
                         TypeRef substituted = subst.apply(payload_type, _arena);
+
+                        // Request instantiation for nested generic types
+                        request_nested_instantiation(substituted);
+
                         substituted_payload.push_back(substituted);
                     }
                     else
@@ -380,6 +384,10 @@ namespace Cryo
                 for (const auto &payload_type : orig_variant.payload_types)
                 {
                     TypeRef substituted = subst.apply(payload_type, _arena);
+
+                    // Request instantiation for nested generic types
+                    request_nested_instantiation(substituted);
+
                     substituted_payload.push_back(substituted);
                 }
 
@@ -475,6 +483,11 @@ namespace Cryo
                     // Apply substitution in case it's a compound type with generic params
                     TypeRef substituted = subst.apply(field_type, _arena);
 
+                    // Request instantiation for nested generic types
+                    // e.g., when HashSet<string> has field entries: HashSetEntry<T>*
+                    // we need to monomorphize HashSetEntry<string> as well
+                    request_nested_instantiation(substituted);
+
                     FieldInfo concrete_field(
                         field->name(),
                         substituted,
@@ -503,6 +516,9 @@ namespace Cryo
             for (const auto &orig_field : struct_type->fields())
             {
                 TypeRef substituted_type = subst.apply(orig_field.type, _arena);
+
+                // Request instantiation for nested generic types
+                request_nested_instantiation(substituted_type);
 
                 FieldInfo concrete_field(
                     orig_field.name,
@@ -583,6 +599,101 @@ namespace Cryo
             }
         }
         return count;
+    }
+
+    // ========================================================================
+    // Nested Type Instantiation
+    // ========================================================================
+
+    void Monomorphizer::request_nested_instantiation(TypeRef type)
+    {
+        if (!type.is_valid())
+            return;
+
+        const Type *t = type.get();
+
+        // Direct InstantiatedType - request monomorphization if not already done
+        if (t->kind() == TypeKind::InstantiatedType)
+        {
+            auto *inst = static_cast<const InstantiatedType *>(t);
+            TypeRef base = inst->generic_base();
+
+            if (base.is_valid() && !inst->type_args().empty())
+            {
+                // Check if already monomorphized
+                if (!_generics.is_monomorphized(base, inst->type_args()))
+                {
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "Monomorphizer: Requesting nested instantiation of {}",
+                              inst->display_name());
+
+                    // Add to pending requests
+                    add_request(base, inst->type_args(), SourceLocation{}, ModuleID::invalid());
+                }
+            }
+
+            // Recursively check type arguments for nested instantiated types
+            for (const auto &arg : inst->type_args())
+            {
+                request_nested_instantiation(arg);
+            }
+            return;
+        }
+
+        // PointerType - check pointee
+        if (t->kind() == TypeKind::Pointer)
+        {
+            auto *ptr = static_cast<const PointerType *>(t);
+            request_nested_instantiation(ptr->pointee());
+            return;
+        }
+
+        // ReferenceType - check referent
+        if (t->kind() == TypeKind::Reference)
+        {
+            auto *ref = static_cast<const ReferenceType *>(t);
+            request_nested_instantiation(ref->referent());
+            return;
+        }
+
+        // ArrayType - check element
+        if (t->kind() == TypeKind::Array)
+        {
+            auto *arr = static_cast<const ArrayType *>(t);
+            request_nested_instantiation(arr->element());
+            return;
+        }
+
+        // OptionalType - check wrapped
+        if (t->kind() == TypeKind::Optional)
+        {
+            auto *opt = static_cast<const OptionalType *>(t);
+            request_nested_instantiation(opt->wrapped());
+            return;
+        }
+
+        // FunctionType - check return type and parameters
+        if (t->kind() == TypeKind::Function)
+        {
+            auto *fn = static_cast<const FunctionType *>(t);
+            request_nested_instantiation(fn->return_type());
+            for (const auto &param : fn->param_types())
+            {
+                request_nested_instantiation(param);
+            }
+            return;
+        }
+
+        // TupleType - check all elements
+        if (t->kind() == TypeKind::Tuple)
+        {
+            auto *tup = static_cast<const TupleType *>(t);
+            for (const auto &elem : tup->elements())
+            {
+                request_nested_instantiation(elem);
+            }
+            return;
+        }
     }
 
     // ========================================================================

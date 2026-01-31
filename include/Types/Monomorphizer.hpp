@@ -356,6 +356,22 @@ namespace Cryo
                                         const std::string &specialized_name,
                                         const std::vector<TypeRef> &type_args,
                                         ASTNode *ast_node);
+
+        /**
+         * @brief Request instantiation for nested generic types
+         *
+         * When monomorphizing a type like HashSet<string>, the field type
+         * HashSetEntry<T>* becomes HashSetEntry<string>*. This method ensures
+         * that nested InstantiatedTypes like HashSetEntry<string> are also
+         * added to the monomorphization queue.
+         *
+         * Handles:
+         * - Direct InstantiatedType
+         * - PointerType to InstantiatedType
+         * - ReferenceType to InstantiatedType
+         * - ArrayType of InstantiatedType
+         */
+        void request_nested_instantiation(TypeRef type);
     };
 
 } // namespace Cryo
