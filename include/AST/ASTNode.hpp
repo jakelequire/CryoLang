@@ -2192,8 +2192,9 @@ namespace Cryo
     {
     private:
         std::vector<std::unique_ptr<ExpressionNode>> _elements;
-        std::string _element_type; // Type of array elements
-        size_t _repeat_count = 0;  // If > 0, this is [expr; count] syntax
+        std::string _element_type;                            // Type of array elements
+        size_t _repeat_count = 0;                             // If > 0, this is [expr; count] syntax with literal count
+        std::unique_ptr<ExpressionNode> _repeat_count_expr;   // Expression-based count for [expr; count_expr] syntax
 
     public:
         ArrayLiteralNode(SourceLocation loc)
@@ -2203,16 +2204,29 @@ namespace Cryo
         const std::string &element_type() const { return _element_type; }
 
         /// Returns the effective size of the array (accounting for repeat syntax)
+        /// Returns 0 if using expression-based count (size determined at runtime)
         size_t size() const { return _repeat_count > 0 ? _repeat_count : _elements.size(); }
 
-        /// Returns true if this array uses [expr; count] repeat syntax
-        bool is_repeat_syntax() const { return _repeat_count > 0; }
+        /// Returns true if this array uses [expr; count] repeat syntax (either literal or expression)
+        bool is_repeat_syntax() const { return _repeat_count > 0 || _repeat_count_expr != nullptr; }
 
-        /// Returns the repeat count (0 if not using repeat syntax)
+        /// Returns true if this array uses expression-based repeat count (runtime size)
+        bool has_dynamic_count() const { return _repeat_count_expr != nullptr; }
+
+        /// Returns the repeat count (0 if not using repeat syntax or using expression)
         size_t repeat_count() const { return _repeat_count; }
 
-        /// Sets the repeat count for [expr; count] syntax
+        /// Returns the repeat count expression (nullptr if using literal count)
+        ExpressionNode *repeat_count_expr() const { return _repeat_count_expr.get(); }
+
+        /// Sets the repeat count for [expr; count] syntax (literal count)
         void set_repeat_count(size_t count) { _repeat_count = count; }
+
+        /// Sets the repeat count expression for [expr; count_expr] syntax
+        void set_repeat_count_expr(std::unique_ptr<ExpressionNode> expr)
+        {
+            _repeat_count_expr = std::move(expr);
+        }
 
         void add_element(std::unique_ptr<ExpressionNode> element)
         {
@@ -2226,9 +2240,15 @@ namespace Cryo
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "ArrayLiteral[" << size() << "]";
+            os << std::string(indent, ' ') << "ArrayLiteral";
+            if (_repeat_count_expr)
+                os << "[dynamic]";
+            else
+                os << "[" << size() << "]";
             if (_repeat_count > 0)
                 os << " (repeat " << _repeat_count << "x)";
+            if (_repeat_count_expr)
+                os << " (repeat expr)";
             if (!_element_type.empty())
                 os << " (" << _element_type << ")";
             os << ":" << std::endl;
@@ -2236,6 +2256,11 @@ namespace Cryo
             {
                 if (element)
                     element->print(os, indent + 2);
+            }
+            if (_repeat_count_expr)
+            {
+                os << std::string(indent + 2, ' ') << "count_expr:" << std::endl;
+                _repeat_count_expr->print(os, indent + 4);
             }
         }
 

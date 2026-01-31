@@ -20,6 +20,28 @@ namespace Cryo::Codegen
     }
 
     //===================================================================
+    // Internal Helpers
+    //===================================================================
+
+    llvm::Function *DeclarationCodegen::validate_existing_function(
+        llvm::Function *existing,
+        llvm::FunctionType *expected_type,
+        const std::string &fn_name)
+    {
+        if (!existing || !expected_type)
+            return existing;
+
+        if (existing->getFunctionType() == expected_type)
+            return existing;
+
+        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                 "DeclarationCodegen: Removing stale function '{}' with mismatched types",
+                 fn_name);
+        existing->eraseFromParent();
+        return nullptr;
+    }
+
+    //===================================================================
     // Function Declarations
     //===================================================================
 
@@ -145,14 +167,22 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating function declaration: {} (namespace: '{}')", name, ns_context);
 
-        // Check if already declared
+        // Get function type first (needed for validation)
+        llvm::FunctionType *fn_type = get_function_type(node);
+
+        // Check if already declared - validate signature matches
         if (llvm::Function *existing = module()->getFunction(name))
         {
-            return existing;
+            llvm::Function *validated = validate_existing_function(existing, fn_type, name);
+            if (validated)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Function '{}' already exists with correct types",
+                          name);
+                return validated;
+            }
+            // Fall through to create fresh function
         }
-
-        // Get function type
-        llvm::FunctionType *fn_type = get_function_type(node);
         if (!fn_type)
         {
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
@@ -617,24 +647,75 @@ namespace Cryo::Codegen
             template_registry->register_method_is_static(llvm_fn_name, is_static);
         }
 
-        // Check if already declared (check both names to handle existing declarations)
-        if (llvm::Function *existing = module()->getFunction(llvm_fn_name))
+        // Get function type first - only add 'this' parameter for non-static methods
+        // (needed for signature validation before checking existing functions)
+        llvm::FunctionType *fn_type = get_function_type(node, !is_static, parent_type);
+
+        // Build a unique name for overloaded methods by including parameter types
+        std::vector<TypeRef> param_types;
+        for (const auto &param : node->parameters())
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "DeclarationCodegen: Method '{}' already exists (llvm_fn_name match), returning early",
-                      llvm_fn_name);
-            return existing;
+            if (param->name() != "this" && param->get_resolved_type())
+            {
+                param_types.push_back(param->get_resolved_type());
+            }
         }
-        if (llvm::Function *existing = module()->getFunction(base_method_name))
+        std::string overload_name = llvm_fn_name;
+        if (!param_types.empty())
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "DeclarationCodegen: Method '{}' already exists (base_method_name='{}' match), returning early",
-                      llvm_fn_name, base_method_name);
-            return existing;
+            overload_name = generate_method_name(parent_type, node->name(), param_types);
+            if (!ns_context.empty())
+            {
+                overload_name = ns_context + "::" + generate_method_name(parent_type, node->name(), param_types);
+            }
         }
 
-        // Get function type - only add 'this' parameter for non-static methods
-        llvm::FunctionType *fn_type = get_function_type(node, !is_static, parent_type);
+        // Check if already declared with exact signature (for overload support)
+        if (llvm::Function *existing = module()->getFunction(overload_name))
+        {
+            llvm::Function *validated = validate_existing_function(existing, fn_type, overload_name);
+            if (validated)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Method '{}' already exists with correct types",
+                          overload_name);
+                return validated;
+            }
+            // Fall through to create fresh function
+        }
+        // Also check base name (for backward compatibility with non-overloaded methods)
+        else if (llvm::Function *existing = module()->getFunction(llvm_fn_name))
+        {
+            // Only reuse if types match - don't erase for overloads
+            if (fn_type && existing->getFunctionType() == fn_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Method '{}' already exists with matching types",
+                          llvm_fn_name);
+                return existing;
+            }
+            // Types differ - this is an overload, use overload_name for the new function
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Method '{}' exists with different types (overload), using '{}'",
+                      llvm_fn_name, overload_name);
+            llvm_fn_name = overload_name;
+        }
+        else if (llvm::Function *existing = module()->getFunction(base_method_name))
+        {
+            // Only reuse if types match - don't erase for overloads
+            if (fn_type && existing->getFunctionType() == fn_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Method '{}' already exists (base_method_name='{}') with matching types",
+                          llvm_fn_name, base_method_name);
+                return existing;
+            }
+            // Types differ - this is an overload, use overload_name
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Method base '{}' exists with different types (overload), using '{}'",
+                      base_method_name, overload_name);
+            llvm_fn_name = overload_name;
+        }
         if (!fn_type)
         {
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
@@ -674,9 +755,12 @@ namespace Cryo::Codegen
             }
         }
 
-        // Register with both names for lookups
+        // Register with the primary name (may include overload signature)
         ctx().register_function(llvm_fn_name, fn);
-        if (llvm_fn_name != base_method_name)
+
+        // Only register with base name if this is not an overload
+        // (i.e., no other function exists with this base name)
+        if (llvm_fn_name != base_method_name && !module()->getFunction(base_method_name))
         {
             ctx().register_function(base_method_name, fn);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -2798,8 +2882,32 @@ namespace Cryo::Codegen
             if (fn_node->body())
             {
                 // Full definition - function should already be declared
-                std::string method_name = generate_method_name(type_name, fn_node->name());
-                llvm::Function *fn = module()->getFunction(method_name);
+                // Build overloaded name with parameter types for lookup
+                std::vector<TypeRef> param_types;
+                for (const auto &param : fn_node->parameters())
+                {
+                    if (param->name() != "this" && param->get_resolved_type())
+                    {
+                        param_types.push_back(param->get_resolved_type());
+                    }
+                }
+
+                std::string base_method_name = generate_method_name(type_name, fn_node->name());
+                std::string overload_name = param_types.empty() ? base_method_name
+                                                                 : generate_method_name(type_name, fn_node->name(), param_types);
+                std::string method_name = base_method_name;
+
+                // Try overloaded name first
+                llvm::Function *fn = module()->getFunction(overload_name);
+                if (fn)
+                {
+                    method_name = overload_name;
+                }
+                else
+                {
+                    // Fall back to base name
+                    fn = module()->getFunction(base_method_name);
+                }
 
                 // Also try with namespace prefix if not found
                 if (!fn)
@@ -2807,11 +2915,22 @@ namespace Cryo::Codegen
                     std::string ns_context = ctx().namespace_context();
                     if (!ns_context.empty())
                     {
-                        std::string namespaced_name = ns_context + "::" + method_name;
-                        fn = module()->getFunction(namespaced_name);
+                        // Try namespaced overload name first
+                        std::string namespaced_overload = ns_context + "::" + overload_name;
+                        fn = module()->getFunction(namespaced_overload);
                         if (fn)
                         {
-                            method_name = namespaced_name; // Update for scope entry below
+                            method_name = namespaced_overload;
+                        }
+                        else
+                        {
+                            // Try namespaced base name
+                            std::string namespaced_name = ns_context + "::" + base_method_name;
+                            fn = module()->getFunction(namespaced_name);
+                            if (fn)
+                            {
+                                method_name = namespaced_name;
+                            }
                         }
                     }
                 }
