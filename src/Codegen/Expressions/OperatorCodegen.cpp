@@ -314,7 +314,7 @@ namespace Cryo::Codegen
     llvm::Value *OperatorCodegen::generate_assignment(Cryo::BinaryExpressionNode *node)
     {
         LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== ASSIGNMENT DEBUG: Starting assignment generation ===");
-        
+
         if (!node)
             return nullptr;
 
@@ -353,34 +353,34 @@ namespace Cryo::Codegen
         if (!target || !value_node)
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                     "Assignment: Null target or value_node: target={}, value_node={}",
-                     (void*)target, (void*)value_node);
+                      "Assignment: Null target or value_node: target={}, value_node={}",
+                      (void *)target, (void *)value_node);
             report_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                        "Assignment generation received null target or value node");
+                         "Assignment generation received null target or value node");
             return nullptr;
         }
 
         std::string var_name = target->name();
         LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                 "Assignment: Processing assignment to variable '{}'", var_name);
+                  "Assignment: Processing assignment to variable '{}'", var_name);
 
         // Find the variable's storage location
         llvm::Value *var_ptr = values().get_alloca(var_name);
         if (!var_ptr)
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                     "Assignment: Variable '{}' not found in alloca, trying globals", var_name);
+                      "Assignment: Variable '{}' not found in alloca, trying globals", var_name);
             // Try global from ValueContext first
             var_ptr = values().get_global_value(var_name);
             if (var_ptr)
             {
                 LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                         "Assignment: Found variable '{}' in ValueContext globals", var_name);
+                          "Assignment: Found variable '{}' in ValueContext globals", var_name);
             }
             else
             {
                 LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                         "Assignment: Variable '{}' not found in ValueContext globals, trying CodegenContext", var_name);
+                          "Assignment: Variable '{}' not found in ValueContext globals, trying CodegenContext", var_name);
                 // Try global from CodegenContext as fallback
                 auto &globals = ctx().globals_map();
                 auto it = globals.find(var_name);
@@ -388,25 +388,25 @@ namespace Cryo::Codegen
                 {
                     var_ptr = it->second;
                     LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                             "Assignment: Found variable '{}' in CodegenContext globals", var_name);
+                              "Assignment: Found variable '{}' in CodegenContext globals", var_name);
                 }
                 else
                 {
                     LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                             "Assignment: Variable '{}' not found in CodegenContext globals either", var_name);
+                              "Assignment: Variable '{}' not found in CodegenContext globals either", var_name);
                 }
             }
         }
         else
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                     "Assignment: Found variable '{}' in alloca", var_name);
+                      "Assignment: Found variable '{}' in alloca", var_name);
         }
 
         if (!var_ptr)
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                     "Assignment: Variable '{}' lookup FAILED - undefined variable", var_name);
+                      "Assignment: Variable '{}' lookup FAILED - undefined variable", var_name);
             report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, target,
                          "Undefined variable: " + var_name);
             return nullptr;
@@ -417,7 +417,7 @@ namespace Cryo::Codegen
         if (auto *call_node = dynamic_cast<Cryo::CallExpressionNode *>(value_node))
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                     "Assignment: Processing call expression for variable '{}'", var_name);
+                      "Assignment: Processing call expression for variable '{}'", var_name);
 
             // Get the function name being called
             std::string callee_name;
@@ -425,14 +425,14 @@ namespace Cryo::Codegen
             {
                 callee_name = callee_id->name();
                 LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                         "Assignment: Callee name is '{}'", callee_name);
+                          "Assignment: Callee name is '{}'", callee_name);
             }
 
             // Check if this is a class type constructor (only if callee_name is non-empty)
             bool is_class = (!callee_name.empty() && _calls) ? _calls->is_class_type(callee_name) : false;
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                     "Assignment: Callee '{}' is_class_type={}, _calls={}",
-                     callee_name, is_class, (void*)_calls);
+                      "Assignment: Callee '{}' is_class_type={}, _calls={}",
+                      callee_name, is_class, (void *)_calls);
 
             if (!callee_name.empty() && _calls)
             {
@@ -442,21 +442,21 @@ namespace Cryo::Codegen
                 {
                     var_type = alloca->getAllocatedType();
                     LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                             "Assignment: Variable '{}' is AllocaInst, type={}", 
-                             var_name, var_type ? "present" : "null");
+                              "Assignment: Variable '{}' is AllocaInst, type={}",
+                              var_name, var_type ? "present" : "null");
                 }
                 else if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(var_ptr))
                 {
                     var_type = global->getValueType();
                     LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                             "Assignment: Variable '{}' is GlobalVariable, type={}", 
-                             var_name, var_type ? "present" : "null");
+                              "Assignment: Variable '{}' is GlobalVariable, type={}",
+                              var_name, var_type ? "present" : "null");
                 }
 
                 // If the target is a struct type (value type), try constructor-based assignment
                 bool is_struct = var_type ? var_type->isStructTy() : false;
                 LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                         "Assignment: Variable '{}' type isStructTy={}", var_name, is_struct);
+                          "Assignment: Variable '{}' type isStructTy={}", var_name, is_struct);
 
                 if (var_type && is_struct)
                 {
@@ -488,16 +488,16 @@ namespace Cryo::Codegen
 
                         // Look for the constructor function
                         LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                                 "Assignment: Calling resolve_constructor for '{}'", callee_name);
+                                  "Assignment: Calling resolve_constructor for '{}'", callee_name);
                         llvm::Function *ctor = _calls->resolve_constructor(callee_name);
                         LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                                 "Assignment: Constructor resolved: {}", ctor ? "SUCCESS" : "FAILED");
-                        
+                                  "Assignment: Constructor resolved: {}", ctor ? "SUCCESS" : "FAILED");
+
                         if (ctor)
                         {
                             LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                                     "Assignment: Calling constructor '{}' with {} args", 
-                                     ctor->getName().str(), args.size());
+                                      "Assignment: Calling constructor '{}' with {} args",
+                                      ctor->getName().str(), args.size());
                             // Call constructor with var_ptr as 'this'
                             std::vector<llvm::Value *> ctor_args;
                             ctor_args.push_back(var_ptr);
@@ -514,7 +514,7 @@ namespace Cryo::Codegen
                                 for (size_t i = 0; i < args.size() && i < st->getNumElements(); ++i)
                                 {
                                     llvm::Value *field_ptr = builder().CreateStructGEP(var_type, var_ptr, i,
-                                                                                        "field." + std::to_string(i));
+                                                                                       "field." + std::to_string(i));
                                     llvm::Value *arg = args[i];
                                     if (arg->getType() != st->getElementType(i))
                                     {
@@ -645,7 +645,7 @@ namespace Cryo::Codegen
                                 for (size_t i = 0; i < args.size() && i < st->getNumElements(); ++i)
                                 {
                                     llvm::Value *field_ptr = builder().CreateStructGEP(member_field_type, member_ptr, i,
-                                                                                        "field." + std::to_string(i));
+                                                                                       "field." + std::to_string(i));
                                     llvm::Value *arg = args[i];
                                     if (arg->getType() != st->getElementType(i))
                                     {
@@ -673,14 +673,14 @@ namespace Cryo::Codegen
         // Get the types involved
         llvm::Type *member_ptr_type = member_ptr->getType();
         llvm::Type *value_type = value->getType();
-        
+
         if (!member_ptr_type->isPointerTy())
         {
             report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, target,
                          "Member address is not a pointer type");
             return nullptr;
         }
-        
+
         // For LLVM 20+, we need to get the pointed-to type differently
         // We'll check if it's an AllocaInst or GEP and extract the type accordingly
         llvm::Type *member_field_type = nullptr;
@@ -706,7 +706,7 @@ namespace Cryo::Codegen
             }
             return value;
         }
-        
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "Member assignment: member_field_type={}, value_type={}",
                   member_field_type->getTypeID(),
@@ -738,7 +738,7 @@ namespace Cryo::Codegen
                 }
                 return value;
             }
-            
+
             // If value points to the same struct type as the field expects
             if (value_pointed_type == member_field_type)
             {
@@ -747,7 +747,7 @@ namespace Cryo::Codegen
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "Member assignment: Struct type is not sized, falling back to regular store");
-                    
+
                     // Fall back to regular store for unsized struct types
                     if (_memory)
                     {
@@ -759,35 +759,34 @@ namespace Cryo::Codegen
                     }
                     return value;
                 }
-                
+
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "Member assignment: Struct value assignment detected, using memcpy");
-                
+
                 // Use memcpy to copy the struct value instead of storing pointer
                 auto &dl = module()->getDataLayout();
                 uint64_t struct_size = dl.getTypeAllocSize(member_field_type);
-                
+
                 // Create memcpy call
                 llvm::Type *i8_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(llvm_ctx()), 0);
                 llvm::Type *size_type = dl.getIntPtrType(llvm_ctx());
-                
+
                 // Cast pointers to i8* for memcpy
                 llvm::Value *dest = builder().CreateBitCast(member_ptr, i8_ptr_type, "dest.cast");
                 llvm::Value *src = builder().CreateBitCast(value, i8_ptr_type, "src.cast");
                 llvm::Value *size_val = llvm::ConstantInt::get(size_type, struct_size);
-                
+
                 // Call memcpy intrinsic
                 llvm::Function *memcpy_fn = llvm::Intrinsic::getDeclaration(
                     module(),
                     llvm::Intrinsic::memcpy,
-                    {i8_ptr_type, i8_ptr_type, size_type}
-                );
-                
+                    {i8_ptr_type, i8_ptr_type, size_type});
+
                 builder().CreateCall(memcpy_fn, {dest, src, size_val, llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_ctx()), false)});
-                
+
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "Member assignment: Memcpy complete for struct of size {} bytes", struct_size);
-                
+
                 return value;
             }
         }
@@ -938,7 +937,7 @@ namespace Cryo::Codegen
                         for (size_t i = 0; i < args.size() && i < st->getNumElements(); ++i)
                         {
                             llvm::Value *field_ptr = builder().CreateStructGEP(struct_type, ptr, i,
-                                                                                "field." + std::to_string(i));
+                                                                               "field." + std::to_string(i));
                             llvm::Value *arg = args[i];
                             if (arg->getType() != st->getElementType(i))
                             {
@@ -983,11 +982,11 @@ namespace Cryo::Codegen
 
                     // Use memcpy to copy struct contents
                     builder().CreateMemCpy(
-                        ptr,                                              // dest
-                        llvm::MaybeAlign(data_layout.getABITypeAlign(struct_type)),  // dest align
-                        value,                                            // src
-                        llvm::MaybeAlign(data_layout.getABITypeAlign(struct_type)),  // src align
-                        size                                              // size
+                        ptr,                                                        // dest
+                        llvm::MaybeAlign(data_layout.getABITypeAlign(struct_type)), // dest align
+                        value,                                                      // src
+                        llvm::MaybeAlign(data_layout.getABITypeAlign(struct_type)), // src align
+                        size                                                        // size
                     );
                     return ptr;
                 }
@@ -1252,10 +1251,10 @@ namespace Cryo::Codegen
                 return b.CreateGEP(element_type, ptr, offset, "ptr.add");
 
             case TokenKind::TK_MINUS:
-                {
-                    llvm::Value *neg_offset = b.CreateNeg(offset, "neg.offset");
-                    return b.CreateGEP(element_type, ptr, neg_offset, "ptr.sub");
-                }
+            {
+                llvm::Value *neg_offset = b.CreateNeg(offset, "neg.offset");
+                return b.CreateGEP(element_type, ptr, neg_offset, "ptr.sub");
+            }
 
             default:
                 report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
@@ -1341,8 +1340,8 @@ namespace Cryo::Codegen
                       "lhs type ID = {}, rhs type ID = {}",
                       lhs->getType()->getTypeID(), rhs->getType()->getTypeID());
             std::string e = "Incompatible types for comparison: " +
-                                TypeIDToString(lhs->getType()->getTypeID()) + " and " +
-                                TypeIDToString(rhs->getType()->getTypeID());
+                            TypeIDToString(lhs->getType()->getTypeID()) + " and " +
+                            TypeIDToString(rhs->getType()->getTypeID());
             report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
                          e.c_str());
             return nullptr;
@@ -1366,8 +1365,14 @@ namespace Cryo::Codegen
             return generate_pointer_comparison(op, lhs, rhs);
         }
 
-        report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
-                     "Comparison not supported for this type");
+        std::string e = "Comparison not supported for type: " +
+                        TypeIDToString(type->getTypeID()) +
+                        " Type Name: `" +
+                        (type ? type->getStructName().str() : "unknown") +
+                        "` With operand type: `" +
+                        (operand_type ? operand_type->display_name() : "unknown") + "`";
+
+        report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, e.c_str());
         return nullptr;
     }
 
@@ -1469,7 +1474,7 @@ namespace Cryo::Codegen
             return nullptr;
 
         llvm::IRBuilder<> &b = builder();
-        
+
         llvm::BasicBlock *and_block = b.GetInsertBlock();
         if (!and_block)
         {
@@ -1545,7 +1550,7 @@ namespace Cryo::Codegen
             return nullptr;
 
         llvm::IRBuilder<> &b = builder();
-        
+
         llvm::BasicBlock *or_block = b.GetInsertBlock();
         if (!or_block)
         {

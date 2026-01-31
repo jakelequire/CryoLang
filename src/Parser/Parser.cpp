@@ -5001,38 +5001,47 @@ namespace Cryo
         {
             advance(); // consume ';'
 
-            // Parse the count expression (must be an integer literal)
+            // Parse the count expression
             auto count_expr = parse_expression();
             if (!count_expr)
             {
                 report_error(ErrorCode::E0102_EXPECTED_EXPRESSION, "Expected count expression after ';' in array repeat syntax");
+                // Try to recover by consuming up to ']'
+                while (!_current_token.is(TokenKind::TK_R_SQUARE) && !is_at_end())
+                {
+                    advance();
+                }
+                if (_current_token.is(TokenKind::TK_R_SQUARE))
+                {
+                    advance();
+                }
                 return array_literal;
             }
 
-            // The count must be an integer literal
-            if (count_expr->kind() != NodeKind::Literal)
+            // Check if it's a compile-time constant (integer literal)
+            if (count_expr->kind() == NodeKind::Literal)
             {
-                report_error(ErrorCode::E0111_INVALID_SYNTAX, "Array repeat count must be an integer literal");
-                return array_literal;
+                auto *literal = static_cast<LiteralNode *>(count_expr.get());
+                if (literal->literal_kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                {
+                    // Parse the string value as integer
+                    size_t repeat_count = static_cast<size_t>(std::stoull(literal->value()));
+
+                    if (repeat_count == 0)
+                    {
+                        report_error(ErrorCode::E0111_INVALID_SYNTAX, "Array repeat count must be greater than 0");
+                        consume(TokenKind::TK_R_SQUARE, "Expected ']' after array repeat count");
+                        return array_literal;
+                    }
+
+                    array_literal->set_repeat_count(repeat_count);
+                    consume(TokenKind::TK_R_SQUARE, "Expected ']' after array repeat count");
+                    return array_literal;
+                }
             }
 
-            auto *literal = static_cast<LiteralNode *>(count_expr.get());
-            if (literal->literal_kind() != TokenKind::TK_NUMERIC_CONSTANT)
-            {
-                report_error(ErrorCode::E0111_INVALID_SYNTAX, "Array repeat count must be an integer literal");
-                return array_literal;
-            }
-
-            // Parse the string value as integer
-            size_t repeat_count = static_cast<size_t>(std::stoull(literal->value()));
-
-            if (repeat_count == 0)
-            {
-                report_error(ErrorCode::E0111_INVALID_SYNTAX, "Array repeat count must be greater than 0");
-                return array_literal;
-            }
-
-            array_literal->set_repeat_count(repeat_count);
+            // Not a literal - use expression-based count (runtime size)
+            array_literal->set_repeat_count_expr(std::move(count_expr));
 
             consume(TokenKind::TK_R_SQUARE, "Expected ']' after array repeat count");
             return array_literal;

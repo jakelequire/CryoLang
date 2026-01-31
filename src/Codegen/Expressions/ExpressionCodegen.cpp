@@ -2732,11 +2732,19 @@ namespace Cryo::Codegen
 
         // Check for [value; count] repeat syntax
         const bool is_repeat = node->is_repeat_syntax();
-        const size_t array_size = node->size(); // Uses repeat_count if repeat syntax
+        const bool is_dynamic = node->has_dynamic_count();
+        const size_t array_size = node->size(); // Uses repeat_count if repeat syntax (0 for dynamic)
 
         if (is_repeat)
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Array literal uses repeat syntax [value; {}]", array_size);
+            if (is_dynamic)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Array literal uses dynamic repeat syntax [value; expr]");
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Array literal uses repeat syntax [value; {}]", array_size);
+            }
         }
 
         // Generate first element to determine type
@@ -2785,6 +2793,65 @@ namespace Cryo::Codegen
         }
 
         // Fallback to traditional C-style array for non-Array<T> types
+        if (is_dynamic)
+        {
+            // Dynamic [value; count_expr] syntax - allocate variable-length array
+            llvm::Value *count_val = generate(node->repeat_count_expr());
+            if (!count_val)
+            {
+                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                             "Failed to generate array repeat count expression");
+                return nullptr;
+            }
+
+            // Convert count to i64 for alloca
+            llvm::Value *count_i64 = builder().CreateZExtOrTrunc(count_val,
+                                                                  llvm::Type::getInt64Ty(llvm_ctx()),
+                                                                  "array.count");
+
+            // Allocate variable-length array on stack
+            llvm::AllocaInst *array_alloca = builder().CreateAlloca(elem_type, count_i64, "array.vla");
+
+            // Generate loop to fill the array
+            llvm::Value *elem_val = cast_if_needed(first_elem, elem_type);
+
+            // Create loop blocks
+            llvm::Function *func = builder().GetInsertBlock()->getParent();
+            llvm::BasicBlock *loop_header = llvm::BasicBlock::Create(llvm_ctx(), "array.fill.header", func);
+            llvm::BasicBlock *loop_body = llvm::BasicBlock::Create(llvm_ctx(), "array.fill.body", func);
+            llvm::BasicBlock *loop_exit = llvm::BasicBlock::Create(llvm_ctx(), "array.fill.exit", func);
+
+            // Branch to loop header
+            builder().CreateBr(loop_header);
+
+            // Loop header: i = phi(0, i+1)
+            builder().SetInsertPoint(loop_header);
+            llvm::PHINode *index_phi = builder().CreatePHI(llvm::Type::getInt64Ty(llvm_ctx()), 2, "array.idx");
+            index_phi->addIncoming(llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0),
+                                   array_alloca->getParent());
+
+            // Check if i < count
+            llvm::Value *cond = builder().CreateICmpULT(index_phi, count_i64, "array.fill.cond");
+            builder().CreateCondBr(cond, loop_body, loop_exit);
+
+            // Loop body: store element
+            builder().SetInsertPoint(loop_body);
+            llvm::Value *elem_ptr = builder().CreateInBoundsGEP(elem_type, array_alloca, index_phi, "elem.ptr");
+            builder().CreateStore(elem_val, elem_ptr);
+
+            // Increment index
+            llvm::Value *next_idx = builder().CreateAdd(index_phi,
+                                                         llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 1),
+                                                         "array.idx.next");
+            index_phi->addIncoming(next_idx, loop_body);
+            builder().CreateBr(loop_header);
+
+            // Loop exit
+            builder().SetInsertPoint(loop_exit);
+
+            return array_alloca;
+        }
+
         llvm::ArrayType *array_type = llvm::ArrayType::get(elem_type, array_size);
 
         // Allocate array on stack
@@ -2846,16 +2913,33 @@ namespace Cryo::Codegen
 
         // Check for [value; count] repeat syntax
         const bool is_repeat = node->is_repeat_syntax();
-        const size_t array_size = node->size(); // Uses repeat_count if repeat syntax
+        const bool is_dynamic = node->has_dynamic_count();
+        const size_t array_size = node->size(); // Uses repeat_count if repeat syntax (0 for dynamic)
 
-        // First, create a traditional C-style array to hold the elements
-        llvm::ArrayType *raw_array_type = llvm::ArrayType::get(elem_type, array_size);
-        llvm::AllocaInst *elements_array = create_entry_alloca(raw_array_type, "array.elements");
+        llvm::Value *elements_array = nullptr;
+        llvm::Value *length_val = nullptr;
 
-        // Store elements in the raw array
-        if (is_repeat)
+        if (is_dynamic)
         {
-            // [value; count] syntax - generate value once and store into all slots
+            // Dynamic [value; count_expr] syntax
+            llvm::Value *count_val = generate(node->repeat_count_expr());
+            if (!count_val)
+            {
+                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                             "Failed to generate array repeat count expression");
+                return nullptr;
+            }
+
+            // Convert count to i64
+            length_val = builder().CreateZExtOrTrunc(count_val,
+                                                      llvm::Type::getInt64Ty(llvm_ctx()),
+                                                      "array.count");
+
+            // Allocate variable-length array on stack
+            llvm::AllocaInst *vla = builder().CreateAlloca(elem_type, length_val, "array.elements.vla");
+            elements_array = vla;
+
+            // Generate the fill value
             llvm::Value *elem_val = generate(elements[0].get());
             if (!elem_val)
             {
@@ -2865,39 +2949,92 @@ namespace Cryo::Codegen
             }
             elem_val = cast_if_needed(elem_val, elem_type);
 
-            for (size_t i = 0; i < array_size; ++i)
-            {
-                llvm::Value *indices[] = {
-                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
-                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
-                llvm::Value *elem_ptr = builder().CreateInBoundsGEP(raw_array_type, elements_array, indices,
-                                                                    "elem." + std::to_string(i) + ".ptr");
-                builder().CreateStore(elem_val, elem_ptr);
-            }
+            // Generate loop to fill the array
+            llvm::Function *func = builder().GetInsertBlock()->getParent();
+            llvm::BasicBlock *loop_header = llvm::BasicBlock::Create(llvm_ctx(), "array.fill.header", func);
+            llvm::BasicBlock *loop_body = llvm::BasicBlock::Create(llvm_ctx(), "array.fill.body", func);
+            llvm::BasicBlock *loop_exit = llvm::BasicBlock::Create(llvm_ctx(), "array.fill.exit", func);
+
+            llvm::BasicBlock *entry_block = builder().GetInsertBlock();
+            builder().CreateBr(loop_header);
+
+            // Loop header
+            builder().SetInsertPoint(loop_header);
+            llvm::PHINode *index_phi = builder().CreatePHI(llvm::Type::getInt64Ty(llvm_ctx()), 2, "array.idx");
+            index_phi->addIncoming(llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 0), entry_block);
+
+            llvm::Value *cond = builder().CreateICmpULT(index_phi, length_val, "array.fill.cond");
+            builder().CreateCondBr(cond, loop_body, loop_exit);
+
+            // Loop body
+            builder().SetInsertPoint(loop_body);
+            llvm::Value *elem_ptr = builder().CreateInBoundsGEP(elem_type, vla, index_phi, "elem.ptr");
+            builder().CreateStore(elem_val, elem_ptr);
+
+            llvm::Value *next_idx = builder().CreateAdd(index_phi,
+                                                         llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 1),
+                                                         "array.idx.next");
+            index_phi->addIncoming(next_idx, loop_body);
+            builder().CreateBr(loop_header);
+
+            // Loop exit
+            builder().SetInsertPoint(loop_exit);
         }
         else
         {
-            // Normal [a, b, c] syntax - store each element
-            for (size_t i = 0; i < elements.size(); ++i)
+            // Static size - use fixed-size array type
+            llvm::ArrayType *raw_array_type = llvm::ArrayType::get(elem_type, array_size);
+            llvm::AllocaInst *static_array = create_entry_alloca(raw_array_type, "array.elements");
+            elements_array = static_array;
+            length_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), array_size);
+
+            // Store elements in the raw array
+            if (is_repeat)
             {
-                llvm::Value *elem_val = generate(elements[i].get());
+                // [value; count] syntax - generate value once and store into all slots
+                llvm::Value *elem_val = generate(elements[0].get());
                 if (!elem_val)
                 {
                     report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
-                                 "Failed to generate array element at index " + std::to_string(i));
+                                 "Failed to generate array repeat element");
                     return nullptr;
                 }
-
-                // Cast if needed
                 elem_val = cast_if_needed(elem_val, elem_type);
 
-                // Get pointer to element
-                llvm::Value *indices[] = {
-                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
-                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
-                llvm::Value *elem_ptr = builder().CreateInBoundsGEP(raw_array_type, elements_array, indices,
-                                                                    "elem." + std::to_string(i) + ".ptr");
-                builder().CreateStore(elem_val, elem_ptr);
+                for (size_t i = 0; i < array_size; ++i)
+                {
+                    llvm::Value *indices[] = {
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
+                    llvm::Value *elem_ptr = builder().CreateInBoundsGEP(raw_array_type, static_array, indices,
+                                                                        "elem." + std::to_string(i) + ".ptr");
+                    builder().CreateStore(elem_val, elem_ptr);
+                }
+            }
+            else
+            {
+                // Normal [a, b, c] syntax - store each element
+                for (size_t i = 0; i < elements.size(); ++i)
+                {
+                    llvm::Value *elem_val = generate(elements[i].get());
+                    if (!elem_val)
+                    {
+                        report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                     "Failed to generate array element at index " + std::to_string(i));
+                        return nullptr;
+                    }
+
+                    // Cast if needed
+                    elem_val = cast_if_needed(elem_val, elem_type);
+
+                    // Get pointer to element
+                    llvm::Value *indices[] = {
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), i)};
+                    llvm::Value *elem_ptr = builder().CreateInBoundsGEP(raw_array_type, static_array, indices,
+                                                                        "elem." + std::to_string(i) + ".ptr");
+                    builder().CreateStore(elem_val, elem_ptr);
+                }
             }
         }
 
@@ -2920,10 +3057,17 @@ namespace Cryo::Codegen
         llvm::AllocaInst *array_instance = create_entry_alloca(array_struct_type, "array.instance");
 
         // Get pointer to the raw array data (elements field)
-        llvm::Value *array_data_indices[] = {
-            llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
-            llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0)};
-        llvm::Value *array_data_ptr = builder().CreateInBoundsGEP(raw_array_type, elements_array, array_data_indices, "array.data.ptr");
+        // For dynamic arrays, elements_array is already a pointer to elem_type
+        // For static arrays, we need to GEP to get pointer to first element
+        llvm::Value *array_data_ptr = elements_array;
+        if (!is_dynamic)
+        {
+            llvm::Value *array_data_indices[] = {
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0)};
+            llvm::ArrayType *raw_array_type = llvm::ArrayType::get(elem_type, array_size);
+            array_data_ptr = builder().CreateInBoundsGEP(raw_array_type, elements_array, array_data_indices, "array.data.ptr");
+        }
 
         // Set elements field (field 0)
         if (llvm::StructType *struct_type = llvm::dyn_cast<llvm::StructType>(array_struct_type))
@@ -2933,7 +3077,6 @@ namespace Cryo::Codegen
 
             // Set length field (field 1)
             llvm::Value *length_field_ptr = builder().CreateStructGEP(struct_type, array_instance, 1, "length.ptr");
-            llvm::Value *length_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), array_size);
             builder().CreateStore(length_val, length_field_ptr);
 
             // Set capacity field (field 2) - same as length for array literals
