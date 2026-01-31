@@ -717,6 +717,17 @@ namespace Cryo
 
         std::string name = type->qualified_name().name;
 
+        // Check if this struct is actually a placeholder for a type alias
+        // If so, redirect to the resolved target type
+        auto alias_it = _type_alias_targets.find(name);
+        if (alias_it != _type_alias_targets.end() && alias_it->second.is_valid())
+        {
+            LOG_DEBUG(LogComponent::CODEGEN,
+                      "TypeMapper::map_struct: '{}' is a type alias placeholder, redirecting to '{}'",
+                      name, alias_it->second->display_name());
+            return map(alias_it->second);
+        }
+
         // First check our cache
         auto existing = lookup_struct(name);
         if (existing && !existing->isOpaque())
@@ -971,7 +982,79 @@ namespace Cryo
             return nullptr;
         }
 
-        return map(target);
+        LOG_DEBUG(LogComponent::CODEGEN,
+                  "TypeMapper::map_type_alias: '{}' -> target '{}' (kind={})",
+                  type->display_name(), target->display_name(),
+                  static_cast<int>(target->kind()));
+
+        // If target is an InstantiatedType, check if it has a resolved concrete type
+        if (target->kind() == TypeKind::InstantiatedType)
+        {
+            auto *inst = static_cast<const InstantiatedType *>(target.get());
+
+            // First try: use resolved_type if available
+            if (inst->has_resolved_type())
+            {
+                TypeRef resolved = inst->resolved_type();
+                LOG_DEBUG(LogComponent::CODEGEN,
+                          "TypeMapper::map_type_alias: '{}' -> InstantiatedType has resolved_type '{}'",
+                          type->display_name(), resolved->display_name());
+                return map(resolved);
+            }
+
+            // Second try: look up by mangled name directly
+            // The monomorphized type might exist under a different name like "Result_voidp_AllocError"
+            std::string mangled = target->mangled_name();
+            if (!mangled.empty())
+            {
+                llvm::StructType *existing = llvm::StructType::getTypeByName(_llvm_ctx, mangled);
+                if (existing && !existing->isOpaque())
+                {
+                    LOG_DEBUG(LogComponent::CODEGEN,
+                              "TypeMapper::map_type_alias: '{}' found concrete type via mangled name '{}'",
+                              type->display_name(), mangled);
+                    return existing;
+                }
+            }
+
+            // Third try: if we have a generic instantiator, trigger instantiation
+            if (!_skip_generic_instantiation && _generic_instantiator)
+            {
+                TypeRef base = inst->generic_base();
+                const std::vector<TypeRef> &args = inst->type_args();
+                if (base.is_valid() && !args.empty())
+                {
+                    std::string base_name = base->display_name();
+                    LOG_DEBUG(LogComponent::CODEGEN,
+                              "TypeMapper::map_type_alias: '{}' triggering instantiation for base '{}'",
+                              type->display_name(), base_name);
+                    llvm::StructType *result = _generic_instantiator(base_name, args);
+                    if (result && !result->isOpaque())
+                    {
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // Default: delegate to map() which handles all type kinds
+        llvm::Type *result = map(target);
+
+        // Safety check: if we got an opaque struct with the alias name, that's wrong
+        // The alias should resolve to the target's concrete type, not create a new type
+        if (result && result->isStructTy())
+        {
+            auto *st = llvm::cast<llvm::StructType>(result);
+            if (st->isOpaque() && st->hasName() && st->getName().str() == type->display_name())
+            {
+                LOG_WARN(LogComponent::CODEGEN,
+                         "TypeMapper::map_type_alias: '{}' resolved to opaque struct with same name - "
+                         "this indicates the target type was not properly instantiated",
+                         type->display_name());
+            }
+        }
+
+        return result;
     }
 
     // ========================================================================

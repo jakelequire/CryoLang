@@ -2590,6 +2590,18 @@ namespace Cryo
             // TODO: Implement proper class registration with AST node
             // type_mapper->register_class_ast_node(class_decl);
         }
+        // Register type alias targets with TypeMapper for placeholder struct resolution
+        else if (auto alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(node))
+        {
+            if (alias_decl->has_resolved_target_type() && !alias_decl->is_generic())
+            {
+                TypeRef resolved_target = alias_decl->get_resolved_target_type();
+                type_mapper->register_type_alias_target(alias_decl->alias_name(), resolved_target);
+                LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                          "Registered type alias target: '{}' -> '{}'",
+                          alias_decl->alias_name(), resolved_target->display_name());
+            }
+        }
         // Recurse into program nodes
         else if (auto program = dynamic_cast<ProgramNode *>(node))
         {
