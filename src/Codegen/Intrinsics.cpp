@@ -794,6 +794,18 @@ namespace Cryo::Codegen
         else if (intrinsic_name == "panic")
             return generate_panic(args);
 
+        // Variadic argument intrinsics
+        else if (intrinsic_name == "va_arg_i32")
+            return generate_va_arg_i32(args);
+        else if (intrinsic_name == "va_arg_i64")
+            return generate_va_arg_i64(args);
+        else if (intrinsic_name == "va_arg_u64")
+            return generate_va_arg_u64(args);
+        else if (intrinsic_name == "va_arg_f64")
+            return generate_va_arg_f64(args);
+        else if (intrinsic_name == "va_arg_ptr")
+            return generate_va_arg_ptr(args);
+
         else
         {
             report_unimplemented_intrinsic(intrinsic_name, node);
@@ -7166,6 +7178,148 @@ namespace Cryo::Codegen
 
         // Narrowing conversion (truncation)
         return builder.CreateTrunc(val, to_type, "conv.trunc");
+    }
+
+    // ========================================
+    // Variadic Argument Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_va_arg_i32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("va_arg_i32 requires exactly 1 argument (va_list pointer)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *va_list_ptr = args[0];
+
+        // Load the current pointer from the va_list
+        llvm::Value *current_ptr = builder.CreateLoad(
+            llvm::PointerType::get(context, 0), va_list_ptr, "va.ptr");
+
+        // Load the i32 value from the current position
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *result = builder.CreateLoad(i32_type, current_ptr, "va.arg.i32");
+
+        // Advance the pointer by 8 bytes (varargs are passed as 64-bit values on x86_64)
+        llvm::Value *next_ptr = builder.CreateGEP(
+            llvm::Type::getInt8Ty(context), current_ptr,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8),
+            "va.next");
+
+        // Store the updated pointer back
+        builder.CreateStore(next_ptr, va_list_ptr);
+
+        return result;
+    }
+
+    llvm::Value *Intrinsics::generate_va_arg_i64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("va_arg_i64 requires exactly 1 argument (va_list pointer)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *va_list_ptr = args[0];
+
+        // Load the current pointer from the va_list
+        llvm::Value *current_ptr = builder.CreateLoad(
+            llvm::PointerType::get(context, 0), va_list_ptr, "va.ptr");
+
+        // Load the i64 value from the current position
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *result = builder.CreateLoad(i64_type, current_ptr, "va.arg.i64");
+
+        // Advance the pointer by 8 bytes
+        llvm::Value *next_ptr = builder.CreateGEP(
+            llvm::Type::getInt8Ty(context), current_ptr,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8),
+            "va.next");
+
+        // Store the updated pointer back
+        builder.CreateStore(next_ptr, va_list_ptr);
+
+        return result;
+    }
+
+    llvm::Value *Intrinsics::generate_va_arg_u64(const std::vector<llvm::Value *> &args)
+    {
+        // Same implementation as i64 - LLVM doesn't distinguish signed/unsigned at load level
+        return generate_va_arg_i64(args);
+    }
+
+    llvm::Value *Intrinsics::generate_va_arg_f64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("va_arg_f64 requires exactly 1 argument (va_list pointer)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *va_list_ptr = args[0];
+
+        // Load the current pointer from the va_list
+        llvm::Value *current_ptr = builder.CreateLoad(
+            llvm::PointerType::get(context, 0), va_list_ptr, "va.ptr");
+
+        // Load the double value from the current position
+        llvm::Type *f64_type = llvm::Type::getDoubleTy(context);
+        llvm::Value *result = builder.CreateLoad(f64_type, current_ptr, "va.arg.f64");
+
+        // Advance the pointer by 8 bytes
+        llvm::Value *next_ptr = builder.CreateGEP(
+            llvm::Type::getInt8Ty(context), current_ptr,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8),
+            "va.next");
+
+        // Store the updated pointer back
+        builder.CreateStore(next_ptr, va_list_ptr);
+
+        return result;
+    }
+
+    llvm::Value *Intrinsics::generate_va_arg_ptr(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("va_arg_ptr requires exactly 1 argument (va_list pointer)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Value *va_list_ptr = args[0];
+
+        // Load the current pointer from the va_list
+        llvm::Value *current_ptr = builder.CreateLoad(
+            llvm::PointerType::get(context, 0), va_list_ptr, "va.ptr");
+
+        // Load the pointer value from the current position
+        llvm::Type *ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Value *result = builder.CreateLoad(ptr_type, current_ptr, "va.arg.ptr");
+
+        // Advance the pointer by 8 bytes (pointer size on 64-bit)
+        llvm::Value *next_ptr = builder.CreateGEP(
+            llvm::Type::getInt8Ty(context), current_ptr,
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8),
+            "va.next");
+
+        // Store the updated pointer back
+        builder.CreateStore(next_ptr, va_list_ptr);
+
+        return result;
     }
 
 } // namespace Cryo::Codegen
