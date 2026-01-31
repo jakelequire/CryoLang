@@ -1660,7 +1660,28 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "generate_enum_variant: Found constructor function: {}",
                       ctor->getName().str());
-            return builder().CreateCall(ctor, args, variant_name);
+
+            // Coerce arguments to match constructor parameter types
+            std::vector<llvm::Value *> coerced_args;
+            llvm::FunctionType *fn_type = ctor->getFunctionType();
+
+            for (size_t i = 0; i < args.size() && i < fn_type->getNumParams(); ++i)
+            {
+                llvm::Value *arg = args[i];
+                llvm::Type *param_type = fn_type->getParamType(i);
+
+                // Handle struct-to-pointer conversion
+                if (arg && param_type->isPointerTy() && arg->getType()->isStructTy())
+                {
+                    llvm::AllocaInst *temp = create_entry_alloca(arg->getType(), "struct.arg.tmp");
+                    builder().CreateStore(arg, temp);
+                    arg = temp;
+                }
+
+                coerced_args.push_back(cast_if_needed(arg, param_type));
+            }
+
+            return builder().CreateCall(ctor, coerced_args, variant_name);
         }
 
         // For simple enum variants (no payload), look up the registered constant value
@@ -1772,7 +1793,25 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "generate_enum_variant: Created extern declaration for '{}'", qualified_variant);
 
-            return builder().CreateCall(extern_ctor, args, variant_name);
+            // Coerce arguments to match constructor parameter types
+            std::vector<llvm::Value *> coerced_args;
+            for (size_t i = 0; i < args.size() && i < ctor_type->getNumParams(); ++i)
+            {
+                llvm::Value *arg = args[i];
+                llvm::Type *param_type = ctor_type->getParamType(i);
+
+                // Handle struct-to-pointer conversion
+                if (arg && param_type->isPointerTy() && arg->getType()->isStructTy())
+                {
+                    llvm::AllocaInst *temp = create_entry_alloca(arg->getType(), "struct.arg.tmp");
+                    builder().CreateStore(arg, temp);
+                    arg = temp;
+                }
+
+                coerced_args.push_back(cast_if_needed(arg, param_type));
+            }
+
+            return builder().CreateCall(extern_ctor, coerced_args, variant_name);
         }
 
         // For simple enum variants (no args), we need the type to exist

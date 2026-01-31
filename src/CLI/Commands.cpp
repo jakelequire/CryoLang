@@ -358,13 +358,13 @@ namespace Cryo::CLI::Commands
                 if (!output_path.empty())
                 {
                     // Determine output type based on extension
-                    std::string extension = "";
-                    size_t dot_pos = output_path.find_last_of('.');
-                    if (dot_pos != std::string::npos)
+                    std::filesystem::path path_obj(output_path);
+                    std::string extension = path_obj.extension().string();
+                    if (!extension.empty() && extension[0] == '.')
                     {
-                        extension = output_path.substr(dot_pos + 1);
-                        std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+                        extension = extension.substr(1); // Remove the leading dot
                     }
+                    std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
 
                     std::cout << "\n[RAW] Generating raw output to: " << output_path << std::endl;
 
