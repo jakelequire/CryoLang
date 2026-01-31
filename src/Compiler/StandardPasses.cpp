@@ -1632,6 +1632,17 @@ namespace Cryo
         _current_struct_type = previous_struct_type;
     }
 
+    /// Helper function to unwrap TypeAlias chain to get the underlying type
+    static TypeRef unwrap_type_alias(TypeRef type)
+    {
+        while (type.is_valid() && type->kind() == TypeKind::TypeAlias)
+        {
+            auto *alias = static_cast<const TypeAliasType *>(type.get());
+            type = alias->target();
+        }
+        return type;
+    }
+
     void GenericExpressionResolutionPass::resolve_statement(StatementNode *stmt, TypeRef expected_type, PassContext &ctx)
     {
         if (!stmt)
@@ -1644,8 +1655,9 @@ namespace Cryo
             auto *ret = static_cast<ReturnStatementNode *>(stmt);
             if (ret->expression())
             {
-                // Return expressions inherit the function's return type as expected type
-                resolve_expression(ret->expression(), expected_type, ctx);
+                // Unwrap TypeAlias for return type context (e.g., AllocResult -> Result<void*, AllocError>)
+                TypeRef unwrapped_expected = unwrap_type_alias(expected_type);
+                resolve_expression(ret->expression(), unwrapped_expected, ctx);
             }
             break;
         }
@@ -2133,6 +2145,11 @@ namespace Cryo
         if (!expected_type.is_valid())
             return TypeRef{};
 
+        // Unwrap TypeAlias to get the underlying type (e.g., AllocResult -> Result<void*, AllocError>)
+        TypeRef unwrapped_expected = unwrap_type_alias(expected_type);
+        if (!unwrapped_expected.is_valid())
+            return TypeRef{};
+
         auto *generics = _compiler.generic_registry();
         if (!generics)
             return TypeRef{};
@@ -2152,19 +2169,19 @@ namespace Cryo
             }
         }
 
-        // Check if expected_type is an instantiated generic type
-        if (expected_type->kind() != TypeKind::InstantiatedType)
+        // Check if unwrapped expected_type is an instantiated generic type
+        if (unwrapped_expected->kind() != TypeKind::InstantiatedType)
         {
             // Could also be a monomorphized enum directly - check if scope_name matches
-            if (expected_type->kind() == TypeKind::Enum)
+            if (unwrapped_expected->kind() == TypeKind::Enum)
             {
-                auto *enum_type = static_cast<const EnumType *>(expected_type.get());
+                auto *enum_type = static_cast<const EnumType *>(unwrapped_expected.get());
                 std::string enum_name = enum_type->name();
 
                 // Direct match
                 if (enum_name == resolved_scope_name)
                 {
-                    return expected_type;
+                    return unwrapped_expected;
                 }
 
                 // Monomorphized name match (e.g., "Option_String" starts with "Option")
@@ -2176,22 +2193,22 @@ namespace Cryo
                     LOG_DEBUG(LogComponent::GENERAL,
                               "resolve_generic_enum_variant: Matched monomorphized enum '{}' to generic '{}'",
                               enum_name, resolved_scope_name);
-                    return expected_type;
+                    return unwrapped_expected;
                 }
 
                 // Also check if the enum is a generic enum that needs resolution
                 // This handles cases where the EnumType is the base generic type
             }
             LOG_DEBUG(LogComponent::GENERAL,
-                      "resolve_generic_enum_variant: expected_type is not InstantiatedType (kind={}, name='{}'), scope='{}', member='{}'",
-                      static_cast<int>(expected_type->kind()),
-                      expected_type->display_name(),
+                      "resolve_generic_enum_variant: unwrapped_expected is not InstantiatedType (kind={}, name='{}'), scope='{}', member='{}'",
+                      static_cast<int>(unwrapped_expected->kind()),
+                      unwrapped_expected->display_name(),
                       resolved_scope_name,
                       member_name);
             return TypeRef{};
         }
 
-        auto *inst_type = static_cast<const InstantiatedType *>(expected_type.get());
+        auto *inst_type = static_cast<const InstantiatedType *>(unwrapped_expected.get());
         TypeRef base_type = inst_type->generic_base();
 
         if (!base_type.is_valid())
@@ -2232,7 +2249,7 @@ namespace Cryo
             }
         }
 
-        // The expected_type (the InstantiatedType) is the correct resolved type
+        // The unwrapped_expected (the InstantiatedType) is the correct resolved type
         // If it has a resolved_type (the monomorphized concrete enum), use that
         if (inst_type->has_resolved_type())
         {
@@ -2240,17 +2257,17 @@ namespace Cryo
         }
 
         // Try to look up the concrete monomorphized type
-        TypeRef concrete = lookup_concrete_type(expected_type, ctx);
+        TypeRef concrete = lookup_concrete_type(unwrapped_expected, ctx);
         if (concrete.is_valid())
         {
             LOG_DEBUG(LogComponent::GENERAL,
                       "resolve_generic_enum_variant: Found concrete type '{}' for InstantiatedType '{}'",
-                      concrete->display_name(), expected_type->display_name());
+                      concrete->display_name(), unwrapped_expected->display_name());
             return concrete;
         }
 
         // Otherwise, use the InstantiatedType itself - it will be resolved during codegen
-        return expected_type;
+        return unwrapped_expected;
     }
 
     TypeRef GenericExpressionResolutionPass::resolve_generic_static_method(
