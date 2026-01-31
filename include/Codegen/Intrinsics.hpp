@@ -390,6 +390,13 @@ namespace Cryo::Codegen
         llvm::Value* generate_float32_to_string(const std::vector<llvm::Value*>& args);
         llvm::Value* generate_float64_to_string(const std::vector<llvm::Value*>& args);
 
+        // Variadic argument intrinsics (va_arg)
+        llvm::Value* generate_va_arg_i32(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_va_arg_i64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_va_arg_u64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_va_arg_f64(const std::vector<llvm::Value*>& args);
+        llvm::Value* generate_va_arg_ptr(const std::vector<llvm::Value*>& args);
+
         // Type conversion intrinsics
         llvm::Value* generate_integer_extension(const std::vector<llvm::Value*>& args, 
                                                unsigned source_bits, unsigned target_bits, bool is_signed);
