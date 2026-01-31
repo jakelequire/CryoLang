@@ -91,6 +91,10 @@ namespace Cryo
         // for cross-module generic types)
         bool _skip_generic_instantiation = false;
 
+        // Type alias resolution map: alias name -> resolved target TypeRef
+        // This is used to redirect placeholder structs to their actual types
+        std::unordered_map<std::string, TypeRef> _type_alias_targets;
+
         // Error state
         bool _has_error = false;
         std::string _last_error;
@@ -149,6 +153,18 @@ namespace Cryo
          * method generation through _generic_instantiator.
          */
         void set_skip_generic_instantiation(bool skip) { _skip_generic_instantiation = skip; }
+
+        /**
+         * @brief Register a type alias target for placeholder struct resolution.
+         * When a placeholder struct with `alias_name` is mapped, this will redirect
+         * to the `resolved_target` type instead of creating an opaque struct.
+         * @param alias_name The name of the type alias (e.g., "AllocResult")
+         * @param resolved_target The resolved target type (e.g., Result<void*, AllocError>)
+         */
+        void register_type_alias_target(const std::string &alias_name, TypeRef resolved_target)
+        {
+            _type_alias_targets[alias_name] = resolved_target;
+        }
 
         // ====================================================================
         // Primary Interface
