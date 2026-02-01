@@ -2518,6 +2518,113 @@ namespace Cryo::Codegen
                     }
                 }
             }
+            // Fallback: If object is an ArrayAccessNode (e.g., entries[i].state), resolve the element type
+            else if (auto *array_access = dynamic_cast<Cryo::ArrayAccessNode *>(object))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_member_info: Object is ArrayAccessNode, resolving array element type");
+
+                // Get the type of the array expression (e.g., entries in entries[i])
+                TypeRef array_type = array_access->array()->get_resolved_type();
+                if (!array_type)
+                {
+                    // Try to get from variable_types_map if array is an identifier
+                    if (auto *arr_id = dynamic_cast<Cryo::IdentifierNode *>(array_access->array()))
+                    {
+                        auto &var_types = ctx().variable_types_map();
+                        auto it = var_types.find(arr_id->name());
+                        if (it != var_types.end() && it->second.is_valid())
+                        {
+                            array_type = it->second;
+                        }
+                    }
+                    // Try to resolve if array is a member access (e.g., this.entries)
+                    else if (auto *arr_member = dynamic_cast<Cryo::MemberAccessNode *>(array_access->array()))
+                    {
+                        llvm::StructType *arr_struct = nullptr;
+                        unsigned arr_field_idx = 0;
+                        if (resolve_member_info(arr_member->object(), arr_member->member(), arr_struct, arr_field_idx))
+                        {
+                            // Get the field type from TemplateRegistry
+                            TypeRef arr_obj_type = arr_member->object()->get_resolved_type();
+                            std::string arr_type_name;
+
+                            if (arr_obj_type)
+                            {
+                                arr_type_name = arr_obj_type->display_name();
+                                if (arr_obj_type->kind() == Cryo::TypeKind::Reference)
+                                {
+                                    auto *ref = dynamic_cast<const Cryo::ReferenceType *>(arr_obj_type.get());
+                                    if (ref && ref->referent())
+                                    {
+                                        arr_type_name = ref->referent()->display_name();
+                                    }
+                                }
+                                else if (arr_obj_type->kind() == Cryo::TypeKind::Pointer)
+                                {
+                                    auto *ptr = dynamic_cast<const Cryo::PointerType *>(arr_obj_type.get());
+                                    if (ptr && ptr->pointee())
+                                    {
+                                        arr_type_name = ptr->pointee()->display_name();
+                                    }
+                                }
+                            }
+
+                            if (!arr_type_name.empty())
+                            {
+                                if (auto *template_reg = ctx().template_registry())
+                                {
+                                    std::vector<std::string> candidates = {arr_type_name};
+                                    if (!ctx().namespace_context().empty())
+                                    {
+                                        candidates.push_back(ctx().namespace_context() + "::" + arr_type_name);
+                                    }
+
+                                    for (const auto &candidate : candidates)
+                                    {
+                                        const auto *field_info = template_reg->get_struct_field_types(candidate);
+                                        if (field_info && arr_field_idx < field_info->field_types.size())
+                                        {
+                                            array_type = field_info->field_types[arr_field_idx];
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "resolve_member_info: Resolved array field '{}' type to '{}'",
+                                                      arr_member->member(), array_type ? array_type->display_name() : "<null>");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Now extract the element type from the array/pointer type
+                if (array_type)
+                {
+                    if (array_type->kind() == Cryo::TypeKind::Pointer)
+                    {
+                        auto *ptr = dynamic_cast<const Cryo::PointerType *>(array_type.get());
+                        if (ptr && ptr->pointee())
+                        {
+                            obj_type = ptr->pointee();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_member_info: ArrayAccessNode - extracted pointee type: {}",
+                                      obj_type->display_name());
+                        }
+                    }
+                    else if (array_type->kind() == Cryo::TypeKind::Array)
+                    {
+                        auto *arr = dynamic_cast<const Cryo::ArrayType *>(array_type.get());
+                        if (arr && arr->element())
+                        {
+                            obj_type = arr->element();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_member_info: ArrayAccessNode - extracted array element type: {}",
+                                      obj_type->display_name());
+                        }
+                    }
+                }
+            }
 
             if (!obj_type)
             {

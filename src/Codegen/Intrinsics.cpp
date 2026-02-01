@@ -26,6 +26,9 @@ namespace Cryo::Codegen
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating intrinsic call: {}", intrinsic_name);
 
+        // Store current node for error context
+        _current_node = node;
+
         // Memory allocation intrinsics
         if (intrinsic_name == "malloc")
             return generate_malloc(args);
@@ -1015,7 +1018,8 @@ namespace Cryo::Codegen
     {
         if (args.size() != 3)
         {
-            report_error("memcpy requires exactly 3 arguments (dest, src, n)");
+            report_error("memcpy requires exactly 3 arguments (dest, src, n), but got " +
+                         std::to_string(args.size()));
             return nullptr;
         }
 
@@ -2223,10 +2227,15 @@ namespace Cryo::Codegen
         _has_errors = true;
         _last_error = message;
 
-        // Report to DiagEmitter if available
+        // Report to DiagEmitter if available, with location context from current node
         if (_diagnostics)
         {
-            _diagnostics->emit(Diag::error(Cryo::ErrorCode::E0600_CODEGEN_FAILED, message));
+            auto diag = Diag::error(Cryo::ErrorCode::E0600_CODEGEN_FAILED, message);
+            if (_current_node)
+            {
+                diag.at(_current_node);
+            }
+            _diagnostics->emit(std::move(diag));
         }
 
         std::cerr << "[Intrinsics] Error: " << message << std::endl;
@@ -3300,7 +3309,8 @@ namespace Cryo::Codegen
     {
         if (args.size() != 3)
         {
-            report_error("read requires exactly 3 arguments (fd, buffer, count)");
+            report_error("intrinsics::read requires exactly 3 arguments (fd, buffer, count), but got " +
+                         std::to_string(args.size()) + ". Did you mean to call a method instead?");
             return nullptr;
         }
 
@@ -3328,7 +3338,8 @@ namespace Cryo::Codegen
     {
         if (args.size() != 3)
         {
-            report_error("write requires exactly 3 arguments (fd, buffer, count)");
+            report_error("intrinsics::write requires exactly 3 arguments (fd, buffer, count), but got " +
+                         std::to_string(args.size()) + ". Did you mean to call a method instead?");
             return nullptr;
         }
 
@@ -6292,7 +6303,8 @@ namespace Cryo::Codegen
     {
         if (args.size() != 3)
         {
-            report_error("accept requires exactly 3 arguments (sockfd, addr, addrlen)");
+            report_error("intrinsics::accept requires exactly 3 arguments (sockfd, addr, addrlen), but got " +
+                         std::to_string(args.size()) + ". Did you mean to call a method instead?");
             return nullptr;
         }
 
