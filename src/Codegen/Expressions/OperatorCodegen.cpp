@@ -170,7 +170,7 @@ namespace Cryo::Codegen
             if (right_type && right_type->is_enum())
                 rhs = extract_enum_discriminant(rhs, right_type);
 
-            return generate_comparison(op, lhs, rhs, left_type);
+            return generate_comparison(op, lhs, rhs, left_type, node);
         }
 
         case BinaryOpClass::Bitwise:
@@ -1300,7 +1300,8 @@ namespace Cryo::Codegen
     llvm::Value *OperatorCodegen::generate_comparison(TokenKind op,
                                                       llvm::Value *lhs,
                                                       llvm::Value *rhs,
-                                                      TypeRef operand_type)
+                                                      TypeRef operand_type,
+                                                      Cryo::BinaryExpressionNode *node)
     {
         if (!lhs || !rhs)
             return nullptr;
@@ -1332,6 +1333,17 @@ namespace Cryo::Codegen
                   "generate_comparison: lhs type = {}, rhs type = {}",
                   lhs->getType()->getTypeID(), rhs->getType()->getTypeID());
 
+        // Get type names from AST for better error messages
+        std::string lhs_type_name = "unknown";
+        std::string rhs_type_name = "unknown";
+        if (node)
+        {
+            if (node->left() && node->left()->get_resolved_type())
+                lhs_type_name = node->left()->get_resolved_type()->display_name();
+            if (node->right() && node->right()->get_resolved_type())
+                rhs_type_name = node->right()->get_resolved_type()->display_name();
+        }
+
         // Ensure compatible types
         if (!ensure_compatible_types(lhs, rhs))
         {
@@ -1339,11 +1351,13 @@ namespace Cryo::Codegen
                       "generate_comparison: Types are incompatible and cannot be converted. "
                       "lhs type ID = {}, rhs type ID = {}",
                       lhs->getType()->getTypeID(), rhs->getType()->getTypeID());
-            std::string e = "Incompatible types for comparison: " +
-                            TypeIDToString(lhs->getType()->getTypeID()) + " and " +
-                            TypeIDToString(rhs->getType()->getTypeID());
-            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
-                         e.c_str());
+
+            std::string e = "Cannot compare `" + lhs_type_name + "` with `" + rhs_type_name + "`";
+
+            if (node)
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, e);
+            else
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, e.c_str());
             return nullptr;
         }
 
@@ -1362,17 +1376,17 @@ namespace Cryo::Codegen
 
         if (type->isPointerTy())
         {
-            return generate_pointer_comparison(op, lhs, rhs);
+            return generate_pointer_comparison(op, lhs, rhs, node);
         }
 
-        std::string e = "Comparison not supported for type: " +
-                        TypeIDToString(type->getTypeID()) +
-                        " Type Name: `" +
-                        (type ? type->getStructName().str() : "unknown") +
-                        "` With operand type: `" +
-                        (operand_type ? operand_type->display_name() : "unknown") + "`";
+        std::string e = "Comparison not supported for type `" + lhs_type_name + "`";
+        if (lhs_type_name != rhs_type_name)
+            e += " with `" + rhs_type_name + "`";
 
-        report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, e.c_str());
+        if (node)
+            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, e);
+        else
+            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, e.c_str());
         return nullptr;
     }
 
@@ -1445,7 +1459,8 @@ namespace Cryo::Codegen
 
     llvm::Value *OperatorCodegen::generate_pointer_comparison(TokenKind op,
                                                               llvm::Value *lhs,
-                                                              llvm::Value *rhs)
+                                                              llvm::Value *rhs,
+                                                              Cryo::BinaryExpressionNode *node)
     {
         llvm::IRBuilder<> &b = builder();
 
@@ -1458,9 +1473,15 @@ namespace Cryo::Codegen
             return b.CreateICmpNE(lhs, rhs, "ptr_ne");
 
         default:
-            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
-                         "Only equality comparisons supported for pointers");
+        {
+            std::string op_str = node ? std::string(node->operator_token().text()) : "comparison";
+            std::string e = "Only equality comparisons (== and !=) are supported for pointers, not `" + op_str + "`";
+            if (node)
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, e);
+            else
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, e.c_str());
             return nullptr;
+        }
         }
     }
 

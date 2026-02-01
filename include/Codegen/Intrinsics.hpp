@@ -422,6 +422,7 @@ namespace Cryo::Codegen
         Cryo::DiagEmitter* _diagnostics;
         bool _has_errors;
         std::string _last_error;
+        Cryo::CallExpressionNode* _current_node = nullptr;  // Current call for error context
 
         // Helper methods
         void report_error(const std::string& message);
