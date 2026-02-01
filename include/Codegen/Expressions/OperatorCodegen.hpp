@@ -211,12 +211,14 @@ namespace Cryo::Codegen
          * @param lhs Left operand
          * @param rhs Right operand
          * @param operand_type Type of operands (for signed/unsigned)
+         * @param node Optional AST node for error location context
          * @return Boolean result (i1)
          */
         llvm::Value *generate_comparison(TokenKind op,
                                          llvm::Value *lhs,
                                          llvm::Value *rhs,
-                                         TypeRef operand_type = TypeRef{});
+                                         TypeRef operand_type = TypeRef{},
+                                         Cryo::BinaryExpressionNode *node = nullptr);
 
         /**
          * @brief Generate integer comparison
@@ -247,11 +249,13 @@ namespace Cryo::Codegen
          * @param op Operator token kind
          * @param lhs Left operand
          * @param rhs Right operand
+         * @param node Optional AST node for error location context
          * @return Boolean result (i1)
          */
         llvm::Value *generate_pointer_comparison(TokenKind op,
                                                  llvm::Value *lhs,
-                                                 llvm::Value *rhs);
+                                                 llvm::Value *rhs,
+                                                 Cryo::BinaryExpressionNode *node = nullptr);
 
         //===================================================================
         // Logical Operations
