@@ -817,12 +817,6 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "classify_call: MemberAccessNode with member '{}'", method_name);
 
-            // Check if method is an intrinsic
-            if (is_intrinsic(method_name))
-            {
-                return CallKind::Intrinsic;
-            }
-
             // Check if object is an identifier (could be namespace or variable)
             if (auto *obj_id = dynamic_cast<IdentifierNode *>(member->object()))
             {
@@ -830,6 +824,14 @@ namespace Cryo::Codegen
 
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "classify_call: Object identifier is '{}'", obj_name);
+
+                // ONLY classify as intrinsic if the object is the 'intrinsics' namespace
+                // This prevents method calls like this.read(buf, len) from being
+                // misclassified as intrinsic calls like intrinsics::read(fd, buf, len)
+                if (obj_name == "intrinsics" && is_intrinsic(method_name))
+                {
+                    return CallKind::Intrinsic;
+                }
 
                 // Check if it's an enum variant
                 if (is_enum_type(obj_name))
