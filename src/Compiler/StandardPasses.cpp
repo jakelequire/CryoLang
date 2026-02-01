@@ -731,7 +731,35 @@ namespace Cryo
                         if (param->name() == "this" && param->has_resolved_type())
                         {
                             TypeRef current_type = param->get_resolved_type();
-                            if (current_type.is_error())
+
+                            // Determine if 'this' needs reconstruction
+                            bool needs_reconstruction = current_type.is_error();
+
+                            // Check if impl block is generic
+                            bool impl_is_generic = !impl_ctx.generic_bindings.empty();
+
+                            if (!needs_reconstruction && impl_is_generic)
+                            {
+                                // Get inner type (dereference if reference)
+                                TypeRef inner_type = current_type;
+                                if (current_type->kind() == TypeKind::Reference)
+                                {
+                                    auto *ref = static_cast<const ReferenceType *>(current_type.get());
+                                    inner_type = ref->referent();
+                                }
+
+                                // If inner type is not instantiated and doesn't contain generic params,
+                                // the parser incorrectly resolved to just the base type
+                                if (!inner_type->is_instantiated() && !contains_generic_params(inner_type))
+                                {
+                                    needs_reconstruction = true;
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                        "TypeResolutionPass: 'this' type '{}' for generic impl '{}::{}' needs reconstruction",
+                                        current_type->display_name(), impl->target_type(), method->name());
+                                }
+                            }
+
+                            if (needs_reconstruction)
                             {
                                 // The parser created an error type - try to resolve using impl target
                                 const std::string &target = impl->target_type();
