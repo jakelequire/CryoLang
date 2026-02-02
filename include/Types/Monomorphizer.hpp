@@ -131,6 +131,9 @@ namespace Cryo
         // Processed specializations: key -> entry
         std::unordered_map<std::string, SpecializationEntry> _specializations;
 
+        // Lookup map from specialized_name to key for get_specialization_by_name
+        std::unordered_map<std::string, std::string> _name_to_key;
+
         // Track which requests are in progress (cycle detection)
         std::unordered_set<std::string> _in_progress;
 
@@ -244,9 +247,17 @@ namespace Cryo
         bool has_specialization(const std::string &key) const;
 
         /**
-         * @brief Get a cached specialization
+         * @brief Get a cached specialization by key
          */
         std::optional<SpecializationEntry> get_specialization(const std::string &key) const;
+
+        /**
+         * @brief Get a cached specialization by mangled type name
+         *
+         * This looks up specializations by the generated specialized_name
+         * (e.g., "Array_Token") rather than the TypeID-based key.
+         */
+        std::optional<SpecializationEntry> get_specialization_by_name(const std::string &specialized_name) const;
 
         /**
          * @brief Get all specializations
@@ -304,6 +315,7 @@ namespace Cryo
             _pending_requests.clear();
             _specializations.clear();
             _in_progress.clear();
+            _name_to_key.clear();
         }
 
         // ====================================================================

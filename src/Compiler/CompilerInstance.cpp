@@ -75,6 +75,18 @@ namespace Cryo
             *_generic_registry,
             _ast_context->modules());
 
+        // Create AST specializer and register callback with Monomorphizer
+        _ast_specializer = std::make_unique<ASTSpecializer>(*_ast_context, _ast_context->types());
+
+        // Capture specializer by raw pointer for the callback (it outlives the callback)
+        ASTSpecializer *specializer = _ast_specializer.get();
+        _monomorphization_pass->set_ast_specializer(
+            [specializer](const GenericTemplate &tmpl,
+                          const TypeSubstitution &subst,
+                          const std::string &specialized_name) -> ASTNode * {
+                return specializer->specialize(tmpl, subst, specialized_name);
+            });
+
         // Create template registry
         _template_registry = std::make_unique<TemplateRegistry>();
 
@@ -431,6 +443,13 @@ namespace Cryo
             {
                 _codegen->get_visitor()->context().set_template_registry(_template_registry.get());
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Set TemplateRegistry in CodegenContext for cross-module resolution");
+            }
+
+            // Set Monomorphizer for access to specialized ASTs during codegen
+            if (_codegen->ensure_visitor_initialized() && _monomorphization_pass)
+            {
+                _codegen->get_visitor()->context().set_monomorphizer(_monomorphization_pass.get());
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Set Monomorphizer in CodegenContext for specialized AST access");
             }
 
             if (_debug_mode)
@@ -3430,6 +3449,13 @@ namespace Cryo
             {
                 _codegen->get_visitor()->context().set_template_registry(_template_registry.get());
                 LOG_DEBUG(LogComponent::GENERAL, "Set TemplateRegistry in CodegenContext for cross-module resolution");
+            }
+
+            // Set Monomorphizer for access to specialized ASTs during codegen
+            if (_codegen->ensure_visitor_initialized() && _monomorphization_pass)
+            {
+                _codegen->get_visitor()->context().set_monomorphizer(_monomorphization_pass.get());
+                LOG_DEBUG(LogComponent::GENERAL, "Set Monomorphizer in CodegenContext for specialized AST access");
             }
 
             LOG_DEBUG(LogComponent::GENERAL, "Parsing phase: AST created with module name '{}'", namespace_for_module);
