@@ -12,6 +12,9 @@
 
 namespace Cryo
 {
+    // Forward declaration for static helper
+    static std::string mangle_display_name(const std::string &display_name);
+
     // ========================================================================
     // Construction
     // ========================================================================
@@ -1154,11 +1157,43 @@ namespace Cryo
         LOG_DEBUG(LogComponent::CODEGEN, "TypeMapper::map_instantiated: '{}' has NO resolved_type, falling through",
                   name);
 
-        // Check if already exists and is complete
+        // Check if already exists and is complete - try display name first
         auto existing = lookup_struct(name);
         if (existing && !existing->isOpaque())
         {
             return existing;
+        }
+
+        // Also try the mangled name - GenericCodegen registers structs under mangled names
+        // (e.g., "Option_voidp" instead of "Option<void*>")
+        std::string mangled = mangle_display_name(name);
+        if (mangled != name)
+        {
+            // Check our cache under mangled name
+            auto mangled_existing = lookup_struct(mangled);
+            if (mangled_existing && !mangled_existing->isOpaque())
+            {
+                // Cache under display name too for future lookups
+                _struct_cache[name] = mangled_existing;
+                LOG_DEBUG(LogComponent::CODEGEN,
+                          "TypeMapper::map_instantiated: Found '{}' under mangled name '{}'",
+                          name, mangled);
+                return mangled_existing;
+            }
+
+            // Check LLVM context directly - the struct might exist there but not in our cache
+            if (llvm::StructType *llvm_mangled = llvm::StructType::getTypeByName(_llvm_ctx, mangled))
+            {
+                if (!llvm_mangled->isOpaque())
+                {
+                    _struct_cache[name] = llvm_mangled;
+                    _struct_cache[mangled] = llvm_mangled;
+                    LOG_DEBUG(LogComponent::CODEGEN,
+                              "TypeMapper::map_instantiated: Found '{}' in LLVM context as '{}'",
+                              name, mangled);
+                    return llvm_mangled;
+                }
+            }
         }
 
         // Try instantiation callback (takes TypeRef base)

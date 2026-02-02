@@ -1879,14 +1879,45 @@ namespace Cryo
             {
                 // Method call: obj.method(arg) - try to get method signature from receiver type
                 TypeRef receiver_type = member->object()->get_resolved_type();
+                std::string method_name = member->member();
+
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "GenericExpressionResolutionPass: Member call '?.{}', receiver_type valid={}",
+                          method_name, receiver_type.is_valid());
+
                 if (receiver_type.is_valid())
                 {
-                    std::string method_name = member->member();
-                    // Try to find method in struct/class type
-                    if (receiver_type->kind() == TypeKind::Struct)
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "GenericExpressionResolutionPass: Receiver type '{}' kind={}",
+                              receiver_type->display_name(), static_cast<int>(receiver_type->kind()));
+
+                    // Dereference pointer/reference types to get the underlying struct/class
+                    TypeRef underlying_type = receiver_type;
+                    if (receiver_type->kind() == TypeKind::Pointer)
                     {
-                        auto *struct_type = static_cast<const StructType *>(receiver_type.get());
+                        auto *ptr_type = static_cast<const PointerType *>(receiver_type.get());
+                        underlying_type = ptr_type->pointee();
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "GenericExpressionResolutionPass: Dereferenced pointer to '{}'",
+                                  underlying_type.is_valid() ? underlying_type->display_name() : "<invalid>");
+                    }
+                    else if (receiver_type->kind() == TypeKind::Reference)
+                    {
+                        auto *ref_type = static_cast<const ReferenceType *>(receiver_type.get());
+                        underlying_type = ref_type->referent();
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "GenericExpressionResolutionPass: Dereferenced reference to '{}'",
+                                  underlying_type.is_valid() ? underlying_type->display_name() : "<invalid>");
+                    }
+
+                    // Try to find method in struct/class type
+                    if (underlying_type.is_valid() && underlying_type->kind() == TypeKind::Struct)
+                    {
+                        auto *struct_type = static_cast<const StructType *>(underlying_type.get());
                         const MethodInfo *method_info = struct_type->get_method(method_name);
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "GenericExpressionResolutionPass: Looking for method '{}' on struct '{}', found={}",
+                                  method_name, struct_type->display_name(), method_info != nullptr);
                         if (method_info && method_info->function_type.is_valid() &&
                             method_info->function_type->kind() == TypeKind::Function)
                         {
@@ -1897,14 +1928,20 @@ namespace Cryo
                             {
                                 param_types.erase(param_types.begin());
                             }
+                            // Set the resolved return type for this call expression
+                            TypeRef return_type = func_type->return_type();
+                            if (return_type.is_valid())
+                            {
+                                call->set_resolved_type(return_type);
+                            }
                             LOG_DEBUG(LogComponent::GENERAL,
                                       "GenericExpressionResolutionPass: Found method '{}.{}' with {} params",
-                                      receiver_type->display_name(), method_name, param_types.size());
+                                      underlying_type->display_name(), method_name, param_types.size());
                         }
                     }
-                    else if (receiver_type->kind() == TypeKind::Class)
+                    else if (underlying_type.is_valid() && underlying_type->kind() == TypeKind::Class)
                     {
-                        auto *class_type = static_cast<const ClassType *>(receiver_type.get());
+                        auto *class_type = static_cast<const ClassType *>(underlying_type.get());
                         const MethodInfo *method_info = class_type->get_method(method_name);
                         if (method_info && method_info->function_type.is_valid() &&
                             method_info->function_type->kind() == TypeKind::Function)
@@ -1916,9 +1953,15 @@ namespace Cryo
                             {
                                 param_types.erase(param_types.begin());
                             }
+                            // Set the resolved return type for this call expression
+                            TypeRef return_type = func_type->return_type();
+                            if (return_type.is_valid())
+                            {
+                                call->set_resolved_type(return_type);
+                            }
                             LOG_DEBUG(LogComponent::GENERAL,
                                       "GenericExpressionResolutionPass: Found method '{}.{}' with {} params",
-                                      receiver_type->display_name(), method_name, param_types.size());
+                                      underlying_type->display_name(), method_name, param_types.size());
                         }
                     }
                 }

@@ -2235,11 +2235,30 @@ namespace Cryo
                                         if (all_generic_params)
                                         {
                                             // This is a valid generic type using impl's generic params
-                                            // Set the base type - the generic params will be resolved at instantiation
-                                            param->set_resolved_type(param_base_type);
+                                            // Create an InstantiatedType with GenericParamTypes so that
+                                            // substitute_type_params() can properly substitute T -> concrete type
+                                            std::vector<TypeRef> generic_type_args;
+                                            for (size_t i = 0; i < type_args.size(); ++i)
+                                            {
+                                                // Find the index of this type arg in impl_generic_params
+                                                size_t param_index = 0;
+                                                for (size_t j = 0; j < impl_generic_params.size(); ++j)
+                                                {
+                                                    if (type_args[i] == impl_generic_params[j])
+                                                    {
+                                                        param_index = j;
+                                                        break;
+                                                    }
+                                                }
+                                                TypeRef gp_type = arena.create_generic_param(type_args[i], param_index);
+                                                generic_type_args.push_back(gp_type);
+                                            }
+                                            // Create InstantiatedType: e.g., Option<T> where T is GenericParamType
+                                            TypeRef instantiated_param_type = arena.create_instantiation(param_base_type, generic_type_args);
+                                            param->set_resolved_type(instantiated_param_type);
                                             LOG_DEBUG(LogComponent::GENERAL,
-                                                      "ModuleLoader: Resolved generic param '{}' for impl '{}::{}' to base type '{}'",
-                                                      param->name(), target, method->name(), param_base_type->display_name());
+                                                      "ModuleLoader: Resolved generic param '{}' for impl '{}::{}' to instantiated type '{}'",
+                                                      param->name(), target, method->name(), instantiated_param_type->display_name());
                                         }
                                     }
                                 }

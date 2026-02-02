@@ -6,6 +6,7 @@
 #include "Types/GenericTypes.hpp"
 #include "Types/UserDefinedTypes.hpp"
 #include "Types/TypeAnnotation.hpp"
+#include "Types/ErrorType.hpp"
 #include "Utils/Logger.hpp"
 
 #include <unordered_set>
@@ -190,6 +191,7 @@ namespace Cryo::Codegen
         // Create struct type OR reuse existing one
         llvm::StructType *struct_type = nullptr;
         std::vector<std::string> field_names;
+        std::vector<TypeRef> substituted_field_types;  // For TemplateRegistry field type registration
 
         if (type_already_exists)
         {
@@ -198,9 +200,15 @@ namespace Cryo::Codegen
             if (struct_decl)
             {
                 field_names.reserve(struct_decl->fields().size());
+                substituted_field_types.reserve(struct_decl->fields().size());
                 for (const auto &field : struct_decl->fields())
                 {
                     field_names.push_back(field->name());
+
+                    // Collect substituted TypeRef for TemplateRegistry
+                    TypeRef field_type = field->get_resolved_type();
+                    TypeRef substituted = substitute_type_params(field_type);
+                    substituted_field_types.push_back(substituted.is_valid() ? substituted : TypeRef{});
                 }
             }
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -219,11 +227,17 @@ namespace Cryo::Codegen
                 std::vector<llvm::Type *> field_types = create_substituted_fields(struct_decl->fields());
                 struct_type->setBody(field_types);
 
-                // Collect field names for member access resolution
+                // Collect field names AND substituted TypeRefs for member access resolution
                 field_names.reserve(struct_decl->fields().size());
+                substituted_field_types.reserve(struct_decl->fields().size());
                 for (const auto &field : struct_decl->fields())
                 {
                     field_names.push_back(field->name());
+
+                    // Collect substituted TypeRef for TemplateRegistry
+                    TypeRef field_type = field->get_resolved_type();
+                    TypeRef substituted = substitute_type_params(field_type);
+                    substituted_field_types.push_back(substituted.is_valid() ? substituted : TypeRef{});
                 }
 
                 // Safety check: verify struct body has correct number of elements
@@ -291,6 +305,29 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "GenericCodegen: Pre-registered {} field names for struct {} before method generation",
                       field_names.size(), mangled);
+        }
+
+        // Register field types in TemplateRegistry for nested member access resolution
+        // This enables resolution of patterns like this.entries[i].state in generic contexts
+        if (!substituted_field_types.empty())
+        {
+            if (auto *template_reg = ctx().template_registry())
+            {
+                std::string source_ns = base_namespace.empty() ? ctx().namespace_context() : base_namespace;
+
+                template_reg->register_struct_field_types(mangled, field_names, substituted_field_types, source_ns);
+
+                // Also register with qualified name for cross-module access
+                if (!source_ns.empty())
+                {
+                    std::string qualified_name = source_ns + "::" + mangled;
+                    template_reg->register_struct_field_types(qualified_name, field_names, substituted_field_types, source_ns);
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Registered {} field types in TemplateRegistry for instantiated struct {}",
+                          substituted_field_types.size(), mangled);
+            }
         }
 
         // Generate methods for the instantiated struct while type params are still in scope
@@ -605,16 +642,23 @@ namespace Cryo::Codegen
 
         // Substitute type parameters in fields and collect field names
         std::vector<std::string> field_names;
+        std::vector<TypeRef> substituted_field_types;  // For TemplateRegistry field type registration
         if (class_decl)
         {
             std::vector<llvm::Type *> field_types = create_substituted_fields(class_decl->fields());
             class_type->setBody(field_types);
 
-            // Collect field names for member access resolution
+            // Collect field names AND substituted TypeRefs for member access resolution
             field_names.reserve(class_decl->fields().size());
+            substituted_field_types.reserve(class_decl->fields().size());
             for (const auto &field : class_decl->fields())
             {
                 field_names.push_back(field->name());
+
+                // Collect substituted TypeRef for TemplateRegistry
+                TypeRef field_type = field->get_resolved_type();
+                TypeRef substituted = substitute_type_params(field_type);
+                substituted_field_types.push_back(substituted.is_valid() ? substituted : TypeRef{});
             }
 
             // Safety check: verify class body has correct number of elements
@@ -679,6 +723,29 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "GenericCodegen: Pre-registered {} field names for class {} before method generation",
                       field_names.size(), mangled);
+        }
+
+        // Register field types in TemplateRegistry for nested member access resolution
+        // This enables resolution of patterns like this.entries[i].state in generic contexts
+        if (!substituted_field_types.empty())
+        {
+            if (auto *template_reg = ctx().template_registry())
+            {
+                std::string source_ns = base_namespace.empty() ? ctx().namespace_context() : base_namespace;
+
+                template_reg->register_struct_field_types(mangled, field_names, substituted_field_types, source_ns);
+
+                // Also register with qualified name for cross-module access
+                if (!source_ns.empty())
+                {
+                    std::string qualified_name = source_ns + "::" + mangled;
+                    template_reg->register_struct_field_types(qualified_name, field_names, substituted_field_types, source_ns);
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Registered {} field types in TemplateRegistry for instantiated class {}",
+                          substituted_field_types.size(), mangled);
+            }
         }
 
         // Generate methods for the instantiated class while type params are still in scope
@@ -1391,6 +1458,15 @@ namespace Cryo::Codegen
                         for (auto &arg : fn->args())
                         {
                             std::string param_name = arg.getName().str();
+
+                            // Debug: Log LLVM argument type
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "GenericCodegen: Enum method arg '{}' LLVM type ID={}, isStruct={}, isInt={}",
+                                      param_name,
+                                      arg.getType()->getTypeID(),
+                                      arg.getType()->isStructTy(),
+                                      arg.getType()->isIntegerTy());
+
                             llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
                             create_store(&arg, alloca);
                             values().set_value(param_name, nullptr, alloca);
@@ -2014,6 +2090,110 @@ namespace Cryo::Codegen
                           type->display_name(), new_fn->display_name());
                 return new_fn;
             }
+            return type;
+        }
+
+        // Handle error types containing unresolved generics
+        // These are created during parsing when types like "Option<T>" can't be resolved
+        // because T is a generic parameter. During instantiation, we can now substitute.
+        if (type->kind() == TypeKind::Error)
+        {
+            auto *error_type = static_cast<const ErrorType *>(type.get());
+            const std::string &reason = error_type->reason();
+
+            // Check for "unresolved generic: X<Y>" pattern
+            const std::string prefix = "unresolved generic: ";
+            if (reason.rfind(prefix, 0) == 0)
+            {
+                // Extract the type string (e.g., "Option<T>" from "unresolved generic: Option<T>")
+                std::string type_str = reason.substr(prefix.length());
+
+                // Use substitute_type_annotation to resolve type parameters
+                // This returns the mangled name (e.g., "Option_voidp")
+                std::string substituted_name = substitute_type_annotation(type_str);
+                if (!substituted_name.empty())
+                {
+                    // Try lookup by mangled name first (e.g., "Option_voidp")
+                    TypeRef resolved = symbols().arena().lookup_type_by_name(substituted_name);
+
+                    // If that fails, try to construct and lookup by display name format
+                    // The arena may have the type registered as "Option<void*>" not "Option_voidp"
+                    if (!resolved.is_valid())
+                    {
+                        // Parse type_str to get base name and type args, then construct display name
+                        size_t angle_pos = type_str.find('<');
+                        if (angle_pos != std::string::npos)
+                        {
+                            std::string base_name = type_str.substr(0, angle_pos);
+                            size_t close_pos = type_str.rfind('>');
+                            if (close_pos != std::string::npos && close_pos > angle_pos)
+                            {
+                                std::string args_str = type_str.substr(angle_pos + 1, close_pos - angle_pos - 1);
+
+                                // Substitute each type parameter
+                                std::string display_name = base_name + "<";
+                                bool first = true;
+                                std::string current_arg;
+                                int depth = 0;
+                                for (size_t i = 0; i <= args_str.size(); ++i)
+                                {
+                                    char c = (i < args_str.size()) ? args_str[i] : ',';
+                                    if (c == '<') depth++;
+                                    else if (c == '>') depth--;
+                                    else if ((c == ',' && depth == 0) || i == args_str.size())
+                                    {
+                                        // Trim whitespace
+                                        size_t start = current_arg.find_first_not_of(" \t");
+                                        size_t end = current_arg.find_last_not_of(" \t");
+                                        if (start != std::string::npos)
+                                        {
+                                            std::string arg = current_arg.substr(start, end - start + 1);
+                                            // Resolve type parameter
+                                            TypeRef resolved_param = resolve_type_param(arg);
+                                            if (!first) display_name += ", ";
+                                            first = false;
+                                            if (resolved_param.is_valid())
+                                            {
+                                                display_name += resolved_param->display_name();
+                                            }
+                                            else
+                                            {
+                                                display_name += arg;
+                                            }
+                                        }
+                                        current_arg.clear();
+                                        continue;
+                                    }
+                                    current_arg += c;
+                                }
+                                display_name += ">";
+
+                                // Try lookup by display name (e.g., "Option<void*>")
+                                resolved = symbols().arena().lookup_type_by_name(display_name);
+                                if (!resolved.is_valid())
+                                {
+                                    // Also try with qualified namespace
+                                    resolved = symbols().arena().lookup_type_by_name("std::core::option::" + display_name);
+                                    if (!resolved.is_valid())
+                                    {
+                                        resolved = symbols().arena().lookup_type_by_name("std::core::result::" + display_name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (resolved.is_valid())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "GenericCodegen: Substituted error type '{}' -> '{}'",
+                                  type->display_name(), resolved->display_name());
+                        return resolved;
+                    }
+                }
+            }
+
+            // For other error types or if substitution fails, return as-is
             return type;
         }
 

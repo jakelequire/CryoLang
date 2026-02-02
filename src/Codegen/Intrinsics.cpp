@@ -1023,6 +1023,9 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        if (!validate_args("memcpy", args))
+            return nullptr;
+
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
@@ -1057,9 +1060,13 @@ namespace Cryo::Codegen
     {
         if (args.size() != 3)
         {
-            report_error("__memset__ requires exactly 3 arguments (ptr, value, n)");
+            report_error("memset requires exactly 3 arguments (ptr, value, n), but got " +
+                         std::to_string(args.size()));
             return nullptr;
         }
+
+        if (!validate_args("memset", args))
+            return nullptr;
 
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
@@ -1079,7 +1086,7 @@ namespace Cryo::Codegen
 
         if (!ptr->getType()->isPointerTy())
         {
-            report_error("__memset__ first argument must be a pointer");
+            report_error("memset first argument must be a pointer");
             return nullptr;
         }
 
@@ -1130,9 +1137,13 @@ namespace Cryo::Codegen
     {
         if (args.size() != 3)
         {
-            report_error("__memmove__ requires exactly 3 arguments (dest, src, n)");
+            report_error("memmove requires exactly 3 arguments (dest, src, n), but got " +
+                         std::to_string(args.size()));
             return nullptr;
         }
+
+        if (!validate_args("memmove", args))
+            return nullptr;
 
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
@@ -1153,7 +1164,7 @@ namespace Cryo::Codegen
 
         if (!dest->getType()->isPointerTy() || !src->getType()->isPointerTy())
         {
-            report_error("__memmove__ first two arguments must be pointers");
+            report_error("memmove first two arguments must be pointers");
             return nullptr;
         }
 
@@ -2241,6 +2252,20 @@ namespace Cryo::Codegen
         std::cerr << "[Intrinsics] Error: " << message << std::endl;
     }
 
+    bool Intrinsics::validate_args(const std::string &intrinsic_name,
+                                   const std::vector<llvm::Value *> &args)
+    {
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            if (!args[i])
+            {
+                report_error(intrinsic_name + ": argument " + std::to_string(i + 1) + " failed to generate");
+                return false;
+            }
+        }
+        return true;
+    }
+
     void Intrinsics::report_unimplemented_intrinsic(const std::string &intrinsic_name, Cryo::CallExpressionNode *node)
     {
         _has_errors = true;
@@ -3314,6 +3339,9 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        if (!validate_args("intrinsics::read", args))
+            return nullptr;
+
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
@@ -3342,6 +3370,9 @@ namespace Cryo::Codegen
                          std::to_string(args.size()) + ". Did you mean to call a method instead?");
             return nullptr;
         }
+
+        if (!validate_args("intrinsics::write", args))
+            return nullptr;
 
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();

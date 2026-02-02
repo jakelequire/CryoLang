@@ -776,6 +776,22 @@ namespace Cryo::Codegen
         // This allows other modules to create correct extern declarations for this method
         // Note: String annotation is registered earlier (before early return check)
         TypeRef return_type = node->get_resolved_return_type();
+
+        // Apply type parameter substitution if we're in a generic instantiation scope
+        // This ensures that error types like "<error: unresolved generic: Option<T>>"
+        // get substituted to concrete types like "Option_Layout"
+        if (return_type.is_valid() && _generics && _generics->in_type_param_scope())
+        {
+            TypeRef substituted = _generics->substitute_type_params(return_type);
+            if (substituted.is_valid() && substituted != return_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Substituted return type for registration '{}' -> '{}'",
+                          return_type->display_name(), substituted->display_name());
+                return_type = substituted;
+            }
+        }
+
         if (return_type)
         {
             // Register in local CodegenContext
@@ -1945,6 +1961,14 @@ namespace Cryo::Codegen
 
                 TypeRef param_cryo_type = param->get_resolved_type();
 
+                // Debug: Log parameter type info before substitution
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_function_type: Param '{}' before substitution: valid={}, kind={}, name='{}'",
+                          param->name(),
+                          param_cryo_type.is_valid(),
+                          param_cryo_type.is_valid() ? static_cast<int>(param_cryo_type->kind()) : -1,
+                          param_cryo_type.is_valid() ? param_cryo_type->display_name() : "null");
+
                 // Try to substitute type parameters if we're in a generic instantiation scope
                 // This handles both direct type params (T) and types containing params (Option<T>)
                 if (param_cryo_type.is_valid() && _generics && _generics->in_type_param_scope())
@@ -1956,9 +1980,23 @@ namespace Cryo::Codegen
                                   param->name(), param_cryo_type->display_name(), substituted->display_name());
                         param_cryo_type = substituted;
                     }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "get_function_type: Param '{}' substitution unchanged (subst valid={}, same={})",
+                                  param->name(), substituted.is_valid(), substituted == param_cryo_type);
+                    }
                 }
 
                 llvm::Type *param_type = get_llvm_type(param_cryo_type);
+
+                // Debug: Log resulting LLVM type
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_function_type: Param '{}' -> LLVM type ID={}, isStruct={}, isInt={}",
+                          param->name(),
+                          param_type ? param_type->getTypeID() : -1,
+                          param_type ? param_type->isStructTy() : false,
+                          param_type ? param_type->isIntegerTy() : false);
                 if (param_type)
                 {
                     // Skip void parameters - void is not a valid parameter type in LLVM

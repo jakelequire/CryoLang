@@ -937,11 +937,16 @@ namespace Cryo
         case ',':
             return TokenKind::TK_COMMA;
         case '.':
-            if (_current + 1 < _buffer_end && peek() == '.' && *(_current + 1) == '.')
+            if (peek() == '.')
             {
-                advance();
-                advance(); // consume ".."
-                return TokenKind::TK_ELLIPSIS;
+                if (_current + 1 < _buffer_end && *(_current + 1) == '.')
+                {
+                    advance();
+                    advance(); // consume ".."
+                    return TokenKind::TK_ELLIPSIS; // "..."
+                }
+                advance(); // consume second '.'
+                return TokenKind::TK_DOTDOT; // ".."
             }
             return TokenKind::TK_PERIOD;
         case '+':
