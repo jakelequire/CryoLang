@@ -2143,25 +2143,65 @@ namespace Cryo::Codegen
 
             builder().SetInsertPoint(current_test_block);
 
-            // Generate pattern match
-            Cryo::PatternNode *pattern = arm->pattern();
-            if (pattern)
+            // Generate pattern match - supports multiple patterns with '|' syntax
+            const auto &patterns = arm->patterns();
+            if (!patterns.empty())
             {
-                // Use control flow codegen to generate pattern match
-                llvm::Value *matches = _control_flow->generate_pattern_match(match_value, pattern);
-                if (matches)
+                // Generate comparisons for all patterns and combine with OR
+                llvm::Value *combined_match = nullptr;
+                bool has_wildcard = false;
+
+                for (const auto &pattern : patterns)
                 {
-                    builder().CreateCondBr(matches, arm_block, next_test_block);
+                    if (!pattern)
+                        continue;
+
+                    // Check if this is a wildcard pattern
+                    if (pattern->is_wildcard())
+                    {
+                        has_wildcard = true;
+                        break; // Wildcard matches everything, no need to check other patterns
+                    }
+
+                    llvm::Value *matches = _control_flow->generate_pattern_match(match_value, pattern.get());
+                    if (matches)
+                    {
+                        if (combined_match)
+                        {
+                            // OR with previous matches
+                            combined_match = builder().CreateOr(combined_match, matches, "matchexpr.or");
+                        }
+                        else
+                        {
+                            combined_match = matches;
+                        }
+                    }
+                    else
+                    {
+                        // Pattern match returned null (wildcard behavior)
+                        has_wildcard = true;
+                        break;
+                    }
                 }
-                else
+
+                if (has_wildcard)
                 {
                     // Wildcard/default pattern - always matches
                     builder().CreateBr(arm_block);
                 }
+                else if (combined_match)
+                {
+                    builder().CreateCondBr(combined_match, arm_block, next_test_block);
+                }
+                else
+                {
+                    // No valid pattern match generated - skip this arm
+                    builder().CreateBr(next_test_block);
+                }
             }
             else
             {
-                // No pattern - always matches (wildcard)
+                // No patterns - always matches (wildcard)
                 builder().CreateBr(arm_block);
             }
 
@@ -2169,10 +2209,11 @@ namespace Cryo::Codegen
             builder().SetInsertPoint(arm_block);
             values().enter_scope("matchexpr.arm." + std::to_string(i));
 
-            // Bind pattern variables before generating body
-            if (pattern)
+            // Bind pattern variables before generating body (use first pattern for bindings)
+            Cryo::PatternNode *first_pattern = arm->pattern();
+            if (first_pattern)
             {
-                _control_flow->bind_enum_pattern_variables(match_value, pattern);
+                _control_flow->bind_enum_pattern_variables(match_value, first_pattern);
             }
 
             llvm::Value *arm_value = nullptr;
@@ -2688,21 +2729,63 @@ namespace Cryo::Codegen
                   "resolve_member_info: Looking up type '{}' for member '{}'",
                   type_name, member_name);
 
-        // Look up struct type in LLVM context
-        out_struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+        // Convert generic type names like "Array<Token>" to mangled form "Array_Token"
+        // This is needed because LLVM struct types are stored with mangled names
+        std::string mangled_type_name = type_name;
+        if (type_name.find('<') != std::string::npos)
+        {
+            // Parse generic type: "Array<Token>" -> base="Array", args=["Token"]
+            size_t angle_pos = type_name.find('<');
+            std::string base_name = type_name.substr(0, angle_pos);
+            std::string args_str = type_name.substr(angle_pos + 1);
+            if (!args_str.empty() && args_str.back() == '>')
+            {
+                args_str.pop_back();
+            }
+
+            // Build mangled name: "Array_Token"
+            mangled_type_name = base_name + "_";
+            // Replace problematic characters in type arguments
+            std::replace(args_str.begin(), args_str.end(), '<', '_');
+            std::replace(args_str.begin(), args_str.end(), '>', '_');
+            std::replace(args_str.begin(), args_str.end(), ',', '_');
+            std::replace(args_str.begin(), args_str.end(), ' ', '_');
+            std::replace(args_str.begin(), args_str.end(), '*', 'p');
+            mangled_type_name += args_str;
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_member_info: Converted generic type '{}' to mangled name '{}'",
+                      type_name, mangled_type_name);
+        }
+
+        // Look up struct type in LLVM context (try mangled name first, then original)
+        out_struct_type = llvm::StructType::getTypeByName(llvm_ctx(), mangled_type_name);
+        if (!out_struct_type && mangled_type_name != type_name)
+        {
+            // Try original type name
+            out_struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+        }
         if (!out_struct_type)
         {
-            // Try context registry
-            if (llvm::Type *type = ctx().get_type(type_name))
+            // Try context registry with both names
+            if (llvm::Type *type = ctx().get_type(mangled_type_name))
             {
                 out_struct_type = llvm::dyn_cast<llvm::StructType>(type);
+            }
+            else if (mangled_type_name != type_name)
+            {
+                if (llvm::Type *type = ctx().get_type(type_name))
+                {
+                    out_struct_type = llvm::dyn_cast<llvm::StructType>(type);
+                }
             }
         }
 
         if (!out_struct_type)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "resolve_member_info: Struct type '{}' not found", type_name);
+                      "resolve_member_info: Struct type '{}' (mangled: '{}') not found",
+                      type_name, mangled_type_name);
             return false;
         }
 
@@ -2716,24 +2799,33 @@ namespace Cryo::Codegen
         }
 
         // Look up field index using the new CodegenContext API
-        int field_idx = ctx().get_struct_field_index(type_name, member_name);
+        // Try mangled name first, then original
+        int field_idx = ctx().get_struct_field_index(mangled_type_name, member_name);
+        if (field_idx < 0 && mangled_type_name != type_name)
+        {
+            field_idx = ctx().get_struct_field_index(type_name, member_name);
+        }
         if (field_idx < 0)
         {
             // Fallback: try TemplateRegistry for cross-module struct field lookup
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "resolve_member_info: Field '{}' not in local registry for '{}', trying TemplateRegistry",
-                      member_name, type_name);
+                      member_name, mangled_type_name);
 
             if (auto *template_reg = ctx().template_registry())
             {
                 // Try various name candidates (qualified and unqualified)
-                std::vector<std::string> candidates = {type_name};
+                std::vector<std::string> candidates = {mangled_type_name};
+                if (mangled_type_name != type_name)
+                {
+                    candidates.push_back(type_name);
+                }
 
                 // Add LLVM struct type name as a candidate
                 if (out_struct_type && out_struct_type->hasName())
                 {
                     std::string llvm_name = out_struct_type->getName().str();
-                    if (llvm_name != type_name)
+                    if (llvm_name != mangled_type_name && llvm_name != type_name)
                     {
                         candidates.push_back(llvm_name);
                     }
@@ -2742,7 +2834,11 @@ namespace Cryo::Codegen
                 // Add current namespace prefix
                 if (!ctx().namespace_context().empty())
                 {
-                    candidates.push_back(ctx().namespace_context() + "::" + type_name);
+                    candidates.push_back(ctx().namespace_context() + "::" + mangled_type_name);
+                    if (mangled_type_name != type_name)
+                    {
+                        candidates.push_back(ctx().namespace_context() + "::" + type_name);
+                    }
                 }
 
                 // Try type_namespace_map for the registered namespace

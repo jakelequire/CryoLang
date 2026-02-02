@@ -3724,8 +3724,17 @@ namespace Cryo
     {
         SourceLocation start_loc = _current_token.location();
 
-        // Parse the pattern
-        auto pattern = parse_pattern();
+        // Parse patterns - supports multiple patterns with '|' syntax
+        // e.g., ' ' | '\r' | '\t' => { ... }
+        std::vector<std::unique_ptr<PatternNode>> patterns;
+        patterns.push_back(parse_pattern());
+
+        // Check for alternative patterns using '|'
+        while (_current_token.is(TokenKind::TK_PIPE))
+        {
+            advance(); // consume '|'
+            patterns.push_back(parse_pattern());
+        }
 
         consume(TokenKind::TK_FATARROW, "Expected '=>' after pattern");
 
@@ -3878,7 +3887,7 @@ namespace Cryo
             advance();
         }
 
-        return std::make_unique<MatchArmNode>(start_loc, std::move(pattern), std::move(body));
+        return std::make_unique<MatchArmNode>(start_loc, std::move(patterns), std::move(body));
     }
 
     std::unique_ptr<PatternNode> Parser::parse_pattern()
@@ -3886,6 +3895,7 @@ namespace Cryo
         SourceLocation start_loc = _current_token.location();
 
         // Handle literal patterns (character, string, integer literals)
+        // Also handles range patterns like 'a'..'z' or 0..100
         if (_current_token.is(TokenKind::TK_CHAR_CONSTANT) ||
             _current_token.is(TokenKind::TK_STRING_LITERAL) ||
             _current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
@@ -3893,6 +3903,29 @@ namespace Cryo
             // Create a literal pattern - for now we can reuse the literal node structure
             auto literal = _builder.create_literal_node(_current_token);
             advance();
+
+            // Check for range pattern (e.g., 'a'..'z', 0..100)
+            if (_current_token.is(TokenKind::TK_DOTDOT))
+            {
+                advance(); // consume '..'
+
+                // Parse the end of the range
+                if (!_current_token.is(TokenKind::TK_CHAR_CONSTANT) &&
+                    !_current_token.is(TokenKind::TK_STRING_LITERAL) &&
+                    !_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
+                {
+                    report_error("Expected literal after '..' in range pattern");
+                    return nullptr;
+                }
+
+                auto end_literal = _builder.create_literal_node(_current_token);
+                advance();
+
+                // Create a range pattern
+                auto pattern = std::make_unique<PatternNode>(start_loc);
+                pattern->set_range(std::move(literal), std::move(end_literal));
+                return std::move(pattern);
+            }
 
             // Create a pattern node that wraps the literal
             auto pattern = std::make_unique<PatternNode>(start_loc);

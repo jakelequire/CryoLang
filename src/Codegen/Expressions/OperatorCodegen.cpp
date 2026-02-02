@@ -1379,6 +1379,62 @@ namespace Cryo::Codegen
             return generate_pointer_comparison(op, lhs, rhs, node);
         }
 
+        // Handle struct comparison using memcmp
+        // This is needed for generic types where T is a struct (e.g., Option<String>::contains)
+        if (type->isStructTy() && rhs->getType()->isStructTy())
+        {
+            // Only support equality/inequality for structs
+            if (op != TokenKind::TK_EQUALEQUAL && op != TokenKind::TK_EXCLAIMEQUAL)
+            {
+                std::string e = "Ordering comparison (<, >, <=, >=) not supported for struct type `" + lhs_type_name + "`";
+                if (node)
+                    report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, e);
+                else
+                    report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, e.c_str());
+                return nullptr;
+            }
+
+            // Get struct size using DataLayout
+            const llvm::DataLayout &dl = module()->getDataLayout();
+            uint64_t struct_size = dl.getTypeAllocSize(type);
+
+            // Need to store the struct values to memory to get pointers for memcmp
+            llvm::IRBuilder<> &b = builder();
+            llvm::Function *fn = b.GetInsertBlock()->getParent();
+
+            // Create allocas for both values
+            llvm::AllocaInst *lhs_alloca = b.CreateAlloca(type, nullptr, "cmp.lhs");
+            llvm::AllocaInst *rhs_alloca = b.CreateAlloca(rhs->getType(), nullptr, "cmp.rhs");
+            b.CreateStore(lhs, lhs_alloca);
+            b.CreateStore(rhs, rhs_alloca);
+
+            // Get or declare memcmp
+            llvm::FunctionCallee memcmp_fn = module()->getOrInsertFunction(
+                "memcmp",
+                llvm::FunctionType::get(
+                    llvm::Type::getInt32Ty(llvm_ctx()),
+                    {llvm::PointerType::get(llvm_ctx(), 0),
+                     llvm::PointerType::get(llvm_ctx(), 0),
+                     llvm::Type::getInt64Ty(llvm_ctx())},
+                    false));
+
+            // Call memcmp(lhs_ptr, rhs_ptr, size)
+            llvm::Value *cmp_result = b.CreateCall(
+                memcmp_fn,
+                {lhs_alloca, rhs_alloca, llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), struct_size)},
+                "memcmp.result");
+
+            // memcmp returns 0 if equal
+            if (op == TokenKind::TK_EQUALEQUAL)
+            {
+                return b.CreateICmpEQ(cmp_result, llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0), "eq");
+            }
+            else // TK_EXCLAIMEQUAL
+            {
+                return b.CreateICmpNE(cmp_result, llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0), "ne");
+            }
+        }
+
         std::string e = "Comparison not supported for type `" + lhs_type_name + "`";
         if (lhs_type_name != rhs_type_name)
             e += " with `" + rhs_type_name + "`";

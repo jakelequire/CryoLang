@@ -426,9 +426,17 @@ namespace Cryo::Codegen
 
         // Helper methods
         void report_error(const std::string& message);
-        void report_unimplemented_intrinsic(const std::string& intrinsic_name, 
+        void report_unimplemented_intrinsic(const std::string& intrinsic_name,
                                            Cryo::CallExpressionNode* node = nullptr);
-        llvm::Value* create_syscall(llvm::Value* syscall_num, 
+
+        /// @brief Validate that all arguments were successfully generated
+        /// @param intrinsic_name Name of the intrinsic (for error message)
+        /// @param args Arguments to validate
+        /// @return true if all arguments are valid, false if any are nullptr
+        bool validate_args(const std::string& intrinsic_name,
+                          const std::vector<llvm::Value*>& args);
+
+        llvm::Value* create_syscall(llvm::Value* syscall_num,
                                   const std::vector<llvm::Value*>& args);
         llvm::Value* ensure_type(llvm::Value* value, llvm::Type* target_type,
                                const std::string& name = "");

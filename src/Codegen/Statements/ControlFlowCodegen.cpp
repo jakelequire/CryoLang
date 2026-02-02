@@ -770,25 +770,65 @@ namespace Cryo::Codegen
 
             builder().SetInsertPoint(current_test_block);
 
-            // Generate pattern match
-            Cryo::PatternNode *pattern = arm->pattern();
-            if (pattern)
+            // Generate pattern match - supports multiple patterns with '|' syntax
+            const auto &patterns = arm->patterns();
+            if (!patterns.empty())
             {
-                // Generate comparison based on pattern type
-                llvm::Value *matches = generate_pattern_match(match_value, pattern);
-                if (matches)
+                // Generate comparisons for all patterns and combine with OR
+                llvm::Value *combined_match = nullptr;
+                bool has_wildcard = false;
+
+                for (const auto &pattern : patterns)
                 {
-                    builder().CreateCondBr(matches, arm_block, next_test_block);
+                    if (!pattern)
+                        continue;
+
+                    // Check if this is a wildcard pattern
+                    if (pattern->is_wildcard())
+                    {
+                        has_wildcard = true;
+                        break; // Wildcard matches everything, no need to check other patterns
+                    }
+
+                    llvm::Value *matches = generate_pattern_match(match_value, pattern.get());
+                    if (matches)
+                    {
+                        if (combined_match)
+                        {
+                            // OR with previous matches
+                            combined_match = builder().CreateOr(combined_match, matches, "match.or");
+                        }
+                        else
+                        {
+                            combined_match = matches;
+                        }
+                    }
+                    else
+                    {
+                        // Pattern match returned null (wildcard behavior)
+                        has_wildcard = true;
+                        break;
+                    }
                 }
-                else
+
+                if (has_wildcard)
                 {
                     // Wildcard/default pattern - always matches
                     builder().CreateBr(arm_block);
                 }
+                else if (combined_match)
+                {
+                    builder().CreateCondBr(combined_match, arm_block, next_test_block);
+                }
+                else
+                {
+                    // No valid pattern match generated - skip this arm
+                    builder().CreateBr(next_test_block);
+                }
             }
             else
             {
-                // No pattern - always matches (wildcard)
+                // No patterns - always matches (wildcard)
                 builder().CreateBr(arm_block);
             }
 
@@ -796,10 +836,11 @@ namespace Cryo::Codegen
             builder().SetInsertPoint(arm_block);
             enter_scope(arm_block);
 
-            // Bind pattern variables before generating body
-            if (pattern)
+            // Bind pattern variables before generating body (use first pattern for bindings)
+            Cryo::PatternNode *first_pattern = arm->pattern();
+            if (first_pattern)
             {
-                bind_enum_pattern_variables(match_value, pattern, node->expr());
+                bind_enum_pattern_variables(match_value, first_pattern, node->expr());
             }
 
             if (arm->body())
@@ -977,6 +1018,74 @@ namespace Cryo::Codegen
 
             // Compare discriminant with expected value
             return builder().CreateICmpEQ(discriminant_value, expected_discriminant, "enum.match");
+        }
+
+        case Cryo::PatternNode::PatternType::Range:
+        {
+            // Range pattern - check if value is within range [start, end]
+            // e.g., 'a'..'z' matches any char from 'a' to 'z'
+            Cryo::LiteralNode *start_lit = pattern->range_start();
+            Cryo::LiteralNode *end_lit = pattern->range_end();
+
+            if (!start_lit || !end_lit)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_pattern_match: Range pattern missing start or end literal");
+                return nullptr;
+            }
+
+            llvm::Value *start_val = generate_expression(start_lit);
+            llvm::Value *end_val = generate_expression(end_lit);
+
+            if (!start_val || !end_val)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_pattern_match: Failed to generate range boundary values");
+                return nullptr;
+            }
+
+            // Ensure types match for comparison
+            llvm::Type *value_type = value->getType();
+
+            if (value_type->isIntegerTy())
+            {
+                // Cast range boundaries to match value type if needed
+                if (start_val->getType() != value_type)
+                {
+                    unsigned value_bits = value_type->getIntegerBitWidth();
+                    unsigned start_bits = start_val->getType()->getIntegerBitWidth();
+                    if (start_bits > value_bits)
+                        start_val = builder().CreateTrunc(start_val, value_type, "range.start.trunc");
+                    else if (start_bits < value_bits)
+                        start_val = builder().CreateZExt(start_val, value_type, "range.start.zext");
+                }
+
+                if (end_val->getType() != value_type)
+                {
+                    unsigned value_bits = value_type->getIntegerBitWidth();
+                    unsigned end_bits = end_val->getType()->getIntegerBitWidth();
+                    if (end_bits > value_bits)
+                        end_val = builder().CreateTrunc(end_val, value_type, "range.end.trunc");
+                    else if (end_bits < value_bits)
+                        end_val = builder().CreateZExt(end_val, value_type, "range.end.zext");
+                }
+
+                // Generate: value >= start && value <= end
+                llvm::Value *ge_start = builder().CreateICmpSGE(value, start_val, "range.ge.start");
+                llvm::Value *le_end = builder().CreateICmpSLE(value, end_val, "range.le.end");
+                return builder().CreateAnd(ge_start, le_end, "range.match");
+            }
+            else if (value_type->isFloatingPointTy())
+            {
+                // For floating point ranges
+                llvm::Value *ge_start = builder().CreateFCmpOGE(value, start_val, "range.ge.start");
+                llvm::Value *le_end = builder().CreateFCmpOLE(value, end_val, "range.le.end");
+                return builder().CreateAnd(ge_start, le_end, "range.match");
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_pattern_match: Unsupported type for range pattern");
+            return nullptr;
         }
         }
 
