@@ -290,27 +290,65 @@ namespace Cryo::Codegen
                             }
                         }
 
-                        // If not a global, fall back to generating the expression
+                        // If not a global, check for local variable
                         if (!receiver)
                         {
-                            receiver = generate_expression(member->object());
+                            // CRITICAL FIX: For local struct variables, we need to pass the alloca
+                            // address directly to methods, NOT load the value and create a temporary.
+                            // Otherwise mutations in the method won't affect the original variable.
+                            //
+                            // Example: tokens.push(token) where tokens is Array<Token>
+                            //   - tokens is stored as: %tokens = alloca %Array_Token
+                            //   - We should pass %tokens directly to push()
+                            //   - Previously: loaded value, stored to temp, passed temp (mutations lost!)
+                            //
+                            // For pointer-type variables (like MemoryPool* or &this parameters), we DO
+                            // need to load the pointer value, because the variable holds a pointer to
+                            // the object, not the object itself.
 
-                            // CRITICAL FIX: For pointer-type variables (like MemoryPool*), we need to
-                            // LOAD the pointer value from the alloca, not pass the alloca address.
-                            // Example: pool_ptr: MemoryPool* stored in %pool_ptr = alloca ptr
-                            //   - We need to load the ptr value: %loaded = load ptr, ptr %pool_ptr
-                            //   - Then pass %loaded as 'this', not %pool_ptr
-                            TypeRef obj_type = member->object()->get_resolved_type();
-                            if (obj_type && obj_type->kind() == Cryo::TypeKind::Pointer)
+                            // Try to get the alloca for local variables
+                            if (llvm::AllocaInst *alloca = values().get_alloca(name))
                             {
-                                // The variable is a pointer type - we need the loaded pointer value
-                                // Check if receiver is an alloca (meaning we got the variable's address)
+                                // Use LLVM type to determine if this alloca stores a pointer vs a struct
+                                // - "alloca ptr" → stores a pointer, need to load
+                                // - "alloca %StructType" → IS the struct storage, use directly
+                                llvm::Type *allocated_type = alloca->getAllocatedType();
+                                bool stores_pointer = allocated_type->isPointerTy();
+
+                                if (stores_pointer)
+                                {
+                                    // The alloca stores a pointer (e.g., 'this' parameter, pointer variables)
+                                    // We need to load the pointer value to get the actual object pointer
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Loading pointer value from alloca for receiver: {} (alloca stores ptr)", name);
+                                    receiver = builder().CreateLoad(
+                                        llvm::PointerType::get(llvm_ctx(), 0), alloca, name + ".ptr.load");
+                                }
+                                else
+                                {
+                                    // The alloca IS the struct storage (local struct variable)
+                                    // Pass the alloca address directly so mutations affect the original
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Using local variable alloca address for method receiver: {} (alloca is struct)", name);
+                                    receiver = alloca;
+                                }
+                            }
+                            else
+                            {
+                                // Fallback: generate expression (for cases not in alloca map)
+                                receiver = generate_expression(member->object());
+
+                                // If we got an alloca back, check if we need to load
                                 if (receiver && llvm::isa<llvm::AllocaInst>(receiver))
                                 {
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                              "Loading pointer value from alloca for pointer-type receiver: {}", name);
-                                    receiver = builder().CreateLoad(
-                                        llvm::PointerType::get(llvm_ctx(), 0), receiver, name + ".ptr.load");
+                                    llvm::AllocaInst *alloca_inst = llvm::cast<llvm::AllocaInst>(receiver);
+                                    if (alloca_inst->getAllocatedType()->isPointerTy())
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "Loading pointer value from generated alloca for receiver: {}", name);
+                                        receiver = builder().CreateLoad(
+                                            llvm::PointerType::get(llvm_ctx(), 0), receiver, name + ".ptr.load");
+                                    }
                                 }
                             }
                         }
