@@ -1159,7 +1159,32 @@ namespace Cryo::Codegen
                                 else if (elem_type_name == "string")
                                     elem_type = llvm::PointerType::get(llvm_ctx(), 0); // Opaque pointer for strings
                                 else
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Unknown element type name: '{}'", elem_type_name);
+                                {
+                                    // Try to look up as struct/class type
+                                    std::string current_ns = ctx().srm_context().get_current_namespace_path();
+                                    std::vector<std::string> candidates;
+
+                                    // Add namespace-qualified name first (most likely)
+                                    if (!current_ns.empty())
+                                        candidates.push_back(current_ns + "::" + elem_type_name);
+                                    candidates.push_back(elem_type_name);
+
+                                    for (const auto &candidate : candidates)
+                                    {
+                                        llvm::StructType *struct_type_lookup = llvm::StructType::getTypeByName(llvm_ctx(), candidate);
+                                        if (struct_type_lookup)
+                                        {
+                                            elem_type = struct_type_lookup;
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "*** Found struct type '{}' for element '{}'",
+                                                      candidate, elem_type_name);
+                                            break;
+                                        }
+                                    }
+
+                                    if (!elem_type)
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "*** Unknown element type name: '{}'", elem_type_name);
+                                }
                             }
 
                             if (elem_type)
@@ -1377,6 +1402,79 @@ namespace Cryo::Codegen
                         element_type = get_llvm_type(ptr->pointee());
                     }
                 }
+                // Try to infer from current function context for monomorphized generic methods
+                if (!element_type)
+                {
+                    llvm::Function *current_fn = builder().GetInsertBlock()->getParent();
+                    if (current_fn)
+                    {
+                        std::string fn_name = current_fn->getName().str();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_array_access: Trying to infer element type from function: {}", fn_name);
+
+                        // Look for Array_<ElementType> pattern in the function name
+                        size_t array_pos = fn_name.find("Array_");
+                        if (array_pos != std::string::npos)
+                        {
+                            size_t elem_start = array_pos + 6; // Skip "Array_"
+                            size_t elem_end = fn_name.find("::", elem_start);
+                            if (elem_end != std::string::npos)
+                            {
+                                std::string elem_name = fn_name.substr(elem_start, elem_end - elem_start);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_array_access: Extracted element type '{}' from function name", elem_name);
+
+                                // Map primitive types
+                                if (elem_name == "u64" || elem_name == "i64")
+                                    element_type = llvm::Type::getInt64Ty(llvm_ctx());
+                                else if (elem_name == "u32" || elem_name == "i32")
+                                    element_type = llvm::Type::getInt32Ty(llvm_ctx());
+                                else if (elem_name == "u16" || elem_name == "i16")
+                                    element_type = llvm::Type::getInt16Ty(llvm_ctx());
+                                else if (elem_name == "u8" || elem_name == "i8")
+                                    element_type = llvm::Type::getInt8Ty(llvm_ctx());
+                                else if (elem_name == "f64")
+                                    element_type = llvm::Type::getDoubleTy(llvm_ctx());
+                                else if (elem_name == "f32")
+                                    element_type = llvm::Type::getFloatTy(llvm_ctx());
+                                else if (elem_name == "string")
+                                    element_type = llvm::PointerType::get(llvm_ctx(), 0);
+                                else
+                                {
+                                    // Try to find struct type
+                                    size_t last_sep = fn_name.rfind("::");
+                                    std::string ns_prefix;
+                                    if (last_sep != std::string::npos)
+                                    {
+                                        size_t second_last = fn_name.rfind("::", last_sep - 1);
+                                        if (second_last != std::string::npos)
+                                        {
+                                            ns_prefix = fn_name.substr(0, second_last);
+                                        }
+                                    }
+
+                                    std::vector<std::string> candidates;
+                                    if (!ns_prefix.empty())
+                                        candidates.push_back(ns_prefix + "::" + elem_name);
+                                    candidates.push_back(elem_name);
+
+                                    for (const auto &candidate : candidates)
+                                    {
+                                        llvm::StructType *struct_type = llvm::StructType::getTypeByName(llvm_ctx(), candidate);
+                                        if (struct_type)
+                                        {
+                                            element_type = struct_type;
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "generate_array_access: Found struct type '{}' for element", candidate);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Fallback to i8 for string-like access only if we still don't have an element type
                 if (!element_type)
                 {
