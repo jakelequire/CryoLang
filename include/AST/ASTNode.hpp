@@ -2628,12 +2628,15 @@ namespace Cryo
             Literal,
             Identifier,
             Wildcard,
-            Enum
+            Enum,
+            Range  // For patterns like 'a'..'z' or 0..9
         };
 
     private:
         PatternType _pattern_type;
         std::unique_ptr<LiteralNode> _literal_value;
+        std::unique_ptr<LiteralNode> _range_start;  // For Range patterns
+        std::unique_ptr<LiteralNode> _range_end;    // For Range patterns
         std::string _identifier;
         bool _is_wildcard = false;
 
@@ -2660,11 +2663,22 @@ namespace Cryo
             _pattern_type = PatternType::Wildcard;
         }
 
+        // Setter for range patterns (e.g., 'a'..'z', 0..100)
+        void set_range(std::unique_ptr<LiteralNode> start, std::unique_ptr<LiteralNode> end)
+        {
+            _range_start = std::move(start);
+            _range_end = std::move(end);
+            _pattern_type = PatternType::Range;
+        }
+
         // Getters
         PatternType pattern_type() const { return _pattern_type; }
         LiteralNode *literal_value() const { return _literal_value.get(); }
+        LiteralNode *range_start() const { return _range_start.get(); }
+        LiteralNode *range_end() const { return _range_end.get(); }
         const std::string &identifier() const { return _identifier; }
         bool is_wildcard() const { return _is_wildcard; }
+        bool is_range() const { return _pattern_type == PatternType::Range; }
 
         void print(std::ostream &os, int indent = 0) const override
         {
@@ -2687,6 +2701,15 @@ namespace Cryo
                 break;
             case PatternType::Enum:
                 os << " (Enum)";
+                break;
+            case PatternType::Range:
+                os << " (Range)" << std::endl;
+                os << std::string(indent + 2, ' ') << "Start:" << std::endl;
+                if (_range_start)
+                    _range_start->print(os, indent + 4);
+                os << std::string(indent + 2, ' ') << "End:" << std::endl;
+                if (_range_end)
+                    _range_end->print(os, indent + 4);
                 break;
             }
             os << std::endl;
@@ -2763,23 +2786,45 @@ namespace Cryo
     class MatchArmNode : public ASTNode
     {
     private:
-        std::unique_ptr<PatternNode> _pattern;
+        std::vector<std::unique_ptr<PatternNode>> _patterns;  // Multiple patterns for '|' syntax
         std::unique_ptr<StatementNode> _body;
 
     public:
+        // Constructor for single pattern (backward compatible)
         MatchArmNode(SourceLocation loc, std::unique_ptr<PatternNode> pattern, std::unique_ptr<StatementNode> body)
-            : ASTNode(NodeKind::MatchArm, loc), _pattern(std::move(pattern)), _body(std::move(body)) {}
+            : ASTNode(NodeKind::MatchArm, loc), _body(std::move(body))
+        {
+            if (pattern)
+                _patterns.push_back(std::move(pattern));
+        }
 
-        PatternNode *pattern() const { return _pattern.get(); }
+        // Constructor for multiple patterns (e.g., ' ' | '\r' | '\t')
+        MatchArmNode(SourceLocation loc, std::vector<std::unique_ptr<PatternNode>> patterns, std::unique_ptr<StatementNode> body)
+            : ASTNode(NodeKind::MatchArm, loc), _patterns(std::move(patterns)), _body(std::move(body)) {}
+
+        // Get first pattern (for backward compatibility)
+        PatternNode *pattern() const { return _patterns.empty() ? nullptr : _patterns[0].get(); }
+
+        // Get all patterns (for multi-pattern support)
+        const std::vector<std::unique_ptr<PatternNode>> &patterns() const { return _patterns; }
+
+        // Check if this arm has multiple patterns
+        bool has_multiple_patterns() const { return _patterns.size() > 1; }
+
         StatementNode *body() const { return _body.get(); }
 
         void print(std::ostream &os, int indent = 0) const override
         {
             os << std::string(indent, ' ') << "MatchArm" << std::endl;
-            if (_pattern)
+            if (!_patterns.empty())
             {
-                os << std::string(indent + 2, ' ') << "Pattern:" << std::endl;
-                _pattern->print(os, indent + 4);
+                os << std::string(indent + 2, ' ') << "Patterns (" << _patterns.size() << "):" << std::endl;
+                for (size_t i = 0; i < _patterns.size(); ++i)
+                {
+                    if (i > 0)
+                        os << std::string(indent + 4, ' ') << "| (alternative)" << std::endl;
+                    _patterns[i]->print(os, indent + 4);
+                }
             }
             if (_body)
             {

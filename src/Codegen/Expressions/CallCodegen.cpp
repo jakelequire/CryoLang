@@ -2943,8 +2943,9 @@ namespace Cryo::Codegen
         std::vector<llvm::Value *> result;
         result.reserve(args.size());
 
-        for (const auto &arg : args)
+        for (size_t i = 0; i < args.size(); ++i)
         {
+            const auto &arg = args[i];
             if (arg)
             {
                 llvm::Value *value = generate_expression(arg.get());
@@ -2954,8 +2955,19 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Failed to generate argument");
+                    // Push nullptr as placeholder to preserve argument count
+                    // This helps intrinsic handlers provide accurate error messages
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Failed to generate argument {} (expression kind: {})",
+                              i, static_cast<int>(arg->kind()));
+                    result.push_back(nullptr);
                 }
+            }
+            else
+            {
+                // Null argument expression - push nullptr placeholder
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Null argument expression at index {}", i);
+                result.push_back(nullptr);
             }
         }
 
