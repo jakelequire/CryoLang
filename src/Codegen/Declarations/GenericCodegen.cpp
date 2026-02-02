@@ -149,8 +149,36 @@ namespace Cryo::Codegen
             }
         }
 
+        // Check if we have a pre-specialized AST from the Monomorphizer
+        // This AST has types already substituted (T -> Token), so we can use it directly
+        Cryo::ASTNode *specialized_ast = nullptr;
+        bool using_specialized_ast = false;
+        if (auto *mono = ctx().monomorphizer())
+        {
+            auto entry = mono->get_specialization_by_name(mangled);
+            if (entry && entry->ast_node)
+            {
+                specialized_ast = entry->ast_node;
+                using_specialized_ast = true;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Using pre-specialized AST for '{}'", mangled);
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: No specialized AST found for '{}' (entry={}, ast_node={})",
+                          mangled, entry.has_value() ? "found" : "not found",
+                          (entry && entry->ast_node) ? "valid" : "null");
+            }
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen: No monomorphizer available, using original AST for '{}'", mangled);
+        }
+
         // Get generic type definition - first check local registry, then TemplateRegistry
-        Cryo::ASTNode *generic_def = get_generic_type_def(generic_name);
+        Cryo::ASTNode *generic_def = specialized_ast ? specialized_ast : get_generic_type_def(generic_name);
         if (!generic_def)
         {
             // Try to get from TemplateRegistry (for cross-module structs)
@@ -205,15 +233,16 @@ namespace Cryo::Codegen
                 {
                     field_names.push_back(field->name());
 
-                    // Collect substituted TypeRef for TemplateRegistry
+                    // Collect TypeRef for TemplateRegistry
+                    // If using specialized AST, types are already substituted
                     TypeRef field_type = field->get_resolved_type();
-                    TypeRef substituted = substitute_type_params(field_type);
-                    substituted_field_types.push_back(substituted.is_valid() ? substituted : TypeRef{});
+                    TypeRef final_type = using_specialized_ast ? field_type : substitute_type_params(field_type);
+                    substituted_field_types.push_back(final_type.is_valid() ? final_type : TypeRef{});
                 }
             }
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "GenericCodegen: Reusing existing LLVM type for struct {}",
-                      mangled);
+                      "GenericCodegen: Reusing existing LLVM type for struct {} (specialized_ast={})",
+                      mangled, using_specialized_ast);
         }
         else
         {
@@ -222,22 +251,34 @@ namespace Cryo::Codegen
                                                  : llvm::StructType::create(llvm_ctx(), mangled);
 
             // Substitute type parameters in fields and collect field names
+            // If using specialized AST, types are already substituted
             if (struct_decl)
             {
-                std::vector<llvm::Type *> field_types = create_substituted_fields(struct_decl->fields());
+                std::vector<llvm::Type *> field_types;
+                if (using_specialized_ast)
+                {
+                    // Specialized AST has concrete types - create fields directly
+                    field_types = create_fields_from_specialized(struct_decl->fields());
+                }
+                else
+                {
+                    // Generic AST needs type parameter substitution
+                    field_types = create_substituted_fields(struct_decl->fields());
+                }
                 struct_type->setBody(field_types);
 
-                // Collect field names AND substituted TypeRefs for member access resolution
+                // Collect field names AND TypeRefs for member access resolution
                 field_names.reserve(struct_decl->fields().size());
                 substituted_field_types.reserve(struct_decl->fields().size());
                 for (const auto &field : struct_decl->fields())
                 {
                     field_names.push_back(field->name());
 
-                    // Collect substituted TypeRef for TemplateRegistry
+                    // Collect TypeRef for TemplateRegistry
+                    // If using specialized AST, types are already substituted
                     TypeRef field_type = field->get_resolved_type();
-                    TypeRef substituted = substitute_type_params(field_type);
-                    substituted_field_types.push_back(substituted.is_valid() ? substituted : TypeRef{});
+                    TypeRef final_type = using_specialized_ast ? field_type : substitute_type_params(field_type);
+                    substituted_field_types.push_back(final_type.is_valid() ? final_type : TypeRef{});
                 }
 
                 // Safety check: verify struct body has correct number of elements
@@ -2351,6 +2392,56 @@ namespace Cryo::Codegen
 
                 // Use opaque pointer as fallback - this ensures field indices stay aligned
                 // even if the type couldn't be fully resolved
+                result.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+            }
+        }
+
+        return result;
+    }
+
+    std::vector<llvm::Type *> GenericCodegen::create_fields_from_specialized(
+        const std::vector<std::unique_ptr<Cryo::StructFieldNode>> &fields)
+    {
+        std::vector<llvm::Type *> result;
+        result.reserve(fields.size());
+
+        for (const auto &field : fields)
+        {
+            if (!field)
+                continue;
+
+            // For specialized AST, types are already concrete (T -> Token)
+            // No substitution needed
+            TypeRef field_type = field->get_resolved_type();
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "create_fields_from_specialized: Field '{}' has concrete type '{}'",
+                      field->name(),
+                      field_type ? field_type->display_name() : "<null>");
+
+            // Ensure any dependent generic types are instantiated
+            ensure_dependent_types_instantiated(field_type);
+
+            llvm::Type *llvm_type = get_llvm_type(field_type);
+            if (llvm_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "create_fields_from_specialized: Field '{}' mapped to LLVM type ID {}",
+                          field->name(), llvm_type->getTypeID());
+                result.push_back(llvm_type);
+            }
+            else
+            {
+                // CRITICAL: We must not skip fields or the struct body will have
+                // fewer elements than the field registry, causing assertion failures
+                // when accessing fields by index. Use a fallback type.
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "create_fields_from_specialized: Failed to get LLVM type for field '{}' "
+                          "(type: '{}'), using ptr fallback",
+                          field->name(),
+                          field_type ? field_type->display_name() : "<null>");
+
+                // Use opaque pointer as fallback
                 result.push_back(llvm::PointerType::get(llvm_ctx(), 0));
             }
         }

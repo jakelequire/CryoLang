@@ -330,6 +330,17 @@ namespace Cryo::Codegen
             const std::vector<std::unique_ptr<Cryo::StructFieldNode>> &fields);
 
         /**
+         * @brief Create field types from specialized AST (no substitution needed)
+         * @param fields Specialized field definitions with concrete types
+         * @return Vector of LLVM types
+         *
+         * This is used when processing a pre-specialized AST from the Monomorphizer.
+         * The types are already concrete (T -> Token), so no substitution is needed.
+         */
+        std::vector<llvm::Type *> create_fields_from_specialized(
+            const std::vector<std::unique_ptr<Cryo::StructFieldNode>> &fields);
+
+        /**
          * @brief Create function type with substitution
          * @param node Function declaration
          * @return Substituted function type

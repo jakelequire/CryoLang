@@ -9,6 +9,7 @@
 #include "AST/TemplateRegistry.hpp"
 #include "Diagnostics/Diag.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
+#include "Types/Monomorphizer.hpp"
 
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Function.h>
@@ -194,6 +195,15 @@ namespace Cryo::Codegen
         /** @brief Get template registry (may be null) */
         Cryo::TemplateRegistry *template_registry() { return _template_registry; }
 
+        /** @brief Set monomorphizer for access to specialized ASTs */
+        void set_monomorphizer(Cryo::Monomorphizer *mono)
+        {
+            _monomorphizer = mono;
+        }
+
+        /** @brief Get monomorphizer (may be null) */
+        Cryo::Monomorphizer *monomorphizer() { return _monomorphizer; }
+
         //===================================================================
         // Symbol Resolution
         //===================================================================
@@ -370,6 +380,7 @@ namespace Cryo::Codegen
         Cryo::DiagEmitter *_diagnostics;
         CodegenVisitor *_visitor = nullptr;
         Cryo::TemplateRegistry *_template_registry = nullptr;
+        Cryo::Monomorphizer *_monomorphizer = nullptr;
 
         //===================================================================
         // Owned Components

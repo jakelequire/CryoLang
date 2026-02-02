@@ -278,6 +278,10 @@ namespace Cryo
             specialized_ast = _ast_specializer(*tmpl, subst, specialized_name);
         }
 
+        // Map specialized_name to key for lookup by name later
+        std::string key = generate_key(template_type, type_args);
+        _name_to_key[specialized_name] = key;
+
         // Mark as monomorphized in the registry
         _generics.mark_monomorphized(template_type, type_args);
 
@@ -565,6 +569,20 @@ namespace Cryo
             return it->second;
         }
         return std::nullopt;
+    }
+
+    std::optional<SpecializationEntry> Monomorphizer::get_specialization_by_name(
+        const std::string &specialized_name) const
+    {
+        // Look up the key by specialized_name
+        auto name_it = _name_to_key.find(specialized_name);
+        if (name_it == _name_to_key.end())
+        {
+            return std::nullopt;
+        }
+
+        // Then get the specialization by key
+        return get_specialization(name_it->second);
     }
 
     void Monomorphizer::cache_specialization(const std::string &key,

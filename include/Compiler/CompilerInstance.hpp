@@ -11,6 +11,7 @@
 #include "AST/TemplateRegistry.hpp"
 #include "AST/DirectiveSystem.hpp"
 #include "AST/DirectiveProcessors.hpp"
+#include "AST/ASTSpecializer.hpp"
 #include "Types/GenericRegistry.hpp"
 #include "Types/TypeResolver.hpp"
 #include "Diagnostics/Diag.hpp"
@@ -62,6 +63,7 @@ namespace Cryo
         // TypeChecker needs arena, resolver, modules, generics
         std::unique_ptr<TypeChecker> _type_checker;
         std::unique_ptr<Monomorphizer> _monomorphization_pass;
+        std::unique_ptr<ASTSpecializer> _ast_specializer;
         std::unique_ptr<TemplateRegistry> _template_registry;
         std::unique_ptr<Cryo::Codegen::CodeGenerator> _codegen;
         std::unique_ptr<Cryo::Linker::CryoLinker> _linker;
@@ -164,6 +166,7 @@ namespace Cryo
         TypeResolver *type_resolver() const { return _type_resolver.get(); }
         GenericRegistry *generic_registry() const { return _generic_registry.get(); }
         Monomorphizer *monomorphizer() const { return _monomorphization_pass.get(); }
+        ASTSpecializer *ast_specializer() const { return _ast_specializer.get(); }
         TemplateRegistry *template_registry() const { return _template_registry.get(); }
         Cryo::SRM::SymbolResolutionManager *symbol_resolution_manager() const { return _symbol_resolution_manager.get(); }
         Cryo::Codegen::CodeGenerator *codegen() const { return _codegen.get(); }
