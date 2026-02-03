@@ -1,5 +1,4 @@
-// This file is going to be a small shell script interpreter
-// example implementation in the Cryo language.
+// This file is going to be a small script interpreter.
 // It will be compiled with the `--raw` flag which disables the Cryo
 // Standard Library and Cryo Runtime, meaning the program will be
 // only linking with libc and other necessary system libraries.
@@ -152,6 +151,7 @@ type struct Array<T> {
     }
 }
 
+
 type enum TokenType {
     NUMBER;
     IDENTIFIER;
@@ -163,6 +163,7 @@ type enum TokenType {
     RPAREN;
     ASSIGN;
     SEMICOLON;
+    PRINT;
     EOF;
 }
 
@@ -178,6 +179,7 @@ function token_type_to_string(ty: TokenType) -> string {
         case TokenType::RPAREN: return "RPAREN";
         case TokenType::ASSIGN: return "ASSIGN";
         case TokenType::SEMICOLON: return "SEMICOLON";
+        case TokenType::PRINT: return "PRINT";
         case TokenType::EOF: return "EOF";
     }
 }
@@ -254,6 +256,9 @@ public:
                     this.advance();
                 }
                 const lexeme: string = substr(this.source, start, this.position);
+                if (strcmp(lexeme, "print") == 0) {
+                    return Token::new(TokenType::PRINT, lexeme, start_line, start + 1);
+                }
                 return Token::new(TokenType::IDENTIFIER, lexeme, start_line, start + 1);
             }
             '+' => { return Token::new(TokenType::PLUS, "+", start_line, start + 1);      }
@@ -356,6 +361,13 @@ type enum Expr {
 }
 
 
+// Statement types
+type enum Stmt {
+    Print(Expr*);
+    Expression(Expr*);
+}
+
+
 // Parser
 type struct Parser {
     tokens: Array<Token>;
@@ -368,18 +380,24 @@ type struct Parser {
         };
     }
 
-    parse(mut &this) -> Expr* {
-        return this.expression();
-    }
-
     has_more(&this) -> boolean {
         return !this.is_at_end();
     }
 
-    skip_semicolons(mut &this) -> void {
-        while (this.check(TokenType::SEMICOLON)) {
-            this.advance();
+    statement(mut &this) -> Stmt* {
+        if (this.match_token(TokenType::PRINT)) {
+            const expr: Expr* = this.expression();
+            this.match_token(TokenType::SEMICOLON);
+            mut result: Stmt* = malloc(sizeof(Stmt));
+            result = Stmt::Print(expr);
+            return result;
         }
+
+        const expr: Expr* = this.expression();
+        this.match_token(TokenType::SEMICOLON);
+        mut result: Stmt* = malloc(sizeof(Stmt));
+        result = Stmt::Expression(expr);
+        return result;
     }
 
     peek(&this) -> Token {
@@ -543,29 +561,49 @@ type struct Parser {
 type struct Interpreter {
     var_names: Array<string>;
     var_values: Array<i32>;
+    repl_mode: boolean;
 
     static new() -> Interpreter {
         return Interpreter {
             var_names: Array<string>::with_capacity(16),
-            var_values: Array<i32>::with_capacity(16)
+            var_values: Array<i32>::with_capacity(16),
+            repl_mode: false
         };
     }
 
-    evaluate(mut &this, expr: Expr*) -> i128 {
+    execute(mut &this, stmt: Stmt*) -> void {
+        match (stmt) {
+            Stmt::Print(expr) => {
+                const value: i32 = this.evaluate(expr);
+                printf("%d\n", value);
+            }
+            Stmt::Expression(expr) => {
+                const value: i32 = this.evaluate(expr);
+                if (this.repl_mode) {
+                    printf("%d\n", value);
+                }
+            }
+            _ => {
+                printf("Error: Unknown statement type\n");
+            }
+        }
+    }
+
+    evaluate(mut &this, expr: Expr*) -> i64 {
         match (expr) {
             Expr::Number(value) => {
                 return value;
             }
             Expr::Binary(binary) => {
-                const left: i32 = this.evaluate(binary.left);
-                const right: i32 = this.evaluate(binary.right);
+                const left: i64 = this.evaluate(binary.left);
+                const right: i64 = this.evaluate(binary.right);
 
                 match (binary.op) {
                     TokenType::PLUS => { return left + right; }
                     TokenType::MINUS => { return left - right; }
                     TokenType::STAR => { return left * right; }
                     TokenType::SLASH => {
-                        if (right == 0 as i32) {
+                        if (right == 0 as i64) {
                             printf("Error: Division by zero\n");
                             return 0;
                         }
@@ -578,7 +616,7 @@ type struct Interpreter {
                 }
             }
             Expr::Unary(u) => {
-                const operand: i32 = this.evaluate(u.operand);
+                const operand: i64 = this.evaluate(u.operand);
                 match (u.op) {
                     TokenType::MINUS => { return 0 - operand; }
                     _ => {
@@ -591,7 +629,7 @@ type struct Interpreter {
                 return this.get_variable(name);
             }
             Expr::Assign(assign) => {
-                const value: i32 = this.evaluate(assign.value);
+                const value: i64 = this.evaluate(assign.value);
                 this.set_variable(assign.name, value);
                 return value;
             }
@@ -632,6 +670,34 @@ type struct Interpreter {
 }
 
 
+function read_line() -> string {
+    mut buffer: char* = malloc(1024);
+    mut pos: i32 = 0;
+
+    loop {
+        const c: i32 = getchar();
+        if (c == -1) {
+            if (pos == 0) {
+                free(buffer);
+                return "";
+            }
+            break;
+        }
+        if (c == 10) {
+            break;
+        }
+        buffer[pos] = c;
+        pos += 1;
+        if (pos >= 1023) {
+            break;
+        }
+    }
+
+    buffer[pos] = '\0';
+    return buffer;
+}
+
+
 function collect(argc: i32, argv: string[]) -> string {
     mut result: char* = malloc(sizeof(string) * 1024);
     mut pos: i32 = 0;
@@ -657,28 +723,45 @@ function collect(argc: i32, argv: string[]) -> string {
 
 
 function main(argc: i32, argv: string[]) -> i32 {
-    if (argc < 2) {
-        printf("Usage: cryo_interpreter <CODE>\n");
-        return 1;
+    mut interpreter: Interpreter = Interpreter::new();
+
+    // CLI mode: run source from arguments
+    if (argc >= 2) {
+        const lexer: Lexer = Lexer::new(collect(argc, argv));
+        const tokens: Array<Token> = lexer.tokenize();
+        mut parser: Parser = Parser::new(tokens);
+        loop {
+            if (!parser.has_more()) { break; }
+            const stmt: Stmt* = parser.statement();
+            interpreter.execute(stmt);
+        }
+        return 0;
     }
 
-    const lexer: Lexer = Lexer::new(collect(argc, argv));
-    const tokens: Array<Token> = lexer.tokenize();
-
-    mut parser: Parser = Parser::new(tokens);
-    mut interpreter: Interpreter = Interpreter::new();
-    mut result: i128 = 0;
+    // REPL mode
+    interpreter.repl_mode = true;
+    printf("Type 'exit' to quit.\n\n");
 
     loop {
-        const ast: Expr* = parser.parse();
-        result = interpreter.evaluate(ast);
-        parser.skip_semicolons();
-        if (!parser.has_more()) {
+        printf("> ");
+        const line: string = read_line();
+        if (strlen(line) == 0) {
             break;
+        }
+        if (strcmp(line, "exit") == 0) {
+            break;
+        }
+
+        const lexer: Lexer = Lexer::new(line);
+        const tokens: Array<Token> = lexer.tokenize();
+        mut parser: Parser = Parser::new(tokens);
+        loop {
+            if (!parser.has_more()) { break; }
+            const stmt: Stmt* = parser.statement();
+            interpreter.execute(stmt);
         }
     }
 
-    printf("%lld\n", result);
-
+    printf("Bye!\n");
     return 0;
 }
