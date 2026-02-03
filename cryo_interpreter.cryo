@@ -340,11 +340,17 @@ type struct AssignExpr {
     value: Expr*;
 }
 
+type struct UnaryExpr {
+    op: TokenType;
+    operand: Expr*;
+}
+
 
 // AST Node types
 type enum Expr {
     Number(i32);
     Binary(BinaryExpr*);
+    Unary(UnaryExpr*);
     Variable(string);
     Assign(AssignExpr*);
 }
@@ -364,6 +370,16 @@ type struct Parser {
 
     parse(mut &this) -> Expr* {
         return this.expression();
+    }
+
+    has_more(&this) -> boolean {
+        return !this.is_at_end();
+    }
+
+    skip_semicolons(mut &this) -> void {
+        while (this.check(TokenType::SEMICOLON)) {
+            this.advance();
+        }
     }
 
     peek(&this) -> Token {
@@ -454,12 +470,12 @@ type struct Parser {
     }
 
     multiplicative(mut &this) -> Expr* {
-        mut expr: Expr* = this.primary();
+        mut expr: Expr* = this.unary();
 
         loop {
             if (this.match_token(TokenType::STAR) || this.match_token(TokenType::SLASH)) {
                 const op: TokenType = this.previous().ty;
-                const right: Expr* = this.primary();
+                const right: Expr* = this.unary();
                 
                 mut binary: BinaryExpr* = malloc(sizeof(BinaryExpr));
                 binary.left = expr;
@@ -477,10 +493,23 @@ type struct Parser {
         return expr;
     }
 
+    unary(mut &this) -> Expr* {
+        if (this.match_token(TokenType::MINUS)) {
+            const operand: Expr* = this.unary();
+            mut u: UnaryExpr* = malloc(sizeof(UnaryExpr));
+            u.op = TokenType::MINUS;
+            u.operand = operand;
+            mut result: Expr* = malloc(sizeof(Expr));
+            result = Expr::Unary(u);
+            return result;
+        }
+        return this.primary();
+    }
+
     primary(mut &this) -> Expr* {
         if (this.match_token(TokenType::NUMBER)) {
             const lexeme: string = this.previous().lexeme;
-            const value: i32 = atoi(lexeme);  // You'll need to add atoi as an intrinsic
+            const value: i32 = atoi(lexeme);
             
             mut result: Expr* = malloc(sizeof(Expr));
             result = Expr::Number(value);
@@ -548,12 +577,20 @@ type struct Interpreter {
                     }
                 }
             }
+            Expr::Unary(u) => {
+                const operand: i32 = this.evaluate(u.operand);
+                match (u.op) {
+                    TokenType::MINUS => { return 0 - operand; }
+                    _ => {
+                        printf("Error: Unknown unary operator\n");
+                        return 0;
+                    }
+                }
+            }
             Expr::Variable(name) => {
-                printf("Variable: %s\n", name);
                 return this.get_variable(name);
             }
             Expr::Assign(assign) => {
-                printf("Assignment to variable: %s\n", assign.name);
                 const value: i32 = this.evaluate(assign.value);
                 this.set_variable(assign.name, value);
                 return value;
@@ -599,10 +636,12 @@ function collect(argc: i32, argv: string[]) -> string {
     mut result: char* = malloc(sizeof(string) * 1024);
     mut pos: i32 = 0;
     mut i: i32 = 1;
+
     while (i < argc) {
         const arg: string = argv[i];
         const arg_len: i32 = strlen(arg);
         memcpy(result + pos, arg, arg_len);
+        
         pos += arg_len;
         if (i < argc - 1) {
             result[pos] = ' ';
@@ -610,6 +649,7 @@ function collect(argc: i32, argv: string[]) -> string {
         }
         i++;
     }
+
     result[pos] = '\0';
     return result;
 }
@@ -626,9 +666,17 @@ function main(argc: i32, argv: string[]) -> i32 {
     const tokens: Array<Token> = lexer.tokenize();
 
     mut parser: Parser = Parser::new(tokens);
-    const ast: Expr* = parser.parse();
     mut interpreter: Interpreter = Interpreter::new();
-    const result: i128 = interpreter.evaluate(ast);
+    mut result: i128 = 0;
+
+    loop {
+        const ast: Expr* = parser.parse();
+        result = interpreter.evaluate(ast);
+        parser.skip_semicolons();
+        if (!parser.has_more()) {
+            break;
+        }
+    }
 
     printf("%lld\n", result);
 
