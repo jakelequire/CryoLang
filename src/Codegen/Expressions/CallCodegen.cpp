@@ -2890,9 +2890,24 @@ namespace Cryo::Codegen
 
         // Prepare arguments: receiver (this) + method args
         std::vector<llvm::Value *> call_args;
-        call_args.push_back(receiver);
 
         llvm::FunctionType *fn_type = method->getFunctionType();
+
+        // Check if the method expects 'this' by value (e.g., simple enum i32) instead of by pointer
+        // If so, load the value from the receiver pointer
+        llvm::Value *this_arg = receiver;
+        if (fn_type->getNumParams() > 0)
+        {
+            llvm::Type *this_param_type = fn_type->getParamType(0);
+            if (!this_param_type->isPointerTy() && receiver->getType()->isPointerTy())
+            {
+                // Function expects value but we have pointer - load the value
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_instance_method: Loading value from pointer for 'this' parameter (simple enum)");
+                this_arg = builder().CreateLoad(this_param_type, receiver, "this.load");
+            }
+        }
+        call_args.push_back(this_arg);
         for (size_t i = 0; i < args.size(); ++i)
         {
             size_t param_idx = i + 1; // Skip 'this' parameter
