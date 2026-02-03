@@ -1024,6 +1024,41 @@ namespace Cryo::Codegen
                 return nullptr;
             }
 
+            // Ensure both values have the same type before comparison
+            // The expected_discriminant is always i32 (from TypeCodegen), but discriminant_value
+            // might be a different integer size depending on how the field was loaded
+            if (discriminant_value->getType() != expected_discriminant->getType())
+            {
+                llvm::Type *disc_type = discriminant_value->getType();
+                llvm::Type *exp_type = expected_discriminant->getType();
+
+                if (disc_type->isIntegerTy() && exp_type->isIntegerTy())
+                {
+                    unsigned disc_bits = disc_type->getIntegerBitWidth();
+                    unsigned exp_bits = exp_type->getIntegerBitWidth();
+
+                    // Cast to the larger type to avoid data loss
+                    if (disc_bits < exp_bits)
+                    {
+                        discriminant_value = builder().CreateZExt(discriminant_value, exp_type, "disc.zext");
+                    }
+                    else if (disc_bits > exp_bits)
+                    {
+                        // Cast expected_discriminant to match discriminant_value's type
+                        expected_discriminant = llvm::ConstantInt::get(
+                            disc_type,
+                            llvm::cast<llvm::ConstantInt>(expected_discriminant)->getZExtValue());
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_pattern_match: Type mismatch between discriminant ({}) and expected ({})",
+                              disc_type->getTypeID(), exp_type->getTypeID());
+                    return nullptr;
+                }
+            }
+
             // Compare discriminant with expected value
             return builder().CreateICmpEQ(discriminant_value, expected_discriminant, "enum.match");
         }
@@ -1449,6 +1484,52 @@ namespace Cryo::Codegen
                         else if (field_type_name == "void") field_ref = arena.get_void();
                         else if (field_type_name == "void*" || field_type_name == "voidp")
                             field_ref = arena.get_pointer_to(arena.get_void());
+                        // Handle pointer types to user-defined types (e.g., "BinaryExpr*")
+                        else if (field_type_name.size() > 1 && field_type_name.back() == '*')
+                        {
+                            std::string base_name = field_type_name.substr(0, field_type_name.size() - 1);
+                            TypeRef base_type = arena.lookup_type_by_name(base_name);
+                            if (base_type.is_valid())
+                            {
+                                field_ref = arena.get_pointer_to(base_type);
+                            }
+                            else
+                            {
+                                // Try with namespace prefix
+                                std::string ns_context = ctx().namespace_context();
+                                if (!ns_context.empty())
+                                {
+                                    base_type = arena.lookup_type_by_name(ns_context + "::" + base_name);
+                                    if (base_type.is_valid())
+                                    {
+                                        field_ref = arena.get_pointer_to(base_type);
+                                    }
+                                }
+                            }
+                        }
+                        // Handle reference types (e.g., "&BinaryExpr")
+                        else if (field_type_name.size() > 1 && field_type_name.front() == '&')
+                        {
+                            std::string base_name = field_type_name.substr(1);
+                            TypeRef base_type = arena.lookup_type_by_name(base_name);
+                            if (base_type.is_valid())
+                            {
+                                field_ref = arena.get_reference_to(base_type, Cryo::RefMutability::Immutable);
+                            }
+                            else
+                            {
+                                // Try with namespace prefix
+                                std::string ns_context = ctx().namespace_context();
+                                if (!ns_context.empty())
+                                {
+                                    base_type = arena.lookup_type_by_name(ns_context + "::" + base_name);
+                                    if (base_type.is_valid())
+                                    {
+                                        field_ref = arena.get_reference_to(base_type, Cryo::RefMutability::Immutable);
+                                    }
+                                }
+                            }
+                        }
                     }
                     if (field_ref.is_valid())
                     {

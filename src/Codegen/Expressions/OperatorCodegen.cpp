@@ -539,14 +539,35 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Store the value
-        if (_memory)
+        // Check if we need to store through a pointer.
+        // When the variable is a pointer type (e.g., Expr*) but the value is a struct/aggregate
+        // type (e.g., %Expr from an enum constructor), we must load the pointer first and store
+        // the value through it into the heap-allocated memory, rather than overwriting the
+        // pointer alloca itself.
+        llvm::Type *alloc_type = nullptr;
+        if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(var_ptr))
+            alloc_type = alloca->getAllocatedType();
+        else if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(var_ptr))
+            alloc_type = global->getValueType();
+
+        if (alloc_type && alloc_type->isPointerTy() && value->getType()->isStructTy())
         {
-            _memory->create_store(value, var_ptr);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Assignment: Storing struct value through pointer for variable '{}'", var_name);
+            llvm::Value *ptr_val = builder().CreateLoad(alloc_type, var_ptr, "ptr.deref");
+            builder().CreateStore(value, ptr_val);
         }
         else
         {
-            builder().CreateStore(value, var_ptr);
+            // Store the value directly
+            if (_memory)
+            {
+                _memory->create_store(value, var_ptr);
+            }
+            else
+            {
+                builder().CreateStore(value, var_ptr);
+            }
         }
 
         return value;

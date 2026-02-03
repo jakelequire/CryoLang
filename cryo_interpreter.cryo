@@ -3,6 +3,13 @@
 // It will be compiled with the `--raw` flag which disables the Cryo
 // Standard Library and Cryo Runtime, meaning the program will be
 // only linking with libc and other necessary system libraries.
+// 
+// The compiler offers several built-in functions and types that can be used
+// even in raw mode, such as basic memory management functions (malloc, free),
+// string manipulation functions (strlen, strcpy), and basic I/O functions
+// (printf, puts). Even though the standard library is not available,
+// these functions are defined in `./stdlib/core/intrinsics.cryo` and
+// can be used directly.
 namespace CryoInterpreter;
 
 
@@ -19,6 +26,28 @@ function substr(s: string, start: i32, end: i32) -> string {
     }
     buffer[length] = '\0';
     return buffer;
+}
+
+function atoi(s: string) -> i32 {
+    mut result: i32 = 0;
+    mut i: i32 = 0;
+    mut negative: boolean = false;
+
+    if (s[0] == '-') {
+        negative = true;
+        i = 1;
+    }
+
+    while (s[i] >= '0' && s[i] <= '9') {
+        result = result * 10 + (s[i] - '0');
+        i++;
+    }
+
+    if (negative) {
+        result = -result;
+    }
+
+    return result;
 }
 
 type struct String {
@@ -137,7 +166,6 @@ type enum TokenType {
     EOF;
 }
 
-
 function token_type_to_string(ty: TokenType) -> string {
     switch (ty) {
         case TokenType::NUMBER: return "NUMBER";
@@ -228,30 +256,14 @@ public:
                 const lexeme: string = substr(this.source, start, this.position);
                 return Token::new(TokenType::IDENTIFIER, lexeme, start_line, start + 1);
             }
-            '+' => {
-                return Token::new(TokenType::PLUS, "+", start_line, start + 1);
-            }
-            '-' => {
-                return Token::new(TokenType::MINUS, "-", start_line, start + 1);
-            }
-            '*' => {
-                return Token::new(TokenType::STAR, "*", start_line, start + 1);
-            }
-            '/' => {
-                return Token::new(TokenType::SLASH, "/", start_line, start + 1);
-            }
-            '(' => {
-                return Token::new(TokenType::LPAREN, "(", start_line, start + 1);
-            }
-            ')' => {
-                return Token::new(TokenType::RPAREN, ")", start_line, start + 1);
-            }
-            '=' => {
-                return Token::new(TokenType::ASSIGN, "=", start_line, start + 1);
-            }
-            ';' => {
-                return Token::new(TokenType::SEMICOLON, ";", start_line, start + 1);
-            }
+            '+' => { return Token::new(TokenType::PLUS, "+", start_line, start + 1);      }
+            '-' => { return Token::new(TokenType::MINUS, "-", start_line, start + 1);     }
+            '*' => { return Token::new(TokenType::STAR, "*", start_line, start + 1);      }
+            '/' => { return Token::new(TokenType::SLASH, "/", start_line, start + 1);     } 
+            '(' => { return Token::new(TokenType::LPAREN, "(", start_line, start + 1);    }
+            ')' => { return Token::new(TokenType::RPAREN, ")", start_line, start + 1);    }
+            '=' => { return Token::new(TokenType::ASSIGN, "=", start_line, start + 1);    }
+            ';' => { return Token::new(TokenType::SEMICOLON, ";", start_line, start + 1); }
             _ => {
                 // Unknown character
                 return Token::new(TokenType::EOF, "", start_line, start + 1);
@@ -317,6 +329,280 @@ private:
 }
 
 
+type struct BinaryExpr {
+    left: Expr*;
+    op: TokenType;
+    right: Expr*;
+}
+
+type struct AssignExpr {
+    name: string;
+    value: Expr*;
+}
+
+
+// AST Node types
+type enum Expr {
+    Number(i32);
+    Binary(BinaryExpr*);
+    Variable(string);
+    Assign(AssignExpr*);
+}
+
+
+// Parser
+type struct Parser {
+    tokens: Array<Token>;
+    current: i32;
+
+    static new(tokens: Array<Token>) -> Parser {
+        return Parser {
+            tokens: tokens,
+            current: 0
+        };
+    }
+
+    parse(mut &this) -> Expr* {
+        return this.expression();
+    }
+
+    peek(&this) -> Token {
+        return this.tokens.get(this.current);
+    }
+
+    previous(&this) -> Token {
+        return this.tokens.get(this.current - 1);
+    }
+
+    is_at_end(&this) -> boolean {
+        return this.peek().ty == TokenType::EOF;
+    }
+
+    advance(mut &this) -> Token {
+        if (!this.is_at_end()) {
+            this.current += 1;
+        }
+        return this.previous();
+    }
+
+    check(&this, ty: TokenType) -> boolean {
+        if (this.is_at_end()) {
+            return false;
+        }
+        return this.peek().ty == ty;
+    }
+
+    match_token(mut &this, ty: TokenType) -> boolean {
+        if (this.check(ty)) {
+            this.advance();
+            return true;
+        }
+        return false;
+    }
+
+    expression(mut &this) -> Expr* {
+        return this.assignment();
+    }
+
+    assignment(mut &this) -> Expr* {
+        mut expr: Expr* = this.additive();
+
+        if (this.match_token(TokenType::ASSIGN)) {
+            // Check if left side is a variable
+            match (expr) {
+                Expr::Variable(name) => {
+                    const value: Expr* = this.expression();
+                    mut assign: AssignExpr* = malloc(sizeof(AssignExpr));
+                    assign.name = name;
+                    assign.value = value;
+                    
+                    mut result: Expr* = malloc(sizeof(Expr));
+                    result = Expr::Assign(assign);
+                    return result;
+                }
+                _ => {
+                    printf("Error: Invalid assignment target\n");
+                    return expr;
+                }
+            }
+        }
+
+        return expr;
+    }
+
+    additive(mut &this) -> Expr* {
+        mut expr: Expr* = this.multiplicative();
+        printf("After multiplicative, current token: %s\n", token_type_to_string(this.peek().ty));
+    
+        loop {
+            printf("Checking for PLUS or MINUS...\n");
+            if (this.match_token(TokenType::PLUS) || this.match_token(TokenType::MINUS)) {
+                printf("Matched operator!\n");
+                const op: TokenType = this.previous().ty;
+                const right: Expr* = this.multiplicative();
+                
+                mut binary: BinaryExpr* = malloc(sizeof(BinaryExpr));
+                binary.left = expr;
+                binary.op = op;
+                binary.right = right;
+                
+                mut result: Expr* = malloc(sizeof(Expr));
+                result = Expr::Binary(binary);
+                expr = result;
+            } else {
+                printf("No match, breaking\n");
+                break;
+            }
+        }
+    
+        return expr;
+    }
+
+    multiplicative(mut &this) -> Expr* {
+        mut expr: Expr* = this.primary();
+
+        loop {
+            if (this.match_token(TokenType::STAR) || this.match_token(TokenType::SLASH)) {
+                const op: TokenType = this.previous().ty;
+                const right: Expr* = this.primary();
+                
+                mut binary: BinaryExpr* = malloc(sizeof(BinaryExpr));
+                binary.left = expr;
+                binary.op = op;
+                binary.right = right;
+                
+                mut result: Expr* = malloc(sizeof(Expr));
+                result = Expr::Binary(binary);
+                expr = result;
+            } else {
+                break;
+            }
+        }
+
+        return expr;
+    }
+
+    primary(mut &this) -> Expr* {
+        if (this.match_token(TokenType::NUMBER)) {
+            const lexeme: string = this.previous().lexeme;
+            const value: i32 = atoi(lexeme);  // You'll need to add atoi as an intrinsic
+            
+            mut result: Expr* = malloc(sizeof(Expr));
+            result = Expr::Number(value);
+            return result;
+        }
+
+        if (this.match_token(TokenType::IDENTIFIER)) {
+            const name: string = this.previous().lexeme;
+            
+            mut result: Expr* = malloc(sizeof(Expr));
+            result = Expr::Variable(name);
+            return result;
+        }
+
+        if (this.match_token(TokenType::LPAREN)) {
+            const expr: Expr* = this.expression();
+            if (!this.match_token(TokenType::RPAREN)) {
+                printf("Error: Expected ')' after expression\n");
+            }
+            return expr;
+        }
+
+        printf("Error: Expected expression\n");
+        mut result: Expr* = malloc(sizeof(Expr));
+        result = Expr::Number(0);
+        return result;
+    }
+}
+
+// Interpreter
+type struct Interpreter {
+    var_names: Array<string>;
+    var_values: Array<i32>;
+
+    static new() -> Interpreter {
+        return Interpreter {
+            var_names: Array<string>::with_capacity(16),
+            var_values: Array<i32>::with_capacity(16)
+        };
+    }
+
+    evaluate(mut &this, expr: Expr*) -> i32 {
+        printf("Evaluating expression...\n");
+        match (expr) {
+            Expr::Number(value) => {
+                printf("Number: %d\n", value);
+                return value;
+            }
+            Expr::Binary(binary) => {
+                printf("Binary Expression\n");
+                const left: i32 = this.evaluate(binary.left);
+                const right: i32 = this.evaluate(binary.right);
+
+                match (binary.op) {
+                    TokenType::PLUS => { return left + right; }
+                    TokenType::MINUS => { return left - right; }
+                    TokenType::STAR => { return left * right; }
+                    TokenType::SLASH => {
+                        if (right == 0 as i32) {
+                            printf("Error: Division by zero\n");
+                            return 0;
+                        }
+                        return left / right;
+                    }
+                    _ => {
+                        printf("Error: Unknown operator\n");
+                        return 0;
+                    }
+                }
+            }
+            Expr::Variable(name) => {
+                printf("Variable: %s\n", name);
+                return this.get_variable(name);
+            }
+            Expr::Assign(assign) => {
+                printf("Assignment to variable: %s\n", assign.name);
+                const value: i32 = this.evaluate(assign.value);
+                this.set_variable(assign.name, value);
+                return value;
+            }
+            _ => {
+                printf("Error: Unknown expression type\n");
+                return 0;
+            }
+        }
+
+        return 0;
+    }
+
+    get_variable(&this, name: string) -> i32 {
+        mut i: i32 = 0;
+        while (i < this.var_names.len()) {
+            if (strcmp(this.var_names.get(i), name) == 0) {
+                return this.var_values.get(i);
+            }
+            i += 1;
+        }
+        printf("Error: Undefined variable: %s\n", name);
+        return 0;
+    }
+
+    set_variable(mut &this, name: string, value: i32) -> void {
+        mut i: i32 = 0;
+        while (i < this.var_names.len()) {
+            if (strcmp(this.var_names.get(i), name) == 0) {
+                this.var_values.data[i] = value;
+                return;
+            }
+            i += 1;
+        }
+        // Variable doesn't exist, add it
+        this.var_names.push(name);
+        this.var_values.push(value);
+    }
+}
+
+
 function collect_args(argc: i32, argv: string[]) -> string {
     mut result: char* = malloc(sizeof(string) * 1024);
     mut pos: i32 = 0;
@@ -346,17 +632,31 @@ function main(argc: i32, argv: string[]) -> i32 {
     }
 
     const str: string = collect_args(argc, argv);
-    printf("Source Code:\n%s\n", str);
+    printf("Source Code: %s\n", str);
 
     const lexer: Lexer = Lexer::new(str);
     const tokens: Array<Token> = lexer.tokenize();
-    printf("Tokens: %d\n", tokens.len());
+
+    printf("Tokens:\n");
     mut i: i32 = 0;
     while (i < tokens.len()) {
         const token: Token = tokens.get(i);
         token.print();
         i++;
     }
+
+    mut parser: Parser = Parser::new(tokens);
+
+    printf("Parsing...\n");
+    const ast: Expr* = parser.parse();
+
+    printf("Interpreting...\n");
+    mut interpreter: Interpreter = Interpreter::new();
+
+    printf("Evaluating...\n");
+    const result: i32 = interpreter.evaluate(ast);
+
+    printf("Result: %d\n", result);
 
     return 0;
 }

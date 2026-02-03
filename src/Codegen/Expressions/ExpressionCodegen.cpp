@@ -1820,6 +1820,34 @@ namespace Cryo::Codegen
 
         // TODO: Get proper Cryo::Type* from node instead of string lookup
         llvm::Type *llvm_type = types().get_type(type_name);
+
+        // Try CodegenContext's type registry (enums are registered there)
+        if (!llvm_type)
+        {
+            llvm_type = ctx().get_type(type_name);
+        }
+
+        // Try with namespace prefix if not found
+        if (!llvm_type)
+        {
+            std::string ns = ctx().namespace_context();
+            if (!ns.empty())
+            {
+                std::string qualified_name = ns + "::" + type_name;
+                llvm_type = types().get_type(qualified_name);
+                if (!llvm_type)
+                {
+                    llvm_type = ctx().get_type(qualified_name);
+                }
+                if (llvm_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_sizeof: Found type '{}' with namespace prefix as '{}'",
+                              type_name, qualified_name);
+                }
+            }
+        }
+
         if (!llvm_type)
         {
             report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, "Unknown type for sizeof: " + type_name);
@@ -2760,6 +2788,91 @@ namespace Cryo::Codegen
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                       "resolve_member_info: ArrayAccessNode - extracted array element type: {}",
                                       obj_type->display_name());
+                        }
+                    }
+                }
+            }
+            // Fallback: If object is a CallExpressionNode (e.g., this.peek().ty), resolve the return type
+            else if (auto *call_expr = dynamic_cast<Cryo::CallExpressionNode *>(object))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_member_info: Object is CallExpressionNode, resolving return type");
+
+                // First check if the call expression has a resolved type set
+                if (call_expr->get_resolved_type().is_valid())
+                {
+                    obj_type = call_expr->get_resolved_type();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_member_info: CallExpressionNode has resolved type: {}",
+                              obj_type->display_name());
+                }
+                else
+                {
+                    // Try to find the return type by looking up the method
+                    Cryo::ExpressionNode *callee = call_expr->callee();
+                    if (auto *member_callee = dynamic_cast<Cryo::MemberAccessNode *>(callee))
+                    {
+                        // It's a method call like this.peek() - look up the method's return type
+                        std::string method_name = member_callee->member();
+
+                        // Get the receiver type
+                        TypeRef receiver_type;
+                        if (auto *recv_id = dynamic_cast<Cryo::IdentifierNode *>(member_callee->object()))
+                        {
+                            auto &var_types = ctx().variable_types_map();
+                            auto it = var_types.find(recv_id->name());
+                            if (it != var_types.end() && it->second.is_valid())
+                            {
+                                receiver_type = it->second;
+                            }
+                        }
+                        else if (member_callee->object()->get_resolved_type().is_valid())
+                        {
+                            receiver_type = member_callee->object()->get_resolved_type();
+                        }
+
+                        if (receiver_type.is_valid())
+                        {
+                            // Get the type name (handle pointer/reference types)
+                            std::string receiver_type_name = receiver_type->display_name();
+                            if (receiver_type->kind() == Cryo::TypeKind::Pointer)
+                            {
+                                auto *ptr = dynamic_cast<const Cryo::PointerType *>(receiver_type.get());
+                                if (ptr && ptr->pointee())
+                                    receiver_type_name = ptr->pointee()->display_name();
+                            }
+                            else if (receiver_type->kind() == Cryo::TypeKind::Reference)
+                            {
+                                auto *ref = dynamic_cast<const Cryo::ReferenceType *>(receiver_type.get());
+                                if (ref && ref->referent())
+                                    receiver_type_name = ref->referent()->display_name();
+                            }
+                            else if (!receiver_type_name.empty() && receiver_type_name.back() == '*')
+                            {
+                                receiver_type_name.pop_back();
+                            }
+
+                            // Look up the method's return type
+                            std::vector<std::string> method_candidates;
+                            std::string ns = ctx().namespace_context();
+                            if (!ns.empty())
+                            {
+                                method_candidates.push_back(ns + "::" + receiver_type_name + "::" + method_name);
+                            }
+                            method_candidates.push_back(receiver_type_name + "::" + method_name);
+
+                            for (const auto &candidate : method_candidates)
+                            {
+                                TypeRef return_type = ctx().get_method_return_type(candidate);
+                                if (return_type.is_valid())
+                                {
+                                    obj_type = return_type;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_member_info: Resolved method '{}' return type to '{}'",
+                                              candidate, obj_type->display_name());
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
