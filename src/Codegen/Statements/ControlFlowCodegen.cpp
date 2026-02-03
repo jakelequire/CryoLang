@@ -1009,6 +1009,14 @@ namespace Cryo::Codegen
                 llvm::Value *discriminant_ptr = builder().CreateStructGEP(struct_type, value, 0, "discriminant.ptr");
                 discriminant_value = builder().CreateLoad(builder().getInt32Ty(), discriminant_ptr, "enum.discriminant");
             }
+            else if (value_type->isIntegerTy())
+            {
+                // Value is a plain integer (simple enum without associated data)
+                // The value IS the discriminant
+                discriminant_value = value;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_pattern_match: Simple integer enum, using value directly as discriminant");
+            }
             else
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
