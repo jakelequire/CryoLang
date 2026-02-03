@@ -46,16 +46,11 @@ namespace Cryo::Codegen
             return generate_compound_assignment(node);
         }
 
-        // Generate operand values
-        llvm::Value *lhs = generate_operand(node->left());
-        if (!lhs)
-        {
-            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
-                         "Failed to generate left operand");
-            return nullptr;
-        }
-
-        // For logical operators, use short-circuit evaluation
+        // For logical operators, use short-circuit evaluation.
+        // These must be checked BEFORE evaluating the LHS, because the logical
+        // handlers evaluate the LHS themselves (to correctly set up short-circuit
+        // branching). Evaluating LHS here first would cause a double evaluation,
+        // which is incorrect for expressions with side effects.
         if (op == TokenKind::TK_AMPAMP)
         {
             return generate_logical_and(node);
@@ -63,6 +58,15 @@ namespace Cryo::Codegen
         if (op == TokenKind::TK_PIPEPIPE)
         {
             return generate_logical_or(node);
+        }
+
+        // Generate operand values
+        llvm::Value *lhs = generate_operand(node->left());
+        if (!lhs)
+        {
+            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
+                         "Failed to generate left operand");
+            return nullptr;
         }
 
         llvm::Value *rhs = generate_operand(node->right());
