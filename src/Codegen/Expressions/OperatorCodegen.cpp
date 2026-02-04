@@ -317,7 +317,7 @@ namespace Cryo::Codegen
 
     llvm::Value *OperatorCodegen::generate_assignment(Cryo::BinaryExpressionNode *node)
     {
-        LOG_ERROR(Cryo::LogComponent::CODEGEN, "=== ASSIGNMENT DEBUG: Starting assignment generation ===");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "=== ASSIGNMENT DEBUG: Starting assignment generation ===");
 
         if (!node)
             return nullptr;
@@ -365,25 +365,25 @@ namespace Cryo::Codegen
         }
 
         std::string var_name = target->name();
-        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "Assignment: Processing assignment to variable '{}'", var_name);
 
         // Find the variable's storage location
         llvm::Value *var_ptr = values().get_alloca(var_name);
         if (!var_ptr)
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "Assignment: Variable '{}' not found in alloca, trying globals", var_name);
             // Try global from ValueContext first
             var_ptr = values().get_global_value(var_name);
             if (var_ptr)
             {
-                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "Assignment: Found variable '{}' in ValueContext globals", var_name);
             }
             else
             {
-                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "Assignment: Variable '{}' not found in ValueContext globals, trying CodegenContext", var_name);
                 // Try global from CodegenContext as fallback
                 auto &globals = ctx().globals_map();
@@ -391,19 +391,19 @@ namespace Cryo::Codegen
                 if (it != globals.end())
                 {
                     var_ptr = it->second;
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "Assignment: Found variable '{}' in CodegenContext globals", var_name);
                 }
                 else
                 {
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "Assignment: Variable '{}' not found in CodegenContext globals either", var_name);
                 }
             }
         }
         else
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "Assignment: Found variable '{}' in alloca", var_name);
         }
 
@@ -420,7 +420,7 @@ namespace Cryo::Codegen
         // In this case, we need to construct in-place rather than heap-allocating
         if (auto *call_node = dynamic_cast<Cryo::CallExpressionNode *>(value_node))
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "Assignment: Processing call expression for variable '{}'", var_name);
 
             // Get the function name being called
@@ -428,13 +428,13 @@ namespace Cryo::Codegen
             if (auto *callee_id = dynamic_cast<Cryo::IdentifierNode *>(call_node->callee()))
             {
                 callee_name = callee_id->name();
-                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "Assignment: Callee name is '{}'", callee_name);
             }
 
             // Check if this is a class type constructor (only if callee_name is non-empty)
             bool is_class = (!callee_name.empty() && _calls) ? _calls->is_class_type(callee_name) : false;
-            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "Assignment: Callee '{}' is_class_type={}, _calls={}",
                       callee_name, is_class, (void *)_calls);
 
@@ -445,34 +445,34 @@ namespace Cryo::Codegen
                 if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(var_ptr))
                 {
                     var_type = alloca->getAllocatedType();
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "Assignment: Variable '{}' is AllocaInst, type={}",
                               var_name, var_type ? "present" : "null");
                 }
                 else if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(var_ptr))
                 {
                     var_type = global->getValueType();
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "Assignment: Variable '{}' is GlobalVariable, type={}",
                               var_name, var_type ? "present" : "null");
                 }
 
                 // If the target is a struct type (value type), try constructor-based assignment
                 bool is_struct = var_type ? var_type->isStructTy() : false;
-                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "Assignment: Variable '{}' type isStructTy={}", var_name, is_struct);
 
                 if (var_type && is_struct)
                 {
                     // Check if class type or try constructor anyway
                     bool try_constructor = is_class || call_node->arguments().empty();
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "Assignment: Try constructor for '{}': is_class={}, try_constructor={}",
                               callee_name, is_class, try_constructor);
 
                     if (try_constructor)
                     {
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Assignment: Starting in-place construction for '{}' of type '{}'",
                                   var_name, callee_name);
 
@@ -491,15 +491,15 @@ namespace Cryo::Codegen
                         }
 
                         // Look for the constructor function
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Assignment: Calling resolve_constructor for '{}'", callee_name);
                         llvm::Function *ctor = _calls->resolve_constructor(callee_name);
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Assignment: Constructor resolved: {}", ctor ? "SUCCESS" : "FAILED");
 
                         if (ctor)
                         {
-                            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                       "Assignment: Calling constructor '{}' with {} args",
                                       ctor->getName().str(), args.size());
                             // Call constructor with var_ptr as 'this'

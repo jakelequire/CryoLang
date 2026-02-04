@@ -6273,7 +6273,7 @@ namespace Cryo
             auto annotation = std::make_unique<TypeAnnotation>(
                 TypeAnnotation::named(return_type_string, start_loc));
             method->set_return_type_annotation(std::move(annotation));
-            LOG_ERROR(LogComponent::PARSER, "PARSER: Set return type annotation '{}' for struct method '{}'",
+            LOG_DEBUG(LogComponent::PARSER, "PARSER: Set return type annotation '{}' for struct method '{}'",
                       return_type_string, method_name);
         }
         else
