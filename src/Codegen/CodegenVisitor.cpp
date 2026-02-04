@@ -439,13 +439,13 @@ namespace Cryo::Codegen
                     if (method->return_type_annotation())
                     {
                         return_type_str = method->return_type_annotation()->to_string();
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Pass 2.6: Method '{}' has return_type_annotation: '{}'",
                                   qualified_method_name, return_type_str);
                     }
                     else
                     {
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Pass 2.6: Method '{}' has NO return_type_annotation (null)",
                                   qualified_method_name);
                     }
