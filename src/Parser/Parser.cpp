@@ -2702,8 +2702,17 @@ namespace Cryo
                                 return nullptr;
                             }
 
-                            generic_args.push_back(std::string(_current_token.text()));
+                            std::string type_arg = std::string(_current_token.text());
                             advance(); // consume type argument
+
+                            // Handle pointer modifiers (e.g., Array<Expr*>)
+                            while (_current_token.is(TokenKind::TK_STAR))
+                            {
+                                type_arg += "*";
+                                advance();
+                            }
+
+                            generic_args.push_back(type_arg);
 
                         } while (match(TokenKind::TK_COMMA));
 

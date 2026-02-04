@@ -344,5 +344,14 @@ namespace Cryo
          * @return true if registered
          */
         bool has_enum_impl_block(const std::string &base_enum_name) const;
+
+        /**
+         * @brief Find the namespace of a type by searching method annotation keys
+         * @param type_name Simple type name (e.g., "PathBuf")
+         * @param method_name Method name to search for (e.g., "from_cstr")
+         * @return The namespace prefix, or empty string if not found
+         */
+        std::string find_type_namespace_from_methods(const std::string &type_name,
+                                                      const std::string &method_name) const;
     };
 }

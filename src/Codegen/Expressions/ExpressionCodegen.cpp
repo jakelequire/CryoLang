@@ -1799,6 +1799,17 @@ namespace Cryo::Codegen
             auto *generics = visitor->get_generics();
             if (generics && generics->in_type_param_scope())
             {
+                // Try to resolve as a direct type parameter (e.g., "T" -> concrete TypeRef)
+                // If successful, use the TypeRef-based overload to bypass string lookup issues
+                TypeRef resolved_type = generics->resolve_type_param(type_name);
+                if (resolved_type.is_valid())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_sizeof: Resolved type param {} -> {} via TypeRef",
+                              type_name, resolved_type->display_name());
+                    return generate_sizeof(resolved_type);
+                }
+
                 // First try exact base name match
                 std::string redirected = generics->get_instantiated_scope_name(type_name);
                 if (!redirected.empty())

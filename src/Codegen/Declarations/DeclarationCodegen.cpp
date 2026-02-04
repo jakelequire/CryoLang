@@ -872,6 +872,23 @@ namespace Cryo::Codegen
         // Get variable type
         TypeRef cryo_var_type = node->get_resolved_type();
 
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "DeclarationCodegen: Variable '{}' resolved type kind={} display='{}'",
+                  name,
+                  cryo_var_type.is_valid() ? static_cast<int>(cryo_var_type->kind()) : -1,
+                  cryo_var_type.is_valid() ? cryo_var_type->display_name() : "null");
+
+        // Unwrap type aliases to their target types (e.g., AllocResult -> Result<void*, AllocError>)
+        while (cryo_var_type.is_valid() && cryo_var_type->kind() == Cryo::TypeKind::TypeAlias)
+        {
+            auto *alias = static_cast<const Cryo::TypeAliasType *>(cryo_var_type.get());
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Unwrapping type alias '{}' -> '{}'",
+                      cryo_var_type->display_name(),
+                      alias->target().is_valid() ? alias->target()->display_name() : "null");
+            cryo_var_type = alias->target();
+        }
+
         // Check if variable type is an error type (unresolved generics, undefined types, etc.)
         // This can happen with forward-referenced types that weren't resolved during parsing
         if (cryo_var_type.is_error())
@@ -1174,6 +1191,13 @@ namespace Cryo::Codegen
             report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
                          "No resolved type for global variable: " + name);
             return nullptr;
+        }
+
+        // Unwrap type aliases to their target types (e.g., AllocResult -> Result<void*, AllocError>)
+        while (cryo_type.is_valid() && cryo_type->kind() == Cryo::TypeKind::TypeAlias)
+        {
+            auto *alias = static_cast<const Cryo::TypeAliasType *>(cryo_type.get());
+            cryo_type = alias->target();
         }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Global '{}' has Cryo type: {} (kind={})",
