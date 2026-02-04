@@ -2493,6 +2493,32 @@ namespace Cryo::Codegen
                                                     type_name.pop_back();
                                                 }
 
+                                                // If display_name contains an error marker, try to resolve
+                                                // from the struct declaration's field type annotation instead
+                                                if (type_name.empty() || type_name.find("<error:") != std::string::npos)
+                                                {
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                              "Field type display_name is invalid ('{}'), trying annotation fallback for field '{}'",
+                                                              type_name, member_name);
+
+                                                    // Try to get the field's type annotation from the struct template
+                                                    const auto *tmpl_info = template_reg->find_template(candidate);
+                                                    if (tmpl_info && tmpl_info->struct_template)
+                                                    {
+                                                        for (const auto &field : tmpl_info->struct_template->fields())
+                                                        {
+                                                            if (field && field->name() == member_name && field->type_annotation())
+                                                            {
+                                                                type_name = field->type_annotation()->to_string();
+                                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                                          "Resolved field type from struct template annotation: {} -> {}",
+                                                                          member_name, type_name);
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
                                                 // Now look up the source_namespace for this type so method resolution
                                                 // can find methods defined in the type's original module
                                                 if (!type_name.empty() && type_name.find("::") == std::string::npos)
@@ -3895,10 +3921,59 @@ namespace Cryo::Codegen
         int field_idx = ctx().get_struct_field_index(type_name, member_name);
         if (field_idx < 0)
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "generate_member_receiver_address: Field '{}' not found in struct '{}'",
-                      member_name, type_name);
-            return nullptr;
+            // Fallback: try TemplateRegistry for cross-module struct field lookup
+            if (auto *template_reg = ctx().template_registry())
+            {
+                std::vector<std::string> candidates = {type_name};
+
+                // Add LLVM struct type name as candidate
+                if (struct_type && struct_type->hasName())
+                {
+                    std::string llvm_name = struct_type->getName().str();
+                    if (llvm_name != type_name)
+                        candidates.push_back(llvm_name);
+                }
+
+                // Add type_namespace_map lookup
+                std::string type_ns = ctx().get_type_namespace(type_name);
+                if (!type_ns.empty())
+                    candidates.push_back(type_ns + "::" + type_name);
+
+                // Try base template name (e.g., "Array" from "Array_Worker")
+                size_t underscore_pos = type_name.find('_');
+                if (underscore_pos != std::string::npos)
+                    candidates.push_back(type_name.substr(0, underscore_pos));
+
+                for (const auto &candidate : candidates)
+                {
+                    const TemplateRegistry::StructFieldInfo *field_info =
+                        template_reg->get_struct_field_types(candidate);
+                    if (field_info && !field_info->field_names.empty())
+                    {
+                        for (size_t i = 0; i < field_info->field_names.size(); ++i)
+                        {
+                            if (field_info->field_names[i] == member_name)
+                            {
+                                field_idx = static_cast<int>(i);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_member_receiver_address: Found field '{}' at index {} via TemplateRegistry (candidate '{}')",
+                                          member_name, field_idx, candidate);
+                                break;
+                            }
+                        }
+                        if (field_idx >= 0)
+                            break;
+                    }
+                }
+            }
+
+            if (field_idx < 0)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_member_receiver_address: Field '{}' not found in struct '{}'",
+                          member_name, type_name);
+                return nullptr;
+            }
         }
 
         // Create GEP for field access - returns pointer to the member field

@@ -1,6 +1,7 @@
 #include "Codegen/Expressions/OperatorCodegen.hpp"
 #include "Codegen/Expressions/CallCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
+#include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "AST/ASTVisitor.hpp"
 #include "AST/TemplateRegistry.hpp"
@@ -2319,6 +2320,11 @@ namespace Cryo::Codegen
                 // For nested member access (obj.a.b), get the address of the inner member
                 object = get_lvalue_address(nested_member);
             }
+            else if (auto *array_access = dynamic_cast<Cryo::ArrayAccessNode *>(member->object()))
+            {
+                // For array element member access (e.g., entries[i].state = ...), get the element address
+                object = get_lvalue_address(array_access);
+            }
             else
             {
                 // For other expressions, generate the value and hope it's a pointer
@@ -2539,11 +2545,153 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Handle ArrayAccessNode object (e.g., entries[i].state = ...)
+            if (type_name.empty())
+            {
+                if (auto *array_access = dynamic_cast<Cryo::ArrayAccessNode *>(member->object()))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "get_lvalue_address: Handling ArrayAccessNode object for member access");
+
+                    // Get the type of the array expression (e.g., entries in entries[i])
+                    TypeRef array_type = array_access->array()->get_resolved_type();
+                    if (!array_type)
+                    {
+                        // Try from variable_types_map if array is an identifier
+                        if (auto *arr_id = dynamic_cast<Cryo::IdentifierNode *>(array_access->array()))
+                        {
+                            auto &var_types = ctx().variable_types_map();
+                            auto it = var_types.find(arr_id->name());
+                            if (it != var_types.end() && it->second.is_valid())
+                                array_type = it->second;
+                        }
+                        // Try if array is a member access (e.g., this.entries)
+                        else if (auto *arr_member = dynamic_cast<Cryo::MemberAccessNode *>(array_access->array()))
+                        {
+                            TypeRef arr_obj_type = arr_member->object()->get_resolved_type();
+                            std::string arr_type_name;
+                            if (arr_obj_type)
+                            {
+                                arr_type_name = arr_obj_type->display_name();
+                                if (arr_obj_type->kind() == Cryo::TypeKind::Pointer)
+                                {
+                                    auto *ptr = dynamic_cast<const Cryo::PointerType *>(arr_obj_type.get());
+                                    if (ptr && ptr->pointee())
+                                        arr_type_name = ptr->pointee()->display_name();
+                                }
+                            }
+                            if (!arr_type_name.empty())
+                            {
+                                if (auto *template_reg = ctx().template_registry())
+                                {
+                                    std::vector<std::string> candidates = {arr_type_name};
+                                    if (!ctx().namespace_context().empty())
+                                        candidates.push_back(ctx().namespace_context() + "::" + arr_type_name);
+
+                                    // Look up the field by name in the TemplateRegistry
+                                    std::string field_name = arr_member->member();
+                                    for (const auto &candidate : candidates)
+                                    {
+                                        const auto *field_info = template_reg->get_struct_field_types(candidate);
+                                        if (field_info)
+                                        {
+                                            for (size_t fi = 0; fi < field_info->field_names.size(); ++fi)
+                                            {
+                                                if (field_info->field_names[fi] == field_name && fi < field_info->field_types.size())
+                                                {
+                                                    array_type = field_info->field_types[fi];
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                              "get_lvalue_address: Resolved array field '{}' type to '{}'",
+                                                              field_name, array_type ? array_type->display_name() : "<null>");
+                                                    break;
+                                                }
+                                            }
+                                            if (array_type)
+                                                break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Extract element type from array/pointer type
+                    if (array_type)
+                    {
+                        if (array_type->kind() == Cryo::TypeKind::Pointer)
+                        {
+                            auto *ptr = dynamic_cast<const Cryo::PointerType *>(array_type.get());
+                            if (ptr && ptr->pointee())
+                                type_name = ptr->pointee()->display_name();
+                        }
+                        else if (array_type->kind() == Cryo::TypeKind::Array)
+                        {
+                            auto *arr = dynamic_cast<const Cryo::ArrayType *>(array_type.get());
+                            if (arr && arr->element())
+                                type_name = arr->element()->display_name();
+                        }
+                    }
+                }
+            }
+
             if (type_name.empty())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "get_lvalue_address: Could not determine type for member access");
                 return nullptr;
+            }
+
+            // Check if we're inside a generic instantiation context and need to redirect
+            // the type name (e.g., "HashSetEntry<T>" -> "HashSetEntry_string")
+            {
+                auto *visitor = ctx().visitor();
+                if (visitor)
+                {
+                    auto *generics = visitor->get_generics();
+                    if (generics && generics->in_type_param_scope())
+                    {
+                        // First try exact base name match
+                        std::string redirected = generics->get_instantiated_scope_name(type_name);
+                        if (!redirected.empty())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "get_lvalue_address: Redirecting type {} -> {} in generic context",
+                                      type_name, redirected);
+                            type_name = redirected;
+                        }
+                        else
+                        {
+                            // Try substituting type parameters in the annotation
+                            redirected = generics->substitute_type_annotation(type_name);
+                            if (!redirected.empty())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "get_lvalue_address: Substituted type annotation {} -> {} in generic context",
+                                          type_name, redirected);
+                                type_name = redirected;
+                            }
+                            else if (type_name.find('<') != std::string::npos)
+                            {
+                                // Manual fallback: parse "HashSetEntry<T>" and resolve T individually
+                                size_t angle = type_name.find('<');
+                                std::string base = type_name.substr(0, angle);
+                                std::string args = type_name.substr(angle + 1);
+                                if (!args.empty() && args.back() == '>')
+                                    args.pop_back();
+
+                                TypeRef resolved_param = generics->resolve_type_param(args);
+                                if (resolved_param.is_valid())
+                                {
+                                    std::string mangled = base + "_" + resolved_param->display_name();
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "get_lvalue_address: Manual fallback resolved {} -> {} in generic context",
+                                              type_name, mangled);
+                                    type_name = mangled;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Look up struct type in LLVM context
@@ -2768,6 +2916,50 @@ namespace Cryo::Codegen
                     if (ptr_type && ptr_type->pointee().is_valid())
                     {
                         element_type = get_llvm_type(ptr_type->pointee());
+
+                        // If get_llvm_type failed (e.g., generic pointee like HashSetEntry<T>),
+                        // try generic substitution to resolve to the concrete type
+                        if (!element_type)
+                        {
+                            std::string pointee_name = ptr_type->pointee()->display_name();
+                            auto *visitor = ctx().visitor();
+                            if (visitor)
+                            {
+                                auto *generics = visitor->get_generics();
+                                if (generics && generics->in_type_param_scope())
+                                {
+                                    std::string substituted = generics->substitute_type_annotation(pointee_name);
+                                    if (substituted.empty() && pointee_name.find('<') != std::string::npos)
+                                    {
+                                        // Manual fallback: parse "HashSetEntry<T>" and resolve T
+                                        size_t angle = pointee_name.find('<');
+                                        std::string base = pointee_name.substr(0, angle);
+                                        std::string args = pointee_name.substr(angle + 1);
+                                        if (!args.empty() && args.back() == '>')
+                                            args.pop_back();
+                                        TypeRef resolved_param = generics->resolve_type_param(args);
+                                        if (resolved_param.is_valid())
+                                            substituted = base + "_" + resolved_param->display_name();
+                                    }
+                                    if (!substituted.empty())
+                                    {
+                                        llvm::StructType *st = llvm::StructType::getTypeByName(llvm_ctx(), substituted);
+                                        if (!st)
+                                        {
+                                            if (llvm::Type *t = ctx().get_type(substituted))
+                                                st = llvm::dyn_cast<llvm::StructType>(t);
+                                        }
+                                        if (st)
+                                        {
+                                            element_type = st;
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "get_lvalue_address: Resolved generic pointer element {} -> {}",
+                                                      pointee_name, substituted);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 else

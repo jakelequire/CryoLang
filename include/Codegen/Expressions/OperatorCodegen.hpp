@@ -19,16 +19,6 @@ namespace Cryo::Codegen
 
     /**
      * @brief Handles all binary and unary operator code generation
-     *
-     * This class replaces the 2,300+ line generate_binary_operation method
-     * and the generate_unary_operation method from CodegenVisitor with a
-     * clean, dispatch-based architecture.
-     *
-     * Key features:
-     * - Dispatch tables for operator handling (no massive if-else chains)
-     * - Separated logic for each operator category
-     * - Consolidated assignment handling
-     * - String operation support
      */
     class OperatorCodegen : public ICodegenComponent
     {
