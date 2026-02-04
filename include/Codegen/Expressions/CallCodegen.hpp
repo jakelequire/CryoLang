@@ -19,15 +19,6 @@ namespace Cryo::Codegen
 
     /**
      * @brief Handles all function/method/constructor call generation
-     *
-     * This class replaces the 3,100+ line generate_function_call method
-     * from CodegenVisitor with specialized handlers for each call type.
-     *
-     * Key features:
-     * - Call type classification for clean dispatch
-     * - Separated logic for each call category
-     * - Proper argument preparation and type coercion
-     * - Support for variadic functions
      */
     class CallCodegen : public ICodegenComponent
     {
@@ -348,7 +339,7 @@ namespace Cryo::Codegen
          * @return Function declaration, or nullptr if unknown function
          */
         llvm::Function *declare_runtime_function(const std::string &unqualified_name,
-                                                  const std::string &qualified_name);
+                                                 const std::string &qualified_name);
 
         /**
          * @brief Get or create a C library function declaration

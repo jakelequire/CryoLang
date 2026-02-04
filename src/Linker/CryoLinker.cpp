@@ -321,7 +321,7 @@ namespace Cryo::Linker
 
         // Step 2: Use llvm-ar to create static library archive
         std::vector<std::string> ar_args;
-        ar_args.push_back("rcs");  // r=insert, c=create, s=write index
+        ar_args.push_back("rcs"); // r=insert, c=create, s=write index
         ar_args.push_back(output_path);
         ar_args.push_back(temp_obj);
 
@@ -435,7 +435,7 @@ namespace Cryo::Linker
             // Windows x64 needs Large code model to handle addresses > 2GB
             code_model = llvm::CodeModel::Large;
             LOG_DEBUG(Cryo::LogComponent::GENERAL,
-                     "CryoLinker: Using Large code model for Windows target: {}", target_triple);
+                      "CryoLinker: Using Large code model for Windows target: {}", target_triple);
         }
         else
         {
@@ -533,7 +533,7 @@ namespace Cryo::Linker
             // Windows x64 needs Large code model to handle addresses > 2GB
             code_model = llvm::CodeModel::Large;
             LOG_DEBUG(Cryo::LogComponent::GENERAL,
-                     "CryoLinker: Using Large code model for Windows target: {}", target_triple);
+                      "CryoLinker: Using Large code model for Windows target: {}", target_triple);
         }
         else
         {

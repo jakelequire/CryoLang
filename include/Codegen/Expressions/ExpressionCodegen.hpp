@@ -25,12 +25,6 @@ namespace Cryo::Codegen
      * - Index expressions (array access)
      * - Cast expressions
      * - Sizeof/alignof expressions
-     *
-     * Key features:
-     * - Consistent value/address distinction
-     * - Proper handling of lvalues vs rvalues
-     * - String literal pooling
-     * - Null literal handling
      */
     class ExpressionCodegen : public ICodegenComponent
     {
