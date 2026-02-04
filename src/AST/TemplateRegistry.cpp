@@ -589,4 +589,21 @@ namespace Cryo
     {
         return _enum_impl_blocks.find(base_enum_name) != _enum_impl_blocks.end();
     }
+
+    std::string TemplateRegistry::find_type_namespace_from_methods(
+        const std::string &type_name, const std::string &method_name) const
+    {
+        // Look for a key ending with "::TypeName::methodName" in the annotations map
+        std::string suffix = "::" + type_name + "::" + method_name;
+        for (const auto &[key, _] : _method_return_type_annotations)
+        {
+            if (key.length() > suffix.length() &&
+                key.compare(key.length() - suffix.length(), suffix.length(), suffix) == 0)
+            {
+                // Extract namespace: everything before "::TypeName::methodName"
+                return key.substr(0, key.length() - suffix.length());
+            }
+        }
+        return "";
+    }
 }

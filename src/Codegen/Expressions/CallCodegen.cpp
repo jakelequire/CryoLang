@@ -504,9 +504,20 @@ namespace Cryo::Codegen
                     type_args_str = type_args_str.substr(start, end - start + 1);
                 }
 
-                // Resolve the type argument - try looking up in symbol table first
+                // Resolve the type argument - handle pointer types (e.g., "Expr*")
                 TypeRef arg_type{};
-                Symbol *type_sym = symbols().lookup_symbol(type_args_str);
+                std::string base_type_name = type_args_str;
+                int ptr_depth = 0;
+                while (!base_type_name.empty() && base_type_name.back() == '*')
+                {
+                    base_type_name.pop_back();
+                    ptr_depth++;
+                }
+                // Trim whitespace after stripping pointers
+                while (!base_type_name.empty() && std::isspace(static_cast<unsigned char>(base_type_name.back())))
+                    base_type_name.pop_back();
+
+                Symbol *type_sym = symbols().lookup_symbol(base_type_name);
                 if (type_sym && type_sym->kind == SymbolKind::Type && type_sym->type.is_valid())
                 {
                     arg_type = type_sym->type;
@@ -514,29 +525,38 @@ namespace Cryo::Codegen
                 if (!arg_type.is_valid())
                 {
                     // Try common primitive types using convenience methods
-                    if (type_args_str == "int" || type_args_str == "i32")
+                    if (base_type_name == "int" || base_type_name == "i32")
                     {
                         arg_type = symbols().arena().get_i32();
                     }
-                    else if (type_args_str == "i64")
+                    else if (base_type_name == "i64")
                     {
                         arg_type = symbols().arena().get_i64();
                     }
-                    else if (type_args_str == "f32" || type_args_str == "float")
+                    else if (base_type_name == "f32" || base_type_name == "float")
                     {
                         arg_type = symbols().arena().get_f32();
                     }
-                    else if (type_args_str == "f64" || type_args_str == "double")
+                    else if (base_type_name == "f64" || base_type_name == "double")
                     {
                         arg_type = symbols().arena().get_f64();
                     }
-                    else if (type_args_str == "string")
+                    else if (base_type_name == "string")
                     {
                         arg_type = symbols().arena().get_string();
                     }
-                    else if (type_args_str == "bool" || type_args_str == "boolean")
+                    else if (base_type_name == "bool" || base_type_name == "boolean")
                     {
                         arg_type = symbols().arena().get_bool();
+                    }
+                }
+
+                // Wrap in pointer type(s) if trailing * were present
+                if (arg_type.is_valid() && ptr_depth > 0)
+                {
+                    for (int p = 0; p < ptr_depth; ++p)
+                    {
+                        arg_type = symbols().arena().get_pointer_to(arg_type);
                     }
                 }
 
@@ -3667,7 +3687,20 @@ namespace Cryo::Codegen
         // Handle scope resolution (e.g., Shape::Circle for enum variants)
         if (auto *scope = dynamic_cast<ScopeResolutionNode *>(callee))
         {
-            return scope->scope_name() + "::" + scope->member_name();
+            std::string name = scope->scope_name();
+            if (scope->has_generic_args())
+            {
+                name += "<";
+                const auto &gargs = scope->generic_args();
+                for (size_t i = 0; i < gargs.size(); ++i)
+                {
+                    if (i > 0)
+                        name += ", ";
+                    name += gargs[i];
+                }
+                name += ">";
+            }
+            return name + "::" + scope->member_name();
         }
 
         return "";
@@ -3754,27 +3787,27 @@ namespace Cryo::Codegen
         // If type_name is still empty, try fallback methods
         if (type_name.empty())
         {
-            // Fallback: Check if this is the 'this' identifier
+            // Fallback: Check if this is an identifier and look up its type
             if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(node->object()))
             {
-                if (identifier->name() == "this")
+                std::string var_name = identifier->name();
+                auto &var_types = ctx().variable_types_map();
+                auto it = var_types.find(var_name);
+                if (it != var_types.end() && it->second.is_valid())
                 {
-                    // Try to get 'this' type from variable_types_map
-                    auto &var_types = ctx().variable_types_map();
-                    auto it = var_types.find("this");
-                    if (it != var_types.end() && it->second.is_valid())
+                    type_name = it->second->display_name();
+                    if (!type_name.empty() && type_name.back() == '*')
                     {
-                        type_name = it->second->display_name();
-                        if (!type_name.empty() && type_name.back() == '*')
-                        {
-                            type_name.pop_back();
-                        }
+                        type_name.pop_back();
                     }
-                    else
-                    {
-                        // Fallback to current_type_name if available
-                        type_name = ctx().current_type_name();
-                    }
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_member_receiver_address: Resolved variable '{}' to type '{}'",
+                              var_name, type_name);
+                }
+                else if (var_name == "this")
+                {
+                    // Fallback to current_type_name if available
+                    type_name = ctx().current_type_name();
                 }
             }
             // Handle nested member access (e.g., this.current_chunk.next)
@@ -4218,8 +4251,20 @@ namespace Cryo::Codegen
         {
             TypeRef arg_type{};
 
+            // Count and strip trailing pointer modifiers (e.g., "Expr*" -> "Expr", pointer_depth=1)
+            std::string base_name = arg_name;
+            int pointer_depth = 0;
+            while (!base_name.empty() && base_name.back() == '*')
+            {
+                base_name.pop_back();
+                pointer_depth++;
+            }
+            // Trim whitespace from base name after stripping pointers
+            while (!base_name.empty() && std::isspace(static_cast<unsigned char>(base_name.back())))
+                base_name.pop_back();
+
             // Try looking up in symbol table first
-            Symbol *type_sym = symbols.lookup_symbol(arg_name);
+            Symbol *type_sym = symbols.lookup_symbol(base_name);
             if (type_sym && type_sym->kind == SymbolKind::Type && type_sym->type.is_valid())
             {
                 arg_type = type_sym->type;
@@ -4228,36 +4273,48 @@ namespace Cryo::Codegen
             // Try common primitive types
             if (!arg_type.is_valid())
             {
-                if (arg_name == "int" || arg_name == "i32")
+                if (base_name == "int" || base_name == "i32")
                     arg_type = symbols.arena().get_i32();
-                else if (arg_name == "i8")
+                else if (base_name == "i8")
                     arg_type = symbols.arena().get_i8();
-                else if (arg_name == "i16")
+                else if (base_name == "i16")
                     arg_type = symbols.arena().get_i16();
-                else if (arg_name == "i64")
+                else if (base_name == "i64")
                     arg_type = symbols.arena().get_i64();
-                else if (arg_name == "u8")
+                else if (base_name == "u8")
                     arg_type = symbols.arena().get_u8();
-                else if (arg_name == "u16")
+                else if (base_name == "u16")
                     arg_type = symbols.arena().get_u16();
-                else if (arg_name == "u32")
+                else if (base_name == "u32")
                     arg_type = symbols.arena().get_u32();
-                else if (arg_name == "u64")
+                else if (base_name == "u64")
                     arg_type = symbols.arena().get_u64();
-                else if (arg_name == "f32" || arg_name == "float")
+                else if (base_name == "f32" || base_name == "float")
                     arg_type = symbols.arena().get_f32();
-                else if (arg_name == "f64" || arg_name == "double")
+                else if (base_name == "f64" || base_name == "double")
                     arg_type = symbols.arena().get_f64();
-                else if (arg_name == "string" || arg_name == "String")
+                else if (base_name == "string" || base_name == "String")
                     arg_type = symbols.arena().get_string();
-                else if (arg_name == "bool" || arg_name == "boolean")
+                else if (base_name == "bool" || base_name == "boolean")
                     arg_type = symbols.arena().get_bool();
             }
 
             // Try looking up by name in TypeArena
             if (!arg_type.is_valid())
             {
-                arg_type = symbols.arena().lookup_type_by_name(arg_name);
+                arg_type = symbols.arena().lookup_type_by_name(base_name);
+            }
+
+            // Wrap in pointer type(s) if trailing * were present
+            if (arg_type.is_valid() && pointer_depth > 0)
+            {
+                for (int p = 0; p < pointer_depth; ++p)
+                {
+                    arg_type = symbols.arena().get_pointer_to(arg_type);
+                }
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "parse_type_args_from_string: Wrapped '{}' in {} pointer level(s) -> '{}'",
+                          base_name, pointer_depth, arg_type->display_name());
             }
 
             if (arg_type.is_valid())

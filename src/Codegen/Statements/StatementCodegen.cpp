@@ -262,7 +262,14 @@ namespace Cryo::Codegen
         llvm::Type *var_type = nullptr;
         if (node->has_resolved_type())
         {
-            var_type = types().map(node->get_resolved_type());
+            TypeRef resolved = node->get_resolved_type();
+            // Unwrap type aliases to their target types (e.g., AllocResult -> Result<void*, AllocError>)
+            while (resolved.is_valid() && resolved->kind() == Cryo::TypeKind::TypeAlias)
+            {
+                auto *alias = static_cast<const Cryo::TypeAliasType *>(resolved.get());
+                resolved = alias->target();
+            }
+            var_type = types().map(resolved);
         }
         if (!var_type)
         {
