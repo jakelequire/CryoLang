@@ -509,6 +509,79 @@ namespace Cryo::Codegen
         // End type parameter scope AFTER methods are generated
         end_type_params();
 
+        // Propagate method annotations from base template to instantiated name
+        // This ensures cross-module lookups work even for methods that were skipped
+        // during instantiation (due to generic params, error types, etc.)
+        {
+            Cryo::TemplateRegistry *tr = ctx().template_registry();
+            if (tr)
+            {
+                std::string base_namespace;
+                const auto *tmpl_info = tr->find_template(generic_name);
+                if (tmpl_info)
+                    base_namespace = tmpl_info->module_namespace;
+
+                if (!base_namespace.empty())
+                {
+                    // Get method info from template metadata (persists after AST cleanup)
+                    const auto *method_info = tr->get_template_method_info(generic_name);
+                    if (method_info)
+                    {
+                        for (const auto &method_meta : method_info->methods)
+                        {
+                            std::string base_key = base_namespace + "::" + generic_name + "::" + method_meta.name;
+                            std::string inst_key = base_namespace + "::" + mangled + "::" + method_meta.name;
+
+                            if (!tr->has_method_return_type_annotation(inst_key))
+                            {
+                                std::string annotation = tr->get_method_return_type_annotation(base_key);
+                                if (!annotation.empty())
+                                {
+                                    tr->register_method_return_type_annotation(inst_key, annotation);
+                                }
+                            }
+
+                            auto [is_static, found] = tr->get_method_is_static(inst_key);
+                            if (!found)
+                            {
+                                auto [base_static, base_found] = tr->get_method_is_static(base_key);
+                                if (base_found)
+                                {
+                                    tr->register_method_is_static(inst_key, base_static);
+                                }
+                            }
+                        }
+                    }
+
+                    // Also check struct template methods directly (for inline methods)
+                    if (tmpl_info->struct_template)
+                    {
+                        for (const auto &method : tmpl_info->struct_template->methods())
+                        {
+                            if (!method) continue;
+                            std::string base_key = base_namespace + "::" + generic_name + "::" + method->name();
+                            std::string inst_key = base_namespace + "::" + mangled + "::" + method->name();
+
+                            if (!tr->has_method_return_type_annotation(inst_key))
+                            {
+                                std::string annotation = tr->get_method_return_type_annotation(base_key);
+                                if (!annotation.empty())
+                                {
+                                    tr->register_method_return_type_annotation(inst_key, annotation);
+                                }
+                            }
+
+                            auto [is_static, found] = tr->get_method_is_static(inst_key);
+                            if (!found)
+                            {
+                                tr->register_method_is_static(inst_key, method->is_static());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Also build the unmangled name (e.g., "Array<u64>") for lookup consistency
         std::string instantiated_name = generic_name + "<";
         for (size_t i = 0; i < type_args.size(); ++i)
@@ -1607,6 +1680,78 @@ namespace Cryo::Codegen
 
         // End type parameter scope AFTER methods are generated
         end_type_params();
+
+        // Propagate method annotations from base template to instantiated name
+        // This ensures cross-module lookups work for enum methods (e.g., Option_i64::is_some)
+        {
+            Cryo::TemplateRegistry *tr = ctx().template_registry();
+            if (tr)
+            {
+                std::string base_namespace;
+                const auto *tmpl_info = tr->find_template(generic_name);
+                if (tmpl_info)
+                    base_namespace = tmpl_info->module_namespace;
+
+                if (!base_namespace.empty())
+                {
+                    const auto *method_info = tr->get_template_method_info(generic_name);
+                    if (method_info)
+                    {
+                        for (const auto &method_meta : method_info->methods)
+                        {
+                            std::string base_key = base_namespace + "::" + generic_name + "::" + method_meta.name;
+                            std::string inst_key = base_namespace + "::" + mangled + "::" + method_meta.name;
+
+                            if (!tr->has_method_return_type_annotation(inst_key))
+                            {
+                                std::string annotation = tr->get_method_return_type_annotation(base_key);
+                                if (!annotation.empty())
+                                {
+                                    tr->register_method_return_type_annotation(inst_key, annotation);
+                                }
+                            }
+
+                            auto [is_static, found] = tr->get_method_is_static(inst_key);
+                            if (!found)
+                            {
+                                auto [base_static, base_found] = tr->get_method_is_static(base_key);
+                                if (base_found)
+                                {
+                                    tr->register_method_is_static(inst_key, base_static);
+                                }
+                            }
+                        }
+                    }
+
+                    // Also check enum impl block methods directly
+                    ImplementationBlockNode *impl_block = tr->get_enum_impl_block(generic_name);
+                    if (impl_block)
+                    {
+                        for (const auto &method : impl_block->method_implementations())
+                        {
+                            if (!method) continue;
+                            std::string base_key = base_namespace + "::" + generic_name + "::" + method->name();
+                            std::string inst_key = base_namespace + "::" + mangled + "::" + method->name();
+
+                            if (!tr->has_method_return_type_annotation(inst_key))
+                            {
+                                std::string annotation = tr->get_method_return_type_annotation(base_key);
+                                if (!annotation.empty())
+                                {
+                                    tr->register_method_return_type_annotation(inst_key, annotation);
+                                }
+                            }
+
+                            auto [is_static, found] = tr->get_method_is_static(inst_key);
+                            if (!found)
+                            {
+                                tr->register_method_is_static(inst_key, method->is_static());
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Also register with unmangled name for lookup consistency
         std::string instantiated_name = generic_name + "<";

@@ -1038,6 +1038,21 @@ namespace Cryo
                     }
                 }
             }
+
+            // Fourth try: mangle the display name and look up in LLVM context
+            std::string display = target->display_name();
+            std::string mangled_display = mangle_display_name(display);
+            if (mangled_display != display)
+            {
+                llvm::StructType *by_mangled = llvm::StructType::getTypeByName(_llvm_ctx, mangled_display);
+                if (by_mangled && !by_mangled->isOpaque())
+                {
+                    LOG_DEBUG(LogComponent::CODEGEN,
+                              "TypeMapper::map_type_alias: '{}' found concrete type via mangled display name '{}'",
+                              type->display_name(), mangled_display);
+                    return by_mangled;
+                }
+            }
         }
 
         // Default: delegate to map() which handles all type kinds

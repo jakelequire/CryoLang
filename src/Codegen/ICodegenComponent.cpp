@@ -188,6 +188,16 @@ namespace Cryo::Codegen
             // e.g., "Array<u64>" -> "Array_u64"
             std::string mangled_type = mangle_generic_type_name(type_name);
 
+            // Strip namespace prefix from mangled_type if it's already qualified
+            // This prevents double-namespacing like "ns::ns::Type::method"
+            {
+                size_t last_sep = mangled_type.rfind("::");
+                if (last_sep != std::string::npos)
+                {
+                    mangled_type = mangled_type.substr(last_sep + 2);
+                }
+            }
+
             // Try namespace lookup with base type first
             std::string type_namespace = ctx().get_type_namespace(base_type);
 
@@ -271,6 +281,16 @@ namespace Cryo::Codegen
             // e.g., "Array<u64>" -> "Array_u64"
             std::string mangled_type = mangle_generic_type_name(type_name);
 
+            // Strip namespace prefix from mangled_type if it's already qualified
+            // This prevents double-namespacing like "ns::ns::Type::method"
+            {
+                size_t last_sep = mangled_type.rfind("::");
+                if (last_sep != std::string::npos)
+                {
+                    mangled_type = mangled_type.substr(last_sep + 2);
+                }
+            }
+
             // Build pattern suffix using mangled type name: "::MangledType::method"
             // e.g., "::Array_u64::push" instead of "::Array::push"
             std::string pattern_suffix = "::" + mangled_type + "::" + method_name;
@@ -327,6 +347,16 @@ namespace Cryo::Codegen
             // Convert display name to mangled name for method lookup
             // e.g., "Array<u64>" -> "Array_u64"
             std::string mangled_type = mangle_generic_type_name(type_name);
+
+            // Strip namespace prefix from mangled_type if it's already qualified
+            // This prevents double-namespacing like "ns::ns::Type::method"
+            {
+                size_t last_sep = mangled_type.rfind("::");
+                if (last_sep != std::string::npos)
+                {
+                    mangled_type = mangled_type.substr(last_sep + 2);
+                }
+            }
 
             // Try to get namespace from TemplateRegistry (dynamic lookup)
             std::string type_namespace;
@@ -405,6 +435,20 @@ namespace Cryo::Codegen
             if (type_namespace.empty())
             {
                 type_namespace = ctx().get_type_namespace(mangled_type);
+            }
+
+            // Try to extract namespace from method annotations registry
+            // For non-generic types (PathBuf, Reader, etc.), the ModuleLoader registers
+            // annotations with fully-qualified names like "std::fs::path::PathBuf::method"
+            if (type_namespace.empty() && template_registry)
+            {
+                type_namespace = template_registry->find_type_namespace_from_methods(base_type, method_name);
+                if (!type_namespace.empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found namespace '{}' for type '{}' via method annotations",
+                              type_namespace, base_type);
+                }
             }
 
             // Fallback for primitive types: their methods are in std::core::primitives
