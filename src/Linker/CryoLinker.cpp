@@ -488,7 +488,7 @@ namespace Cryo::Linker
         }
         else
         {
-            LOG_ERROR(Cryo::LogComponent::GENERAL, "After PassManager run: @llvm.global_ctors REMOVED by PassManager!");
+            LOG_DEBUG(Cryo::LogComponent::GENERAL, "After PassManager run: @llvm.global_ctors REMOVED by PassManager!");
         }
         dest.flush();
 

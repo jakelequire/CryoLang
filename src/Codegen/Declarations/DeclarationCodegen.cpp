@@ -476,7 +476,7 @@ namespace Cryo::Codegen
 
         // Also check if return type has generic parameters
         TypeRef resolved_ret = node->get_resolved_return_type();
-        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "DeclarationCodegen: TRACE Method '{}::{}' resolved_return_type valid={}, is_error={}, kind={}",
                   parent_type, node->name(),
                   resolved_ret.is_valid(),
@@ -597,7 +597,7 @@ namespace Cryo::Codegen
         // IMPORTANT: Register method return type annotation BEFORE early return check
         // This ensures annotations are registered even when the function already exists
         // (e.g., from Pass 2.5 forward declarations)
-        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "DeclarationCodegen: TRACE registering annotation for '{}' (passed skip checks)",
                   llvm_fn_name);
         Cryo::TemplateRegistry *template_registry = ctx().template_registry();
@@ -625,20 +625,20 @@ namespace Cryo::Codegen
                 if (!return_type_str.empty() && return_type_str != "void")
                 {
                     template_registry->register_method_return_type_annotation(llvm_fn_name, return_type_str);
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: TRACE registered annotation for '{}': '{}'",
                               llvm_fn_name, return_type_str);
                 }
                 else
                 {
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "DeclarationCodegen: TRACE NOT registering annotation for '{}': return_type_str='{}' (empty or void)",
                               llvm_fn_name, return_type_str);
                 }
             }
             else
             {
-                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: TRACE annotation already exists for '{}': '{}'",
                           llvm_fn_name, existing_annotation);
             }
