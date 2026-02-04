@@ -1485,6 +1485,8 @@ namespace Cryo
                             std::string return_type_str = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "";
                             std::string qualified_method_name = qualified_type + "::" + method->name();
 
+                            _template_registry.register_method_is_static(qualified_method_name, method->is_static());
+
                             if (!return_type_str.empty())
                             {
                                 std::string qualified_return_type = qualify_type_annotation(return_type_str);
@@ -1711,6 +1713,8 @@ namespace Cryo
                             std::string return_type_str = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "";
                             std::string qualified_method_name = qualified_type + "::" + method->name();
 
+                            _template_registry.register_method_is_static(qualified_method_name, method->is_static());
+
                             if (!return_type_str.empty())
                             {
                                 // Qualify the return type (e.g., "Option<u64>" -> "std::core::option::Option<u64>")
@@ -1839,6 +1843,8 @@ namespace Cryo
                         {
                             std::string return_type_str = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "";
                             std::string qualified_method_name = qualified_type + "::" + method->name();
+
+                            _template_registry.register_method_is_static(qualified_method_name, method->is_static());
 
                             // Always register the string annotation for cross-module lookups
                             // Qualify the return type to include its full namespace path

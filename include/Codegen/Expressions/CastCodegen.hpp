@@ -19,11 +19,6 @@ namespace Cryo::Codegen
      * - Numeric conversions (int <-> float, widening, narrowing)
      * - Pointer conversions
      * - Reference/dereference operations
-     *
-     * Key features:
-     * - Safe vs unsafe cast distinction
-     * - Overflow checking for numeric casts (optional)
-     * - Proper handling of signed/unsigned conversions
      */
     class CastCodegen : public ICodegenComponent
     {

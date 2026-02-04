@@ -407,6 +407,14 @@ namespace Cryo::Codegen
                 type_namespace = ctx().get_type_namespace(mangled_type);
             }
 
+            // Fallback for primitive types: their methods are in std::core::primitives
+            if (type_namespace.empty() && primitive_types.find(base_type) != primitive_types.end())
+            {
+                type_namespace = "std::core::primitives";
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Using primitive namespace for type '{}'", base_type);
+            }
+
             if (!type_namespace.empty())
             {
                 // Use MANGLED type name (not simple_type_name) when building the full method name
@@ -832,7 +840,129 @@ namespace Cryo::Codegen
                         }
                     }
                     // Note: EnumDeclarationNode doesn't have methods() - enum methods are in impl blocks
-                    // which are stored separately. Check the method registry for return type.
+                    // which are stored separately. Try TemplateMethodInfo for enum methods
+                    // (populated by register_enum_impl_block).
+                    if (!return_type && template_registry)
+                    {
+                        const auto *method_meta = template_registry->find_template_method(simple_type_name, method_name);
+                        if (method_meta)
+                        {
+                            // Get is_static from metadata
+                            if (!found_is_static)
+                            {
+                                is_static_method = method_meta->is_static;
+                                found_is_static = true;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_method_by_name: Got is_static={} from enum TemplateMethodInfo for '{}::{}'",
+                                          is_static_method, simple_type_name, method_name);
+                            }
+
+                            // Get return type from annotation with generic substitution
+                            std::string annotation = method_meta->return_type_annotation;
+                            if (!annotation.empty() && annotation != "void")
+                            {
+                                // Substitute generic params if we have type args
+                                if (!type_args_str.empty())
+                                {
+                                    const Cryo::TemplateRegistry::TemplateInfo *tmpl_info = template_registry->find_template(simple_type_name);
+                                    std::vector<std::string> generic_param_names;
+                                    if (tmpl_info && !tmpl_info->metadata.generic_parameter_names.empty())
+                                    {
+                                        generic_param_names = tmpl_info->metadata.generic_parameter_names;
+                                    }
+
+                                    // Parse type arguments from type_args_str
+                                    std::vector<std::string> type_arg_values;
+                                    {
+                                        size_t start = 0;
+                                        int depth = 0;
+                                        for (size_t i = 0; i <= type_args_str.length(); ++i)
+                                        {
+                                            if (i == type_args_str.length() || (type_args_str[i] == ',' && depth == 0))
+                                            {
+                                                std::string arg = type_args_str.substr(start, i - start);
+                                                while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.front())))
+                                                    arg.erase(0, 1);
+                                                while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.back())))
+                                                    arg.pop_back();
+                                                if (!arg.empty())
+                                                    type_arg_values.push_back(arg);
+                                                start = i + 1;
+                                            }
+                                            else if (type_args_str[i] == '<')
+                                                depth++;
+                                            else if (type_args_str[i] == '>')
+                                                depth--;
+                                        }
+                                    }
+
+                                    // Perform substitution: replace generic params with concrete types
+                                    if (!generic_param_names.empty() && generic_param_names.size() == type_arg_values.size())
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "resolve_method_by_name: Substituting {} generic params in enum method annotation '{}'",
+                                                  generic_param_names.size(), annotation);
+
+                                        for (size_t i = 0; i < generic_param_names.size(); ++i)
+                                        {
+                                            const std::string &param = generic_param_names[i];
+                                            const std::string &value = type_arg_values[i];
+
+                                            std::string result;
+                                            size_t pos = 0;
+                                            while (pos < annotation.length())
+                                            {
+                                                size_t found = annotation.find(param, pos);
+                                                if (found == std::string::npos)
+                                                {
+                                                    result += annotation.substr(pos);
+                                                    break;
+                                                }
+
+                                                bool is_start = (found == 0 ||
+                                                                 (!std::isalnum(static_cast<unsigned char>(annotation[found - 1])) &&
+                                                                  annotation[found - 1] != '_'));
+                                                bool is_end = (found + param.length() >= annotation.length() ||
+                                                               (!std::isalnum(static_cast<unsigned char>(annotation[found + param.length()])) &&
+                                                                annotation[found + param.length()] != '_'));
+
+                                                if (is_start && is_end)
+                                                {
+                                                    result += annotation.substr(pos, found - pos);
+                                                    result += value;
+                                                    pos = found + param.length();
+                                                }
+                                                else
+                                                {
+                                                    result += annotation.substr(pos, found - pos + param.length());
+                                                    pos = found + param.length();
+                                                }
+                                            }
+                                            annotation = result;
+                                        }
+
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "resolve_method_by_name: Substituted enum method annotation: '{}'", annotation);
+                                    }
+                                }
+
+                                return_type = types().resolve_and_map(annotation);
+                                if (return_type)
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_method_by_name: Got return type from enum TemplateMethodInfo for '{}::{}': {}",
+                                              simple_type_name, method_name, annotation);
+                                }
+                            }
+                            else if (annotation == "void")
+                            {
+                                return_type = llvm::Type::getVoidTy(llvm_ctx());
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_method_by_name: Enum method '{}::{}' returns void",
+                                          simple_type_name, method_name);
+                            }
+                        }
+                    }
                 }
 
                 // Only add 'this' parameter for non-static methods

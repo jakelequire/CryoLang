@@ -803,6 +803,11 @@ namespace Cryo::Codegen
             // For nested member access (obj.a.b), get the address of the inner member
             object = generate_member_address(nested_member);
         }
+        else if (auto *array_access = dynamic_cast<Cryo::ArrayAccessNode *>(node->object()))
+        {
+            // For array element member access (e.g., entries[i].state), get the address of the element
+            object = generate_index_address(array_access);
+        }
         else
         {
             // For other expressions, generate the value and hope it's a pointer
@@ -2932,6 +2937,26 @@ namespace Cryo::Codegen
                                   type_name, redirected);
                         type_name = redirected;
                     }
+                    else if (type_name.find('<') != std::string::npos)
+                    {
+                        // Manual fallback: parse "HashSetEntry<T>" and resolve T individually
+                        size_t angle = type_name.find('<');
+                        std::string base = type_name.substr(0, angle);
+                        std::string args = type_name.substr(angle + 1);
+                        if (!args.empty() && args.back() == '>')
+                            args.pop_back();
+
+                        // Resolve each type param
+                        TypeRef resolved_param = generics->resolve_type_param(args);
+                        if (resolved_param.is_valid())
+                        {
+                            std::string mangled = base + "_" + resolved_param->display_name();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_member_info: Manual fallback resolved {} -> {} in generic context",
+                                      type_name, mangled);
+                            type_name = mangled;
+                        }
+                    }
                 }
             }
         }
@@ -3798,6 +3823,36 @@ namespace Cryo::Codegen
         llvm::Type *struct_type = ctx().get_type(type_name);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: ctx().get_type returned {}",
                   struct_type ? "non-null" : "null");
+
+        // If struct type not found, try on-demand instantiation for generic types
+        if (!struct_type || !struct_type->isStructTy())
+        {
+            auto *visitor = ctx().visitor();
+            if (visitor)
+            {
+                auto *generics = visitor->get_generics();
+                if (generics && generics->in_type_param_scope())
+                {
+                    std::string substituted = generics->substitute_type_annotation(type_name);
+                    if (!substituted.empty() && substituted != type_name)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_struct_literal: On-demand instantiation attempt {} -> {}",
+                                  type_name, substituted);
+                        struct_type = ctx().get_type(substituted);
+                        if (!struct_type)
+                        {
+                            // Try LLVM context directly
+                            llvm::StructType *st = llvm::StructType::getTypeByName(llvm_ctx(), substituted);
+                            if (st)
+                                struct_type = st;
+                        }
+                        if (struct_type && struct_type->isStructTy())
+                            type_name = substituted;
+                    }
+                }
+            }
+        }
 
         if (!struct_type || !struct_type->isStructTy())
         {
