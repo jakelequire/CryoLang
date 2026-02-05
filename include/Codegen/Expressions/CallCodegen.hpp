@@ -360,6 +360,23 @@ namespace Cryo::Codegen
          */
         llvm::Function *create_forward_declaration_from_symbol(const std::string &name);
 
+        /**
+         * @brief Generate default value for a type (handles type aliases)
+         * @param node Call expression for error reporting
+         * @param type_name Type name (may be an alias)
+         * @return Default value or nullptr on failure
+         */
+        llvm::Value *generate_default_value(Cryo::CallExpressionNode *node,
+                                            const std::string &type_name);
+
+        /**
+         * @brief Generate zero/null value for an LLVM type
+         * @param llvm_type The LLVM type
+         * @param name Name for alloca if needed
+         * @return Zero value (may be alloca for aggregates)
+         */
+        llvm::Value *generate_zero_value(llvm::Type *llvm_type, const std::string &name);
+
         // Static sets for type checking
         static const std::unordered_set<std::string> _primitive_types;
         static const std::unordered_set<std::string> _runtime_functions;

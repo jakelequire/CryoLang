@@ -1380,6 +1380,10 @@ namespace Cryo
                 mangled += mangle_display_name(trimmed) + "_";
                 current_arg.clear();
             }
+            else if (c == '*')
+            {
+                current_arg += 'p';  // Pointer marker: void* -> voidp
+            }
             else if (c != ' ' || depth > 0)
             {
                 current_arg += c;

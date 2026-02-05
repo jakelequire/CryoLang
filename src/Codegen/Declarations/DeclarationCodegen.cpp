@@ -872,20 +872,10 @@ namespace Cryo::Codegen
         // Get variable type
         TypeRef cryo_var_type = node->get_resolved_type();
 
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                  "DeclarationCodegen: Variable '{}' resolved type kind={} display='{}'",
-                  name,
-                  cryo_var_type.is_valid() ? static_cast<int>(cryo_var_type->kind()) : -1,
-                  cryo_var_type.is_valid() ? cryo_var_type->display_name() : "null");
-
         // Unwrap type aliases to their target types (e.g., AllocResult -> Result<void*, AllocError>)
         while (cryo_var_type.is_valid() && cryo_var_type->kind() == Cryo::TypeKind::TypeAlias)
         {
             auto *alias = static_cast<const Cryo::TypeAliasType *>(cryo_var_type.get());
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "DeclarationCodegen: Unwrapping type alias '{}' -> '{}'",
-                      cryo_var_type->display_name(),
-                      alias->target().is_valid() ? alias->target()->display_name() : "null");
             cryo_var_type = alias->target();
         }
 
