@@ -1101,6 +1101,53 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Handle string indexing (this[idx] where this is &string or string)
+            if (resolved_type)
+            {
+                TypeRef effective_type = resolved_type;
+                // Unwrap Reference<String> (e.g., &string for primitive implement blocks)
+                if (effective_type->kind() == TypeKind::Reference)
+                {
+                    auto *ref = dynamic_cast<const Cryo::ReferenceType *>(effective_type.get());
+                    if (ref && ref->referent())
+                        effective_type = ref->referent();
+                }
+                if (effective_type->kind() == TypeKind::String)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "*** Detected String indexing for variable: '{}'", array_name);
+
+                    // String is a pointer to i8 (char*) in LLVM
+                    element_type = llvm::Type::getInt8Ty(llvm_ctx());
+
+                    // Generate index
+                    llvm::Value *index_val = generate(node->index());
+                    if (!index_val)
+                    {
+                        report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                     "Failed to generate index expression for string");
+                        return nullptr;
+                    }
+                    if (!index_val->getType()->isIntegerTy())
+                        index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
+
+                    // Get the string pointer (load from alloca)
+                    llvm::AllocaInst *str_alloca = values().get_alloca(array_name);
+                    if (str_alloca)
+                    {
+                        llvm::Value *str_ptr = create_load(str_alloca, str_alloca->getAllocatedType(), array_name + ".load");
+                        // If this was a reference, we need an extra dereference
+                        if (resolved_type->kind() == TypeKind::Reference)
+                        {
+                            str_ptr = create_load(str_ptr, llvm::PointerType::get(llvm_ctx(), 0), array_name + ".deref");
+                        }
+                        // GEP into the char array
+                        llvm::Value *elem_ptr = builder().CreateGEP(element_type, str_ptr, index_val, "str.idx");
+                        return create_load(elem_ptr, element_type, "str.char");
+                    }
+                }
+            }
+
             // Handle Array<T> type class (when kind is Struct/Generic, not Array)
             // This handles cases where the resolved type is "Array<u64>" from the type class
             if (resolved_type && resolved_type->kind() != TypeKind::Array)
@@ -2899,6 +2946,40 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "resolve_member_info: No resolved type for object");
                 return false;
+            }
+        }
+
+        // Special handling for dynamic array types (T[])
+        // Dynamic arrays are lowered to struct { ptr, i64, i64 } (elements, length, capacity)
+        if (obj_type->kind() == Cryo::TypeKind::Array)
+        {
+            auto *arr_type = dynamic_cast<const Cryo::ArrayType *>(obj_type.get());
+            if (arr_type && arr_type->is_dynamic())
+            {
+                llvm::Type *llvm_arr_type = get_llvm_type(obj_type);
+                if (llvm_arr_type)
+                {
+                    out_struct_type = llvm::dyn_cast<llvm::StructType>(llvm_arr_type);
+                }
+
+                if (out_struct_type)
+                {
+                    if (member_name == "length" || member_name == "len")
+                    {
+                        out_field_idx = 1;
+                        return true;
+                    }
+                    else if (member_name == "capacity" || member_name == "cap")
+                    {
+                        out_field_idx = 2;
+                        return true;
+                    }
+                    else if (member_name == "elements" || member_name == "ptr" || member_name == "data")
+                    {
+                        out_field_idx = 0;
+                        return true;
+                    }
+                }
             }
         }
 
