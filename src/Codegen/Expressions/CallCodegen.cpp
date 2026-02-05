@@ -2325,10 +2325,95 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Not ::new(), regular static method not found - error
+        // 3. Fallback for ::default() - handle type aliases and generate default values
+        if (method_name == "default" && args.empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Static default() not found for {}, trying default value fallback", resolved_type_name);
+
+            llvm::Value *default_val = generate_default_value(node, resolved_type_name);
+            if (default_val)
+            {
+                return default_val;
+            }
+        }
+
+        // Not ::new() or ::default(), regular static method not found - error
         report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                      "Static method not found: " + resolved_type_name + "::" + method_name);
         return nullptr;
+    }
+
+    llvm::Value *CallCodegen::generate_default_value(Cryo::CallExpressionNode *node,
+                                                      const std::string &type_name)
+    {
+        // Resolve type alias chain to get base type name
+        std::string resolved_name = type_name;
+        if (ctx().is_type_alias(type_name))
+        {
+            resolved_name = ctx().resolve_type_alias(type_name);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_default_value: '{}' is alias for '{}'", type_name, resolved_name);
+
+            // Try target type's ::default() method first
+            llvm::Function *target_default = resolve_method(resolved_name, "default");
+            if (target_default)
+            {
+                return builder().CreateCall(target_default, {}, "default.result");
+            }
+        }
+
+        // Look up TypeRef to determine type kind
+        TypeRef type_ref = ctx().symbols().arena().lookup_type_by_name(resolved_name);
+
+        // Unwrap nested TypeAlias to get actual target
+        while (type_ref.is_valid() && type_ref->kind() == Cryo::TypeKind::TypeAlias)
+        {
+            auto *alias = static_cast<const Cryo::TypeAliasType *>(type_ref.get());
+            type_ref = alias->target();
+        }
+
+        if (!type_ref.is_valid())
+        {
+            // Fallback: get LLVM type and generate zero value
+            llvm::Type *llvm_type = resolve_type_by_name(resolved_name);
+            if (llvm_type)
+            {
+                return generate_zero_value(llvm_type, type_name);
+            }
+            return nullptr;
+        }
+
+        // Generate default based on type kind
+        llvm::Type *llvm_type = types().map(type_ref);
+        if (!llvm_type)
+        {
+            return nullptr;
+        }
+
+        return generate_zero_value(llvm_type, type_name);
+    }
+
+    llvm::Value *CallCodegen::generate_zero_value(llvm::Type *llvm_type, const std::string &name)
+    {
+        // For aggregate types (structs), allocate and zero-initialize
+        if (llvm_type->isStructTy())
+        {
+            llvm::AllocaInst *alloca = create_entry_alloca(llvm_type, name + ".default");
+            builder().CreateStore(llvm::Constant::getNullValue(llvm_type), alloca);
+            return alloca;
+        }
+
+        // For arrays, allocate and zero-initialize
+        if (llvm_type->isArrayTy())
+        {
+            llvm::AllocaInst *alloca = create_entry_alloca(llvm_type, name + ".default");
+            builder().CreateStore(llvm::Constant::getNullValue(llvm_type), alloca);
+            return alloca;
+        }
+
+        // For scalar types, return zero constant directly
+        return llvm::Constant::getNullValue(llvm_type);
     }
 
     llvm::Value *CallCodegen::generate_instance_method(Cryo::CallExpressionNode *node,
@@ -3548,6 +3633,16 @@ namespace Cryo::Codegen
 
     bool CallCodegen::is_struct_type(const std::string &name) const
     {
+        // First check if this is a type alias and resolve to base type
+        std::string resolved_name = ctx().resolve_type_alias(name);
+        if (resolved_name != name)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "is_struct_type: '{}' is alias for '{}', checking base type", name, resolved_name);
+            // Recursively check if the base type is a struct
+            return is_struct_type(resolved_name);
+        }
+
         // Use SRM to generate type candidates and check if any is a struct type
         auto &non_const_ctx = const_cast<CodegenContext &>(ctx());
         auto candidates = non_const_ctx.srm().generate_lookup_candidates(name, Cryo::SymbolKind::Type);
