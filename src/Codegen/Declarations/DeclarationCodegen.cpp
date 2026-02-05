@@ -3052,6 +3052,8 @@ namespace Cryo::Codegen
                                     this_type = arena.get_bool();
                                 else if (type_name == "char")
                                     this_type = arena.get_char();
+                                else if (type_name == "string")
+                                    this_type = arena.get_string();
                             }
                             if (this_type.is_valid())
                             {
