@@ -199,6 +199,11 @@ namespace Cryo::Codegen
         void set_monomorphizer(Cryo::Monomorphizer *mono)
         {
             _monomorphizer = mono;
+            // Also wire to TypeMapper for on-demand monomorphization during type mapping
+            if (_type_mapper)
+            {
+                _type_mapper->set_monomorphizer(mono);
+            }
         }
 
         /** @brief Get monomorphizer (may be null) */

@@ -22,6 +22,7 @@
 #include "Types/UserDefinedTypes.hpp"
 #include "Types/GenericTypes.hpp"
 #include "Types/ErrorType.hpp"
+#include "Types/Monomorphizer.hpp"
 
 #include <llvm/IR/Type.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -40,6 +41,7 @@ namespace Cryo
 {
     // Forward declarations
     class GenericRegistry;
+    class Monomorphizer;
 
     /**************************************************************************
      * @brief Callback for generic type instantiation during codegen
@@ -70,6 +72,7 @@ namespace Cryo
         llvm::LLVMContext &_llvm_ctx;
         llvm::Module *_module;
         GenericRegistry *_generics;
+        Monomorphizer *_monomorphizer = nullptr;
 
         // Cache: TypeID -> LLVM Type
         std::unordered_map<TypeID, llvm::Type *, TypeID::Hash> _type_cache;
@@ -120,6 +123,7 @@ namespace Cryo
 
         void set_module(llvm::Module *module) { _module = module; }
         void set_generic_registry(GenericRegistry *reg) { _generics = reg; }
+        void set_monomorphizer(Monomorphizer *mono) { _monomorphizer = mono; }
         void set_template_registry(class TemplateRegistry *) {} // Legacy compat - no-op
         void set_instantiation_callback(GenericInstantiationCallback cb)
         {

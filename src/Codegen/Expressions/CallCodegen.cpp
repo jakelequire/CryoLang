@@ -944,6 +944,14 @@ namespace Cryo::Codegen
                     }
                 }
 
+                // Check if it's a type alias (including cross-module aliases)
+                if (ctx().is_type_alias(obj_name))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "classify_call: '{}' is a type alias, treating as StaticMethod", obj_name);
+                    return CallKind::StaticMethod;
+                }
+
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "classify_call: '{}::{}' falling through to FreeFunction", obj_name, method_name);
 

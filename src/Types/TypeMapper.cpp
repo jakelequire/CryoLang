@@ -1172,6 +1172,68 @@ namespace Cryo
         LOG_DEBUG(LogComponent::CODEGEN, "TypeMapper::map_instantiated: '{}' has NO resolved_type, falling through",
                   name);
 
+        // Attempt on-demand monomorphization if we have access to the monomorphizer
+        // This follows the pattern from GenericExpressionResolutionPass::lookup_concrete_type()
+        if (_monomorphizer && _generics)
+        {
+            TypeRef base = type->generic_base();
+            const std::vector<TypeRef> &args = type->type_args();
+
+            // Try by TypeID first
+            if (base.is_valid() && _generics->is_template(base))
+            {
+                LOG_DEBUG(LogComponent::CODEGEN,
+                          "TypeMapper::map_instantiated: Attempting on-demand monomorphization for '{}'", name);
+                auto result = _monomorphizer->specialize(base, args);
+                if (result.is_ok())
+                {
+                    TypeRef specialized = result.specialized_type;
+                    if (specialized.is_valid() && specialized->kind() == TypeKind::InstantiatedType)
+                    {
+                        auto *spec_inst = static_cast<const InstantiatedType *>(specialized.get());
+                        if (spec_inst->has_resolved_type())
+                        {
+                            LOG_DEBUG(LogComponent::CODEGEN,
+                                      "TypeMapper::map_instantiated: On-demand monomorphization succeeded for '{}'", name);
+                            // Update the original InstantiatedType so subsequent lookups succeed
+                            auto *mut_inst = const_cast<InstantiatedType *>(type);
+                            mut_inst->set_resolved_type(spec_inst->resolved_type());
+                            return map(spec_inst->resolved_type());
+                        }
+                    }
+                }
+            }
+
+            // If TypeID lookup failed, try by name (handles cross-module TypeID mismatches)
+            if (base.is_valid())
+            {
+                std::string base_name = base->display_name();
+                auto tmpl = _generics->get_template_by_name(base_name);
+                if (tmpl && tmpl->generic_type.is_valid() && tmpl->generic_type.id() != base.id())
+                {
+                    LOG_DEBUG(LogComponent::CODEGEN,
+                              "TypeMapper::map_instantiated: TypeID mismatch for '{}', trying by name", base_name);
+                    auto result = _monomorphizer->specialize(tmpl->generic_type, args);
+                    if (result.is_ok())
+                    {
+                        TypeRef specialized = result.specialized_type;
+                        if (specialized.is_valid() && specialized->kind() == TypeKind::InstantiatedType)
+                        {
+                            auto *spec_inst = static_cast<const InstantiatedType *>(specialized.get());
+                            if (spec_inst->has_resolved_type())
+                            {
+                                LOG_DEBUG(LogComponent::CODEGEN,
+                                          "TypeMapper::map_instantiated: Name-based monomorphization succeeded for '{}'", name);
+                                auto *mut_inst = const_cast<InstantiatedType *>(type);
+                                mut_inst->set_resolved_type(spec_inst->resolved_type());
+                                return map(spec_inst->resolved_type());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Check if already exists and is complete - try display name first
         auto existing = lookup_struct(name);
         if (existing && !existing->isOpaque())

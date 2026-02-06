@@ -264,7 +264,7 @@ namespace Cryo::Codegen
          * @param name Type name to check
          * @return true if the type is a generic template
          */
-        bool is_generic_template(const std::string &name) const;
+        bool is_generic_template(const std::string &name);
 
         /**
          * @brief Register a generic function definition
