@@ -6,6 +6,7 @@
 #include "AST/ASTVisitor.hpp"
 #include "AST/TemplateRegistry.hpp"
 #include "Types/UserDefinedTypes.hpp"
+#include "Types/CompoundTypes.hpp"
 #include "Utils/Logger.hpp"
 
 namespace Cryo::Codegen
@@ -852,6 +853,67 @@ namespace Cryo::Codegen
             report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, value_node,
                          "Failed to generate assignment value");
             return nullptr;
+        }
+
+        // Convert value to match element type if needed (e.g., i32 -> i8 for u8 arrays)
+        // Try multiple approaches to determine the target element type:
+
+        llvm::Type *target_store_type = nullptr;
+
+        // Approach 1: Try to get element type from GEP instruction (most reliable)
+        if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(element_ptr))
+        {
+            target_store_type = gep->getSourceElementType();
+        }
+
+        // Approach 2: Try from array access node's resolved type
+        if (!target_store_type)
+        {
+            TypeRef element_type_ref = target->get_resolved_type();
+            if (element_type_ref)
+            {
+                target_store_type = types().map_type(element_type_ref);
+            }
+        }
+
+        // Approach 3: Try from array expression's pointer/array type
+        if (!target_store_type && target->array())
+        {
+            TypeRef array_type = target->array()->get_resolved_type();
+            if (array_type && array_type->kind() == Cryo::TypeKind::Pointer)
+            {
+                auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(array_type.get());
+                if (ptr_type && ptr_type->pointee().is_valid())
+                {
+                    target_store_type = types().map_type(ptr_type->pointee());
+                }
+            }
+            else if (array_type && array_type->kind() == Cryo::TypeKind::Array)
+            {
+                auto *arr_type = dynamic_cast<const Cryo::ArrayType *>(array_type.get());
+                if (arr_type && arr_type->element().is_valid())
+                {
+                    target_store_type = types().map_type(arr_type->element());
+                }
+            }
+        }
+
+        // Apply truncation/extension if needed
+        if (target_store_type && target_store_type != value->getType())
+        {
+            if (target_store_type->isIntegerTy() && value->getType()->isIntegerTy())
+            {
+                unsigned target_bits = target_store_type->getIntegerBitWidth();
+                unsigned val_bits = value->getType()->getIntegerBitWidth();
+                if (val_bits > target_bits)
+                {
+                    value = builder().CreateTrunc(value, target_store_type, "trunc");
+                }
+                else if (val_bits < target_bits)
+                {
+                    value = builder().CreateZExt(value, target_store_type, "zext");
+                }
+            }
         }
 
         // Store the value
