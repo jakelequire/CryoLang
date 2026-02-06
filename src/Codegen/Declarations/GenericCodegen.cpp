@@ -2464,9 +2464,25 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Registered generic type: {}", name);
     }
 
-    bool GenericCodegen::is_generic_template(const std::string &name) const
+    bool GenericCodegen::is_generic_template(const std::string &name)
     {
-        return _generic_types.find(name) != _generic_types.end();
+        // Check local registry first (fast path)
+        if (_generic_types.find(name) != _generic_types.end())
+        {
+            return true;
+        }
+
+        // Check TemplateRegistry for cross-module templates
+        Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+        if (template_registry && template_registry->has_template(name))
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen::is_generic_template: Found '{}' in TemplateRegistry (cross-module)",
+                      name);
+            return true;
+        }
+
+        return false;
     }
 
     void GenericCodegen::register_generic_function(const std::string &name, Cryo::ASTNode *node)
@@ -2477,8 +2493,31 @@ namespace Cryo::Codegen
 
     Cryo::ASTNode *GenericCodegen::get_generic_type_def(const std::string &name)
     {
+        // Check local registry first
         auto it = _generic_types.find(name);
-        return (it != _generic_types.end()) ? it->second : nullptr;
+        if (it != _generic_types.end())
+        {
+            return it->second;
+        }
+
+        // Fallback: check TemplateRegistry for cross-module templates
+        Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+        if (template_registry)
+        {
+            const Cryo::TemplateRegistry::TemplateInfo *tmpl_info =
+                template_registry->find_template(name);
+            if (tmpl_info)
+            {
+                if (tmpl_info->struct_template)
+                    return tmpl_info->struct_template;
+                if (tmpl_info->class_template)
+                    return tmpl_info->class_template;
+                if (tmpl_info->enum_template)
+                    return tmpl_info->enum_template;
+            }
+        }
+
+        return nullptr;
     }
 
     Cryo::ASTNode *GenericCodegen::get_generic_function_def(const std::string &name)
