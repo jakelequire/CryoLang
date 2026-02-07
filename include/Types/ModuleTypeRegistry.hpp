@@ -216,6 +216,20 @@ namespace Cryo
             return name;
         }
 
+        // Resolve type alias to its target TypeRef (searches all modules)
+        TypeRef resolve_alias_type(const std::string &alias_name) const
+        {
+            for (const auto &[mod_id, aliases] : _type_aliases)
+            {
+                auto it = aliases.find(alias_name);
+                if (it != aliases.end())
+                {
+                    return it->second;
+                }
+            }
+            return TypeRef{};
+        }
+
         // Unregister a type (rarely needed)
         void unregister_type(ModuleID module, const std::string &name);
 
