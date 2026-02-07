@@ -1006,6 +1006,22 @@ namespace Cryo::Codegen
                 return CallKind::StaticMethod;
             }
 
+            // For ::default() and ::new(), treat as StaticMethod even for type aliases
+            // to non-struct types (e.g., PThreadCond = void[48])
+            // The symbol table knows about all imported types including aliases
+            if (member_name == "default" || member_name == "new")
+            {
+                Symbol *sym = symbols().lookup_symbol(scope_name);
+                if (sym && sym->kind == SymbolKind::Type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "classify_call: '{}::{}' - scope is a known type (kind={}), treating as StaticMethod",
+                              scope_name, member_name,
+                              sym->type.is_valid() ? static_cast<int>(sym->type->kind()) : -1);
+                    return CallKind::StaticMethod;
+                }
+            }
+
             // Could be a namespace-qualified function
             return CallKind::FreeFunction;
         }
@@ -2355,6 +2371,9 @@ namespace Cryo::Codegen
     llvm::Value *CallCodegen::generate_default_value(Cryo::CallExpressionNode *node,
                                                       const std::string &type_name)
     {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "generate_default_value: Generating default for '{}'", type_name);
+
         // Resolve type alias chain to get base type name
         std::string resolved_name = type_name;
         if (ctx().is_type_alias(type_name))
@@ -2371,8 +2390,25 @@ namespace Cryo::Codegen
             }
         }
 
-        // Look up TypeRef to determine type kind
+        // Strategy 1: Look up TypeRef through arena (by resolved name, then original name)
         TypeRef type_ref = ctx().symbols().arena().lookup_type_by_name(resolved_name);
+        if (!type_ref.is_valid() && resolved_name != type_name)
+        {
+            type_ref = ctx().symbols().arena().lookup_type_by_name(type_name);
+        }
+
+        // Strategy 2: Try symbol table lookup (handles cross-module imported types)
+        if (!type_ref.is_valid())
+        {
+            Symbol *sym = symbols().lookup_symbol(type_name);
+            if (sym && sym->kind == SymbolKind::Type && sym->type.is_valid())
+            {
+                type_ref = sym->type;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_default_value: Found '{}' via symbol table (kind={})",
+                          type_name, static_cast<int>(type_ref->kind()));
+            }
+        }
 
         // Unwrap nested TypeAlias to get actual target
         while (type_ref.is_valid() && type_ref->kind() == Cryo::TypeKind::TypeAlias)
@@ -2381,33 +2417,102 @@ namespace Cryo::Codegen
             type_ref = alias->target();
         }
 
-        if (!type_ref.is_valid())
+        if (type_ref.is_valid())
         {
-            // Fallback: get LLVM type and generate zero value
-            llvm::Type *llvm_type = resolve_type_by_name(resolved_name);
-            if (llvm_type)
+            llvm::Type *llvm_type = types().map(type_ref);
+            if (llvm_type && llvm_type->isSized() && !llvm_type->isVoidTy())
             {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_default_value: Mapped '{}' to LLVM type (typeID={})",
+                          type_name, llvm_type->getTypeID());
                 return generate_zero_value(llvm_type, type_name);
             }
-            return nullptr;
         }
 
-        // Generate default based on type kind
-        llvm::Type *llvm_type = types().map(type_ref);
-        if (!llvm_type)
+        // Strategy 3: Try LLVM type lookup by name (may find non-opaque struct)
+        llvm::Type *llvm_type = resolve_type_by_name(type_name);
+        if (llvm_type && llvm_type->isSized() && !llvm_type->isVoidTy())
         {
-            return nullptr;
+            return generate_zero_value(llvm_type, type_name);
         }
 
-        return generate_zero_value(llvm_type, type_name);
+        // Strategy 4: Parse the resolved alias string directly
+        // Handles type aliases to fixed-size arrays like "void[48]" or "u8[64]"
+        if (resolved_name != type_name)
+        {
+            llvm::Type *parsed_type = parse_type_annotation_to_llvm(resolved_name);
+            if (parsed_type && parsed_type->isSized() && !parsed_type->isVoidTy())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_default_value: Parsed alias target '{}' to LLVM type (typeID={})",
+                          resolved_name, parsed_type->getTypeID());
+                return generate_zero_value(parsed_type, type_name);
+            }
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "generate_default_value: Could not resolve type '{}'", type_name);
+        return nullptr;
+    }
+
+    llvm::Type *CallCodegen::parse_type_annotation_to_llvm(const std::string &annotation)
+    {
+        // Handle fixed-size array annotations: "T[N]" -> [N x LLVM_T]
+        // e.g., "void[48]" -> [48 x i8], "u8[64]" -> [64 x i8]
+        size_t bracket_pos = annotation.find('[');
+        size_t close_pos = annotation.find(']');
+        if (bracket_pos != std::string::npos && close_pos != std::string::npos && close_pos > bracket_pos)
+        {
+            std::string elem_name = annotation.substr(0, bracket_pos);
+            std::string size_str = annotation.substr(bracket_pos + 1, close_pos - bracket_pos - 1);
+
+            size_t array_size = 0;
+            try { array_size = std::stoull(size_str); }
+            catch (...) { return nullptr; }
+
+            if (array_size == 0) return nullptr;
+
+            // Map element type - void means opaque byte buffer
+            llvm::Type *elem_type = nullptr;
+            if (elem_name == "void" || elem_name == "u8" || elem_name == "i8")
+                elem_type = types().i8_type();
+            else if (elem_name == "i16" || elem_name == "u16")
+                elem_type = types().i16_type();
+            else if (elem_name == "i32" || elem_name == "u32")
+                elem_type = types().i32_type();
+            else if (elem_name == "i64" || elem_name == "u64")
+                elem_type = types().i64_type();
+            else
+                elem_type = types().i8_type(); // Default to byte
+
+            return llvm::ArrayType::get(elem_type, array_size);
+        }
+
+        // Handle pointer types: "T*"
+        if (!annotation.empty() && annotation.back() == '*')
+        {
+            return types().ptr_type();
+        }
+
+        // Try as a primitive or known type via TypeMapper
+        return types().get_type(annotation);
     }
 
     llvm::Value *CallCodegen::generate_zero_value(llvm::Type *llvm_type, const std::string &name)
     {
+        // Safety: reject unsized types (e.g., opaque structs) - they can't be allocated or zero-initialized
+        if (!llvm_type->isSized())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_zero_value: Type '{}' is not sized, cannot zero-initialize", name);
+            return nullptr;
+        }
+
         // For aggregate types (structs), allocate and zero-initialize
         if (llvm_type->isStructTy())
         {
             llvm::AllocaInst *alloca = create_entry_alloca(llvm_type, name + ".default");
+            if (!alloca) return nullptr;
             builder().CreateStore(llvm::Constant::getNullValue(llvm_type), alloca);
             return alloca;
         }
@@ -2416,6 +2521,7 @@ namespace Cryo::Codegen
         if (llvm_type->isArrayTy())
         {
             llvm::AllocaInst *alloca = create_entry_alloca(llvm_type, name + ".default");
+            if (!alloca) return nullptr;
             builder().CreateStore(llvm::Constant::getNullValue(llvm_type), alloca);
             return alloca;
         }

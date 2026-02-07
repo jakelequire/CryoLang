@@ -377,6 +377,12 @@ namespace Cryo::Codegen
          */
         llvm::Value *generate_zero_value(llvm::Type *llvm_type, const std::string &name);
 
+        /**
+         * @brief Parse a type annotation string into an LLVM type
+         * Handles: "void[48]" -> [48 x i8], "u8*" -> ptr, primitives
+         */
+        llvm::Type *parse_type_annotation_to_llvm(const std::string &annotation);
+
         // Static sets for type checking
         static const std::unordered_set<std::string> _primitive_types;
         static const std::unordered_set<std::string> _runtime_functions;
