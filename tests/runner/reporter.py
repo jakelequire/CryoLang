@@ -77,7 +77,13 @@ class ConsoleReporter:
                 name = r.test.metadata.name
                 verdict = self._verdict_str(r.verdict)
                 timing = self._dim(f"({r.duration_ms:>4.0f}ms)")
-                print(f"  {verdict}  {name:<{max_name}}  {timing}")
+                line = f"  {verdict}  {name:<{max_name}}  {timing}"
+
+                # Show xfail reason inline so it's always visible
+                if r.verdict == TestVerdict.XFAIL and r.test.metadata.xfail:
+                    line += f"  {self._dim('-- ' + r.test.metadata.xfail)}"
+
+                print(line)
 
                 if self.verbose and r.verdict in (TestVerdict.FAIL, TestVerdict.ERROR, TestVerdict.XPASS):
                     self._print_failure_detail(r)
