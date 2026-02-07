@@ -396,7 +396,7 @@ ast-runtime:
 # 	@echo "Runtime object created successfully: $(BIN_DIR)stdlib/runtime.o"
 
 
-.PHONY: debug clean all lsp tools
+.PHONY: debug clean all lsp tools test test-tier1 test-tier2 test-negative test-verbose test-list test-clean
 .NOTPARALLEL: clean clean-% libs
 
 # Help command
@@ -413,3 +413,37 @@ help:
 	@echo "  make compiler-lib   - Build the Cryo compiler library for LSP integration"
 	@echo "  make runtime        - Build the runtime library"
 	@echo "  make runtime-clean  - Clean runtime build artifacts"
+	@echo "  make test           - Run the full E2E test suite"
+	@echo "  make test-tier1     - Run tier 1 (core language) tests"
+	@echo "  make test-tier2     - Run tier 2 (type system) tests"
+	@echo "  make test-negative  - Run negative (expected failure) tests"
+	@echo "  make test-verbose   - Run tests with verbose output"
+	@echo "  make test-list      - List all discovered tests"
+	@echo "  make test-clean     - Clean test build artifacts"
+
+# ============================================================
+# Test Targets
+# ============================================================
+PYTHON ?= python3
+TEST_BUILD_DIR = tests/.build
+
+test: $(MAIN_BIN)
+	@$(PYTHON) tests/run_tests.py --cryo $(MAIN_BIN) --build-dir $(TEST_BUILD_DIR)
+
+test-tier1: $(MAIN_BIN)
+	@$(PYTHON) tests/run_tests.py --cryo $(MAIN_BIN) --build-dir $(TEST_BUILD_DIR) --tier 1
+
+test-tier2: $(MAIN_BIN)
+	@$(PYTHON) tests/run_tests.py --cryo $(MAIN_BIN) --build-dir $(TEST_BUILD_DIR) --tier 2
+
+test-negative: $(MAIN_BIN)
+	@$(PYTHON) tests/run_tests.py --cryo $(MAIN_BIN) --build-dir $(TEST_BUILD_DIR) --category negative
+
+test-verbose: $(MAIN_BIN)
+	@$(PYTHON) tests/run_tests.py --cryo $(MAIN_BIN) --build-dir $(TEST_BUILD_DIR) --verbose
+
+test-list:
+	@$(PYTHON) tests/run_tests.py --list
+
+test-clean:
+	@rm -rf $(TEST_BUILD_DIR)
