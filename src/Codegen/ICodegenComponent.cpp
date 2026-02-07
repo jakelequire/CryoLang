@@ -1569,8 +1569,9 @@ namespace Cryo::Codegen
 
             if (source_bits < target_bits)
             {
-                // Extension - assume signed for safety
-                return b.CreateSExt(value, target_type, "sext");
+                // Extension - use zero-extend as the safe default for this LLVM-only path
+                // (callers with signedness info should use CastCodegen::cast_to instead)
+                return b.CreateZExt(value, target_type, "zext");
             }
             else if (source_bits > target_bits)
             {

@@ -3237,9 +3237,9 @@ namespace Cryo::Codegen
 
             if (!element_type)
             {
-                // Fallback to i8 as a generic byte type
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Falling back to i8");
-                element_type = llvm::Type::getInt8Ty(llvm_ctx());
+                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+                             "Could not determine element type for array lvalue address");
+                return nullptr;
             }
 
             // Create GEP for array element access
