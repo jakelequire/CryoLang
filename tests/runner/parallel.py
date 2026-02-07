@@ -18,6 +18,11 @@ from .compiler import CompilerDriver
 from .executor import BinaryExecutor
 
 
+def _indent(text: str, prefix: str = "    ") -> str:
+    """Indent each line of text for readable failure output."""
+    return "\n".join(prefix + line for line in text.rstrip("\n").split("\n"))
+
+
 def _run_single_test(
     cryo_binary: str,
     source_path: str,
@@ -176,7 +181,7 @@ def run_test(test: TestCase, cryo_binary: Path, build_dir: Path) -> TestResult:
                 verdict=TestVerdict.FAIL,
                 compilation=comp,
                 execution=exe,
-                failure_reason=f"Stdout mismatch:\n  expected: {expected_stdout!r}\n  actual:   {actual_stdout!r}",
+                failure_reason=f"Stdout mismatch:\n  expected:\n{_indent(expected_stdout)}\n  actual:\n{_indent(actual_stdout)}",
                 duration_ms=total_ms,
             )
             return _apply_xfail(result, meta.xfail)
@@ -189,7 +194,7 @@ def run_test(test: TestCase, cryo_binary: Path, build_dir: Path) -> TestResult:
                 verdict=TestVerdict.FAIL,
                 compilation=comp,
                 execution=exe,
-                failure_reason=f"Stdout missing substring: {substr!r}",
+                failure_reason=f"Stdout missing substring: {substr}",
                 duration_ms=total_ms,
             )
             return _apply_xfail(result, meta.xfail)
