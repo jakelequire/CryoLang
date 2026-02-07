@@ -59,6 +59,19 @@ namespace Cryo::Codegen
         llvm::Value *cast_to(llvm::Value *value, llvm::Type *target_type,
                              const std::string &name = "");
 
+        /**
+         * @brief Generate cast with explicit signedness information
+         * @param value Source value
+         * @param target_type Target LLVM type
+         * @param source_signed Whether source type is signed
+         * @param target_signed Whether target type is signed
+         * @param name Optional name for result
+         * @return Cast value
+         */
+        llvm::Value *cast_to(llvm::Value *value, llvm::Type *target_type,
+                             bool source_signed, bool target_signed,
+                             const std::string &name = "");
+
         //===================================================================
         // Integer Conversions
         //===================================================================
