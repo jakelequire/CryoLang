@@ -2937,6 +2937,71 @@ namespace Cryo::Codegen
                 }
             }
 
+            // If no resolved type and array is a member access (e.g., this.cells),
+            // look up the field type from TemplateRegistry
+            if (!array_type)
+            {
+                if (auto *member_access = dynamic_cast<Cryo::MemberAccessNode *>(array_access->array()))
+                {
+                    std::string base_type_name;
+                    if (auto *base_ident = dynamic_cast<Cryo::IdentifierNode *>(member_access->object()))
+                    {
+                        auto &var_types = ctx().variable_types_map();
+                        auto it = var_types.find(base_ident->name());
+                        if (it != var_types.end() && it->second.is_valid())
+                        {
+                            TypeRef base_type = it->second;
+                            base_type_name = base_type->display_name();
+                            if (base_type->kind() == Cryo::TypeKind::Pointer)
+                            {
+                                auto *ptr = dynamic_cast<const Cryo::PointerType *>(base_type.get());
+                                if (ptr && ptr->pointee())
+                                    base_type_name = ptr->pointee()->display_name();
+                            }
+                            else if (!base_type_name.empty() && base_type_name.back() == '*')
+                                base_type_name.pop_back();
+                        }
+                        else if (base_ident->name() == "this")
+                        {
+                            base_type_name = ctx().current_type_name();
+                        }
+                    }
+
+                    if (!base_type_name.empty())
+                    {
+                        if (auto *template_reg = ctx().template_registry())
+                        {
+                            std::vector<std::string> candidates = {base_type_name};
+                            if (!ctx().namespace_context().empty())
+                                candidates.push_back(ctx().namespace_context() + "::" + base_type_name);
+
+                            for (const auto &candidate : candidates)
+                            {
+                                const auto *field_info = template_reg->get_struct_field_types(candidate);
+                                if (field_info)
+                                {
+                                    for (size_t fi = 0; fi < field_info->field_names.size(); ++fi)
+                                    {
+                                        if (field_info->field_names[fi] == member_access->member() &&
+                                            fi < field_info->field_types.size())
+                                        {
+                                            array_type = field_info->field_types[fi];
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "get_lvalue_address: Resolved member field '{}' type from TemplateRegistry: {}",
+                                                      member_access->member(),
+                                                      array_type ? array_type->display_name() : "<null>");
+                                            break;
+                                        }
+                                    }
+                                    if (array_type)
+                                        break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Also check if the array identifier is pool_sizes specifically
             if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(array_access->array()))
             {
