@@ -577,6 +577,11 @@ namespace Cryo
         if (type->is_fixed_size())
         {
             size_t array_size = type->size().value();
+            // void[N] represents an opaque byte buffer (e.g., pthread types) - map to [N x i8]
+            if (elem_llvm->isVoidTy())
+            {
+                elem_llvm = i8_type();
+            }
             return llvm::ArrayType::get(elem_llvm, array_size);
         }
 

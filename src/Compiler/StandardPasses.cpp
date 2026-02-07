@@ -1843,6 +1843,49 @@ namespace Cryo
                             ctx);
                     }
 
+                    // For built-in static methods like ::default() and ::new(),
+                    // resolve the scope name as a type so codegen has the TypeRef
+                    if (!resolved.is_valid())
+                    {
+                        std::string member_name = scope_res->member_name();
+                        if (member_name == "default" || member_name == "new")
+                        {
+                            std::string scope_name = scope_res->scope_name();
+                            // Try module registry first (handles cross-module types)
+                            // auto &module_registry = _compiler.symbol_table()->modules();
+                            // auto type_opt = module_registry.resolve_with_imports(
+                            //     scope_name,
+                            //     ctx.current_module,
+                            //     module_registry.get_module_info(ctx.current_module)
+                            //         ? module_registry.get_module_info(ctx.current_module)->imports
+                            //         : std::vector<ImportDecl>{});
+                            // if (type_opt.has_value())
+                            // {
+                            //     resolved = type_opt.value();
+                            // }
+                            // Fallback: try symbol table
+                            if (!resolved.is_valid())
+                            {
+                                const Symbol *type_sym = _compiler.symbol_table()->lookup(scope_name);
+                                if (type_sym && type_sym->kind == SymbolKind::Type && type_sym->type.is_valid())
+                                {
+                                    resolved = type_sym->type;
+                                }
+                            }
+                            // Fallback: try type arena
+                            if (!resolved.is_valid())
+                            {
+                                resolved = _compiler.symbol_table()->arena().lookup_type_by_name(scope_name);
+                            }
+                            if (resolved.is_valid())
+                            {
+                                LOG_DEBUG(LogComponent::GENERAL,
+                                          "GenericExpressionResolutionPass: Resolved {}::{} scope type to '{}'",
+                                          scope_name, member_name, resolved->display_name());
+                            }
+                        }
+                    }
+
                     if (resolved.is_valid())
                     {
                         scope_res->set_resolved_type(resolved);
