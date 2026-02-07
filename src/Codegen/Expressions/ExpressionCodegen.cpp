@@ -1408,6 +1408,91 @@ namespace Cryo::Codegen
                                       result->getType()->getTypeID());
                             return result;
                         }
+                        else if (field_type->isPointerTy())
+                        {
+                            // Field is a pointer type (e.g., i32* stored as opaque ptr in LLVM)
+                            // Need to determine the pointee type from the Cryo type system for correct GEP stride
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "ExpressionCodegen: Member field '{}' is pointer type, resolving pointee type for indexing",
+                                      member_access->member());
+
+                            llvm::Type *pointee_type = nullptr;
+
+                            // Look up the Cryo type of this field from the TemplateRegistry
+                            std::string struct_name = struct_type->hasName() ? struct_type->getName().str() : "";
+                            if (!struct_name.empty())
+                            {
+                                if (auto *template_reg = ctx().template_registry())
+                                {
+                                    std::vector<std::string> candidates = {struct_name};
+                                    if (!ctx().namespace_context().empty())
+                                        candidates.push_back(ctx().namespace_context() + "::" + struct_name);
+
+                                    for (const auto &candidate : candidates)
+                                    {
+                                        const auto *field_info = template_reg->get_struct_field_types(candidate);
+                                        if (field_info && field_idx < field_info->field_types.size())
+                                        {
+                                            TypeRef cryo_field_type = field_info->field_types[field_idx];
+                                            if (cryo_field_type && cryo_field_type->kind() == TypeKind::Pointer)
+                                            {
+                                                auto *ptr_type = static_cast<const Cryo::PointerType *>(cryo_field_type.get());
+                                                if (ptr_type->pointee())
+                                                {
+                                                    pointee_type = get_llvm_type(ptr_type->pointee());
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                              "ExpressionCodegen: Resolved pointer field pointee type: {}",
+                                                              ptr_type->pointee()->display_name());
+                                                }
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Fallback: try the MemberAccessNode's resolved type
+                            if (!pointee_type)
+                            {
+                                TypeRef member_type = member_access->get_resolved_type();
+                                if (member_type && member_type->kind() == TypeKind::Pointer)
+                                {
+                                    auto *ptr_type = static_cast<const Cryo::PointerType *>(member_type.get());
+                                    if (ptr_type->pointee())
+                                        pointee_type = get_llvm_type(ptr_type->pointee());
+                                }
+                            }
+
+                            if (pointee_type)
+                            {
+                                // Load the pointer value from the struct field
+                                llvm::Value *loaded_ptr = create_load(member_ptr, field_type,
+                                                                      member_access->member() + ".load");
+
+                                // Generate index expression
+                                llvm::Value *index_val = generate(node->index());
+                                if (!index_val)
+                                {
+                                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                                 "Failed to generate index expression");
+                                    return nullptr;
+                                }
+                                if (!index_val->getType()->isIntegerTy())
+                                    index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
+
+                                // GEP with the correct pointee type (e.g., i32 for i32*)
+                                llvm::Value *element_ptr = builder().CreateGEP(
+                                    pointee_type, loaded_ptr, index_val,
+                                    member_access->member() + ".elem.ptr");
+
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "ExpressionCodegen: Created GEP for pointer member element access");
+
+                                // Load and return the element value
+                                return create_load(element_ptr, pointee_type,
+                                                   member_access->member() + ".elem.load");
+                            }
+                        }
                     }
                 }
             }
@@ -1701,6 +1786,94 @@ namespace Cryo::Codegen
                 {
                     array_ptr = alloca;
                     element_type = arr_type->getElementType();
+                }
+            }
+        }
+
+        // Handle member access expressions (e.g., this.cells[i] where cells is a pointer field)
+        if (!array_ptr)
+        {
+            if (auto *member_access = dynamic_cast<Cryo::MemberAccessNode *>(node->array()))
+            {
+                llvm::Value *member_ptr = generate_member_address(member_access);
+                if (member_ptr)
+                {
+                    llvm::StructType *struct_type = nullptr;
+                    unsigned field_idx = 0;
+                    if (resolve_member_info(member_access->object(), member_access->member(),
+                                            struct_type, field_idx))
+                    {
+                        llvm::Type *field_type = struct_type->getElementType(field_idx);
+
+                        if (field_type->isPointerTy())
+                        {
+                            // Pointer field - resolve pointee type from Cryo type system
+                            llvm::Type *pointee_type = nullptr;
+
+                            std::string struct_name = struct_type->hasName() ? struct_type->getName().str() : "";
+                            if (!struct_name.empty())
+                            {
+                                if (auto *template_reg = ctx().template_registry())
+                                {
+                                    std::vector<std::string> candidates = {struct_name};
+                                    if (!ctx().namespace_context().empty())
+                                        candidates.push_back(ctx().namespace_context() + "::" + struct_name);
+
+                                    for (const auto &candidate : candidates)
+                                    {
+                                        const auto *field_info = template_reg->get_struct_field_types(candidate);
+                                        if (field_info && field_idx < field_info->field_types.size())
+                                        {
+                                            TypeRef cryo_field_type = field_info->field_types[field_idx];
+                                            if (cryo_field_type && cryo_field_type->kind() == TypeKind::Pointer)
+                                            {
+                                                auto *ptr_type = static_cast<const Cryo::PointerType *>(cryo_field_type.get());
+                                                if (ptr_type->pointee())
+                                                    pointee_type = get_llvm_type(ptr_type->pointee());
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (!pointee_type)
+                            {
+                                TypeRef member_type = member_access->get_resolved_type();
+                                if (member_type && member_type->kind() == TypeKind::Pointer)
+                                {
+                                    auto *ptr_type = static_cast<const Cryo::PointerType *>(member_type.get());
+                                    if (ptr_type->pointee())
+                                        pointee_type = get_llvm_type(ptr_type->pointee());
+                                }
+                            }
+
+                            if (pointee_type)
+                            {
+                                llvm::Value *loaded_ptr = create_load(member_ptr, field_type,
+                                                                      member_access->member() + ".load");
+
+                                llvm::Value *index_val = generate(node->index());
+                                if (!index_val)
+                                {
+                                    report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                                 "Failed to generate index expression");
+                                    return nullptr;
+                                }
+                                if (!index_val->getType()->isIntegerTy())
+                                    index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
+
+                                // Return address of element (for assignment targets)
+                                return builder().CreateGEP(pointee_type, loaded_ptr, index_val,
+                                                          member_access->member() + ".elem.ptr");
+                            }
+                        }
+                        else if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(field_type))
+                        {
+                            array_ptr = member_ptr;
+                            element_type = arr_type->getElementType();
+                        }
+                    }
                 }
             }
         }
@@ -2605,6 +2778,14 @@ namespace Cryo::Codegen
                             this_type_name = ptr_type->pointee().get()->display_name();
                         }
                     }
+                    else if (this_type->kind() == Cryo::TypeKind::Reference)
+                    {
+                        auto *ref_type = dynamic_cast<const Cryo::ReferenceType *>(this_type.get());
+                        if (ref_type && ref_type->referent().is_valid())
+                        {
+                            this_type_name = ref_type->referent()->display_name();
+                        }
+                    }
                     else if (!this_type_name.empty() && this_type_name.back() == '*')
                     {
                         this_type_name.pop_back();
@@ -2693,6 +2874,14 @@ namespace Cryo::Codegen
                                 outer_type_name = ptr->pointee()->display_name();
                             }
                         }
+                        else if (outer_obj_type->kind() == Cryo::TypeKind::Reference)
+                        {
+                            auto *ref = dynamic_cast<const Cryo::ReferenceType *>(outer_obj_type.get());
+                            if (ref && ref->referent().is_valid())
+                            {
+                                outer_type_name = ref->referent()->display_name();
+                            }
+                        }
                         else if (!outer_type_name.empty() && outer_type_name.back() == '*')
                         {
                             outer_type_name.pop_back();
@@ -2711,6 +2900,14 @@ namespace Cryo::Codegen
                                 if (ptr && ptr->pointee())
                                 {
                                     outer_type_name = ptr->pointee()->display_name();
+                                }
+                            }
+                            else if (it->second->kind() == Cryo::TypeKind::Reference)
+                            {
+                                auto *ref = dynamic_cast<const Cryo::ReferenceType *>(it->second.get());
+                                if (ref && ref->referent().is_valid())
+                                {
+                                    outer_type_name = ref->referent()->display_name();
                                 }
                             }
                             else if (!outer_type_name.empty() && outer_type_name.back() == '*')
@@ -2986,13 +3183,21 @@ namespace Cryo::Codegen
         // Get type name (handle pointer types)
         std::string type_name = obj_type.get()->display_name();
 
-        // Handle pointer types - get the pointee type name
+        // Handle pointer/reference types - get the underlying type name
         if (obj_type->kind() == Cryo::TypeKind::Pointer)
         {
             auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
             if (ptr_type && ptr_type->pointee())
             {
                 type_name = ptr_type->pointee().get()->display_name();
+            }
+        }
+        else if (obj_type->kind() == Cryo::TypeKind::Reference)
+        {
+            auto *ref_type = dynamic_cast<const Cryo::ReferenceType *>(obj_type.get());
+            if (ref_type && ref_type->referent().is_valid())
+            {
+                type_name = ref_type->referent()->display_name();
             }
         }
         else if (!type_name.empty() && type_name.back() == '*')
