@@ -9,6 +9,7 @@
 #include "Types/ErrorType.hpp"
 #include "Utils/Logger.hpp"
 
+#include <llvm/IR/Verifier.h>
 #include <unordered_set>
 
 namespace Cryo::Codegen
@@ -486,6 +487,14 @@ namespace Cryo::Codegen
                         {
                             builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
                         }
+                    }
+
+                    // Verify function - don't erase on failure as other methods may reference it
+                    if (llvm::verifyFunction(*fn, &llvm::errs()))
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                  "Generic struct method verification failed: {}::{}",
+                                  mangled, method->name());
                     }
 
                     // Clean up method scope
@@ -1648,6 +1657,14 @@ namespace Cryo::Codegen
                             {
                                 builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
                             }
+                        }
+
+                        // Verify function - don't erase on failure as other methods may reference it
+                        if (llvm::verifyFunction(*fn, &llvm::errs()))
+                        {
+                            LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                      "Generic enum method verification failed: {}::{}",
+                                      mangled, method->name());
                         }
 
                         // Clean up method scope

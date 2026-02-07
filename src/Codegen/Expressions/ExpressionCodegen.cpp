@@ -231,8 +231,8 @@ namespace Cryo::Codegen
                 }
                 // Check if it contains a decimal point or scientific notation 'e'/'E' (but not hex 'E')
                 else if (value_str.find('.') != std::string::npos ||
-                        (value_str.find('e') != std::string::npos && !value_str.starts_with("0x") && !value_str.starts_with("0X")) ||
-                        (value_str.find('E') != std::string::npos && !value_str.starts_with("0x") && !value_str.starts_with("0X")))
+                         (value_str.find('e') != std::string::npos && !value_str.starts_with("0x") && !value_str.starts_with("0X")) ||
+                         (value_str.find('E') != std::string::npos && !value_str.starts_with("0x") && !value_str.starts_with("0X")))
                 {
                     // Parse as float
                     double float_value = std::stod(value_str);
@@ -522,7 +522,7 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    LOG_WARN(Cryo::LogComponent::CODEGEN, 
+                    LOG_WARN(Cryo::LogComponent::CODEGEN,
                              "ExpressionCodegen: Referenced uninitialized global '{}' in global context", name);
                     return global; // Return the global itself as a constant
                 }
@@ -1611,21 +1611,16 @@ namespace Cryo::Codegen
                         }
                     }
                 }
-
-                // Fallback to i8 for string-like access only if we still don't have an element type
-                if (!element_type)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Falling back to i8 element type for array access");
-                    element_type = llvm::Type::getInt8Ty(llvm_ctx());
-                }
             }
         }
 
         if (!element_type)
         {
-            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
-                         "Could not determine element type for array access");
-            return nullptr;
+            // Fallback to i8 for string-like/byte access when element type can't be resolved
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "generate_array_access: Falling back to i8 element type - "
+                     "element type resolution failed for array access");
+            element_type = llvm::Type::getInt8Ty(llvm_ctx());
         }
 
         // Generate index expression
@@ -1865,7 +1860,7 @@ namespace Cryo::Codegen
 
                                 // Return address of element (for assignment targets)
                                 return builder().CreateGEP(pointee_type, loaded_ptr, index_val,
-                                                          member_access->member() + ".elem.ptr");
+                                                           member_access->member() + ".elem.ptr");
                             }
                         }
                         else if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(field_type))
@@ -1897,8 +1892,9 @@ namespace Cryo::Codegen
             }
             else
             {
-                // Assume pointer to elements
-                element_type = llvm::Type::getInt8Ty(llvm_ctx()); // Default
+                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                             "Could not determine element type for index address");
+                return nullptr;
             }
         }
 
@@ -2248,8 +2244,9 @@ namespace Cryo::Codegen
 
         if (!load_type)
         {
-            // Default to i8
-            load_type = llvm::Type::getInt8Ty(llvm_ctx());
+            report_error(ErrorCode::E0616_UNARY_OPERATION_ERROR,
+                         "Could not determine pointee type for dereference");
+            return nullptr;
         }
 
         return create_load(operand, load_type, "deref");
@@ -2308,7 +2305,7 @@ namespace Cryo::Codegen
             report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for ternary expression");
             return nullptr;
         }
-        
+
         llvm::BasicBlock *then_block = create_block("ternary.then", fn);
         llvm::BasicBlock *else_block = create_block("ternary.else", fn);
         llvm::BasicBlock *merge_block = create_block("ternary.merge", fn);
@@ -2398,7 +2395,7 @@ namespace Cryo::Codegen
             report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "No current function for if expression");
             return nullptr;
         }
-        
+
         llvm::BasicBlock *then_block = create_block("ifexpr.then", fn);
         llvm::BasicBlock *else_block = create_block("ifexpr.else", fn);
         llvm::BasicBlock *merge_block = create_block("ifexpr.merge", fn);
@@ -2609,8 +2606,7 @@ namespace Cryo::Codegen
 
         if (arm_results.empty())
         {
-            // No arms produced values - return void
-            return llvm::Constant::getNullValue(llvm::Type::getInt8Ty(llvm_ctx()));
+            return nullptr;
         }
 
         // Determine result type from first arm
@@ -3542,8 +3538,8 @@ namespace Cryo::Codegen
 
             // Convert count to i64 for alloca
             llvm::Value *count_i64 = builder().CreateZExtOrTrunc(count_val,
-                                                                  llvm::Type::getInt64Ty(llvm_ctx()),
-                                                                  "array.count");
+                                                                 llvm::Type::getInt64Ty(llvm_ctx()),
+                                                                 "array.count");
 
             // Allocate variable-length array on stack
             llvm::AllocaInst *array_alloca = builder().CreateAlloca(elem_type, count_i64, "array.vla");
@@ -3577,8 +3573,8 @@ namespace Cryo::Codegen
 
             // Increment index
             llvm::Value *next_idx = builder().CreateAdd(index_phi,
-                                                         llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 1),
-                                                         "array.idx.next");
+                                                        llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 1),
+                                                        "array.idx.next");
             index_phi->addIncoming(next_idx, loop_body);
             builder().CreateBr(loop_header);
 
@@ -3668,8 +3664,8 @@ namespace Cryo::Codegen
 
             // Convert count to i64
             length_val = builder().CreateZExtOrTrunc(count_val,
-                                                      llvm::Type::getInt64Ty(llvm_ctx()),
-                                                      "array.count");
+                                                     llvm::Type::getInt64Ty(llvm_ctx()),
+                                                     "array.count");
 
             // Allocate variable-length array on stack
             llvm::AllocaInst *vla = builder().CreateAlloca(elem_type, length_val, "array.elements.vla");
@@ -3708,8 +3704,8 @@ namespace Cryo::Codegen
             builder().CreateStore(elem_val, elem_ptr);
 
             llvm::Value *next_idx = builder().CreateAdd(index_phi,
-                                                         llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 1),
-                                                         "array.idx.next");
+                                                        llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 1),
+                                                        "array.idx.next");
             index_phi->addIncoming(next_idx, loop_body);
             builder().CreateBr(loop_header);
 
@@ -4167,9 +4163,9 @@ namespace Cryo::Codegen
         if (st->isOpaque())
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                     "ExpressionCodegen: ERROR - Struct '{}' is OPAQUE (unsized), cannot create struct literal. "
-                     "This likely means the struct body was not set before method body generation.",
-                     type_name);
+                      "ExpressionCodegen: ERROR - Struct '{}' is OPAQUE (unsized), cannot create struct literal. "
+                      "This likely means the struct body was not set before method body generation.",
+                      type_name);
 
             // Try to look up the struct type by name directly from LLVM context
             // The type might have been registered under a different name (e.g., qualified name)
@@ -4177,13 +4173,13 @@ namespace Cryo::Codegen
             std::string qualified_name = module_namespace.empty() ? type_name : module_namespace + "::" + type_name;
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "Attempting to find non-opaque struct under qualified name: '{}'", qualified_name);
+                      "Attempting to find non-opaque struct under qualified name: '{}'", qualified_name);
 
             llvm::StructType *qualified_type = llvm::StructType::getTypeByName(llvm_ctx(), qualified_name);
             if (qualified_type && !qualified_type->isOpaque())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                         "Found non-opaque struct type under qualified name: '{}'", qualified_name);
+                          "Found non-opaque struct type under qualified name: '{}'", qualified_name);
                 st = qualified_type;
                 struct_type = qualified_type;
             }
@@ -4194,7 +4190,7 @@ namespace Cryo::Codegen
                 if (completed && !completed->isOpaque())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                             "Completed struct '{}' from TypeMapper registry", type_name);
+                              "Completed struct '{}' from TypeMapper registry", type_name);
                     st = completed;
                     struct_type = completed;
                 }
@@ -4226,12 +4222,12 @@ namespace Cryo::Codegen
             if (ret_type)
             {
                 is_constructor = ret_type->isPointerTy() &&
-                               fn_name.find(type_name) != std::string::npos;
+                                 fn_name.find(type_name) != std::string::npos;
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                         "Function '{}' constructor check: {} (return type: {}, contains '{}': {})",
-                         fn_name, is_constructor ? "yes" : "no",
-                         ret_type->isPointerTy() ? "pointer" : "non-pointer",
-                         type_name, fn_name.find(type_name) != std::string::npos ? "yes" : "no");
+                          "Function '{}' constructor check: {} (return type: {}, contains '{}': {})",
+                          fn_name, is_constructor ? "yes" : "no",
+                          ret_type->isPointerTy() ? "pointer" : "non-pointer",
+                          type_name, fn_name.find(type_name) != std::string::npos ? "yes" : "no");
             }
         }
 
@@ -4246,7 +4242,7 @@ namespace Cryo::Codegen
             llvm::Value *size = llvm::ConstantInt::get(
                 llvm::Type::getInt64Ty(llvm_ctx()),
                 DL.getTypeAllocSize(struct_type));
-            
+
             // Get or declare malloc function
             llvm::Function *malloc_fn = module()->getFunction("malloc");
             if (!malloc_fn)
@@ -4256,15 +4252,15 @@ namespace Cryo::Codegen
                 llvm::FunctionType *fn_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
                 malloc_fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "malloc", module());
             }
-            
+
             llvm::Value *raw_ptr = builder().CreateCall(malloc_fn, {size}, "heap.alloc");
             // Cast void* to struct*
-            struct_storage = builder().CreateBitCast(raw_ptr, 
+            struct_storage = builder().CreateBitCast(raw_ptr,
                                                      struct_type->getPointerTo(),
                                                      type_name + ".heap.ptr");
-            
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN, 
-                     "Constructor: allocated {} on heap", type_name);
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Constructor: allocated {} on heap", type_name);
         }
         else
         {
@@ -4286,7 +4282,7 @@ namespace Cryo::Codegen
             {
                 LOG_WARN(Cryo::LogComponent::CODEGEN, "Null field initializer at index {}", i);
                 report_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION, node,
-                            "Null field initializer at index " + std::to_string(i) + " in struct '" + type_name + "'");
+                             "Null field initializer at index " + std::to_string(i) + " in struct '" + type_name + "'");
                 continue;
             }
 
@@ -4299,7 +4295,7 @@ namespace Cryo::Codegen
                 LOG_WARN(Cryo::LogComponent::CODEGEN,
                          "Field '{}' not found in struct '{}', skipping", field_name, type_name);
                 report_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION, node,
-                            "Field '" + field_name + "' not found in struct '" + type_name + "'");
+                             "Field '" + field_name + "' not found in struct '" + type_name + "'");
                 continue;
             }
 
@@ -4310,8 +4306,8 @@ namespace Cryo::Codegen
                          "Field index {} out of bounds for struct '{}' with {} elements",
                          field_idx, type_name, st->getNumElements());
                 report_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION, node,
-                            "Field index " + std::to_string(field_idx) + " out of bounds for struct '" +
-                            type_name + "' with " + std::to_string(st->getNumElements()) + " elements");
+                             "Field index " + std::to_string(field_idx) + " out of bounds for struct '" +
+                                 type_name + "' with " + std::to_string(st->getNumElements()) + " elements");
                 continue;
             }
 
@@ -4321,7 +4317,7 @@ namespace Cryo::Codegen
                 LOG_WARN(Cryo::LogComponent::CODEGEN, "Failed to generate struct field {}",
                          field_name);
                 report_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION, node,
-                            "Failed to generate value for field '" + field_name + "' in struct '" + type_name + "'");
+                             "Failed to generate value for field '" + field_name + "' in struct '" + type_name + "'");
                 continue;
             }
 
@@ -4335,8 +4331,8 @@ namespace Cryo::Codegen
             create_store(field_val, field_ptr);
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "Initialized struct field '{}' at index {} (type: {})",
-                     field_name, field_idx, type_name);
+                      "Initialized struct field '{}' at index {} (type: {})",
+                      field_name, field_idx, type_name);
         }
 
         if (is_constructor)
@@ -4535,10 +4531,10 @@ namespace Cryo::Codegen
 
             // Try various constructor name patterns
             std::vector<std::string> ctor_patterns = {
-                type_name_for_alloc + "::" + node->type_name(),  // Point::Point
-                type_name_for_alloc + "::init",                   // Point::init
-                type_name_for_alloc + "::new",                    // Point::new
-                node->type_name() + "::" + node->type_name(),    // Also try simple name
+                type_name_for_alloc + "::" + node->type_name(), // Point::Point
+                type_name_for_alloc + "::init",                 // Point::init
+                type_name_for_alloc + "::new",                  // Point::new
+                node->type_name() + "::" + node->type_name(),   // Also try simple name
             };
 
             for (const auto &ctor_name : ctor_patterns)
@@ -4833,7 +4829,7 @@ namespace Cryo::Codegen
         // Report error for unresolved enum variants (no placeholders - fail early and clearly)
         report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, node,
                      "Cannot resolve enum variant: " + qualified_name +
-                     " (generic enum variants must be instantiated before use)");
+                         " (generic enum variants must be instantiated before use)");
         return nullptr;
     }
 

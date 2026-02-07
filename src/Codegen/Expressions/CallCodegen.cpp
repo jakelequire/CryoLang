@@ -2483,7 +2483,12 @@ namespace Cryo::Codegen
             else if (elem_name == "i64" || elem_name == "u64")
                 elem_type = types().i64_type();
             else
-                elem_type = types().i8_type(); // Default to byte
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                         "parse_type_annotation_to_llvm: Unknown element type '{}' in fixed-size array",
+                         elem_name);
+                elem_type = types().i8_type(); // Keep fallback - annotation parsing is best-effort
+            }
 
             return llvm::ArrayType::get(elem_type, array_size);
         }

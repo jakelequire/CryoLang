@@ -2800,6 +2800,12 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Verify function - don't erase on failure as other methods may reference it
+            if (llvm::verifyFunction(*fn, &llvm::errs()))
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN, "Method verification failed: {}", method_name);
+            }
+
             // Exit function scope and clean up
             values().exit_scope();
             ctx().clear_current_function();
@@ -3133,6 +3139,12 @@ namespace Cryo::Codegen
                         {
                             builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
                         }
+                    }
+
+                    // Verify function - don't erase on failure as other methods may reference it
+                    if (llvm::verifyFunction(*fn, &llvm::errs()))
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN, "Impl method verification failed: {}", method_name);
                     }
 
                     // Exit function scope and clean up

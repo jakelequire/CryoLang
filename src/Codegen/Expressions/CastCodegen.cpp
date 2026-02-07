@@ -71,7 +71,18 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        return cast_to(value, llvm_target, "cast");
+        // Determine target signedness
+        bool target_signed = true; // default
+        if (node->has_resolved_target_type())
+            target_signed = is_signed_type(node->get_resolved_target_type());
+
+        // Determine source signedness from the expression's resolved type
+        bool source_signed = true; // default
+        TypeRef source_type_ref = node->expression()->get_resolved_type();
+        if (source_type_ref)
+            source_signed = is_signed_type(source_type_ref);
+
+        return cast_to(value, llvm_target, source_signed, target_signed, "cast");
     }
 
     llvm::Value *CastCodegen::generate_implicit_cast(llvm::Value *value, TypeRef target_type)
@@ -87,7 +98,7 @@ namespace Cryo::Codegen
         }
 
         bool is_signed = is_signed_type(target_type);
-        return cast_to(value, llvm_target, "cast");
+        return cast_to(value, llvm_target, is_signed, is_signed, "cast");
     }
 
     llvm::Value *CastCodegen::cast_to(llvm::Value *value, llvm::Type *target_type,
@@ -162,6 +173,34 @@ namespace Cryo::Codegen
 
         LOG_WARN(Cryo::LogComponent::CODEGEN, "CastCodegen: Unable to cast between types");
         return value;
+    }
+
+    llvm::Value *CastCodegen::cast_to(llvm::Value *value, llvm::Type *target_type,
+                                      bool source_signed, bool target_signed,
+                                      const std::string &name)
+    {
+        if (!value || !target_type)
+            return value;
+
+        if (value->getType() == target_type)
+            return value;
+
+        llvm::Type *source_type = value->getType();
+
+        // Integer to integer - use provided signedness
+        if (is_int_type(source_type) && is_int_type(target_type))
+            return cast_integer(value, target_type, source_signed, target_signed);
+
+        // Integer to float - source signedness matters
+        if (is_int_type(source_type) && is_float_type(target_type))
+            return int_to_float(value, target_type, source_signed);
+
+        // Float to integer - target signedness matters
+        if (is_float_type(source_type) && is_int_type(target_type))
+            return float_to_int(value, target_type, target_signed);
+
+        // Delegate remaining cases to the original cast_to
+        return cast_to(value, target_type, name);
     }
 
     //===================================================================
@@ -509,9 +548,12 @@ namespace Cryo::Codegen
         if (!type)
             return true; // Default to signed
 
-        std::string name = type.get()->display_name();
-        // Unsigned types in Cryo start with 'u'
-        return name.empty() || name[0] != 'u';
+        const Type *t = type.get();
+        if (!t)
+            return true;
+
+        // Use virtual is_signed() which IntType and FloatType override
+        return t->is_signed();
     }
 
     //===================================================================
