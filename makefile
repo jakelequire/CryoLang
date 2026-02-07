@@ -22,9 +22,6 @@
 # Include shared configuration
 include makefile.config
 
-# Include test framework configuration
-include test.makefile.config
-
 # Determine number of CPU cores
 ifeq ($(OS), Windows_NT)
     NUM_CORES = $(NUMBER_OF_PROCESSORS)
@@ -398,34 +395,8 @@ ast-runtime:
 # endif
 # 	@echo "Runtime object created successfully: $(BIN_DIR)stdlib/runtime.o"
 
-# Test targets - Simple and clean (no external scripts)
-.PHONY: test test-clean
-test: $(MAIN_BIN) $(TEST_ALL_EXECUTABLE)
-	@echo "Running CryoLang Test Suite..."
-	@$(TEST_ALL_EXECUTABLE)
 
-test-clean:
-	@echo "Cleaning test artifacts..."
-ifeq ($(OS), Windows_NT)
-	@if exist "$(subst /,\,$(TEST_BIN_DIR))" rmdir /s /q "$(subst /,\,$(TEST_BIN_DIR))"
-	@if exist "$(subst /,\,$(BIN_DIR)).o\tests" rmdir /s /q "$(subst /,\,$(BIN_DIR)).o\tests"
-else
-	@rm -rf $(TEST_BIN_DIR)
-	@rm -rf $(BIN_DIR).o/tests
-endif
-	@echo "✅ Test cleanup complete"
-
-# Single unified test executable (combines all test types)
-$(TEST_BIN_DIR)/cryo_tests$(EXE_SUFFIX): $(TEST_ALL_OBJECTS) | test-dirs
-	@echo "🔨 Building unified test executable..."
-	@$(CXX) $(TEST_CXXFLAGS) $^ -o $@ $(TEST_LDFLAGS) $(LIBS)
-ifdef FILE
-	@$(PYTHON) test/test_runner.py --file $(FILE)
-else
-	@echo "Please specify FILE variable"
-endif
-
-.PHONY: debug clean all lsp tools test test-quick test-verbose test-category test-file
+.PHONY: debug clean all lsp tools
 .NOTPARALLEL: clean clean-% libs
 
 # Help command
@@ -440,7 +411,5 @@ help:
 	@echo "  make tools          - Build all Cryo tools (e.g., CryoLSP)"
 	@echo "  make lsp            - Build the Cryo Language Server (CryoLSP)"
 	@echo "  make compiler-lib   - Build the Cryo compiler library for LSP integration"
-	@echo "  make test           - Run the full test suite"
-	@echo "  make test-clean     - Clean test artifacts"
 	@echo "  make runtime        - Build the runtime library"
 	@echo "  make runtime-clean  - Clean runtime build artifacts"
