@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -18,6 +19,8 @@ class CompilerDriver:
         """Compile a .cryo test file and return the result."""
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / test.metadata.name
+        if sys.platform == "win32":
+            output_path = output_path.with_suffix(".exe")
 
         cmd = [str(self.cryo_binary), str(test.source_path)]
 
@@ -62,7 +65,7 @@ class CompilerDriver:
         binary = None
         if result.returncode == 0:
             # The compiler may produce the binary at the exact output_path or with an extension
-            for candidate in [output_path, output_path.with_suffix(".out"), output_path.with_suffix("")]:
+            for candidate in [output_path, output_path.with_suffix(".exe"), output_path.with_suffix(".out"), output_path.with_suffix("")]:
                 if candidate.exists() and candidate.is_file():
                     binary = candidate
                     break
