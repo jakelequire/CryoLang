@@ -88,6 +88,10 @@ Examples:
     build_dir = Path(args.build_dir) if args.build_dir else project_root / "tests" / ".build"
     e2e_dir = Path(args.e2e_dir) if args.e2e_dir else project_root / "tests" / "e2e"
 
+    # Append executable extension on Windows if not provided
+    if sys.platform == "win32" and cryo_binary.suffix != ".exe":
+        cryo_binary = cryo_binary.with_suffix(".exe")
+
     # Discover tests
     try:
         tests = discover_tests(e2e_dir)
