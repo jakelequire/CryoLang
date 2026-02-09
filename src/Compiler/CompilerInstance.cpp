@@ -2058,20 +2058,25 @@ namespace Cryo
                 auto *enum_ptr = const_cast<EnumType *>(dynamic_cast<const EnumType *>(enum_type.get()));
                 if (enum_ptr)
                 {
-                    // Check if variants need payload type resolution
-                    // (they were created with placeholder types in ModuleLoader)
-                    bool needs_resolution = false;
-                    for (const auto &variant : enum_ptr->variants())
+                    // Check if variants need population or payload type resolution.
+                    // Variants need population if:
+                    // 1. The enum has no variants yet (created without them in collect_declarations_pass)
+                    // 2. Any existing variant has unresolved payload types (from ModuleLoader)
+                    bool needs_resolution = enum_ptr->variant_count() == 0;
+                    if (!needs_resolution)
                     {
-                        for (const auto &payload_type : variant.payload_types)
+                        for (const auto &variant : enum_ptr->variants())
                         {
-                            if (!payload_type.is_valid())
+                            for (const auto &payload_type : variant.payload_types)
                             {
-                                needs_resolution = true;
-                                break;
+                                if (!payload_type.is_valid())
+                                {
+                                    needs_resolution = true;
+                                    break;
+                                }
                             }
+                            if (needs_resolution) break;
                         }
-                        if (needs_resolution) break;
                     }
 
                     if (needs_resolution)

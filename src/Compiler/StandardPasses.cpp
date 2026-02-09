@@ -285,7 +285,8 @@ namespace Cryo
         ResolutionContext &ctx,
         TypeRef expected_return_type,
         size_t &resolved_count,
-        size_t &error_count)
+        size_t &error_count,
+        DiagEmitter *diagnostics = nullptr)
     {
         if (!stmt)
             return;
@@ -318,9 +319,13 @@ namespace Cryo
                 else
                 {
                     error_count++;
-                    LOG_DEBUG(LogComponent::GENERAL,
-                        "TypeResolutionPass: Failed to resolve local variable '{}' type: {}",
-                        var_decl->name(), resolved->display_name());
+                    if (diagnostics)
+                    {
+                        diagnostics->emit(
+                            Diag::error(ErrorCode::E0203_UNDEFINED_TYPE,
+                                        "undefined type '" + ann->name + "' for variable '" + var_decl->name() + "'")
+                                .at(var_decl));
+                    }
                 }
             }
         }
@@ -345,9 +350,13 @@ namespace Cryo
                     else
                     {
                         error_count++;
-                        LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Failed to resolve local variable '{}' type: {}",
-                            var_decl->name(), resolved->display_name());
+                        if (diagnostics)
+                        {
+                            diagnostics->emit(
+                                Diag::error(ErrorCode::E0203_UNDEFINED_TYPE,
+                                            "undefined type '" + ann->name + "' for variable '" + var_decl->name() + "'")
+                                    .at(var_decl));
+                        }
                     }
                 }
             }
@@ -357,28 +366,28 @@ namespace Cryo
         {
             for (const auto &child : block->statements())
             {
-                resolve_variable_types_in_statement(child.get(), resolver, ctx, expected_return_type, resolved_count, error_count);
+                resolve_variable_types_in_statement(child.get(), resolver, ctx, expected_return_type, resolved_count, error_count, diagnostics);
             }
         }
         // Process if statement branches
         else if (auto *if_stmt = dynamic_cast<IfStatementNode *>(stmt))
         {
             if (if_stmt->then_statement())
-                resolve_variable_types_in_statement(if_stmt->then_statement(), resolver, ctx, expected_return_type, resolved_count, error_count);
+                resolve_variable_types_in_statement(if_stmt->then_statement(), resolver, ctx, expected_return_type, resolved_count, error_count, diagnostics);
             if (if_stmt->else_statement())
-                resolve_variable_types_in_statement(if_stmt->else_statement(), resolver, ctx, expected_return_type, resolved_count, error_count);
+                resolve_variable_types_in_statement(if_stmt->else_statement(), resolver, ctx, expected_return_type, resolved_count, error_count, diagnostics);
         }
         // Process while loop body
         else if (auto *while_stmt = dynamic_cast<WhileStatementNode *>(stmt))
         {
             if (while_stmt->body())
-                resolve_variable_types_in_statement(while_stmt->body(), resolver, ctx, expected_return_type, resolved_count, error_count);
+                resolve_variable_types_in_statement(while_stmt->body(), resolver, ctx, expected_return_type, resolved_count, error_count, diagnostics);
         }
         // Process for loop body
         else if (auto *for_stmt = dynamic_cast<ForStatementNode *>(stmt))
         {
             if (for_stmt->body())
-                resolve_variable_types_in_statement(for_stmt->body(), resolver, ctx, expected_return_type, resolved_count, error_count);
+                resolve_variable_types_in_statement(for_stmt->body(), resolver, ctx, expected_return_type, resolved_count, error_count, diagnostics);
         }
         // Process match statement arms
         else if (auto *match_stmt = dynamic_cast<MatchStatementNode *>(stmt))
@@ -386,7 +395,7 @@ namespace Cryo
             for (const auto &arm : match_stmt->arms())
             {
                 if (arm->body())
-                    resolve_variable_types_in_statement(arm->body(), resolver, ctx, expected_return_type, resolved_count, error_count);
+                    resolve_variable_types_in_statement(arm->body(), resolver, ctx, expected_return_type, resolved_count, error_count, diagnostics);
             }
         }
     }
@@ -1178,7 +1187,7 @@ namespace Cryo
                     if (method->body())
                     {
                         TypeRef return_type = method->get_resolved_return_type();
-                        resolve_variable_types_in_statement(method->body(), resolver, method_ctx, return_type, resolved_count, error_count);
+                        resolve_variable_types_in_statement(method->body(), resolver, method_ctx, return_type, resolved_count, error_count, _compiler.diagnostics());
                     }
                 }
             }
@@ -1208,7 +1217,7 @@ namespace Cryo
                     if (method->body())
                     {
                         TypeRef return_type = method->get_resolved_return_type();
-                        resolve_variable_types_in_statement(method->body(), resolver, method_ctx, return_type, resolved_count, error_count);
+                        resolve_variable_types_in_statement(method->body(), resolver, method_ctx, return_type, resolved_count, error_count, _compiler.diagnostics());
                     }
                 }
             }
@@ -1227,7 +1236,7 @@ namespace Cryo
                 if (func->body())
                 {
                     TypeRef return_type = func->get_resolved_return_type();
-                    resolve_variable_types_in_statement(func->body(), resolver, func_ctx, return_type, resolved_count, error_count);
+                    resolve_variable_types_in_statement(func->body(), resolver, func_ctx, return_type, resolved_count, error_count, _compiler.diagnostics());
                 }
             }
         }
@@ -1823,6 +1832,68 @@ namespace Cryo
                 if (var_decl->initializer())
                 {
                     resolve_expression(var_decl->initializer(), var_type, ctx);
+
+                    // Check for type mismatch between declared type and initializer
+                    if (var_type.is_valid() && !var_type.is_error())
+                    {
+                        TypeRef init_type = var_decl->initializer()->get_resolved_type();
+
+                        // If the initializer has no resolved type, try to infer from literals
+                        if (!init_type.is_valid())
+                        {
+                            if (auto *lit = dynamic_cast<LiteralNode *>(var_decl->initializer()))
+                            {
+                                auto *tc = _compiler.type_checker();
+                                if (tc)
+                                {
+                                    auto &arena = tc->arena();
+                                    switch (lit->literal_kind())
+                                    {
+                                    case TokenKind::TK_STRING_LITERAL:
+                                        init_type = arena.get_string();
+                                        break;
+                                    case TokenKind::TK_NUMERIC_CONSTANT:
+                                        if (lit->value().find('.') != std::string::npos)
+                                            init_type = arena.get_float_alias();
+                                        else
+                                            init_type = arena.get_int();
+                                        break;
+                                    case TokenKind::TK_CHAR_CONSTANT:
+                                        init_type = arena.get_char();
+                                        break;
+                                    case TokenKind::TK_BOOLEAN_LITERAL:
+                                    case TokenKind::TK_KW_TRUE:
+                                    case TokenKind::TK_KW_FALSE:
+                                        init_type = arena.get_bool();
+                                        break;
+                                    default:
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (init_type.is_valid() && !init_type.is_error())
+                        {
+                            auto *tc = _compiler.type_checker();
+                            if (tc)
+                            {
+                                auto compat = tc->check_compatibility(init_type, var_type);
+                                if (compat == TypeCompatibility::Incompatible)
+                                {
+                                    std::string msg = "cannot initialize variable '" + var_decl->name() +
+                                                      "' of type '" + var_type->display_name() +
+                                                      "' with value of type '" + init_type->display_name() + "'";
+                                    if (_compiler.diagnostics())
+                                    {
+                                        _compiler.diagnostics()->emit(
+                                            Diag::error(ErrorCode::E0200_TYPE_MISMATCH, msg)
+                                                .at(var_decl));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             break;

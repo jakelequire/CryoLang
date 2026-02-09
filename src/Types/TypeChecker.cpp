@@ -115,7 +115,25 @@ namespace Cryo
             return check_compatibility(from, alias->target());
         }
 
-        // Instantiated type to base type
+        // Unwrap InstantiatedType to its resolved concrete type
+        if (from_kind == TypeKind::InstantiatedType)
+        {
+            auto *inst = static_cast<const InstantiatedType *>(from_t);
+            if (inst->has_resolved_type())
+            {
+                return check_compatibility(inst->resolved_type(), to);
+            }
+        }
+        if (to_kind == TypeKind::InstantiatedType)
+        {
+            auto *inst = static_cast<const InstantiatedType *>(to_t);
+            if (inst->has_resolved_type())
+            {
+                return check_compatibility(from, inst->resolved_type());
+            }
+        }
+
+        // Instantiated type to base type (both unresolved)
         if (from_kind == TypeKind::InstantiatedType && to_kind == TypeKind::InstantiatedType)
         {
             auto *from_inst = static_cast<const InstantiatedType *>(from_t);
