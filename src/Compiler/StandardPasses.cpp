@@ -1619,6 +1619,54 @@ namespace Cryo
         return PassResult::ok({PassProvides::GENERIC_EXPRESSIONS_RESOLVED});
     }
 
+    /// Helper to check if a statement guarantees a return on all code paths.
+    static bool statement_always_returns(StatementNode *stmt)
+    {
+        if (!stmt)
+            return false;
+
+        switch (stmt->kind())
+        {
+        case NodeKind::ReturnStatement:
+            return true;
+
+        case NodeKind::BlockStatement:
+        {
+            auto *block = static_cast<BlockStatementNode *>(stmt);
+            const auto &stmts = block->statements();
+            if (stmts.empty())
+                return false;
+            return statement_always_returns(stmts.back().get());
+        }
+
+        case NodeKind::IfStatement:
+        {
+            auto *if_stmt = static_cast<IfStatementNode *>(stmt);
+            if (!if_stmt->else_statement())
+                return false;
+            return statement_always_returns(if_stmt->then_statement()) &&
+                   statement_always_returns(if_stmt->else_statement());
+        }
+
+        case NodeKind::MatchStatement:
+        {
+            auto *match_stmt = static_cast<MatchStatementNode *>(stmt);
+            const auto &arms = match_stmt->arms();
+            if (arms.empty())
+                return false;
+            for (const auto &arm : arms)
+            {
+                if (!statement_always_returns(arm->body()))
+                    return false;
+            }
+            return true;
+        }
+
+        default:
+            return false;
+        }
+    }
+
     void GenericExpressionResolutionPass::resolve_function_body(FunctionDeclarationNode *func, TypeRef struct_type, PassContext &ctx)
     {
         if (!func || !func->body())
@@ -1630,6 +1678,7 @@ namespace Cryo
 
         // Clear local variable tracking for this function scope
         _local_variable_types.clear();
+        _immutable_locals.clear();
 
         // Track function parameters as local variables
         for (const auto &param : func->parameters())
@@ -1655,6 +1704,25 @@ namespace Cryo
 
         // Resolve expressions in the function body
         resolve_statement(func->body(), return_type, ctx);
+
+        // Check for missing return statement in non-void functions
+        if (return_type.is_valid() &&
+            return_type->kind() != TypeKind::Void &&
+            return_type->kind() != TypeKind::Unit)
+        {
+            if (!statement_always_returns(func->body()))
+            {
+                std::string msg = "function '" + func->name() +
+                                  "' has return type '" + return_type->display_name() +
+                                  "' but not all code paths return a value";
+                if (_compiler.diagnostics())
+                {
+                    _compiler.diagnostics()->emit(
+                        Diag::error(ErrorCode::E0403_MISSING_RETURN, msg)
+                            .at(func));
+                }
+            }
+        }
 
         // Restore previous struct type
         _current_struct_type = previous_struct_type;
@@ -1744,6 +1812,12 @@ namespace Cryo
                 if (var_type.is_valid() && !var_decl->name().empty())
                 {
                     _local_variable_types[var_decl->name()] = var_type;
+                }
+
+                // Track immutable (const) variables for reassignment checking
+                if (!var_decl->is_mutable() && !var_decl->name().empty())
+                {
+                    _immutable_locals.insert(var_decl->name());
                 }
 
                 if (var_decl->initializer())
@@ -1903,16 +1977,20 @@ namespace Cryo
 
             // Look up function signature to get parameter types for argument resolution
             std::vector<TypeRef> param_types;
+            bool is_variadic_func = false;
+            std::string callee_name;
 
             // Try to get function type from callee
             if (auto *ident = dynamic_cast<IdentifierNode *>(call->callee()))
             {
                 // Simple function call: foo(arg)
+                callee_name = ident->name();
                 const Symbol *func_sym = _compiler.symbol_table()->lookup(ident->name());
                 if (func_sym && func_sym->type.is_valid() && func_sym->type->kind() == TypeKind::Function)
                 {
                     auto *func_type = static_cast<const FunctionType *>(func_sym->type.get());
                     param_types = func_type->param_types();
+                    is_variadic_func = func_type->is_variadic();
                     LOG_DEBUG(LogComponent::GENERAL,
                               "GenericExpressionResolutionPass: Found function '{}' with {} params",
                               ident->name(), param_types.size());
@@ -1923,6 +2001,7 @@ namespace Cryo
                 // Method call: obj.method(arg) - try to get method signature from receiver type
                 TypeRef receiver_type = member->object()->get_resolved_type();
                 std::string method_name = member->member();
+                callee_name = method_name;
 
                 LOG_DEBUG(LogComponent::GENERAL,
                           "GenericExpressionResolutionPass: Member call '?.{}', receiver_type valid={}",
@@ -2013,6 +2092,7 @@ namespace Cryo
             {
                 // Static method call: Type::method(arg) - look up in symbol table
                 std::string qualified_name = scope_res_callee->scope_name() + "::" + scope_res_callee->member_name();
+                callee_name = qualified_name;
                 const Symbol *func_sym = _compiler.symbol_table()->lookup(qualified_name);
                 if (!func_sym)
                 {
@@ -2023,14 +2103,51 @@ namespace Cryo
                 {
                     auto *func_type = static_cast<const FunctionType *>(func_sym->type.get());
                     param_types = func_type->param_types();
+                    is_variadic_func = func_type->is_variadic();
                     LOG_DEBUG(LogComponent::GENERAL,
                               "GenericExpressionResolutionPass: Found static method '{}' with {} params",
                               qualified_name, param_types.size());
                 }
             }
 
-            // Resolve arguments with parameter types as expected types
+            // Validate argument count against parameter count
             auto &args = call->arguments();
+            if (!param_types.empty() || !callee_name.empty())
+            {
+                size_t expected_count = param_types.size();
+                size_t actual_count = args.size();
+
+                if (!is_variadic_func && expected_count != actual_count && !param_types.empty())
+                {
+                    std::ostringstream oss;
+                    oss << "function '" << callee_name << "' expects "
+                        << expected_count << " argument(s), but "
+                        << actual_count << " were provided";
+
+                    if (_compiler.diagnostics())
+                    {
+                        _compiler.diagnostics()->emit(
+                            Diag::error(ErrorCode::E0214_ARGUMENT_MISMATCH, oss.str())
+                                .at(call));
+                    }
+                }
+                else if (is_variadic_func && actual_count < expected_count)
+                {
+                    std::ostringstream oss;
+                    oss << "function '" << callee_name << "' expects at least "
+                        << expected_count << " argument(s), but "
+                        << actual_count << " were provided";
+
+                    if (_compiler.diagnostics())
+                    {
+                        _compiler.diagnostics()->emit(
+                            Diag::error(ErrorCode::E0214_ARGUMENT_MISMATCH, oss.str())
+                                .at(call));
+                    }
+                }
+            }
+
+            // Resolve arguments with parameter types as expected types
             for (size_t i = 0; i < args.size(); ++i)
             {
                 TypeRef expected_arg_type = (i < param_types.size()) ? param_types[i] : TypeRef{};
@@ -2047,6 +2164,33 @@ namespace Cryo
         case NodeKind::BinaryExpression:
         {
             auto *binary = static_cast<BinaryExpressionNode *>(expr);
+
+            // Check for const reassignment on any assignment operator
+            {
+                auto op_kind = binary->operator_token().kind();
+                bool is_assignment = (op_kind == TokenKind::TK_EQUAL ||
+                                      op_kind == TokenKind::TK_PLUSEQUAL ||
+                                      op_kind == TokenKind::TK_MINUSEQUAL ||
+                                      op_kind == TokenKind::TK_STAREQUAL ||
+                                      op_kind == TokenKind::TK_SLASHEQUAL);
+                if (is_assignment)
+                {
+                    if (auto *ident = dynamic_cast<IdentifierNode *>(binary->left()))
+                    {
+                        if (_immutable_locals.count(ident->name()))
+                        {
+                            std::string msg = "cannot assign to immutable variable '" + ident->name() + "'";
+                            if (_compiler.diagnostics())
+                            {
+                                _compiler.diagnostics()->emit(
+                                    Diag::error(ErrorCode::E0218_IMMUTABLE_ASSIGNMENT, msg)
+                                        .at(binary));
+                            }
+                        }
+                    }
+                }
+            }
+
             // For assignments, RHS inherits expected type from LHS
             if (binary->operator_token().kind() == TokenKind::TK_EQUAL)
             {

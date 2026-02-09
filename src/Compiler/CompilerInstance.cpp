@@ -1,5 +1,6 @@
 #include "Compiler/CompilerInstance.hpp"
 #include "Compiler/StandardPasses.hpp"
+#include "Diagnostics/Diag.hpp"
 #include "Types/TypeMapper.hpp"
 #include "Types/GenericTypes.hpp"
 #include "Types/UserDefinedTypes.hpp"
@@ -2239,31 +2240,30 @@ namespace Cryo
         {
             // Already processed in first pass, nothing to do
         }
-        // Handle constant variable declarations only (const variables need global visibility)
+        // Handle variable declarations (both const and mutable)
         else if (auto var_decl = dynamic_cast<VariableDeclarationNode *>(node))
         {
-            // Only process const variables (not mutable ones) - they need to be available for lookup
-            if (!var_decl->is_mutable())
+            TypeRef var_type = var_decl->get_resolved_type();
+
+            // Register in scope to detect duplicate declarations
+            bool success = current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
+                                                         var_decl->location(), var_type, scope_name);
+
+            if (!success)
             {
-                // Use resolved type from AST node
-                TypeRef var_type = var_decl->get_resolved_type();
-
-                // Add constant to current scope for global visibility
-                bool success = current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
-                                                             var_decl->location(), var_type, scope_name);
-
-                if (!success && _debug_mode)
+                if (_diagnostics)
                 {
-                    LOG_WARN(Cryo::LogComponent::GENERAL, "Constant '{}' already declared in scope '{}'",
-                             var_decl->name(), scope_name);
-                }
-                else if (_debug_mode)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added constant '{}' to scope '{}' with type '{}'",
-                              var_decl->name(), scope_name, var_type.is_valid() ? var_type.get()->display_name() : "null");
+                    _diagnostics->emit(
+                        Diag::error(ErrorCode::E0205_REDEFINED_SYMBOL,
+                                    "variable '" + var_decl->name() + "' is already declared in this scope")
+                            .at(var_decl));
                 }
             }
-            // Skip mutable variables - they will be handled by TypeChecker
+            else if (_debug_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added variable '{}' to scope '{}' with type '{}'",
+                          var_decl->name(), scope_name, var_type.is_valid() ? var_type.get()->display_name() : "null");
+            }
         }
         // Handle declaration statements (our wrapper)
         else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
