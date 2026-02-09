@@ -4,6 +4,7 @@
 #include "Types/TypeID.hpp"
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Cryo
 {
@@ -570,6 +571,7 @@ namespace Cryo
         CompilerInstance &_compiler;
         TypeRef _current_struct_type; // Track the current struct/class type for 'this' resolution
         std::unordered_map<std::string, TypeRef> _local_variable_types; // Track local variable types
+        std::unordered_set<std::string> _immutable_locals;               // Track const/immutable local variables
 
         // Resolve generic enum variants in a function body
         void resolve_function_body(FunctionDeclarationNode *func, TypeRef struct_type, PassContext &ctx);
