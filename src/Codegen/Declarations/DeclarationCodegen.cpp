@@ -1094,6 +1094,23 @@ namespace Cryo::Codegen
                         );
                     }
                 }
+                else if (var_type->isArrayTy() && init_val->getType()->isPointerTy())
+                {
+                    // Array literal returned a pointer to its alloca - memcpy contents
+                    auto &data_layout = module()->getDataLayout();
+                    uint64_t size = data_layout.getTypeAllocSize(var_type);
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Array initialization via memcpy for '{}', size {} bytes",
+                              name, size);
+
+                    builder().CreateMemCpy(
+                        alloca,
+                        llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),
+                        init_val,
+                        llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),
+                        size);
+                }
                 else
                 {
                     llvm::Value *cast_val = cast_if_needed(init_val, var_type);
