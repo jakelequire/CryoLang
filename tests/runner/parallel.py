@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .core import (
     CompilationResult,
+    CompileMode,
     ExpectResult,
     TestCase,
     TestResult,
@@ -29,6 +30,7 @@ def _run_single_test(
     metadata_dict: dict,
     category: str,
     build_dir: str,
+    project_dir: str | None = None,
 ) -> dict:
     """Run a single test in a worker process. Uses dicts for pickling."""
     from .core import (
@@ -59,7 +61,12 @@ def _run_single_test(
         compiler_args=metadata_dict.get("compiler_args", ""),
         run_args=metadata_dict.get("run_args", ""),
     )
-    test = TestCase(source_path=Path(source_path), metadata=meta, category=category)
+    test = TestCase(
+        source_path=Path(source_path),
+        metadata=meta,
+        category=category,
+        project_dir=Path(project_dir) if project_dir else None,
+    )
 
     result = run_test(test, Path(cryo_binary), Path(build_dir))
 
@@ -101,8 +108,11 @@ def run_test(test: TestCase, cryo_binary: Path, build_dir: Path) -> TestResult:
     executor = BinaryExecutor()
 
     # Step 2: Compile
-    output_dir = build_dir / meta.name
-    comp = driver.compile(test, output_dir)
+    if meta.mode == CompileMode.PROJECT:
+        comp = driver.compile_project(test)
+    else:
+        output_dir = build_dir / meta.name
+        comp = driver.compile(test, output_dir)
 
     if comp.stderr == "Compilation timed out":
         result = TestResult(
@@ -310,6 +320,7 @@ def run_tests_parallel(
                 meta_dict,
                 test.category,
                 str(worker_dir),
+                str(test.project_dir) if test.project_dir else None,
             )
             futures[future] = test
 
