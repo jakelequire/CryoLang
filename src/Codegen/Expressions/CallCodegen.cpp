@@ -485,6 +485,61 @@ namespace Cryo::Codegen
                 return nullptr;
             }
 
+            // Check for generic function FIRST (before struct),
+            // since is_generic_template matches both function and struct templates
+            if (generics->get_generic_function_def(base_name))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericInstantiation: '{}' is a generic function, instantiating",
+                          base_name);
+
+                // Parse type arguments
+                std::vector<TypeRef> type_args;
+                std::string trimmed = type_args_str;
+                size_t fn_start = trimmed.find_first_not_of(" \t");
+                size_t fn_end = trimmed.find_last_not_of(" \t");
+                if (fn_start != std::string::npos && fn_end != std::string::npos)
+                {
+                    trimmed = trimmed.substr(fn_start, fn_end - fn_start + 1);
+                }
+
+                TypeRef arg_type{};
+                Symbol *type_sym = symbols().lookup_symbol(trimmed);
+                if (type_sym && type_sym->kind == SymbolKind::Type && type_sym->type.is_valid())
+                {
+                    arg_type = type_sym->type;
+                }
+                if (!arg_type.is_valid())
+                {
+                    if (trimmed == "int" || trimmed == "i32")
+                        arg_type = symbols().arena().get_i32();
+                    else if (trimmed == "i64")
+                        arg_type = symbols().arena().get_i64();
+                    else if (trimmed == "f32" || trimmed == "float")
+                        arg_type = symbols().arena().get_f32();
+                    else if (trimmed == "f64" || trimmed == "double")
+                        arg_type = symbols().arena().get_f64();
+                    else if (trimmed == "string")
+                        arg_type = symbols().arena().get_string();
+                    else if (trimmed == "bool" || trimmed == "boolean")
+                        arg_type = symbols().arena().get_bool();
+                }
+                if (arg_type.is_valid())
+                {
+                    type_args.push_back(arg_type);
+                }
+
+                llvm::Function *instantiated_fn = generics->instantiate_function(base_name, type_args);
+                if (instantiated_fn)
+                {
+                    return generate_free_function(node, instantiated_fn);
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericInstantiation: Failed to instantiate generic function '{}', trying struct path",
+                          base_name);
+            }
+
             // Check if base_name is a registered generic struct template
             if (generics->is_generic_template(base_name))
             {
@@ -2151,6 +2206,22 @@ namespace Cryo::Codegen
             }
         }
 
+        // Fallback: If the type_name contains generic angle brackets and we have
+        // active generic bindings, substitute type params to get the concrete mangled name.
+        // This handles static calls like Inner<T>::new(v) inside Outer<i32>::new
+        // where the type name hasn't been fully resolved through other paths.
+        if (generics && generics->in_type_param_scope() && type_name.find('<') != std::string::npos)
+        {
+            std::string substituted = generics->substitute_type_annotation(type_name);
+            if (!substituted.empty())
+            {
+                resolved_type_name = substituted;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_static_method: Substituted nested generic type '{}' -> '{}'",
+                          type_name, resolved_type_name);
+            }
+        }
+
         // Generate arguments
         auto args = generate_arguments(node->arguments());
 
@@ -2560,6 +2631,42 @@ namespace Cryo::Codegen
             if (obj_type.is_valid())
             {
                 type_name = obj_type->display_name();
+
+                // Handle InstantiatedType - use monomorphized name
+                if (obj_type->kind() == Cryo::TypeKind::InstantiatedType)
+                {
+                    auto *inst_type = static_cast<const Cryo::InstantiatedType *>(obj_type.get());
+                    if (inst_type->has_resolved_type())
+                    {
+                        type_name = inst_type->resolved_type()->display_name();
+                    }
+                    else if (inst_type->generic_base().is_valid())
+                    {
+                        std::string base = inst_type->generic_base()->display_name();
+                        std::string mangled = base;
+                        const auto &args = inst_type->type_args();
+                        if (!args.empty())
+                        {
+                            mangled += "_";
+                            for (size_t i = 0; i < args.size(); ++i)
+                            {
+                                if (i > 0) mangled += "_";
+                                if (args[i].is_valid())
+                                {
+                                    std::string arg_name = args[i]->display_name();
+                                    std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                                    std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                                    std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                                    std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                                    std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                                    mangled += arg_name;
+                                }
+                            }
+                        }
+                        type_name = mangled;
+                    }
+                }
+
                 // Strip pointer/reference suffix if present
                 if (!type_name.empty() && (type_name.back() == '*' || type_name.back() == '&'))
                 {
@@ -2663,6 +2770,42 @@ namespace Cryo::Codegen
                             if (it != var_types.end() && it->second.is_valid())
                             {
                                 parent_type_name = it->second->display_name();
+
+                                // Handle InstantiatedType - use monomorphized name
+                                if (it->second->kind() == Cryo::TypeKind::InstantiatedType)
+                                {
+                                    auto *inst = static_cast<const Cryo::InstantiatedType *>(it->second.get());
+                                    if (inst->has_resolved_type())
+                                    {
+                                        parent_type_name = inst->resolved_type()->display_name();
+                                    }
+                                    else if (inst->generic_base().is_valid())
+                                    {
+                                        std::string base = inst->generic_base()->display_name();
+                                        std::string mangled = base;
+                                        const auto &args = inst->type_args();
+                                        if (!args.empty())
+                                        {
+                                            mangled += "_";
+                                            for (size_t i = 0; i < args.size(); ++i)
+                                            {
+                                                if (i > 0) mangled += "_";
+                                                if (args[i].is_valid())
+                                                {
+                                                    std::string arg_name = args[i]->display_name();
+                                                    std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                                                    std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                                                    std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                                                    std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                                                    std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                                                    mangled += arg_name;
+                                                }
+                                            }
+                                        }
+                                        parent_type_name = mangled;
+                                    }
+                                }
+
                                 if (!parent_type_name.empty() && parent_type_name.back() == '*')
                                 {
                                     parent_type_name.pop_back();
@@ -2704,6 +2847,42 @@ namespace Cryo::Codegen
                                             if (field_type.is_valid())
                                             {
                                                 type_name = field_type->display_name();
+
+                                                // Handle InstantiatedType - use monomorphized name
+                                                if (field_type->kind() == Cryo::TypeKind::InstantiatedType)
+                                                {
+                                                    auto *inst = static_cast<const Cryo::InstantiatedType *>(field_type.get());
+                                                    if (inst->has_resolved_type())
+                                                    {
+                                                        type_name = inst->resolved_type()->display_name();
+                                                    }
+                                                    else if (inst->generic_base().is_valid())
+                                                    {
+                                                        std::string base = inst->generic_base()->display_name();
+                                                        std::string mangled = base;
+                                                        const auto &args = inst->type_args();
+                                                        if (!args.empty())
+                                                        {
+                                                            mangled += "_";
+                                                            for (size_t i = 0; i < args.size(); ++i)
+                                                            {
+                                                                if (i > 0) mangled += "_";
+                                                                if (args[i].is_valid())
+                                                                {
+                                                                    std::string arg_name = args[i]->display_name();
+                                                                    std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                                                                    std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                                                                    std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                                                                    std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                                                                    std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                                                                    mangled += arg_name;
+                                                                }
+                                                            }
+                                                        }
+                                                        type_name = mangled;
+                                                    }
+                                                }
+
                                                 if (field_type->kind() == Cryo::TypeKind::Pointer)
                                                 {
                                                     auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(field_type.get());
@@ -3957,8 +4136,31 @@ namespace Cryo::Codegen
 
         std::string member_name = node->member();
 
-        // Generate the object expression to get the base pointer
-        llvm::Value *object = generate_expression(node->object());
+        // Try to get the alloca (pointer) for identifiers instead of loading the value.
+        // For struct variables, generate_expression loads the struct value, but we need
+        // a pointer to GEP into the struct fields.
+        llvm::Value *object = nullptr;
+        if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(node->object()))
+        {
+            std::string var_name = identifier->name();
+            if (llvm::AllocaInst *alloca = values().get_alloca(var_name))
+            {
+                object = alloca;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_member_receiver_address: Using alloca for identifier '{}'", var_name);
+            }
+            else if (llvm::GlobalVariable *global = module()->getGlobalVariable(var_name))
+            {
+                object = global;
+            }
+        }
+
+        // Fallback to generating the expression
+        if (!object)
+        {
+            object = generate_expression(node->object());
+        }
+
         if (!object)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -3970,7 +4172,8 @@ namespace Cryo::Codegen
         if (!object->getType()->isPointerTy())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "generate_member_receiver_address: Object is not a pointer type");
+                      "generate_member_receiver_address: Object is not a pointer type (type: {})",
+                      object->getType()->getTypeID());
             return nullptr;
         }
 
@@ -3983,8 +4186,47 @@ namespace Cryo::Codegen
         if (obj_type.is_valid())
         {
             type_name = obj_type->display_name();
+
+            // Handle InstantiatedType - use the monomorphized name
+            // This ensures we get "Outer_i32" instead of "Outer<i32>"
+            if (obj_type->kind() == Cryo::TypeKind::InstantiatedType)
+            {
+                auto *inst_type = static_cast<const Cryo::InstantiatedType *>(obj_type.get());
+                if (inst_type->has_resolved_type())
+                {
+                    type_name = inst_type->resolved_type()->display_name();
+                }
+                else if (inst_type->generic_base().is_valid())
+                {
+                    std::string base = inst_type->generic_base()->display_name();
+                    std::string mangled = base;
+                    const auto &args = inst_type->type_args();
+                    if (!args.empty())
+                    {
+                        mangled += "_";
+                        for (size_t i = 0; i < args.size(); ++i)
+                        {
+                            if (i > 0) mangled += "_";
+                            if (args[i].is_valid())
+                            {
+                                std::string arg_name = args[i]->display_name();
+                                std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                                std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                                std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                                std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                                std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                                mangled += arg_name;
+                            }
+                        }
+                    }
+                    type_name = mangled;
+                }
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_member_receiver_address: Using InstantiatedType name: {}",
+                          type_name);
+            }
             // Handle pointer types - get the pointee type name
-            if (obj_type->kind() == Cryo::TypeKind::Pointer)
+            else if (obj_type->kind() == Cryo::TypeKind::Pointer)
             {
                 auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
                 if (ptr_type && ptr_type->pointee().is_valid())
@@ -4010,6 +4252,40 @@ namespace Cryo::Codegen
                 if (it != var_types.end() && it->second.is_valid())
                 {
                     type_name = it->second->display_name();
+                    // Handle InstantiatedType
+                    if (it->second->kind() == Cryo::TypeKind::InstantiatedType)
+                    {
+                        auto *inst = static_cast<const Cryo::InstantiatedType *>(it->second.get());
+                        if (inst->has_resolved_type())
+                        {
+                            type_name = inst->resolved_type()->display_name();
+                        }
+                        else if (inst->generic_base().is_valid())
+                        {
+                            std::string base = inst->generic_base()->display_name();
+                            std::string mangled = base;
+                            const auto &args = inst->type_args();
+                            if (!args.empty())
+                            {
+                                mangled += "_";
+                                for (size_t i = 0; i < args.size(); ++i)
+                                {
+                                    if (i > 0) mangled += "_";
+                                    if (args[i].is_valid())
+                                    {
+                                        std::string arg_name = args[i]->display_name();
+                                        std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                                        std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                                        std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                                        std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                                        std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                                        mangled += arg_name;
+                                    }
+                                }
+                            }
+                            type_name = mangled;
+                        }
+                    }
                     if (!type_name.empty() && type_name.back() == '*')
                     {
                         type_name.pop_back();

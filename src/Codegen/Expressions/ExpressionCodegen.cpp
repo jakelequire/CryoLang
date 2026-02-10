@@ -2862,7 +2862,41 @@ namespace Cryo::Codegen
                     if (outer_obj_type)
                     {
                         outer_type_name = outer_obj_type->display_name();
-                        if (outer_obj_type->kind() == Cryo::TypeKind::Pointer)
+                        // Handle InstantiatedType - use monomorphized name
+                        if (outer_obj_type->kind() == Cryo::TypeKind::InstantiatedType)
+                        {
+                            auto *inst = static_cast<const Cryo::InstantiatedType *>(outer_obj_type.get());
+                            if (inst->has_resolved_type())
+                            {
+                                outer_type_name = inst->resolved_type()->display_name();
+                            }
+                            else if (inst->generic_base().is_valid())
+                            {
+                                std::string base = inst->generic_base()->display_name();
+                                std::string mangled = base;
+                                const auto &args = inst->type_args();
+                                if (!args.empty())
+                                {
+                                    mangled += "_";
+                                    for (size_t i = 0; i < args.size(); ++i)
+                                    {
+                                        if (i > 0) mangled += "_";
+                                        if (args[i].is_valid())
+                                        {
+                                            std::string arg_name = args[i]->display_name();
+                                            std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                                            std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                                            std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                                            std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                                            std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                                            mangled += arg_name;
+                                        }
+                                    }
+                                }
+                                outer_type_name = mangled;
+                            }
+                        }
+                        else if (outer_obj_type->kind() == Cryo::TypeKind::Pointer)
                         {
                             auto *ptr = dynamic_cast<const Cryo::PointerType *>(outer_obj_type.get());
                             if (ptr && ptr->pointee())
@@ -2890,7 +2924,41 @@ namespace Cryo::Codegen
                         if (it != var_types.end() && it->second.is_valid())
                         {
                             outer_type_name = it->second->display_name();
-                            if (it->second->kind() == Cryo::TypeKind::Pointer)
+                            // Handle InstantiatedType - use monomorphized name
+                            if (it->second->kind() == Cryo::TypeKind::InstantiatedType)
+                            {
+                                auto *inst = static_cast<const Cryo::InstantiatedType *>(it->second.get());
+                                if (inst->has_resolved_type())
+                                {
+                                    outer_type_name = inst->resolved_type()->display_name();
+                                }
+                                else if (inst->generic_base().is_valid())
+                                {
+                                    std::string base = inst->generic_base()->display_name();
+                                    std::string mangled = base;
+                                    const auto &args = inst->type_args();
+                                    if (!args.empty())
+                                    {
+                                        mangled += "_";
+                                        for (size_t i = 0; i < args.size(); ++i)
+                                        {
+                                            if (i > 0) mangled += "_";
+                                            if (args[i].is_valid())
+                                            {
+                                                std::string arg_name = args[i]->display_name();
+                                                std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                                                std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                                                std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                                                std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                                                std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                                                mangled += arg_name;
+                                            }
+                                        }
+                                    }
+                                    outer_type_name = mangled;
+                                }
+                            }
+                            else if (it->second->kind() == Cryo::TypeKind::Pointer)
                             {
                                 auto *ptr = dynamic_cast<const Cryo::PointerType *>(it->second.get());
                                 if (ptr && ptr->pointee())
@@ -3178,6 +3246,47 @@ namespace Cryo::Codegen
 
         // Get type name (handle pointer types)
         std::string type_name = obj_type.get()->display_name();
+
+        // Handle InstantiatedType - use the monomorphized name
+        // This ensures we get "KV_i32_i32" instead of "KV<i32, i32>" which
+        // would mangle incorrectly (double underscores from ", " separator)
+        if (obj_type->kind() == Cryo::TypeKind::InstantiatedType)
+        {
+            auto *inst_type = static_cast<const Cryo::InstantiatedType *>(obj_type.get());
+            if (inst_type->has_resolved_type())
+            {
+                type_name = inst_type->resolved_type()->display_name();
+            }
+            else if (inst_type->generic_base().is_valid())
+            {
+                // Construct mangled name from base + type args (same as mangle_type_name)
+                std::string base = inst_type->generic_base()->display_name();
+                std::string mangled = base;
+                const auto &args = inst_type->type_args();
+                if (!args.empty())
+                {
+                    mangled += "_";
+                    for (size_t i = 0; i < args.size(); ++i)
+                    {
+                        if (i > 0) mangled += "_";
+                        if (args[i].is_valid())
+                        {
+                            std::string arg_name = args[i]->display_name();
+                            std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                            std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                            std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                            std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                            std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                            mangled += arg_name;
+                        }
+                    }
+                }
+                type_name = mangled;
+            }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_member_info: Using InstantiatedType name: {} -> {}",
+                      obj_type->display_name(), type_name);
+        }
 
         // Handle pointer/reference types - get the underlying type name
         if (obj_type->kind() == Cryo::TypeKind::Pointer)

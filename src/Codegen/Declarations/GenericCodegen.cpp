@@ -235,9 +235,10 @@ namespace Cryo::Codegen
                     field_names.push_back(field->name());
 
                     // Collect TypeRef for TemplateRegistry
-                    // If using specialized AST, types are already substituted
+                    // Always apply substitution - specialized AST may still have compound
+                    // generic types like Inner<T> that need T substituted to concrete args
                     TypeRef field_type = field->get_resolved_type();
-                    TypeRef final_type = using_specialized_ast ? field_type : substitute_type_params(field_type);
+                    TypeRef final_type = substitute_type_params(field_type);
                     substituted_field_types.push_back(final_type.is_valid() ? final_type : TypeRef{});
                 }
             }
@@ -276,9 +277,10 @@ namespace Cryo::Codegen
                     field_names.push_back(field->name());
 
                     // Collect TypeRef for TemplateRegistry
-                    // If using specialized AST, types are already substituted
+                    // Always apply substitution - specialized AST may still have compound
+                    // generic types like Inner<T> that need T substituted to concrete args
                     TypeRef field_type = field->get_resolved_type();
-                    TypeRef final_type = using_specialized_ast ? field_type : substitute_type_params(field_type);
+                    TypeRef final_type = substitute_type_params(field_type);
                     substituted_field_types.push_back(final_type.is_valid() ? final_type : TypeRef{});
                 }
 
@@ -1942,12 +1944,98 @@ namespace Cryo::Codegen
             mangled,
             module());
 
+        // Set parameter names from AST
+        {
+            const auto &ast_params = func_decl->parameters();
+            unsigned idx = 0;
+            for (auto &arg : fn->args())
+            {
+                if (idx < ast_params.size())
+                {
+                    arg.setName(ast_params[idx]->name());
+                }
+                idx++;
+            }
+        }
+
         // Generate body if available
         if (func_decl->body() && _declarations)
         {
-            // The body generation would need to use substituted types
-            // For now, we just create the declaration
-            // Full body generation would be handled by DeclarationCodegen
+            // Save caller's state (we may be called during another function's codegen)
+            llvm::BasicBlock *saved_block = builder().GetInsertBlock();
+            auto saved_fn_ctx = ctx().release_current_function();
+
+            // Create entry block
+            llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+            builder().SetInsertPoint(entry);
+
+            // Set up function context
+            auto fn_ctx = std::make_unique<FunctionContext>(fn, func_decl);
+            fn_ctx->entry_block = entry;
+            ctx().set_current_function(std::move(fn_ctx));
+
+            // Enter function scope
+            values().enter_scope(fn->getName().str());
+
+            // Allocate parameters
+            const auto &ast_params = func_decl->parameters();
+            unsigned param_idx = 0;
+            for (auto &arg : fn->args())
+            {
+                std::string param_name = arg.getName().str();
+                llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
+                create_store(&arg, alloca);
+                values().set_value(param_name, nullptr, alloca);
+
+                if (param_idx < ast_params.size())
+                {
+                    TypeRef param_type = ast_params[param_idx]->get_resolved_type();
+                    TypeRef substituted = substitute_type_params(param_type);
+                    if (substituted.is_valid())
+                    {
+                        ctx().variable_types_map()[param_name] = substituted;
+                    }
+                }
+                param_idx++;
+            }
+
+            // Generate function body
+            CodegenVisitor *visitor = ctx().visitor();
+            if (visitor && func_decl->body())
+            {
+                func_decl->body()->accept(*visitor);
+            }
+
+            // Add implicit return if needed
+            llvm::BasicBlock *current_block = builder().GetInsertBlock();
+            if (current_block && !current_block->getTerminator())
+            {
+                if (fn->getReturnType()->isVoidTy())
+                {
+                    builder().CreateRetVoid();
+                }
+                else
+                {
+                    builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+                }
+            }
+
+            // Verify function
+            if (llvm::verifyFunction(*fn, &llvm::errs()))
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "Generic function verification failed: {}", mangled);
+            }
+
+            // Exit function scope
+            values().exit_scope();
+            ctx().clear_current_function();
+
+            // Restore caller's state
+            if (saved_fn_ctx)
+                ctx().set_current_function(std::move(saved_fn_ctx));
+            if (saved_block)
+                builder().SetInsertPoint(saved_block);
         }
 
         // End substitution scope
@@ -2611,9 +2699,16 @@ namespace Cryo::Codegen
             if (!field)
                 continue;
 
-            // For specialized AST, types are already concrete (T -> Token)
-            // No substitution needed
+            // For specialized AST, types should already be concrete (T -> Token).
+            // However, compound generic types (e.g., Inner<T>) may not be fully
+            // substituted by the ASTTypeSubstituter. Apply substitution as fallback.
             TypeRef field_type = field->get_resolved_type();
+
+            // If the field type still contains generic params (e.g., Inner<T> when
+            // specializing Outer<i32>), apply type param substitution to resolve them.
+            TypeRef substituted = substitute_type_params(field_type);
+            if (substituted.is_valid())
+                field_type = substituted;
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "create_fields_from_specialized: Field '{}' has concrete type '{}'",
