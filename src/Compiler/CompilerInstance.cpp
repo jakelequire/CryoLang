@@ -2217,7 +2217,11 @@ namespace Cryo
             // Only process the function body in this second pass
             if (func_decl->body())
             {
+                // Enter a new scope for this function's local variables so that
+                // identically-named locals in different functions don't collide.
+                current_scope->enter_scope(func_decl->name());
                 populate_symbol_table_with_scope(func_decl->body(), current_scope, func_decl->name());
+                current_scope->exit_scope();
             }
         }
         // Handle intrinsic function declarations - skip, already processed in first pass
