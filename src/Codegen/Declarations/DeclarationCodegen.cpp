@@ -230,6 +230,11 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "DeclarationCodegen: Skipping generic function '{}' - has {} generic type parameters",
                       node->name(), node->generic_parameters().size());
+            // Register in GenericCodegen so it can be instantiated later
+            if (_generics)
+            {
+                _generics->register_generic_function(node->name(), node);
+            }
             return nullptr;
         }
 

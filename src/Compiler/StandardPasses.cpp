@@ -1925,11 +1925,22 @@ namespace Cryo
         if (!expr)
             return;
 
+        LOG_DEBUG(LogComponent::GENERAL,
+                  "GenericExpressionResolutionPass::resolve_expression: kind={}, expected_type='{}'",
+                  static_cast<int>(expr->kind()),
+                  expected_type.is_valid() ? expected_type->display_name() : "none");
+
         switch (expr->kind())
         {
         case NodeKind::ScopeResolution:
         {
             auto *scope_res = static_cast<ScopeResolutionNode *>(expr);
+
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "GenericExpressionResolutionPass: ScopeRes '{}::{}', has_resolved_type={}, expected_type='{}'",
+                      scope_res->scope_name(), scope_res->member_name(),
+                      scope_res->has_resolved_type(),
+                      expected_type.is_valid() ? expected_type->display_name() : "none");
 
             // Skip if already resolved
             if (scope_res->has_resolved_type())
@@ -1970,6 +1981,11 @@ namespace Cryo
             // or a generic static method call like Array<String>::new()
             if (auto *scope_res = dynamic_cast<ScopeResolutionNode *>(call->callee()))
             {
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "GenericExpressionResolutionPass: CallExpr callee ScopeRes '{}::{}', has_resolved_type={}, call has_resolved_type={}",
+                          scope_res->scope_name(), scope_res->member_name(),
+                          scope_res->has_resolved_type(), call->has_resolved_type());
+
                 if (!scope_res->has_resolved_type())
                 {
                     // First try to resolve as generic enum variant
@@ -2471,6 +2487,12 @@ namespace Cryo
         TypeRef expected_type,
         PassContext &ctx)
     {
+        LOG_DEBUG(LogComponent::GENERAL,
+                  "resolve_generic_enum_variant: scope='{}', member='{}', expected_type kind={}, name='{}'",
+                  scope_name, member_name,
+                  expected_type.is_valid() ? static_cast<int>(expected_type->kind()) : -1,
+                  expected_type.is_valid() ? expected_type->display_name() : "invalid");
+
         if (!expected_type.is_valid())
             return TypeRef{};
 
@@ -2571,7 +2593,9 @@ namespace Cryo
         if (base_type->kind() == TypeKind::Enum)
         {
             auto *base_enum = static_cast<const EnumType *>(base_type.get());
-            if (!base_enum->get_variant(member_name))
+            // Only validate variants if the base enum has them populated.
+            // Generic enum bases may have 0 variants (not yet populated with concrete types).
+            if (base_enum->variant_count() > 0 && !base_enum->get_variant(member_name))
             {
                 // Not a valid variant
                 return TypeRef{};

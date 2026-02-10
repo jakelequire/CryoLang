@@ -748,6 +748,17 @@ namespace Cryo::Codegen
             return;
         }
 
+        // If match_value is an alloca storing a pointer (e.g., from match (&this)
+        // where this is a reference parameter), load the pointer to get the
+        // actual struct pointer for pattern matching.
+        if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(match_value))
+        {
+            if (alloca->getAllocatedType()->isPointerTy())
+            {
+                match_value = builder().CreateLoad(alloca->getAllocatedType(), match_value, "match.ptr.load");
+            }
+        }
+
         // Create end block
         llvm::BasicBlock *end_block = create_block("match.end", function);
 
@@ -961,6 +972,40 @@ namespace Cryo::Codegen
                 enum_name + "::" + variant_name,
                 variant_name,
                 enum_pattern->enum_name() + "::" + variant_name};
+
+            // For monomorphized generic enums, also try the LLVM struct type name
+            // (e.g., Maybe_i32::Just when pattern says Maybe::Just)
+            if (value->getType()->isStructTy())
+            {
+                std::string llvm_name = llvm::cast<llvm::StructType>(value->getType())->getName().str();
+                variant_candidates.push_back(llvm_name + "::" + variant_name);
+            }
+            else if (value->getType()->isPointerTy())
+            {
+                // For pointer values, check if we can find a monomorphized name
+                // by searching for enum_name + "_" prefix in variants map
+                auto &vm = ctx().enum_variants_map();
+                for (const auto &entry : vm)
+                {
+                    const std::string &key = entry.first;
+                    // Match pattern: {enum_name}_{type}::{variant_name}
+                    if (key.size() > enum_name.size() + 2 + variant_name.size() &&
+                        key.substr(0, enum_name.size()) == enum_name &&
+                        key[enum_name.size()] == '_' &&
+                        key.substr(key.size() - variant_name.size() - 2) == "::" + variant_name)
+                    {
+                        variant_candidates.push_back(key);
+                        // Also update enum_name to the monomorphized name for struct type lookup later
+                        // e.g., "Maybe_i32::Just" -> "Maybe_i32"
+                        size_t colon_pos = key.rfind("::");
+                        if (colon_pos != std::string::npos)
+                        {
+                            enum_name = key.substr(0, colon_pos);
+                        }
+                        break;
+                    }
+                }
+            }
 
             // Look up the expected discriminant value
             llvm::Value *expected_discriminant = nullptr;

@@ -2254,13 +2254,16 @@ namespace Cryo
             bool success = current_scope->declare_symbol(var_decl->name(), SymbolKind::Variable,
                                                          var_decl->location(), var_type, scope_name);
 
-            if (!success)
+            if (!success && scope_name != "Global")
             {
+                // Only emit duplicate errors for local scopes, not global scope
+                // (global scope gets processed multiple times by different passes)
                 if (_diagnostics)
                 {
+                    std::string err_msg = "variable '" + var_decl->name() + "' is already declared in this scope" +
+                                          "Declared in scope: " + scope_name;
                     _diagnostics->emit(
-                        Diag::error(ErrorCode::E0205_REDEFINED_SYMBOL,
-                                    "variable '" + var_decl->name() + "' is already declared in this scope")
+                        Diag::error(ErrorCode::E0205_REDEFINED_SYMBOL, err_msg)
                             .at(var_decl));
                 }
             }
