@@ -17,6 +17,7 @@ class ExpectResult(Enum):
 class CompileMode(Enum):
     RAW = "raw"
     STDLIB = "stdlib"
+    PROJECT = "project"
 
 
 class TestVerdict(Enum):
@@ -55,6 +56,7 @@ class TestCase:
     source_path: Path
     metadata: TestMetadata
     category: str = ""
+    project_dir: Optional[Path] = None
 
 
 @dataclass
