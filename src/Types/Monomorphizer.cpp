@@ -455,15 +455,16 @@ namespace Cryo
             {
                 TypeRef field_type;
 
-                // First try to get the resolved type from the field
-                if (field->has_resolved_type())
-                {
-                    field_type = field->get_resolved_type();
-                }
-                // Otherwise, try to resolve from type annotation
-                else if (field->has_type_annotation())
+                // Try annotation-based substitution first for generic type params,
+                // since resolved types may have different TypeIDs than the template params
+                if (field->has_type_annotation())
                 {
                     std::string type_name = field->type_annotation()->name;
+
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "Monomorphizer::create_concrete_struct: field '{}' annotation name='{}', kind={}, type_params=[{}]",
+                              field->name(), type_name, static_cast<int>(field->type_annotation()->kind),
+                              [&]() { std::string s; for (size_t j = 0; j < type_params.size(); ++j) { if (j) s += ", "; s += type_params[j]; } return s; }());
 
                     // Check if it's a type parameter that needs substitution
                     for (size_t i = 0; i < type_params.size(); ++i)
@@ -475,15 +476,84 @@ namespace Cryo
                         }
                     }
 
-                    // If not a type param, try to look it up as a named type
+                    // If not a type param, try resolved type or name lookup
                     if (!field_type.is_valid())
                     {
-                        field_type = _arena.lookup_type_by_name(type_name);
+                        if (field->has_resolved_type())
+                        {
+                            field_type = field->get_resolved_type();
+                        }
+                        else
+                        {
+                            field_type = _arena.lookup_type_by_name(type_name);
+                        }
+                    }
+                }
+                // Fallback to resolved type if no annotation
+                else if (field->has_resolved_type())
+                {
+                    field_type = field->get_resolved_type();
+
+                    // If the resolved type is a GenericParam, substitute by name
+                    // (TypeID-based substitution may fail due to ID mismatch between passes)
+                    if (field_type->kind() == TypeKind::GenericParam)
+                    {
+                        auto *gp = static_cast<const GenericParamType *>(field_type.get());
+                        for (size_t i = 0; i < type_params.size(); ++i)
+                        {
+                            if (gp->param_name() == type_params[i] && i < type_args.size())
+                            {
+                                field_type = type_args[i];
+                                break;
+                            }
+                        }
                     }
                 }
 
                 if (field_type.is_valid())
                 {
+                    // Handle InstantiatedType fields (e.g., Inner<T>) where generic param
+                    // TypeIDs may differ between templates. The T in Inner<T> resolved to
+                    // Inner's own GenericParam TypeID, but the substitution map uses Outer's
+                    // TypeID. Substitute by name before applying the TypeID-based substitution.
+                    if (field_type->kind() == TypeKind::InstantiatedType)
+                    {
+                        auto *inst = static_cast<const InstantiatedType *>(field_type.get());
+                        std::vector<TypeRef> new_args;
+                        bool args_changed = false;
+
+                        for (const auto &arg : inst->type_args())
+                        {
+                            if (arg->kind() == TypeKind::GenericParam)
+                            {
+                                auto *gp = static_cast<const GenericParamType *>(arg.get());
+                                bool found = false;
+                                for (size_t j = 0; j < type_params.size(); ++j)
+                                {
+                                    if (gp->param_name() == type_params[j] && j < type_args.size())
+                                    {
+                                        new_args.push_back(type_args[j]);
+                                        args_changed = true;
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (!found)
+                                    new_args.push_back(arg);
+                            }
+                            else
+                            {
+                                new_args.push_back(arg);
+                            }
+                        }
+
+                        if (args_changed)
+                        {
+                            field_type = _arena.create_instantiation(inst->generic_base(), std::move(new_args));
+                            _arena.register_instantiated_by_name(field_type);
+                        }
+                    }
+
                     // Apply substitution in case it's a compound type with generic params
                     TypeRef substituted = subst.apply(field_type, _arena);
 
