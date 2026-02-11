@@ -1048,7 +1048,36 @@ namespace Cryo::Codegen
                 return CallKind::FreeFunction;
             }
 
-            // Object is not a simple identifier - likely an instance method
+            // Object is not a simple identifier - check if it's a qualified enum type name
+            // e.g., Shapes::Shape in Shapes::Shape::Circle(5)
+            {
+                std::string obj_qualified = extract_function_name(member->object());
+                if (!obj_qualified.empty())
+                {
+                    if (is_enum_type(obj_qualified))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "classify_call: Qualified '{}' is an enum type, returning EnumVariant", obj_qualified);
+                        return CallKind::EnumVariant;
+                    }
+
+                    // Also try the last segment (e.g., "Shape" from "Shapes::Shape")
+                    size_t last_sep = obj_qualified.rfind("::");
+                    if (last_sep != std::string::npos)
+                    {
+                        std::string simple_name = obj_qualified.substr(last_sep + 2);
+                        if (is_enum_type(simple_name))
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "classify_call: Qualified '{}' -> simple '{}' is an enum type, returning EnumVariant",
+                                      obj_qualified, simple_name);
+                            return CallKind::EnumVariant;
+                        }
+                    }
+                }
+            }
+
+            // Fallback: likely an instance method
             return CallKind::InstanceMethod;
         }
 
@@ -1844,6 +1873,16 @@ namespace Cryo::Codegen
         {
             // Fallback to base name (e.g., Option::Some)
             ctor = module()->getFunction(base_qualified_variant);
+        }
+        if (!ctor)
+        {
+            // Fallback: strip namespace prefix (e.g., "Shapes::Shape::Circle" -> "Shape::Circle")
+            size_t last_sep = resolved_enum_name.rfind("::");
+            if (last_sep != std::string::npos)
+            {
+                std::string short_name = resolved_enum_name.substr(last_sep + 2) + "::" + variant_name;
+                ctor = module()->getFunction(short_name);
+            }
         }
         if (ctor)
         {

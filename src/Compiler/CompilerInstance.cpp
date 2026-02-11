@@ -647,6 +647,14 @@ namespace Cryo
                         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Synced imported namespace to codegen SRM: '{}'", ns);
                     }
                     LOG_DEBUG(Cryo::LogComponent::GENERAL, "Synced {} imported namespaces to codegen SRM", imported_namespaces.size());
+
+                    // Sync namespace aliases (e.g., U -> Utils from "import Utils as U")
+                    const auto &aliases = compiler_srm_ctx->get_namespace_aliases();
+                    for (const auto &[alias, target] : aliases)
+                    {
+                        codegen_srm_ctx->register_namespace_alias(alias, target);
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL, "Synced namespace alias to codegen SRM: '{}' -> '{}'", alias, target);
+                    }
                 }
             }
 

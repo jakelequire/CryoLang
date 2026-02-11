@@ -4956,17 +4956,21 @@ namespace Cryo::Codegen
             if (llvm::Function *fn = module()->getFunction(name))
                 return fn;
 
-            // Try as global variable
+            // Try as global variable (load the value from the pointer)
             if (llvm::GlobalVariable *global = module()->getGlobalVariable(name))
-                return global;
+                return builder().CreateLoad(global->getValueType(), global, name + ".val");
 
             // Try context function registry
             if (llvm::Function *fn = ctx().get_function(name))
                 return fn;
 
-            // Try as global value (module-level constants)
+            // Try as global value (module-level constants — load the value)
             if (llvm::Value *val = values().get_global_value(name))
+            {
+                if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(val))
+                    return builder().CreateLoad(global->getValueType(), global, name + ".val");
                 return val;
+            }
 
             // Try as enum variant
             auto &enum_variants = ctx().enum_variants_map();
