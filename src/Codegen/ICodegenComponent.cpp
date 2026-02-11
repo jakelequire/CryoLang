@@ -143,6 +143,10 @@ namespace Cryo::Codegen
         }
 
         // For each type candidate, try to find the method
+        // Prefer definitions (functions with bodies) over declarations to avoid
+        // picking up forward declarations with the wrong qualified name (e.g., Main::Buz::new)
+        // when the actual definition has a different prefix (e.g., Baz::Qix::Buz::new).
+        llvm::Function *declaration_fallback = nullptr;
         for (const auto &type_candidate : type_candidates)
         {
             // Build qualified method name: Type::method
@@ -154,19 +158,30 @@ namespace Cryo::Codegen
             // Try LLVM module
             if (llvm::Function *fn = module()->getFunction(qualified_method))
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "resolve_method_by_name: Found '{}.{}' as '{}'",
-                          type_name, method_name, qualified_method);
-                return fn;
+                if (!fn->isDeclaration())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found definition '{}.{}' as '{}'",
+                              type_name, method_name, qualified_method);
+                    return fn;
+                }
+                // Remember declaration as fallback but keep looking for a definition
+                if (!declaration_fallback)
+                    declaration_fallback = fn;
             }
 
             // Try context's function registry
             if (llvm::Function *fn = ctx().get_function(qualified_method))
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "resolve_method_by_name: Found '{}.{}' in registry as '{}'",
-                          type_name, method_name, qualified_method);
-                return fn;
+                if (!fn->isDeclaration())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found definition '{}.{}' in registry as '{}'",
+                              type_name, method_name, qualified_method);
+                    return fn;
+                }
+                if (!declaration_fallback)
+                    declaration_fallback = fn;
             }
         }
 
@@ -1239,6 +1254,15 @@ namespace Cryo::Codegen
 
                 return fn;
             }
+        }
+
+        // If we found a declaration (but no definition) during SRM lookup, return it as fallback
+        if (declaration_fallback)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_method_by_name: Returning declaration fallback for '{}.{}'",
+                      type_name, method_name);
+            return declaration_fallback;
         }
 
         // Final diagnostic: list all functions in module containing the method name
