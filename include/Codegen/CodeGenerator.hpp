@@ -101,6 +101,19 @@ namespace Cryo::Codegen
         bool generate_ir(Cryo::ProgramNode *program_node);
 
         /**
+         * @brief Generate LLVM IR for an imported module's AST
+         *
+         * Called after generate_ir() for the main program. Visits the imported
+         * AST to generate function bodies and struct methods into the same
+         * LLVM module. Types and forward declarations should already exist.
+         *
+         * @param program_node Root AST node of the imported module
+         * @param module_namespace Namespace of the imported module (e.g., "Foo" or "Baz::Qix")
+         * @return Success status
+         */
+        bool generate_imported_ir(Cryo::ProgramNode *program_node, const std::string &module_namespace = "");
+
+        /**
          * @brief Generate optimized LLVM IR
          * @param optimization_level Optimization level (0-3)
          * @return Success status

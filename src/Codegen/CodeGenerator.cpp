@@ -124,6 +124,44 @@ namespace Cryo::Codegen
         }
     }
 
+    bool CodeGenerator::generate_imported_ir(ProgramNode *program, const std::string &module_namespace)
+    {
+        if (!program || !_visitor)
+        {
+            report_error("Cannot generate imported IR: null program or visitor not initialized");
+            return false;
+        }
+
+        try
+        {
+            // Save and set namespace context for the imported module.
+            // The multi-pass visitor processes namespace declarations in Pass 4, but
+            // struct types and method bodies need the correct namespace in Pass 1/3.
+            std::string saved_source_file = _pending_source_file;
+            std::string saved_namespace = _pending_namespace_context;
+
+            if (!module_namespace.empty())
+            {
+                _visitor->set_source_info(_pending_source_file, module_namespace);
+            }
+
+            // Visit the imported AST to generate function bodies and struct methods.
+            // Types and forward declarations should already exist from earlier passes.
+            program->accept(*_visitor);
+
+            // Restore the main module's namespace context
+            _visitor->set_source_info(saved_source_file, saved_namespace);
+
+            // Re-validate after adding new function bodies
+            return finalize_ir();
+        }
+        catch (const std::exception &e)
+        {
+            report_error(std::string("Imported IR generation failed: ") + e.what());
+            return false;
+        }
+    }
+
     llvm::Module *CodeGenerator::get_module() const
     {
         return _context_manager ? _context_manager->get_module() : nullptr;

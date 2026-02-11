@@ -4311,6 +4311,40 @@ namespace Cryo::Codegen
             }
         }
 
+        // Fallback: if the node has explicit generic args (e.g., Stack<int> { ... }),
+        // build the mangled name from the base type + resolved generic args
+        if ((!struct_type || !struct_type->isStructTy()) && !node->generic_args().empty())
+        {
+            std::string mangled = node->struct_type() + "_";
+            for (size_t i = 0; i < node->generic_args().size(); ++i)
+            {
+                if (i > 0)
+                    mangled += "_";
+                std::string arg_name = node->generic_args()[i];
+                // Resolve common type aliases (parser stores "int" but LLVM uses "i32")
+                auto &arena = ctx().symbols().arena();
+                TypeRef arg_type = arena.lookup_type_by_name(arg_name);
+                if (arg_type.is_valid())
+                    arg_name = arg_type->display_name();
+                // Replace problematic characters for nested generics
+                std::replace(arg_name.begin(), arg_name.end(), '<', '_');
+                std::replace(arg_name.begin(), arg_name.end(), '>', '_');
+                std::replace(arg_name.begin(), arg_name.end(), ',', '_');
+                std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
+                std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                mangled += arg_name;
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_struct_literal: Trying mangled generic name '{}' for '{}'",
+                      mangled, node->struct_type());
+            struct_type = ctx().get_type(mangled);
+            if (!struct_type)
+                struct_type = llvm::StructType::getTypeByName(llvm_ctx(), mangled);
+            if (struct_type && struct_type->isStructTy())
+                type_name = mangled;
+        }
+
         if (!struct_type || !struct_type->isStructTy())
         {
             report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,

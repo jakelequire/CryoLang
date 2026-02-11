@@ -1267,6 +1267,32 @@ namespace Cryo::Codegen
             ctx().register_type_namespace(mangled, base_namespace);
         }
 
+        // Ensure all type arguments that are themselves generic types are instantiated first.
+        // This is needed for nested generic enums (e.g., Maybe<Maybe<int>>) where the inner
+        // type (Maybe_i32) must exist as an LLVM type before the outer type's constructor
+        // can reference it as a parameter type.
+        for (const auto &arg : type_args)
+        {
+            if (arg.is_valid() && arg->kind() == Cryo::TypeKind::InstantiatedType)
+            {
+                auto *inst = static_cast<const Cryo::InstantiatedType *>(arg.get());
+                TypeRef base = inst->generic_base();
+                if (base.is_valid())
+                {
+                    std::string base_name = base->display_name();
+                    std::string arg_mangled = mangle_type_name(base_name, inst->type_args());
+                    if (!types().get_type(arg_mangled) &&
+                        !llvm::StructType::getTypeByName(llvm_ctx(), arg_mangled))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "GenericCodegen: Pre-instantiating nested type '{}' for enum '{}'",
+                                  arg_mangled, mangled);
+                        get_instantiated_type(base_name, inst->type_args());
+                    }
+                }
+            }
+        }
+
         // Register enum variants with instantiated names
         // This is CRITICAL for codegen to find Option_string::None, Option_string::Some, etc.
         int32_t index = 0;
@@ -1302,7 +1328,29 @@ namespace Cryo::Codegen
                     {
                         if (type_name == type_params[i] && i < type_args.size() && type_args[i].is_valid())
                         {
-                            substituted_name = type_args[i]->display_name();
+                            // For instantiated generic types (e.g., Maybe<i32>), use the
+                            // mangled name (e.g., Maybe_i32) that matches LLVM type registration.
+                            // display_name() returns "Maybe<i32>" but the LLVM type is "Maybe_i32".
+                            if (type_args[i]->kind() == Cryo::TypeKind::InstantiatedType)
+                            {
+                                auto *inst = static_cast<const Cryo::InstantiatedType *>(type_args[i].get());
+                                if (inst->has_resolved_type())
+                                {
+                                    substituted_name = inst->resolved_type()->display_name();
+                                }
+                                else
+                                {
+                                    TypeRef base = inst->generic_base();
+                                    if (base.is_valid())
+                                        substituted_name = mangle_type_name(base->display_name(), inst->type_args());
+                                    else
+                                        substituted_name = type_args[i]->display_name();
+                                }
+                            }
+                            else
+                            {
+                                substituted_name = type_args[i]->display_name();
+                            }
                             break;
                         }
                     }
@@ -1329,6 +1377,13 @@ namespace Cryo::Codegen
                     for (const auto &type_name : substituted_types)
                     {
                         llvm::Type *param_type = types().get_type(type_name);
+                        // Fallback: the type may not be in the CodegenContext registry yet
+                        // (e.g., nested generic enums instantiated out of order).
+                        // Try looking up the LLVM struct type directly from the LLVM context.
+                        if (!param_type)
+                        {
+                            param_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+                        }
                         if (!param_type)
                         {
                             LOG_WARN(Cryo::LogComponent::CODEGEN,

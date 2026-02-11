@@ -2223,6 +2223,124 @@ namespace Cryo
                               "GenericExpressionResolutionPass: Found static method '{}' with {} params",
                               qualified_name, param_types.size());
                 }
+
+                // If no function signature found in symbol table, try to derive param_types
+                // from enum variant payload types. This is needed for generic enum variant
+                // constructors like Maybe::Just(inner) where the argument type must be
+                // inferred from the resolved instantiation (e.g., Maybe<Maybe<int>>).
+                if (param_types.empty() && call->has_resolved_type())
+                {
+                    TypeRef call_resolved = call->get_resolved_type();
+                    std::string variant_name = scope_res_callee->member_name();
+
+                    // Path 1: Resolved type is already a concrete (monomorphized) enum
+                    if (call_resolved->kind() == TypeKind::Enum)
+                    {
+                        auto *enum_type = static_cast<const EnumType *>(call_resolved.get());
+                        const EnumVariant *variant = enum_type->get_variant(variant_name);
+                        if (variant && variant->has_payload())
+                        {
+                            param_types = variant->payload_types;
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                      "GenericExpressionResolutionPass: Derived {} param types from concrete enum variant '{}' on '{}'",
+                                      param_types.size(), variant_name, enum_type->display_name());
+                        }
+                    }
+                    // Path 2: Resolved type is an InstantiatedType (generic enum)
+                    else if (call_resolved->kind() == TypeKind::InstantiatedType)
+                    {
+                        auto *inst_type = static_cast<const InstantiatedType *>(call_resolved.get());
+
+                        // Try to get the concrete monomorphized enum type
+                        TypeRef concrete;
+                        if (inst_type->has_resolved_type() && inst_type->resolved_type()->kind() == TypeKind::Enum)
+                        {
+                            concrete = inst_type->resolved_type();
+                        }
+                        else
+                        {
+                            concrete = lookup_concrete_type(call_resolved, ctx);
+                        }
+
+                        if (concrete.is_valid() && concrete->kind() == TypeKind::Enum)
+                        {
+                            auto *enum_type = static_cast<const EnumType *>(concrete.get());
+                            const EnumVariant *variant = enum_type->get_variant(variant_name);
+                            if (variant && variant->has_payload())
+                            {
+                                param_types = variant->payload_types;
+                                LOG_DEBUG(LogComponent::GENERAL,
+                                          "GenericExpressionResolutionPass: Derived {} param types from monomorphized enum variant '{}' on '{}'",
+                                          param_types.size(), variant_name, enum_type->display_name());
+                            }
+                        }
+                        else
+                        {
+                            // Fallback: use AST enum declaration + type param substitution
+                            TypeRef base_type = inst_type->generic_base();
+                            if (base_type.is_valid())
+                            {
+                                auto *generics = _compiler.generic_registry();
+                                if (generics)
+                                {
+                                    auto tmpl_opt = generics->get_template(base_type);
+                                    if (!tmpl_opt.has_value())
+                                        tmpl_opt = generics->get_template_by_name(base_type->display_name());
+
+                                    if (tmpl_opt.has_value())
+                                    {
+                                        auto *enum_decl = tmpl_opt->ast_node
+                                                              ? dynamic_cast<EnumDeclarationNode *>(tmpl_opt->ast_node)
+                                                              : nullptr;
+                                        if (enum_decl)
+                                        {
+                                            // Build type param name -> type arg mapping
+                                            std::vector<std::string> type_param_names;
+                                            for (const auto &p : enum_decl->generic_parameters())
+                                                type_param_names.push_back(p->name());
+
+                                            const auto &type_args = inst_type->type_args();
+
+                                            // Find the matching variant and substitute payload types
+                                            for (const auto &v : enum_decl->variants())
+                                            {
+                                                if (v->name() == variant_name)
+                                                {
+                                                    for (const auto &assoc_type : v->associated_types())
+                                                    {
+                                                        TypeRef payload_type;
+                                                        // Check if it's a direct type parameter reference
+                                                        for (size_t j = 0; j < type_param_names.size(); ++j)
+                                                        {
+                                                            if (assoc_type == type_param_names[j] && j < type_args.size())
+                                                            {
+                                                                payload_type = type_args[j];
+                                                                break;
+                                                            }
+                                                        }
+                                                        // If not a type param, try to resolve as a named type
+                                                        if (!payload_type.is_valid())
+                                                            payload_type = _compiler.symbol_table()->arena().lookup_type_by_name(assoc_type);
+                                                        if (payload_type.is_valid())
+                                                            param_types.push_back(payload_type);
+                                                    }
+                                                    break;
+                                                }
+                                            }
+
+                                            if (!param_types.empty())
+                                            {
+                                                LOG_DEBUG(LogComponent::GENERAL,
+                                                          "GenericExpressionResolutionPass: Derived {} param types from AST for enum variant '{}' on '{}'",
+                                                          param_types.size(), variant_name, base_type->display_name());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Validate argument count against parameter count
@@ -2354,9 +2472,36 @@ namespace Cryo
             LOG_DEBUG(LogComponent::GENERAL,
                       "GenericExpressionResolutionPass: Processing struct literal for '{}'", struct_name);
 
+            // For generic struct literals (e.g., Stack<int> { ... }), set the resolved type
+            // from the expected type so codegen can find the correct monomorphized LLVM type.
+            if (!struct_lit->generic_args().empty() && expected_type.is_valid() && !struct_lit->has_resolved_type())
+            {
+                struct_lit->set_resolved_type(expected_type);
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "GenericExpressionResolutionPass: Set resolved type on generic struct literal '{}' from expected type '{}'",
+                          struct_name, expected_type->display_name());
+            }
+
             // Try to look up the struct type to get field types
             TypeRef struct_type_ref = _compiler.symbol_table()->lookup_struct_type(struct_name);
             const StructType *struct_type = nullptr;
+
+            // If direct lookup fails and we have an expected type, try using the concrete type
+            if ((!struct_type_ref.is_valid() || struct_type_ref->kind() != TypeKind::Struct) &&
+                expected_type.is_valid())
+            {
+                TypeRef concrete = expected_type;
+                if (concrete->kind() == TypeKind::InstantiatedType)
+                {
+                    auto *inst = static_cast<const InstantiatedType *>(concrete.get());
+                    if (inst->has_resolved_type())
+                        concrete = inst->resolved_type();
+                    else
+                        concrete = lookup_concrete_type(expected_type, ctx);
+                }
+                if (concrete.is_valid() && concrete->kind() == TypeKind::Struct)
+                    struct_type_ref = concrete;
+            }
 
             if (struct_type_ref.is_valid() && struct_type_ref->kind() == TypeKind::Struct)
             {
