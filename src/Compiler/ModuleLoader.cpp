@@ -12,6 +12,7 @@
 #include "Types/GenericTypes.hpp"
 #include "Diagnostics/Diag.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -182,6 +183,53 @@ namespace Cryo
         std::string import_path = import_node.path();
         std::string resolved_path = resolve_import_path(import_path);
 
+        // Fallback: treat last path segment as a specific symbol name
+        // e.g., "Baz::Qix::Buz" → load "Baz::Qix" module, filter to "Buz"
+        // Note: resolve_import_path may return a non-existent path as fallback,
+        // so we check file existence rather than just empty string.
+        if (!std::filesystem::exists(resolved_path) && import_path.find("::") != std::string::npos)
+        {
+            size_t last_sep = import_path.rfind("::");
+            std::string parent_path = import_path.substr(0, last_sep);
+            std::string symbol_name = import_path.substr(last_sep + 2);
+
+            std::string parent_resolved = resolve_import_path(parent_path);
+            if (std::filesystem::exists(parent_resolved))
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "ModuleLoader: Fallback - treating '{}' as specific symbol '{}' from module '{}'",
+                          import_path, symbol_name, parent_path);
+
+                // Check cache for parent module
+                auto cached = _loaded_modules.find(parent_resolved);
+                ImportResult result;
+                if (cached != _loaded_modules.end())
+                {
+                    result = cached->second;
+                }
+                else
+                {
+                    _loading_modules.insert(parent_resolved);
+                    result = load_module_from_file(parent_resolved, parent_path);
+                    _loading_modules.erase(parent_resolved);
+
+                    if (result.success)
+                    {
+                        // Cache the full parent module
+                        _loaded_modules[parent_resolved] = result;
+                    }
+                }
+
+                if (result.success)
+                {
+                    result.is_local_import = _last_resolve_was_local;
+                    result = filter_specific_imports(std::move(result), {symbol_name});
+                    result.resolved_as_specific = true;
+                }
+                return result;
+            }
+        }
+
         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Loading import '{}' -> '{}'", import_path, resolved_path);
         LOG_DEBUG(LogComponent::GENERAL, "=== IMPORT: Loading '{}' (resolved: '{}') ===", import_path, resolved_path);
 
@@ -252,6 +300,9 @@ namespace Cryo
         ImportResult result = load_module_from_file(resolved_path, import_path);
         _loading_modules.erase(resolved_path);
 
+        // Mark whether this is a local project import (not from stdlib)
+        result.is_local_import = _last_resolve_was_local;
+
         // Handle specific imports - distinguish between namespace aliases and symbol imports
         if (import_node.is_specific_import() && result.success)
         {
@@ -273,6 +324,7 @@ namespace Cryo
         // Create a copy for caching before returning
         ImportResult cache_copy;
         cache_copy.success = result.success;
+        cache_copy.is_local_import = result.is_local_import;
         cache_copy.error_message = result.error_message;
         cache_copy.module_name = result.module_name;
         cache_copy.namespace_alias = result.namespace_alias;
@@ -298,8 +350,47 @@ namespace Cryo
         }
 
         auto &os = Cryo::Utils::OS::instance();
-        std::string resolved = os.join_path(_stdlib_root, file_path);
-        return resolve_module_file_path(resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+        _last_resolve_was_local = false;
+
+        // 1. Try stdlib root first (standard library imports)
+        std::string stdlib_resolved = os.join_path(_stdlib_root, file_path);
+        std::string result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+        if (std::filesystem::exists(result))
+        {
+            _last_resolve_was_local = false;
+            return result;
+        }
+
+        // 2. Try current file's directory (local project imports)
+        if (!_current_file_dir.empty())
+        {
+            // Try exact case first (import Foo → Foo.cryo or Foo/_module.cryo)
+            std::string local_resolved = os.join_path(_current_file_dir, file_path);
+            result = resolve_module_file_path(local_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+            if (std::filesystem::exists(result))
+            {
+                _last_resolve_was_local = true;
+                return result;
+            }
+
+            // Try lowercase (import Foo → foo.cryo or foo/_module.cryo)
+            std::string lower_file_path = file_path;
+            std::transform(lower_file_path.begin(), lower_file_path.end(), lower_file_path.begin(), ::tolower);
+            if (lower_file_path != file_path)
+            {
+                local_resolved = os.join_path(_current_file_dir, lower_file_path);
+                result = resolve_module_file_path(local_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
+        }
+
+        // Fall back to stdlib path (will fail at load time with proper error)
+        _last_resolve_was_local = false;
+        return resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
     }
 
     std::string ModuleLoader::resolve_module_file_path(const std::string &module_path, ImportDeclarationNode::ImportStyle import_style)
@@ -361,6 +452,11 @@ namespace Cryo
         // This must be declared before try block so it's accessible in catch block.
         ModuleID saved_module = _symbol_table.current_module();
 
+        // Save and update _current_file_dir so that recursive imports (e.g., public module
+        // declarations in _module.cryo files) resolve relative to the imported file's directory.
+        std::string saved_file_dir = _current_file_dir;
+        _current_file_dir = get_parent_directory(file_path);
+
         try
         {
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Reading file {}", file_path);
@@ -369,6 +465,7 @@ namespace Cryo
             auto file = make_file_from_path(file_path);
             if (!file)
             {
+                _current_file_dir = saved_file_dir;
                 result.success = false;
                 result.error_message = "Failed to create File object for: " + file_path;
                 if (_diagnostics)
@@ -400,6 +497,7 @@ namespace Cryo
             {
                 // Restore module context before early return since Parser modified it
                 _symbol_table.set_current_module(saved_module);
+                _current_file_dir = saved_file_dir;
                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Restored current module context after parse failure (id={})", saved_module.id);
 
                 result.success = false;
@@ -475,6 +573,7 @@ namespace Cryo
             // This ensures the importing module's compilation continues with its own module ID,
             // not the imported module's ID.
             _symbol_table.set_current_module(saved_module);
+            _current_file_dir = saved_file_dir;
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Restored current module context (id={})", saved_module.id);
 
             result.success = true;
@@ -484,6 +583,7 @@ namespace Cryo
         {
             // Restore module context even on exception to maintain consistency
             _symbol_table.set_current_module(saved_module);
+            _current_file_dir = saved_file_dir;
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Restored current module context after exception (id={})", saved_module.id);
 
             result.success = false;
@@ -1392,6 +1492,17 @@ namespace Cryo
                 result.error_message = "Symbol '" + import_name + "' not found in module '" + result.module_name + "'";
                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Error - Symbol not found: {}", import_name);
                 return result;
+            }
+
+            // Also include methods of this type (TypeName::method patterns)
+            std::string prefix = import_name + "::";
+            for (const auto &[name, sym] : result.symbol_map)
+            {
+                if (name.size() > prefix.size() && name.compare(0, prefix.size(), prefix) == 0)
+                {
+                    filtered_symbol_map[name] = sym;
+                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Also included method symbol: {}", name);
+                }
             }
         }
 
