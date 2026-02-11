@@ -1690,6 +1690,16 @@ namespace Cryo
                         {
                             _symbol_resolution_manager->get_context()->add_imported_namespace(namespace_name);
                             LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added '{}' to SRM imported namespaces", namespace_name);
+
+                            // Register namespace alias so SRM can resolve U::add → Utils::add
+                            if (import_decl->has_alias())
+                            {
+                                _symbol_resolution_manager->get_context()->register_namespace_alias(
+                                    import_decl->alias(), import_decl->path());
+                                LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                          "Registered namespace alias '{}' -> '{}' in SRM",
+                                          import_decl->alias(), import_decl->path());
+                            }
                         }
 
                         // Note: TypeChecker doesn't have get_srm_context - SRM synchronization not available

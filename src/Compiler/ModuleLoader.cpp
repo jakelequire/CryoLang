@@ -569,6 +569,37 @@ namespace Cryo
             _imported_asts[result.module_name] = std::move(ast); // Move is necessary to transfer ownership
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Stored AST successfully. Map now has {} entries", _imported_asts.size());
 
+            // Recursively resolve this module's imports to detect transitive circular dependencies.
+            // The caller has already added our resolved_path to _loading_modules, so if any
+            // transitive dependency tries to import us again, has_circular_dependency() will fire.
+            {
+                auto *stored_ast = _imported_asts[result.module_name].get();
+                if (stored_ast)
+                {
+                    for (const auto &stmt : stored_ast->statements())
+                    {
+                        auto *import_decl = dynamic_cast<ImportDeclarationNode *>(stmt.get());
+                        if (!import_decl)
+                            continue;
+
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "ModuleLoader: Recursively resolving import '{}' from module '{}'",
+                                  import_decl->path(), result.module_name);
+
+                        auto sub_result = load_import(*import_decl);
+                        if (!sub_result.success)
+                        {
+                            // Propagate circular dependency or other import errors
+                            _symbol_table.set_current_module(saved_module);
+                            _current_file_dir = saved_file_dir;
+                            result.success = false;
+                            result.error_message = sub_result.error_message;
+                            return result;
+                        }
+                    }
+                }
+            }
+
             // CRITICAL: Restore the saved module context after import processing.
             // This ensures the importing module's compilation continues with its own module ID,
             // not the imported module's ID.
