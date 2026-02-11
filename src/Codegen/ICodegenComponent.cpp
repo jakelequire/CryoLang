@@ -1804,6 +1804,34 @@ namespace Cryo::Codegen
             mangled.pop_back();
         }
 
+        // Normalize user-facing type aliases to canonical names to match
+        // what the Monomorphizer generates (e.g., Entry_int -> Entry_i32).
+        // The Monomorphizer uses TypeRef::display_name() which returns canonical names.
+        auto normalize_suffix = [](std::string &s, const std::string &from, const std::string &to)
+        {
+            size_t pos = 0;
+            while ((pos = s.find(from, pos)) != std::string::npos)
+            {
+                // Only replace if it's a full segment (preceded by _ or start, followed by _ or end)
+                bool at_start = (pos == 0 || s[pos - 1] == '_');
+                bool at_end = (pos + from.size() == s.size() || s[pos + from.size()] == '_');
+                if (at_start && at_end)
+                {
+                    s.replace(pos, from.size(), to);
+                    pos += to.size();
+                }
+                else
+                {
+                    pos += from.size();
+                }
+            }
+        };
+        normalize_suffix(mangled, "int", "i32");
+        normalize_suffix(mangled, "uint", "u32");
+        normalize_suffix(mangled, "float", "f32");
+        normalize_suffix(mangled, "double", "f64");
+        normalize_suffix(mangled, "boolean", "bool");
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "mangle_generic_type_name: '{}' -> '{}'", display_name, mangled);
 

@@ -1135,7 +1135,7 @@ namespace Cryo
                 _template_registry->register_function_template(
                     func_decl->name(),
                     func_decl,
-                    "Main", // Use "Main" as the module name for local templates
+                    _current_namespace.empty() ? "Main" : _current_namespace,
                     ""      // No source file path for main file templates
                 );
                 LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic function template: {}", func_decl->name());
@@ -1246,7 +1246,7 @@ namespace Cryo
                 _template_registry->register_struct_template(
                     struct_decl->name(),
                     struct_decl,
-                    "Main", // Use "Main" as the module name for local templates
+                    _current_namespace.empty() ? "Main" : _current_namespace,
                     ""      // No source file path for main file templates
                 );
 
@@ -1332,7 +1332,7 @@ namespace Cryo
                 _template_registry->register_class_template(
                     class_decl->name(),
                     class_decl,
-                    "Main", // Use "Main" as the module name for local templates
+                    _current_namespace.empty() ? "Main" : _current_namespace,
                     ""      // No source file path for main file templates
                 );
 
@@ -1425,7 +1425,7 @@ namespace Cryo
                 _template_registry->register_enum_template(
                     enum_decl->name(),
                     enum_decl,
-                    "Main", // Use "Main" as the module name for local templates
+                    _current_namespace.empty() ? "Main" : _current_namespace,
                     ""      // No source file path for main file templates
                 );
 
@@ -1463,7 +1463,7 @@ namespace Cryo
                 _template_registry->register_trait_template(
                     trait_decl->name(),
                     trait_decl,
-                    "Main", // Use "Main" as the module name for local templates
+                    _current_namespace.empty() ? "Main" : _current_namespace,
                     ""      // No source file path for main file templates
                 );
                 LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic trait template: {}", trait_decl->name());
