@@ -1662,7 +1662,13 @@ namespace Cryo::Codegen
                 }
 
                 // Compute offset for next field based on field type size
-                size_t field_size = field_type ? ctx().types().size_of(field_type) : 8;
+                // Use module DataLayout directly (ctx().types().size_of() may return 0
+                // if the TypeMapper's module pointer is not set)
+                size_t field_size = 8; // default to pointer size
+                if (field_type && field_type->isSized())
+                {
+                    field_size = module()->getDataLayout().getTypeAllocSize(field_type);
+                }
                 offset += field_size;
                 payload_index++;
             }
@@ -1672,7 +1678,9 @@ namespace Cryo::Codegen
                 if (payload_index < payload_types.size())
                 {
                     llvm::Type *field_type = ctx().types().map(payload_types[payload_index]);
-                    offset += field_type ? ctx().types().size_of(field_type) : 8;
+                    offset += (field_type && field_type->isSized())
+                                  ? module()->getDataLayout().getTypeAllocSize(field_type)
+                                  : 8;
                 }
                 else
                 {

@@ -183,6 +183,41 @@ namespace Cryo
             return resolve_reference_type_string(name, ctx);
         }
 
+        // Check if the name is an array type (ends with ']')
+        // This handles types like "int[2]", "Entry<int>[2]", "u8[]"
+        if (!name.empty() && name.back() == ']')
+        {
+            size_t bracket_pos = name.rfind('[');
+            if (bracket_pos != std::string::npos)
+            {
+                std::string base_type_str = name.substr(0, bracket_pos);
+                std::string size_str = name.substr(bracket_pos + 1, name.size() - bracket_pos - 2);
+
+                LOG_DEBUG(LogComponent::GENERAL, "TypeResolver: Detected array type syntax in named type '{}': base='{}', size='{}'",
+                          name, base_type_str, size_str);
+
+                std::optional<size_t> array_size;
+                if (!size_str.empty())
+                {
+                    try
+                    {
+                        array_size = std::stoull(size_str);
+                    }
+                    catch (...)
+                    {
+                        return make_error("invalid array size in '" + name + "'", ctx.current_location);
+                    }
+                }
+
+                TypeRef base_type = resolve_named(base_type_str, ctx);
+                if (base_type.is_valid() && !base_type.is_error())
+                {
+                    return _arena.get_array_of(base_type, array_size);
+                }
+                return base_type; // propagate error
+            }
+        }
+
         // Check if the name contains generic syntax (e.g., "Option<Layout>")
         // This handles cases where the Parser stored the full type string as a Named annotation
         size_t angle_pos = name.find('<');
