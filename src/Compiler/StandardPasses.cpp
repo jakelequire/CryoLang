@@ -1663,12 +1663,40 @@ namespace Cryo
             const auto &arms = match_stmt->arms();
             if (arms.empty())
                 return false;
+
+            // Check all arms have return statements
             for (const auto &arm : arms)
             {
                 if (!statement_always_returns(arm->body()))
                     return false;
             }
-            return true;
+
+            // All arms return, but is the match exhaustive?
+            // Check for wildcard arm
+            for (const auto &arm : arms)
+            {
+                if (arm->pattern() && arm->pattern()->is_wildcard())
+                    return true;
+            }
+
+            // Check if matching on an enum - verify all variants are covered
+            ExpressionNode *match_expr = match_stmt->expr();
+            if (match_expr)
+            {
+                TypeRef match_type = match_expr->get_resolved_type();
+                if (match_type.is_valid() && match_type->kind() == TypeKind::Enum)
+                {
+                    auto *enum_type = static_cast<const EnumType *>(match_type.get());
+                    // Count total patterns (handles multi-pattern arms with '|')
+                    size_t total_patterns = 0;
+                    for (const auto &arm : arms)
+                        total_patterns += arm->patterns().size();
+                    return total_patterns >= enum_type->variant_count();
+                }
+            }
+
+            // Non-enum match without wildcard: can't prove exhaustiveness
+            return false;
         }
 
         default:
