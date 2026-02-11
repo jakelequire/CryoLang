@@ -2881,8 +2881,18 @@ namespace Cryo::Codegen
                     }
                 }
             }
+            else if (auto *member_access = dynamic_cast<Cryo::MemberAccessNode *>(array_access->array()))
+            {
+                // For member access arrays (e.g., this.data[i]), get the ADDRESS of the member
+                // field rather than its value. This gives us a pointer to the array field in
+                // the struct, which we can then GEP into for element access.
+                array_val = get_lvalue_address(member_access);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Got member address for array field '{}'",
+                          member_access->member());
+            }
 
-            // Fallback to generate_operand for non-identifiers or if alloca not found
+            // Fallback to generate_operand for other expressions or if above methods failed
             if (!array_val)
             {
                 array_val = generate_operand(array_access->array());

@@ -2496,8 +2496,10 @@ namespace Cryo::Codegen
 
             // Create blocks for this arm
             llvm::BasicBlock *arm_block = create_block("matchexpr.arm." + std::to_string(i), fn);
+            // For the last arm, create a separate "nomatch" block instead of using merge_block.
+            // This prevents merge_block from having a predecessor without a PHI entry.
             llvm::BasicBlock *next_test_block = is_last
-                                                    ? merge_block
+                                                    ? create_block("matchexpr.nomatch", fn)
                                                     : create_block("matchexpr.test." + std::to_string(i + 1), fn);
 
             builder().SetInsertPoint(current_test_block);
@@ -2599,6 +2601,13 @@ namespace Cryo::Codegen
             }
 
             current_test_block = next_test_block;
+        }
+
+        // Terminate the nomatch block (reached if no arm matched — unreachable in well-typed code)
+        if (current_test_block != merge_block && !current_test_block->getTerminator())
+        {
+            builder().SetInsertPoint(current_test_block);
+            builder().CreateUnreachable();
         }
 
         // Create PHI node to merge results
@@ -3038,6 +3047,52 @@ namespace Cryo::Codegen
                         {
                             // Get the field type from TemplateRegistry
                             TypeRef arr_obj_type = arr_member->object()->get_resolved_type();
+
+                            // Fallback: if resolved type not on AST node, check variable_types_map
+                            // This handles 'this' whose type is stored in the map, not on the node
+                            if (!arr_obj_type)
+                            {
+                                if (auto *arr_id = dynamic_cast<Cryo::IdentifierNode *>(arr_member->object()))
+                                {
+                                    auto &var_types = ctx().variable_types_map();
+                                    auto it = var_types.find(arr_id->name());
+                                    if (it != var_types.end() && it->second.is_valid())
+                                    {
+                                        arr_obj_type = it->second;
+                                    }
+                                }
+                            }
+
+                            // Fallback: use current_type_name (set during method codegen)
+                            if (!arr_obj_type)
+                            {
+                                const std::string &current_type = ctx().current_type_name();
+                                if (!current_type.empty())
+                                {
+                                    // Use current_type_name directly as the type name
+                                    // and skip to TemplateRegistry lookup
+                                    if (auto *template_reg = ctx().template_registry())
+                                    {
+                                        std::vector<std::string> candidates = {current_type};
+                                        if (!ctx().namespace_context().empty())
+                                            candidates.push_back(ctx().namespace_context() + "::" + current_type);
+
+                                        for (const auto &candidate : candidates)
+                                        {
+                                            const auto *field_info = template_reg->get_struct_field_types(candidate);
+                                            if (field_info && arr_field_idx < field_info->field_types.size())
+                                            {
+                                                array_type = field_info->field_types[arr_field_idx];
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_member_info: Resolved array field '{}' type to '{}' via current_type_name",
+                                                          arr_member->member(), array_type ? array_type->display_name() : "<null>");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             std::string arr_type_name;
 
                             if (arr_obj_type)
@@ -4384,6 +4439,18 @@ namespace Cryo::Codegen
         // IMPORTANT: Use field name lookup to get correct index, NOT positional index
         // Fields may be provided in any order (e.g., Point { y: 5, x: 10 })
         const auto &field_initializers = node->field_initializers();
+
+        // Validate that all fields are provided
+        unsigned expected_fields = st->getNumElements();
+        if (field_initializers.size() != expected_fields)
+        {
+            report_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION, node,
+                         "Wrong number of fields in struct literal '" + type_name +
+                             "': expected " + std::to_string(expected_fields) +
+                             " but got " + std::to_string(field_initializers.size()));
+            return nullptr;
+        }
+
         for (size_t i = 0; i < field_initializers.size(); ++i)
         {
             const auto &initializer = field_initializers[i];
