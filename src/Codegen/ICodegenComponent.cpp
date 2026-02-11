@@ -326,6 +326,26 @@ namespace Cryo::Codegen
                     return fn;
                 }
             }
+
+            // Direct lookup with simple type name: "SimpleType::method"
+            // Handles namespace-qualified calls (e.g., "Foo::Bar::print" → try "Bar::print")
+            std::string simple_method = mangled_type + "::" + method_name;
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_method_by_name: Trying simple name lookup '{}'", simple_method);
+            if (llvm::Function *fn = module()->getFunction(simple_method))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Found '{}.{}' via simple name as '{}'",
+                          type_name, method_name, simple_method);
+                return fn;
+            }
+            if (llvm::Function *fn = ctx().get_function(simple_method))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_method_by_name: Found '{}.{}' in registry via simple name as '{}'",
+                          type_name, method_name, simple_method);
+                return fn;
+            }
         }
 
         // Create extern declarations for cross-module method calls

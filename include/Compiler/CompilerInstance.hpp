@@ -93,7 +93,8 @@ namespace Cryo
         bool _dump_symbols;                            // Dump symbol tables for each module to debug files
         std::string _dump_symbols_output_dir;          // Output directory for symbol dumps
         std::string _current_namespace;                // Current namespace context
-        std::vector<std::string> _imported_namespaces; // Track imported namespaces for enhanced resolution
+        std::vector<std::string> _imported_namespaces;     // Track imported namespaces for enhanced resolution
+        std::vector<std::string> _local_import_modules;    // Modules from local project files that need IR generation
 
         // Results
         std::unique_ptr<ProgramNode> _ast_root;

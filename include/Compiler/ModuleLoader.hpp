@@ -29,6 +29,8 @@ namespace Cryo
         struct ImportResult
         {
             bool success = false;
+            bool is_local_import = false;          // True if resolved from project directory (not stdlib)
+            bool resolved_as_specific = false;     // True if wildcard path was resolved as specific symbol import
             std::string error_message;
             std::string module_name;
             std::unordered_map<std::string, Symbol> symbol_map;
@@ -39,6 +41,7 @@ namespace Cryo
     private:
         std::string _stdlib_root;                                      // Root directory for standard library
         std::string _current_file_dir;                                 // Directory of currently compiling file
+        bool _last_resolve_was_local = false;                          // Whether the last resolve_import_path found a local file
         std::unordered_map<std::string, ImportResult> _loaded_modules; // Cache of loaded modules
         std::unordered_set<std::string> _loading_modules;              // Track modules currently being loaded (cycle detection)
         SymbolTable &_symbol_table;                                    // Reference to main symbol table

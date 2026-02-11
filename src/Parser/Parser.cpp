@@ -1949,6 +1949,11 @@ namespace Cryo
                 module_path = first_identifier;
                 // Continue parsing the module path
             }
+            else if (_current_token.is(TokenKind::TK_SEMICOLON) || _current_token.is(TokenKind::TK_KW_AS))
+            {
+                // Simple bare module import: import Foo;  or  import Foo as Bar;
+                module_path = first_identifier;
+            }
             else
             {
                 throw ParseError("Expected '::' for module path, 'from' for specific imports, or ',' for multiple imports", _current_token.location());
@@ -1977,6 +1982,35 @@ namespace Cryo
         while (_current_token.is(TokenKind::TK_COLONCOLON))
         {
             advance(); // consume '::'
+
+            // Check for multi-import syntax: import Foo::Bar::{A, B}
+            if (_current_token.is(TokenKind::TK_L_BRACE))
+            {
+                advance(); // consume '{'
+                std::vector<std::string> multi_imports;
+
+                while (!_current_token.is(TokenKind::TK_R_BRACE))
+                {
+                    if (!_current_token.is_identifier() && !_current_token.is_keyword())
+                    {
+                        throw ParseError("Expected identifier in import list", _current_token.location());
+                    }
+                    multi_imports.push_back(std::string(_current_token.text()));
+                    advance();
+                    if (_current_token.is(TokenKind::TK_COMMA))
+                        advance(); // consume comma
+                }
+                advance(); // consume '}'
+
+                // Parse optional ';'
+                if (_current_token.is(TokenKind::TK_SEMICOLON))
+                    advance();
+
+                // Create SpecificImport node with module_path as the base path
+                return std::make_unique<ImportDeclarationNode>(
+                    start_loc, std::move(multi_imports), module_path);
+            }
+
             // Accept both identifiers and keywords as valid path segments
             if (!_current_token.is_identifier() && !_current_token.is_keyword())
             {

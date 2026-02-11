@@ -233,11 +233,11 @@ def _read_source_safe(path: Path) -> str:
 _HIGHLIGHT_RE = re.compile("|".join([
     r"(?P<comment>//[^\n]*)",
     r'(?P<string>"(?:[^"\\]|\\.)*")',
-    r"(?P<keyword>\b(?:function|return|if|else|while|for|const|let|mut|"
-    r"struct|enum|impl|namespace|match|break|continue|loop|import|"
-    r"public|private|static|class|new|self|true|false|extern)\b)",
+    r"(?P<keyword>\b(?:function|return|if|else|while|for|const|mut|type|"
+    r"struct|enum|implement|namespace|match|break|continue|loop|import|"
+    r"public|private|static|class|new|this|true|false|extern)\b)",
     r"(?P<type>\b(?:int|i8|i16|i32|i64|u8|u16|u32|u64|float|f32|f64|"
-    r"bool|char|string|void|String)\b)",
+    r"boolean|char|string|void|String)\b)",
     r"(?P<number>\b\d+\.?\d*\b)",
     r"(?P<arrow>->)",
     r"(?P<decorator>@\w+)",
@@ -589,6 +589,16 @@ def _html_test_card(r: TestResult, source: str) -> str:
             f'<div class="expected-section">'
             f'<h4>Expected Output</h4>'
             f'<pre class="output-block compact">{expected}</pre>'
+            f'</div>'
+        )
+
+    # Actual output
+    if r.execution and r.execution.stdout:
+        actual = _esc(r.execution.stdout.rstrip())
+        body_parts.append(
+            f'<div class="actual-section">'
+            f'<h4>Actual Output</h4>'
+            f'<pre class="output-block compact">{actual}</pre>'
             f'</div>'
         )
 

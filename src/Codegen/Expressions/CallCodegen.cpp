@@ -411,6 +411,40 @@ namespace Cryo::Codegen
             llvm::Function *fn = resolve_function(function_name);
             if (!fn)
             {
+                // Fallback: if the function name looks like a namespace-qualified static method
+                // (e.g., "Foo::Bar::method"), try resolving as a static method call.
+                // This handles cases where classify_call couldn't determine the type during classification.
+                size_t last_sep = function_name.rfind("::");
+                if (last_sep != std::string::npos && function_name.find("::") != last_sep)
+                {
+                    // Has at least two :: separators → likely Namespace::Type::method
+                    std::string type_name = function_name.substr(0, last_sep);
+                    std::string method_name = function_name.substr(last_sep + 2);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "FreeFunction: Trying as static method '{}::{}'", type_name, method_name);
+                    llvm::Function *method = resolve_method_by_name(type_name, method_name);
+                    if (method)
+                    {
+                        // Generate arguments and call
+                        auto args = generate_arguments(node->arguments());
+                        std::vector<llvm::Value *> coerced_args;
+                        llvm::FunctionType *fn_type = method->getFunctionType();
+                        for (size_t i = 0; i < args.size() && i < fn_type->getNumParams(); ++i)
+                        {
+                            llvm::Value *arg = args[i];
+                            llvm::Type *param_type = fn_type->getParamType(i);
+                            if (arg && param_type->isPointerTy() && arg->getType()->isStructTy())
+                            {
+                                llvm::AllocaInst *temp = create_entry_alloca(arg->getType(), "struct.arg.tmp");
+                                builder().CreateStore(arg, temp);
+                                arg = temp;
+                            }
+                            coerced_args.push_back(cast_if_needed(arg, param_type));
+                        }
+                        std::string result_name = method->getReturnType()->isVoidTy() ? "" : method_name + ".result";
+                        return builder().CreateCall(method, coerced_args, result_name);
+                    }
+                }
                 report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                              "Unknown function: " + function_name);
                 return nullptr;
@@ -1075,6 +1109,23 @@ namespace Cryo::Codegen
                               sym->type.is_valid() ? static_cast<int>(sym->type->kind()) : -1);
                     return CallKind::StaticMethod;
                 }
+            }
+
+            // Fallback: scope_name may be namespace-qualified (e.g., "Foo::Bar")
+            // Extract the last component and check if it's a type
+            size_t last_sep = scope_name.rfind("::");
+            if (last_sep != std::string::npos)
+            {
+                std::string simple_type_name = scope_name.substr(last_sep + 2);
+                if (is_enum_type(simple_type_name))
+                    return CallKind::EnumVariant;
+                if (is_struct_type(simple_type_name) || is_class_type(simple_type_name))
+                    return CallKind::StaticMethod;
+                // Also check the symbol table directly (more reliable for imported types
+                // whose LLVM struct types may not exist yet)
+                Symbol *sym = symbols().lookup_symbol(simple_type_name);
+                if (sym && sym->kind == SymbolKind::Type)
+                    return CallKind::StaticMethod;
             }
 
             // Could be a namespace-qualified function

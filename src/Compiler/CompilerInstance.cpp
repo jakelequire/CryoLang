@@ -18,6 +18,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <unordered_set>
 
 namespace Cryo
 {
@@ -1026,6 +1027,7 @@ namespace Cryo
         }
         _lexer.reset();
         _parser.reset();
+        _local_import_modules.clear();
 
         // Note: TypeChecker doesn't have reset_state or set_stdlib_compilation_mode.
         // TypeChecker is stateless - it just provides type-checking utilities.
@@ -1545,6 +1547,13 @@ namespace Cryo
 
             if (result.success)
             {
+                // Track local project imports for IR generation
+                if (result.is_local_import)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Tracking local import '{}' for IR generation", result.module_name);
+                    _local_import_modules.push_back(result.module_name);
+                }
+
                 if (import_decl->is_specific_import())
                 {
                     // Check if this is a namespace alias (single specific import) or symbol imports (multiple)
@@ -1650,10 +1659,25 @@ namespace Cryo
                         }
                     }
                 }
+                else if (result.resolved_as_specific)
+                {
+                    // Path resolved as specific symbol import (e.g., "import Baz::Qix::Buz")
+                    // Register each symbol directly in current scope (like specific imports)
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                              "Processing resolved-as-specific import with {} symbols", result.symbol_map.size());
+
+                    for (const auto &[symbol_name, symbol] : result.symbol_map)
+                    {
+                        _symbol_table->declare_symbol(symbol_name, symbol.kind, symbol.location, symbol.type, scope_name);
+                        LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered resolved-as-specific symbol: {}", symbol_name);
+                    }
+                }
                 else
                 {
-                    // For wildcard imports, register the namespace and symbols
-                    std::string namespace_name = import_decl->has_alias() ? import_decl->alias() : result.module_name;
+                    // For wildcard imports, register the namespace and symbols.
+                    // Use the import path (e.g., "Foo") rather than the file's full namespace
+                    // (e.g., "Main::Foo") so symbols are accessible as Foo::X from the caller.
+                    std::string namespace_name = import_decl->has_alias() ? import_decl->alias() : import_decl->path();
 
                     if (!result.symbol_map.empty())
                     {
@@ -3572,6 +3596,31 @@ namespace Cryo
             // Process struct declarations to ensure TypeMapper has correct type information
             process_struct_declarations_for_preregistration(_ast_root.get());
 
+            // Also pre-register imported module structs so they exist during main module codegen
+            if (_module_loader && !_local_import_modules.empty())
+            {
+                const auto &imported_asts = _module_loader->get_imported_asts();
+                std::unordered_set<std::string> seen;
+                for (const auto &module_name : _local_import_modules)
+                {
+                    if (seen.insert(module_name).second)
+                    {
+                        auto it = imported_asts.find(module_name);
+                        if (it != imported_asts.end() && it->second)
+                            process_struct_declarations_for_preregistration(it->second.get());
+                    }
+                    std::string prefix = module_name + "::";
+                    for (const auto &[ast_name, ast_ptr] : imported_asts)
+                    {
+                        if (ast_ptr && ast_name.compare(0, prefix.size(), prefix) == 0 &&
+                            seen.insert(ast_name).second)
+                        {
+                            process_struct_declarations_for_preregistration(ast_ptr.get());
+                        }
+                    }
+                }
+            }
+
             // Disable pre-registration mode
             _codegen->get_visitor()->set_pre_registration_mode(false);
         }
@@ -3629,6 +3678,56 @@ namespace Cryo
                 _codegen->get_visitor()->set_imported_asts(&_module_loader->get_imported_asts());
             }
 
+            // Generate IR for local project imports FIRST so that all imported types
+            // and functions exist in the LLVM module before main module codegen runs.
+            if (_module_loader && !_local_import_modules.empty())
+            {
+                const auto &imported_asts = _module_loader->get_imported_asts();
+
+                // Build complete list: explicit imports + any submodules (e.g., "Baz" → also "Baz::Qix")
+                std::vector<std::string> modules_to_generate;
+                std::unordered_set<std::string> seen;
+                for (const auto &module_name : _local_import_modules)
+                {
+                    if (seen.insert(module_name).second)
+                        modules_to_generate.push_back(module_name);
+                    // Also find submodule ASTs (prefix match: "Baz" → "Baz::Qix", "Baz::Qix::Sub")
+                    std::string prefix = module_name + "::";
+                    for (const auto &[ast_name, ast_ptr] : imported_asts)
+                    {
+                        if (ast_ptr && ast_name.compare(0, prefix.size(), prefix) == 0 &&
+                            seen.insert(ast_name).second)
+                        {
+                            modules_to_generate.push_back(ast_name);
+                        }
+                    }
+                }
+
+                for (const auto &module_name : modules_to_generate)
+                {
+                    auto it = imported_asts.find(module_name);
+                    if (it != imported_asts.end() && it->second)
+                    {
+                        LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Generating IR for local import '{}'", module_name);
+                        bool import_success = _codegen->generate_imported_ir(it->second.get(), module_name);
+                        if (!import_success)
+                        {
+                            LOG_ERROR(LogComponent::GENERAL, "IR generation phase: Failed to generate IR for local import '{}': {}",
+                                      module_name, _codegen->get_last_error());
+                            _diagnostics->emit(Diag::error(ErrorCode::E0600_CODEGEN_FAILED,
+                                                           "IR generation failed for imported module '" + module_name + "': " + _codegen->get_last_error()));
+                            return false;
+                        }
+                        LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Successfully generated IR for local import '{}'", module_name);
+                    }
+                    else
+                    {
+                        LOG_WARN(LogComponent::GENERAL, "IR generation phase: AST not found for local import '{}'", module_name);
+                    }
+                }
+            }
+
+            // Now generate main module IR (imported types and functions already available)
             LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Generating LLVM IR");
             bool success = _codegen->generate_ir(_ast_root.get());
 
@@ -3638,9 +3737,10 @@ namespace Cryo
                           _codegen->get_last_error());
                 _diagnostics->emit(Diag::error(ErrorCode::E0600_CODEGEN_FAILED,
                                                "IR generation failed: " + _codegen->get_last_error()));
+                return false;
             }
 
-            return success;
+            return true;
         }
         catch (const std::exception &e)
         {
