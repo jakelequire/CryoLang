@@ -3985,146 +3985,163 @@ namespace Cryo
             return std::move(pattern);
         }
 
-        // Handle enum patterns like Shape::Circle(radius)
+        // Handle enum patterns like Shape::Circle(radius) or Colors::Color::Red
         if (_current_token.is(TokenKind::TK_IDENTIFIER))
         {
-            std::string enum_name{_current_token.text()};
+            // Collect all path segments: A::B::C::D → segments = [A, B, C, D]
+            std::vector<std::string> segments;
+            segments.push_back(std::string{_current_token.text()});
             advance();
 
-            if (_current_token.is(TokenKind::TK_COLONCOLON))
+            while (_current_token.is(TokenKind::TK_COLONCOLON))
             {
-                advance();
-
-                // Allow both identifiers and keywords as variant names
+                advance(); // consume ::
                 if (_current_token.is_identifier() || _current_token.is_keyword())
                 {
-                    std::string variant_name{_current_token.text()};
+                    segments.push_back(std::string{_current_token.text()});
+                    advance();
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            if (segments.size() >= 2)
+            {
+                // Last segment is variant, everything before is the enum qualified name
+                std::string variant_name = segments.back();
+                segments.pop_back();
+                std::string enum_name;
+                for (size_t i = 0; i < segments.size(); ++i)
+                {
+                    if (i > 0) enum_name += "::";
+                    enum_name += segments[i];
+                }
+
+                auto pattern = std::make_unique<EnumPatternNode>(start_loc, enum_name, variant_name);
+
+                // Parse pattern elements if present (bindings, wildcards, or literals)
+                if (_current_token.is(TokenKind::TK_L_PAREN))
+                {
                     advance();
 
-                    auto pattern = std::make_unique<EnumPatternNode>(start_loc, enum_name, variant_name);
-
-                    // Parse pattern elements if present (bindings, wildcards, or literals)
-                    if (_current_token.is(TokenKind::TK_L_PAREN))
+                    while (!_current_token.is(TokenKind::TK_R_PAREN) && !is_at_end())
                     {
-                        advance();
-
-                        while (!_current_token.is(TokenKind::TK_R_PAREN) && !is_at_end())
+                        // Handle identifier (variable binding) or wildcard (_)
+                        if (_current_token.is(TokenKind::TK_IDENTIFIER))
                         {
-                            // Handle identifier (variable binding) or wildcard (_)
-                            if (_current_token.is(TokenKind::TK_IDENTIFIER))
+                            std::string text{_current_token.text()};
+                            if (text == "_")
                             {
-                                std::string text{_current_token.text()};
-                                if (text == "_")
-                                {
-                                    // Wildcard pattern
-                                    pattern->add_pattern_element(PatternElement::make_wildcard());
-                                }
-                                else
-                                {
-                                    // Variable binding
-                                    pattern->add_pattern_element(PatternElement::make_binding(text));
-                                }
-                                advance();
-
-                                if (_current_token.is(TokenKind::TK_COMMA))
-                                {
-                                    advance();
-                                }
-                            }
-                            // Handle numeric literals (e.g., 0, 42, -1)
-                            else if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
-                            {
-                                std::string num_text{_current_token.text()};
-                                // Parse as integer (for simplicity, floating point patterns can be added later)
-                                int64_t value = 0;
-                                try
-                                {
-                                    value = std::stoll(num_text);
-                                }
-                                catch (...)
-                                {
-                                    // Try parsing as float if integer parsing fails
-                                    try
-                                    {
-                                        double fval = std::stod(num_text);
-                                        pattern->add_pattern_element(PatternElement::make_literal_float(fval));
-                                        advance();
-                                        if (_current_token.is(TokenKind::TK_COMMA))
-                                        {
-                                            advance();
-                                        }
-                                        continue;
-                                    }
-                                    catch (...)
-                                    {
-                                        error("Invalid numeric literal in pattern");
-                                        break;
-                                    }
-                                }
-                                pattern->add_pattern_element(PatternElement::make_literal_int(value));
-                                advance();
-
-                                if (_current_token.is(TokenKind::TK_COMMA))
-                                {
-                                    advance();
-                                }
-                            }
-                            // Handle boolean literals (true/false)
-                            else if (_current_token.is(TokenKind::TK_KW_TRUE))
-                            {
-                                pattern->add_pattern_element(PatternElement::make_literal_bool(true));
-                                advance();
-
-                                if (_current_token.is(TokenKind::TK_COMMA))
-                                {
-                                    advance();
-                                }
-                            }
-                            else if (_current_token.is(TokenKind::TK_KW_FALSE))
-                            {
-                                pattern->add_pattern_element(PatternElement::make_literal_bool(false));
-                                advance();
-
-                                if (_current_token.is(TokenKind::TK_COMMA))
-                                {
-                                    advance();
-                                }
-                            }
-                            // Handle string literals
-                            else if (_current_token.is(TokenKind::TK_STRING_LITERAL))
-                            {
-                                std::string str_text{_current_token.text()};
-                                // Remove quotes if present
-                                if (str_text.length() >= 2 && str_text.front() == '"' && str_text.back() == '"')
-                                {
-                                    str_text = str_text.substr(1, str_text.length() - 2);
-                                }
-                                pattern->add_pattern_element(PatternElement::make_literal_string(str_text));
-                                advance();
-
-                                if (_current_token.is(TokenKind::TK_COMMA))
-                                {
-                                    advance();
-                                }
+                                // Wildcard pattern
+                                pattern->add_pattern_element(PatternElement::make_wildcard());
                             }
                             else
                             {
-                                error("Expected identifier, wildcard (_), or literal in pattern");
-                                break;
+                                // Variable binding
+                                pattern->add_pattern_element(PatternElement::make_binding(text));
+                            }
+                            advance();
+
+                            if (_current_token.is(TokenKind::TK_COMMA))
+                            {
+                                advance();
                             }
                         }
+                        // Handle numeric literals (e.g., 0, 42, -1)
+                        else if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
+                        {
+                            std::string num_text{_current_token.text()};
+                            // Parse as integer (for simplicity, floating point patterns can be added later)
+                            int64_t value = 0;
+                            try
+                            {
+                                value = std::stoll(num_text);
+                            }
+                            catch (...)
+                            {
+                                // Try parsing as float if integer parsing fails
+                                try
+                                {
+                                    double fval = std::stod(num_text);
+                                    pattern->add_pattern_element(PatternElement::make_literal_float(fval));
+                                    advance();
+                                    if (_current_token.is(TokenKind::TK_COMMA))
+                                    {
+                                        advance();
+                                    }
+                                    continue;
+                                }
+                                catch (...)
+                                {
+                                    error("Invalid numeric literal in pattern");
+                                    break;
+                                }
+                            }
+                            pattern->add_pattern_element(PatternElement::make_literal_int(value));
+                            advance();
 
-                        consume(TokenKind::TK_R_PAREN, "Expected ')' after pattern elements");
+                            if (_current_token.is(TokenKind::TK_COMMA))
+                            {
+                                advance();
+                            }
+                        }
+                        // Handle boolean literals (true/false)
+                        else if (_current_token.is(TokenKind::TK_KW_TRUE))
+                        {
+                            pattern->add_pattern_element(PatternElement::make_literal_bool(true));
+                            advance();
+
+                            if (_current_token.is(TokenKind::TK_COMMA))
+                            {
+                                advance();
+                            }
+                        }
+                        else if (_current_token.is(TokenKind::TK_KW_FALSE))
+                        {
+                            pattern->add_pattern_element(PatternElement::make_literal_bool(false));
+                            advance();
+
+                            if (_current_token.is(TokenKind::TK_COMMA))
+                            {
+                                advance();
+                            }
+                        }
+                        // Handle string literals
+                        else if (_current_token.is(TokenKind::TK_STRING_LITERAL))
+                        {
+                            std::string str_text{_current_token.text()};
+                            // Remove quotes if present
+                            if (str_text.length() >= 2 && str_text.front() == '"' && str_text.back() == '"')
+                            {
+                                str_text = str_text.substr(1, str_text.length() - 2);
+                            }
+                            pattern->add_pattern_element(PatternElement::make_literal_string(str_text));
+                            advance();
+
+                            if (_current_token.is(TokenKind::TK_COMMA))
+                            {
+                                advance();
+                            }
+                        }
+                        else
+                        {
+                            error("Expected identifier, wildcard (_), or literal in pattern");
+                            break;
+                        }
                     }
 
-                    return std::move(pattern);
+                    consume(TokenKind::TK_R_PAREN, "Expected ')' after pattern elements");
                 }
+
+                return std::move(pattern);
             }
             else
             {
-                // Simple identifier pattern (variable binding)
+                // Simple identifier pattern (variable binding, single segment with no ::)
                 auto pattern = std::make_unique<PatternNode>(start_loc);
-                pattern->set_identifier(enum_name);
+                pattern->set_identifier(segments[0]);
                 return std::move(pattern);
             }
         }

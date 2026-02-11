@@ -1043,6 +1043,15 @@ namespace Cryo::Codegen
             {
                 // Value is a pointer to struct, need to GEP and load
                 llvm::Type *resolved_type = ctx().get_type(enum_name);
+                if (!resolved_type)
+                {
+                    // Fallback: try last segment of qualified name (e.g., "Colors::Color" -> "Color")
+                    size_t last_sep = enum_name.rfind("::");
+                    if (last_sep != std::string::npos)
+                    {
+                        resolved_type = ctx().get_type(enum_name.substr(last_sep + 2));
+                    }
+                }
                 if (!resolved_type || !resolved_type->isStructTy())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1325,11 +1334,37 @@ namespace Cryo::Codegen
                         }
                     }
                 }
+
+                // Fallback: strip namespace prefix for qualified names (e.g., "Colors::Color" -> "Color")
+                if (ctx().get_type(type_name) == nullptr)
+                {
+                    size_t last_sep = type_name.rfind("::");
+                    if (last_sep != std::string::npos)
+                    {
+                        type_name = type_name.substr(last_sep + 2);
+                    }
+                }
             }
 
             // Convert type name format if needed (e.g., "Result<i8, ConversionError>" -> "Result_i8_ConversionError")
             // First try exact match
             llvm::Type *resolved_type = ctx().get_type(type_name);
+            if (!resolved_type || !resolved_type->isStructTy())
+            {
+                // Try stripping namespace prefix for qualified names (e.g., "Shapes::Shape" -> "Shape")
+                size_t last_sep = type_name.rfind("::");
+                if (last_sep != std::string::npos)
+                {
+                    std::string short_name = type_name.substr(last_sep + 2);
+                    resolved_type = ctx().get_type(short_name);
+                    if (resolved_type && resolved_type->isStructTy())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "bind_enum_pattern_variables: Found type via short name '{}' (original: '{}')",
+                                  short_name, type_name);
+                    }
+                }
+            }
             if (!resolved_type || !resolved_type->isStructTy())
             {
                 // Try converting angle bracket format to underscore format
@@ -1431,6 +1466,16 @@ namespace Cryo::Codegen
         {
             std::string base_enum_name = enum_pattern->enum_name();
             enum_type_ref = ctx().symbols().arena().lookup_type_by_name(base_enum_name);
+            if (!enum_type_ref.is_valid())
+            {
+                // Fallback: strip namespace prefix for qualified names (e.g., "Colors::Color" -> "Color")
+                size_t last_sep = base_enum_name.rfind("::");
+                if (last_sep != std::string::npos)
+                {
+                    base_enum_name = base_enum_name.substr(last_sep + 2);
+                    enum_type_ref = ctx().symbols().arena().lookup_type_by_name(base_enum_name);
+                }
+            }
             if (enum_type_ref.is_valid())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,

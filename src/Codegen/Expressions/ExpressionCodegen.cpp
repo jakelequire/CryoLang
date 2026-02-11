@@ -4964,6 +4964,10 @@ namespace Cryo::Codegen
             if (llvm::Function *fn = ctx().get_function(name))
                 return fn;
 
+            // Try as global value (module-level constants)
+            if (llvm::Value *val = values().get_global_value(name))
+                return val;
+
             // Try as enum variant
             auto &enum_variants = ctx().enum_variants_map();
             auto it = enum_variants.find(name);
