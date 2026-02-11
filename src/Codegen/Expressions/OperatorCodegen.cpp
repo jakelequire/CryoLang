@@ -2630,16 +2630,43 @@ namespace Cryo::Codegen
                         // Try if array is a member access (e.g., this.entries)
                         else if (auto *arr_member = dynamic_cast<Cryo::MemberAccessNode *>(array_access->array()))
                         {
-                            TypeRef arr_obj_type = arr_member->object()->get_resolved_type();
                             std::string arr_type_name;
-                            if (arr_obj_type)
+                            // Use variable_types_map first (works correctly in monomorphized code)
+                            if (auto *base_ident = dynamic_cast<Cryo::IdentifierNode *>(arr_member->object()))
                             {
-                                arr_type_name = arr_obj_type->display_name();
-                                if (arr_obj_type->kind() == Cryo::TypeKind::Pointer)
+                                auto &var_types = ctx().variable_types_map();
+                                auto vit = var_types.find(base_ident->name());
+                                if (vit != var_types.end() && vit->second.is_valid())
                                 {
-                                    auto *ptr = dynamic_cast<const Cryo::PointerType *>(arr_obj_type.get());
-                                    if (ptr && ptr->pointee())
-                                        arr_type_name = ptr->pointee()->display_name();
+                                    TypeRef base_type = vit->second;
+                                    arr_type_name = base_type->display_name();
+                                    if (base_type->kind() == Cryo::TypeKind::Pointer)
+                                    {
+                                        auto *ptr = dynamic_cast<const Cryo::PointerType *>(base_type.get());
+                                        if (ptr && ptr->pointee())
+                                            arr_type_name = ptr->pointee()->display_name();
+                                    }
+                                    else if (!arr_type_name.empty() && arr_type_name.back() == '*')
+                                        arr_type_name.pop_back();
+                                }
+                                else if (base_ident->name() == "this")
+                                {
+                                    arr_type_name = ctx().current_type_name();
+                                }
+                            }
+                            // Fallback: try AST resolved type
+                            if (arr_type_name.empty())
+                            {
+                                TypeRef arr_obj_type = arr_member->object()->get_resolved_type();
+                                if (arr_obj_type)
+                                {
+                                    arr_type_name = arr_obj_type->display_name();
+                                    if (arr_obj_type->kind() == Cryo::TypeKind::Pointer)
+                                    {
+                                        auto *ptr = dynamic_cast<const Cryo::PointerType *>(arr_obj_type.get());
+                                        if (ptr && ptr->pointee())
+                                            arr_type_name = ptr->pointee()->display_name();
+                                    }
                                 }
                             }
                             if (!arr_type_name.empty())
@@ -2849,6 +2876,7 @@ namespace Cryo::Codegen
             // For array access, we need a pointer to the array, not the array value
             // Handle identifier arrays specially - get the alloca address
             llvm::Value *array_val = nullptr;
+            bool is_member_access_array = false;
 
             if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(array_access->array()))
             {
@@ -2887,6 +2915,7 @@ namespace Cryo::Codegen
                 // field rather than its value. This gives us a pointer to the array field in
                 // the struct, which we can then GEP into for element access.
                 array_val = get_lvalue_address(member_access);
+                is_member_access_array = true;
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "get_lvalue_address: Got member address for array field '{}'",
                           member_access->member());
@@ -3250,6 +3279,17 @@ namespace Cryo::Codegen
                 report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
                              "Could not determine element type for array lvalue address");
                 return nullptr;
+            }
+
+            // If the array came from a member access and the field is a pointer type
+            // (not an array type), we need to load the pointer value first.
+            // get_lvalue_address gives us the address of the pointer field; we must
+            // dereference it to get the actual array base pointer before indexing.
+            if (is_member_access_array && array_type && array_type->kind() == Cryo::TypeKind::Pointer)
+            {
+                array_val = builder().CreateLoad(builder().getPtrTy(), array_val, "ptr.load");
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Loaded pointer field before array indexing");
             }
 
             // Create GEP for array element access

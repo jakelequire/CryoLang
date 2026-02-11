@@ -2020,8 +2020,9 @@ namespace Cryo::Codegen
             // Use the full intrinsic system with Windows ABI fixes
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "[STDLIB REDIRECT] Redirecting {} to printf intrinsic", intrinsic_name);
 
-            // Generate arguments
-            auto args = generate_arguments(node->arguments());
+            // args already generated at the top of generate_intrinsic — do NOT
+            // call generate_arguments again, as it would double-evaluate
+            // side-effectful expressions (e.g., it.next()).
 
             // Delegate to the proper intrinsic system that handles Windows ABI
             Intrinsics intrinsic_gen(ctx().llvm_manager(), ctx().diagnostics());
