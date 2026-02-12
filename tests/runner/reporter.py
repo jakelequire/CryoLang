@@ -162,10 +162,6 @@ class ConsoleReporter:
                 print(f"    {self._dim(line)}")
             if len(stderr_lines) > 20:
                 print(f"    {self._dim(f'... ({len(stderr_lines) - 20} more lines)')}")
-        if r.execution and r.execution.stdout:
-            print(f"  Actual stdout:")
-            for line in r.execution.stdout.split("\n"):
-                print(f"    {self._dim(line)}")
         if r.execution and r.execution.stderr:
             print(f"  Binary stderr:")
             for line in r.execution.stderr.strip().split("\n")[:10]:
