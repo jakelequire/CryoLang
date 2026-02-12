@@ -79,6 +79,17 @@ namespace Cryo::Codegen
         // Determine source signedness from the expression's resolved type
         bool source_signed = true; // default
         TypeRef source_type_ref = node->expression()->get_resolved_type();
+        if (!source_type_ref)
+        {
+            // Fallback: if the source expression is an identifier, look up its type
+            if (auto *ident = dynamic_cast<Cryo::IdentifierNode *>(node->expression()))
+            {
+                auto &var_types = ctx().variable_types_map();
+                auto it = var_types.find(ident->name());
+                if (it != var_types.end())
+                    source_type_ref = it->second;
+            }
+        }
         if (source_type_ref)
             source_signed = is_signed_type(source_type_ref);
 

@@ -8,6 +8,7 @@
 #include "Diagnostics/Diag.hpp"
 #include "Utils/Logger.hpp"
 
+#include <algorithm>
 #include <sstream>
 
 namespace Cryo
@@ -922,6 +923,28 @@ namespace Cryo
             {
                 _struct_cache[name] = ctx_existing;
                 return ctx_existing;
+            }
+        }
+
+        // GenericCodegen mangles special characters in type names (e.g., * -> p).
+        // Try the mangled name to find types it created.
+        {
+            std::string mangled_name = name;
+            std::replace(mangled_name.begin(), mangled_name.end(), '<', '_');
+            std::replace(mangled_name.begin(), mangled_name.end(), '>', '_');
+            std::replace(mangled_name.begin(), mangled_name.end(), ',', '_');
+            std::replace(mangled_name.begin(), mangled_name.end(), ' ', '_');
+            std::replace(mangled_name.begin(), mangled_name.end(), '*', 'p');
+            if (mangled_name != name)
+            {
+                if (llvm::StructType *mangled_existing = llvm::StructType::getTypeByName(_llvm_ctx, mangled_name))
+                {
+                    if (!mangled_existing->isOpaque())
+                    {
+                        _struct_cache[name] = mangled_existing;
+                        return mangled_existing;
+                    }
+                }
             }
         }
 

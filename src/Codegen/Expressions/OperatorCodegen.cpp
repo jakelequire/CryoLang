@@ -248,7 +248,39 @@ namespace Cryo::Codegen
         }
         if (op == TokenKind::TK_STAR)
         {
-            return generate_dereference(operand, node->operand()->get_resolved_type());
+            // Get the Cryo type of the operand to determine the correct pointee type
+            TypeRef operand_type = node->operand()->get_resolved_type();
+
+            // If the operand expression doesn't have a resolved type, look it up
+            if (!operand_type.is_valid())
+            {
+                if (auto *ident = dynamic_cast<Cryo::IdentifierNode *>(node->operand()))
+                {
+                    auto &var_types = ctx().variable_types_map();
+                    auto it = var_types.find(ident->name());
+                    if (it != var_types.end())
+                        operand_type = it->second;
+                }
+            }
+
+            // Extract the actual pointee type from the pointer type
+            TypeRef pointee_type;
+            if (operand_type.is_valid() && operand_type->kind() == Cryo::TypeKind::Pointer)
+            {
+                auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(operand_type.get());
+                if (ptr_type)
+                    pointee_type = ptr_type->pointee();
+            }
+
+            llvm::Value *result = generate_dereference(operand, pointee_type);
+
+            // Set the resolved type on this node so parent dereferences can use it
+            if (pointee_type.is_valid() && !node->has_resolved_type())
+            {
+                node->set_resolved_type(pointee_type);
+            }
+
+            return result;
         }
 
         report_error(ErrorCode::E0616_UNARY_OPERATION_ERROR, node,
@@ -2135,11 +2167,17 @@ namespace Cryo::Codegen
         llvm::Type *load_type = nullptr;
         if (pointee_type)
         {
+            // Cannot dereference void* — return the pointer as-is
+            if (pointee_type->kind() == Cryo::TypeKind::Void)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Dereference of void* — returning pointer as-is");
+                return ptr;
+            }
             load_type = types().map_type(pointee_type);
         }
 
         // Fallback to i32 if we can't determine type
-        if (!load_type)
+        if (!load_type || load_type->isVoidTy())
         {
             load_type = llvm::Type::getInt32Ty(llvm_ctx());
             LOG_WARN(Cryo::LogComponent::CODEGEN, "Dereference type unknown, defaulting to i32");
