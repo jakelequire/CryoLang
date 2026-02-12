@@ -813,10 +813,6 @@ def _render_text_report(results: list[TestResult], elapsed_ms: float) -> str:
                     lines += ["  Compiler output:", ""]
                     lines += [f"    {sl}" for sl in stderr.split("\n")]
                     lines.append("")
-            if r.execution and r.execution.stdout:
-                lines += ["  Actual stdout:", ""]
-                lines += [f"    {sl}" for sl in r.execution.stdout.rstrip("\n").split("\n")]
-                lines.append("")
             if r.execution and r.execution.stderr:
                 stderr = r.execution.stderr.strip()
                 if stderr:
