@@ -884,6 +884,20 @@ namespace Cryo::Codegen
             cryo_var_type = alias->target();
         }
 
+        // Inside a generic instantiation (e.g., enum method body), substitute type
+        // parameters so that Maybe<T> becomes Maybe<int> when T=int.
+        if (_generics && _generics->in_type_param_scope() && cryo_var_type.is_valid())
+        {
+            TypeRef substituted = _generics->substitute_type_params(cryo_var_type);
+            if (substituted.is_valid() && substituted != cryo_var_type)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Substituted local var '{}' type {} -> {}",
+                          name, cryo_var_type->display_name(), substituted->display_name());
+                cryo_var_type = substituted;
+            }
+        }
+
         // Check if variable type is an error type (unresolved generics, undefined types, etc.)
         // This can happen with forward-referenced types that weren't resolved during parsing
         if (cryo_var_type.is_error())

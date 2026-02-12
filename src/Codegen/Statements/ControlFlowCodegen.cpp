@@ -1052,16 +1052,26 @@ namespace Cryo::Codegen
                         resolved_type = ctx().get_type(enum_name.substr(last_sep + 2));
                     }
                 }
-                if (!resolved_type || !resolved_type->isStructTy())
+                if (resolved_type && resolved_type->isStructTy())
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "generate_pattern_match: Could not resolve struct type for '{}'", enum_name);
-                    return nullptr;
+                    llvm::StructType *struct_type = llvm::cast<llvm::StructType>(resolved_type);
+                    llvm::Value *discriminant_ptr = builder().CreateStructGEP(struct_type, value, 0, "discriminant.ptr");
+                    discriminant_value = builder().CreateLoad(builder().getInt32Ty(), discriminant_ptr, "enum.discriminant");
                 }
-
-                llvm::StructType *struct_type = llvm::cast<llvm::StructType>(resolved_type);
-                llvm::Value *discriminant_ptr = builder().CreateStructGEP(struct_type, value, 0, "discriminant.ptr");
-                discriminant_value = builder().CreateLoad(builder().getInt32Ty(), discriminant_ptr, "enum.discriminant");
+                else if (resolved_type && resolved_type->isIntegerTy())
+                {
+                    // Simple integer enum accessed via pointer (e.g., match (&this) on a C-style enum)
+                    discriminant_value = builder().CreateLoad(resolved_type, value, "enum.discriminant");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_pattern_match: Loaded simple integer enum discriminant through pointer");
+                }
+                else
+                {
+                    // Last resort: assume pointer to i32 discriminant (common for simple enums)
+                    discriminant_value = builder().CreateLoad(builder().getInt32Ty(), value, "enum.discriminant");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_pattern_match: Assumed i32 discriminant through pointer for '{}'", enum_name);
+                }
             }
             else if (value_type->isIntegerTy())
             {
