@@ -527,7 +527,7 @@ namespace Cryo::Codegen
                           "GenericInstantiation: '{}' is a generic function, instantiating",
                           base_name);
 
-                // Parse type arguments
+                // Parse type arguments — handle pointer types (e.g., "void*")
                 std::vector<TypeRef> type_args;
                 std::string trimmed = type_args_str;
                 size_t fn_start = trimmed.find_first_not_of(" \t");
@@ -537,26 +537,45 @@ namespace Cryo::Codegen
                     trimmed = trimmed.substr(fn_start, fn_end - fn_start + 1);
                 }
 
+                std::string base_type_name = trimmed;
+                int ptr_depth = 0;
+                while (!base_type_name.empty() && base_type_name.back() == '*')
+                {
+                    base_type_name.pop_back();
+                    ptr_depth++;
+                }
+                while (!base_type_name.empty() && std::isspace(static_cast<unsigned char>(base_type_name.back())))
+                    base_type_name.pop_back();
+
                 TypeRef arg_type{};
-                Symbol *type_sym = symbols().lookup_symbol(trimmed);
+                Symbol *type_sym = symbols().lookup_symbol(base_type_name);
                 if (type_sym && type_sym->kind == SymbolKind::Type && type_sym->type.is_valid())
                 {
                     arg_type = type_sym->type;
                 }
                 if (!arg_type.is_valid())
                 {
-                    if (trimmed == "int" || trimmed == "i32")
+                    if (base_type_name == "int" || base_type_name == "i32")
                         arg_type = symbols().arena().get_i32();
-                    else if (trimmed == "i64")
+                    else if (base_type_name == "i64")
                         arg_type = symbols().arena().get_i64();
-                    else if (trimmed == "f32" || trimmed == "float")
+                    else if (base_type_name == "f32" || base_type_name == "float")
                         arg_type = symbols().arena().get_f32();
-                    else if (trimmed == "f64" || trimmed == "double")
+                    else if (base_type_name == "f64" || base_type_name == "double")
                         arg_type = symbols().arena().get_f64();
-                    else if (trimmed == "string")
+                    else if (base_type_name == "string")
                         arg_type = symbols().arena().get_string();
-                    else if (trimmed == "bool" || trimmed == "boolean")
+                    else if (base_type_name == "bool" || base_type_name == "boolean")
                         arg_type = symbols().arena().get_bool();
+                    else if (base_type_name == "void")
+                        arg_type = symbols().arena().get_void();
+                }
+                if (arg_type.is_valid() && ptr_depth > 0)
+                {
+                    for (int p = 0; p < ptr_depth; ++p)
+                    {
+                        arg_type = symbols().arena().get_pointer_to(arg_type);
+                    }
                 }
                 if (arg_type.is_valid())
                 {
@@ -1782,6 +1801,21 @@ namespace Cryo::Codegen
                                         // Get the argument's resolved type
                                         TypeRef arg_type = arg_nodes[i] ? arg_nodes[i]->get_resolved_type() : TypeRef{};
 
+                                        // If no resolved type on the AST node (e.g., generic function body
+                                        // skipped by resolution pass), try variable_types_map which has
+                                        // concrete substituted types from instantiate_function
+                                        if (!arg_type.is_valid())
+                                        {
+                                            if (auto *ident = dynamic_cast<Cryo::IdentifierNode *>(arg_nodes[i].get()))
+                                            {
+                                                auto it = ctx().variable_types_map().find(ident->name());
+                                                if (it != ctx().variable_types_map().end())
+                                                {
+                                                    arg_type = it->second;
+                                                }
+                                            }
+                                        }
+
                                         if (arg_type.is_valid())
                                         {
                                             // If it's a GenericParam, substitute it
@@ -2318,6 +2352,93 @@ namespace Cryo::Codegen
 
         // 1. First try: resolve the static method directly
         llvm::Function *method = resolve_method(resolved_type_name, method_name);
+
+        // Check for overloaded methods: if the resolved method's parameter count doesn't
+        // match the argument count, try finding an overloaded variant with a mangled name
+        // that includes parameter types (e.g., "Buffer::new(i32)" instead of "Buffer::new")
+        if (method && method->getFunctionType()->getNumParams() != args.size())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_static_method: Parameter count mismatch (method has {}, call has {}), "
+                      "trying overload resolution for {}::{}",
+                      method->getFunctionType()->getNumParams(), args.size(),
+                      resolved_type_name, method_name);
+
+            // Build overloaded name with argument types
+            std::string overload_suffix = "(";
+            for (size_t i = 0; i < args.size(); ++i)
+            {
+                if (i > 0)
+                    overload_suffix += ",";
+                if (args[i])
+                {
+                    llvm::Type *arg_type = args[i]->getType();
+                    if (arg_type->isIntegerTy(8))
+                        overload_suffix += "i8";
+                    else if (arg_type->isIntegerTy(16))
+                        overload_suffix += "i16";
+                    else if (arg_type->isIntegerTy(32))
+                        overload_suffix += "i32";
+                    else if (arg_type->isIntegerTy(64))
+                        overload_suffix += "i64";
+                    else if (arg_type->isFloatTy())
+                        overload_suffix += "f32";
+                    else if (arg_type->isDoubleTy())
+                        overload_suffix += "f64";
+                    else if (arg_type->isPointerTy())
+                        overload_suffix += "ptr";
+                    else if (arg_type->isIntegerTy(1))
+                        overload_suffix += "bool";
+                    else
+                    {
+                        std::string type_str;
+                        llvm::raw_string_ostream rso(type_str);
+                        arg_type->print(rso);
+                        overload_suffix += type_str;
+                    }
+                }
+            }
+            overload_suffix += ")";
+
+            // Try finding the overloaded function with various qualified names
+            auto type_candidates = generate_lookup_candidates(resolved_type_name, Cryo::SymbolKind::Type);
+            for (const auto &type_candidate : type_candidates)
+            {
+                std::string overloaded_name = type_candidate + "::" + method_name + overload_suffix;
+                if (llvm::Function *overloaded_fn = module()->getFunction(overloaded_name))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_static_method: Found overloaded method: {}", overloaded_name);
+                    method = overloaded_fn;
+                    break;
+                }
+            }
+
+            // Broader fallback: scan module for functions matching Type::method(...)
+            // with the correct parameter count (handles type name mismatches like int vs i32)
+            if (method->getFunctionType()->getNumParams() != args.size())
+            {
+                for (const auto &type_candidate : type_candidates)
+                {
+                    std::string prefix = type_candidate + "::" + method_name + "(";
+                    for (auto &fn : module()->functions())
+                    {
+                        std::string fn_name = fn.getName().str();
+                        if (fn_name.starts_with(prefix) && fn_name.back() == ')' &&
+                            fn.getFunctionType()->getNumParams() == args.size())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "generate_static_method: Found overloaded method via scan: {}", fn_name);
+                            method = &fn;
+                            break;
+                        }
+                    }
+                    if (method->getFunctionType()->getNumParams() == args.size())
+                        break;
+                }
+            }
+        }
+
         if (method)
         {
             // Call with arguments (no implicit 'this')
@@ -4236,9 +4357,21 @@ namespace Cryo::Codegen
             std::string var_name = identifier->name();
             if (llvm::AllocaInst *alloca = values().get_alloca(var_name))
             {
-                object = alloca;
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "generate_member_receiver_address: Using alloca for identifier '{}'", var_name);
+                llvm::Type *alloca_type = alloca->getAllocatedType();
+                if (alloca_type->isPointerTy())
+                {
+                    // The alloca stores a pointer (like 'this') - load to get the pointer value
+                    object = create_load(alloca, alloca_type, var_name + ".load");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_member_receiver_address: Loaded pointer from alloca for '{}'", var_name);
+                }
+                else
+                {
+                    // The alloca stores a by-value struct - use alloca address directly
+                    object = alloca;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_member_receiver_address: Using alloca for identifier '{}'", var_name);
+                }
             }
             else if (llvm::GlobalVariable *global = module()->getGlobalVariable(var_name))
             {

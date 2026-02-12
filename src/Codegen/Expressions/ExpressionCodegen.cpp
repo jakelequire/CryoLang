@@ -183,8 +183,14 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        const std::string &value_str = node->value();
+        std::string value_str = node->value();
         TokenKind kind = node->literal_kind();
+
+        // Strip underscore separators from numeric literals (e.g., 1_000_000 -> 1000000)
+        if (kind == TokenKind::TK_NUMERIC_CONSTANT)
+        {
+            std::erase(value_str, '_');
+        }
 
         // Parse based on literal kind
         switch (kind)
@@ -627,11 +633,25 @@ namespace Cryo::Codegen
             }
         }
 
-        // Try function
+        // Try function by bare name
         if (llvm::Function *func = module()->getFunction(name))
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "lookup_variable: Found '{}' as function", name);
             return func;
+        }
+
+        // Try function with SRM-qualified names (e.g., "dub" -> "FnTypeParam::dub")
+        {
+            auto fn_candidates = generate_lookup_candidates(name, Cryo::SymbolKind::Function);
+            for (const auto &candidate : fn_candidates)
+            {
+                if (llvm::Function *func = module()->getFunction(candidate))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "lookup_variable: Found '{}' as function '{}'", name, candidate);
+                    return func;
+                }
+            }
         }
 
         // Check enum variants map for constants (lower priority than functions)
@@ -695,6 +715,31 @@ namespace Cryo::Codegen
 
         std::string member_name = node->member();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Generating member access: {}", member_name);
+
+        // Handle built-in array .length property
+        if (member_name == "length")
+        {
+            TypeRef obj_type;
+            if (auto *ident = dynamic_cast<Cryo::IdentifierNode *>(node->object()))
+            {
+                auto it = ctx().variable_types_map().find(ident->name());
+                if (it != ctx().variable_types_map().end())
+                    obj_type = it->second;
+            }
+            if (!obj_type.is_valid())
+                obj_type = node->object()->get_resolved_type();
+
+            if (obj_type.is_valid() && obj_type->kind() == Cryo::TypeKind::Array)
+            {
+                auto *arr_type = dynamic_cast<const Cryo::ArrayType *>(obj_type.get());
+                if (arr_type && arr_type->is_fixed_size())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "ExpressionCodegen: Array .length = {}", *arr_type->size());
+                    return llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), *arr_type->size());
+                }
+            }
+        }
 
         // First resolve the member info to get struct type and field index
         llvm::StructType *struct_type = nullptr;
@@ -1098,6 +1143,47 @@ namespace Cryo::Codegen
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "*** ArrayType has unexpected LLVM type, falling through to generic handling");
+                }
+            }
+
+            // Handle pointer indexing (e.g., ptr[i] where ptr is int*)
+            if (resolved_type && resolved_type->kind() == TypeKind::Pointer)
+            {
+                auto *ptr_type = static_cast<const Cryo::PointerType *>(resolved_type.get());
+                if (ptr_type->pointee())
+                {
+                    element_type = get_llvm_type(ptr_type->pointee());
+                    if (element_type)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "*** Detected Pointer indexing for variable: '{}', pointee type: {}",
+                                  array_name, ptr_type->pointee()->display_name());
+
+                        // Generate index expression
+                        llvm::Value *index_val = generate(node->index());
+                        if (!index_val)
+                        {
+                            report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                         "Failed to generate index expression for pointer indexing");
+                            return nullptr;
+                        }
+                        if (!index_val->getType()->isIntegerTy())
+                            index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
+
+                        // Load the pointer value from the alloca
+                        llvm::AllocaInst *ptr_alloca = values().get_alloca(array_name);
+                        if (ptr_alloca)
+                        {
+                            llvm::Value *ptr_val = create_load(ptr_alloca, ptr_alloca->getAllocatedType(),
+                                                               array_name + ".load");
+
+                            // GEP with the correct element type for proper stride
+                            llvm::Value *elem_ptr = builder().CreateGEP(
+                                element_type, ptr_val, index_val, "elem.ptr");
+
+                            return create_load(elem_ptr, element_type, "elem.load");
+                        }
+                    }
                 }
             }
 
@@ -1769,6 +1855,32 @@ namespace Cryo::Codegen
                     elements_array,
                     index_val,
                     "elem.ptr");
+            }
+
+            // Handle pointer indexing address (e.g., ptr[i] as lvalue where ptr is int*)
+            if (resolved_type && resolved_type->kind() == TypeKind::Pointer)
+            {
+                auto *ptr_type = static_cast<const Cryo::PointerType *>(resolved_type.get());
+                if (ptr_type->pointee())
+                {
+                    element_type = get_llvm_type(ptr_type->pointee());
+                    if (element_type)
+                    {
+                        llvm::Value *index_val = generate(node->index());
+                        if (!index_val)
+                            return nullptr;
+                        if (!index_val->getType()->isIntegerTy())
+                            index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
+
+                        llvm::AllocaInst *ptr_alloca = values().get_alloca(array_name);
+                        if (ptr_alloca)
+                        {
+                            llvm::Value *ptr_val = create_load(ptr_alloca, ptr_alloca->getAllocatedType(),
+                                                               array_name + ".load");
+                            return builder().CreateGEP(element_type, ptr_val, index_val, "elem.ptr");
+                        }
+                    }
+                }
             }
 
             // Try to get the alloca directly for traditional stack-allocated arrays
@@ -4531,14 +4643,30 @@ namespace Cryo::Codegen
                 continue;
             }
 
-            // Cast if needed - use the correct field type based on looked-up index
-            field_val = cast_if_needed(field_val, st->getElementType(field_idx));
-
             // Get pointer to field using correct index
             llvm::Value *field_ptr = create_struct_gep(struct_type, struct_storage,
                                                        static_cast<unsigned>(field_idx),
                                                        field_name + ".ptr");
-            create_store(field_val, field_ptr);
+
+            // Handle array literal values: generate_array_literal returns an alloca (pointer),
+            // but the struct field expects the array value. Use memcpy to copy the data.
+            llvm::Type *field_type = st->getElementType(field_idx);
+            if (field_type->isArrayTy() && llvm::isa<llvm::AllocaInst>(field_val))
+            {
+                const llvm::DataLayout &DL = module()->getDataLayout();
+                uint64_t size = DL.getTypeAllocSize(field_type);
+                builder().CreateMemCpy(field_ptr, llvm::MaybeAlign(),
+                                       field_val, llvm::MaybeAlign(),
+                                       size);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Initialized struct array field '{}' via memcpy ({} bytes)", field_name, size);
+            }
+            else
+            {
+                // Cast if needed - use the correct field type based on looked-up index
+                field_val = cast_if_needed(field_val, field_type);
+                create_store(field_val, field_ptr);
+            }
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "Initialized struct field '{}' at index {} (type: {})",

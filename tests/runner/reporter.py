@@ -148,6 +148,23 @@ class ConsoleReporter:
                 if self.verbose and r.verdict in (TestVerdict.FAIL, TestVerdict.ERROR, TestVerdict.XPASS):
                     self._print_failure_detail(r)
 
+        print(f"\n{self._bold('Summary:')}")
+        parts = [self._green(f"{passed} passed")]
+        if failed:
+            parts.append(self._red(f"{failed} failed"))
+        if skipped:
+            parts.append(self._yellow(f"{skipped} skipped"))
+        if xfail:
+            parts.append(self._yellow(f"{xfail} xfail"))
+        if xpass:
+            parts.append(self._red(f"{xpass} xpass"))
+        if errors:
+            parts.append(self._red(f"{errors} errors"))
+        if timeouts:
+            parts.append(self._red(f"{timeouts} timeouts"))
+        parts.append(f"{total} total")
+        print(f"  {', '.join(parts)}")
+
         return 0 if all(r.verdict in _OK_VERDICTS for r in results) else 1
 
     def _print_failure_detail(self, r: TestResult) -> None:

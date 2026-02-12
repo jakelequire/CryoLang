@@ -1573,6 +1573,14 @@ namespace Cryo
 
             if (auto *func = dynamic_cast<FunctionDeclarationNode *>(decl.get()))
             {
+                // Skip generic function templates — their bodies will be codegen'd
+                // during instantiation with concrete type substitutions.
+                // Resolving them here would create spurious types like Maybe_T.
+                if (!func->generic_parameters().empty())
+                {
+                    LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Skipping generic function '{}'", func->name());
+                    continue;
+                }
                 LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Found function '{}'", func->name());
                 resolve_function_body(func, TypeRef{}, ctx);
             }
@@ -2693,6 +2701,16 @@ namespace Cryo
             }
         }
 
+        // Strip namespace prefix for matching (e.g., "Types::Maybe" -> "Maybe")
+        // Templates and enum types are registered by simple name
+        {
+            auto pos = resolved_scope_name.rfind("::");
+            if (pos != std::string::npos)
+            {
+                resolved_scope_name = resolved_scope_name.substr(pos + 2);
+            }
+        }
+
         // Check if unwrapped expected_type is an instantiated generic type
         if (unwrapped_expected->kind() != TypeKind::InstantiatedType)
         {
@@ -2813,6 +2831,17 @@ namespace Cryo
 
         // 1. Look up generic template by name
         auto tmpl = generics->get_template_by_name(scope_name);
+        if (!tmpl)
+        {
+            // Templates are registered with simple names (e.g., "Box"), but scope_name
+            // may be qualified (e.g., "Containers::Box"). Try stripping the namespace prefix.
+            auto pos = scope_name.rfind("::");
+            if (pos != std::string::npos)
+            {
+                std::string simple_name = scope_name.substr(pos + 2);
+                tmpl = generics->get_template_by_name(simple_name);
+            }
+        }
         if (!tmpl)
         {
             LOG_DEBUG(LogComponent::GENERAL,

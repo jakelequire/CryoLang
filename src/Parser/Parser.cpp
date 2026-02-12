@@ -2971,6 +2971,127 @@ namespace Cryo
                     }
                     // else: not a generic pattern, treat '<' as less-than operator (handled by caller)
                 }
+                else if (auto scope_node = dynamic_cast<ScopeResolutionNode *>(expr.get()))
+                {
+                    // Handle qualified generic types like Containers::Box<int>::new(10)
+                    std::string type_name = generate_scope_resolution_name(scope_node->scope_name(), scope_node->member_name());
+                    SourceLocation type_location = scope_node->location();
+
+                    bool looks_like_generic = is_generic_call_ahead();
+
+                    if (looks_like_generic)
+                    {
+                        // Parse generic arguments
+                        advance(); // consume '<'
+                        std::vector<std::string> generic_args;
+
+                        do
+                        {
+                            if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !is_type_token())
+                            {
+                                error("Expected type name in generic arguments");
+                                return nullptr;
+                            }
+
+                            std::string type_arg = std::string(_current_token.text());
+                            advance(); // consume type argument
+
+                            // Handle pointer modifiers (e.g., Array<Expr*>)
+                            while (_current_token.is(TokenKind::TK_STAR))
+                            {
+                                type_arg += "*";
+                                advance();
+                            }
+
+                            generic_args.push_back(type_arg);
+
+                        } while (match(TokenKind::TK_COMMA));
+
+                        consume(TokenKind::TK_R_ANGLE, "Expected '>' after generic arguments");
+
+                        // Check if this is followed by parentheses (call) or scope resolution
+                        if (_current_token.is(TokenKind::TK_L_PAREN))
+                        {
+                            // Generic constructor call: Containers::Box<int>(10)
+                            bool is_type_constructor = !type_name.empty() && std::isupper(scope_node->member_name()[0]);
+
+                            if (is_type_constructor)
+                            {
+                                advance(); // consume '('
+                                auto new_expr = _builder.create_new_expression(type_location, type_name);
+                                for (const auto &generic_arg : generic_args)
+                                {
+                                    new_expr->add_generic_arg(generic_arg);
+                                }
+
+                                if (!_current_token.is(TokenKind::TK_R_PAREN))
+                                {
+                                    do
+                                    {
+                                        auto arg = parse_expression();
+                                        if (!arg)
+                                        {
+                                            error("Expected expression in constructor arguments");
+                                            return nullptr;
+                                        }
+                                        new_expr->add_argument(std::move(arg));
+                                    } while (match(TokenKind::TK_COMMA));
+                                }
+
+                                consume(TokenKind::TK_R_PAREN, "Expected ')' after constructor arguments");
+                                expr = std::move(new_expr);
+                            }
+                            else
+                            {
+                                // Generic function call
+                                auto call_expr = _builder.create_call_expression(type_location, std::move(expr));
+                                for (const auto &generic_arg : generic_args)
+                                {
+                                    call_expr->add_generic_arg(generic_arg);
+                                }
+                                advance(); // consume '('
+                                if (!_current_token.is(TokenKind::TK_R_PAREN))
+                                {
+                                    do
+                                    {
+                                        auto arg = parse_expression();
+                                        if (!arg)
+                                        {
+                                            error("Expected expression in function call arguments");
+                                            return nullptr;
+                                        }
+                                        call_expr->add_argument(std::move(arg));
+                                    } while (match(TokenKind::TK_COMMA));
+                                }
+                                consume(TokenKind::TK_R_PAREN, "Expected ')' after function call arguments");
+                                expr = std::move(call_expr);
+                            }
+                        }
+                        else if (_current_token.is(TokenKind::TK_COLONCOLON))
+                        {
+                            // Generic type with scope resolution: Containers::Box<int>::new()
+                            advance(); // consume '::'
+
+                            if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
+                            {
+                                error("Expected identifier after '::'");
+                                return nullptr;
+                            }
+
+                            std::string member_name = std::string(_current_token.text());
+                            advance();
+
+                            // Create ScopeResolutionNode with the full qualified type name and generic_args
+                            expr = _builder.create_scope_resolution(type_location, type_name, member_name, generic_args);
+                        }
+                        else
+                        {
+                            error("Generic type expressions must be followed by constructor call '()', struct literal '{...}', or scope resolution '::'");
+                            return nullptr;
+                        }
+                    }
+                    // else: not a generic pattern, treat '<' as less-than operator
+                }
             }
 
             // Handle multi-level scope resolution (e.g., Std::Runtime::function)
@@ -4053,6 +4174,7 @@ namespace Cryo
                         else if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
                         {
                             std::string num_text{_current_token.text()};
+                            std::erase(num_text, '_'); // Strip underscore separators
                             // Parse as integer (for simplicity, floating point patterns can be added later)
                             int64_t value = 0;
                             try
@@ -5821,7 +5943,9 @@ namespace Cryo
 
             if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
             {
-                int64_t explicit_value = std::stoll(std::string(_current_token.text()));
+                std::string enum_val_text = std::string(_current_token.text());
+                std::erase(enum_val_text, '_'); // Strip underscore separators
+                int64_t explicit_value = std::stoll(enum_val_text);
                 advance(); // consume the number
                 return _builder.create_enum_variant_with_value(start_loc, variant_name, explicit_value);
             }
