@@ -3689,6 +3689,32 @@ namespace Cryo
             LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Setting source info");
             _codegen->set_source_info(_source_file, _current_namespace);
 
+            // Sync imported namespaces and aliases from compiler's SRM to codegen's SRM
+            // This ensures functions from imported modules can be resolved by alias
+            // (e.g., "import Utils as U" → U::add resolves to Utils::add)
+            if (_symbol_resolution_manager && _codegen->ensure_visitor_initialized())
+            {
+                auto *compiler_srm_ctx = _symbol_resolution_manager->get_context();
+                auto *codegen_srm_ctx = _codegen->get_visitor()->get_srm_context();
+
+                if (compiler_srm_ctx && codegen_srm_ctx)
+                {
+                    const auto &imported_namespaces = compiler_srm_ctx->get_imported_namespaces();
+                    for (const auto &ns : imported_namespaces)
+                    {
+                        codegen_srm_ctx->add_imported_namespace(ns);
+                    }
+                    LOG_DEBUG(LogComponent::GENERAL, "IR gen phase: Synced {} imported namespaces to codegen SRM", imported_namespaces.size());
+
+                    const auto &aliases = compiler_srm_ctx->get_namespace_aliases();
+                    for (const auto &[alias, target] : aliases)
+                    {
+                        codegen_srm_ctx->register_namespace_alias(alias, target);
+                        LOG_DEBUG(LogComponent::GENERAL, "IR gen phase: Synced namespace alias '{}' -> '{}'", alias, target);
+                    }
+                }
+            }
+
             // Pass imported ASTs to CodegenVisitor for dynamic enum variant extraction
             if (_codegen->get_visitor() && _module_loader)
             {
