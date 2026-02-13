@@ -27,6 +27,7 @@ class CompilerDriver:
 
         if test.metadata.mode == CompileMode.RAW:
             cmd.append("--raw")
+            cmd.append("--emit-llvm")
 
         cmd.extend(["-o", str(output_path)])
 
