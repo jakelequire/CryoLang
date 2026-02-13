@@ -81,6 +81,9 @@ Examples:
     parser.add_argument("--list", action="store_true",
                         help="List discovered tests without running them")
 
+    parser.add_argument("--cat", action="store_true",
+                        help="Print contents of test files (for debugging)")
+
     args = parser.parse_args()
 
     # Resolve paths

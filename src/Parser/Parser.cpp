@@ -4174,7 +4174,7 @@ namespace Cryo
                         else if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
                         {
                             std::string num_text{_current_token.text()};
-                            std::erase(num_text, '_'); // Strip underscore separators
+                            num_text.erase(std::remove(num_text.begin(), num_text.end(), '_'), num_text.end()); // Strip underscore separators
                             // Parse as integer (for simplicity, floating point patterns can be added later)
                             int64_t value = 0;
                             try
@@ -5944,7 +5944,7 @@ namespace Cryo
             if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
             {
                 std::string enum_val_text = std::string(_current_token.text());
-                std::erase(enum_val_text, '_'); // Strip underscore separators
+                enum_val_text.erase(std::remove(enum_val_text.begin(), enum_val_text.end(), '_'), enum_val_text.end()); // Strip underscore separators
                 int64_t explicit_value = std::stoll(enum_val_text);
                 advance(); // consume the number
                 return _builder.create_enum_variant_with_value(start_loc, variant_name, explicit_value);

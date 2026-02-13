@@ -715,6 +715,24 @@ namespace Cryo
                 {
                     // Create function symbol with proper type information
                     TypeRef func_type = create_function_type_from_declaration(func_decl, &type_arena);
+
+                    // If the function type was successfully created and the AST node's return type
+                    // is still an error (unresolved generic), propagate the resolved return type
+                    // back to the AST node so that codegen sees it.
+                    if (func_type.is_valid() && !func_type.is_error() &&
+                        func_decl->get_resolved_return_type().is_error())
+                    {
+                        auto *func_type_obj = static_cast<const FunctionType *>(func_type.get());
+                        TypeRef resolved_ret = func_type_obj->return_type();
+                        if (resolved_ret.is_valid() && !resolved_ret.is_error())
+                        {
+                            func_decl->set_resolved_return_type(resolved_ret);
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                      "ModuleLoader: Updated AST return type for '{}' -> {}",
+                                      func_decl->name(), resolved_ret->display_name());
+                        }
+                    }
+
                     Symbol symbol(func_decl->name(), SymbolKind::Function, func_type, module_id, func_decl->location());
                     symbol.scope = module_name;
                     symbol_map[func_decl->name()] = symbol;
@@ -1398,6 +1416,90 @@ namespace Cryo
         return _loading_modules.find(module_path) != _loading_modules.end();
     }
 
+    TypeRef ModuleLoader::resolve_generic_type_string(const std::string &type_str, TypeArena *type_arena)
+    {
+        // Parse "Maybe<int>" -> base="Maybe", args=["int"]
+        size_t angle_pos = type_str.find('<');
+        if (angle_pos == std::string::npos || type_str.back() != '>')
+            return TypeRef{};
+
+        std::string base_name = type_str.substr(0, angle_pos);
+        std::string args_str = type_str.substr(angle_pos + 1, type_str.size() - angle_pos - 2);
+
+        // Look up the generic base type in the arena
+        TypeRef generic_base = type_arena->lookup_type_by_name(base_name);
+        if (!generic_base.is_valid())
+            return TypeRef{};
+
+        // Parse comma-separated type arguments, respecting nested angle brackets
+        std::vector<TypeRef> type_args;
+        size_t start = 0;
+        int depth = 0;
+        for (size_t i = 0; i <= args_str.size(); ++i)
+        {
+            if (i == args_str.size() || (args_str[i] == ',' && depth == 0))
+            {
+                std::string arg = args_str.substr(start, i - start);
+                while (!arg.empty() && std::isspace(arg.front()))
+                    arg.erase(0, 1);
+                while (!arg.empty() && std::isspace(arg.back()))
+                    arg.pop_back();
+
+                TypeRef resolved_arg;
+                // Try resolving as a nested generic first
+                if (arg.find('<') != std::string::npos)
+                    resolved_arg = resolve_generic_type_string(arg, type_arena);
+                // Then try arena lookup (handles primitives and named types)
+                if (!resolved_arg.is_valid())
+                    resolved_arg = type_arena->lookup_type_by_name(arg);
+                // Try common primitive aliases
+                if (!resolved_arg.is_valid())
+                {
+                    if (arg == "int")
+                        resolved_arg = type_arena->get_i32();
+                    else if (arg == "string")
+                        resolved_arg = type_arena->get_string();
+                    else if (arg == "boolean")
+                        resolved_arg = type_arena->get_bool();
+                    else if (arg == "float")
+                        resolved_arg = type_arena->get_f32();
+                    else if (arg == "double")
+                        resolved_arg = type_arena->get_f64();
+                    else if (arg == "char")
+                        resolved_arg = type_arena->get_char();
+                    else if (arg == "void")
+                        resolved_arg = type_arena->get_void();
+                }
+
+                if (!resolved_arg.is_valid())
+                    return TypeRef{};
+                type_args.push_back(resolved_arg);
+                start = i + 1;
+            }
+            else if (args_str[i] == '<')
+            {
+                depth++;
+            }
+            else if (args_str[i] == '>')
+            {
+                depth--;
+            }
+        }
+
+        if (type_args.empty())
+            return TypeRef{};
+
+        TypeRef result = type_arena->create_instantiation(generic_base, std::move(type_args));
+        if (result.is_valid())
+        {
+            type_arena->register_instantiated_by_name(result);
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "ModuleLoader: Resolved generic type string '{}' -> {}",
+                      type_str, result->display_name());
+        }
+        return result;
+    }
+
     TypeRef ModuleLoader::create_function_type_from_declaration(const FunctionDeclarationNode *func_decl, TypeArena *type_arena)
     {
         if (!func_decl || !type_arena)
@@ -1412,6 +1514,26 @@ namespace Cryo
         {
             // Default to void for functions without explicit return type or explicit void
             return_type = type_arena->get_void();
+        }
+
+        // If return type is an error containing an unresolved generic, try to resolve it now.
+        // This happens when the parser defers generic return types like Maybe<int> as error types.
+        if (return_type.is_error())
+        {
+            const std::string display = return_type->display_name();
+            const std::string prefix = "<error: unresolved generic: ";
+            if (display.find(prefix) == 0 && display.back() == '>')
+            {
+                std::string generic_str = display.substr(prefix.size(), display.size() - prefix.size() - 1);
+                TypeRef resolved = resolve_generic_type_string(generic_str, type_arena);
+                if (resolved.is_valid())
+                {
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "ModuleLoader: Resolved unresolved generic return type for '{}': {} -> {}",
+                              func_decl->name(), display, resolved->display_name());
+                    return_type = resolved;
+                }
+            }
         }
 
         // Get parameter types

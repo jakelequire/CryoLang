@@ -147,7 +147,8 @@ namespace Cryo::Codegen
          * @return Generated LLVM function
          */
         llvm::Function *generate_method_declaration(Cryo::FunctionDeclarationNode *node,
-                                                     const std::string &parent_type);
+                                                     const std::string &parent_type,
+                                                     bool force_allow_generic = false);
 
         /**
          * @brief Generate external function declaration

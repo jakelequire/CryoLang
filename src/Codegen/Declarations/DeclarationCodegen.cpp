@@ -391,7 +391,8 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *DeclarationCodegen::generate_method_declaration(Cryo::FunctionDeclarationNode *node,
-                                                                    const std::string &parent_type)
+                                                                    const std::string &parent_type,
+                                                                    bool force_allow_generic)
     {
         if (!node)
             return nullptr;
@@ -413,7 +414,8 @@ namespace Cryo::Codegen
 
         // Skip methods that have their own generic parameters (e.g., alloc_one<T>)
         // These should only be generated when instantiated with concrete types
-        if (!node->generic_parameters().empty())
+        // Unless force_allow_generic is set (on-demand instantiation with concrete bindings)
+        if (!node->generic_parameters().empty() && !force_allow_generic)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "DeclarationCodegen: Skipping generic method declaration '{}' - has {} generic type parameters",
