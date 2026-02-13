@@ -1699,6 +1699,24 @@ namespace Cryo::Codegen
                 // Direct enum type, use its name
                 instantiated_enum_name = resolved->display_name();
             }
+
+            // When inside a type param scope, the Monomorphizer may have partially
+            // substituted the type name (e.g., "Maybe_U" where T was substituted but
+            // method-level U was not). Apply type annotation substitution to resolve
+            // the remaining params (e.g., "Maybe_U" → "Maybe_i32" when U=i32).
+            CodegenVisitor *visitor = ctx().visitor();
+            GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
+            if (generics && generics->in_type_param_scope())
+            {
+                std::string substituted = generics->substitute_type_annotation(instantiated_enum_name);
+                if (!substituted.empty() && substituted != instantiated_enum_name)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_enum_variant: Substituted partially-resolved enum name '{}' -> '{}'",
+                              instantiated_enum_name, substituted);
+                    instantiated_enum_name = substituted;
+                }
+            }
         }
         else
         {
@@ -1947,7 +1965,7 @@ namespace Cryo::Codegen
             return builder().CreateCall(ctor, coerced_args, variant_name);
         }
 
-        // For simple enum variants (no payload), look up the registered constant value
+        // Look up the registered variant constant (discriminant value)
         auto &enum_variants = ctx().enum_variants_map();
         auto it = enum_variants.find(qualified_variant);
         if (it == enum_variants.end() && instantiated_enum_name != resolved_enum_name)
@@ -1955,30 +1973,99 @@ namespace Cryo::Codegen
             // Try base name
             it = enum_variants.find(base_qualified_variant);
         }
-        if (it != enum_variants.end())
+
+        // Try with namespace prefix if direct lookup failed
+        if (it == enum_variants.end())
+        {
+            std::string current_ns = ctx().namespace_context();
+            if (!current_ns.empty())
+            {
+                std::string ns_qualified = current_ns + "::" + qualified_variant;
+                it = enum_variants.find(ns_qualified);
+                if (it == enum_variants.end() && instantiated_enum_name != resolved_enum_name)
+                {
+                    ns_qualified = current_ns + "::" + base_qualified_variant;
+                    it = enum_variants.find(ns_qualified);
+                }
+            }
+        }
+
+        // If variant has payload arguments, inline-construct the enum struct
+        // (the constructor function wasn't found, but we have the discriminant and args)
+        if (!args.empty() && it != enum_variants.end())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_enum_variant: Variant '{}' has {} payload args, inline constructing",
+                      it->first, args.size());
+
+            llvm::Value *disc_const = it->second;
+
+            // Find the enum struct type
+            llvm::Type *inline_enum_type = nullptr;
+            if (resolved_type_ref.is_valid())
+                inline_enum_type = types().map(resolved_type_ref);
+            if (!inline_enum_type)
+                inline_enum_type = types().get_type(instantiated_enum_name);
+            if (!inline_enum_type && instantiated_enum_name != resolved_enum_name)
+                inline_enum_type = types().get_type(resolved_enum_name);
+            // Fallback: use the current function's return type (common for return statements)
+            if (!inline_enum_type)
+            {
+                llvm::Function *fn = builder().GetInsertBlock()
+                    ? builder().GetInsertBlock()->getParent() : nullptr;
+                if (fn && fn->getReturnType()->isStructTy())
+                    inline_enum_type = fn->getReturnType();
+            }
+
+            if (inline_enum_type && inline_enum_type->isStructTy())
+            {
+                auto *struct_ty = llvm::cast<llvm::StructType>(inline_enum_type);
+
+                // Allocate the enum struct
+                llvm::Value *enum_alloca = create_entry_alloca(struct_ty, variant_name + ".ctor");
+
+                // Store discriminant
+                llvm::Value *disc_ptr = builder().CreateStructGEP(struct_ty, enum_alloca, 0, "disc_ptr");
+                llvm::Value *disc_val = disc_const;
+                if (disc_val->getType() != struct_ty->getElementType(0))
+                    disc_val = builder().CreateIntCast(disc_val, struct_ty->getElementType(0), true, "disc.cast");
+                builder().CreateStore(disc_val, disc_ptr);
+
+                // Store payload fields
+                if (struct_ty->getNumElements() > 1)
+                {
+                    llvm::Value *payload_ptr = builder().CreateStructGEP(struct_ty, enum_alloca, 1, "payload_ptr");
+                    size_t byte_offset = 0;
+                    for (size_t i = 0; i < args.size(); i++)
+                    {
+                        llvm::Value *field_ptr = builder().CreateConstGEP1_32(
+                            llvm::Type::getInt8Ty(llvm_ctx()), payload_ptr, byte_offset, "field_ptr");
+                        builder().CreateStore(args[i], field_ptr);
+
+                        llvm::Type *arg_type = args[i]->getType();
+                        if (arg_type->isSized())
+                            byte_offset += module()->getDataLayout().getTypeAllocSize(arg_type);
+                        else
+                            byte_offset += 8;
+                    }
+                }
+
+                return builder().CreateLoad(struct_ty, enum_alloca, variant_name + ".val");
+            }
+            else
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                         "generate_enum_variant: Could not find struct type for inline construction of '{}'",
+                         qualified_variant);
+            }
+        }
+
+        // For simple enum variants (no payload), return the registered constant
+        if (it != enum_variants.end() && args.empty())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "Found simple enum variant: {} -> constant", it->first);
             return it->second;
-        }
-
-        // Try with namespace prefix
-        std::string current_ns = ctx().namespace_context();
-        if (!current_ns.empty())
-        {
-            std::string ns_qualified = current_ns + "::" + qualified_variant;
-            it = enum_variants.find(ns_qualified);
-            if (it == enum_variants.end() && instantiated_enum_name != resolved_enum_name)
-            {
-                ns_qualified = current_ns + "::" + base_qualified_variant;
-                it = enum_variants.find(ns_qualified);
-            }
-            if (it != enum_variants.end())
-            {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "Found simple enum variant with namespace: {} -> constant", ns_qualified);
-                return it->second;
-            }
         }
 
         // Look up the enum type - use TypeMapper for proper caching
@@ -3521,6 +3608,21 @@ namespace Cryo::Codegen
             }
         }
 
+        if (!method || method->empty())
+        {
+            // Try on-demand instantiation of generic methods
+            // (e.g., map<U> on Maybe_i32 called as b.map(double))
+            // This also handles cases where resolve_method created an extern declaration
+            // with no body for a doubly-generic method like map<U> on Maybe<T>
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_instance_method: method '{}' on type '{}' is {} - trying on-demand instantiation",
+                      method_name, type_name,
+                      method ? "declared but empty (no body)" : "null");
+            llvm::Function *instantiated = try_instantiate_generic_method(node, type_name, method_name);
+            if (instantiated)
+                method = instantiated;
+        }
+
         if (!method)
         {
             // Report error if method not found
@@ -5045,6 +5147,270 @@ namespace Cryo::Codegen
         }
 
         return type_args;
+    }
+
+    //===================================================================
+    // On-Demand Generic Method Instantiation
+    //===================================================================
+
+    llvm::Function *CallCodegen::try_instantiate_generic_method(
+        Cryo::CallExpressionNode *node,
+        const std::string &type_name,
+        const std::string &method_name)
+    {
+        GenericCodegen *generics = ctx().visitor() ? ctx().visitor()->get_generics() : nullptr;
+        Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+        if (!generics || !template_registry)
+            return nullptr;
+
+        // Get the receiver's TypeRef to find the generic base and type args
+        // We need the callee to be a MemberAccessNode
+        if (!node->callee() || node->callee()->kind() != NodeKind::MemberAccess)
+            return nullptr;
+
+        auto *member = static_cast<Cryo::MemberAccessNode *>(node->callee());
+        if (!member->object())
+            return nullptr;
+
+        TypeRef obj_type = member->object()->get_resolved_type();
+
+        // Fallback: if the AST node doesn't have a resolved type, check variable_types_map
+        if ((!obj_type.is_valid() || obj_type->kind() != Cryo::TypeKind::InstantiatedType) &&
+            member->object()->kind() == NodeKind::Identifier)
+        {
+            auto *id = static_cast<Cryo::IdentifierNode *>(member->object());
+            auto &var_types = ctx().variable_types_map();
+            auto it = var_types.find(id->name());
+            if (it != var_types.end() && it->second.is_valid())
+            {
+                obj_type = it->second;
+            }
+        }
+
+        if (!obj_type.is_valid() || obj_type->kind() != Cryo::TypeKind::InstantiatedType)
+            return nullptr;
+
+        auto *inst = static_cast<const Cryo::InstantiatedType *>(obj_type.get());
+        if (!inst->generic_base().is_valid())
+            return nullptr;
+
+        std::string generic_base = inst->generic_base()->display_name();
+        const auto &enum_type_args = inst->type_args();
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "try_instantiate_generic_method: Trying on-demand instantiation of {}::{} "
+                  "(generic_base={}, enum_type_args={})",
+                  type_name, method_name, generic_base, enum_type_args.size());
+
+        // Look up the impl block for the generic base
+        Cryo::ImplementationBlockNode *impl_block = template_registry->get_enum_impl_block(generic_base);
+        if (!impl_block)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "try_instantiate_generic_method: No impl block for '{}'", generic_base);
+            return nullptr;
+        }
+
+        // Find the method by name that has its own generic parameters
+        Cryo::FunctionDeclarationNode *target_method = nullptr;
+        for (const auto &method_impl : impl_block->method_implementations())
+        {
+            if (method_impl->name() == method_name && !method_impl->generic_parameters().empty())
+            {
+                target_method = method_impl.get();
+                break;
+            }
+        }
+        if (!target_method)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "try_instantiate_generic_method: No generic method '{}' in impl block for '{}'",
+                      method_name, generic_base);
+            return nullptr;
+        }
+
+        // Get enum-level type params from the template
+        const Cryo::TemplateRegistry::TemplateInfo *tmpl_info = template_registry->find_template(generic_base);
+        std::vector<std::string> enum_type_params;
+        if (tmpl_info && tmpl_info->enum_template)
+        {
+            for (const auto &param : tmpl_info->enum_template->generic_parameters())
+            {
+                enum_type_params.push_back(param->name());
+            }
+        }
+
+        // Get method-level type params
+        std::vector<std::string> method_type_params;
+        for (const auto &param : target_method->generic_parameters())
+        {
+            method_type_params.push_back(param->name());
+        }
+
+        // Infer method-level type arguments from call arguments
+        std::vector<TypeRef> method_type_args;
+        const auto &method_params = target_method->parameters();
+        const auto &call_args = node->arguments();
+
+        for (const auto &method_param_name : method_type_params)
+        {
+            TypeRef inferred;
+
+            // Strategy 1: Check method parameters for FunctionType whose return type
+            // is a GenericParam matching the method type param we need to infer.
+            // Then look at the corresponding call argument to get the concrete type.
+            bool has_this = !method_params.empty() && method_params[0]->name() == "this";
+
+            for (size_t pi = 0; pi < method_params.size(); ++pi)
+            {
+                TypeRef param_type = method_params[pi]->get_resolved_type();
+                if (!param_type.is_valid())
+                    continue;
+
+                // Check if this param is a FunctionType with return type matching the generic param
+                if (param_type->kind() == Cryo::TypeKind::Function)
+                {
+                    auto *fn_type = static_cast<const Cryo::FunctionType *>(param_type.get());
+                    TypeRef ret = fn_type->return_type();
+                    if (ret.is_valid() && ret->kind() == Cryo::TypeKind::GenericParam &&
+                        ret->display_name() == method_param_name)
+                    {
+                        // Found it! Now infer from the corresponding call argument
+                        size_t call_arg_idx = has_this ? (pi - 1) : pi;
+                        if (call_arg_idx < call_args.size())
+                        {
+                            // Primary: check resolved type of the call argument
+                            TypeRef arg_type = call_args[call_arg_idx]->get_resolved_type();
+                            if (arg_type.is_valid() && arg_type->kind() == Cryo::TypeKind::Function)
+                            {
+                                auto *arg_fn = static_cast<const Cryo::FunctionType *>(arg_type.get());
+                                inferred = arg_fn->return_type();
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "try_instantiate_generic_method: Inferred {} = {} from call arg resolved type",
+                                          method_param_name, inferred.is_valid() ? inferred->display_name() : "null");
+                            }
+
+                            // Fallback: look up LLVM function by identifier name
+                            if (!inferred.is_valid() && call_args[call_arg_idx]->kind() == NodeKind::Identifier)
+                            {
+                                auto *id_node = static_cast<Cryo::IdentifierNode *>(call_args[call_arg_idx].get());
+                                std::string fn_name = id_node->name();
+
+                                std::string ns = ctx().namespace_context();
+                                llvm::Function *llvm_fn = nullptr;
+                                if (!ns.empty())
+                                    llvm_fn = module()->getFunction(ns + "::" + fn_name);
+                                if (!llvm_fn)
+                                    llvm_fn = module()->getFunction(fn_name);
+
+                                if (llvm_fn)
+                                {
+                                    llvm::Type *ret_ty = llvm_fn->getReturnType();
+                                    if (ret_ty->isIntegerTy(32))
+                                        inferred = symbols().arena().lookup_type_by_name("i32");
+                                    else if (ret_ty->isIntegerTy(64))
+                                        inferred = symbols().arena().lookup_type_by_name("i64");
+                                    else if (ret_ty->isIntegerTy(8))
+                                        inferred = symbols().arena().lookup_type_by_name("i8");
+                                    else if (ret_ty->isIntegerTy(16))
+                                        inferred = symbols().arena().lookup_type_by_name("i16");
+                                    else if (ret_ty->isIntegerTy(1))
+                                        inferred = symbols().arena().lookup_type_by_name("boolean");
+                                    else if (ret_ty->isFloatTy())
+                                        inferred = symbols().arena().lookup_type_by_name("f32");
+                                    else if (ret_ty->isDoubleTy())
+                                        inferred = symbols().arena().lookup_type_by_name("f64");
+                                    else if (ret_ty->isVoidTy())
+                                        inferred = symbols().arena().lookup_type_by_name("void");
+
+                                    if (inferred.is_valid())
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "try_instantiate_generic_method: Inferred {} = {} from LLVM function '{}'",
+                                                  method_param_name, inferred->display_name(), llvm_fn->getName().str());
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                // Also check TypeAnnotation as a fallback (some params retain the original annotation)
+                const auto *ann = method_params[pi]->type_annotation();
+                if (ann && ann->kind == TypeAnnotationKind::Function &&
+                    ann->return_type && ann->return_type->name == method_param_name)
+                {
+                    size_t call_arg_idx = has_this ? (pi - 1) : pi;
+                    if (call_arg_idx < call_args.size())
+                    {
+                        TypeRef arg_type = call_args[call_arg_idx]->get_resolved_type();
+                        if (arg_type.is_valid() && arg_type->kind() == Cryo::TypeKind::Function)
+                        {
+                            auto *arg_fn = static_cast<const Cryo::FunctionType *>(arg_type.get());
+                            inferred = arg_fn->return_type();
+                        }
+                    }
+                    break;
+                }
+            }
+
+            if (!inferred.is_valid())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "try_instantiate_generic_method: Could not infer type for param '{}'",
+                          method_param_name);
+                return nullptr;
+            }
+
+            method_type_args.push_back(inferred);
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "try_instantiate_generic_method: Inferred {} = {}",
+                      method_param_name, inferred->display_name());
+        }
+
+        // Combine enum type params + method type params
+        std::vector<std::string> all_type_params;
+        std::vector<TypeRef> all_type_args;
+        for (size_t i = 0; i < enum_type_params.size(); ++i)
+        {
+            all_type_params.push_back(enum_type_params[i]);
+            all_type_args.push_back(i < enum_type_args.size() ? enum_type_args[i] : TypeRef{});
+        }
+        for (size_t i = 0; i < method_type_params.size(); ++i)
+        {
+            all_type_params.push_back(method_type_params[i]);
+            all_type_args.push_back(i < method_type_args.size() ? method_type_args[i] : TypeRef{});
+        }
+
+        // Get namespace
+        std::string base_namespace;
+        if (tmpl_info && !tmpl_info->module_namespace.empty())
+        {
+            base_namespace = tmpl_info->module_namespace;
+        }
+        if (base_namespace.empty())
+        {
+            base_namespace = ctx().get_type_namespace(generic_base);
+        }
+        if (base_namespace.empty())
+        {
+            base_namespace = ctx().namespace_context();
+        }
+
+        // Call GenericCodegen to instantiate
+        llvm::Function *fn = generics->instantiate_method_for_type(
+            type_name, generic_base, all_type_params, all_type_args,
+            target_method, base_namespace);
+
+        if (fn)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "try_instantiate_generic_method: Successfully generated {}::{}",
+                      type_name, method_name);
+        }
+
+        return fn;
     }
 
 } // namespace Cryo::Codegen

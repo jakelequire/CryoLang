@@ -68,6 +68,7 @@ namespace Cryo::Codegen
         // Wire up inter-component dependencies
         // Statements needs ControlFlow for if/while/for/switch
         _statements->set_control_flow(_control_flow.get());
+        _statements->set_generic_codegen(_generics.get());
 
         // ControlFlow needs Statements for block generation
         _control_flow->set_statement_codegen(_statements.get());

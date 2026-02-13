@@ -12,6 +12,7 @@
 #include "Utils/Logger.hpp"
 
 #include <stdexcept>
+#include <algorithm>
 
 namespace Cryo::Codegen
 {
@@ -189,7 +190,7 @@ namespace Cryo::Codegen
         // Strip underscore separators from numeric literals (e.g., 1_000_000 -> 1000000)
         if (kind == TokenKind::TK_NUMERIC_CONSTANT)
         {
-            std::erase(value_str, '_');
+            value_str.erase(std::remove(value_str.begin(), value_str.end(), '_'), value_str.end());
         }
 
         // Parse based on literal kind
@@ -5205,6 +5206,29 @@ namespace Cryo::Codegen
                 type_name = resolved_type->display_name();
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "ExpressionCodegen: Using monomorphized type '{}'", type_name);
+            }
+        }
+
+        // When inside a type param scope, the Monomorphizer may have partially
+        // substituted the type name (e.g., "Maybe_U"). Apply substitution to resolve
+        // remaining type params (e.g., "Maybe_U" → "Maybe_i32" when U=i32).
+        {
+            CodegenVisitor *visitor = ctx().visitor();
+            GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
+            if (generics && generics->in_type_param_scope())
+            {
+                std::string substituted = generics->substitute_type_annotation(type_name);
+                if (!substituted.empty() && substituted != type_name)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "ExpressionCodegen: Substituted partially-resolved enum name '{}' -> '{}'",
+                              type_name, substituted);
+                    type_name = substituted;
+                    // Also update resolved_type to the substituted type
+                    TypeRef subst_type = symbols().arena().lookup_type_by_name(substituted);
+                    if (subst_type.is_valid())
+                        resolved_type = subst_type;
+                }
             }
         }
 

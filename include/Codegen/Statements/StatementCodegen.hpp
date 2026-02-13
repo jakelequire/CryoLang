@@ -13,6 +13,7 @@ namespace Cryo::Codegen
     // Forward declarations
     class ControlFlowCodegen;
     class ExpressionCodegen;
+    class GenericCodegen;
 
     /**
      * @brief Handles statement code generation
@@ -46,6 +47,11 @@ namespace Cryo::Codegen
          * @brief Set the expression codegen component
          */
         void set_expression_codegen(ExpressionCodegen *expressions) { _expressions = expressions; }
+
+        /**
+         * @brief Set the generic codegen component for type parameter substitution
+         */
+        void set_generic_codegen(GenericCodegen *generics) { _generics = generics; }
 
         //===================================================================
         // Main Entry Point
@@ -166,6 +172,7 @@ namespace Cryo::Codegen
     private:
         ControlFlowCodegen *_control_flow = nullptr;
         ExpressionCodegen *_expressions = nullptr;
+        GenericCodegen *_generics = nullptr;
 
         //===================================================================
         // Internal Helpers
