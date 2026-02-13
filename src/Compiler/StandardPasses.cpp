@@ -1620,6 +1620,24 @@ namespace Cryo
                 {
                     impl_type = _compiler.symbol_table()->lookup_class_type(type_name);
                 }
+                if (!impl_type.is_valid())
+                {
+                    impl_type = _compiler.symbol_table()->lookup_enum_type(type_name);
+                }
+                // For generic targets like "Option<T>": strip <...> suffix and retry
+                if (!impl_type.is_valid())
+                {
+                    auto angle_pos = type_name.find('<');
+                    if (angle_pos != std::string::npos)
+                    {
+                        std::string base_name = type_name.substr(0, angle_pos);
+                        impl_type = _compiler.symbol_table()->lookup_struct_type(base_name);
+                        if (!impl_type.is_valid())
+                            impl_type = _compiler.symbol_table()->lookup_class_type(base_name);
+                        if (!impl_type.is_valid())
+                            impl_type = _compiler.symbol_table()->lookup_enum_type(base_name);
+                    }
+                }
                 LOG_DEBUG(LogComponent::GENERAL, "GenericExpressionResolutionPass: Impl type lookup for '{}': {}",
                           type_name, impl_type.is_valid() ? "found" : "NOT FOUND");
                 // Process implementation block methods
@@ -1637,7 +1655,7 @@ namespace Cryo
     }
 
     /// Helper to check if a statement guarantees a return on all code paths.
-    static bool statement_always_returns(StatementNode *stmt)
+    static bool statement_always_returns(StatementNode *stmt, CompilerInstance *compiler = nullptr)
     {
         if (!stmt)
             return false;
@@ -1653,7 +1671,7 @@ namespace Cryo
             const auto &stmts = block->statements();
             if (stmts.empty())
                 return false;
-            return statement_always_returns(stmts.back().get());
+            return statement_always_returns(stmts.back().get(), compiler);
         }
 
         case NodeKind::IfStatement:
@@ -1661,8 +1679,8 @@ namespace Cryo
             auto *if_stmt = static_cast<IfStatementNode *>(stmt);
             if (!if_stmt->else_statement())
                 return false;
-            return statement_always_returns(if_stmt->then_statement()) &&
-                   statement_always_returns(if_stmt->else_statement());
+            return statement_always_returns(if_stmt->then_statement(), compiler) &&
+                   statement_always_returns(if_stmt->else_statement(), compiler);
         }
 
         case NodeKind::MatchStatement:
@@ -1672,10 +1690,10 @@ namespace Cryo
             if (arms.empty())
                 return false;
 
-            // Check all arms have return statements
+            // Check all arms have return statements (or diverge)
             for (const auto &arm : arms)
             {
-                if (!statement_always_returns(arm->body()))
+                if (!statement_always_returns(arm->body(), compiler))
                     return false;
             }
 
@@ -1692,18 +1710,138 @@ namespace Cryo
             if (match_expr)
             {
                 TypeRef match_type = match_expr->get_resolved_type();
+
+                // Unwrap reference types (e.g., match (&this) where &this is &Maybe<T>)
+                if (match_type.is_valid() && match_type->kind() == TypeKind::Reference)
+                {
+                    auto *ref_type = static_cast<const ReferenceType *>(match_type.get());
+                    match_type = ref_type->referent();
+                }
+
+                // Check plain enum types
                 if (match_type.is_valid() && match_type->kind() == TypeKind::Enum)
                 {
                     auto *enum_type = static_cast<const EnumType *>(match_type.get());
-                    // Count total patterns (handles multi-pattern arms with '|')
                     size_t total_patterns = 0;
                     for (const auto &arm : arms)
                         total_patterns += arm->patterns().size();
                     return total_patterns >= enum_type->variant_count();
                 }
+
+                // Check instantiated generic enum types (e.g., Maybe<T>, Option<int>)
+                if (match_type.is_valid() && match_type->kind() == TypeKind::InstantiatedType)
+                {
+                    auto *inst_type = static_cast<const InstantiatedType *>(match_type.get());
+                    TypeRef base = inst_type->generic_base();
+                    // Check if the base is an enum
+                    if (base.is_valid() && base->kind() == TypeKind::Enum)
+                    {
+                        auto *enum_type = static_cast<const EnumType *>(base.get());
+                        size_t total_patterns = 0;
+                        for (const auto &arm : arms)
+                            total_patterns += arm->patterns().size();
+                        return total_patterns >= enum_type->variant_count();
+                    }
+                    // Also check the resolved concrete type
+                    if (inst_type->has_resolved_type())
+                    {
+                        TypeRef resolved = inst_type->resolved_type();
+                        if (resolved.is_valid() && resolved->kind() == TypeKind::Enum)
+                        {
+                            auto *enum_type = static_cast<const EnumType *>(resolved.get());
+                            size_t total_patterns = 0;
+                            for (const auto &arm : arms)
+                                total_patterns += arm->patterns().size();
+                            return total_patterns >= enum_type->variant_count();
+                        }
+                    }
+                }
+            }
+
+            // Pattern-based fallback: if type info is unavailable (generic contexts),
+            // inspect the patterns themselves to determine exhaustiveness
+            if (compiler)
+            {
+                std::string common_enum_name;
+                size_t total_enum_patterns = 0;
+                bool all_enum_or_wildcard = true;
+
+                for (const auto &arm : arms)
+                {
+                    for (const auto &pat : arm->patterns())
+                    {
+                        if (pat->kind() == NodeKind::EnumPattern)
+                        {
+                            auto *enum_pat = static_cast<EnumPatternNode *>(pat.get());
+                            total_enum_patterns++;
+                            if (common_enum_name.empty())
+                                common_enum_name = enum_pat->enum_name();
+                            else if (common_enum_name != enum_pat->enum_name())
+                                all_enum_or_wildcard = false;
+                        }
+                        else if (pat->is_wildcard())
+                        {
+                            // Wildcard is fine, already checked above but handle multi-pattern arms
+                        }
+                        else
+                        {
+                            all_enum_or_wildcard = false;
+                        }
+                    }
+                }
+
+                if (all_enum_or_wildcard && !common_enum_name.empty())
+                {
+                    // Try to find the enum type by name to get variant count
+                    size_t expected_variants = 0;
+
+                    // First try the symbol table
+                    TypeRef enum_type_ref = compiler->symbol_table()->lookup_enum_type(common_enum_name);
+                    if (enum_type_ref.is_valid() && enum_type_ref->kind() == TypeKind::Enum)
+                    {
+                        auto *enum_type = static_cast<const EnumType *>(enum_type_ref.get());
+                        expected_variants = enum_type->variant_count();
+                    }
+
+                    // If not found, try the generic registry (for generic enums like Option, Result)
+                    if (expected_variants == 0)
+                    {
+                        auto tmpl = compiler->generic_registry()->get_template_by_name(common_enum_name);
+                        if (tmpl.has_value() && tmpl->ast_node)
+                        {
+                            if (auto *enum_decl = dynamic_cast<EnumDeclarationNode *>(tmpl->ast_node))
+                            {
+                                expected_variants = enum_decl->variants().size();
+                            }
+                        }
+                    }
+
+                    if (expected_variants > 0 && total_enum_patterns >= expected_variants)
+                    {
+                        return true;
+                    }
+                }
             }
 
             // Non-enum match without wildcard: can't prove exhaustiveness
+            return false;
+        }
+
+        // Recognize diverging function calls (panic, unreachable, abort, todo)
+        case NodeKind::ExpressionStatement:
+        {
+            auto *expr_stmt = static_cast<ExpressionStatementNode *>(stmt);
+            if (auto *call = dynamic_cast<CallExpressionNode *>(expr_stmt->expression()))
+            {
+                if (auto *ident = dynamic_cast<IdentifierNode *>(call->callee()))
+                {
+                    const std::string &name = ident->name();
+                    if (name == "panic" || name == "unreachable" || name == "abort" || name == "todo")
+                    {
+                        return true;
+                    }
+                }
+            }
             return false;
         }
 
@@ -1755,7 +1893,7 @@ namespace Cryo
             return_type->kind() != TypeKind::Void &&
             return_type->kind() != TypeKind::Unit)
         {
-            if (!statement_always_returns(func->body()))
+            if (!statement_always_returns(func->body(), &_compiler))
             {
                 std::string msg = "function '" + func->name() +
                                   "' has return type '" + return_type->display_name() +
