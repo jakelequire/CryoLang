@@ -1,6 +1,7 @@
 #include "Codegen/Statements/StatementCodegen.hpp"
 #include "Codegen/Statements/ControlFlowCodegen.hpp"
 #include "Codegen/Expressions/ExpressionCodegen.hpp"
+#include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Utils/Logger.hpp"
 
@@ -269,6 +270,21 @@ namespace Cryo::Codegen
                 auto *alias = static_cast<const Cryo::TypeAliasType *>(resolved.get());
                 resolved = alias->target();
             }
+
+            // Inside a generic instantiation (e.g., struct method body), substitute type
+            // parameters so that Bucket<K, V>* becomes Bucket<int, string>* when K=int, V=string.
+            if (_generics && _generics->in_type_param_scope() && resolved.is_valid())
+            {
+                TypeRef substituted = _generics->substitute_type_params(resolved);
+                if (substituted.is_valid() && substituted != resolved)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "StatementCodegen: Substituted var '{}' type {} -> {}",
+                              name, resolved->display_name(), substituted->display_name());
+                    resolved = substituted;
+                }
+            }
+
             var_type = types().map(resolved);
         }
         if (!var_type)

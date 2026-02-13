@@ -217,6 +217,14 @@ namespace Cryo
         TypeRef create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeArena *type_arena);
 
         /**
+         * @brief Resolve a generic type string like "Maybe<int>" to an InstantiatedType
+         * @param type_str The generic type string (e.g., "Maybe<int>", "Result<string, i32>")
+         * @param type_arena TypeArena for type creation and lookup
+         * @return Instantiated type or invalid TypeRef if resolution fails
+         */
+        TypeRef resolve_generic_type_string(const std::string &type_str, TypeArena *type_arena);
+
+        /**
          * @brief Resolve a primitive type annotation string to a Type object
          * @param type_str The type annotation string (e.g., "boolean", "i32")
          * @param arena TypeArena for getting primitive types

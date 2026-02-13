@@ -118,6 +118,28 @@ namespace Cryo::Codegen
                                             const std::string &method_name,
                                             const std::vector<TypeRef> &type_args);
 
+        /**
+         * @brief Instantiate a specific method on an already-instantiated type
+         *
+         * Used for on-demand generation of "doubly generic" methods like map<U>
+         * on Maybe<T> when called with concrete type arguments at the call site.
+         *
+         * @param mangled_type Instantiated type name (e.g., "Maybe_i32")
+         * @param generic_base Generic base name (e.g., "Maybe")
+         * @param all_type_params Combined type params (e.g., ["T", "U"])
+         * @param all_type_args Combined type args (e.g., [i32, i32])
+         * @param method The method AST node to generate
+         * @param base_namespace Namespace for scope resolution
+         * @return Generated LLVM function, or nullptr on failure
+         */
+        llvm::Function *instantiate_method_for_type(
+            const std::string &mangled_type,
+            const std::string &generic_base,
+            const std::vector<std::string> &all_type_params,
+            const std::vector<TypeRef> &all_type_args,
+            Cryo::FunctionDeclarationNode *method,
+            const std::string &base_namespace);
+
         //===================================================================
         // Type Parameter Handling
         //===================================================================

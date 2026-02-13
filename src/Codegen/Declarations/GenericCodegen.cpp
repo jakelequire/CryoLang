@@ -2111,6 +2111,247 @@ namespace Cryo::Codegen
         return instantiate_function(qualified, type_args);
     }
 
+    llvm::Function *GenericCodegen::instantiate_method_for_type(
+        const std::string &mangled_type,
+        const std::string &generic_base,
+        const std::vector<std::string> &all_type_params,
+        const std::vector<TypeRef> &all_type_args,
+        Cryo::FunctionDeclarationNode *method,
+        const std::string &base_namespace)
+    {
+        if (!method || !_declarations)
+            return nullptr;
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "GenericCodegen::instantiate_method_for_type: {}::{} with {} type params",
+                  mangled_type, method->name(), all_type_params.size());
+
+        // Save parent context
+        auto saved_fn_ctx = ctx().release_current_function();
+        llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
+        std::string saved_type_name = ctx().current_type_name();
+        std::string saved_namespace = ctx().namespace_context();
+
+        // Set namespace context
+        if (!base_namespace.empty())
+        {
+            ctx().set_namespace_context(base_namespace);
+        }
+
+        // Begin type parameter scope with combined params
+        begin_type_params(all_type_params, all_type_args, generic_base, mangled_type);
+
+        // Register partially-substituted type names as redirects.
+        // The Monomorphizer already substituted enum-level params (T→i32) but left
+        // method-level params (U) as-is, producing names like "Maybe_U".
+        // We need to redirect "Maybe_U" → "Maybe_i32" for variant resolution.
+        // Build the partial name: generic_base + "_" + method-level param names
+        // and register variants under the fully-substituted name.
+        {
+            // Build the partially-substituted name (e.g., "Maybe_U")
+            std::string partial_name = generic_base;
+            for (const auto &param : all_type_params)
+            {
+                // Check if this param has a concrete binding in our scope
+                TypeRef binding = resolve_type_param(param);
+                if (binding.is_valid())
+                {
+                    partial_name += "_" + binding->display_name();
+                }
+                else
+                {
+                    partial_name += "_" + param;
+                }
+            }
+
+            // The Monomorphizer produces names with only enum-level params substituted
+            // e.g., for Maybe<T> with T=i32, method-level U stays: "Maybe_U"
+            // Compute this: substitute only enum-level params, leave method-level as param names
+            std::string mono_partial = generic_base;
+            // Enum-level params come first in all_type_params
+            Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+            size_t enum_param_count = 0;
+            if (template_registry)
+            {
+                const auto *tmpl_info = template_registry->find_template(generic_base);
+                if (tmpl_info && tmpl_info->enum_template)
+                {
+                    enum_param_count = tmpl_info->enum_template->generic_parameters().size();
+                }
+            }
+            // Build partial name: enum params substituted, method params as names
+            for (size_t i = enum_param_count; i < all_type_params.size(); ++i)
+            {
+                mono_partial = generic_base + "_" + all_type_params[i];
+            }
+
+            if (mono_partial != mangled_type && mono_partial != generic_base)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen::instantiate_method_for_type: Registering partial redirect {} -> {}",
+                          mono_partial, mangled_type);
+
+                // Register enum variants under the partial name pointing to the real ones
+                // Look up existing variants for mangled_type and register under mono_partial
+                Cryo::EnumDeclarationNode *enum_decl = nullptr;
+                if (template_registry)
+                {
+                    const auto *tmpl_info = template_registry->find_template(generic_base);
+                    if (tmpl_info && tmpl_info->enum_template)
+                        enum_decl = tmpl_info->enum_template;
+                }
+                auto &variants_map = ctx().enum_variants_map();
+                if (enum_decl)
+                {
+                    for (const auto &variant : enum_decl->variants())
+                    {
+                        std::string real_variant = mangled_type + "::" + variant->name();
+                        std::string partial_variant = mono_partial + "::" + variant->name();
+                        // Look up the discriminant from the real variant
+                        llvm::Value *disc = nullptr;
+                        auto it = variants_map.find(real_variant);
+                        if (it != variants_map.end())
+                            disc = it->second;
+                        if (!disc && !base_namespace.empty())
+                        {
+                            auto it2 = variants_map.find(base_namespace + "::" + real_variant);
+                            if (it2 != variants_map.end())
+                                disc = it2->second;
+                        }
+                        if (disc)
+                        {
+                            ctx().register_enum_variant(partial_variant, disc);
+                            if (!base_namespace.empty())
+                            {
+                                ctx().register_enum_variant(base_namespace + "::" + partial_variant, disc);
+                            }
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "GenericCodegen::instantiate_method_for_type: Registered variant redirect {} -> {}",
+                                      partial_variant, real_variant);
+                        }
+                    }
+                }
+
+                // Variant constructor functions (Maybe_i32::Just) will be found via
+                // substitute_type_annotation redirecting "Maybe_U" → "Maybe_i32" at call sites
+            }
+        }
+
+        // Generate method declaration (force_allow_generic = true to bypass generic skip)
+        llvm::Function *fn = _declarations->generate_method_declaration(method, mangled_type, /*force_allow_generic=*/true);
+        if (fn && method->body() && fn->empty())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "GenericCodegen::instantiate_method_for_type: Generating body for {}::{}",
+                      mangled_type, method->name());
+
+            // Create entry block
+            llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+            builder().SetInsertPoint(entry);
+
+            // Set up function context
+            auto fn_ctx = std::make_unique<FunctionContext>(fn, method);
+            fn_ctx->entry_block = entry;
+            ctx().set_current_function(std::move(fn_ctx));
+
+            // Set current type name for this.field resolution
+            ctx().set_current_type_name(mangled_type);
+
+            // Enter function scope
+            values().enter_scope(fn->getName().str());
+
+            // Allocate parameters and register their types
+            const auto &ast_params = method->parameters();
+            unsigned param_idx = 0;
+            for (auto &arg : fn->args())
+            {
+                std::string param_name = arg.getName().str();
+
+                llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
+                create_store(&arg, alloca);
+                values().set_value(param_name, nullptr, alloca);
+
+                if (param_name == "this")
+                {
+                    TypeRef this_type = symbols().arena().lookup_type_by_name(mangled_type);
+                    if (this_type.is_valid())
+                    {
+                        TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
+                        ctx().variable_types_map()[param_name] = this_ptr;
+                    }
+                }
+                else if (param_idx < ast_params.size() + 1)
+                {
+                    bool ast_has_explicit_this = !ast_params.empty() &&
+                        ast_params[0]->name() == "this";
+                    size_t ast_idx = ast_has_explicit_this ? param_idx :
+                        (param_idx > 0 ? param_idx - 1 : param_idx);
+                    if (ast_idx < ast_params.size())
+                    {
+                        TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
+                        TypeRef substituted = substitute_type_params(param_type);
+                        if (substituted.is_valid())
+                        {
+                            ensure_dependent_types_instantiated(substituted);
+                            ctx().variable_types_map()[param_name] = substituted;
+                        }
+                    }
+                }
+                param_idx++;
+            }
+
+            // Generate method body
+            CodegenVisitor *visitor = ctx().visitor();
+            if (visitor && method->body())
+            {
+                method->body()->accept(*visitor);
+            }
+
+            // Add implicit return if needed
+            llvm::BasicBlock *current_block = builder().GetInsertBlock();
+            if (current_block && !current_block->getTerminator())
+            {
+                if (fn->getReturnType()->isVoidTy())
+                {
+                    builder().CreateRetVoid();
+                }
+                else
+                {
+                    builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+                }
+            }
+
+            // Verify function
+            if (llvm::verifyFunction(*fn, &llvm::errs()))
+            {
+                LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen::instantiate_method_for_type: verification failed for {}::{}",
+                          mangled_type, method->name());
+            }
+
+            // Clean up method scope
+            values().exit_scope();
+            ctx().set_result(nullptr);
+        }
+
+        // End type parameter scope
+        end_type_params();
+
+        // Restore parent context
+        if (saved_fn_ctx)
+        {
+            ctx().set_current_function(std::move(saved_fn_ctx));
+        }
+        if (saved_insert_block)
+        {
+            builder().SetInsertPoint(saved_insert_block);
+        }
+        ctx().set_current_type_name(saved_type_name);
+        ctx().set_namespace_context(saved_namespace);
+
+        return fn;
+    }
+
     //===================================================================
     // Type Parameter Handling
     //===================================================================
@@ -2178,6 +2419,49 @@ namespace Cryo::Codegen
                           type_annotation, resolved->display_name());
                 return resolved->display_name();
             }
+
+            // Check for underscore-mangled names (e.g., "Maybe_U" from Monomorphizer)
+            // where a suffix component is a bound type parameter.
+            // Try replacing type param names after underscores with their concrete types.
+            size_t underscore_pos = type_annotation.find('_');
+            if (underscore_pos != std::string::npos)
+            {
+                std::string result = type_annotation;
+                bool any_substituted = false;
+                const auto &scope = _type_param_stack.back();
+                for (const auto &[param_name, binding] : scope.bindings)
+                {
+                    if (!binding.is_valid())
+                        continue;
+                    // Look for _ParamName as a component in the mangled name
+                    std::string search = "_" + param_name;
+                    size_t pos = result.find(search);
+                    while (pos != std::string::npos)
+                    {
+                        // Make sure it's a complete component (followed by _ or end of string)
+                        size_t end = pos + search.size();
+                        if (end == result.size() || result[end] == '_')
+                        {
+                            std::string replacement = "_" + binding->display_name();
+                            result.replace(pos, search.size(), replacement);
+                            any_substituted = true;
+                            pos = result.find(search, pos + replacement.size());
+                        }
+                        else
+                        {
+                            pos = result.find(search, end);
+                        }
+                    }
+                }
+                if (any_substituted)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "substitute_type_annotation: Mangled name '{}' -> '{}'",
+                              type_annotation, result);
+                    return result;
+                }
+            }
+
             // Also check for exact base name match (handled by get_instantiated_scope_name)
             return get_instantiated_scope_name(type_annotation);
         }

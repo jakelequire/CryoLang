@@ -136,6 +136,78 @@ TypeRef ASTTypeSubstituter::resolve_type_string_with_modifiers(const std::string
         base_type = _arena.lookup_type_by_name(remaining);
     }
 
+    // Handle generic type expressions like "Bucket<K,V>" where K,V are type parameters
+    if (!base_type.is_valid())
+    {
+        size_t angle_pos = remaining.find('<');
+        if (angle_pos != std::string::npos && remaining.back() == '>')
+        {
+            std::string generic_name = remaining.substr(0, angle_pos);
+            std::string args_str = remaining.substr(angle_pos + 1, remaining.size() - angle_pos - 2);
+
+            // Look up the generic base type
+            TypeRef generic_base = _arena.lookup_type_by_name(generic_name);
+            if (generic_base.is_valid())
+            {
+                // Parse and resolve each type argument, handling nested generics
+                std::vector<TypeRef> type_args;
+                bool args_valid = true;
+                size_t start = 0;
+                int depth = 0;
+                for (size_t i = 0; i <= args_str.size(); ++i)
+                {
+                    if (i == args_str.size() || (args_str[i] == ',' && depth == 0))
+                    {
+                        std::string arg = args_str.substr(start, i - start);
+                        // Trim whitespace
+                        while (!arg.empty() && std::isspace(arg.front()))
+                            arg.erase(0, 1);
+                        while (!arg.empty() && std::isspace(arg.back()))
+                            arg.pop_back();
+
+                        // Recursively resolve the argument (handles nested generics and modifiers)
+                        TypeRef resolved_arg = resolve_type_string_with_modifiers(arg);
+                        if (!resolved_arg.is_valid())
+                        {
+                            resolved_arg = lookup_type_param(arg);
+                        }
+                        if (!resolved_arg.is_valid())
+                        {
+                            resolved_arg = _arena.lookup_type_by_name(arg);
+                        }
+                        if (!resolved_arg.is_valid())
+                        {
+                            args_valid = false;
+                            break;
+                        }
+                        type_args.push_back(resolved_arg);
+                        start = i + 1;
+                    }
+                    else if (args_str[i] == '<')
+                    {
+                        depth++;
+                    }
+                    else if (args_str[i] == '>')
+                    {
+                        depth--;
+                    }
+                }
+
+                if (args_valid && !type_args.empty())
+                {
+                    base_type = _arena.create_instantiation(generic_base, std::move(type_args));
+                    if (base_type.is_valid())
+                    {
+                        _arena.register_instantiated_by_name(base_type);
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "ASTTypeSubstituter::resolve_type_string_with_modifiers: Resolved generic '{}' -> {}",
+                                  remaining, base_type->display_name());
+                    }
+                }
+            }
+        }
+    }
+
     if (!base_type.is_valid())
     {
         LOG_DEBUG(LogComponent::GENERAL,

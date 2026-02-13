@@ -383,6 +383,23 @@ namespace Cryo::Codegen
          */
         llvm::Type *parse_type_annotation_to_llvm(const std::string &annotation);
 
+        /**
+         * @brief Try on-demand instantiation of a generic method on an instantiated type
+         *
+         * For "doubly generic" methods like map<U> on Maybe<T>, the method body
+         * is not generated during type instantiation. This resolves them at the
+         * call site by inferring method-level type arguments from the call arguments.
+         *
+         * @param node Call expression (for argument info)
+         * @param type_name Instantiated type name (e.g., "Maybe_i32")
+         * @param method_name Method name (e.g., "map")
+         * @return Generated LLVM function, or nullptr if not applicable
+         */
+        llvm::Function *try_instantiate_generic_method(
+            Cryo::CallExpressionNode *node,
+            const std::string &type_name,
+            const std::string &method_name);
+
         // Static sets for type checking
         static const std::unordered_set<std::string> _primitive_types;
         static const std::unordered_set<std::string> _runtime_functions;
