@@ -114,6 +114,7 @@ class CompilerDriver:
                 str(self.cryo_binary),
                 str(project_dir / entry_point),
                 "--raw",
+                "--emit-llvm",
                 "-o", str(output_path),
             ]
             if test.metadata.compiler_args:

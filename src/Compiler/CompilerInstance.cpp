@@ -868,6 +868,58 @@ namespace Cryo
         }
     }
 
+    bool CompilerInstance::compile_for_lsp_from_content(const std::string &virtual_path, const std::string &content)
+    {
+        try
+        {
+            _lsp_mode = true;
+            _frontend_only = true;
+
+            if (_debug_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::LSP, "Starting LSP compilation from content for: {}", virtual_path);
+            }
+
+            set_source_file(virtual_path);
+
+            auto file = make_file_from_string(virtual_path, content);
+            if (!file)
+            {
+                _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, "LSP: Failed to create in-memory file"));
+                return false;
+            }
+
+            if (!parse_source_from_file(std::move(file)))
+            {
+                if (_debug_mode)
+                {
+                    LOG_ERROR(Cryo::LogComponent::LSP, "LSP: Parse failed for {}", virtual_path);
+                }
+                // Don't return false - provide partial information even with parse errors
+            }
+
+            // Note: analyze() is intentionally skipped here.
+            // The LSP only needs the parsed AST for hover/tokens/diagnostics.
+            // Semantic analysis is crash-prone on incomplete code and runs separately
+            // if needed via the public analyze() method.
+
+            if (_debug_mode)
+            {
+                LOG_DEBUG(Cryo::LogComponent::LSP, "LSP content compilation completed for: {}", virtual_path);
+            }
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            if (_debug_mode)
+            {
+                LOG_ERROR(Cryo::LogComponent::LSP, "LSP content compilation exception: {}", e.what());
+            }
+            _diagnostics->emit(Diag::error(ErrorCode::E0000_UNKNOWN, std::string("LSP compilation exception: ") + e.what()));
+            return false;
+        }
+    }
+
     void CompilerInstance::print_ast(std::ostream &os, bool use_colors) const
     {
         if (_ast_root)
