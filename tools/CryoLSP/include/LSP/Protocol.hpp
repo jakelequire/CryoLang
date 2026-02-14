@@ -120,6 +120,9 @@ namespace CryoLSP
         std::string detail;
         std::string documentation;
         std::string insertText;
+        std::string sortText;
+        std::string filterText;
+        int insertTextFormat = 1; // 1=PlainText, 2=Snippet
     };
 
     struct CompletionList

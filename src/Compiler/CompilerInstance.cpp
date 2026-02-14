@@ -270,6 +270,18 @@ namespace Cryo
                 return false;
             }
 
+            // In frontend-only mode (LSP), skip semantic analysis and IR generation.
+            // The LSP only needs the parsed AST for hover/tokens/diagnostics.
+            // Running analyze() on incomplete or raw-mode code can corrupt AST nodes.
+            if (_frontend_only)
+            {
+                if (_debug_mode)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Frontend-only mode: skipping analyze() and generate_ir()");
+                }
+                return true;
+            }
+
             // Phase 5: Semantic analysis (including symbol table population)
             if (!analyze())
             {
@@ -419,6 +431,14 @@ namespace Cryo
                 {
                     LOG_DEBUG(Cryo::LogComponent::GENERAL, "Parsed namespace: {}", _parser->current_namespace());
                 }
+            }
+
+            // In frontend-only mode (LSP), we only need the parsed AST.
+            // Skip CodeGenerator creation, visitor initialization, and TypeMapper registration
+            // which can corrupt AST nodes when run on raw-mode / incomplete code.
+            if (_frontend_only)
+            {
+                return _ast_root != nullptr;
             }
 
             // Create CodeGenerator now that we have the namespace information

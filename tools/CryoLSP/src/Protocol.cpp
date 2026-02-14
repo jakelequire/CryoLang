@@ -156,6 +156,12 @@ namespace CryoLSP
         }
         if (!item.insertText.empty())
             obj["insertText"] = cjson::JsonValue(item.insertText);
+        if (!item.sortText.empty())
+            obj["sortText"] = cjson::JsonValue(item.sortText);
+        if (!item.filterText.empty())
+            obj["filterText"] = cjson::JsonValue(item.filterText);
+        if (item.insertTextFormat != 1)
+            obj["insertTextFormat"] = cjson::JsonValue(item.insertTextFormat);
         return cjson::JsonValue(std::move(obj));
     }
 

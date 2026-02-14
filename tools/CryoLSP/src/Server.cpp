@@ -14,7 +14,7 @@ namespace CryoLSP
         : _diagnosticsProvider(_engine, _transport),
           _hoverProvider(_engine),
           _definitionProvider(_engine),
-          _completionProvider(_engine),
+          _completionProvider(_engine, _documents),
           _symbolProvider(_engine),
           _referencesProvider(_engine),
           _signatureHelpProvider(_engine),
@@ -350,7 +350,17 @@ namespace CryoLSP
     cjson::JsonValue Server::handleCompletion(const cjson::JsonValue &params)
     {
         auto tdp = text_document_position_from_json(params);
-        auto result = _completionProvider.getCompletions(tdp.textDocument.uri, tdp.position);
+
+        // Extract trigger character from completion context
+        std::string triggerCharacter;
+        if (params.is_object() && params.as_object().contains("context") &&
+            params["context"].is_object() && params["context"].as_object().contains("triggerCharacter") &&
+            params["context"]["triggerCharacter"].is_string())
+        {
+            triggerCharacter = params["context"]["triggerCharacter"].get_string();
+        }
+
+        auto result = _completionProvider.getCompletions(tdp.textDocument.uri, tdp.position, triggerCharacter);
         return completion_list_to_json(result);
     }
 
@@ -434,6 +444,7 @@ namespace CryoLSP
         triggerChars.push_back(cjson::JsonValue(":"));
         triggerChars.push_back(cjson::JsonValue("<"));
         completionProvider["triggerCharacters"] = cjson::JsonValue(std::move(triggerChars));
+        completionProvider["resolveProvider"] = cjson::JsonValue(false);
         caps["completionProvider"] = cjson::JsonValue(std::move(completionProvider));
 
         // Document symbols
