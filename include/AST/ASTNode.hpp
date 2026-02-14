@@ -435,9 +435,15 @@ namespace Cryo
     private:
         std::string _documentation; // Documentation comment associated with this declaration
         std::string _source_module; // Track which module this declaration originated from (empty = current module)
+        SourceLocation _name_location; // Location of the declaration's name identifier (for LSP semantic tokens)
 
     public:
         DeclarationNode(NodeKind kind, SourceLocation loc) : ASTNode(kind, loc) {}
+
+        // Name location (points to the identifier, not the keyword)
+        const SourceLocation &name_location() const { return _name_location; }
+        void set_name_location(const SourceLocation &loc) { _name_location = loc; }
+        bool has_name_location() const { return _name_location.line() > 0; }
 
         // Documentation support
         const std::string &documentation() const { return _documentation; }
@@ -2019,12 +2025,16 @@ namespace Cryo
     {
     private:
         std::string _type_name;
+        SourceLocation _type_location;
 
     public:
         SizeofExpressionNode(SourceLocation loc, std::string type_name)
             : ExpressionNode(NodeKind::SizeofExpression, loc), _type_name(std::move(type_name)) {}
 
         const std::string &type_name() const { return _type_name; }
+        const SourceLocation &type_location() const { return _type_location; }
+        void set_type_location(const SourceLocation &loc) { _type_location = loc; }
+        bool has_type_location() const { return _type_location.line() > 0; }
 
         void print(std::ostream &os, int indent = 0) const override
         {
@@ -2041,12 +2051,16 @@ namespace Cryo
     {
     private:
         std::string _type_name;
+        SourceLocation _type_location;
 
     public:
         AlignofExpressionNode(SourceLocation loc, std::string type_name)
             : ExpressionNode(NodeKind::AlignofExpression, loc), _type_name(std::move(type_name)) {}
 
         const std::string &type_name() const { return _type_name; }
+        const SourceLocation &type_location() const { return _type_location; }
+        void set_type_location(const SourceLocation &loc) { _type_location = loc; }
+        bool has_type_location() const { return _type_location.line() > 0; }
 
         void print(std::ostream &os, int indent = 0) const override
         {
@@ -2396,6 +2410,7 @@ namespace Cryo
     private:
         std::unique_ptr<ExpressionNode> _object;
         std::string _member;
+        SourceLocation _member_location;
 
     public:
         MemberAccessNode(SourceLocation loc, std::unique_ptr<ExpressionNode> object,
@@ -2405,6 +2420,9 @@ namespace Cryo
 
         ExpressionNode *object() const { return _object.get(); }
         const std::string &member() const { return _member; }
+        const SourceLocation &member_location() const { return _member_location; }
+        void set_member_location(const SourceLocation &loc) { _member_location = loc; }
+        bool has_member_location() const { return _member_location.line() > 0; }
 
         void print(std::ostream &os, int indent = 0) const override
         {

@@ -239,6 +239,7 @@ namespace Cryo
 
         // LSP-specific compilation mode
         bool compile_for_lsp(const std::string &source_file);
+        bool compile_for_lsp_from_content(const std::string &virtual_path, const std::string &content);
         void set_lsp_mode(bool enabled) { _lsp_mode = enabled; }
         bool is_lsp_mode() const { return _lsp_mode; }
         void clear();
