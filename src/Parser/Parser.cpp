@@ -1477,6 +1477,7 @@ namespace Cryo
 
         // Parse required colon and type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after variable name");
+        SourceLocation type_loc = _current_token.location();
         std::string type_string;
         TypeRef var_type = parse_type_annotation(&type_string);
 
@@ -1495,8 +1496,9 @@ namespace Cryo
 
         // Create the variable declaration with the TypeAnnotation to preserve type info for resolution
         auto type_annotation = std::make_unique<TypeAnnotation>(
-            TypeAnnotation::named(type_string, start_loc));
+            TypeAnnotation::named(type_string, type_loc));
         auto var_decl = _builder.create_variable_declaration(start_loc, var_name, std::move(type_annotation), std::move(initializer), is_mutable, is_global);
+        var_decl->set_name_location(name_token.location());
 
         // Also set the resolved type (may be an error type for generic types, will be resolved later)
         var_decl->set_resolved_type(var_type);
@@ -1573,6 +1575,7 @@ namespace Cryo
         // Create function declaration early so we can add generic parameters
         TypeRef void_type = resolve_type_from_string("void");
         auto func_decl = _builder.create_function_declaration(start_loc, func_name, void_type, is_public);
+        func_decl->set_name_location(name_token.location());
 
         // Attach documentation if available
         attach_documentation(func_decl.get());
@@ -1608,9 +1611,11 @@ namespace Cryo
         // Parse return type
         TypeRef return_type = _context.types().get_void();
         std::string return_type_string = "void"; // Track the type string for TypeAnnotation
+        SourceLocation return_type_loc;
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
+            return_type_loc = _current_token.location();
             return_type = parse_type_annotation(&return_type_string);
         }
 
@@ -1622,7 +1627,7 @@ namespace Cryo
         if (!return_type_string.empty())
         {
             auto annotation = std::make_unique<TypeAnnotation>(
-                TypeAnnotation::named(return_type_string, start_loc));
+                TypeAnnotation::named(return_type_string, return_type_loc));
             func_decl->set_return_type_annotation(std::move(annotation));
         }
 
@@ -1700,9 +1705,11 @@ namespace Cryo
         // Parse return type
         TypeRef return_type = _context.types().get_void();
         std::string return_type_string = "void"; // Track the type string for TypeAnnotation
+        SourceLocation return_type_loc;
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
+            return_type_loc = _current_token.location();
             return_type = parse_type_annotation(&return_type_string);
         }
 
@@ -1714,7 +1721,7 @@ namespace Cryo
         if (!return_type_string.empty())
         {
             auto annotation = std::make_unique<TypeAnnotation>(
-                TypeAnnotation::named(return_type_string, start_loc));
+                TypeAnnotation::named(return_type_string, return_type_loc));
             func_decl->set_return_type_annotation(std::move(annotation));
         }
 
@@ -1904,6 +1911,7 @@ namespace Cryo
         std::string alias;
         bool has_alias = false;
         bool using_from_syntax = false;
+        SourceLocation module_path_loc; // Track start of the module path for LSP
 
         // Check if we have a wildcard (*) or specific imports before 'from'
         if (_current_token.is(TokenKind::TK_STAR))
@@ -1922,6 +1930,7 @@ namespace Cryo
         else if (_current_token.is(TokenKind::TK_IDENTIFIER))
         {
             // Could be: import IO from core::stdio; or import IO, Function from core::stdio; or import core::option;
+            SourceLocation first_ident_loc = _current_token.location();
             std::string first_identifier = std::string(_current_token.text());
             advance(); // consume identifier
 
@@ -1947,12 +1956,14 @@ namespace Cryo
             {
                 // This is module path syntax: import core::option;
                 module_path = first_identifier;
+                module_path_loc = first_ident_loc;
                 // Continue parsing the module path
             }
             else if (_current_token.is(TokenKind::TK_SEMICOLON) || _current_token.is(TokenKind::TK_KW_AS))
             {
                 // Simple bare module import: import Foo;  or  import Foo as Bar;
                 module_path = first_identifier;
+                module_path_loc = first_ident_loc;
             }
             else
             {
@@ -1973,6 +1984,7 @@ namespace Cryo
                 throw ParseError("Expected module path after 'from' or 'import'", _current_token.location());
             }
 
+            module_path_loc = _current_token.location();
             module_path = std::string(_current_token.text());
             advance(); // consume first identifier
         }
@@ -2007,8 +2019,10 @@ namespace Cryo
                     advance();
 
                 // Create SpecificImport node with module_path as the base path
-                return std::make_unique<ImportDeclarationNode>(
+                auto import_node = std::make_unique<ImportDeclarationNode>(
                     start_loc, std::move(multi_imports), module_path);
+                import_node->set_name_location(module_path_loc);
+                return import_node;
             }
 
             // Accept both identifiers and keywords as valid path segments
@@ -2039,17 +2053,23 @@ namespace Cryo
         if (!specific_imports.empty())
         {
             // Specific import: import IO from core::stdio;
-            return std::make_unique<ImportDeclarationNode>(start_loc, std::move(specific_imports), module_path);
+            auto import_node = std::make_unique<ImportDeclarationNode>(start_loc, std::move(specific_imports), module_path);
+            import_node->set_name_location(module_path_loc);
+            return import_node;
         }
         else if (has_alias)
         {
             // Import with alias: import core::option as Option;
-            return std::make_unique<ImportDeclarationNode>(start_loc, module_path, alias);
+            auto import_node = std::make_unique<ImportDeclarationNode>(start_loc, module_path, alias);
+            import_node->set_name_location(module_path_loc);
+            return import_node;
         }
         else
         {
             // Wildcard import: import core::option;
-            return std::make_unique<ImportDeclarationNode>(start_loc, module_path);
+            auto import_node = std::make_unique<ImportDeclarationNode>(start_loc, module_path);
+            import_node->set_name_location(module_path_loc);
+            return import_node;
         }
     }
 
@@ -3741,6 +3761,7 @@ namespace Cryo
             std::string var_name = std::string(name_token.text());
 
             consume(TokenKind::TK_COLON, "Expected ':' after variable name");
+            SourceLocation type_loc = _current_token.location();
             std::string type_string;
             TypeRef var_type = parse_type_annotation(&type_string);
 
@@ -3756,7 +3777,7 @@ namespace Cryo
             // For-loop variables are implicitly mutable
             // Create with TypeAnnotation to preserve type info for resolution
             auto type_annotation = std::make_unique<TypeAnnotation>(
-                TypeAnnotation::named(type_string, var_loc));
+                TypeAnnotation::named(type_string, type_loc));
             init = _builder.create_variable_declaration(var_loc, var_name, std::move(type_annotation), std::move(initializer), true, false);
             // Also set the resolved type (may be an error type for generic types)
             init->set_resolved_type(var_type);
@@ -4391,13 +4412,14 @@ namespace Cryo
 
         // Parse type annotation
         consume(TokenKind::TK_COLON, "Expected ':' after parameter name");
+        SourceLocation type_loc = _current_token.location();
         std::string type_string;
         TypeRef param_type = parse_type_annotation(&type_string);
 
         // Create parameter as variable declaration (without initializer)
         // Use TypeAnnotation to preserve type info for resolution
         auto type_annotation = std::make_unique<TypeAnnotation>(
-            TypeAnnotation::named(type_string, name_token.location()));
+            TypeAnnotation::named(type_string, type_loc));
         // Parameters: loc, name, type_annotation, init (nullptr), is_mutable (true for params), is_global (false)
         auto param_decl = _builder.create_variable_declaration(name_token.location(), param_name, std::move(type_annotation), nullptr, true, false);
         // Also set the resolved type (may be an error type for generic types)
@@ -4878,6 +4900,9 @@ namespace Cryo
 
         consume(TokenKind::TK_L_PAREN, "Expected '(' after 'sizeof'");
 
+        // Capture location of the type name token for LSP hover
+        SourceLocation type_loc = _current_token.location();
+
         // Parse type annotation - use out_type_string to get the original annotation
         // instead of display_name(), which would include error messages for unresolved generics.
         // For sizeof(HashSetEntry<T>), we need to preserve "HashSetEntry<T>" so that
@@ -4899,7 +4924,13 @@ namespace Cryo
 
         consume(TokenKind::TK_R_PAREN, "Expected ')' after type name");
 
-        return _builder.create_sizeof_expression(sizeof_location, type_name);
+        auto node = _builder.create_sizeof_expression(sizeof_location, type_name);
+        if (node)
+        {
+            auto *sizeof_node = static_cast<SizeofExpressionNode *>(node.get());
+            sizeof_node->set_type_location(type_loc);
+        }
+        return node;
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_alignof_expression()
@@ -4908,6 +4939,9 @@ namespace Cryo
         consume(TokenKind::TK_KW_ALIGNOF, "Expected 'alignof' keyword");
 
         consume(TokenKind::TK_L_PAREN, "Expected '(' after 'alignof'");
+
+        // Capture location of the type name token for LSP hover
+        SourceLocation type_loc = _current_token.location();
 
         // Parse type annotation - use out_type_string to get the original annotation
         // instead of display_name(), which would include error messages for unresolved generics.
@@ -4928,7 +4962,13 @@ namespace Cryo
 
         consume(TokenKind::TK_R_PAREN, "Expected ')' after type name");
 
-        return _builder.create_alignof_expression(alignof_location, type_name);
+        auto node = _builder.create_alignof_expression(alignof_location, type_name);
+        if (node)
+        {
+            auto *alignof_node = static_cast<AlignofExpressionNode *>(node.get());
+            alignof_node->set_type_location(type_loc);
+        }
+        return node;
     }
 
     std::string Parser::parse_generic_type_suffix()
@@ -5027,6 +5067,7 @@ namespace Cryo
         }
 
         std::string member_name = std::string(_current_token.text());
+        SourceLocation member_name_loc = _current_token.location();
         advance(); // consume member name
 
         // Check for generic method call: method_name<T>(args)
@@ -5184,6 +5225,7 @@ namespace Cryo
         {
             // Create member access node first
             auto member_access = _builder.create_member_access(access_location, std::move(expr), member_name);
+            member_access->set_member_location(member_name_loc);
 
             // Then parse the function call with the member access as the callee
             auto call_expr = parse_call_expression(std::move(member_access));
@@ -5206,7 +5248,9 @@ namespace Cryo
         else
         {
             // Simple member access (field access)
-            return _builder.create_member_access(access_location, std::move(expr), member_name);
+            auto member_access = _builder.create_member_access(access_location, std::move(expr), member_name);
+            member_access->set_member_location(member_name_loc);
+            return member_access;
         }
     }
 
@@ -5316,6 +5360,7 @@ namespace Cryo
         std::string struct_name = std::string(name_token.text());
 
         auto struct_decl = _builder.create_struct_declaration(start_loc, struct_name);
+        struct_decl->set_name_location(name_token.location());
 
         // Attach documentation if available
         attach_documentation(struct_decl.get());
@@ -5446,6 +5491,7 @@ namespace Cryo
         std::string class_name = std::string(name_token.text());
 
         auto class_decl = _builder.create_class_declaration(start_loc, class_name);
+        class_decl->set_name_location(name_token.location());
 
         // Attach documentation if available
         attach_documentation(class_decl.get());
@@ -5581,6 +5627,7 @@ namespace Cryo
         std::string trait_name = std::string(name_token.text());
 
         auto trait_decl = _builder.create_trait_declaration(start_loc, trait_name);
+        trait_decl->set_name_location(name_token.location());
 
         // Attach documentation if available
         attach_documentation(trait_decl.get());
@@ -5690,9 +5737,11 @@ namespace Cryo
                     // Parse return type
                     TypeRef return_type = _context.types().get_void(); // Default to void
                     std::string return_type_string = "void";           // Track the type string for TypeAnnotation
+                    SourceLocation return_type_loc;
                     if (_current_token.is(TokenKind::TK_ARROW))
                     {
                         advance(); // consume '->'
+                        return_type_loc = _current_token.location();
                         return_type = parse_type_annotation(&return_type_string);
                     }
 
@@ -5707,7 +5756,7 @@ namespace Cryo
                     if (!return_type_string.empty())
                     {
                         auto annotation = std::make_unique<TypeAnnotation>(
-                            TypeAnnotation::named(return_type_string, _current_token.location()));
+                            TypeAnnotation::named(return_type_string, return_type_loc));
                         method_decl->set_return_type_annotation(std::move(annotation));
                     }
 
@@ -5744,6 +5793,7 @@ namespace Cryo
 
         // Handle both identifiers and reserved keywords as type names
         std::string alias_name;
+        SourceLocation alias_name_loc = _current_token.location();
         if (_current_token.is(TokenKind::TK_IDENTIFIER))
         {
             alias_name = std::string(_current_token.text());
@@ -5817,6 +5867,7 @@ namespace Cryo
             }
             advance();                                                                           // consume semicolon
             auto type_alias = _builder.create_type_alias_declaration(start_loc, alias_name, ""); // Empty target for forward decl
+            type_alias->set_name_location(alias_name_loc);
 
             // Attach documentation if available
             attach_documentation(type_alias.get());
@@ -5832,6 +5883,7 @@ namespace Cryo
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after type alias");
 
         auto type_alias = _builder.create_type_alias_declaration(start_loc, alias_name, target_type, generic_params);
+        type_alias->set_name_location(alias_name_loc);
 
         // Attach documentation if available
         attach_documentation(type_alias.get());
@@ -5855,6 +5907,7 @@ namespace Cryo
         std::string enum_name = std::string(name_token.text());
 
         auto enum_decl = _builder.create_enum_declaration(start_loc, enum_name);
+        enum_decl->set_name_location(name_token.location());
 
         // Attach documentation if available
         attach_documentation(enum_decl.get());
@@ -6071,6 +6124,7 @@ namespace Cryo
         }
 
         auto impl_block = _builder.create_implementation_block(start_loc, target_type);
+        impl_block->set_name_location(target_token.location());
 
         consume(TokenKind::TK_L_BRACE, "Expected '{' after implement declaration");
 
@@ -6259,6 +6313,9 @@ namespace Cryo
 
         consume(TokenKind::TK_COLON, "Expected ':' after field name");
 
+        // Capture location of the type token for LSP hover and deferred resolution
+        SourceLocation type_loc = _current_token.location();
+
         // Capture the type string for deferred resolution
         std::string type_string;
         TypeRef field_type = parse_type_annotation(&type_string);
@@ -6270,12 +6327,15 @@ namespace Cryo
         {
             LOG_DEBUG(LogComponent::PARSER, "Struct field '{}' type '{}' deferred to type resolution phase",
                       field_name, type_string);
-            auto annotation = std::make_unique<TypeAnnotation>(TypeAnnotation::named(type_string, start_loc));
+            auto annotation = std::make_unique<TypeAnnotation>(TypeAnnotation::named(type_string, type_loc));
             field = _builder.create_struct_field(start_loc, field_name, std::move(annotation), visibility);
         }
         else
         {
-            field = _builder.create_struct_field(start_loc, field_name, field_type, visibility);
+            // Even with resolved type, store annotation for LSP hover on the type name
+            auto annotation = std::make_unique<TypeAnnotation>(TypeAnnotation::named(type_string, type_loc));
+            field = _builder.create_struct_field(start_loc, field_name, std::move(annotation), visibility);
+            field->set_resolved_type(field_type);
         }
 
         // Parse optional default value
@@ -6415,9 +6475,11 @@ namespace Cryo
         // Parse return type (optional for constructors)
         TypeRef return_type = _context.types().get_void(); // Default to void
         std::string return_type_string = "void";           // Track the type string for TypeAnnotation
+        SourceLocation return_type_loc;
         if (_current_token.is(TokenKind::TK_ARROW))
         {
             advance(); // consume '->'
+            return_type_loc = _current_token.location();
             return_type = parse_type_annotation(&return_type_string);
         }
         else if (is_constructor)
@@ -6449,13 +6511,14 @@ namespace Cryo
         }
 
         auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor, is_destructor, is_static, is_default_destructor);
+        method->set_name_location(method_token.location());
 
         // Set the return type annotation from the captured type string
         // This preserves the original type annotation (e.g., "Option<u64>") for later phases
         if (!return_type_string.empty())
         {
             auto annotation = std::make_unique<TypeAnnotation>(
-                TypeAnnotation::named(return_type_string, start_loc));
+                TypeAnnotation::named(return_type_string, return_type_loc));
             method->set_return_type_annotation(std::move(annotation));
             LOG_DEBUG(LogComponent::PARSER, "PARSER: Set return type annotation '{}' for struct method '{}'",
                       return_type_string, method_name);

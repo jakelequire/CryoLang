@@ -259,21 +259,22 @@ namespace Cryo
         std::string final_message = log_stream.str();
 
         // Write to console if level is sufficient
+        // Always use stderr so that stdout remains clean for LSP/JSON-RPC
         if (level >= _config.console_level)
         {
             if (_config.enable_colors)
             {
-                std::cout << log_level_to_color(level) << final_message
+                std::cerr << log_level_to_color(level) << final_message
                           << "\033[0m" << std::endl;
             }
             else
             {
-                std::cout << final_message << std::endl;
+                std::cerr << final_message << std::endl;
             }
 
             if (_config.auto_flush)
             {
-                std::cout.flush();
+                std::cerr.flush();
             }
         }
 
@@ -341,7 +342,7 @@ namespace Cryo
     void Logger::flush()
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        std::cout.flush();
+        std::cerr.flush();
         if (_log_file.is_open())
         {
             _log_file.flush();
