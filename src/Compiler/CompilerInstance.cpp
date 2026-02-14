@@ -85,7 +85,8 @@ namespace Cryo
         _monomorphization_pass->set_ast_specializer(
             [specializer](const GenericTemplate &tmpl,
                           const TypeSubstitution &subst,
-                          const std::string &specialized_name) -> ASTNode * {
+                          const std::string &specialized_name) -> ASTNode *
+            {
                 return specializer->specialize(tmpl, subst, specialized_name);
             });
 
@@ -1060,7 +1061,7 @@ namespace Cryo
         {
             _compiled_asts.push_back(std::move(_ast_root));
             LOG_DEBUG(LogComponent::GENERAL, "CompilerInstance: Preserved AST for stdlib mode (total: {} ASTs)",
-                _compiled_asts.size());
+                      _compiled_asts.size());
         }
         else
         {
@@ -1198,7 +1199,7 @@ namespace Cryo
                     func_decl->name(),
                     func_decl,
                     _current_namespace.empty() ? "Main" : _current_namespace,
-                    ""      // No source file path for main file templates
+                    "" // No source file path for main file templates
                 );
                 LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic function template: {}", func_decl->name());
             }
@@ -1309,7 +1310,7 @@ namespace Cryo
                     struct_decl->name(),
                     struct_decl,
                     _current_namespace.empty() ? "Main" : _current_namespace,
-                    ""      // No source file path for main file templates
+                    "" // No source file path for main file templates
                 );
 
                 // Also register in GenericRegistry for the new type system
@@ -1323,9 +1324,9 @@ namespace Cryo
                         params.emplace_back(param_node->name(), i, param_type);
                     }
                     _generic_registry->register_template(struct_type, params,
-                        _symbol_table->current_module(), struct_decl, struct_decl->name());
+                                                         _symbol_table->current_module(), struct_decl, struct_decl->name());
                     LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered struct '{}' in GenericRegistry with {} params",
-                        struct_decl->name(), params.size());
+                              struct_decl->name(), params.size());
                 }
 
                 LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic struct template: {}", struct_decl->name());
@@ -1395,7 +1396,7 @@ namespace Cryo
                     class_decl->name(),
                     class_decl,
                     _current_namespace.empty() ? "Main" : _current_namespace,
-                    ""      // No source file path for main file templates
+                    "" // No source file path for main file templates
                 );
 
                 // Also register in GenericRegistry for the new type system
@@ -1409,9 +1410,9 @@ namespace Cryo
                         params.emplace_back(param_node->name(), i, param_type);
                     }
                     _generic_registry->register_template(class_type, params,
-                        _symbol_table->current_module(), class_decl, class_decl->name());
+                                                         _symbol_table->current_module(), class_decl, class_decl->name());
                     LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered class '{}' in GenericRegistry with {} params",
-                        class_decl->name(), params.size());
+                              class_decl->name(), params.size());
                 }
 
                 LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic class template: {}", class_decl->name());
@@ -1488,7 +1489,7 @@ namespace Cryo
                     enum_decl->name(),
                     enum_decl,
                     _current_namespace.empty() ? "Main" : _current_namespace,
-                    ""      // No source file path for main file templates
+                    "" // No source file path for main file templates
                 );
 
                 // Also register in GenericRegistry for the new type system
@@ -1502,9 +1503,9 @@ namespace Cryo
                         params.emplace_back(param_node->name(), i, param_type);
                     }
                     _generic_registry->register_template(enum_type, params,
-                        _symbol_table->current_module(), enum_decl, enum_decl->name());
+                                                         _symbol_table->current_module(), enum_decl, enum_decl->name());
                     LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered enum '{}' in GenericRegistry with {} params",
-                        enum_decl->name(), params.size());
+                              enum_decl->name(), params.size());
                 }
 
                 LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic enum template: {}", enum_decl->name());
@@ -1526,7 +1527,7 @@ namespace Cryo
                     trait_decl->name(),
                     trait_decl,
                     _current_namespace.empty() ? "Main" : _current_namespace,
-                    ""      // No source file path for main file templates
+                    "" // No source file path for main file templates
                 );
                 LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered local generic trait template: {}", trait_decl->name());
             }
@@ -1572,7 +1573,7 @@ namespace Cryo
                 // Create a type alias type for the template
                 TypeRef alias_type = _ast_context->types().create_type_alias(
                     QualifiedTypeName{_symbol_table->current_module(), alias_decl->alias_name()},
-                    TypeRef{}  // Target will be resolved during instantiation
+                    TypeRef{} // Target will be resolved during instantiation
                 );
 
                 std::vector<GenericParam> params;
@@ -1583,9 +1584,9 @@ namespace Cryo
                     params.emplace_back(param_name, i, param_type);
                 }
                 _generic_registry->register_template(alias_type, params,
-                    _symbol_table->current_module(), alias_decl, alias_decl->alias_name());
+                                                     _symbol_table->current_module(), alias_decl, alias_decl->alias_name());
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Registered generic type alias '{}' in GenericRegistry with {} params",
-                    alias_decl->alias_name(), params.size());
+                          alias_decl->alias_name(), params.size());
             }
         }
         // Handle import declarations (process in first pass since they affect symbol resolution)
@@ -2016,8 +2017,8 @@ namespace Cryo
                                     if (field_type.is_error())
                                     {
                                         LOG_WARN(Cryo::LogComponent::GENERAL,
-                                                  "CompilerInstance: Field '{}' in struct '{}' still has unresolved type after all registrations (annotation: '{}')",
-                                                  field->name(), struct_decl->name(), ann->to_string());
+                                                 "CompilerInstance: Field '{}' in struct '{}' still has unresolved type after all registrations (annotation: '{}')",
+                                                 field->name(), struct_decl->name(), ann->to_string());
                                         field_type = TypeRef{};
                                     }
                                 }
@@ -2102,8 +2103,8 @@ namespace Cryo
                                     if (field_type.is_error())
                                     {
                                         LOG_WARN(Cryo::LogComponent::GENERAL,
-                                                  "CompilerInstance: Field '{}' in class '{}' still has unresolved type",
-                                                  field->name(), class_decl->name());
+                                                 "CompilerInstance: Field '{}' in class '{}' still has unresolved type",
+                                                 field->name(), class_decl->name());
                                         field_type = TypeRef{};
                                     }
                                 }
@@ -2169,7 +2170,8 @@ namespace Cryo
                                     break;
                                 }
                             }
-                            if (needs_resolution) break;
+                            if (needs_resolution)
+                                break;
                         }
                     }
 
@@ -2905,7 +2907,7 @@ namespace Cryo
     }
 
     llvm::Type *CompilerInstance::desc_to_llvm_type(const SimpleTypeDesc &desc,
-                                                     llvm::LLVMContext &ctx)
+                                                    llvm::LLVMContext &ctx)
     {
         switch (desc.kind)
         {

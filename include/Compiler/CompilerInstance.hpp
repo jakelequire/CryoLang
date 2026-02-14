@@ -59,7 +59,7 @@ namespace Cryo
         std::unique_ptr<TypeResolver> _type_resolver;
         // SymbolTable - use ASTContext's symbol table to ensure consistency with Parser
         // This is a non-owning pointer to _ast_context->symbols()
-        SymbolTable* _symbol_table;
+        SymbolTable *_symbol_table;
         // TypeChecker needs arena, resolver, modules, generics
         std::unique_ptr<TypeChecker> _type_checker;
         std::unique_ptr<Monomorphizer> _monomorphization_pass;
@@ -84,17 +84,17 @@ namespace Cryo
         std::vector<std::string> _include_paths;
         bool _debug_mode;
         bool _show_ast_before_ir;
-        bool _stdlib_linking_enabled;                  // Control whether to link libcryo.a by default
-        bool _stdlib_compilation_mode;                 // Control whether to generate full implementations for stdlib compilation
-        bool _auto_imports_enabled;                    // Control whether to automatically import core types
-        bool _lsp_mode;                                // LSP compilation mode
-        bool _frontend_only;                           // Frontend-only compilation mode
-        bool _raw_mode;                                // Raw mode compilation (no stdlib, no main transform)
-        bool _dump_symbols;                            // Dump symbol tables for each module to debug files
-        std::string _dump_symbols_output_dir;          // Output directory for symbol dumps
-        std::string _current_namespace;                // Current namespace context
-        std::vector<std::string> _imported_namespaces;     // Track imported namespaces for enhanced resolution
-        std::vector<std::string> _local_import_modules;    // Modules from local project files that need IR generation
+        bool _stdlib_linking_enabled;                   // Control whether to link libcryo.a by default
+        bool _stdlib_compilation_mode;                  // Control whether to generate full implementations for stdlib compilation
+        bool _auto_imports_enabled;                     // Control whether to automatically import core types
+        bool _lsp_mode;                                 // LSP compilation mode
+        bool _frontend_only;                            // Frontend-only compilation mode
+        bool _raw_mode;                                 // Raw mode compilation (no stdlib, no main transform)
+        bool _dump_symbols;                             // Dump symbol tables for each module to debug files
+        std::string _dump_symbols_output_dir;           // Output directory for symbol dumps
+        std::string _current_namespace;                 // Current namespace context
+        std::vector<std::string> _imported_namespaces;  // Track imported namespaces for enhanced resolution
+        std::vector<std::string> _local_import_modules; // Modules from local project files that need IR generation
 
         // Results
         std::unique_ptr<ProgramNode> _ast_root;
@@ -110,10 +110,19 @@ namespace Cryo
         // the LLVMContext (which causes struct type collisions).
         struct SimpleTypeDesc
         {
-            enum Kind : uint8_t { Void, Int, Float, Double, Ptr, NamedStruct, Other };
+            enum Kind : uint8_t
+            {
+                Void,
+                Int,
+                Float,
+                Double,
+                Ptr,
+                NamedStruct,
+                Other
+            };
             Kind kind = Other;
-            unsigned int_width = 0;    // for Int
-            std::string struct_name;   // for NamedStruct
+            unsigned int_width = 0;  // for Int
+            std::string struct_name; // for NamedStruct
         };
         struct CrossModuleFnEntry
         {
@@ -205,9 +214,11 @@ namespace Cryo
         bool auto_imports_enabled() const { return _auto_imports_enabled; }
 
         // Raw mode control (no stdlib, no main transform)
-        void set_raw_mode(bool enable) { 
-            _raw_mode = enable; 
-            if (enable) {
+        void set_raw_mode(bool enable)
+        {
+            _raw_mode = enable;
+            if (enable)
+            {
                 // Raw mode implies no stdlib linking and no auto imports
                 _stdlib_linking_enabled = false;
                 _auto_imports_enabled = false;
@@ -216,7 +227,11 @@ namespace Cryo
         bool raw_mode() const { return _raw_mode; }
 
         // Symbol dump control
-        void set_dump_symbols(bool enable, const std::string &output_dir = "") { _dump_symbols = enable; _dump_symbols_output_dir = output_dir; }
+        void set_dump_symbols(bool enable, const std::string &output_dir = "")
+        {
+            _dump_symbols = enable;
+            _dump_symbols_output_dir = output_dir;
+        }
         bool dump_symbols_enabled() const { return _dump_symbols; }
         const std::string &dump_symbols_output_dir() const { return _dump_symbols_output_dir; }
 
