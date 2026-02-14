@@ -2,10 +2,14 @@
 #include "Compiler/CompilerInstance.hpp"
 #include "LSP/Transport.hpp"
 
+#include <fstream>
+#include <filesystem>
+
 namespace CryoLSP
 {
 
-    AnalysisEngine::AnalysisEngine() = default;
+    AnalysisEngine::AnalysisEngine()
+        : _intrinsics_loaded(false) {}
     AnalysisEngine::~AnalysisEngine() = default;
 
     void AnalysisEngine::setWorkspaceRoot(const std::string &root)
@@ -63,6 +67,82 @@ namespace CryoLSP
         if (it != _instances.end())
             return it->second.get();
         return nullptr;
+    }
+
+    Cryo::CompilerInstance *AnalysisEngine::getIntrinsicsInstance()
+    {
+        if (!_intrinsics_loaded)
+        {
+            loadIntrinsics();
+        }
+
+        if (_intrinsics_instance)
+            return _intrinsics_instance.get();
+
+        return nullptr;
+    }
+
+    void AnalysisEngine::loadIntrinsics()
+    {
+        _intrinsics_loaded = true;
+
+        if (_workspace_root.empty())
+            return;
+
+        std::string intrinsics_path = _workspace_root + "/stdlib/core/intrinsics.cryo";
+
+        if (!std::filesystem::exists(intrinsics_path))
+        {
+            Transport::log("[Intrinsics] File not found: " + intrinsics_path);
+            return;
+        }
+
+        _intrinsics_file_path = intrinsics_path;
+
+        // Always create a dedicated instance for intrinsics — never reuse from _instances.
+        // The _instances map stores instances created by analyzeDocument (via didOpen),
+        // which go through parse_source_from_file and may run analysis passes that
+        // corrupt the AST. We need a clean, parse-only AST for safe traversal.
+        std::ifstream file(intrinsics_path);
+        if (!file.is_open())
+        {
+            Transport::log("[Intrinsics] Failed to open file");
+            return;
+        }
+
+        std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+        file.close();
+
+        try
+        {
+            Transport::log("[Intrinsics] Creating dedicated CompilerInstance...");
+            auto instance = Cryo::create_compiler_instance();
+            instance->set_raw_mode(true);
+            Transport::log("[Intrinsics] Calling compile_for_lsp_from_content...");
+            instance->compile_for_lsp_from_content(intrinsics_path, content);
+            Transport::log("[Intrinsics] compile_for_lsp_from_content returned");
+
+            if (instance->ast_root())
+            {
+                _intrinsics_instance = std::move(instance);
+                Transport::log("[Intrinsics] Loaded " + std::to_string(
+                                   _intrinsics_instance->ast_root()->statements().size()) +
+                               " declarations from intrinsics.cryo");
+            }
+            else
+            {
+                Transport::log("[Intrinsics] Parse produced no AST");
+            }
+        }
+        catch (const std::exception &e)
+        {
+            Transport::log(std::string("[Intrinsics] Failed to load: ") + e.what());
+        }
+        catch (...)
+        {
+            Transport::log("[Intrinsics] Failed to load: unknown error");
+        }
     }
 
     std::vector<Diagnostic> AnalysisEngine::convertDiagnostics(Cryo::CompilerInstance *instance, const std::string &file_path)

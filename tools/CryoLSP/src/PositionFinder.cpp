@@ -380,6 +380,15 @@ namespace CryoLSP
 
     void PositionFinder::visit(Cryo::SizeofExpressionNode &node)
     {
+        // Check if cursor is on the 'sizeof' keyword itself
+        if (matchesPosition(node.location(), 6)) // "sizeof" = 6 chars
+        {
+            _result.node = &node;
+            _result.identifier_name = "sizeof";
+            _result.kind = FoundNode::Kind::Identifier;
+            return;
+        }
+
         // Check if cursor is on the type name inside sizeof(TypeName)
         if (node.has_type_location())
         {
@@ -394,6 +403,15 @@ namespace CryoLSP
 
     void PositionFinder::visit(Cryo::AlignofExpressionNode &node)
     {
+        // Check if cursor is on the 'alignof' keyword itself
+        if (matchesPosition(node.location(), 7)) // "alignof" = 7 chars
+        {
+            _result.node = &node;
+            _result.identifier_name = "alignof";
+            _result.kind = FoundNode::Kind::Identifier;
+            return;
+        }
+
         // Check if cursor is on the type name inside alignof(TypeName)
         if (node.has_type_location())
         {
