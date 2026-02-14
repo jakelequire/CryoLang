@@ -76,6 +76,12 @@ namespace CryoLSP
                 _result = &node;
         }
 
+        void visit(Cryo::IntrinsicDeclarationNode &node) override
+        {
+            if (node.name() == _target)
+                _result = &node;
+        }
+
     private:
         std::string _target;
         Cryo::ASTNode *_result = nullptr;
@@ -774,6 +780,30 @@ namespace CryoLSP
                 return formatVariableHover(varDecl);
         }
 
+        // Try MemberFinder for methods/fields inside structs, classes, and impl blocks
+        // This handles cases like `Point::new` where the method isn't a top-level decl
+        if (!declNode)
+        {
+            // For qualified names like "Point::new", search for the member part
+            std::string memberName = sym->name;
+            auto colonPos = memberName.rfind("::");
+            if (colonPos != std::string::npos)
+                memberName = memberName.substr(colonPos + 2);
+
+            MemberFinder memberFinder(memberName);
+            Cryo::ASTNode *memberNode = memberFinder.find(ast_root);
+            if (memberNode)
+            {
+                if (auto *method = dynamic_cast<Cryo::FunctionDeclarationNode *>(memberNode))
+                    return formatFunctionHover(method);
+                if (auto *field = dynamic_cast<Cryo::StructFieldNode *>(memberNode))
+                {
+                    std::string fieldResult = "```cryo\n" + memberFinder.owner_name() + "." + field->name() + ": " + getFieldTypeStr(field) + "\n```";
+                    return appendDocumentation(field, fieldResult);
+                }
+            }
+        }
+
         // Fallback: format from symbol table info only
         std::string result;
         std::string type_str;
@@ -893,6 +923,10 @@ namespace CryoLSP
             // Boolean literals (in case they're parsed as identifiers)
             {"true", {"boolean", "The boolean type.\n\nCan be either `true` or `false`. \nSize: 1 byte\n\nValue: `true`"}},
             {"false", {"boolean", "The boolean type.\n\nCan be either `true` or `false`. \nSize: 1 byte\n\nValue: `false`"}},
+
+            // Built-in operators
+            {"sizeof", {"sizeof(Type) -> int", "Returns the size in bytes of the given type.\n\nEvaluated at compile time. The result is an integer representing the number of bytes the type occupies in memory.\n\n**Example:**\n```cryo\nsizeof(i32)    // 4\nsizeof(Point)  // depends on fields\n```"}},
+            {"alignof", {"alignof(Type) -> int", "Returns the alignment requirement in bytes of the given type.\n\nEvaluated at compile time. The result is an integer representing the minimum alignment boundary the type requires.\n\n**Example:**\n```cryo\nalignof(i32)    // 4\nalignof(Point)  // depends on fields\n```"}},
         };
 
         auto it = primitives.find(name);
@@ -1004,13 +1038,22 @@ namespace CryoLSP
     std::optional<Hover> HoverProvider::getHover(const std::string &uri, const Position &position)
     {
         std::string file_path = uri_to_path(uri);
+        Transport::log("[Hover] Request for " + file_path + " at " +
+                       std::to_string(position.line) + ":" + std::to_string(position.character));
+
         auto *instance = _engine.getCompilerInstance(file_path);
         if (!instance || !instance->ast_root())
+        {
+            Transport::log("[Hover] No compiler instance or AST for file");
             return std::nullopt;
+        }
 
         // Find node at cursor position (convert 0-based LSP to 1-based compiler)
+        Transport::log("[Hover] Running PositionFinder...");
         PositionFinder finder(position.line + 1, position.character + 1);
         auto found = finder.find(instance->ast_root());
+        Transport::log("[Hover] PositionFinder done: kind=" + std::to_string(static_cast<int>(found.kind)) +
+                       " identifier='" + found.identifier_name + "'");
 
         if (found.kind == FoundNode::Kind::Unknown)
             return std::nullopt;
@@ -1122,6 +1165,8 @@ namespace CryoLSP
         if (found.identifier_name.empty())
             return std::nullopt;
 
+        Transport::log("[Hover] Entering switch for kind=" + std::to_string(static_cast<int>(found.kind)));
+
         // Handle based on found node kind
         switch (found.kind)
         {
@@ -1212,22 +1257,34 @@ namespace CryoLSP
             // For type references from annotations, try primitive docs first (already done above)
             // Then try symbol table + AST declaration search
             auto *symbol_table = instance->symbol_table();
+            Transport::log("[Hover] Symbol table: " + std::string(symbol_table ? "valid" : "null"));
 
             Cryo::Symbol *sym = nullptr;
             if (symbol_table)
             {
+                Transport::log("[Hover] Looking up '" + found.identifier_name + "' in symbol table...");
                 sym = symbol_table->lookup(found.identifier_name);
+                Transport::log("[Hover] lookup: " + std::string(sym ? "found" : "not found"));
                 if (!sym)
+                {
+                    Transport::log("[Hover] Trying lookup_with_imports...");
                     sym = symbol_table->lookup_with_imports(found.identifier_name);
+                    Transport::log("[Hover] lookup_with_imports: " + std::string(sym ? "found" : "not found"));
+                }
             }
 
             if (sym)
+            {
+                Transport::log("[Hover] Formatting symbol ref hover...");
                 hover_text = formatSymbolRefHover(sym, instance->ast_root());
+            }
             else
             {
                 // No symbol found - try DeclarationFinder directly on AST
+                Transport::log("[Hover] Trying DeclarationFinder...");
                 DeclarationFinder declFinder(found.identifier_name);
                 Cryo::ASTNode *declNode = declFinder.find(instance->ast_root());
+                Transport::log("[Hover] DeclarationFinder: " + std::string(declNode ? "found" : "not found"));
                 if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(declNode))
                     hover_text = formatFunctionHover(func);
                 else if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(declNode))
@@ -1241,14 +1298,84 @@ namespace CryoLSP
                 else
                 {
                     // Try deep AST search for variable/parameter declarations
+                    Transport::log("[Hover] Trying VariableRefResolver...");
                     VariableRefResolver varResolver(found.identifier_name);
                     Cryo::ASTNode *varNode = varResolver.find(instance->ast_root());
+                    Transport::log("[Hover] VariableRefResolver: " + std::string(varNode ? "found" : "not found"));
                     if (auto *varDecl = dynamic_cast<Cryo::VariableDeclarationNode *>(varNode))
                         hover_text = formatVariableHover(varDecl);
                 }
             }
             break;
         }
+        }
+
+        // Fallback: search intrinsics file for the identifier
+        Transport::log("[Hover] After switch, hover_text empty=" + std::string(hover_text.empty() ? "true" : "false"));
+        if (hover_text.empty() && !found.identifier_name.empty())
+        {
+            Transport::log("[Hover] Entering intrinsics fallback for '" + found.identifier_name + "'");
+            auto *intrinsics = _engine.getIntrinsicsInstance();
+            Transport::log("[Hover] getIntrinsicsInstance returned: " + std::string(intrinsics ? "valid" : "null"));
+            if (intrinsics)
+            {
+                auto *intrinsics_ast = intrinsics->ast_root();
+                Transport::log("[Hover] intrinsics ast_root: " + std::string(intrinsics_ast ? "valid" : "null"));
+                if (intrinsics_ast)
+                {
+                    Transport::log("[Hover] intrinsics statements count: " + std::to_string(intrinsics_ast->statements().size()));
+                    // Direct iteration over ProgramNode children (avoids visitor dispatch)
+                    Cryo::ASTNode *intrinsicNode = nullptr;
+                    for (const auto &child : intrinsics_ast->statements())
+                    {
+                        if (!child)
+                            continue;
+                        if (auto *decl = dynamic_cast<Cryo::IntrinsicDeclarationNode *>(child.get()))
+                        {
+                            if (decl->name() == found.identifier_name)
+                            {
+                                intrinsicNode = decl;
+                                break;
+                            }
+                        }
+                        else if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(child.get()))
+                        {
+                            if (func->name() == found.identifier_name)
+                            {
+                                intrinsicNode = func;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(intrinsicNode))
+                    {
+                        std::string sig = "intrinsic " + buildFunctionSignature(func);
+                        hover_text = "```cryo\n" + sig + "\n```";
+                        hover_text = appendDocumentation(func, hover_text);
+                    }
+                    else if (auto *intrinsicDecl = dynamic_cast<Cryo::IntrinsicDeclarationNode *>(intrinsicNode))
+                    {
+                        // Build signature from IntrinsicDeclarationNode
+                        std::string sig = "intrinsic function " + intrinsicDecl->name() + "(";
+                        const auto &params = intrinsicDecl->parameters();
+                        for (size_t i = 0; i < params.size(); ++i)
+                        {
+                            if (!params[i])
+                                continue;
+                            if (i > 0)
+                                sig += ", ";
+                            sig += params[i]->name() + ": " + getParamTypeStr(params[i].get());
+                        }
+                        sig += ")";
+                        std::string ret = intrinsicDecl->return_type_annotation();
+                        if (!ret.empty() && ret != "void" && ret != "undefined")
+                            sig += " -> " + ret;
+                        hover_text = "```cryo\n" + sig + "\n```";
+                        hover_text = appendDocumentation(intrinsicDecl, hover_text);
+                    }
+                }
+            }
         }
 
         if (hover_text.empty())

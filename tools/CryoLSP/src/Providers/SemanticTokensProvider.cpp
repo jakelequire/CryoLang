@@ -93,9 +93,8 @@ namespace CryoLSP
         void visit(Cryo::IdentifierNode &node) override
         {
             if (node.name() == "this")
-                addToken(node.location(), node.name().size(), TT_Parameter);
-            else
-                addToken(node.location(), node.name().size(), TT_Variable);
+                return; // Let TextMate grammar handle `this` keyword coloring
+            addToken(node.location(), node.name().size(), TT_Variable);
         }
 
         void visit(Cryo::LiteralNode &node) override
@@ -124,7 +123,9 @@ namespace CryoLSP
             if (!node.is_mutable())
                 mods |= TM_Readonly;
             const auto &loc = node.has_name_location() ? node.name_location() : node.location();
-            int type = (node.name() == "this") ? TT_Parameter : TT_Variable;
+            if (node.name() == "this")
+                return; // Let TextMate grammar handle `this` keyword coloring
+            int type = TT_Variable;
             addToken(loc, node.name().size(), type, mods);
             if (node.initializer())
                 node.initializer()->accept(*this);
