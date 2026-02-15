@@ -1,4 +1,5 @@
 #include "LSP/Providers/HoverProvider.hpp"
+#include "LSP/ASTSearchHelpers.hpp"
 #include "LSP/PositionFinder.hpp"
 #include "LSP/Transport.hpp"
 #include "Compiler/CompilerInstance.hpp"
@@ -11,202 +12,7 @@
 namespace CryoLSP
 {
 
-    // ============================================================================
-    // Declaration Finder - walks top-level AST to find declarations by name
-    // ============================================================================
-
-    class DeclarationFinder : public Cryo::BaseASTVisitor
-    {
-    public:
-        DeclarationFinder(const std::string &name) : _target(name) {}
-
-        Cryo::ASTNode *find(Cryo::ASTNode *root)
-        {
-            _result = nullptr;
-            if (root)
-                root->accept(*this);
-            return _result;
-        }
-
-        void visit(Cryo::ProgramNode &node) override
-        {
-            for (const auto &child : node.statements())
-                if (child && !_result)
-                    child->accept(*this);
-        }
-
-        void visit(Cryo::DeclarationStatementNode &node) override
-        {
-            if (node.declaration() && !_result)
-                node.declaration()->accept(*this);
-        }
-
-        void visit(Cryo::FunctionDeclarationNode &node) override
-        {
-            if (node.name() == _target)
-                _result = &node;
-        }
-
-        void visit(Cryo::StructDeclarationNode &node) override
-        {
-            if (node.name() == _target)
-                _result = &node;
-        }
-
-        void visit(Cryo::ClassDeclarationNode &node) override
-        {
-            if (node.name() == _target)
-                _result = &node;
-        }
-
-        void visit(Cryo::EnumDeclarationNode &node) override
-        {
-            if (node.name() == _target)
-                _result = &node;
-        }
-
-        void visit(Cryo::TraitDeclarationNode &node) override
-        {
-            if (node.name() == _target)
-                _result = &node;
-        }
-
-        void visit(Cryo::TypeAliasDeclarationNode &node) override
-        {
-            if (node.alias_name() == _target)
-                _result = &node;
-        }
-
-        void visit(Cryo::IntrinsicDeclarationNode &node) override
-        {
-            if (node.name() == _target)
-                _result = &node;
-        }
-
-    private:
-        std::string _target;
-        Cryo::ASTNode *_result = nullptr;
-    };
-
-    // ============================================================================
-    // Member Finder - searches methods and fields across structs, classes, and
-    // impl blocks for a given member name
-    // ============================================================================
-
-    class MemberFinder : public Cryo::BaseASTVisitor
-    {
-    public:
-        MemberFinder(const std::string &member_name) : _target(member_name) {}
-
-        Cryo::ASTNode *find(Cryo::ASTNode *root)
-        {
-            _result = nullptr;
-            _owner_name.clear();
-            if (root)
-                root->accept(*this);
-            return _result;
-        }
-
-        const std::string &owner_name() const { return _owner_name; }
-
-        void visit(Cryo::ProgramNode &node) override
-        {
-            for (const auto &child : node.statements())
-                if (child && !_result)
-                    child->accept(*this);
-        }
-
-        void visit(Cryo::DeclarationStatementNode &node) override
-        {
-            if (node.declaration() && !_result)
-                node.declaration()->accept(*this);
-        }
-
-        void visit(Cryo::StructDeclarationNode &node) override
-        {
-            if (_result)
-                return;
-
-            // Search methods
-            for (const auto &method : node.methods())
-            {
-                if (method && method->name() == _target)
-                {
-                    _result = method.get();
-                    _owner_name = node.name();
-                    return;
-                }
-            }
-
-            // Search fields
-            for (const auto &field : node.fields())
-            {
-                if (field && field->name() == _target)
-                {
-                    _result = field.get();
-                    _owner_name = node.name();
-                    return;
-                }
-            }
-        }
-
-        void visit(Cryo::ClassDeclarationNode &node) override
-        {
-            if (_result)
-                return;
-
-            for (const auto &method : node.methods())
-            {
-                if (method && method->name() == _target)
-                {
-                    _result = method.get();
-                    _owner_name = node.name();
-                    return;
-                }
-            }
-
-            for (const auto &field : node.fields())
-            {
-                if (field && field->name() == _target)
-                {
-                    _result = field.get();
-                    _owner_name = node.name();
-                    return;
-                }
-            }
-        }
-
-        void visit(Cryo::ImplementationBlockNode &node) override
-        {
-            if (_result)
-                return;
-
-            for (const auto &method : node.method_implementations())
-            {
-                if (method && method->name() == _target)
-                {
-                    _result = method.get();
-                    _owner_name = node.target_type();
-                    return;
-                }
-            }
-
-            for (const auto &field : node.field_implementations())
-            {
-                if (field && field->name() == _target)
-                {
-                    _result = field.get();
-                    _owner_name = node.target_type();
-                    return;
-                }
-            }
-        }
-
-    private:
-        std::string _target;
-        Cryo::ASTNode *_result = nullptr;
-        std::string _owner_name;
-    };
+    // DeclarationFinder, MemberFinder - shared from ASTSearchHelpers.hpp
 
     // ============================================================================
     // Enclosing Type Finder - walks AST to find the struct/class/impl type
@@ -325,126 +131,7 @@ namespace CryoLSP
         }
     };
 
-    // ============================================================================
-    // Variable Reference Resolver - deep AST search for variable/parameter
-    // declarations by name (recurses into function bodies, blocks, etc.)
-    // ============================================================================
-
-    class VariableRefResolver : public Cryo::BaseASTVisitor
-    {
-    public:
-        VariableRefResolver(const std::string &name) : _target(name) {}
-
-        Cryo::ASTNode *find(Cryo::ASTNode *root)
-        {
-            _result = nullptr;
-            if (root)
-                root->accept(*this);
-            return _result;
-        }
-
-        void visit(Cryo::ProgramNode &node) override
-        {
-            for (const auto &child : node.statements())
-                if (child && !_result)
-                    child->accept(*this);
-        }
-
-        void visit(Cryo::DeclarationStatementNode &node) override
-        {
-            if (node.declaration() && !_result)
-                node.declaration()->accept(*this);
-        }
-
-        void visit(Cryo::BlockStatementNode &node) override
-        {
-            for (const auto &stmt : node.statements())
-                if (stmt && !_result)
-                    stmt->accept(*this);
-        }
-
-        void visit(Cryo::ExpressionStatementNode &node) override
-        {
-            // Expression statements don't contain variable declarations
-        }
-
-        void visit(Cryo::VariableDeclarationNode &node) override
-        {
-            if (node.name() == _target)
-                _result = &node;
-        }
-
-        void visit(Cryo::FunctionDeclarationNode &node) override
-        {
-            // Check parameters
-            for (const auto &param : node.parameters())
-            {
-                if (param && !_result && param->name() == _target)
-                    _result = param.get();
-            }
-            // Recurse into body
-            if (node.body() && !_result)
-                node.body()->accept(*this);
-        }
-
-        void visit(Cryo::StructMethodNode &node) override
-        {
-            for (const auto &param : node.parameters())
-            {
-                if (param && !_result && param->name() == _target)
-                    _result = param.get();
-            }
-            if (node.body() && !_result)
-                node.body()->accept(*this);
-        }
-
-        void visit(Cryo::StructDeclarationNode &node) override
-        {
-            for (const auto &method : node.methods())
-                if (method && !_result)
-                    method->accept(*this);
-        }
-
-        void visit(Cryo::ClassDeclarationNode &node) override
-        {
-            for (const auto &method : node.methods())
-                if (method && !_result)
-                    method->accept(*this);
-        }
-
-        void visit(Cryo::ImplementationBlockNode &node) override
-        {
-            for (const auto &method : node.method_implementations())
-                if (method && !_result)
-                    method->accept(*this);
-        }
-
-        void visit(Cryo::IfStatementNode &node) override
-        {
-            if (node.then_statement() && !_result)
-                node.then_statement()->accept(*this);
-            if (node.else_statement() && !_result)
-                node.else_statement()->accept(*this);
-        }
-
-        void visit(Cryo::ForStatementNode &node) override
-        {
-            if (node.init() && !_result)
-                node.init()->accept(*this);
-            if (node.body() && !_result)
-                node.body()->accept(*this);
-        }
-
-        void visit(Cryo::WhileStatementNode &node) override
-        {
-            if (node.body() && !_result)
-                node.body()->accept(*this);
-        }
-
-    private:
-        std::string _target;
-        Cryo::ASTNode *_result = nullptr;
-    };
+    // VariableRefResolver - shared from ASTSearchHelpers.hpp
 
     // ============================================================================
     // Static Helpers
@@ -471,63 +158,7 @@ namespace CryoLSP
         return "unknown";
     }
 
-    // Strip generic arguments from a type name: "Array<Token>" -> "Array"
-    static std::string stripGenericArgs(const std::string &name)
-    {
-        auto pos = name.find('<');
-        if (pos == std::string::npos)
-            return name;
-        return name.substr(0, pos);
-    }
-
-    // Parse generic type arguments: "Array<Token, i32>" -> {"Token", "i32"}
-    static std::vector<std::string> parseGenericArgs(const std::string &name)
-    {
-        auto open = name.find('<');
-        if (open == std::string::npos)
-            return {};
-        auto close = name.rfind('>');
-        if (close == std::string::npos || close <= open)
-            return {};
-
-        std::string inner = name.substr(open + 1, close - open - 1);
-        std::vector<std::string> args;
-        int depth = 0;
-        size_t start = 0;
-
-        for (size_t i = 0; i < inner.size(); ++i)
-        {
-            if (inner[i] == '<')
-                depth++;
-            else if (inner[i] == '>')
-                depth--;
-            else if (inner[i] == ',' && depth == 0)
-            {
-                std::string arg = inner.substr(start, i - start);
-                // Trim whitespace
-                size_t first = arg.find_first_not_of(" \t");
-                if (first != std::string::npos)
-                    arg = arg.substr(first);
-                size_t last = arg.find_last_not_of(" \t");
-                if (last != std::string::npos)
-                    arg = arg.substr(0, last + 1);
-                args.push_back(arg);
-                start = i + 1;
-            }
-        }
-        // Last argument
-        std::string last = inner.substr(start);
-        size_t first = last.find_first_not_of(" \t");
-        if (first != std::string::npos)
-            last = last.substr(first);
-        size_t lastpos = last.find_last_not_of(" \t");
-        if (lastpos != std::string::npos)
-            last = last.substr(0, lastpos + 1);
-        if (!last.empty())
-            args.push_back(last);
-
-        return args;
-    }
+    // stripGenericArgs, parseGenericArgs - shared from ASTSearchHelpers.hpp
 
     // Build a generic parameter substitution map: {T -> string, K -> i32, ...}
     static std::unordered_map<std::string, std::string> buildSubstitutionMap(
@@ -801,7 +432,7 @@ namespace CryoLSP
     // ============================================================================
 
     std::string HoverProvider::formatFunctionHover(Cryo::FunctionDeclarationNode *func,
-                                                    const std::vector<std::string> &type_args)
+                                                   const std::vector<std::string> &type_args)
     {
         std::string sig = buildFunctionSignature(func);
         // Apply generic type argument substitution if provided
@@ -815,7 +446,7 @@ namespace CryoLSP
     }
 
     std::string HoverProvider::formatStructHover(Cryo::StructDeclarationNode *decl,
-                                                  const std::vector<std::string> &type_args)
+                                                 const std::vector<std::string> &type_args)
     {
         size_t prop_limit = 3;
         size_t method_limit = 5;
@@ -873,7 +504,7 @@ namespace CryoLSP
     }
 
     std::string HoverProvider::formatClassHover(Cryo::ClassDeclarationNode *decl,
-                                                 const std::vector<std::string> &type_args)
+                                                const std::vector<std::string> &type_args)
     {
         size_t prop_limit = 3;
         size_t method_limit = 5;
@@ -1053,7 +684,7 @@ namespace CryoLSP
     // ============================================================================
 
     std::string HoverProvider::formatSymbolRefHover(Cryo::Symbol *sym, Cryo::ASTNode *ast_root,
-                                                     const std::vector<std::string> &type_args)
+                                                    const std::vector<std::string> &type_args)
     {
         // Try to find the declaration in the AST for rich info
         DeclarationFinder declFinder(sym->name);
@@ -1324,7 +955,7 @@ namespace CryoLSP
 
             {"enum", {"enum", "An enum can take on three distinct forms:\n\n- A **complex** enum with variant constructors\n- A **simple** C-style enum with integer values\n- A **mix** of both simple and complex variants\n\n**Example:**\n```cryo\nenum Color {\n    Red,\n    Green,\n    Blue,\n}\n\nenum Option<T> {\n    Some(T),\n    None,\n}\n```"}},
 
-            {"implement", {"implement", "An implementation block is used to implement methods of an object type or enum.\n\nPrimarily used for complex enum implementations. Structs and classes generally inline their method implementations.\n\n**Example:**\n```cryo\nimplement Option<T> {\n    function is_some(this) -> boolean {\n        match (this) {\n            Option::Some(_) => { true },\n            Option::None => { false }\n        }\n    }\n}\n```"}},
+            {"implement", {"implement", "An implementation block is used to implement methods of an object type or enum.\n\nPrimarily used for complex enum implementations. Structs and classes generally inline their method implementations.\n\n**Example:**\n```cryo\nimplement enum Option<T> {\n    is_some(this) -> boolean {\n        match (this) {\n            Option::Some(_) => { true },\n            Option::None => { false }\n        }\n    }\n}\n```"}},
 
             {"match", {"match", "A match expression performs pattern matching against a value.\n\nCan be used as a statement or as an expression that returns a value.\n\n**Example:**\n```cryo\nmatch (value) {\n    1 => { println(\"one\") }\n    2 => { println(\"two\") }\n    _ => { println(\"other\") }\n}\n\nconst result = match (opt) {\n    Option::Some(x) => { x }\n    Option::None => { 0 }\n};\n```"}},
 
