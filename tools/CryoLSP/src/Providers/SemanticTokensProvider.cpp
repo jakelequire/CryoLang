@@ -1,4 +1,5 @@
 #include "LSP/Providers/SemanticTokensProvider.hpp"
+#include "LSP/Protocol.hpp"
 #include "LSP/Transport.hpp"
 #include "Compiler/CompilerInstance.hpp"
 #include "AST/ASTNode.hpp"
@@ -27,6 +28,7 @@ namespace CryoLSP
         TT_Comment = 14,
         TT_String = 15,
         TT_Number = 16,
+        TT_Regexp = 17, // Used for escape sequences in strings
     };
 
     // Token modifier bits
@@ -52,6 +54,9 @@ namespace CryoLSP
     {
     public:
         std::vector<RawToken> tokens;
+        const std::string *_doc_content = nullptr; // Document content for escape sequence detection
+
+        void setDocumentContent(const std::string *content) { _doc_content = content; }
 
         void addToken(const Cryo::SourceLocation &loc, size_t length, int type, int mods = 0)
         {
@@ -101,9 +106,135 @@ namespace CryoLSP
         {
             auto kind = node.literal_kind();
             if (kind == Cryo::TokenKind::TK_NUMERIC_CONSTANT)
+            {
                 addToken(node.location(), node.value().size(), TT_Number);
+            }
             else if (kind == Cryo::TokenKind::TK_STRING_LITERAL)
-                addToken(node.location(), node.value().size() + 2, TT_String); // +2 for quotes
+            {
+                emitStringTokens(node);
+            }
+        }
+
+        // Emit string tokens with escape sequences highlighted separately
+        void emitStringTokens(Cryo::LiteralNode &node)
+        {
+            int line = static_cast<int>(node.location().line() > 0 ? node.location().line() - 1 : 0);
+            int col = static_cast<int>(node.location().column() > 0 ? node.location().column() - 1 : 0);
+
+            if (!_doc_content)
+            {
+                // Fallback: emit as single string token
+                addToken(node.location(), node.value().size() + 2, TT_String);
+                return;
+            }
+
+            // Find the start of this line in the document content
+            size_t pos = 0;
+            int cur_line = 0;
+            while (cur_line < line && pos < _doc_content->size())
+            {
+                if ((*_doc_content)[pos] == '\n')
+                    ++cur_line;
+                ++pos;
+            }
+
+            size_t str_start = pos + col;
+            if (str_start >= _doc_content->size() || (*_doc_content)[str_start] != '"')
+            {
+                // Can't find the string in source, fallback
+                addToken(node.location(), node.value().size() + 2, TT_String);
+                return;
+            }
+
+            // Scan the string to find escape sequences and emit split tokens
+            size_t i = str_start + 1; // skip opening quote
+            size_t seg_start = str_start; // start of current segment (includes opening quote)
+            int seg_col = col;
+
+            // Emit opening quote as string
+            RawToken qt;
+            qt.line = line;
+            qt.startChar = col;
+            qt.length = 1;
+            qt.tokenType = TT_String;
+            qt.modifiers = 0;
+            tokens.push_back(qt);
+
+            int cur_col = col + 1;
+
+            while (i < _doc_content->size() && (*_doc_content)[i] != '"')
+            {
+                if ((*_doc_content)[i] == '\\' && i + 1 < _doc_content->size())
+                {
+                    // Determine escape sequence length
+                    int esc_len = 2; // default: \n, \t, \\, etc.
+                    char next = (*_doc_content)[i + 1];
+                    if (next == 'x' || next == 'X')
+                    {
+                        // Hex escape: \xHH
+                        esc_len = 2;
+                        size_t j = i + 2;
+                        while (j < _doc_content->size() && esc_len < 4 &&
+                               (((*_doc_content)[j] >= '0' && (*_doc_content)[j] <= '9') ||
+                                ((*_doc_content)[j] >= 'a' && (*_doc_content)[j] <= 'f') ||
+                                ((*_doc_content)[j] >= 'A' && (*_doc_content)[j] <= 'F')))
+                        {
+                            ++esc_len;
+                            ++j;
+                        }
+                    }
+                    else if (next >= '0' && next <= '7')
+                    {
+                        // Octal escape: \DDD
+                        esc_len = 2;
+                        size_t j = i + 2;
+                        while (j < _doc_content->size() && esc_len < 4 &&
+                               (*_doc_content)[j] >= '0' && (*_doc_content)[j] <= '7')
+                        {
+                            ++esc_len;
+                            ++j;
+                        }
+                    }
+
+                    // Skip escape sequence — leave a gap so the TextMate grammar
+                    // can color it (e.g., constant.character.escape)
+                    cur_col += esc_len;
+                    i += esc_len;
+                }
+                else
+                {
+                    // Normal character - emit as string
+                    // Batch consecutive normal characters
+                    int normal_start = cur_col;
+                    while (i < _doc_content->size() && (*_doc_content)[i] != '"' && (*_doc_content)[i] != '\\')
+                    {
+                        ++cur_col;
+                        ++i;
+                    }
+                    if (cur_col > normal_start)
+                    {
+                        RawToken str;
+                        str.line = line;
+                        str.startChar = normal_start;
+                        str.length = cur_col - normal_start;
+                        str.tokenType = TT_String;
+                        str.modifiers = 0;
+                        tokens.push_back(str);
+                    }
+                }
+            }
+
+            // Emit closing quote as string
+            if (i < _doc_content->size() && (*_doc_content)[i] == '"')
+            {
+                RawToken cq;
+                cq.line = line;
+                cq.startChar = cur_col;
+                cq.length = 1;
+                cq.tokenType = TT_String;
+                cq.modifiers = 0;
+                tokens.push_back(cq);
+            }
         }
 
         void visit(Cryo::FunctionDeclarationNode &node) override
@@ -310,8 +441,8 @@ namespace CryoLSP
         }
     };
 
-    SemanticTokensProvider::SemanticTokensProvider(AnalysisEngine &engine)
-        : _engine(engine) {}
+    SemanticTokensProvider::SemanticTokensProvider(AnalysisEngine &engine, DocumentStore &documents)
+        : _engine(engine), _documents(documents) {}
 
     SemanticTokensLegend SemanticTokensProvider::getLegend()
     {
@@ -334,6 +465,7 @@ namespace CryoLSP
             "comment",       // 14
             "string",        // 15
             "number",        // 16
+            "regexp",        // 17 - escape sequences in strings
         };
         legend.tokenModifiers = {
             "declaration",
@@ -353,6 +485,9 @@ namespace CryoLSP
             return result;
 
         TokenCollector collector;
+        auto doc_content = _documents.getContent(uri);
+        if (doc_content.has_value())
+            collector.setDocumentContent(&doc_content.value());
         instance->ast_root()->accept(collector);
 
         // Sort tokens by position

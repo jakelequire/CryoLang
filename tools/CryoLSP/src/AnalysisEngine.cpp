@@ -1,5 +1,6 @@
 #include "LSP/AnalysisEngine.hpp"
 #include "Compiler/CompilerInstance.hpp"
+#include "AST/ASTNode.hpp"
 #include "LSP/Transport.hpp"
 
 #include <fstream>
@@ -143,6 +144,32 @@ namespace CryoLSP
         {
             Transport::log("[Intrinsics] Failed to load: unknown error");
         }
+    }
+
+    Cryo::CompilerInstance *AnalysisEngine::findModuleInstance(const std::string &module_name)
+    {
+        for (auto &[path, instance] : _instances)
+        {
+            if (!instance || !instance->ast_root())
+                continue;
+
+            for (const auto &stmt : instance->ast_root()->statements())
+            {
+                if (!stmt)
+                    continue;
+
+                Cryo::ASTNode *check = stmt.get();
+                if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(check))
+                    check = decl_stmt->declaration();
+
+                if (auto *mod = dynamic_cast<Cryo::ModuleDeclarationNode *>(check))
+                {
+                    if (mod->module_path() == module_name)
+                        return instance.get();
+                }
+            }
+        }
+        return nullptr;
     }
 
     std::vector<Diagnostic> AnalysisEngine::convertDiagnostics(Cryo::CompilerInstance *instance, const std::string &file_path)
