@@ -28,6 +28,8 @@ namespace CryoLSP
             EnumDecl,
             EnumVariant,
             FieldAccess,
+            FieldInitializer,  // Field name in a struct literal (e.g., `x:` in `Point { x: 1 }`)
+            PatternBinding,    // Variable binding in an enum pattern (e.g., `name` in `Expr::Variable(name)`)
             ScopeResolution,
             TypeReference,
             Parameter,
@@ -86,6 +88,9 @@ namespace CryoLSP
         void visit(Cryo::CastExpressionNode &node) override;
         void visit(Cryo::StructFieldNode &node) override;
         void visit(Cryo::StructLiteralNode &node) override;
+        void visit(Cryo::SwitchStatementNode &node) override;
+        void visit(Cryo::CaseStatementNode &node) override;
+        void visit(Cryo::ArrayAccessNode &node) override;
 
     private:
         size_t _target_line;

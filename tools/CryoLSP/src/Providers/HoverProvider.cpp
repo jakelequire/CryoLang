@@ -471,6 +471,230 @@ namespace CryoLSP
         return "unknown";
     }
 
+    // Strip generic arguments from a type name: "Array<Token>" -> "Array"
+    static std::string stripGenericArgs(const std::string &name)
+    {
+        auto pos = name.find('<');
+        if (pos == std::string::npos)
+            return name;
+        return name.substr(0, pos);
+    }
+
+    // Parse generic type arguments: "Array<Token, i32>" -> {"Token", "i32"}
+    static std::vector<std::string> parseGenericArgs(const std::string &name)
+    {
+        auto open = name.find('<');
+        if (open == std::string::npos)
+            return {};
+        auto close = name.rfind('>');
+        if (close == std::string::npos || close <= open)
+            return {};
+
+        std::string inner = name.substr(open + 1, close - open - 1);
+        std::vector<std::string> args;
+        int depth = 0;
+        size_t start = 0;
+
+        for (size_t i = 0; i < inner.size(); ++i)
+        {
+            if (inner[i] == '<')
+                depth++;
+            else if (inner[i] == '>')
+                depth--;
+            else if (inner[i] == ',' && depth == 0)
+            {
+                std::string arg = inner.substr(start, i - start);
+                // Trim whitespace
+                size_t first = arg.find_first_not_of(" \t");
+                if (first != std::string::npos)
+                    arg = arg.substr(first);
+                size_t last = arg.find_last_not_of(" \t");
+                if (last != std::string::npos)
+                    arg = arg.substr(0, last + 1);
+                args.push_back(arg);
+                start = i + 1;
+            }
+        }
+        // Last argument
+        std::string last = inner.substr(start);
+        size_t first = last.find_first_not_of(" \t");
+        if (first != std::string::npos)
+            last = last.substr(first);
+        size_t lastpos = last.find_last_not_of(" \t");
+        if (lastpos != std::string::npos)
+            last = last.substr(0, lastpos + 1);
+        if (!last.empty())
+            args.push_back(last);
+
+        return args;
+    }
+
+    // Build a generic parameter substitution map: {T -> string, K -> i32, ...}
+    static std::unordered_map<std::string, std::string> buildSubstitutionMap(
+        const std::vector<std::unique_ptr<Cryo::GenericParameterNode>> &params,
+        const std::vector<std::string> &type_args)
+    {
+        std::unordered_map<std::string, std::string> subst;
+        for (size_t i = 0; i < params.size() && i < type_args.size(); ++i)
+            subst[params[i]->name()] = type_args[i];
+        return subst;
+    }
+
+    // Substitute generic parameter names in a type string at word boundaries.
+    // e.g., with {T -> string}: "T" -> "string", "T*" -> "string*", "Array<T>" -> "Array<string>"
+    static std::string substituteTypeStr(const std::string &type_str,
+                                         const std::unordered_map<std::string, std::string> &subst)
+    {
+        if (subst.empty())
+            return type_str;
+
+        auto isIdentChar = [](char c)
+        { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; };
+
+        std::string result = type_str;
+        for (const auto &[param, arg] : subst)
+        {
+            size_t pos = 0;
+            while ((pos = result.find(param, pos)) != std::string::npos)
+            {
+                bool left_ok = (pos == 0 || !isIdentChar(result[pos - 1]));
+                bool right_ok = (pos + param.size() >= result.size() || !isIdentChar(result[pos + param.size()]));
+                if (left_ok && right_ok)
+                {
+                    result.replace(pos, param.size(), arg);
+                    pos += arg.size();
+                }
+                else
+                {
+                    pos += param.size();
+                }
+            }
+        }
+        return result;
+    }
+
+    // Known primitive type sizes for layout computation (when resolved type is unavailable)
+    static std::pair<size_t, size_t> getKnownTypeSize(const std::string &type_name)
+    {
+        // Returns {size, alignment} or {0, 0} if unknown
+        if (type_name == "i8" || type_name == "u8" || type_name == "boolean")
+            return {1, 1};
+        if (type_name == "i16" || type_name == "u16")
+            return {2, 2};
+        if (type_name == "i32" || type_name == "u32" || type_name == "int")
+            return {4, 4};
+        if (type_name == "i64" || type_name == "u64")
+            return {8, 8};
+        if (type_name == "f32")
+            return {4, 4};
+        if (type_name == "f64")
+            return {8, 8};
+        if (type_name == "char")
+            return {4, 4};
+        if (type_name == "isize" || type_name == "usize")
+            return {sizeof(void *), sizeof(void *)};
+        if (type_name == "string")
+            return {sizeof(void *), sizeof(void *)};
+        return {0, 0};
+    }
+
+    // Compute size and alignment from a list of struct/class fields.
+    // Returns a comment line like "// Size: 12 bytes, Align: 4 bytes\n" or empty if unknown.
+    // subst: optional generic parameter substitution map for instantiated types.
+    static std::string computeFieldLayoutInfo(
+        const std::vector<std::unique_ptr<Cryo::StructFieldNode>> &fields,
+        const std::unordered_map<std::string, std::string> &subst = {})
+    {
+        if (fields.empty())
+            return "// Size: 0 bytes, Align: 1 byte\n";
+
+        size_t total_size = 0;
+        size_t max_align = 1;
+        bool all_known = true;
+
+        for (const auto &field : fields)
+        {
+            if (!field)
+            {
+                all_known = false;
+                continue;
+            }
+
+            size_t field_size = 0;
+            size_t field_align = 0;
+
+            // Try resolved type first
+            if (field->has_resolved_type())
+            {
+                auto type_ref = field->get_resolved_type();
+                if (type_ref.is_valid() && !type_ref.is_error())
+                {
+                    field_size = type_ref->size_bytes();
+                    field_align = type_ref->alignment();
+                }
+            }
+
+            // If resolved type didn't give us size, infer from type annotation
+            if (field_size == 0 && field->has_type_annotation())
+            {
+                // Apply generic substitution if available
+                std::string type_name = field->type_annotation()->name;
+                if (!subst.empty())
+                    type_name = substituteTypeStr(type_name, subst);
+
+                // Pointer types (Foo*, u8**, etc.) are always pointer-sized
+                if (!type_name.empty() && type_name.back() == '*')
+                {
+                    field_size = sizeof(void *);
+                    field_align = sizeof(void *);
+                }
+                // Reference types (&Foo, &mut Bar) are also pointer-sized
+                else if (!type_name.empty() && type_name[0] == '&')
+                {
+                    field_size = sizeof(void *);
+                    field_align = sizeof(void *);
+                }
+                // Try known primitive type sizes
+                else
+                {
+                    auto [sz, al] = getKnownTypeSize(type_name);
+                    field_size = sz;
+                    field_align = al;
+                }
+            }
+
+            if (field_size == 0)
+            {
+                all_known = false;
+                continue;
+            }
+
+            // Align the current offset
+            if (field_align > 0)
+            {
+                size_t padding = (field_align - (total_size % field_align)) % field_align;
+                total_size += padding;
+            }
+            total_size += field_size;
+            if (field_align > max_align)
+                max_align = field_align;
+        }
+
+        if (!all_known)
+            return "";
+
+        // Final struct padding to alignment
+        if (max_align > 0)
+        {
+            size_t padding = (max_align - (total_size % max_align)) % max_align;
+            total_size += padding;
+        }
+
+        std::string result = "// Size: " + std::to_string(total_size) + (total_size == 1 ? " byte" : " bytes");
+        result += ", Align: " + std::to_string(max_align) + (max_align == 1 ? " byte" : " bytes") + "\n";
+        return result;
+    }
+
     static std::string getReturnTypeStr(Cryo::FunctionDeclarationNode *func)
     {
         if (func->has_return_type_annotation())
@@ -576,18 +800,49 @@ namespace CryoLSP
     // Format Functions
     // ============================================================================
 
-    std::string HoverProvider::formatFunctionHover(Cryo::FunctionDeclarationNode *func)
+    std::string HoverProvider::formatFunctionHover(Cryo::FunctionDeclarationNode *func,
+                                                    const std::vector<std::string> &type_args)
     {
-        std::string result = "```cryo\n" + buildFunctionSignature(func) + "\n```";
+        std::string sig = buildFunctionSignature(func);
+        // Apply generic type argument substitution if provided
+        if (!type_args.empty())
+        {
+            auto subst = buildSubstitutionMap(func->generic_parameters(), type_args);
+            sig = substituteTypeStr(sig, subst);
+        }
+        std::string result = "```cryo\n" + sig + "\n```";
         return appendDocumentation(func, result);
     }
 
-    std::string HoverProvider::formatStructHover(Cryo::StructDeclarationNode *decl)
+    std::string HoverProvider::formatStructHover(Cryo::StructDeclarationNode *decl,
+                                                  const std::vector<std::string> &type_args)
     {
         size_t prop_limit = 3;
         size_t method_limit = 5;
-        std::string result = "```cryo\ntype struct " + decl->name();
-        result += formatGenericParams(decl->generic_parameters());
+
+        // Build generic substitution map if concrete type args are provided
+        auto subst = buildSubstitutionMap(decl->generic_parameters(), type_args);
+
+        // Compute layout info as a comment prefix inside the code block
+        std::string layout_comment = computeFieldLayoutInfo(decl->fields(), subst);
+
+        std::string result = "```cryo\n" + layout_comment + "type struct " + decl->name();
+        // Show concrete type args if instantiated, otherwise show generic params
+        if (!type_args.empty())
+        {
+            result += "<";
+            for (size_t i = 0; i < type_args.size(); ++i)
+            {
+                if (i > 0)
+                    result += ", ";
+                result += type_args[i];
+            }
+            result += ">";
+        }
+        else
+        {
+            result += formatGenericParams(decl->generic_parameters());
+        }
         result += " {\n";
 
         for (size_t i = 0; i < decl->fields().size() && i < prop_limit; ++i)
@@ -595,7 +850,8 @@ namespace CryoLSP
             const auto &field = decl->fields()[i];
             if (!field)
                 continue;
-            result += "    " + field->name() + ": " + getFieldTypeStr(field.get()) + ",\n";
+            std::string type_str = getFieldTypeStr(field.get());
+            result += "    " + field->name() + ": " + substituteTypeStr(type_str, subst) + ",\n";
         }
 
         // Show methods
@@ -607,7 +863,7 @@ namespace CryoLSP
                 const auto &method = decl->methods()[i];
                 if (!method)
                     continue;
-                result += "\t" + buildFunctionSignature(method.get()) + "\n";
+                result += "\t" + substituteTypeStr(buildFunctionSignature(method.get()), subst) + "\n";
             }
         }
 
@@ -616,12 +872,34 @@ namespace CryoLSP
         return appendDocumentation(decl, result);
     }
 
-    std::string HoverProvider::formatClassHover(Cryo::ClassDeclarationNode *decl)
+    std::string HoverProvider::formatClassHover(Cryo::ClassDeclarationNode *decl,
+                                                 const std::vector<std::string> &type_args)
     {
         size_t prop_limit = 3;
         size_t method_limit = 5;
-        std::string result = "```cryo\ntype class " + decl->name();
-        result += formatGenericParams(decl->generic_parameters());
+
+        // Build generic substitution map if concrete type args are provided
+        auto subst = buildSubstitutionMap(decl->generic_parameters(), type_args);
+
+        // Compute layout info as a comment prefix inside the code block
+        std::string layout_comment = computeFieldLayoutInfo(decl->fields(), subst);
+
+        std::string result = "```cryo\n" + layout_comment + "type class " + decl->name();
+        if (!type_args.empty())
+        {
+            result += "<";
+            for (size_t i = 0; i < type_args.size(); ++i)
+            {
+                if (i > 0)
+                    result += ", ";
+                result += type_args[i];
+            }
+            result += ">";
+        }
+        else
+        {
+            result += formatGenericParams(decl->generic_parameters());
+        }
 
         if (!decl->fields().empty())
         {
@@ -631,7 +909,8 @@ namespace CryoLSP
                 const auto &field = decl->fields()[i];
                 if (!field)
                     continue;
-                result += "    " + field->name() + ": " + getFieldTypeStr(field.get()) + ",\n";
+                std::string type_str = getFieldTypeStr(field.get());
+                result += "    " + field->name() + ": " + substituteTypeStr(type_str, subst) + ",\n";
             }
             result += "}\n```";
         }
@@ -648,7 +927,7 @@ namespace CryoLSP
                 const auto &method = decl->methods()[i];
                 if (!method)
                     continue;
-                result += "- `" + buildFunctionSignature(method.get()) + "`\n";
+                result += "- `" + substituteTypeStr(buildFunctionSignature(method.get()), subst) + "`\n";
             }
         }
 
@@ -657,7 +936,27 @@ namespace CryoLSP
 
     std::string HoverProvider::formatEnumHover(Cryo::EnumDeclarationNode *decl)
     {
-        std::string result = "```cryo\nenum " + decl->name();
+        // Compute size comment for simple enums
+        std::string layout_comment;
+        {
+            bool all_simple = true;
+            for (const auto &variant : decl->variants())
+            {
+                if (variant && !variant->is_simple_variant())
+                {
+                    all_simple = false;
+                    break;
+                }
+            }
+
+            if (all_simple && !decl->variants().empty())
+            {
+                // Simple C-style enum: size is the discriminant (i32 = 4 bytes)
+                layout_comment = "// Size: 4 bytes, Align: 4 bytes\n";
+            }
+        }
+
+        std::string result = "```cryo\n" + layout_comment + "enum " + decl->name();
         result += formatGenericParams(decl->generic_parameters());
         result += " {\n";
 
@@ -686,6 +985,7 @@ namespace CryoLSP
         }
 
         result += "}\n```";
+
         return appendDocumentation(decl, result);
     }
 
@@ -752,7 +1052,8 @@ namespace CryoLSP
     // Symbol Reference Hover (for identifiers that reference a declaration)
     // ============================================================================
 
-    std::string HoverProvider::formatSymbolRefHover(Cryo::Symbol *sym, Cryo::ASTNode *ast_root)
+    std::string HoverProvider::formatSymbolRefHover(Cryo::Symbol *sym, Cryo::ASTNode *ast_root,
+                                                     const std::vector<std::string> &type_args)
     {
         // Try to find the declaration in the AST for rich info
         DeclarationFinder declFinder(sym->name);
@@ -761,11 +1062,11 @@ namespace CryoLSP
         if (declNode)
         {
             if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(declNode))
-                return formatFunctionHover(func);
+                return formatFunctionHover(func, type_args);
             if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(declNode))
-                return formatStructHover(strct);
+                return formatStructHover(strct, type_args);
             if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(declNode))
-                return formatClassHover(cls);
+                return formatClassHover(cls, type_args);
             if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(declNode))
                 return formatEnumHover(enm);
             if (auto *trait = dynamic_cast<Cryo::TraitDeclarationNode *>(declNode))
@@ -1030,6 +1331,28 @@ namespace CryoLSP
             {"if", {"if", "A conditional expression.\n\nCan be used as a statement or as an expression that returns a value.\n\n**Example:**\n```cryo\nif (condition) {\n    // ...\n} else {\n    // ...\n}\n\nconst value = if (x > 0) { x } else { -x };\n```"}},
 
             {"for", {"for", "A loop statement.\n\nCurrently supports C-style `for(init; condition; update)` loops.\n\n**Example:**\n```cryo\nfor (mut i: int = 0; i < 10; i++) {\n    println(i);\n}\n```"}},
+
+            {"while", {"while", "A loop statement.\n\n**Example:**\n```cryo\nwhile (condition) {\n    // ...\n}\n```"}},
+
+            {"return", {"return", "Exits the current function and optionally returns a value.\n\n**Example:**\n```cryo\nfunction add(x: int, y: int) -> int {\n    return x + y;\n}\n```"}},
+
+            {"break", {"break", "Exits the nearest enclosing loop.\n\n**Example:**\n```cryo\nfor (mut i: int = 0; i < 10; i++) {\n    if (i == 5) {\n        break;\n    }\n}\n```"}},
+
+            {"continue", {"continue", "Skips the rest of the current loop iteration and continues with the next iteration.\n\n**Example:**\n```cryo\nfor (mut i: int = 0; i < 10; i++) {\n    if (i % 2 == 0) {\n        continue;\n    }\n    println(i); // Only prints odd numbers\n}\n```"}},
+
+            {"loop", {"loop", "An infinite loop statement.\n\n**Example:**\n```cryo\nloop {\n    // ...\n}\n```"}},
+
+            {"function", {"function", "Declare a function.\n\nFunctions can be declared at the top level or inside structs, classes, and impl blocks. \n\n**Example:**\n```cryo\nfunction add(x: int, y: int) -> int {\n    return x + y;\n}\n```"}},
+
+            {"static", {"static", "Indicates that a struct method is static, meaning it does not take a `this` parameter and cannot access instance fields.\n\n**Example:**\n```cryo\ntype struct Math {\n    static add(x: int, y: int) -> int {\n        return x + y;\n    }\n}\n```"}},
+
+            {"public", {"public", "A visibility modifier indicating that the following members are publicly accessible.\n\n**Example:**\n```cryo\ntype class Foo {\npublic:\n    x: int,\n    bar() { ... }\n}\n```"}},
+
+            {"private", {"private", "A visibility modifier indicating that the following members are only accessible within the same module.\n\n**Example:**\n```cryo\ntype class Foo {\nprivate:\n    secret: string,\n    reveal_secret() { ... }\n}\n```"}},
+
+            {"protected", {"protected", "A visibility modifier indicating that the following members are accessible within the same module and by subclasses (if inheritance is supported).\n\n**Example:**\n```cryo\ntype class Foo {\nprotected:\n    x: int,\n}\n```"}},
+
+            {"as", {"as", "Used for type casting and renaming imports.\n\n**Example:**\n```cryo\nconst x: int = 42;\nconst y: f32 = x as f32; // Cast int to float\n\nimport math as m; // Rename import\n```"}},
         };
 
         auto it = keywords.find(keyword);
@@ -1631,6 +1954,25 @@ namespace CryoLSP
             // Fall through to normal identifier handling
         }
 
+        // Handle literals that map to primitive types (e.g., () unit literal)
+        if (found.kind == FoundNode::Kind::Literal && found.node && !found.identifier_name.empty())
+        {
+            hover_text = getPrimitiveTypeHover(found.identifier_name);
+            if (!hover_text.empty())
+            {
+                Hover hover;
+                hover.contents.kind = "markdown";
+                hover.contents.value = hover_text;
+                Range range;
+                range.start.line = position.line;
+                range.start.character = static_cast<int>(found.node->location().column()) - 1;
+                range.end.line = position.line;
+                range.end.character = range.start.character + static_cast<int>(found.identifier_name.size());
+                hover.range = range;
+                return hover;
+            }
+        }
+
         if (found.identifier_name.empty())
             return std::nullopt;
 
@@ -1736,16 +2078,60 @@ namespace CryoLSP
             break;
         case FoundNode::Kind::FieldAccess:
         {
+            // Try to extract generic type args from the object's variable declaration
+            // e.g., for `generic_struct.value` where `generic_struct: GenericStruct<string>`,
+            // we extract ["string"] so we can substitute T -> string in the field type
+            std::unordered_map<std::string, std::string> field_subst;
+            auto *member_access = dynamic_cast<Cryo::MemberAccessNode *>(found.node);
+            if (member_access && member_access->object())
+            {
+                std::string obj_type_str;
+                if (auto *ident = dynamic_cast<Cryo::IdentifierNode *>(member_access->object()))
+                {
+                    // Find the variable declaration to get its type annotation
+                    VariableRefResolver varResolver(ident->name());
+                    Cryo::ASTNode *varNode = varResolver.find(instance->ast_root());
+                    if (auto *varDecl = dynamic_cast<Cryo::VariableDeclarationNode *>(varNode))
+                    {
+                        if (varDecl->has_type_annotation())
+                            obj_type_str = varDecl->type_annotation()->to_string();
+                    }
+                }
+                // Parse generic args from the object type and build substitution map
+                if (!obj_type_str.empty())
+                {
+                    auto obj_type_args = parseGenericArgs(obj_type_str);
+                    if (!obj_type_args.empty())
+                    {
+                        std::string base_type = stripGenericArgs(obj_type_str);
+                        DeclarationFinder typeFinder(base_type);
+                        Cryo::ASTNode *typeNode = typeFinder.find(instance->ast_root());
+                        if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(typeNode))
+                            field_subst = buildSubstitutionMap(strct->generic_parameters(), obj_type_args);
+                        else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(typeNode))
+                            field_subst = buildSubstitutionMap(cls->generic_parameters(), obj_type_args);
+                    }
+                }
+            }
+
             // Search all structs, classes, and impl blocks for a method/field with this name
             MemberFinder memberFinder(found.identifier_name);
             Cryo::ASTNode *memberNode = memberFinder.find(instance->ast_root());
             if (memberNode)
             {
                 if (auto *method = dynamic_cast<Cryo::FunctionDeclarationNode *>(memberNode))
-                    hover_text = formatFunctionHover(method);
+                {
+                    std::string sig = buildFunctionSignature(method);
+                    if (!field_subst.empty())
+                        sig = substituteTypeStr(sig, field_subst);
+                    hover_text = "```cryo\n" + sig + "\n```";
+                    hover_text = appendDocumentation(method, hover_text);
+                }
                 else if (auto *field = dynamic_cast<Cryo::StructFieldNode *>(memberNode))
                 {
                     std::string type_str = getFieldTypeStr(field);
+                    if (!field_subst.empty())
+                        type_str = substituteTypeStr(type_str, field_subst);
                     hover_text = "```cryo\n" + memberFinder.owner_name() + "." + field->name() + ": " + type_str + "\n```";
                 }
             }
@@ -1763,6 +2149,172 @@ namespace CryoLSP
                 }
                 if (sym)
                     hover_text = formatSymbolRefHover(sym, instance->ast_root());
+            }
+            break;
+        }
+        case FoundNode::Kind::FieldInitializer:
+        {
+            // Cursor is on a field name in a struct literal (e.g., "x" in "Point { x: 1 }")
+            auto *struct_literal = dynamic_cast<Cryo::StructLiteralNode *>(found.node);
+            if (struct_literal)
+            {
+                const std::string &struct_type_name = struct_literal->struct_type();
+                Transport::log("[Hover] FieldInitializer: field='" + found.identifier_name + "' in struct '" + struct_type_name + "'");
+
+                // Find the struct declaration in the AST
+                DeclarationFinder declFinder(struct_type_name);
+                Cryo::ASTNode *declNode = declFinder.find(instance->ast_root());
+
+                // If not found locally, search imported modules via qualified_name
+                if (!declNode)
+                {
+                    auto *symbol_table = instance->symbol_table();
+                    if (symbol_table)
+                    {
+                        Cryo::Symbol *sym = symbol_table->lookup(struct_type_name);
+                        if (!sym)
+                            sym = symbol_table->lookup_with_imports(struct_type_name);
+                        if (sym && !sym->qualified_name.empty())
+                        {
+                            // Extract module prefix from qualified name (e.g., "MyModule::Point" -> "MyModule")
+                            auto sep = sym->qualified_name.rfind("::");
+                            if (sep != std::string::npos)
+                            {
+                                std::string module_prefix = sym->qualified_name.substr(0, sep);
+                                auto *moduleInstance = _engine.findModuleInstance(module_prefix);
+                                if (moduleInstance && moduleInstance->ast_root())
+                                {
+                                    DeclarationFinder modFinder(struct_type_name);
+                                    declNode = modFinder.find(moduleInstance->ast_root());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Find the matching field in the struct/class declaration
+                if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(declNode))
+                {
+                    for (const auto &field : strct->fields())
+                    {
+                        if (field && field->name() == found.identifier_name)
+                        {
+                            std::string type_str = getFieldTypeStr(field.get());
+                            hover_text = "```cryo\n" + struct_type_name + "." + field->name() + ": " + type_str + "\n```";
+                            break;
+                        }
+                    }
+                }
+                else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(declNode))
+                {
+                    for (const auto &field : cls->fields())
+                    {
+                        if (field && field->name() == found.identifier_name)
+                        {
+                            std::string type_str = getFieldTypeStr(field.get());
+                            hover_text = "```cryo\n" + struct_type_name + "." + field->name() + ": " + type_str + "\n```";
+                            break;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case FoundNode::Kind::PatternBinding:
+        {
+            // Cursor is on a variable binding in an enum pattern (e.g., "name" in Expr::Variable(name))
+            auto *enum_pattern = dynamic_cast<Cryo::EnumPatternNode *>(found.node);
+            if (enum_pattern)
+            {
+                const std::string &enum_name = enum_pattern->enum_name();
+                const std::string &variant_name = enum_pattern->variant_name();
+                Transport::log("[Hover] PatternBinding: '" + found.identifier_name + "' in " + enum_name + "::" + variant_name);
+
+                // Find the binding's position index within the pattern elements
+                size_t binding_index = 0;
+                bool found_binding = false;
+                for (size_t i = 0; i < enum_pattern->pattern_elements().size(); ++i)
+                {
+                    const auto &elem = enum_pattern->pattern_elements()[i];
+                    if (elem.is_binding() && elem.binding_name == found.identifier_name)
+                    {
+                        binding_index = i;
+                        found_binding = true;
+                        break;
+                    }
+                }
+
+                if (found_binding)
+                {
+                    // Find the enum declaration to get the variant's associated types
+                    // Extract the actual enum type name (last segment of enum_name, e.g., "Color" from "Colors::Color")
+                    std::string actual_enum = enum_name;
+                    auto last_sep = enum_name.rfind("::");
+                    std::string namespace_prefix;
+                    if (last_sep != std::string::npos)
+                    {
+                        actual_enum = enum_name.substr(last_sep + 2);
+                        namespace_prefix = enum_name.substr(0, last_sep);
+                    }
+
+                    // Search locally first
+                    DeclarationFinder declFinder(actual_enum);
+                    Cryo::ASTNode *declNode = declFinder.find(instance->ast_root());
+
+                    // Search imported modules
+                    if (!declNode && !namespace_prefix.empty())
+                    {
+                        auto *moduleInstance = _engine.findModuleInstance(namespace_prefix);
+                        if (moduleInstance && moduleInstance->ast_root())
+                        {
+                            DeclarationFinder modFinder(actual_enum);
+                            declNode = modFinder.find(moduleInstance->ast_root());
+                        }
+                    }
+                    if (!declNode)
+                    {
+                        auto *symbol_table = instance->symbol_table();
+                        if (symbol_table)
+                        {
+                            Cryo::Symbol *sym = symbol_table->lookup(actual_enum);
+                            if (!sym)
+                                sym = symbol_table->lookup_with_imports(actual_enum);
+                            if (sym && !sym->qualified_name.empty())
+                            {
+                                auto sep = sym->qualified_name.rfind("::");
+                                if (sep != std::string::npos)
+                                {
+                                    auto mod_prefix = sym->qualified_name.substr(0, sep);
+                                    auto *moduleInstance = _engine.findModuleInstance(mod_prefix);
+                                    if (moduleInstance && moduleInstance->ast_root())
+                                    {
+                                        DeclarationFinder modFinder(actual_enum);
+                                        declNode = modFinder.find(moduleInstance->ast_root());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Look up the variant and get the associated type at binding_index
+                    if (auto *enumDecl = dynamic_cast<Cryo::EnumDeclarationNode *>(declNode))
+                    {
+                        for (const auto &variant : enumDecl->variants())
+                        {
+                            if (variant && variant->name() == variant_name)
+                            {
+                                const auto &assoc_types = variant->associated_types();
+                                if (binding_index < assoc_types.size())
+                                {
+                                    std::string type_str = assoc_types[binding_index];
+                                    hover_text = "```cryo\n" + found.identifier_name + ": " + type_str + "\n```";
+                                    hover_text += "\n\nBinding from `" + enum_name + "::" + variant_name + "`";
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             break;
         }
@@ -1937,27 +2489,42 @@ namespace CryoLSP
                 break;
             [[fallthrough]];
         }
+        case FoundNode::Kind::Parameter:
+        {
+            auto *param = dynamic_cast<Cryo::VariableDeclarationNode *>(found.node);
+            if (param)
+            {
+                std::string type_str = getParamTypeStr(param);
+                hover_text = "```cryo\n(parameter) " + param->name() + ": " + type_str + "\n```";
+            }
+            break;
+        }
         case FoundNode::Kind::Identifier:
         case FoundNode::Kind::TypeReference:
         case FoundNode::Kind::ImportDecl:
-        case FoundNode::Kind::Parameter:
         default:
         {
             // For type references from annotations, try primitive docs first (already done above)
             // Then try symbol table + AST declaration search
+
+            // Strip generic arguments for lookups: "Array<Token>" -> "Array"
+            std::string lookup_name = stripGenericArgs(found.identifier_name);
+            // Parse concrete type args for generic substitution in hover display
+            std::vector<std::string> type_args = parseGenericArgs(found.identifier_name);
+
             auto *symbol_table = instance->symbol_table();
             Transport::log("[Hover] Symbol table: " + std::string(symbol_table ? "valid" : "null"));
 
             Cryo::Symbol *sym = nullptr;
             if (symbol_table)
             {
-                Transport::log("[Hover] Looking up '" + found.identifier_name + "' in symbol table...");
-                sym = symbol_table->lookup(found.identifier_name);
+                Transport::log("[Hover] Looking up '" + lookup_name + "' in symbol table...");
+                sym = symbol_table->lookup(lookup_name);
                 Transport::log("[Hover] lookup: " + std::string(sym ? "found" : "not found"));
                 if (!sym)
                 {
                     Transport::log("[Hover] Trying lookup_with_imports...");
-                    sym = symbol_table->lookup_with_imports(found.identifier_name);
+                    sym = symbol_table->lookup_with_imports(lookup_name);
                     Transport::log("[Hover] lookup_with_imports: " + std::string(sym ? "found" : "not found"));
                 }
             }
@@ -1965,21 +2532,21 @@ namespace CryoLSP
             if (sym)
             {
                 Transport::log("[Hover] Formatting symbol ref hover...");
-                hover_text = formatSymbolRefHover(sym, instance->ast_root());
+                hover_text = formatSymbolRefHover(sym, instance->ast_root(), type_args);
             }
             else
             {
                 // No symbol found - try DeclarationFinder directly on AST
                 Transport::log("[Hover] Trying DeclarationFinder...");
-                DeclarationFinder declFinder(found.identifier_name);
+                DeclarationFinder declFinder(lookup_name);
                 Cryo::ASTNode *declNode = declFinder.find(instance->ast_root());
                 Transport::log("[Hover] DeclarationFinder: " + std::string(declNode ? "found" : "not found"));
                 if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(declNode))
-                    hover_text = formatFunctionHover(func);
+                    hover_text = formatFunctionHover(func, type_args);
                 else if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(declNode))
-                    hover_text = formatStructHover(strct);
+                    hover_text = formatStructHover(strct, type_args);
                 else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(declNode))
-                    hover_text = formatClassHover(cls);
+                    hover_text = formatClassHover(cls, type_args);
                 else if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(declNode))
                     hover_text = formatEnumHover(enm);
                 else if (auto *trait = dynamic_cast<Cryo::TraitDeclarationNode *>(declNode))
@@ -1988,7 +2555,7 @@ namespace CryoLSP
                 {
                     // Try deep AST search for variable/parameter declarations
                     Transport::log("[Hover] Trying VariableRefResolver...");
-                    VariableRefResolver varResolver(found.identifier_name);
+                    VariableRefResolver varResolver(lookup_name);
                     Cryo::ASTNode *varNode = varResolver.find(instance->ast_root());
                     Transport::log("[Hover] VariableRefResolver: " + std::string(varNode ? "found" : "not found"));
                     if (auto *varDecl = dynamic_cast<Cryo::VariableDeclarationNode *>(varNode))
@@ -2059,14 +2626,14 @@ namespace CryoLSP
                         auto *moduleInstance = _engine.findModuleInstance(module_prefix);
                         if (moduleInstance && moduleInstance->ast_root())
                         {
-                            DeclarationFinder modDeclFinder(found.identifier_name);
+                            DeclarationFinder modDeclFinder(lookup_name);
                             Cryo::ASTNode *modDeclNode = modDeclFinder.find(moduleInstance->ast_root());
                             if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(modDeclNode))
-                                hover_text = formatFunctionHover(func);
+                                hover_text = formatFunctionHover(func, type_args);
                             else if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(modDeclNode))
-                                hover_text = formatStructHover(strct);
+                                hover_text = formatStructHover(strct, type_args);
                             else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(modDeclNode))
-                                hover_text = formatClassHover(cls);
+                                hover_text = formatClassHover(cls, type_args);
                             else if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(modDeclNode))
                                 hover_text = formatEnumHover(enm);
                             else if (auto *trait = dynamic_cast<Cryo::TraitDeclarationNode *>(modDeclNode))
@@ -2202,6 +2769,15 @@ namespace CryoLSP
                 {
                     range.start.character = position.character;
                 }
+            }
+            else if (found.kind == FoundNode::Kind::FieldInitializer || found.kind == FoundNode::Kind::PatternBinding)
+            {
+                // Field name in struct literal or binding in enum pattern - find word start from document
+                auto content = _documents.getContent(uri);
+                if (content.has_value())
+                    range.start.character = findWordStartColumn(content.value(), position.line, position.character);
+                else
+                    range.start.character = position.character;
             }
             else if (found.kind == FoundNode::Kind::EnumVariant && !dynamic_cast<Cryo::EnumVariantNode *>(found.node))
             {
