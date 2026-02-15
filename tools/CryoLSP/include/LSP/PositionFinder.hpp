@@ -75,12 +75,17 @@ namespace CryoLSP
         void visit(Cryo::StructMethodNode &node) override;
         void visit(Cryo::ImportDeclarationNode &node) override;
         void visit(Cryo::MatchStatementNode &node) override;
+        void visit(Cryo::MatchExpressionNode &node) override;
+        void visit(Cryo::MatchArmNode &node) override;
+        void visit(Cryo::PatternNode &node) override;
+        void visit(Cryo::EnumPatternNode &node) override;
         void visit(Cryo::TypeAliasDeclarationNode &node) override;
         void visit(Cryo::TraitDeclarationNode &node) override;
         void visit(Cryo::SizeofExpressionNode &node) override;
         void visit(Cryo::AlignofExpressionNode &node) override;
         void visit(Cryo::CastExpressionNode &node) override;
         void visit(Cryo::StructFieldNode &node) override;
+        void visit(Cryo::StructLiteralNode &node) override;
 
     private:
         size_t _target_line;

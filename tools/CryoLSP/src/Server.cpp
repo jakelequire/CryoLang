@@ -12,13 +12,13 @@ namespace CryoLSP
 
     Server::Server()
         : _diagnosticsProvider(_engine, _transport),
-          _hoverProvider(_engine),
+          _hoverProvider(_engine, _documents),
           _definitionProvider(_engine),
           _completionProvider(_engine, _documents),
           _symbolProvider(_engine),
           _referencesProvider(_engine),
           _signatureHelpProvider(_engine),
-          _semanticTokensProvider(_engine)
+          _semanticTokensProvider(_engine, _documents)
     {
         registerHandlers();
     }
