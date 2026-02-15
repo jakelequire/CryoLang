@@ -344,11 +344,67 @@ namespace CryoLSP
 
     void PositionFinder::visit(Cryo::ScopeResolutionNode &node)
     {
-        if (matchesPosition(node, node.scope_name().size() + 2 + node.member_name().size()))
+        if (node.location().line() != _target_line)
+            return;
+
+        const std::string &scope_name = node.scope_name();
+
+        // Split scope_name by "::" to handle chained resolution
+        // e.g., "Colors::Color" in "Colors::Color::Red" -> ["Colors", "Color"]
+        std::vector<std::string> segments;
+        size_t start = 0;
+        while (true)
+        {
+            size_t pos = scope_name.find("::", start);
+            if (pos == std::string::npos)
+            {
+                segments.push_back(scope_name.substr(start));
+                break;
+            }
+            segments.push_back(scope_name.substr(start, pos - start));
+            start = pos + 2;
+        }
+
+        // Check each segment of the scope name
+        size_t current_col = node.location().column();
+        for (const auto &segment : segments)
+        {
+            if (_target_col >= current_col && _target_col < current_col + segment.size())
+            {
+                _result.node = &node;
+                _result.identifier_name = segment;
+                _result.kind = FoundNode::Kind::TypeReference;
+                return;
+            }
+            current_col += segment.size() + 2; // +2 for "::"
+        }
+
+        // Account for generic args after the last scope segment
+        if (node.has_generic_args())
+        {
+            // Backtrack: generic args are on the last segment, before the final "::"
+            // current_col is past the last "::" after scope segments
+            // Actually, generics attach to the whole scope_name, positioned after scope_name
+            // Recompute: generics start right after scope_name ends
+            current_col = node.location().column() + scope_name.size();
+            current_col += 1; // <
+            for (size_t i = 0; i < node.generic_args().size(); ++i)
+            {
+                if (i > 0)
+                    current_col += 2; // ", "
+                current_col += node.generic_args()[i].size();
+            }
+            current_col += 1; // >
+            current_col += 2; // "::" before member
+        }
+
+        // Check if cursor is on the member name (e.g., "new" in "Point::new")
+        if (_target_col >= current_col && _target_col < current_col + node.member_name().size())
         {
             _result.node = &node;
-            _result.identifier_name = node.scope_name() + "::" + node.member_name();
+            _result.identifier_name = node.member_name();
             _result.kind = FoundNode::Kind::ScopeResolution;
+            return;
         }
     }
 
@@ -451,6 +507,24 @@ namespace CryoLSP
             checkTypeAnnotation(node.type_annotation());
     }
 
+    void PositionFinder::visit(Cryo::StructLiteralNode &node)
+    {
+        // Check if cursor is on the struct type name (e.g., "Point" in "Point { x: 1, y: 2 }")
+        if (matchesPosition(node.location(), node.struct_type().size()))
+        {
+            _result.node = &node;
+            _result.identifier_name = node.struct_type();
+            _result.kind = FoundNode::Kind::TypeReference;
+        }
+
+        // Visit field initializer value expressions
+        for (const auto &field : node.field_initializers())
+        {
+            if (field && field->value())
+                field->value()->accept(*this);
+        }
+    }
+
     // ============================================================================
     // Statements
     // ============================================================================
@@ -498,8 +572,98 @@ namespace CryoLSP
 
         for (const auto &arm : node.arms())
         {
-            if (arm && arm->body())
-                arm->body()->accept(*this);
+            if (arm)
+                arm->accept(*this);
+        }
+    }
+
+    void PositionFinder::visit(Cryo::MatchExpressionNode &node)
+    {
+        if (node.expression())
+            node.expression()->accept(*this);
+
+        for (const auto &arm : node.arms())
+        {
+            if (arm)
+                arm->accept(*this);
+        }
+    }
+
+    void PositionFinder::visit(Cryo::MatchArmNode &node)
+    {
+        for (const auto &pattern : node.patterns())
+        {
+            if (pattern)
+                pattern->accept(*this);
+        }
+
+        if (node.body())
+            node.body()->accept(*this);
+    }
+
+    void PositionFinder::visit(Cryo::PatternNode &node)
+    {
+        // For literal patterns, visit the literal value
+        if (node.literal_value())
+            node.literal_value()->accept(*this);
+
+        // For identifier patterns, check cursor on the identifier
+        if (node.pattern_type() == Cryo::PatternNode::PatternType::Identifier)
+        {
+            if (matchesPosition(node, node.identifier().size()))
+            {
+                _result.node = &node;
+                _result.identifier_name = node.identifier();
+                _result.kind = FoundNode::Kind::Identifier;
+            }
+        }
+    }
+
+    void PositionFinder::visit(Cryo::EnumPatternNode &node)
+    {
+        const std::string &enum_name = node.enum_name();
+        const std::string &variant_name = node.variant_name();
+
+        if (node.location().line() != _target_line)
+            return;
+
+        // Split enum_name by "::" to get individual segments
+        // e.g., "Colors::Color" -> ["Colors", "Color"]
+        std::vector<std::string> segments;
+        size_t start = 0;
+        while (true)
+        {
+            size_t pos = enum_name.find("::", start);
+            if (pos == std::string::npos)
+            {
+                segments.push_back(enum_name.substr(start));
+                break;
+            }
+            segments.push_back(enum_name.substr(start, pos - start));
+            start = pos + 2;
+        }
+
+        // Check each segment of enum_name
+        size_t current_col = node.location().column();
+        for (const auto &segment : segments)
+        {
+            if (_target_col >= current_col && _target_col < current_col + segment.size())
+            {
+                _result.node = &node;
+                _result.identifier_name = segment;
+                _result.kind = FoundNode::Kind::TypeReference;
+                return;
+            }
+            current_col += segment.size() + 2; // +2 for "::"
+        }
+
+        // Check variant name
+        if (_target_col >= current_col && _target_col < current_col + variant_name.size())
+        {
+            _result.node = &node;
+            _result.identifier_name = variant_name;
+            _result.kind = FoundNode::Kind::EnumVariant;
+            return;
         }
     }
 

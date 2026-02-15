@@ -3,6 +3,7 @@
 #include "LSP/Transport.hpp"
 #include "Compiler/CompilerInstance.hpp"
 #include "Types/SymbolTable.hpp"
+#include "AST/ASTVisitor.hpp"
 
 namespace CryoLSP
 {
@@ -56,6 +57,334 @@ namespace CryoLSP
             loc.range.end.line = loc.range.start.line;
             loc.range.end.character = loc.range.start.character + static_cast<int>(sym->name.size());
             return loc;
+        }
+
+        // AST-based search: find declarations directly in the AST
+        {
+            Transport::log("[Definition] Trying AST-based declaration search...");
+            Cryo::ASTNode *ast_root = instance->ast_root();
+
+            // Helper lambda to build a Location from an AST node
+            auto buildLocationFromNode = [&](Cryo::ASTNode *node, const std::string &name) -> std::optional<Location>
+            {
+                if (!node)
+                    return std::nullopt;
+
+                Location loc;
+                loc.uri = path_to_uri(file_path);
+
+                // Prefer name_location for declarations that have it
+                Cryo::SourceLocation srcLoc = node->location();
+                if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(node))
+                {
+                    if (func->has_name_location())
+                        srcLoc = func->name_location();
+                }
+                else if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(node))
+                {
+                    if (strct->has_name_location())
+                        srcLoc = strct->name_location();
+                }
+                else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(node))
+                {
+                    if (cls->has_name_location())
+                        srcLoc = cls->name_location();
+                }
+                else if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(node))
+                {
+                    if (enm->has_name_location())
+                        srcLoc = enm->name_location();
+                }
+                else if (auto *trait = dynamic_cast<Cryo::TraitDeclarationNode *>(node))
+                {
+                    if (trait->has_name_location())
+                        srcLoc = trait->name_location();
+                }
+                else if (auto *alias = dynamic_cast<Cryo::TypeAliasDeclarationNode *>(node))
+                {
+                    if (alias->has_name_location())
+                        srcLoc = alias->name_location();
+                }
+                else if (auto *varDecl = dynamic_cast<Cryo::VariableDeclarationNode *>(node))
+                {
+                    if (varDecl->has_name_location())
+                        srcLoc = varDecl->name_location();
+                }
+
+                loc.range.start.line = static_cast<int>(srcLoc.line() > 0 ? srcLoc.line() - 1 : 0);
+                loc.range.start.character = static_cast<int>(srcLoc.column() > 0 ? srcLoc.column() - 1 : 0);
+                loc.range.end.line = loc.range.start.line;
+                loc.range.end.character = loc.range.start.character + static_cast<int>(name.size());
+                return loc;
+            };
+
+            // 1. Search top-level declarations (functions, structs, classes, enums, traits)
+            class DeclarationFinder : public Cryo::BaseASTVisitor
+            {
+            public:
+                DeclarationFinder(const std::string &name) : _target(name) {}
+                Cryo::ASTNode *find(Cryo::ASTNode *root)
+                {
+                    _result = nullptr;
+                    if (root)
+                        root->accept(*this);
+                    return _result;
+                }
+                void visit(Cryo::ProgramNode &node) override
+                {
+                    for (const auto &child : node.statements())
+                        if (child && !_result)
+                            child->accept(*this);
+                }
+                void visit(Cryo::DeclarationStatementNode &node) override
+                {
+                    if (node.declaration() && !_result)
+                        node.declaration()->accept(*this);
+                }
+                void visit(Cryo::FunctionDeclarationNode &node) override
+                {
+                    if (node.name() == _target)
+                        _result = &node;
+                }
+                void visit(Cryo::StructDeclarationNode &node) override
+                {
+                    if (node.name() == _target)
+                        _result = &node;
+                }
+                void visit(Cryo::ClassDeclarationNode &node) override
+                {
+                    if (node.name() == _target)
+                        _result = &node;
+                }
+                void visit(Cryo::EnumDeclarationNode &node) override
+                {
+                    if (node.name() == _target)
+                        _result = &node;
+                }
+                void visit(Cryo::TraitDeclarationNode &node) override
+                {
+                    if (node.name() == _target)
+                        _result = &node;
+                }
+                void visit(Cryo::TypeAliasDeclarationNode &node) override
+                {
+                    if (node.alias_name() == _target)
+                        _result = &node;
+                }
+
+            private:
+                std::string _target;
+                Cryo::ASTNode *_result = nullptr;
+            };
+
+            DeclarationFinder declFinder(found.identifier_name);
+            Cryo::ASTNode *declNode = declFinder.find(ast_root);
+            if (declNode)
+            {
+                Transport::log("[Definition] Found declaration in AST");
+                auto loc = buildLocationFromNode(declNode, found.identifier_name);
+                if (loc.has_value())
+                    return loc;
+            }
+
+            // 2. Deep search for variable/parameter declarations
+            class VariableRefResolver : public Cryo::BaseASTVisitor
+            {
+            public:
+                VariableRefResolver(const std::string &name) : _target(name) {}
+                Cryo::ASTNode *find(Cryo::ASTNode *root)
+                {
+                    _result = nullptr;
+                    if (root)
+                        root->accept(*this);
+                    return _result;
+                }
+                void visit(Cryo::ProgramNode &node) override
+                {
+                    for (const auto &child : node.statements())
+                        if (child && !_result)
+                            child->accept(*this);
+                }
+                void visit(Cryo::DeclarationStatementNode &node) override
+                {
+                    if (node.declaration() && !_result)
+                        node.declaration()->accept(*this);
+                }
+                void visit(Cryo::BlockStatementNode &node) override
+                {
+                    for (const auto &stmt : node.statements())
+                        if (stmt && !_result)
+                            stmt->accept(*this);
+                }
+                void visit(Cryo::VariableDeclarationNode &node) override
+                {
+                    if (node.name() == _target)
+                        _result = &node;
+                }
+                void visit(Cryo::FunctionDeclarationNode &node) override
+                {
+                    for (const auto &param : node.parameters())
+                        if (param && !_result && param->name() == _target)
+                            _result = param.get();
+                    if (node.body() && !_result)
+                        node.body()->accept(*this);
+                }
+                void visit(Cryo::StructMethodNode &node) override
+                {
+                    for (const auto &param : node.parameters())
+                        if (param && !_result && param->name() == _target)
+                            _result = param.get();
+                    if (node.body() && !_result)
+                        node.body()->accept(*this);
+                }
+                void visit(Cryo::StructDeclarationNode &node) override
+                {
+                    for (const auto &method : node.methods())
+                        if (method && !_result)
+                            method->accept(*this);
+                }
+                void visit(Cryo::ClassDeclarationNode &node) override
+                {
+                    for (const auto &method : node.methods())
+                        if (method && !_result)
+                            method->accept(*this);
+                }
+                void visit(Cryo::ImplementationBlockNode &node) override
+                {
+                    for (const auto &method : node.method_implementations())
+                        if (method && !_result)
+                            method->accept(*this);
+                }
+                void visit(Cryo::IfStatementNode &node) override
+                {
+                    if (node.then_statement() && !_result)
+                        node.then_statement()->accept(*this);
+                    if (node.else_statement() && !_result)
+                        node.else_statement()->accept(*this);
+                }
+                void visit(Cryo::ForStatementNode &node) override
+                {
+                    if (node.init() && !_result)
+                        node.init()->accept(*this);
+                    if (node.body() && !_result)
+                        node.body()->accept(*this);
+                }
+                void visit(Cryo::WhileStatementNode &node) override
+                {
+                    if (node.body() && !_result)
+                        node.body()->accept(*this);
+                }
+
+            private:
+                std::string _target;
+                Cryo::ASTNode *_result = nullptr;
+            };
+
+            VariableRefResolver varResolver(found.identifier_name);
+            Cryo::ASTNode *varNode = varResolver.find(ast_root);
+            if (varNode)
+            {
+                Transport::log("[Definition] Found variable/parameter declaration in AST");
+                auto loc = buildLocationFromNode(varNode, found.identifier_name);
+                if (loc.has_value())
+                    return loc;
+            }
+
+            // 3. Search methods/fields in structs, classes, impl blocks
+            class MemberFinder : public Cryo::BaseASTVisitor
+            {
+            public:
+                MemberFinder(const std::string &name) : _target(name) {}
+                Cryo::ASTNode *find(Cryo::ASTNode *root)
+                {
+                    _result = nullptr;
+                    if (root)
+                        root->accept(*this);
+                    return _result;
+                }
+                void visit(Cryo::ProgramNode &node) override
+                {
+                    for (const auto &child : node.statements())
+                        if (child && !_result)
+                            child->accept(*this);
+                }
+                void visit(Cryo::DeclarationStatementNode &node) override
+                {
+                    if (node.declaration() && !_result)
+                        node.declaration()->accept(*this);
+                }
+                void visit(Cryo::StructDeclarationNode &node) override
+                {
+                    if (_result)
+                        return;
+                    for (const auto &method : node.methods())
+                        if (method && method->name() == _target)
+                        {
+                            _result = method.get();
+                            return;
+                        }
+                    for (const auto &field : node.fields())
+                        if (field && field->name() == _target)
+                        {
+                            _result = field.get();
+                            return;
+                        }
+                }
+                void visit(Cryo::ClassDeclarationNode &node) override
+                {
+                    if (_result)
+                        return;
+                    for (const auto &method : node.methods())
+                        if (method && method->name() == _target)
+                        {
+                            _result = method.get();
+                            return;
+                        }
+                    for (const auto &field : node.fields())
+                        if (field && field->name() == _target)
+                        {
+                            _result = field.get();
+                            return;
+                        }
+                }
+                void visit(Cryo::ImplementationBlockNode &node) override
+                {
+                    if (_result)
+                        return;
+                    for (const auto &method : node.method_implementations())
+                        if (method && method->name() == _target)
+                        {
+                            _result = method.get();
+                            return;
+                        }
+                    for (const auto &field : node.field_implementations())
+                        if (field && field->name() == _target)
+                        {
+                            _result = field.get();
+                            return;
+                        }
+                }
+
+            private:
+                std::string _target;
+                Cryo::ASTNode *_result = nullptr;
+            };
+
+            // For qualified names like "Point::new", search for the member part
+            std::string memberName = found.identifier_name;
+            auto colonPos = memberName.rfind("::");
+            if (colonPos != std::string::npos)
+                memberName = memberName.substr(colonPos + 2);
+
+            MemberFinder memberFinder(memberName);
+            Cryo::ASTNode *memberNode = memberFinder.find(ast_root);
+            if (memberNode)
+            {
+                Transport::log("[Definition] Found member declaration in AST");
+                auto loc = buildLocationFromNode(memberNode, memberName);
+                if (loc.has_value())
+                    return loc;
+            }
         }
 
         // Fallback: search intrinsics file

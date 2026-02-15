@@ -1499,6 +1499,7 @@ namespace Cryo
             TypeAnnotation::named(type_string, type_loc));
         auto var_decl = _builder.create_variable_declaration(start_loc, var_name, std::move(type_annotation), std::move(initializer), is_mutable, is_global);
         var_decl->set_name_location(name_token.location());
+        attach_documentation(var_decl.get());
 
         // Also set the resolved type (may be an error type for generic types, will be resolved later)
         var_decl->set_resolved_type(var_type);
@@ -6000,12 +6001,16 @@ namespace Cryo
                 enum_val_text.erase(std::remove(enum_val_text.begin(), enum_val_text.end(), '_'), enum_val_text.end()); // Strip underscore separators
                 int64_t explicit_value = std::stoll(enum_val_text);
                 advance(); // consume the number
-                return _builder.create_enum_variant_with_value(start_loc, variant_name, explicit_value);
+                auto variant = _builder.create_enum_variant_with_value(start_loc, variant_name, explicit_value);
+                attach_documentation(variant.get());
+                return variant;
             }
             else
             {
                 error("Expected integer value after '=' in enum variant");
-                return _builder.create_enum_variant(start_loc, variant_name);
+                auto variant = _builder.create_enum_variant(start_loc, variant_name);
+                attach_documentation(variant.get());
+                return variant;
             }
         }
         // Check if this is a complex variant with associated data
@@ -6037,12 +6042,16 @@ namespace Cryo
 
             consume(TokenKind::TK_R_PAREN, "Expected ')' after variant types");
 
-            return _builder.create_enum_variant(start_loc, variant_name, associated_types);
+            auto variant = _builder.create_enum_variant(start_loc, variant_name, associated_types);
+            attach_documentation(variant.get());
+            return variant;
         }
         else
         {
             // Simple variant: NAME_1, NAME_2
-            return _builder.create_enum_variant(start_loc, variant_name);
+            auto variant = _builder.create_enum_variant(start_loc, variant_name);
+            attach_documentation(variant.get());
+            return variant;
         }
     }
 
@@ -6347,6 +6356,7 @@ namespace Cryo
         }
 
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after field declaration");
+        attach_documentation(field.get());
         return field;
     }
 
@@ -6512,6 +6522,7 @@ namespace Cryo
 
         auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor, is_destructor, is_static, is_default_destructor);
         method->set_name_location(method_token.location());
+        attach_documentation(method.get());
 
         // Set the return type annotation from the captured type string
         // This preserves the original type annotation (e.g., "Option<u64>") for later phases

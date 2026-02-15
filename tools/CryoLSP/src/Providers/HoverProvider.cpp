@@ -6,6 +6,7 @@
 #include "Types/TypeAnnotation.hpp"
 #include "Lexer/lexer.hpp"
 #include <unordered_map>
+#include <cstdint>
 
 namespace CryoLSP
 {
@@ -449,8 +450,8 @@ namespace CryoLSP
     // Static Helpers
     // ============================================================================
 
-    HoverProvider::HoverProvider(AnalysisEngine &engine)
-        : _engine(engine) {}
+    HoverProvider::HoverProvider(AnalysisEngine &engine, DocumentStore &documents)
+        : _engine(engine), _documents(documents) {}
 
     static std::string getParamTypeStr(Cryo::VariableDeclarationNode *param)
     {
@@ -537,17 +538,22 @@ namespace CryoLSP
         // Parameters
         sig += "(";
         const auto &params = func->parameters();
+        bool is_variadic = func->is_variadic();
         for (size_t i = 0; i < params.size(); ++i)
         {
             if (i > 0)
                 sig += ", ";
-            sig += params[i]->name() + ": " + getParamTypeStr(params[i].get());
-        }
-        if (func->is_variadic())
-        {
-            if (!params.empty())
-                sig += ", ";
-            sig += "...";
+
+            // If this is the last parameter and the function is variadic,
+            // display as `name...` instead of `name: void`
+            if (is_variadic && i == params.size() - 1)
+            {
+                sig += params[i]->name() + "...";
+            }
+            else
+            {
+                sig += params[i]->name() + ": " + getParamTypeStr(params[i].get());
+            }
         }
         sig += ")";
 
@@ -719,7 +725,7 @@ namespace CryoLSP
         }
 
         result += "\n```";
-        return result;
+        return appendDocumentation(variant, result);
     }
 
     std::string HoverProvider::formatTraitHover(Cryo::TraitDeclarationNode *decl)
@@ -880,6 +886,71 @@ namespace CryoLSP
     }
 
     // ============================================================================
+    // Namespace / Module Hover
+    // ============================================================================
+
+    std::string HoverProvider::formatNamespaceHover(const std::string &name, Cryo::ProgramNode *ast)
+    {
+        std::string result = "```cryo\nnamespace " + name + "\n```\n\n---\n\n";
+
+        int count = 0;
+        int max_items = 10;
+
+        for (const auto &stmt : ast->statements())
+        {
+            if (count >= max_items)
+                break;
+            if (!stmt)
+                continue;
+
+            Cryo::ASTNode *decl = stmt.get();
+            if (auto *ds = dynamic_cast<Cryo::DeclarationStatementNode *>(decl))
+                decl = ds->declaration();
+
+            if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(decl))
+            {
+                result += "- `" + buildFunctionSignature(func) + "`\n";
+                ++count;
+            }
+            else if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(decl))
+            {
+                result += "- `type struct " + strct->name();
+                result += formatGenericParams(strct->generic_parameters());
+                result += "`\n";
+                ++count;
+            }
+            else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(decl))
+            {
+                result += "- `type class " + cls->name();
+                result += formatGenericParams(cls->generic_parameters());
+                result += "`\n";
+                ++count;
+            }
+            else if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(decl))
+            {
+                result += "- `enum " + enm->name();
+                result += formatGenericParams(enm->generic_parameters());
+                result += "`\n";
+                ++count;
+            }
+            else if (auto *trait = dynamic_cast<Cryo::TraitDeclarationNode *>(decl))
+            {
+                result += "- `trait " + trait->name();
+                result += formatGenericParams(trait->generic_parameters());
+                result += "`\n";
+                ++count;
+            }
+        }
+
+        if (count == 0)
+            result += "*No exported declarations found*\n";
+        else if (count >= max_items)
+            result += "\n*... and more*\n";
+
+        return result;
+    }
+
+    // ============================================================================
     // Primitive Type Documentation
     // ============================================================================
 
@@ -908,7 +979,7 @@ namespace CryoLSP
             {"f64", {"f64", "A 64-bit floating-point type (double precision).\n\nSize: 8 bytes \nPrecision: ~15-17 significant digits"}},
 
             // Boolean
-            {"boolean", {"bool", "The boolean type.\n\nCan be either `true` or `false`. \nSize: 1 byte"}},
+            {"boolean", {"boolean", "The boolean type.\n\nCan be either `true` or `false`. \nSize: 1 byte"}},
 
             // String and char
             {"string", {"string", "A UTF-8 encoded string type.\n\nStrings are heap-allocated and growable. \nString literals like `\"hello\"` create values of this type."}},
@@ -921,8 +992,8 @@ namespace CryoLSP
             {"()", {"()", "The unit type.\n\nRepresents an empty value. \nUsed when a function returns no meaningful value but you want to indicate it returns successfully."}},
 
             // Boolean literals (in case they're parsed as identifiers)
-            {"true", {"boolean", "The boolean type.\n\nCan be either `true` or `false`. \nSize: 1 byte\n\nValue: `true`"}},
-            {"false", {"boolean", "The boolean type.\n\nCan be either `true` or `false`. \nSize: 1 byte\n\nValue: `false`"}},
+            {"true", {"true", "The boolean type.\n\nCan be either `true` or `false`. \nSize: 1 byte\n"}},
+            {"false", {"false", "The boolean type.\n\nCan be either `true` or `false`. \nSize: 1 byte\n"}},
 
             // Built-in operators
             {"sizeof", {"sizeof(Type) -> int", "Returns the size in bytes of the given type.\n\nEvaluated at compile time. The result is an integer representing the number of bytes the type occupies in memory.\n\n**Example:**\n```cryo\nsizeof(i32)    // 4\nsizeof(Point)  // depends on fields\n```"}},
@@ -935,6 +1006,127 @@ namespace CryoLSP
 
         const auto &[display_name, description] = it->second;
         return "```cryo\n" + display_name + "\n```\n\n---\n\n" + description;
+    }
+
+    // ============================================================================
+    // Keyword Documentation
+    // ============================================================================
+
+    std::string HoverProvider::getKeywordHover(const std::string &keyword)
+    {
+        static const std::unordered_map<std::string, std::pair<std::string, std::string>> keywords = {
+            {"type", {"type", "Declare a data type or type alias.\n\n`type struct Foo { ... }` declares a struct of Foo type. \n`type class Bar { ... }` declares a class of Bar type. \n`type` can also *alias* types: `type Bar = Foo;` creates an alias where `Bar` is equivalent to `Foo`."}},
+
+            {"struct", {"struct", "A struct is a data type where all of its members are **public** by default.\n\nA struct does **not** allow for inheritance but may be generic.\n\n**Example:**\n```cryo\ntype struct Point<T> {\n    x: T,\n    y: T,\n}\n```"}},
+
+            {"class", {"class", "A class is similar to a struct, but all members must declare their visibility in a visibility block (`public:` | `private:` | `protected:`).\n\nNon-generic classes may allow for inheritance.\n\n**Example:**\n```cryo\ntype class Foo {\npublic:\n    x: int,\n    y: int,\n}\n```"}},
+
+            {"enum", {"enum", "An enum can take on three distinct forms:\n\n- A **complex** enum with variant constructors\n- A **simple** C-style enum with integer values\n- A **mix** of both simple and complex variants\n\n**Example:**\n```cryo\nenum Color {\n    Red,\n    Green,\n    Blue,\n}\n\nenum Option<T> {\n    Some(T),\n    None,\n}\n```"}},
+
+            {"implement", {"implement", "An implementation block is used to implement methods of an object type or enum.\n\nPrimarily used for complex enum implementations. Structs and classes generally inline their method implementations.\n\n**Example:**\n```cryo\nimplement Option<T> {\n    function is_some(this) -> boolean {\n        match (this) {\n            Option::Some(_) => { true },\n            Option::None => { false }\n        }\n    }\n}\n```"}},
+
+            {"match", {"match", "A match expression performs pattern matching against a value.\n\nCan be used as a statement or as an expression that returns a value.\n\n**Example:**\n```cryo\nmatch (value) {\n    1 => { println(\"one\") }\n    2 => { println(\"two\") }\n    _ => { println(\"other\") }\n}\n\nconst result = match (opt) {\n    Option::Some(x) => { x }\n    Option::None => { 0 }\n};\n```"}},
+
+            {"if", {"if", "A conditional expression.\n\nCan be used as a statement or as an expression that returns a value.\n\n**Example:**\n```cryo\nif (condition) {\n    // ...\n} else {\n    // ...\n}\n\nconst value = if (x > 0) { x } else { -x };\n```"}},
+
+            {"for", {"for", "A loop statement.\n\nCurrently supports C-style `for(init; condition; update)` loops.\n\n**Example:**\n```cryo\nfor (mut i: int = 0; i < 10; i++) {\n    println(i);\n}\n```"}},
+        };
+
+        auto it = keywords.find(keyword);
+        if (it == keywords.end())
+            return "";
+
+        const auto &[display_name, description] = it->second;
+        return "```cryo\n" + display_name + "\n```\n\n---\n\n" + description;
+    }
+
+    // ============================================================================
+    // Word Extraction Helper
+    // ============================================================================
+
+    std::string HoverProvider::extractWordAtPosition(const std::string &content, int line, int character)
+    {
+        // Find the target line in the content
+        size_t pos = 0;
+        int current_line = 0;
+        while (current_line < line && pos < content.size())
+        {
+            if (content[pos] == '\n')
+                ++current_line;
+            ++pos;
+        }
+
+        if (current_line != line || pos >= content.size())
+            return "";
+
+        // pos now points to the start of the target line
+        size_t line_start = pos;
+        size_t line_end = content.find('\n', line_start);
+        if (line_end == std::string::npos)
+            line_end = content.size();
+
+        size_t cursor = line_start + static_cast<size_t>(character);
+        if (cursor >= line_end)
+            return "";
+
+        // Check if cursor is on a word character
+        auto isWordChar = [](char c)
+        { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; };
+
+        if (!isWordChar(content[cursor]))
+            return "";
+
+        // Find word boundaries
+        size_t word_start = cursor;
+        while (word_start > line_start && isWordChar(content[word_start - 1]))
+            --word_start;
+
+        size_t word_end = cursor;
+        while (word_end < line_end && isWordChar(content[word_end]))
+            ++word_end;
+
+        // Encode word start column offset in a way the caller can use:
+        // We prefix the result with the column offset separated by a null char.
+        // This is a simple way to return two values without changing the signature.
+        // Actually, let's just return the word — the caller can compute the offset.
+        return content.substr(word_start, word_end - word_start);
+    }
+
+    int HoverProvider::findWordStartColumn(const std::string &content, int line, int character)
+    {
+        // Find the target line
+        size_t pos = 0;
+        int current_line = 0;
+        while (current_line < line && pos < content.size())
+        {
+            if (content[pos] == '\n')
+                ++current_line;
+            ++pos;
+        }
+
+        if (current_line != line || pos >= content.size())
+            return character;
+
+        size_t line_start = pos;
+        size_t line_end = content.find('\n', line_start);
+        if (line_end == std::string::npos)
+            line_end = content.size();
+
+        size_t cursor = line_start + static_cast<size_t>(character);
+        if (cursor >= line_end)
+            return character;
+
+        auto isWordChar = [](char c)
+        { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; };
+
+        if (!isWordChar(content[cursor]))
+            return character;
+
+        size_t word_start = cursor;
+        while (word_start > line_start && isWordChar(content[word_start - 1]))
+            --word_start;
+
+        return static_cast<int>(word_start - line_start);
     }
 
     // ============================================================================
@@ -975,7 +1167,7 @@ namespace CryoLSP
         return result;
     }
 
-    std::string HoverProvider::formatLiteralHover(Cryo::LiteralNode *literal)
+    std::string HoverProvider::formatLiteralHover(Cryo::LiteralNode *literal, bool is_negated)
     {
         auto lk = literal->literal_kind();
         const std::string &value = literal->value();
@@ -988,13 +1180,24 @@ namespace CryoLSP
                                                                      "A UTF-8 encoded string type.\n\n";
         }
 
-        if (lk == Cryo::TokenKind::TK_BOOLEAN_LITERAL || lk == Cryo::TokenKind::TK_KW_BOOLEAN ||
-            lk == Cryo::TokenKind::TK_KW_TRUE || lk == Cryo::TokenKind::TK_KW_FALSE)
+        if (lk == Cryo::TokenKind::TK_BOOLEAN_LITERAL || lk == Cryo::TokenKind::TK_KW_BOOLEAN)
         {
-            return "```cryo\nboolean\n```\n\n---\n\n"
-                   "The boolean type.\n\n"
-                   "Value: `" +
-                   value + "`";
+            return "```cryo\ntype boolean = true | false\n```\n\n---\n\n"
+                   "The boolean type.\n";
+        }
+
+        if (lk == Cryo::TokenKind::TK_KW_TRUE)
+        {
+            return "```cryo\ntrue\n\n"
+                   "type boolean = true | false\n```\n\n---\n\n"
+                   "The boolean type.\n";
+        }
+
+        if (lk == Cryo::TokenKind::TK_KW_FALSE)
+        {
+            return "```cryo\nfalse\n\n"
+                   "type boolean = true | false\n```\n\n---\n\n"
+                   "The boolean type.\n";
         }
 
         if (lk == Cryo::TokenKind::TK_CHAR_CONSTANT)
@@ -1014,17 +1217,182 @@ namespace CryoLSP
 
             if (is_float)
             {
-                return "```cryo\nfloat\n```\n\n---\n\n"
-                       "The default floating-point type (64-bit double precision).\n\n"
-                       "Numeric literal: `" +
-                       value + "`";
+                // Check for float suffix
+                std::string float_type = "float";
+                std::string float_desc = "The default floating-point type (64-bit double precision).";
+                if (value.size() >= 3)
+                {
+                    std::string suffix = value.substr(value.size() - 3);
+                    if (suffix == "f32")
+                    {
+                        float_type = "f32";
+                        float_desc = "A 32-bit floating-point type (single precision).\n\nSize: 4 bytes \nPrecision: ~6-9 significant digits";
+                    }
+                    else if (suffix == "f64")
+                    {
+                        float_type = "f64";
+                        float_desc = "A 64-bit floating-point type (double precision).\n\nSize: 8 bytes \nPrecision: ~15-17 significant digits";
+                    }
+                }
+
+                return "```cryo\n" + float_type + "(" + value + ")" + "\n```\n\n---\n\n" + float_desc;
             }
             else
             {
-                return "```cryo\nint\n```\n\n---\n\n"
-                       "The default signed integer type (32-bit).\n\n"
-                       "Numeric literal: `" +
-                       value + "`";
+                // Check for integer type suffix (e.g., 42i64, 0xFFu32)
+                std::string int_type;
+                std::string int_desc;
+
+                // Try to extract suffix: scan backwards for type suffix
+                static const std::vector<std::pair<std::string, std::pair<std::string, std::string>>> suffixes = {
+                    {"i128", {"i128", "A 128-bit signed integer type.\n\nSize: 16 bytes"}},
+                    {"u128", {"u128", "A 128-bit unsigned integer type.\n\nSize: 16 bytes"}},
+                    {"i64", {"i64", "A 64-bit signed integer type.\n\nSize: 8 bytes \nRange: `-9,223,372,036,854,775,808` to `9,223,372,036,854,775,807`"}},
+                    {"u64", {"u64", "A 64-bit unsigned integer type.\n\nSize: 8 bytes \nRange: `0` to `18,446,744,073,709,551,615`"}},
+                    {"i32", {"i32", "A 32-bit signed integer type.\n\nSize: 4 bytes \nRange: `-2,147,483,648` to `2,147,483,647`"}},
+                    {"u32", {"u32", "A 32-bit unsigned integer type.\n\nSize: 4 bytes \nRange: `0` to `4,294,967,295`"}},
+                    {"i16", {"i16", "A 16-bit signed integer type.\n\nSize: 2 bytes \nRange: `-32,768` to `32,767`"}},
+                    {"u16", {"u16", "A 16-bit unsigned integer type.\n\nSize: 2 bytes \nRange: `0` to `65,535`"}},
+                    {"i8", {"i8", "An 8-bit signed integer type.\n\nSize: 1 byte \nRange: `-128` to `127`"}},
+                    {"u8", {"u8", "An 8-bit unsigned integer type.\n\nSize: 1 byte \nRange: `0` to `255`"}},
+                    {"usize", {"usize", "A pointer-sized unsigned integer type.\n\nSize: platform-dependent (4 or 8 bytes)"}},
+                    {"isize", {"isize", "A pointer-sized signed integer type.\n\nSize: platform-dependent (4 or 8 bytes)"}},
+                };
+
+                for (const auto &[sfx, info] : suffixes)
+                {
+                    if (value.size() > sfx.size() &&
+                        value.substr(value.size() - sfx.size()) == sfx)
+                    {
+                        int_type = info.first;
+                        int_desc = info.second;
+                        break;
+                    }
+                }
+
+                // Fall back to resolved type if no suffix
+                if (int_type.empty() && literal->has_resolved_type())
+                {
+                    std::string resolved = literal->get_resolved_type()->display_name();
+                    if (!resolved.empty() && resolved != "auto" && resolved != "unknown")
+                    {
+                        // Check if resolved type matches a known integer type
+                        for (const auto &[sfx, info] : suffixes)
+                        {
+                            if (resolved == info.first)
+                            {
+                                int_type = info.first;
+                                int_desc = info.second;
+                                break;
+                            }
+                        }
+                        // Also match "int" which is the display name for the default i32
+                        if (int_type.empty() && resolved == "int")
+                        {
+                            int_type = "int";
+                            int_desc = "The default signed integer type (32-bit).\n\nSize: 4 bytes \nRange: `-2,147,483,648` to `2,147,483,647`";
+                        }
+                    }
+                }
+
+                // Default: infer minimum unsigned type from the actual value
+                if (int_type.empty())
+                {
+                    // Strip underscores and any trailing suffix remnants for parsing
+                    std::string digits;
+                    for (char c : value)
+                    {
+                        if (c != '_')
+                            digits += c;
+                    }
+
+                    // Parse the numeric value
+                    uint64_t num_val = 0;
+                    bool parsed = false;
+                    try
+                    {
+                        if (digits.size() > 2 && digits[0] == '0')
+                        {
+                            if (digits[1] == 'x' || digits[1] == 'X')
+                                num_val = std::stoull(digits, nullptr, 16);
+                            else if (digits[1] == 'b' || digits[1] == 'B')
+                                num_val = std::stoull(digits.substr(2), nullptr, 2);
+                            else if (digits[1] == 'o' || digits[1] == 'O')
+                                num_val = std::stoull(digits.substr(2), nullptr, 8);
+                            else
+                                num_val = std::stoull(digits, nullptr, 10);
+                        }
+                        else
+                        {
+                            num_val = std::stoull(digits, nullptr, 10);
+                        }
+                        parsed = true;
+                    }
+                    catch (...)
+                    {
+                        parsed = false;
+                    }
+
+                    if (parsed)
+                    {
+                        if (is_negated)
+                        {
+                            // Negated literal: use minimum signed type that fits
+                            if (num_val <= 128)
+                            {
+                                int_type = "i8";
+                                int_desc = "An 8-bit signed integer type.\n\nSize: 1 byte \nRange: `-128` to `127`";
+                            }
+                            else if (num_val <= 32768)
+                            {
+                                int_type = "i16";
+                                int_desc = "A 16-bit signed integer type.\n\nSize: 2 bytes \nRange: `-32,768` to `32,767`";
+                            }
+                            else if (num_val <= 2147483648ULL)
+                            {
+                                int_type = "i32";
+                                int_desc = "A 32-bit signed integer type.\n\nSize: 4 bytes \nRange: `-2,147,483,648` to `2,147,483,647`";
+                            }
+                            else
+                            {
+                                int_type = "i64";
+                                int_desc = "A 64-bit signed integer type.\n\nSize: 8 bytes \nRange: `-9,223,372,036,854,775,808` to `9,223,372,036,854,775,807`";
+                            }
+                        }
+                        else
+                        {
+                            // Positive literal: use minimum unsigned type that fits
+                            if (num_val <= 255)
+                            {
+                                int_type = "u8";
+                                int_desc = "An 8-bit unsigned integer type.\n\nSize: 1 byte \nRange: `0` to `255`";
+                            }
+                            else if (num_val <= 65535)
+                            {
+                                int_type = "u16";
+                                int_desc = "A 16-bit unsigned integer type.\n\nSize: 2 bytes \nRange: `0` to `65,535`";
+                            }
+                            else if (num_val <= 4294967295ULL)
+                            {
+                                int_type = "u32";
+                                int_desc = "A 32-bit unsigned integer type.\n\nSize: 4 bytes \nRange: `0` to `4,294,967,295`";
+                            }
+                            else
+                            {
+                                int_type = "u64";
+                                int_desc = "A 64-bit unsigned integer type.\n\nSize: 8 bytes \nRange: `0` to `18,446,744,073,709,551,615`";
+                            }
+                        }
+                    }
+                    else
+                    {
+                        int_type = "int";
+                        int_desc = "The default signed integer type (32-bit).\n\nSize: 4 bytes \nRange: `-2,147,483,648` to `2,147,483,647`";
+                    }
+                }
+
+                std::string display_val = is_negated ? "-" + value : value;
+                return "```cryo\n" + int_type + "(" + display_val + ")" + "\n```\n\n---\n\n" + int_desc;
             }
         }
 
@@ -1056,7 +1424,33 @@ namespace CryoLSP
                        " identifier='" + found.identifier_name + "'");
 
         if (found.kind == FoundNode::Kind::Unknown)
+        {
+            // PositionFinder didn't match any AST node — check if cursor is on a keyword
+            auto content = _documents.getContent(uri);
+            if (content.has_value())
+            {
+                std::string word = extractWordAtPosition(content.value(), position.line, position.character);
+                if (!word.empty())
+                {
+                    std::string keyword_hover = getKeywordHover(word);
+                    if (!keyword_hover.empty())
+                    {
+                        Hover hover;
+                        hover.contents.kind = "markdown";
+                        hover.contents.value = keyword_hover;
+                        int word_start = findWordStartColumn(content.value(), position.line, position.character);
+                        Range range;
+                        range.start.line = position.line;
+                        range.start.character = word_start;
+                        range.end.line = position.line;
+                        range.end.character = word_start + static_cast<int>(word.size());
+                        hover.range = range;
+                        return hover;
+                    }
+                }
+            }
             return std::nullopt;
+        }
 
         std::string hover_text;
 
@@ -1065,7 +1459,39 @@ namespace CryoLSP
         {
             auto *literal = dynamic_cast<Cryo::LiteralNode *>(found.node);
             if (literal)
-                hover_text = formatLiteralHover(literal);
+            {
+                // Check if literal is preceded by unary minus (e.g., -42)
+                bool is_negated = false;
+                if (literal->literal_kind() == Cryo::TokenKind::TK_NUMERIC_CONSTANT)
+                {
+                    auto content = _documents.getContent(uri);
+                    if (content.has_value())
+                    {
+                        int col = static_cast<int>(found.node->location().column()) - 1; // 0-based
+                        int line = static_cast<int>(found.node->location().line()) - 1;
+                        // Scan backwards from the literal to find a '-' (skipping whitespace)
+                        if (col > 0)
+                        {
+                            // Find start of the line in the content
+                            size_t pos = 0;
+                            int cur_line = 0;
+                            while (cur_line < line && pos < content->size())
+                            {
+                                if ((*content)[pos] == '\n')
+                                    ++cur_line;
+                                ++pos;
+                            }
+                            // pos is now at start of the target line
+                            int check_col = col - 1;
+                            while (check_col >= 0 && ((*content)[pos + check_col] == ' ' || (*content)[pos + check_col] == '\t'))
+                                --check_col;
+                            if (check_col >= 0 && (*content)[pos + check_col] == '-')
+                                is_negated = true;
+                        }
+                    }
+                }
+                hover_text = formatLiteralHover(literal, is_negated);
+            }
 
             if (!hover_text.empty())
             {
@@ -1076,7 +1502,43 @@ namespace CryoLSP
                 range.start.line = position.line;
                 range.start.character = static_cast<int>(found.node->location().column()) - 1;
                 range.end.line = position.line;
-                range.end.character = range.start.character + static_cast<int>(found.identifier_name.size());
+
+                // For string literals, compute source-text length from document content
+                // (processed value is shorter than source due to escape sequences)
+                int source_len = static_cast<int>(found.identifier_name.size());
+                if (literal->literal_kind() == Cryo::TokenKind::TK_STRING_LITERAL ||
+                    literal->literal_kind() == Cryo::TokenKind::TK_RAW_STRING_LITERAL)
+                {
+                    auto content = _documents.getContent(uri);
+                    if (content.has_value())
+                    {
+                        // Find the start of this line
+                        size_t pos = 0;
+                        int cur_line = 0;
+                        while (cur_line < static_cast<int>(found.node->location().line()) - 1 && pos < content->size())
+                        {
+                            if ((*content)[pos] == '\n')
+                                ++cur_line;
+                            ++pos;
+                        }
+                        size_t str_start = pos + found.node->location().column() - 1;
+                        // Scan forward from opening quote to find closing quote
+                        if (str_start < content->size() && (*content)[str_start] == '"')
+                        {
+                            size_t i = str_start + 1;
+                            while (i < content->size() && (*content)[i] != '"')
+                            {
+                                if ((*content)[i] == '\\')
+                                    ++i; // skip escaped char
+                                ++i;
+                            }
+                            if (i < content->size())
+                                source_len = static_cast<int>(i - str_start + 1); // include closing quote
+                        }
+                    }
+                }
+
+                range.end.character = range.start.character + source_len;
                 hover.range = range;
                 return hover;
             }
@@ -1133,9 +1595,16 @@ namespace CryoLSP
                 hover.contents.value = hover_text;
                 Range range;
                 range.start.line = position.line;
-                range.start.character = position.character;
+                // Type annotations have no AST node - find actual word start from document
+                {
+                    auto content = _documents.getContent(uri);
+                    if (content.has_value())
+                        range.start.character = findWordStartColumn(content.value(), position.line, position.character);
+                    else
+                        range.start.character = position.character;
+                }
                 range.end.line = position.line;
-                range.end.character = position.character + static_cast<int>(found.identifier_name.size());
+                range.end.character = range.start.character + static_cast<int>(found.identifier_name.size());
                 hover.range = range;
                 return hover;
             }
@@ -1209,7 +1678,57 @@ namespace CryoLSP
         {
             auto *variant = dynamic_cast<Cryo::EnumVariantNode *>(found.node);
             if (variant)
+            {
                 hover_text = formatEnumVariantHover(variant);
+            }
+            else if (auto *pattern = dynamic_cast<Cryo::EnumPatternNode *>(found.node))
+            {
+                // Enum variant referenced from a match pattern (e.g., "Red" in "Color::Red =>")
+                // Find the actual enum declaration and the variant within it
+                std::string enum_name = pattern->enum_name();
+                // Get the last segment as the actual enum type name
+                auto last_sep = enum_name.rfind("::");
+                std::string actual_enum = (last_sep != std::string::npos)
+                                              ? enum_name.substr(last_sep + 2)
+                                              : enum_name;
+
+                DeclarationFinder declFinder(actual_enum);
+                Cryo::ASTNode *typeNode = declFinder.find(instance->ast_root());
+                if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(typeNode))
+                {
+                    for (const auto &v : enm->variants())
+                    {
+                        if (v && v->name() == found.identifier_name)
+                        {
+                            hover_text = formatEnumVariantHover(v.get());
+                            break;
+                        }
+                    }
+                }
+
+                // Also search other loaded modules if not found locally
+                if (hover_text.empty())
+                {
+                    auto *moduleInstance = _engine.findModuleInstance(
+                        (last_sep != std::string::npos) ? enum_name.substr(0, last_sep) : "");
+                    if (moduleInstance && moduleInstance->ast_root())
+                    {
+                        DeclarationFinder modDeclFinder(actual_enum);
+                        Cryo::ASTNode *modTypeNode = modDeclFinder.find(moduleInstance->ast_root());
+                        if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(modTypeNode))
+                        {
+                            for (const auto &v : enm->variants())
+                            {
+                                if (v && v->name() == found.identifier_name)
+                                {
+                                    hover_text = formatEnumVariantHover(v.get());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             break;
         }
         case FoundNode::Kind::Literal:
@@ -1247,8 +1766,178 @@ namespace CryoLSP
             }
             break;
         }
-        case FoundNode::Kind::Identifier:
         case FoundNode::Kind::ScopeResolution:
+        {
+            // Cursor is on the member name of a scope resolution (e.g., "new" in "Point::new")
+            auto *scope_node = dynamic_cast<Cryo::ScopeResolutionNode *>(found.node);
+            if (scope_node)
+            {
+                std::string scope_name = scope_node->scope_name();
+                std::string member_name = found.identifier_name;
+                Transport::log("[Hover] ScopeResolution: " + scope_name + "::" + member_name);
+
+                // For chained scope (e.g., "Colors::Color"), the last segment is the type name
+                std::string actual_type = scope_name;
+                std::string namespace_prefix;
+                auto last_sep = scope_name.rfind("::");
+                if (last_sep != std::string::npos)
+                {
+                    actual_type = scope_name.substr(last_sep + 2);
+                    namespace_prefix = scope_name.substr(0, last_sep);
+                }
+
+                // Find the type declaration for the scope (try local first)
+                DeclarationFinder typeFinder(actual_type);
+                Cryo::ASTNode *typeNode = typeFinder.find(instance->ast_root());
+
+                // If not found locally and there's a namespace prefix, search the module
+                if (!typeNode && !namespace_prefix.empty())
+                {
+                    auto *moduleInstance = _engine.findModuleInstance(namespace_prefix);
+                    if (moduleInstance && moduleInstance->ast_root())
+                    {
+                        DeclarationFinder modFinder(actual_type);
+                        typeNode = modFinder.find(moduleInstance->ast_root());
+                    }
+                }
+
+                // Search for the member in the type's methods/fields
+                if (typeNode)
+                {
+                    if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(typeNode))
+                    {
+                        for (const auto &method : strct->methods())
+                        {
+                            if (method && method->name() == member_name)
+                            {
+                                hover_text = formatFunctionHover(method.get());
+                                break;
+                            }
+                        }
+                        if (hover_text.empty())
+                        {
+                            for (const auto &field : strct->fields())
+                            {
+                                if (field && field->name() == member_name)
+                                {
+                                    hover_text = "```cryo\n" + scope_name + "." + field->name() + ": " + getFieldTypeStr(field.get()) + "\n```";
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(typeNode))
+                    {
+                        for (const auto &method : cls->methods())
+                        {
+                            if (method && method->name() == member_name)
+                            {
+                                hover_text = formatFunctionHover(method.get());
+                                break;
+                            }
+                        }
+                        if (hover_text.empty())
+                        {
+                            for (const auto &field : cls->fields())
+                            {
+                                if (field && field->name() == member_name)
+                                {
+                                    hover_text = "```cryo\n" + scope_name + "." + field->name() + ": " + getFieldTypeStr(field.get()) + "\n```";
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    else if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(typeNode))
+                    {
+                        for (const auto &variant : enm->variants())
+                        {
+                            if (variant && variant->name() == member_name)
+                            {
+                                hover_text = formatEnumVariantHover(variant.get());
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Also search impl blocks for the member
+                if (hover_text.empty())
+                {
+                    // Search all impl blocks that target the scope type
+                    class ImplMemberFinder : public Cryo::BaseASTVisitor
+                    {
+                    public:
+                        ImplMemberFinder(const std::string &type_name, const std::string &member)
+                            : _type(type_name), _member(member) {}
+
+                        Cryo::ASTNode *find(Cryo::ASTNode *root)
+                        {
+                            _result = nullptr;
+                            if (root)
+                                root->accept(*this);
+                            return _result;
+                        }
+
+                        void visit(Cryo::ProgramNode &node) override
+                        {
+                            for (const auto &child : node.statements())
+                                if (child && !_result)
+                                    child->accept(*this);
+                        }
+
+                        void visit(Cryo::DeclarationStatementNode &node) override
+                        {
+                            if (node.declaration() && !_result)
+                                node.declaration()->accept(*this);
+                        }
+
+                        void visit(Cryo::ImplementationBlockNode &node) override
+                        {
+                            if (_result || node.target_type() != _type)
+                                return;
+                            for (const auto &method : node.method_implementations())
+                            {
+                                if (method && method->name() == _member)
+                                {
+                                    _result = method.get();
+                                    return;
+                                }
+                            }
+                        }
+
+                    private:
+                        std::string _type;
+                        std::string _member;
+                        Cryo::ASTNode *_result = nullptr;
+                    };
+
+                    ImplMemberFinder implFinder(actual_type, member_name);
+                    Cryo::ASTNode *implNode = implFinder.find(instance->ast_root());
+                    if (auto *method = dynamic_cast<Cryo::FunctionDeclarationNode *>(implNode))
+                        hover_text = formatFunctionHover(method);
+
+                    // Also search impl blocks in the module if not found locally
+                    if (!implNode && !namespace_prefix.empty())
+                    {
+                        auto *moduleInstance = _engine.findModuleInstance(namespace_prefix);
+                        if (moduleInstance && moduleInstance->ast_root())
+                        {
+                            ImplMemberFinder modImplFinder(actual_type, member_name);
+                            Cryo::ASTNode *modImplNode = modImplFinder.find(moduleInstance->ast_root());
+                            if (auto *method = dynamic_cast<Cryo::FunctionDeclarationNode *>(modImplNode))
+                                hover_text = formatFunctionHover(method);
+                        }
+                    }
+                }
+            }
+
+            // If still empty, fall through to generic lookup
+            if (!hover_text.empty())
+                break;
+            [[fallthrough]];
+        }
+        case FoundNode::Kind::Identifier:
         case FoundNode::Kind::TypeReference:
         case FoundNode::Kind::ImportDecl:
         case FoundNode::Kind::Parameter:
@@ -1305,13 +1994,103 @@ namespace CryoLSP
                     if (auto *varDecl = dynamic_cast<Cryo::VariableDeclarationNode *>(varNode))
                         hover_text = formatVariableHover(varDecl);
                 }
+
+                // If still not found, try searching other loaded module instances
+                // This handles cases like "Color" in "Colors::Color::Red" where Color is defined in Colors module
+                if (hover_text.empty() && found.node)
+                {
+                    std::string module_prefix;
+
+                    // Extract module prefix from the scope resolution or enum pattern context
+                    if (auto *scope_node = dynamic_cast<Cryo::ScopeResolutionNode *>(found.node))
+                    {
+                        // For "Colors::Color::Red", scope_name = "Colors::Color"
+                        // If we're looking up "Color", the prefix is "Colors"
+                        const std::string &sn = scope_node->scope_name();
+                        auto sep = sn.find("::");
+                        if (sep != std::string::npos)
+                        {
+                            // Check if our identifier is a segment after the first "::"
+                            size_t search_pos = 0;
+                            while (search_pos < sn.size())
+                            {
+                                auto next_sep = sn.find("::", search_pos);
+                                std::string segment = (next_sep != std::string::npos)
+                                                          ? sn.substr(search_pos, next_sep - search_pos)
+                                                          : sn.substr(search_pos);
+                                if (segment == found.identifier_name && search_pos > 0)
+                                {
+                                    module_prefix = sn.substr(0, search_pos - 2); // before the "::"
+                                    break;
+                                }
+                                if (next_sep == std::string::npos)
+                                    break;
+                                search_pos = next_sep + 2;
+                            }
+                        }
+                    }
+                    else if (auto *pattern = dynamic_cast<Cryo::EnumPatternNode *>(found.node))
+                    {
+                        const std::string &en = pattern->enum_name();
+                        auto sep = en.find("::");
+                        if (sep != std::string::npos)
+                        {
+                            size_t search_pos = 0;
+                            while (search_pos < en.size())
+                            {
+                                auto next_sep = en.find("::", search_pos);
+                                std::string segment = (next_sep != std::string::npos)
+                                                          ? en.substr(search_pos, next_sep - search_pos)
+                                                          : en.substr(search_pos);
+                                if (segment == found.identifier_name && search_pos > 0)
+                                {
+                                    module_prefix = en.substr(0, search_pos - 2);
+                                    break;
+                                }
+                                if (next_sep == std::string::npos)
+                                    break;
+                                search_pos = next_sep + 2;
+                            }
+                        }
+                    }
+
+                    if (!module_prefix.empty())
+                    {
+                        auto *moduleInstance = _engine.findModuleInstance(module_prefix);
+                        if (moduleInstance && moduleInstance->ast_root())
+                        {
+                            DeclarationFinder modDeclFinder(found.identifier_name);
+                            Cryo::ASTNode *modDeclNode = modDeclFinder.find(moduleInstance->ast_root());
+                            if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(modDeclNode))
+                                hover_text = formatFunctionHover(func);
+                            else if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(modDeclNode))
+                                hover_text = formatStructHover(strct);
+                            else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(modDeclNode))
+                                hover_text = formatClassHover(cls);
+                            else if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(modDeclNode))
+                                hover_text = formatEnumHover(enm);
+                            else if (auto *trait = dynamic_cast<Cryo::TraitDeclarationNode *>(modDeclNode))
+                                hover_text = formatTraitHover(trait);
+                        }
+                    }
+                }
             }
             break;
         }
         }
 
-        // Fallback: search intrinsics file for the identifier
+        // Fallback: try to find identifier as a module/namespace name
         Transport::log("[Hover] After switch, hover_text empty=" + std::string(hover_text.empty() ? "true" : "false"));
+        if (hover_text.empty() && !found.identifier_name.empty())
+        {
+            auto *moduleInstance = _engine.findModuleInstance(found.identifier_name);
+            if (moduleInstance && moduleInstance->ast_root())
+            {
+                hover_text = formatNamespaceHover(found.identifier_name, moduleInstance->ast_root());
+            }
+        }
+
+        // Fallback: search intrinsics file for the identifier
         if (hover_text.empty() && !found.identifier_name.empty())
         {
             Transport::log("[Hover] Entering intrinsics fallback for '" + found.identifier_name + "'");
@@ -1365,7 +2144,12 @@ namespace CryoLSP
                                 continue;
                             if (i > 0)
                                 sig += ", ";
-                            sig += params[i]->name() + ": " + getParamTypeStr(params[i].get());
+                            // Detect variadic: last param with void type is the parser placeholder for `args...`
+                            std::string ptype = getParamTypeStr(params[i].get());
+                            if (i == params.size() - 1 && (ptype == "void" || ptype == "..."))
+                                sig += params[i]->name() + "...";
+                            else
+                                sig += params[i]->name() + ": " + ptype;
                         }
                         sig += ")";
                         std::string ret = intrinsicDecl->return_type_annotation();
@@ -1394,12 +2178,70 @@ namespace CryoLSP
             auto *member_node = dynamic_cast<Cryo::MemberAccessNode *>(found.node);
             if (member_node && member_node->has_member_location())
                 range.start.character = static_cast<int>(member_node->member_location().column()) - 1;
+            else if (found.kind == FoundNode::Kind::ScopeResolution)
+            {
+                // For scope resolution member hover, compute member start column
+                auto *scope_node = dynamic_cast<Cryo::ScopeResolutionNode *>(found.node);
+                if (scope_node)
+                {
+                    size_t scope_display_len = scope_node->scope_name().size();
+                    if (scope_node->has_generic_args())
+                    {
+                        scope_display_len += 1;
+                        for (size_t i = 0; i < scope_node->generic_args().size(); ++i)
+                        {
+                            if (i > 0)
+                                scope_display_len += 2;
+                            scope_display_len += scope_node->generic_args()[i].size();
+                        }
+                        scope_display_len += 1;
+                    }
+                    range.start.character = static_cast<int>(scope_node->location().column() - 1 + scope_display_len + 2);
+                }
+                else
+                {
+                    range.start.character = position.character;
+                }
+            }
+            else if (found.kind == FoundNode::Kind::EnumVariant && !dynamic_cast<Cryo::EnumVariantNode *>(found.node))
+            {
+                // Enum variant from a match pattern - find word start from document
+                auto content = _documents.getContent(uri);
+                if (content.has_value())
+                    range.start.character = findWordStartColumn(content.value(), position.line, position.character);
+                else
+                    range.start.character = position.character;
+            }
+            else if (found.kind == FoundNode::Kind::TypeReference && !dynamic_cast<Cryo::DeclarationNode *>(found.node))
+            {
+                // Type reference inside an expression (sizeof, alignof, struct literal, scope resolution, etc.)
+                // The node's location points to the expression start, not the type name
+                auto content = _documents.getContent(uri);
+                if (content.has_value())
+                    range.start.character = findWordStartColumn(content.value(), position.line, position.character);
+                else
+                    range.start.character = position.character;
+            }
             else
-                range.start.character = static_cast<int>(found.node->location().column()) - 1;
+            {
+                // Prefer name_location for declarations (location() points to keywords like 'function')
+                Cryo::SourceLocation loc = found.node->location();
+                if (auto *decl = dynamic_cast<Cryo::DeclarationNode *>(found.node))
+                {
+                    if (decl->has_name_location())
+                        loc = decl->name_location();
+                }
+                range.start.character = static_cast<int>(loc.column()) - 1;
+            }
         }
         else
         {
-            range.start.character = position.character;
+            // No AST node (e.g., type annotations) - find actual word start from document
+            auto content = _documents.getContent(uri);
+            if (content.has_value())
+                range.start.character = findWordStartColumn(content.value(), position.line, position.character);
+            else
+                range.start.character = position.character;
         }
         range.end.line = position.line;
         range.end.character = range.start.character + static_cast<int>(found.identifier_name.size());
