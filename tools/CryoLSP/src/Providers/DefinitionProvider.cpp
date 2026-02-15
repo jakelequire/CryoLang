@@ -1,7 +1,9 @@
 #include "LSP/Providers/DefinitionProvider.hpp"
+#include "LSP/ASTSearchHelpers.hpp"
 #include "LSP/PositionFinder.hpp"
 #include "LSP/Transport.hpp"
 #include "Compiler/CompilerInstance.hpp"
+#include "Compiler/ModuleLoader.hpp"
 #include "Types/SymbolTable.hpp"
 #include "AST/ASTVisitor.hpp"
 
@@ -10,6 +12,178 @@ namespace CryoLSP
 
     DefinitionProvider::DefinitionProvider(AnalysisEngine &engine)
         : _engine(engine) {}
+
+    // ============================================================================
+    // buildLocationFromNode - construct an LSP Location from an AST node
+    // ============================================================================
+
+    std::optional<Location> DefinitionProvider::buildLocationFromNode(
+        Cryo::ASTNode *node, const std::string &name, const std::string &file_path)
+    {
+        if (!node)
+            return std::nullopt;
+
+        Location loc;
+        loc.uri = path_to_uri(file_path);
+
+        // Prefer name_location for declaration nodes that have it
+        Cryo::SourceLocation srcLoc = node->location();
+
+        if (auto *decl = dynamic_cast<Cryo::DeclarationNode *>(node))
+        {
+            if (decl->has_name_location())
+                srcLoc = decl->name_location();
+        }
+
+        loc.range.start.line = static_cast<int>(srcLoc.line() > 0 ? srcLoc.line() - 1 : 0);
+        loc.range.start.character = static_cast<int>(srcLoc.column() > 0 ? srcLoc.column() - 1 : 0);
+        loc.range.end.line = loc.range.start.line;
+        loc.range.end.character = loc.range.start.character + static_cast<int>(name.size());
+        return loc;
+    }
+
+    // ============================================================================
+    // resolveModuleFilePath - resolve a module name to a filesystem path
+    // ============================================================================
+
+    std::string DefinitionProvider::resolveModuleFilePath(
+        const std::string &module_name, Cryo::CompilerInstance *instance)
+    {
+        // 1. Try searching open instances by module declaration name
+        std::string path = _engine.findModuleFilePath(module_name);
+        if (!path.empty())
+            return path;
+
+        // 2. Fallback: use the module loader's resolve_import_path
+        if (instance && instance->module_loader())
+        {
+            std::string resolved = instance->module_loader()->resolve_import_path(module_name);
+            if (!resolved.empty())
+                return resolved;
+        }
+
+        return {};
+    }
+
+    // ============================================================================
+    // searchDeclaration - search for a declaration across all available sources
+    // ============================================================================
+
+    std::optional<Location> DefinitionProvider::searchDeclaration(
+        const std::string &name, Cryo::CompilerInstance *instance, const std::string &current_file)
+    {
+        Cryo::ASTNode *ast_root = instance ? instance->ast_root() : nullptr;
+
+        // 1. Current file: top-level declarations
+        if (ast_root)
+        {
+            DeclarationFinder declFinder(name);
+            Cryo::ASTNode *found = declFinder.find(ast_root);
+            if (found)
+            {
+                Transport::log("[Definition] Found declaration in current file AST");
+                return buildLocationFromNode(found, name, current_file);
+            }
+        }
+
+        // 2. Current file: deep variable/parameter search
+        if (ast_root)
+        {
+            VariableRefResolver varResolver(name);
+            Cryo::ASTNode *found = varResolver.find(ast_root);
+            if (found)
+            {
+                Transport::log("[Definition] Found variable/parameter in current file");
+                return buildLocationFromNode(found, name, current_file);
+            }
+        }
+
+        // 3. Current file: member search (methods, fields in structs/classes/impl blocks)
+        if (ast_root)
+        {
+            MemberFinder memberFinder(name);
+            Cryo::ASTNode *found = memberFinder.find(ast_root);
+            if (found)
+            {
+                Transport::log("[Definition] Found member in current file");
+                return buildLocationFromNode(found, name, current_file);
+            }
+        }
+
+        // 4. Imported module ASTs (from module loader)
+        if (instance && instance->module_loader())
+        {
+            const auto &imported_asts = instance->module_loader()->get_imported_asts();
+            for (const auto &[mod_path, mod_ast] : imported_asts)
+            {
+                if (!mod_ast)
+                    continue;
+
+                DeclarationFinder declFinder(name);
+                Cryo::ASTNode *found = declFinder.find(mod_ast.get());
+                if (found)
+                {
+                    // Resolve the file path for this module
+                    std::string mod_file = resolveModuleFilePath(mod_path, instance);
+                    if (mod_file.empty())
+                        mod_file = mod_path; // fallback to the key itself
+                    Transport::log("[Definition] Found declaration in imported module: " + mod_path);
+                    return buildLocationFromNode(found, name, mod_file);
+                }
+
+                // Also search members in imported modules
+                MemberFinder memberFinder(name);
+                found = memberFinder.find(mod_ast.get());
+                if (found)
+                {
+                    std::string mod_file = resolveModuleFilePath(mod_path, instance);
+                    if (mod_file.empty())
+                        mod_file = mod_path;
+                    Transport::log("[Definition] Found member in imported module: " + mod_path);
+                    return buildLocationFromNode(found, name, mod_file);
+                }
+            }
+        }
+
+        // 5. Other open instances (for cross-file navigation)
+        {
+            auto *mod_instance = _engine.findModuleInstance(name);
+            if (mod_instance && mod_instance != instance && mod_instance->ast_root())
+            {
+                // Find the file path for this instance
+                std::string mod_file = _engine.findModuleFilePath(name);
+                if (!mod_file.empty())
+                {
+                    DeclarationFinder declFinder(name);
+                    Cryo::ASTNode *found = declFinder.find(mod_instance->ast_root());
+                    if (found)
+                    {
+                        Transport::log("[Definition] Found declaration in other open file: " + mod_file);
+                        return buildLocationFromNode(found, name, mod_file);
+                    }
+                }
+            }
+        }
+
+        // 6. Intrinsics
+        auto *intrinsics = _engine.getIntrinsicsInstance();
+        if (intrinsics && intrinsics->ast_root())
+        {
+            DeclarationFinder declFinder(name);
+            Cryo::ASTNode *found = declFinder.find(intrinsics->ast_root());
+            if (found)
+            {
+                Transport::log("[Definition] Found declaration in intrinsics");
+                return buildLocationFromNode(found, name, _engine.getIntrinsicsFilePath());
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    // ============================================================================
+    // getDefinition - main entry point with kind-based dispatch
+    // ============================================================================
 
     std::optional<Location> DefinitionProvider::getDefinition(const std::string &uri, const Position &position)
     {
@@ -25,422 +199,287 @@ namespace CryoLSP
         }
 
         // Find node at cursor
-        Transport::log("[Definition] Running PositionFinder...");
         PositionFinder finder(position.line + 1, position.character + 1);
         auto found = finder.find(instance->ast_root());
-        Transport::log("[Definition] PositionFinder done: identifier='" + found.identifier_name + "'");
+        Transport::log("[Definition] PositionFinder: identifier='" + found.identifier_name +
+                       "' kind=" + std::to_string(static_cast<int>(found.kind)));
 
         if (!found.node || found.identifier_name.empty())
             return std::nullopt;
 
-        auto *symbol_table = instance->symbol_table();
+        // Strip generic args for lookup: "Array<Token>" -> "Array"
+        std::string lookup_name = stripGenericArgs(found.identifier_name);
 
-        // Look up symbol in the current file's symbol table
-        Cryo::Symbol *sym = nullptr;
-        if (symbol_table)
+        using Kind = FoundNode::Kind;
+
+        switch (found.kind)
         {
-            Transport::log("[Definition] Looking up symbol in symbol table...");
-            sym = symbol_table->lookup(found.identifier_name);
-            if (!sym)
-                sym = symbol_table->lookup_with_imports(found.identifier_name);
-            Transport::log("[Definition] Symbol table lookup: " + std::string(sym ? "found" : "not found"));
+        // ---- Cursor is ON a declaration: the found node IS the definition ----
+        case Kind::FunctionDecl:
+        case Kind::StructDecl:
+        case Kind::ClassDecl:
+        case Kind::EnumDecl:
+        case Kind::VariableDecl:
+        case Kind::Parameter:
+        case Kind::EnumVariant:
+        case Kind::PatternBinding:
+            Transport::log("[Definition] Cursor on declaration node");
+            return buildLocationFromNode(found.node, lookup_name, file_path);
+
+        // ---- Import declaration: navigate to the imported file ----
+        case Kind::ImportDecl:
+        {
+            Transport::log("[Definition] Import declaration");
+            auto *import_node = dynamic_cast<Cryo::ImportDeclarationNode *>(found.node);
+            if (!import_node)
+                return std::nullopt;
+
+            std::string import_path = import_node->module_path();
+
+            // Try to resolve the import to a file path
+            if (instance->module_loader())
+            {
+                std::string resolved = instance->module_loader()->resolve_import_path(import_path);
+                if (!resolved.empty())
+                {
+                    Transport::log("[Definition] Import resolved to: " + resolved);
+                    Location loc;
+                    loc.uri = path_to_uri(resolved);
+                    loc.range.start.line = 0;
+                    loc.range.start.character = 0;
+                    loc.range.end.line = 0;
+                    loc.range.end.character = 0;
+                    return loc;
+                }
+            }
+
+            // Fallback: try open instances
+            std::string mod_file = _engine.findModuleFilePath(import_path);
+            if (!mod_file.empty())
+            {
+                Location loc;
+                loc.uri = path_to_uri(mod_file);
+                loc.range.start.line = 0;
+                loc.range.start.character = 0;
+                loc.range.end.line = 0;
+                loc.range.end.character = 0;
+                return loc;
+            }
+
+            return std::nullopt;
         }
 
-        if (sym)
+        // ---- Type reference: search for type declaration ----
+        case Kind::TypeReference:
         {
-            // Build location from symbol
-            Location loc;
-            std::string sym_file = file_path;
-            loc.uri = path_to_uri(sym_file);
-            loc.range.start.line = static_cast<int>(sym->location.line() > 0 ? sym->location.line() - 1 : 0);
-            loc.range.start.character = static_cast<int>(sym->location.column() > 0 ? sym->location.column() - 1 : 0);
-            loc.range.end.line = loc.range.start.line;
-            loc.range.end.character = loc.range.start.character + static_cast<int>(sym->name.size());
-            return loc;
+            Transport::log("[Definition] Type reference: " + lookup_name);
+            return searchDeclaration(lookup_name, instance, file_path);
         }
 
-        // AST-based search: find declarations directly in the AST
+        // ---- Scope resolution: e.g., Color::RED or Point::new ----
+        case Kind::ScopeResolution:
         {
-            Transport::log("[Definition] Trying AST-based declaration search...");
+            auto *scope_node = dynamic_cast<Cryo::ScopeResolutionNode *>(found.node);
+            if (!scope_node)
+            {
+                // Fallback to generic search
+                return searchDeclaration(lookup_name, instance, file_path);
+            }
+
+            std::string scope_name = stripGenericArgs(scope_node->scope_name());
+            std::string member_name = scope_node->member_name();
+            Transport::log("[Definition] Scope resolution: " + scope_name + "::" + member_name);
+
+            // Search for the member within the scoped type
+            // Check current file first
             Cryo::ASTNode *ast_root = instance->ast_root();
 
-            // Helper lambda to build a Location from an AST node
-            auto buildLocationFromNode = [&](Cryo::ASTNode *node, const std::string &name) -> std::optional<Location>
+            ScopedMemberFinder scopedFinder(scope_name, member_name);
+            Cryo::ASTNode *member_node = scopedFinder.find(ast_root);
+            if (member_node)
             {
-                if (!node)
-                    return std::nullopt;
-
-                Location loc;
-                loc.uri = path_to_uri(file_path);
-
-                // Prefer name_location for declarations that have it
-                Cryo::SourceLocation srcLoc = node->location();
-                if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(node))
-                {
-                    if (func->has_name_location())
-                        srcLoc = func->name_location();
-                }
-                else if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(node))
-                {
-                    if (strct->has_name_location())
-                        srcLoc = strct->name_location();
-                }
-                else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(node))
-                {
-                    if (cls->has_name_location())
-                        srcLoc = cls->name_location();
-                }
-                else if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(node))
-                {
-                    if (enm->has_name_location())
-                        srcLoc = enm->name_location();
-                }
-                else if (auto *trait = dynamic_cast<Cryo::TraitDeclarationNode *>(node))
-                {
-                    if (trait->has_name_location())
-                        srcLoc = trait->name_location();
-                }
-                else if (auto *alias = dynamic_cast<Cryo::TypeAliasDeclarationNode *>(node))
-                {
-                    if (alias->has_name_location())
-                        srcLoc = alias->name_location();
-                }
-                else if (auto *varDecl = dynamic_cast<Cryo::VariableDeclarationNode *>(node))
-                {
-                    if (varDecl->has_name_location())
-                        srcLoc = varDecl->name_location();
-                }
-
-                loc.range.start.line = static_cast<int>(srcLoc.line() > 0 ? srcLoc.line() - 1 : 0);
-                loc.range.start.character = static_cast<int>(srcLoc.column() > 0 ? srcLoc.column() - 1 : 0);
-                loc.range.end.line = loc.range.start.line;
-                loc.range.end.character = loc.range.start.character + static_cast<int>(name.size());
-                return loc;
-            };
-
-            // 1. Search top-level declarations (functions, structs, classes, enums, traits)
-            class DeclarationFinder : public Cryo::BaseASTVisitor
-            {
-            public:
-                DeclarationFinder(const std::string &name) : _target(name) {}
-                Cryo::ASTNode *find(Cryo::ASTNode *root)
-                {
-                    _result = nullptr;
-                    if (root)
-                        root->accept(*this);
-                    return _result;
-                }
-                void visit(Cryo::ProgramNode &node) override
-                {
-                    for (const auto &child : node.statements())
-                        if (child && !_result)
-                            child->accept(*this);
-                }
-                void visit(Cryo::DeclarationStatementNode &node) override
-                {
-                    if (node.declaration() && !_result)
-                        node.declaration()->accept(*this);
-                }
-                void visit(Cryo::FunctionDeclarationNode &node) override
-                {
-                    if (node.name() == _target)
-                        _result = &node;
-                }
-                void visit(Cryo::StructDeclarationNode &node) override
-                {
-                    if (node.name() == _target)
-                        _result = &node;
-                }
-                void visit(Cryo::ClassDeclarationNode &node) override
-                {
-                    if (node.name() == _target)
-                        _result = &node;
-                }
-                void visit(Cryo::EnumDeclarationNode &node) override
-                {
-                    if (node.name() == _target)
-                        _result = &node;
-                }
-                void visit(Cryo::TraitDeclarationNode &node) override
-                {
-                    if (node.name() == _target)
-                        _result = &node;
-                }
-                void visit(Cryo::TypeAliasDeclarationNode &node) override
-                {
-                    if (node.alias_name() == _target)
-                        _result = &node;
-                }
-
-            private:
-                std::string _target;
-                Cryo::ASTNode *_result = nullptr;
-            };
-
-            DeclarationFinder declFinder(found.identifier_name);
-            Cryo::ASTNode *declNode = declFinder.find(ast_root);
-            if (declNode)
-            {
-                Transport::log("[Definition] Found declaration in AST");
-                auto loc = buildLocationFromNode(declNode, found.identifier_name);
-                if (loc.has_value())
-                    return loc;
+                Transport::log("[Definition] Found scoped member in current file");
+                return buildLocationFromNode(member_node, member_name, file_path);
             }
 
-            // 2. Deep search for variable/parameter declarations
-            class VariableRefResolver : public Cryo::BaseASTVisitor
+            // Search imported modules
+            if (instance->module_loader())
             {
-            public:
-                VariableRefResolver(const std::string &name) : _target(name) {}
-                Cryo::ASTNode *find(Cryo::ASTNode *root)
+                const auto &imported_asts = instance->module_loader()->get_imported_asts();
+                for (const auto &[mod_path, mod_ast] : imported_asts)
                 {
-                    _result = nullptr;
-                    if (root)
-                        root->accept(*this);
-                    return _result;
-                }
-                void visit(Cryo::ProgramNode &node) override
-                {
-                    for (const auto &child : node.statements())
-                        if (child && !_result)
-                            child->accept(*this);
-                }
-                void visit(Cryo::DeclarationStatementNode &node) override
-                {
-                    if (node.declaration() && !_result)
-                        node.declaration()->accept(*this);
-                }
-                void visit(Cryo::BlockStatementNode &node) override
-                {
-                    for (const auto &stmt : node.statements())
-                        if (stmt && !_result)
-                            stmt->accept(*this);
-                }
-                void visit(Cryo::VariableDeclarationNode &node) override
-                {
-                    if (node.name() == _target)
-                        _result = &node;
-                }
-                void visit(Cryo::FunctionDeclarationNode &node) override
-                {
-                    for (const auto &param : node.parameters())
-                        if (param && !_result && param->name() == _target)
-                            _result = param.get();
-                    if (node.body() && !_result)
-                        node.body()->accept(*this);
-                }
-                void visit(Cryo::StructMethodNode &node) override
-                {
-                    for (const auto &param : node.parameters())
-                        if (param && !_result && param->name() == _target)
-                            _result = param.get();
-                    if (node.body() && !_result)
-                        node.body()->accept(*this);
-                }
-                void visit(Cryo::StructDeclarationNode &node) override
-                {
-                    for (const auto &method : node.methods())
-                        if (method && !_result)
-                            method->accept(*this);
-                }
-                void visit(Cryo::ClassDeclarationNode &node) override
-                {
-                    for (const auto &method : node.methods())
-                        if (method && !_result)
-                            method->accept(*this);
-                }
-                void visit(Cryo::ImplementationBlockNode &node) override
-                {
-                    for (const auto &method : node.method_implementations())
-                        if (method && !_result)
-                            method->accept(*this);
-                }
-                void visit(Cryo::IfStatementNode &node) override
-                {
-                    if (node.then_statement() && !_result)
-                        node.then_statement()->accept(*this);
-                    if (node.else_statement() && !_result)
-                        node.else_statement()->accept(*this);
-                }
-                void visit(Cryo::ForStatementNode &node) override
-                {
-                    if (node.init() && !_result)
-                        node.init()->accept(*this);
-                    if (node.body() && !_result)
-                        node.body()->accept(*this);
-                }
-                void visit(Cryo::WhileStatementNode &node) override
-                {
-                    if (node.body() && !_result)
-                        node.body()->accept(*this);
-                }
+                    if (!mod_ast)
+                        continue;
 
-            private:
-                std::string _target;
-                Cryo::ASTNode *_result = nullptr;
-            };
-
-            VariableRefResolver varResolver(found.identifier_name);
-            Cryo::ASTNode *varNode = varResolver.find(ast_root);
-            if (varNode)
-            {
-                Transport::log("[Definition] Found variable/parameter declaration in AST");
-                auto loc = buildLocationFromNode(varNode, found.identifier_name);
-                if (loc.has_value())
-                    return loc;
+                    ScopedMemberFinder importedScopedFinder(scope_name, member_name);
+                    Cryo::ASTNode *found_node = importedScopedFinder.find(mod_ast.get());
+                    if (found_node)
+                    {
+                        std::string mod_file = resolveModuleFilePath(mod_path, instance);
+                        if (mod_file.empty())
+                            mod_file = mod_path;
+                        Transport::log("[Definition] Found scoped member in imported module: " + mod_path);
+                        return buildLocationFromNode(found_node, member_name, mod_file);
+                    }
+                }
             }
 
-            // 3. Search methods/fields in structs, classes, impl blocks
-            class MemberFinder : public Cryo::BaseASTVisitor
+            // Search intrinsics
+            auto *intrinsics = _engine.getIntrinsicsInstance();
+            if (intrinsics && intrinsics->ast_root())
             {
-            public:
-                MemberFinder(const std::string &name) : _target(name) {}
-                Cryo::ASTNode *find(Cryo::ASTNode *root)
+                ScopedMemberFinder intrScopedFinder(scope_name, member_name);
+                Cryo::ASTNode *found_node = intrScopedFinder.find(intrinsics->ast_root());
+                if (found_node)
                 {
-                    _result = nullptr;
-                    if (root)
-                        root->accept(*this);
-                    return _result;
+                    Transport::log("[Definition] Found scoped member in intrinsics");
+                    return buildLocationFromNode(found_node, member_name, _engine.getIntrinsicsFilePath());
                 }
-                void visit(Cryo::ProgramNode &node) override
-                {
-                    for (const auto &child : node.statements())
-                        if (child && !_result)
-                            child->accept(*this);
-                }
-                void visit(Cryo::DeclarationStatementNode &node) override
-                {
-                    if (node.declaration() && !_result)
-                        node.declaration()->accept(*this);
-                }
-                void visit(Cryo::StructDeclarationNode &node) override
-                {
-                    if (_result)
-                        return;
-                    for (const auto &method : node.methods())
-                        if (method && method->name() == _target)
-                        {
-                            _result = method.get();
-                            return;
-                        }
-                    for (const auto &field : node.fields())
-                        if (field && field->name() == _target)
-                        {
-                            _result = field.get();
-                            return;
-                        }
-                }
-                void visit(Cryo::ClassDeclarationNode &node) override
-                {
-                    if (_result)
-                        return;
-                    for (const auto &method : node.methods())
-                        if (method && method->name() == _target)
-                        {
-                            _result = method.get();
-                            return;
-                        }
-                    for (const auto &field : node.fields())
-                        if (field && field->name() == _target)
-                        {
-                            _result = field.get();
-                            return;
-                        }
-                }
-                void visit(Cryo::ImplementationBlockNode &node) override
-                {
-                    if (_result)
-                        return;
-                    for (const auto &method : node.method_implementations())
-                        if (method && method->name() == _target)
-                        {
-                            _result = method.get();
-                            return;
-                        }
-                    for (const auto &field : node.field_implementations())
-                        if (field && field->name() == _target)
-                        {
-                            _result = field.get();
-                            return;
-                        }
-                }
-
-            private:
-                std::string _target;
-                Cryo::ASTNode *_result = nullptr;
-            };
-
-            // For qualified names like "Point::new", search for the member part
-            std::string memberName = found.identifier_name;
-            auto colonPos = memberName.rfind("::");
-            if (colonPos != std::string::npos)
-                memberName = memberName.substr(colonPos + 2);
-
-            MemberFinder memberFinder(memberName);
-            Cryo::ASTNode *memberNode = memberFinder.find(ast_root);
-            if (memberNode)
-            {
-                Transport::log("[Definition] Found member declaration in AST");
-                auto loc = buildLocationFromNode(memberNode, memberName);
-                if (loc.has_value())
-                    return loc;
             }
+
+            // Fallback: try searching just the member name
+            return searchDeclaration(member_name, instance, file_path);
         }
 
-        // Fallback: search intrinsics file
-        auto *intrinsics = _engine.getIntrinsicsInstance();
-
-        if (intrinsics && intrinsics->ast_root())
+        // ---- Field access: e.g., obj.field_name ----
+        case Kind::FieldAccess:
         {
-            // Direct iteration over ProgramNode children (avoids visitor dispatch)
-            Cryo::ASTNode *declNode = nullptr;
-            for (const auto &child : intrinsics->ast_root()->statements())
+            Transport::log("[Definition] Field access: " + lookup_name);
+
+            // Search for the member across all types
+            Cryo::ASTNode *ast_root = instance->ast_root();
+
+            MemberFinder memberFinder(lookup_name);
+            Cryo::ASTNode *member_node = memberFinder.find(ast_root);
+            if (member_node)
             {
-                if (!child)
-                    continue;
-                if (auto *decl = dynamic_cast<Cryo::IntrinsicDeclarationNode *>(child.get()))
+                Transport::log("[Definition] Found field/method in current file");
+                return buildLocationFromNode(member_node, lookup_name, file_path);
+            }
+
+            // Search imported modules
+            if (instance->module_loader())
+            {
+                const auto &imported_asts = instance->module_loader()->get_imported_asts();
+                for (const auto &[mod_path, mod_ast] : imported_asts)
                 {
-                    if (decl->name() == found.identifier_name)
+                    if (!mod_ast)
+                        continue;
+
+                    MemberFinder importedMemberFinder(lookup_name);
+                    Cryo::ASTNode *found_node = importedMemberFinder.find(mod_ast.get());
+                    if (found_node)
                     {
-                        declNode = decl;
-                        break;
-                    }
-                }
-                else if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(child.get()))
-                {
-                    if (func->name() == found.identifier_name)
-                    {
-                        declNode = func;
-                        break;
+                        std::string mod_file = resolveModuleFilePath(mod_path, instance);
+                        if (mod_file.empty())
+                            mod_file = mod_path;
+                        Transport::log("[Definition] Found field/method in imported module: " + mod_path);
+                        return buildLocationFromNode(found_node, lookup_name, mod_file);
                     }
                 }
             }
 
-            if (declNode)
-            {
-                Location loc;
-                loc.uri = path_to_uri(_engine.getIntrinsicsFilePath());
-
-                // Use name_location for FunctionDeclarationNode, or location for IntrinsicDeclarationNode
-                auto *funcDecl = dynamic_cast<Cryo::FunctionDeclarationNode *>(declNode);
-                auto *intrinsicDecl = dynamic_cast<Cryo::IntrinsicDeclarationNode *>(declNode);
-
-                Cryo::SourceLocation srcLoc = declNode->location();
-                if (funcDecl && funcDecl->has_name_location())
-                    srcLoc = funcDecl->name_location();
-                else if (intrinsicDecl)
-                    srcLoc = intrinsicDecl->location();
-
-                loc.range.start.line = static_cast<int>(srcLoc.line() > 0 ? srcLoc.line() - 1 : 0);
-                loc.range.start.character = static_cast<int>(srcLoc.column() > 0 ? srcLoc.column() - 1 : 0);
-                loc.range.end.line = loc.range.start.line;
-                loc.range.end.character = loc.range.start.character + static_cast<int>(found.identifier_name.size());
-                return loc;
-            }
+            // Fallback to general search
+            return searchDeclaration(lookup_name, instance, file_path);
         }
 
-        Transport::log("[Definition] No definition found");
-        return std::nullopt;
+        // ---- Field initializer: e.g., field name in `Point { x: 1 }` ----
+        case Kind::FieldInitializer:
+        {
+            auto *struct_lit = dynamic_cast<Cryo::StructLiteralNode *>(found.node);
+            if (!struct_lit)
+            {
+                // Fallback
+                return searchDeclaration(lookup_name, instance, file_path);
+            }
+
+            std::string struct_type = stripGenericArgs(struct_lit->struct_type());
+            std::string field_name = found.identifier_name;
+            Transport::log("[Definition] Field initializer: " + struct_type + "." + field_name);
+
+            // Search for the field within the struct declaration
+            Cryo::ASTNode *ast_root = instance->ast_root();
+
+            ScopedMemberFinder scopedFinder(struct_type, field_name);
+            Cryo::ASTNode *field_node = scopedFinder.find(ast_root);
+            if (field_node)
+            {
+                Transport::log("[Definition] Found field in struct declaration");
+                return buildLocationFromNode(field_node, field_name, file_path);
+            }
+
+            // Search imported modules
+            if (instance->module_loader())
+            {
+                const auto &imported_asts = instance->module_loader()->get_imported_asts();
+                for (const auto &[mod_path, mod_ast] : imported_asts)
+                {
+                    if (!mod_ast)
+                        continue;
+
+                    ScopedMemberFinder importedScopedFinder(struct_type, field_name);
+                    Cryo::ASTNode *found_node = importedScopedFinder.find(mod_ast.get());
+                    if (found_node)
+                    {
+                        std::string mod_file = resolveModuleFilePath(mod_path, instance);
+                        if (mod_file.empty())
+                            mod_file = mod_path;
+                        Transport::log("[Definition] Found field in imported module: " + mod_path);
+                        return buildLocationFromNode(found_node, field_name, mod_file);
+                    }
+                }
+            }
+
+            return std::nullopt;
+        }
+
+        // ---- Identifier (default): symbol table + AST search ----
+        case Kind::Identifier:
+        default:
+        {
+            // Skip literals
+            if (found.kind == Kind::Literal || found.kind == Kind::Unknown)
+                return std::nullopt;
+
+            Transport::log("[Definition] Identifier lookup: " + lookup_name);
+
+            auto *symbol_table = instance->symbol_table();
+            if (symbol_table)
+            {
+                Cryo::Symbol *sym = symbol_table->lookup(lookup_name);
+                if (!sym)
+                    sym = symbol_table->lookup_with_imports(lookup_name);
+
+                if (sym)
+                {
+                    // Determine the correct file for this symbol
+                    std::string sym_file = file_path;
+
+                    // If the symbol has a scope (module namespace), resolve the correct file
+                    if (!sym->scope.empty())
+                    {
+                        std::string module_file = resolveModuleFilePath(sym->scope, instance);
+                        if (!module_file.empty())
+                        {
+                            sym_file = module_file;
+                            Transport::log("[Definition] Resolved imported symbol to file: " + sym_file);
+                        }
+                    }
+
+                    Location loc;
+                    loc.uri = path_to_uri(sym_file);
+                    loc.range.start.line = static_cast<int>(sym->location.line() > 0 ? sym->location.line() - 1 : 0);
+                    loc.range.start.character = static_cast<int>(sym->location.column() > 0 ? sym->location.column() - 1 : 0);
+                    loc.range.end.line = loc.range.start.line;
+                    loc.range.end.character = loc.range.start.character + static_cast<int>(sym->name.size());
+                    return loc;
+                }
+            }
+
+            // Fallback to AST-based search
+            return searchDeclaration(lookup_name, instance, file_path);
+        }
+        }
     }
 
 } // namespace CryoLSP

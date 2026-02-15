@@ -70,6 +70,10 @@ namespace CryoLSP
         // Searches all loaded instances for one with a matching ModuleDeclarationNode
         Cryo::CompilerInstance *findModuleInstance(const std::string &module_name);
 
+        // Find the file path for a module by namespace name
+        // Same search as findModuleInstance but returns the file path string
+        std::string findModuleFilePath(const std::string &module_name);
+
     private:
         std::string _workspace_root;
         std::unordered_map<std::string, std::unique_ptr<Cryo::CompilerInstance>> _instances;
