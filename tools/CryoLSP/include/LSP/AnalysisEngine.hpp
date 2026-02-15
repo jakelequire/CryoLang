@@ -1,9 +1,11 @@
 #pragma once
 
 #include "LSP/Protocol.hpp"
+#include "CLI/ConfigParser.hpp"
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 
 // Forward declare CompilerInstance to avoid pulling all compiler headers into LSP headers
@@ -22,6 +24,17 @@ namespace CryoLSP
     {
         std::vector<Diagnostic> diagnostics;
         bool success = false;
+    };
+
+    /**
+     * @brief Cached information about a detected Cryo project
+     */
+    struct ProjectInfo
+    {
+        std::string project_root;  // Directory containing cryoconfig
+        std::string config_path;   // Full path to cryoconfig file
+        Cryo::CLI::CryoConfig config;
+        bool valid = false;
     };
 
     /**
@@ -66,7 +79,20 @@ namespace CryoLSP
         std::string _intrinsics_file_path;
         bool _intrinsics_loaded = false;
 
+        // Project detection cache
+        std::unordered_map<std::string, ProjectInfo> _project_cache; // dir -> ProjectInfo (positive cache)
+        std::unordered_set<std::string> _non_project_dirs;           // dirs confirmed to have no project
+
         void loadIntrinsics();
+
+        // Detect whether a file belongs to a Cryo project (has cryoconfig in parent dirs)
+        ProjectInfo detectProject(const std::string &file_path);
+
+        // Configure the ModuleLoader for project-aware compilation
+        void configureModuleLoader(Cryo::CompilerInstance *instance, const ProjectInfo &project, const std::string &file_path);
+
+        // Walk AST to find and resolve import declarations
+        void processImportDeclarations(Cryo::CompilerInstance *instance, const std::string &file_path);
 
         // Convert compiler's LspDiagnostic to our Diagnostic
         std::vector<Diagnostic> convertDiagnostics(Cryo::CompilerInstance *instance, const std::string &file_path);

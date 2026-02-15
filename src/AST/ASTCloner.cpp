@@ -258,7 +258,8 @@ void ASTCloner::visit(StructLiteralNode &node)
     {
         auto field_init = std::make_unique<FieldInitializerNode>(
             init->field_name(),
-            clone_expression(init->value()));
+            clone_expression(init->value()),
+            init->location());
         cloned->add_field_initializer(std::move(field_init));
     }
 

@@ -85,14 +85,22 @@ namespace CryoLSP
     {
         // For string literals, account for the surrounding quotes in position matching
         size_t match_len = node.value().size();
+        std::string ident_name = node.value();
         auto lk = node.literal_kind();
         if (lk == Cryo::TokenKind::TK_STRING_LITERAL || lk == Cryo::TokenKind::TK_RAW_STRING_LITERAL)
             match_len += 2; // opening and closing quotes
 
+        // Unit literal () is stored as "void" but source text is "()" (2 chars)
+        if (lk == Cryo::TokenKind::TK_KW_VOID)
+        {
+            match_len = 2;
+            ident_name = "()";
+        }
+
         if (matchesPosition(node, match_len))
         {
             _result.node = &node;
-            _result.identifier_name = node.value();
+            _result.identifier_name = ident_name;
             _result.kind = FoundNode::Kind::Literal;
         }
     }
@@ -134,11 +142,21 @@ namespace CryoLSP
         if (node.has_return_type_annotation())
             checkTypeAnnotation(node.return_type_annotation());
 
-        // Visit parameters (also checks their type annotations)
+        // Visit parameters - check as Parameter kind (not VariableDecl)
         for (const auto &param : node.parameters())
         {
-            if (param)
-                param->accept(*this);
+            if (!param)
+                continue;
+            const auto &ploc = param->has_name_location() ? param->name_location() : param->location();
+            if (matchesPosition(ploc, param->name().size()))
+            {
+                _result.node = param.get();
+                _result.identifier_name = param->name();
+                _result.kind = FoundNode::Kind::Parameter;
+            }
+            // Also check parameter type annotations
+            if (param->has_type_annotation())
+                checkTypeAnnotation(param->type_annotation());
         }
 
         // Visit body
@@ -271,10 +289,21 @@ namespace CryoLSP
         if (node.has_return_type_annotation())
             checkTypeAnnotation(node.return_type_annotation());
 
+        // Visit parameters - check as Parameter kind (not VariableDecl)
         for (const auto &param : node.parameters())
         {
-            if (param)
-                param->accept(*this);
+            if (!param)
+                continue;
+            const auto &ploc = param->has_name_location() ? param->name_location() : param->location();
+            if (matchesPosition(ploc, param->name().size()))
+            {
+                _result.node = param.get();
+                _result.identifier_name = param->name();
+                _result.kind = FoundNode::Kind::Parameter;
+            }
+            // Also check parameter type annotations
+            if (param->has_type_annotation())
+                checkTypeAnnotation(param->type_annotation());
         }
 
         if (node.body())
@@ -367,12 +396,26 @@ namespace CryoLSP
 
         // Check each segment of the scope name
         size_t current_col = node.location().column();
-        for (const auto &segment : segments)
+        for (size_t si = 0; si < segments.size(); ++si)
         {
+            const auto &segment = segments[si];
             if (_target_col >= current_col && _target_col < current_col + segment.size())
             {
                 _result.node = &node;
                 _result.identifier_name = segment;
+                // If this is the last scope segment and node has generic args, include them
+                // so hover can substitute concrete types (e.g., "GenericStruct" -> "GenericStruct<string>")
+                if (si == segments.size() - 1 && node.has_generic_args())
+                {
+                    _result.identifier_name += "<";
+                    for (size_t i = 0; i < node.generic_args().size(); ++i)
+                    {
+                        if (i > 0)
+                            _result.identifier_name += ", ";
+                        _result.identifier_name += node.generic_args()[i];
+                    }
+                    _result.identifier_name += ">";
+                }
                 _result.kind = FoundNode::Kind::TypeReference;
                 return;
             }
@@ -410,8 +453,25 @@ namespace CryoLSP
 
     void PositionFinder::visit(Cryo::CallExpressionNode &node)
     {
+        std::string prev_ident = _result.identifier_name;
+
         if (node.callee())
             node.callee()->accept(*this);
+
+        // If callee visit found a new match and call has generic type args,
+        // append them for hover substitution (e.g., "generic_fn" -> "generic_fn<int>")
+        if (_result.identifier_name != prev_ident && node.has_generic_args())
+        {
+            std::string args = "<";
+            for (size_t i = 0; i < node.generic_args().size(); ++i)
+            {
+                if (i > 0)
+                    args += ", ";
+                args += node.generic_args()[i];
+            }
+            args += ">";
+            _result.identifier_name += args;
+        }
 
         for (const auto &arg : node.arguments())
         {
@@ -432,6 +492,14 @@ namespace CryoLSP
     {
         if (node.operand())
             node.operand()->accept(*this);
+    }
+
+    void PositionFinder::visit(Cryo::ArrayAccessNode &node)
+    {
+        if (node.array())
+            node.array()->accept(*this);
+        if (node.index())
+            node.index()->accept(*this);
     }
 
     void PositionFinder::visit(Cryo::SizeofExpressionNode &node)
@@ -517,9 +585,20 @@ namespace CryoLSP
             _result.kind = FoundNode::Kind::TypeReference;
         }
 
-        // Visit field initializer value expressions
+        // Check if cursor is on a field initializer name (e.g., "x" in "Point { x: 1 }")
         for (const auto &field : node.field_initializers())
         {
+            if (field && field->has_location())
+            {
+                if (matchesPosition(field->location(), field->field_name().size()))
+                {
+                    _result.node = &node; // Point to the StructLiteralNode so we can get struct_type()
+                    _result.identifier_name = field->field_name();
+                    _result.kind = FoundNode::Kind::FieldInitializer;
+                }
+            }
+
+            // Visit field initializer value expressions
             if (field && field->value())
                 field->value()->accept(*this);
         }
@@ -563,6 +642,32 @@ namespace CryoLSP
     {
         if (node.expression())
             node.expression()->accept(*this);
+    }
+
+    void PositionFinder::visit(Cryo::SwitchStatementNode &node)
+    {
+        if (node.expression())
+            node.expression()->accept(*this);
+
+        for (const auto &case_stmt : node.cases())
+        {
+            if (case_stmt)
+                case_stmt->accept(*this);
+        }
+    }
+
+    void PositionFinder::visit(Cryo::CaseStatementNode &node)
+    {
+        // Visit the case value expression (e.g., TokenType::NUMBER)
+        if (node.value())
+            node.value()->accept(*this);
+
+        // Visit statements in the case body
+        for (const auto &stmt : node.statements())
+        {
+            if (stmt)
+                stmt->accept(*this);
+        }
     }
 
     void PositionFinder::visit(Cryo::MatchStatementNode &node)
@@ -664,6 +769,21 @@ namespace CryoLSP
             _result.identifier_name = variant_name;
             _result.kind = FoundNode::Kind::EnumVariant;
             return;
+        }
+
+        // Check pattern element bindings (e.g., "name" in Expr::Variable(name))
+        for (const auto &elem : node.pattern_elements())
+        {
+            if (elem.is_binding() && elem.has_location())
+            {
+                if (matchesPosition(elem.location, elem.binding_name.size()))
+                {
+                    _result.node = &node; // Point to the EnumPatternNode for context
+                    _result.identifier_name = elem.binding_name;
+                    _result.kind = FoundNode::Kind::PatternBinding;
+                    return;
+                }
+            }
         }
     }
 

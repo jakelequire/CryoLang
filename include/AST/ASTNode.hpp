@@ -52,20 +52,23 @@ namespace Cryo
         Kind kind = Kind::Binding;
         std::string binding_name;                                                    // For Kind::Binding
         std::variant<std::monostate, int64_t, double, bool, std::string> lit_value;  // For Kind::Literal
+        SourceLocation location;                                                     // Location of this element in source
 
         // Factory methods
-        static PatternElement make_binding(const std::string &name)
+        static PatternElement make_binding(const std::string &name, SourceLocation loc = SourceLocation{})
         {
             PatternElement pe;
             pe.kind = Kind::Binding;
             pe.binding_name = name;
+            pe.location = loc;
             return pe;
         }
 
-        static PatternElement make_wildcard()
+        static PatternElement make_wildcard(SourceLocation loc = SourceLocation{})
         {
             PatternElement pe;
             pe.kind = Kind::Wildcard;
+            pe.location = loc;
             return pe;
         }
 
@@ -104,6 +107,7 @@ namespace Cryo
         bool is_binding() const { return kind == Kind::Binding; }
         bool is_wildcard() const { return kind == Kind::Wildcard; }
         bool is_literal() const { return kind == Kind::Literal; }
+        bool has_location() const { return location.line() > 0 && location.column() > 0; }
 
         // Get string representation for debugging/printing
         std::string to_string() const
@@ -2133,13 +2137,19 @@ namespace Cryo
     private:
         std::string _field_name;
         std::unique_ptr<ExpressionNode> _value;
+        SourceLocation _location; // Location of the field name token
 
     public:
         FieldInitializerNode(std::string field_name, std::unique_ptr<ExpressionNode> value)
             : _field_name(std::move(field_name)), _value(std::move(value)) {}
 
+        FieldInitializerNode(std::string field_name, std::unique_ptr<ExpressionNode> value, SourceLocation location)
+            : _field_name(std::move(field_name)), _value(std::move(value)), _location(location) {}
+
         const std::string &field_name() const { return _field_name; }
         ExpressionNode *value() const { return _value.get(); }
+        const SourceLocation &location() const { return _location; }
+        bool has_location() const { return _location.line() > 0 && _location.column() > 0; }
 
         void print(std::ostream &os, int indent = 0) const
         {
