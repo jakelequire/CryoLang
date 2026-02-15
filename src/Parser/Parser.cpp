@@ -2817,6 +2817,7 @@ namespace Cryo
                                             }
 
                                             std::string field_name = std::string(_current_token.text());
+                                            auto field_name_loc = _current_token.location();
                                             advance(); // consume field name
 
                                             consume(TokenKind::TK_COLON, "Expected ':' after field name");
@@ -2830,7 +2831,7 @@ namespace Cryo
                                             }
 
                                             // Create field initializer
-                                            auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
+                                            auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value), field_name_loc);
                                             struct_literal->add_field_initializer(std::move(field_init));
 
                                             // Continue if comma or another field (identifier:)
@@ -2957,6 +2958,7 @@ namespace Cryo
                                     }
 
                                     std::string field_name = std::string(_current_token.text());
+                                    auto field_name_loc = _current_token.location();
                                     advance(); // consume field name
 
                                     consume(TokenKind::TK_COLON, "Expected ':' after field name");
@@ -2970,7 +2972,7 @@ namespace Cryo
                                     }
 
                                     // Create field initializer
-                                    auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
+                                    auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value), field_name_loc);
                                     struct_literal->add_field_initializer(std::move(field_init));
 
                                     // Continue if comma or another field (identifier:)
@@ -3230,6 +3232,7 @@ namespace Cryo
                             }
 
                             std::string field_name = std::string(_current_token.text());
+                            auto field_name_loc = _current_token.location();
                             advance();
 
                             // Expect ':'
@@ -3239,7 +3242,7 @@ namespace Cryo
                             auto field_value = parse_expression();
 
                             // Create field initializer
-                            auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
+                            auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value), field_name_loc);
                             struct_literal->add_field_initializer(std::move(field_init));
 
                             // Continue if we see comma, or if we see another field (identifier:)
@@ -4175,15 +4178,16 @@ namespace Cryo
                         if (_current_token.is(TokenKind::TK_IDENTIFIER))
                         {
                             std::string text{_current_token.text()};
+                            auto elem_loc = _current_token.location();
                             if (text == "_")
                             {
                                 // Wildcard pattern
-                                pattern->add_pattern_element(PatternElement::make_wildcard());
+                                pattern->add_pattern_element(PatternElement::make_wildcard(elem_loc));
                             }
                             else
                             {
                                 // Variable binding
-                                pattern->add_pattern_element(PatternElement::make_binding(text));
+                                pattern->add_pattern_element(PatternElement::make_binding(text, elem_loc));
                             }
                             advance();
 
@@ -4666,6 +4670,7 @@ namespace Cryo
                         }
 
                         std::string field_name = std::string(_current_token.text());
+                        auto field_name_loc = _current_token.location();
                         advance(); // consume field name
 
                         consume(TokenKind::TK_COLON, "Expected ':' after field name");
@@ -4679,7 +4684,7 @@ namespace Cryo
                         }
 
                         // Create field initializer
-                        auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value));
+                        auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value), field_name_loc);
                         struct_literal->add_field_initializer(std::move(field_init));
 
                         // Continue if comma or another field (identifier:)

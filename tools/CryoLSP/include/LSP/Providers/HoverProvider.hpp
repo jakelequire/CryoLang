@@ -7,6 +7,7 @@
 #include "Types/SymbolTable.hpp"
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace CryoLSP
 {
@@ -23,16 +24,21 @@ namespace CryoLSP
         DocumentStore &_documents;
 
         // Format hover for specific declaration types
-        std::string formatFunctionHover(Cryo::FunctionDeclarationNode *func);
-        std::string formatStructHover(Cryo::StructDeclarationNode *decl);
-        std::string formatClassHover(Cryo::ClassDeclarationNode *decl);
+        // type_args: concrete type arguments for generic instantiation (e.g., {"string"} for Array<string>)
+        std::string formatFunctionHover(Cryo::FunctionDeclarationNode *func,
+                                        const std::vector<std::string> &type_args = {});
+        std::string formatStructHover(Cryo::StructDeclarationNode *decl,
+                                      const std::vector<std::string> &type_args = {});
+        std::string formatClassHover(Cryo::ClassDeclarationNode *decl,
+                                     const std::vector<std::string> &type_args = {});
         std::string formatEnumHover(Cryo::EnumDeclarationNode *decl);
         std::string formatVariableHover(Cryo::VariableDeclarationNode *decl);
         std::string formatEnumVariantHover(Cryo::EnumVariantNode *variant);
         std::string formatTraitHover(Cryo::TraitDeclarationNode *decl);
 
         // Format hover from symbol table lookup (for references)
-        std::string formatSymbolRefHover(Cryo::Symbol *sym, Cryo::ASTNode *ast_root);
+        std::string formatSymbolRefHover(Cryo::Symbol *sym, Cryo::ASTNode *ast_root,
+                                         const std::vector<std::string> &type_args = {});
 
         // Format hover for a module/namespace showing its exported declarations
         std::string formatNamespaceHover(const std::string &name, Cryo::ProgramNode *ast);

@@ -107,6 +107,10 @@ namespace Cryo
          */
         void set_current_file(const std::string &current_file_path);
 
+        // Temporary debug getter for LSP
+        const std::string &current_file_dir() const { return _current_file_dir; }
+        const std::string &stdlib_root() const { return _stdlib_root; }
+
         /**
          * @brief Set callback for auto-imports on runtime dependencies
          * @param callback Function to call for auto-imports (symbol_table, scope_name, source_file)
