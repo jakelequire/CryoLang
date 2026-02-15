@@ -47,6 +47,7 @@ SRCS = \
 	$(SRC_DIR)/DocumentStore.cpp \
 	$(SRC_DIR)/AnalysisEngine.cpp \
 	$(SRC_DIR)/PositionFinder.cpp \
+	$(SRC_DIR)/ASTSearchHelpers.cpp \
 	$(SRC_DIR)/Server.cpp \
 	$(SRC_DIR)/Providers/DiagnosticsProvider.cpp \
 	$(SRC_DIR)/Providers/HoverProvider.cpp \
