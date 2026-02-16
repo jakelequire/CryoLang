@@ -289,6 +289,9 @@ namespace Cryo::Codegen
         /** @brief Get a registered function by name */
         llvm::Function *get_function(const std::string &name);
 
+        /** @brief Unregister a function (e.g., after eraseFromParent) to prevent dangling pointers */
+        void unregister_function(llvm::Function *fn);
+
         //===================================================================
         // Current Expression Result
         //===================================================================

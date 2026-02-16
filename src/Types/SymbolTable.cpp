@@ -24,6 +24,28 @@ namespace Cryo
             if ((it->second.kind == SymbolKind::Function || it->second.kind == SymbolKind::Method) &&
                 (symbol.kind == SymbolKind::Function || symbol.kind == SymbolKind::Method))
             {
+                // Deduplicate: skip if the same function type already exists
+                // (can happen when struct inline methods and impl block methods overlap)
+                if (symbol.type.is_valid() && it->second.type.is_valid() &&
+                    symbol.type == it->second.type)
+                {
+                    return true; // Same type — duplicate, not a new overload
+                }
+
+                // Check against existing overloads too
+                auto ovl_it = _function_overloads.find(name);
+                if (ovl_it != _function_overloads.end())
+                {
+                    for (const auto &ovl : ovl_it->second)
+                    {
+                        if (symbol.type.is_valid() && ovl.type.is_valid() &&
+                            symbol.type == ovl.type)
+                        {
+                            return true; // Duplicate of existing overload
+                        }
+                    }
+                }
+
                 _function_overloads[name].push_back(symbol);
                 return true;
             }

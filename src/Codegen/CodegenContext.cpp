@@ -149,6 +149,26 @@ namespace Cryo::Codegen
         return (it != _functions.end()) ? it->second : nullptr;
     }
 
+    void CodegenContext::unregister_function(llvm::Function *fn)
+    {
+        if (!fn)
+            return;
+
+        // Remove all entries pointing to this function to prevent dangling pointers
+        for (auto it = _functions.begin(); it != _functions.end();)
+        {
+            if (it->second == fn)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Unregistered function: {}", it->first);
+                it = _functions.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
     //===================================================================
     // Source Context
     //===================================================================
