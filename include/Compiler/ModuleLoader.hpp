@@ -111,6 +111,9 @@ namespace Cryo
         const std::string &current_file_dir() const { return _current_file_dir; }
         const std::string &stdlib_root() const { return _stdlib_root; }
 
+        // Access loading modules set for external cycle-guard insertion (used by LSP)
+        std::unordered_set<std::string> *loading_modules_set() { return &_loading_modules; }
+
         /**
          * @brief Set callback for auto-imports on runtime dependencies
          * @param callback Function to call for auto-imports (symbol_table, scope_name, source_file)

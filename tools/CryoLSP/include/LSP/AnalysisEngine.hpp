@@ -98,10 +98,12 @@ namespace CryoLSP
         ProjectInfo detectProject(const std::string &file_path);
 
         // Configure the ModuleLoader for project-aware compilation
-        void configureModuleLoader(Cryo::CompilerInstance *instance, const ProjectInfo &project, const std::string &file_path);
+        void configureModuleLoader(Cryo::CompilerInstance *instance, const ProjectInfo &project,
+                                   const std::string &file_path, bool is_stdlib_project = false);
 
         // Walk AST to find and resolve import declarations
-        void processImportDeclarations(Cryo::CompilerInstance *instance, const std::string &file_path);
+        void processImportDeclarations(Cryo::CompilerInstance *instance, const ProjectInfo &project,
+                                       const std::string &file_path);
 
         // Convert compiler's LspDiagnostic to our Diagnostic
         std::vector<Diagnostic> convertDiagnostics(Cryo::CompilerInstance *instance, const std::string &file_path);
