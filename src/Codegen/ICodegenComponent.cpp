@@ -1665,6 +1665,48 @@ namespace Cryo::Codegen
             return b.CreateLoad(target_type, value, "struct.load");
         }
 
+        // Pointer to floating-point: load the value through the pointer.
+        // Handles &this in primitive implement blocks (e.g., fabs(&this) where fabs expects f64).
+        // If the pointer is an alloca that stores another pointer (double indirection),
+        // load through both levels.
+        if (source_type->isPointerTy() && target_type->isFloatingPointTy())
+        {
+            if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(value))
+            {
+                if (alloca_inst->getAllocatedType()->isPointerTy())
+                {
+                    // Double indirection: alloca stores a pointer → load ptr, then load value
+                    llvm::Value *loaded_ptr = b.CreateLoad(
+                        alloca_inst->getAllocatedType(), value, "ptr.deref");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                             "cast_if_needed: Double deref ptr→ptr→float");
+                    return b.CreateLoad(target_type, loaded_ptr, "float.deref");
+                }
+            }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                     "cast_if_needed: Loading float from pointer");
+            return b.CreateLoad(target_type, value, "float.load");
+        }
+
+        // Pointer (double-indirection) to integer: for &this in primitive implement blocks
+        // on integer types. Only triggers when the alloca stores a pointer (double indirection).
+        // Single-indirection ptr→int is handled below by PtrToInt.
+        if (source_type->isPointerTy() && target_type->isIntegerTy())
+        {
+            if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(value))
+            {
+                if (alloca_inst->getAllocatedType()->isPointerTy())
+                {
+                    llvm::Value *loaded_ptr = b.CreateLoad(
+                        alloca_inst->getAllocatedType(), value, "ptr.deref");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                             "cast_if_needed: Double deref ptr→ptr→int");
+                    return b.CreateLoad(target_type, loaded_ptr, "int.deref");
+                }
+            }
+            // Fall through to PtrToInt for single-indirection cases
+        }
+
         // Integer to struct (tagged union): wrap discriminant in tagged union struct
         // This handles cases where an enum variant is stored as a raw i32 discriminant
         // but the function return type expects the full tagged union struct { i32, [N x i8] }

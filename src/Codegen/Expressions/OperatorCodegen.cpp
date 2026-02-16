@@ -3166,6 +3166,22 @@ namespace Cryo::Codegen
                         }
                     }
                 }
+                else if (array_type->kind() == Cryo::TypeKind::String)
+                {
+                    // String is a char* (i8*) in LLVM - elements are i8
+                    element_type = llvm::Type::getInt8Ty(llvm_ctx());
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Detected TypeKind::String, element type = i8");
+                }
+                else if (array_type->kind() == Cryo::TypeKind::Reference)
+                {
+                    // Unwrap Reference to check if it wraps a String (e.g., &string in implement blocks)
+                    auto *ref_type = dynamic_cast<const Cryo::ReferenceType *>(array_type.get());
+                    if (ref_type && ref_type->referent() && ref_type->referent()->kind() == Cryo::TypeKind::String)
+                    {
+                        element_type = llvm::Type::getInt8Ty(llvm_ctx());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Detected Reference<String>, element type = i8");
+                    }
+                }
                 else
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_lvalue_address: Type kind {} not handled, checking for Array<T> patterns",
