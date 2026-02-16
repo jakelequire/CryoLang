@@ -162,6 +162,57 @@ namespace Cryo
                     }
                 }
             }
+
+            // Cross-module: same base name + same type arg names = compatible
+            if (from_inst->generic_base().is_valid() && to_inst->generic_base().is_valid() &&
+                from_inst->generic_base()->display_name() == to_inst->generic_base()->display_name() &&
+                from_inst->type_args().size() == to_inst->type_args().size())
+            {
+                bool all_match = true;
+                for (size_t i = 0; i < from_inst->type_args().size(); ++i)
+                {
+                    if (check_compatibility(from_inst->type_args()[i], to_inst->type_args()[i]) ==
+                        TypeCompatibility::Incompatible)
+                    {
+                        all_match = false;
+                        break;
+                    }
+                }
+                if (all_match)
+                    return TypeCompatibility::Compatible;
+            }
+        }
+
+        // Cross-module: one side is an unresolved InstantiatedType, the other is a
+        // concrete type (Enum/Struct) produced by monomorphization. Compare using the
+        // InstantiatedType's display_name (e.g. "Maybe<i32>") against the concrete
+        // type's name (e.g. "Maybe_i32") by normalizing both to a canonical form.
+        if (from_kind == TypeKind::InstantiatedType || to_kind == TypeKind::InstantiatedType)
+        {
+            // Normalize: replace <,> with _ and trim trailing _
+            auto normalize = [](const std::string &name) -> std::string {
+                std::string result = name;
+                for (char &c : result)
+                {
+                    if (c == '<' || c == '>' || c == ',' || c == ' ')
+                        c = '_';
+                }
+                // Remove trailing underscores
+                while (!result.empty() && result.back() == '_')
+                    result.pop_back();
+                return result;
+            };
+
+            if (normalize(from_t->display_name()) == normalize(to_t->display_name()))
+            {
+                return TypeCompatibility::Compatible;
+            }
+        }
+
+        // Last resort: exact display name match (handles other cross-module duplicates)
+        if (from_t->display_name() == to_t->display_name())
+        {
+            return TypeCompatibility::Compatible;
         }
 
         return TypeCompatibility::Incompatible;

@@ -2407,9 +2407,20 @@ namespace Cryo
                         }
                     }
 
+                    // Set the resolved return type for static method calls.
+                    // This corrects cases like static new() -> Node* where the earlier
+                    // new/default resolution set the call type to the struct type (Node)
+                    // instead of the actual return type (Node*).
+                    TypeRef return_type = func_type->return_type();
+                    if (return_type.is_valid() && !return_type.is_error())
+                    {
+                        call->set_resolved_type(return_type);
+                    }
+
                     LOG_DEBUG(LogComponent::GENERAL,
-                              "GenericExpressionResolutionPass: Found static method '{}' with {} params",
-                              qualified_name, param_types.size());
+                              "GenericExpressionResolutionPass: Found static method '{}' with {} params, return type '{}'",
+                              qualified_name, param_types.size(),
+                              return_type.is_valid() ? return_type->display_name() : "<unknown>");
                 }
 
                 // If no function signature found in symbol table, try to derive param_types
