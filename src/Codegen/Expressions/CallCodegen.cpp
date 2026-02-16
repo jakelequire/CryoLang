@@ -1910,6 +1910,11 @@ namespace Cryo::Codegen
             }
         }
 
+        // Sanitize instantiated_enum_name to match the mangling used by mangle_type_name.
+        // display_name() may contain '*' (e.g., "Outcome_void*_i32") but the defined
+        // constructor functions use sanitized names (e.g., "Outcome_voidp_i32::Ok").
+        std::replace(instantiated_enum_name.begin(), instantiated_enum_name.end(), '*', 'p');
+
         // Use instantiated name for qualified variant lookup
         std::string qualified_variant = instantiated_enum_name + "::" + variant_name;
         // Also try with base name for non-generic enums
