@@ -4,6 +4,7 @@
 #include "AST/ASTNode.hpp"
 #include "CLI/ConfigParser.hpp"
 #include "LSP/Transport.hpp"
+#include "Utils/Logger.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -32,6 +33,8 @@ namespace CryoLSP
             // internal compiler state inconsistent, leading to segfaults.
             auto instance = Cryo::create_compiler_instance();
 
+            Cryo::Logger::instance().disable_colors(); // Disable colors for LSP output
+
             // Set workspace include path if available
             if (!_workspace_root.empty())
             {
@@ -48,12 +51,12 @@ namespace CryoLSP
                                "' at " + project.project_root + " for file " + file_path);
 
                 bool is_stdlib_project = project.config.stdlib_mode ||
-                                        project.config.target_type == "stdlib";
+                                         project.config.target_type == "stdlib";
                 bool use_stdlib = !project.config.no_std && !is_stdlib_project;
 
                 instance->set_raw_mode(false);
                 instance->set_auto_imports_enabled(use_stdlib); // Only auto-import prelude when stdlib is used
-                instance->set_stdlib_linking(false);             // No codegen/linking in LSP
+                instance->set_stdlib_linking(false);            // No codegen/linking in LSP
 
                 if (is_stdlib_project)
                 {
@@ -199,8 +202,7 @@ namespace CryoLSP
             if (instance->ast_root())
             {
                 _intrinsics_instance = std::move(instance);
-                Transport::log("[Intrinsics] Loaded " + std::to_string(
-                                   _intrinsics_instance->ast_root()->statements().size()) +
+                Transport::log("[Intrinsics] Loaded " + std::to_string(_intrinsics_instance->ast_root()->statements().size()) +
                                " declarations from intrinsics.cryo");
             }
             else

@@ -314,7 +314,7 @@ namespace Cryo
         void process_struct_declarations_recursive(ASTNode *node);
         std::string build_function_signature(FunctionDeclarationNode *func_decl);
         void inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name); // Auto-import core types
-        void inject_parent_module_import(); // Auto-import parent _module.cryo for submodule files
+        void inject_parent_module_import();                                                  // Auto-import parent _module.cryo for submodule files
 
         // SRM helper methods
         std::string generate_method_name(const std::string &scope_name, const std::string &class_name, const std::string &method_name);

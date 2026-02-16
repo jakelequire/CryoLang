@@ -68,24 +68,24 @@ namespace Cryo
     LoggerConfig Logger::create_default_config()
     {
         LoggerConfig config;
-        
+
         // Disable logging by default (will be configured by CLI flags)
         config.console_level = LogLevel::NONE;
         config.file_level = LogLevel::NONE;
         config.log_file_path = "";
-        
+
         // Enable nice formatting features
         config.enable_colors = true;
         config.enable_timestamps = true;
         config.enable_component_tags = true;
-        
+
         // Reasonable defaults for other options
         config.enable_thread_id = false;
         config.enable_source_location = false;
         config.append_to_file = true;
         config.max_file_size_mb = 100;
         config.auto_flush = false;
-        
+
         return config;
     }
 
@@ -110,9 +110,12 @@ namespace Cryo
         std::filesystem::path file_path(path);
         if (file_path.has_parent_path())
         {
-            try {
+            try
+            {
                 std::filesystem::create_directories(file_path.parent_path());
-            } catch (const std::exception& e) {
+            }
+            catch (const std::exception &e)
+            {
                 std::cerr << "Warning: Could not create log directory: " << e.what() << std::endl;
                 // Continue anyway - let file opening fail if needed
             }

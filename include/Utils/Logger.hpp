@@ -227,7 +227,7 @@ namespace Cryo
 
         /**
          * @brief Create a default logger configuration
-         * 
+         *
          * Creates a configuration with logging disabled by default (NONE level).
          * This configuration is designed to be overridden by CLI flags.
          */
@@ -277,6 +277,12 @@ namespace Cryo
          * @brief Check if component is enabled
          */
         bool is_component_enabled(LogComponent component) const;
+
+        /**
+         * @brief Enable/disable colors in console output
+         */
+        void disable_colors() { _config.enable_colors = false; }
+        void enable_colors() { _config.enable_colors = true; }
 
         /**
          * @brief Get current configuration
