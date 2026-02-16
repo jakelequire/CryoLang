@@ -848,6 +848,27 @@ namespace Cryo::Codegen
         {
             // For nested member access (obj.a.b), get the address of the inner member
             object = generate_member_address(nested_member);
+
+            // If the inner member is a pointer field (e.g., node.next where next: Node*),
+            // we need to load the pointer value so the outer GEP operates on the pointed-to struct.
+            if (object && object->getType()->isPointerTy())
+            {
+                llvm::StructType *inner_struct_type = nullptr;
+                unsigned inner_field_idx = 0;
+                if (resolve_member_info(nested_member->object(), nested_member->member(),
+                                        inner_struct_type, inner_field_idx))
+                {
+                    llvm::Type *field_type = inner_struct_type->getElementType(inner_field_idx);
+                    if (field_type->isPointerTy())
+                    {
+                        // The field is a pointer - load to get the actual pointer value
+                        object = create_load(object, field_type, nested_member->member() + ".deref");
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_member_address: Dereferenced pointer field '{}' for chained access",
+                                  nested_member->member());
+                    }
+                }
+            }
         }
         else if (auto *array_access = dynamic_cast<Cryo::ArrayAccessNode *>(node->object()))
         {
