@@ -33,7 +33,7 @@ namespace CryoLSP
                                      const std::vector<std::string> &type_args = {});
         std::string formatEnumHover(Cryo::EnumDeclarationNode *decl);
         std::string formatVariableHover(Cryo::VariableDeclarationNode *decl);
-        std::string formatEnumVariantHover(Cryo::EnumVariantNode *variant);
+        std::string formatEnumVariantHover(Cryo::EnumVariantNode *variant, int variant_index = -1);
         std::string formatTraitHover(Cryo::TraitDeclarationNode *decl);
 
         // Format hover from symbol table lookup (for references)

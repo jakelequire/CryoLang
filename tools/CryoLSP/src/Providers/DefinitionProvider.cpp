@@ -6,6 +6,7 @@
 #include "Compiler/ModuleLoader.hpp"
 #include "Types/SymbolTable.hpp"
 #include "AST/ASTVisitor.hpp"
+#include <filesystem>
 
 namespace CryoLSP
 {
@@ -55,10 +56,12 @@ namespace CryoLSP
             return path;
 
         // 2. Fallback: use the module loader's resolve_import_path
+        //    Note: resolve_import_path always returns something (even a non-existent
+        //    fallback path), so we must check that the result actually exists.
         if (instance && instance->module_loader())
         {
             std::string resolved = instance->module_loader()->resolve_import_path(module_name);
-            if (!resolved.empty())
+            if (!resolved.empty() && std::filesystem::exists(resolved))
                 return resolved;
         }
 
@@ -235,12 +238,15 @@ namespace CryoLSP
                 return std::nullopt;
 
             std::string import_path = import_node->module_path();
+            Transport::log("[Definition] Import module_path: '" + import_path + "'");
 
             // Try to resolve the import to a file path
             if (instance->module_loader())
             {
                 std::string resolved = instance->module_loader()->resolve_import_path(import_path);
-                if (!resolved.empty())
+                Transport::log("[Definition] resolve_import_path returned: '" + resolved +
+                               "' exists=" + (std::filesystem::exists(resolved) ? "Y" : "N"));
+                if (!resolved.empty() && std::filesystem::exists(resolved))
                 {
                     Transport::log("[Definition] Import resolved to: " + resolved);
                     Location loc;
