@@ -2252,6 +2252,27 @@ namespace Cryo
                     auto *func_type = static_cast<const FunctionType *>(func_sym->type.get());
                     param_types = func_type->param_types();
                     is_variadic_func = func_type->is_variadic();
+
+                    // If arity doesn't match, try to find an overload that does
+                    size_t actual_args = call->arguments().size();
+                    if (!is_variadic_func && param_types.size() != actual_args)
+                    {
+                        auto overloads = _compiler.symbol_table()->get_overloads(ident->name());
+                        for (const auto *overload : overloads)
+                        {
+                            if (overload->type.is_valid() && overload->type->kind() == TypeKind::Function)
+                            {
+                                auto *ovl_func_type = static_cast<const FunctionType *>(overload->type.get());
+                                if (ovl_func_type->param_count() == actual_args || ovl_func_type->is_variadic())
+                                {
+                                    param_types = ovl_func_type->param_types();
+                                    is_variadic_func = ovl_func_type->is_variadic();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     LOG_DEBUG(LogComponent::GENERAL,
                               "GenericExpressionResolutionPass: Found function '{}' with {} params",
                               ident->name(), param_types.size());
@@ -2365,6 +2386,27 @@ namespace Cryo
                     auto *func_type = static_cast<const FunctionType *>(func_sym->type.get());
                     param_types = func_type->param_types();
                     is_variadic_func = func_type->is_variadic();
+
+                    // If arity doesn't match, try to find an overload that does
+                    size_t actual_args = call->arguments().size();
+                    if (!is_variadic_func && param_types.size() != actual_args)
+                    {
+                        auto overloads = _compiler.symbol_table()->get_overloads(qualified_name);
+                        for (const auto *overload : overloads)
+                        {
+                            if (overload->type.is_valid() && overload->type->kind() == TypeKind::Function)
+                            {
+                                auto *ovl_func_type = static_cast<const FunctionType *>(overload->type.get());
+                                if (ovl_func_type->param_count() == actual_args || ovl_func_type->is_variadic())
+                                {
+                                    param_types = ovl_func_type->param_types();
+                                    is_variadic_func = ovl_func_type->is_variadic();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     LOG_DEBUG(LogComponent::GENERAL,
                               "GenericExpressionResolutionPass: Found static method '{}' with {} params",
                               qualified_name, param_types.size());

@@ -2471,6 +2471,65 @@ namespace Cryo
         // LOG_INFO(Cryo::LogComponent::GENERAL, "Standard library initialized from libcryo");
     }
 
+    void CompilerInstance::inject_parent_module_import()
+    {
+        if (_current_namespace.empty() || !_module_loader)
+            return;
+
+        // Skip _module.cryo files — they ARE the parent
+        std::string filename = std::filesystem::path(_source_file).filename().string();
+        if (filename == "_module.cryo")
+            return;
+
+        // Compute parent module path from namespace.
+        // "std::net::tcp" → strip "std::" → "net::tcp" → strip last segment → "net"
+        std::string ns = _current_namespace;
+        const std::string std_prefix = "std::";
+        if (ns.size() > std_prefix.size() && ns.substr(0, std_prefix.size()) == std_prefix)
+            ns = ns.substr(std_prefix.size());
+
+        size_t last_sep = ns.rfind("::");
+        if (last_sep == std::string::npos)
+            return; // Top-level module, no parent
+
+        std::string parent_module_path = ns.substr(0, last_sep);
+
+        LOG_DEBUG(LogComponent::GENERAL,
+                  "Injecting parent module import '{}' for submodule namespace '{}'",
+                  parent_module_path, _current_namespace);
+
+        // Set up module loader (same pattern as inject_auto_imports line 2598-2610)
+        if (!_module_loader->auto_detect_stdlib_root())
+            _module_loader->set_stdlib_root("./stdlib");
+        _module_loader->set_current_file(_source_file);
+
+        // Create synthetic wildcard import for parent module
+        auto parent_import = std::make_unique<ImportDeclarationNode>(
+            SourceLocation(0, 0), parent_module_path);
+
+        // Temporarily disable stdlib mode (same pattern as line 2498)
+        bool saved = _stdlib_compilation_mode;
+        _stdlib_compilation_mode = false;
+
+        auto result = _module_loader->load_import(*parent_import);
+
+        _stdlib_compilation_mode = saved;
+
+        if (!result.success || result.symbol_map.empty())
+            return;
+
+        // Register symbols for unqualified access (sockaddr_in, timeval)
+        for (const auto &[name, symbol] : result.symbol_map)
+            _symbol_table->declare_symbol(name, symbol.kind, symbol.location, symbol.type, "Global");
+
+        // Also register as namespace for qualified access (net::sockaddr_in)
+        _symbol_table->register_namespace(parent_module_path, result.symbol_map);
+
+        LOG_DEBUG(LogComponent::GENERAL,
+                  "Injected {} symbols from parent module '{}' for submodule '{}'",
+                  result.symbol_map.size(), parent_module_path, _current_namespace);
+    }
+
     void CompilerInstance::inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name)
     {
         // Special handling for runtime files in stdlib mode - they need access to intrinsics AND core/types
@@ -3603,6 +3662,10 @@ namespace Cryo
 
     void CompilerInstance::run_auto_import_phase()
     {
+        // Always inject parent module imports for submodule files.
+        // This runs even in stdlib mode so net/tcp.cryo can see net/_module.cryo types.
+        inject_parent_module_import();
+
         if (!_stdlib_compilation_mode && _auto_imports_enabled)
         {
             LOG_DEBUG(LogComponent::GENERAL, "Auto-import phase: Injecting auto-imports");
@@ -3866,6 +3929,47 @@ namespace Cryo
                                            std::string("IR generation exception: ") + e.what()));
             return false;
         }
+    }
+
+    bool CompilerInstance::run_lsp_semantic_analysis()
+    {
+        if (!_ast_root)
+            return false;
+
+        // Create the frontend pipeline (stages 1-5, no codegen)
+        auto pipeline = StandardPassFactory::create_frontend_pipeline(*this);
+        PassContext ctx(*this);
+
+        // Pre-seed the context with stage 1-2 provisions since the LSP already
+        // handled parsing and import resolution outside the PassManager.
+        ctx.mark_provided(PassProvides::TOKENS);
+        ctx.mark_provided(PassProvides::AST);
+        ctx.mark_provided(PassProvides::AST_VALIDATED);
+        ctx.mark_provided(PassProvides::IMPORTS_DISCOVERED);
+        ctx.mark_provided(PassProvides::MODULES_LOADED);
+        ctx.mark_provided(PassProvides::MODULE_ORDER);
+
+        // Run only stages 3-5 (frontend parsing and import resolution already done by LSP)
+        size_t errs = _diagnostics ? _diagnostics->error_count() : 0;
+
+        // Stage 3: Declaration Collection (type names, function signatures, templates)
+        bool s3 = pipeline->run_stage(ctx, PassStage::DeclarationCollection);
+        size_t errs3 = _diagnostics ? _diagnostics->error_count() : 0;
+        LOG_DEBUG(LogComponent::LSP, "LSP Stage 3 (DeclarationCollection): {} -> errs={}", s3, errs3 - errs);
+
+        // Stage 4: Type Resolution (resolve type annotations, sync struct fields)
+        bool s4 = pipeline->run_stage(ctx, PassStage::TypeResolution);
+        size_t errs4 = _diagnostics ? _diagnostics->error_count() : 0;
+        LOG_DEBUG(LogComponent::LSP, "LSP Stage 4 (TypeResolution): {} -> errs={}", s4, errs4 - errs3);
+
+        // Stage 5: Semantic Analysis (directive processing, function body type checking)
+        bool s5 = pipeline->run_stage(ctx, PassStage::SemanticAnalysis);
+        size_t errs5 = _diagnostics ? _diagnostics->error_count() : 0;
+        LOG_DEBUG(LogComponent::LSP, "LSP Stage 5 (SemanticAnalysis): {} -> errs={}", s5, errs5 - errs4);
+
+        // Always return true — diagnostics are accumulated in DiagEmitter regardless
+        // of whether individual passes succeed. The LSP will read them via convertDiagnostics.
+        return true;
     }
 
     void CompilerInstance::dump_pass_order(std::ostream &os) const

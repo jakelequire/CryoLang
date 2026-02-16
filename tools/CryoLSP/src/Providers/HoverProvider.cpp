@@ -492,7 +492,7 @@ namespace CryoLSP
             for (size_t i = 0; i < decl->methods().size() && i < method_limit; ++i)
             {
                 const auto &method = decl->methods()[i];
-                if (!method)
+                if (!method || method->name() != "new")
                     continue;
                 result += "\t" + substituteTypeStr(buildFunctionSignature(method.get()), subst) + "\n";
             }

@@ -17,9 +17,17 @@ namespace Cryo
 
     bool Scope::declare(const std::string &name, const Symbol &symbol)
     {
-        if (_symbols.find(name) != _symbols.end())
+        auto it = _symbols.find(name);
+        if (it != _symbols.end())
         {
-            return false; // Already declared
+            // Allow function/method overloading - store additional overloads
+            if ((it->second.kind == SymbolKind::Function || it->second.kind == SymbolKind::Method) &&
+                (symbol.kind == SymbolKind::Function || symbol.kind == SymbolKind::Method))
+            {
+                _function_overloads[name].push_back(symbol);
+                return true;
+            }
+            return false; // Already declared (non-function)
         }
         _symbols[name] = symbol;
         return true;
@@ -79,6 +87,41 @@ namespace Cryo
     bool Scope::has_symbol_local(const std::string &name) const
     {
         return _symbols.find(name) != _symbols.end();
+    }
+
+    std::vector<const Symbol *> Scope::lookup_overloads(const std::string &name) const
+    {
+        std::vector<const Symbol *> result;
+
+        // Add the primary symbol if it exists and is a function/method
+        auto it = _symbols.find(name);
+        if (it != _symbols.end() &&
+            (it->second.kind == SymbolKind::Function || it->second.kind == SymbolKind::Method))
+        {
+            result.push_back(&it->second);
+        }
+
+        // Add any additional overloads
+        auto overload_it = _function_overloads.find(name);
+        if (overload_it != _function_overloads.end())
+        {
+            for (const auto &sym : overload_it->second)
+            {
+                result.push_back(&sym);
+            }
+        }
+
+        return result;
+    }
+
+    size_t Scope::symbol_count() const
+    {
+        size_t count = _symbols.size();
+        for (const auto &[name, overloads] : _function_overloads)
+        {
+            count += overloads.size();
+        }
+        return count;
     }
 
     // ========================================================================
@@ -270,8 +313,18 @@ namespace Cryo
         // Register each symbol with the namespace prefix
         for (const auto &[name, symbol] : symbols)
         {
+            // Strip arity-disambiguated suffix (e.g., "String::new#1" -> "String::new")
+            // These suffixes are added by ModuleLoader::create_symbol_map to transport
+            // overloaded methods through the flat unordered_map
+            std::string base_name = name;
+            size_t hash_pos = name.find('#');
+            if (hash_pos != std::string::npos)
+            {
+                base_name = name.substr(0, hash_pos);
+            }
+
             // Register with qualified name for qualified access (e.g., IO::println)
-            std::string qualified_name = namespace_name + "::" + name;
+            std::string qualified_name = namespace_name + "::" + base_name;
             Symbol qualified_sym = symbol;
             qualified_sym.name = qualified_name;
             _current_scope->declare(qualified_name, qualified_sym);
@@ -467,6 +520,14 @@ namespace Cryo
             {
                 callback(symbol);
             }
+            // Also iterate function overloads
+            for (const auto &[name, overloads] : scope->function_overloads())
+            {
+                for (const auto &symbol : overloads)
+                {
+                    callback(symbol);
+                }
+            }
         }
     }
 
@@ -478,23 +539,30 @@ namespace Cryo
             {
                 callback(symbol);
             }
+            // Also iterate function overloads in current scope
+            for (const auto &[name, overloads] : _current_scope->function_overloads())
+            {
+                for (const auto &symbol : overloads)
+                {
+                    callback(symbol);
+                }
+            }
         }
     }
 
     std::vector<const Symbol *> SymbolTable::get_overloads(const std::string &name) const
     {
-        std::vector<const Symbol *> result;
-
-        for (const auto &scope : _scopes)
+        // Walk from current scope outward, stop at the first scope that has any matches
+        for (auto it = _scopes.rbegin(); it != _scopes.rend(); ++it)
         {
-            const Symbol *sym = scope->lookup_local(name);
-            if (sym && sym->kind == SymbolKind::Function)
+            auto overloads = (*it)->lookup_overloads(name);
+            if (!overloads.empty())
             {
-                result.push_back(sym);
+                return overloads;
             }
         }
 
-        return result;
+        return {};
     }
 
     // ========================================================================
@@ -526,6 +594,20 @@ namespace Cryo
                                              : "<no type>")
                    << symbol.location.line() << ":" << symbol.location.column()
                    << "\n";
+            }
+            // Show function overloads
+            for (const auto &[name, overloads] : scope->function_overloads())
+            {
+                for (const auto &symbol : overloads)
+                {
+                    os << std::setw(20) << std::left << (name + " [overload]")
+                       << std::setw(12) << symbol_kind_to_string(symbol.kind)
+                       << std::setw(20) << (symbol.type.is_valid()
+                                                 ? symbol.type.get()->display_name()
+                                                 : "<no type>")
+                       << symbol.location.line() << ":" << symbol.location.column()
+                       << "\n";
+                }
             }
             os << "\n";
         }
