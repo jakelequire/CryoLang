@@ -1134,6 +1134,38 @@ namespace Cryo::Codegen
                         llvm::MaybeAlign(data_layout.getABITypeAlign(var_type)),
                         size);
                 }
+                else if (node->is_mutable() && var_type->isPointerTy() &&
+                         cryo_var_type.is_valid() && cryo_var_type->kind() == Cryo::TypeKind::String)
+                {
+                    // Mutable string initialized from a string literal: create a writable
+                    // stack copy so that str[i] = 'x' doesn't write to read-only memory.
+                    auto *lit = dynamic_cast<Cryo::LiteralNode *>(node->initializer());
+                    if (lit && lit->literal_kind() == TokenKind::TK_STRING_LITERAL)
+                    {
+                        size_t str_len = lit->value().length() + 1; // +1 for null terminator
+                        llvm::Type *buf_type = llvm::ArrayType::get(
+                            llvm::Type::getInt8Ty(llvm_ctx()), str_len);
+                        llvm::AllocaInst *buf = create_entry_alloca(buf_type, name + ".buf");
+                        buf->setAlignment(llvm::Align(1));
+
+                        // Memcpy from the read-only literal into the mutable buffer
+                        llvm::Value *size_val = llvm::ConstantInt::get(
+                            llvm::Type::getInt64Ty(llvm_ctx()), str_len);
+                        builder().CreateMemCpy(buf, llvm::Align(1),
+                                               init_val, llvm::Align(1), size_val);
+
+                        // Store the buffer pointer (not the literal pointer) into the alloca
+                        create_store(buf, alloca);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Created mutable stack copy for string '{}' ({} bytes)",
+                                  name, str_len);
+                    }
+                    else
+                    {
+                        llvm::Value *cast_val = cast_if_needed(init_val, var_type);
+                        create_store(cast_val, alloca);
+                    }
+                }
                 else
                 {
                     llvm::Value *cast_val = cast_if_needed(init_val, var_type);

@@ -2116,14 +2116,14 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        llvm::Value *arg = args[0];
-        llvm::Type *arg_type = arg->getType();
+        llvm::Type *double_type = llvm::Type::getDoubleTy(context);
+        llvm::Value *arg = ensure_type(args[0], double_type, "sqrt.x");
 
         // Use LLVM sqrt intrinsic
         llvm::Function *sqrt_intrinsic = llvm::Intrinsic::getDeclaration(
             _context_manager.get_module(),
             llvm::Intrinsic::sqrt,
-            arg_type);
+            {double_type});
 
         return builder.CreateCall(sqrt_intrinsic, {arg}, "sqrt.result");
     }
@@ -2139,14 +2139,15 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        llvm::Value *base = args[0];
-        llvm::Value *exp = args[1];
+        llvm::Type *double_type = llvm::Type::getDoubleTy(context);
+        llvm::Value *base = ensure_type(args[0], double_type, "pow.base");
+        llvm::Value *exp = ensure_type(args[1], double_type, "pow.exp");
 
         // Use LLVM pow intrinsic
         llvm::Function *pow_intrinsic = llvm::Intrinsic::getDeclaration(
             _context_manager.get_module(),
             llvm::Intrinsic::pow,
-            base->getType());
+            {double_type});
 
         return builder.CreateCall(pow_intrinsic, {base, exp}, "pow.result");
     }
@@ -2160,14 +2161,16 @@ namespace Cryo::Codegen
         }
 
         auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
-        llvm::Value *arg = args[0];
+        llvm::Type *double_type = llvm::Type::getDoubleTy(context);
+        llvm::Value *arg = ensure_type(args[0], double_type, "sin.x");
 
         // Use LLVM sin intrinsic
         llvm::Function *sin_intrinsic = llvm::Intrinsic::getDeclaration(
             _context_manager.get_module(),
             llvm::Intrinsic::sin,
-            arg->getType());
+            {double_type});
 
         return builder.CreateCall(sin_intrinsic, {arg}, "sin.result");
     }
@@ -2181,14 +2184,16 @@ namespace Cryo::Codegen
         }
 
         auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
 
-        llvm::Value *arg = args[0];
+        llvm::Type *double_type = llvm::Type::getDoubleTy(context);
+        llvm::Value *arg = ensure_type(args[0], double_type, "cos.x");
 
         // Use LLVM cos intrinsic
         llvm::Function *cos_intrinsic = llvm::Intrinsic::getDeclaration(
             _context_manager.get_module(),
             llvm::Intrinsic::cos,
-            arg->getType());
+            {double_type});
 
         return builder.CreateCall(cos_intrinsic, {arg}, "cos.result");
     }
@@ -2413,6 +2418,25 @@ namespace Cryo::Codegen
         if (current_type->isIntegerTy() && target_type->isPointerTy())
         {
             return builder.CreateIntToPtr(value, target_type, name + ".inttoptr");
+        }
+
+        // Handle pointer to floating-point conversion.
+        // This handles &this in primitive implement blocks where the alloca stores
+        // a pointer to the primitive value (double indirection: alloca ptr → ptr → f64).
+        if (current_type->isPointerTy() && target_type->isFloatingPointTy())
+        {
+            if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(value))
+            {
+                if (alloca_inst->getAllocatedType()->isPointerTy())
+                {
+                    // Double indirection: alloca stores ptr → load ptr, then load float
+                    llvm::Value *loaded_ptr = builder.CreateLoad(
+                        alloca_inst->getAllocatedType(), value, name + ".ptr.deref");
+                    return builder.CreateLoad(target_type, loaded_ptr, name + ".val");
+                }
+            }
+            // Single indirection: pointer directly to float value
+            return builder.CreateLoad(target_type, value, name + ".load");
         }
 
         // If we can't convert, return original value
