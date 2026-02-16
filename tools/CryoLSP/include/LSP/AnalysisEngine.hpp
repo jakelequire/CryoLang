@@ -70,6 +70,11 @@ namespace CryoLSP
         // Searches all loaded instances for one with a matching ModuleDeclarationNode
         Cryo::CompilerInstance *findModuleInstance(const std::string &module_name);
 
+        // Find a compiler instance by its namespace context (set from `namespace X;` declarations)
+        // Unlike findModuleInstance() which only matches ModuleDeclarationNode, this searches
+        // the stored namespace context on each CompilerInstance.
+        Cryo::CompilerInstance *findInstanceByNamespace(const std::string &namespace_name);
+
         // Find the file path for a module by namespace name
         // Same search as findModuleInstance but returns the file path string
         std::string findModuleFilePath(const std::string &module_name);

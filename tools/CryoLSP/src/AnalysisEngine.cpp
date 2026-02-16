@@ -202,6 +202,18 @@ namespace CryoLSP
         return nullptr;
     }
 
+    Cryo::CompilerInstance *AnalysisEngine::findInstanceByNamespace(const std::string &namespace_name)
+    {
+        for (auto &[path, instance] : _instances)
+        {
+            if (!instance)
+                continue;
+            if (instance->get_namespace_context() == namespace_name)
+                return instance.get();
+        }
+        return nullptr;
+    }
+
     std::string AnalysisEngine::findModuleFilePath(const std::string &module_name)
     {
         for (auto &[path, instance] : _instances)

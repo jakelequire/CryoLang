@@ -634,7 +634,7 @@ namespace CryoLSP
         return appendDocumentation(decl, result);
     }
 
-    std::string HoverProvider::formatEnumVariantHover(Cryo::EnumVariantNode *variant)
+    std::string HoverProvider::formatEnumVariantHover(Cryo::EnumVariantNode *variant, int variant_index)
     {
         std::string result = "```cryo\n" + variant->name();
 
@@ -653,6 +653,10 @@ namespace CryoLSP
         else if (variant->has_explicit_value())
         {
             result += " = " + std::to_string(variant->explicit_value());
+        }
+        else if (variant_index >= 0)
+        {
+            result += " = " + std::to_string(variant_index);
         }
 
         result += "\n```";
@@ -823,7 +827,8 @@ namespace CryoLSP
 
     std::string HoverProvider::formatNamespaceHover(const std::string &name, Cryo::ProgramNode *ast)
     {
-        std::string result = "```cryo\nnamespace " + name + "\n```\n\n---\n\n";
+        std::string sub_text = "Module with " + std::to_string(ast->statements().size()) + " top-level statements.\n";
+        std::string result = "```cryo\nnamespace " + name + "\n```\n\n --- \n\n" + sub_text + "```cryo\n";
 
         int count = 0;
         int max_items = 10;
@@ -841,43 +846,48 @@ namespace CryoLSP
 
             if (auto *func = dynamic_cast<Cryo::FunctionDeclarationNode *>(decl))
             {
-                result += "- `" + buildFunctionSignature(func) + "`\n";
+                result += buildFunctionSignature(func) + "\n";
                 ++count;
             }
             else if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(decl))
             {
-                result += "- `type struct " + strct->name();
+                result += "type struct " + strct->name();
                 result += formatGenericParams(strct->generic_parameters());
-                result += "`\n";
+                result += "\n";
                 ++count;
             }
             else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(decl))
             {
-                result += "- `type class " + cls->name();
+                result += "type class " + cls->name();
                 result += formatGenericParams(cls->generic_parameters());
-                result += "`\n";
+                result += "\n";
                 ++count;
             }
             else if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(decl))
             {
-                result += "- `enum " + enm->name();
+                result += "enum " + enm->name();
                 result += formatGenericParams(enm->generic_parameters());
-                result += "`\n";
+                result += "\n";
                 ++count;
             }
             else if (auto *trait = dynamic_cast<Cryo::TraitDeclarationNode *>(decl))
             {
-                result += "- `trait " + trait->name();
+                result += "trait " + trait->name();
                 result += formatGenericParams(trait->generic_parameters());
-                result += "`\n";
+                result += "\n";
                 ++count;
             }
         }
 
         if (count == 0)
-            result += "*No exported declarations found*\n";
-        else if (count >= max_items)
-            result += "\n*... and more*\n";
+        {
+            result += "// No exported declarations found\n";
+        }
+
+        result += "```";
+
+        if (count >= max_items)
+            result += "\n\n*... and more*\n";
 
         return result;
     }
@@ -1379,13 +1389,13 @@ namespace CryoLSP
 
         if (found.kind == FoundNode::Kind::Unknown)
         {
-            // PositionFinder didn't match any AST node — check if cursor is on a keyword
             auto content = _documents.getContent(uri);
             if (content.has_value())
             {
                 std::string word = extractWordAtPosition(content.value(), position.line, position.character);
                 if (!word.empty())
                 {
+                    // Check if cursor is on a keyword
                     std::string keyword_hover = getKeywordHover(word);
                     if (!keyword_hover.empty())
                     {
@@ -1400,6 +1410,58 @@ namespace CryoLSP
                         range.end.character = word_start + static_cast<int>(word.size());
                         hover.range = range;
                         return hover;
+                    }
+
+                    // Fallback: check if cursor is on a struct/class field declaration
+                    // (StructFieldNode locations may be (1,1) due to parser lexer interaction)
+                    if (instance->ast_root())
+                    {
+                        std::string field_hover;
+                        for (const auto &stmt : instance->ast_root()->statements())
+                        {
+                            if (!stmt)
+                                continue;
+                            Cryo::ASTNode *decl = stmt.get();
+                            if (auto *ds = dynamic_cast<Cryo::DeclarationStatementNode *>(decl))
+                                decl = ds->declaration();
+
+                            auto checkFields = [&](const std::vector<std::unique_ptr<Cryo::StructFieldNode>> &fields)
+                            {
+                                for (const auto &field : fields)
+                                {
+                                    if (field && field->name() == word)
+                                    {
+                                        std::string type_str = getFieldTypeStr(field.get());
+                                        field_hover = "```cryo\nproperty " + field->name() + ": " + type_str + "\n```";
+                                        field_hover = appendDocumentation(field.get(), field_hover);
+                                        return;
+                                    }
+                                }
+                            };
+
+                            if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(decl))
+                                checkFields(strct->fields());
+                            else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(decl))
+                                checkFields(cls->fields());
+
+                            if (!field_hover.empty())
+                                break;
+                        }
+
+                        if (!field_hover.empty())
+                        {
+                            Hover hover;
+                            hover.contents.kind = "markdown";
+                            hover.contents.value = field_hover;
+                            int word_start = findWordStartColumn(content.value(), position.line, position.character);
+                            Range range;
+                            range.start.line = position.line;
+                            range.start.character = word_start;
+                            range.end.line = position.line;
+                            range.end.character = word_start + static_cast<int>(word.size());
+                            hover.range = range;
+                            return hover;
+                        }
                     }
                 }
             }
@@ -1520,9 +1582,9 @@ namespace CryoLSP
                 }
 
                 if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(resolved_type_node))
-                    hover_text += "\n\n--- \n\n \n" + formatStructHover(strct);
+                    hover_text += "\n\n" + formatStructHover(strct);
                 else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(resolved_type_node))
-                    hover_text += "\n\n--- \n\n \n" + formatClassHover(cls);
+                    hover_text += "\n\n" + formatClassHover(cls);
 
                 Hover hover;
                 hover.contents.kind = "markdown";
@@ -1645,14 +1707,52 @@ namespace CryoLSP
             auto *decl = dynamic_cast<Cryo::VariableDeclarationNode *>(found.node);
             if (decl)
                 hover_text = formatVariableHover(decl);
+            else if (auto *field = dynamic_cast<Cryo::StructFieldNode *>(found.node))
+            {
+                std::string type_str = getFieldTypeStr(field);
+                hover_text = "```cryo\n(property) " + field->name() + ": " + type_str + "\n```";
+                hover_text = appendDocumentation(field, hover_text);
+            }
             break;
         }
         case FoundNode::Kind::EnumVariant:
         {
+            // Helper: find variant index within an enum declaration
+            auto findVariantIndex = [](Cryo::EnumDeclarationNode *enm, const std::string &name) -> int
+            {
+                int idx = 0;
+                for (const auto &v : enm->variants())
+                {
+                    if (v && v->name() == name)
+                        return idx;
+                    ++idx;
+                }
+                return -1;
+            };
+
             auto *variant = dynamic_cast<Cryo::EnumVariantNode *>(found.node);
             if (variant)
             {
-                hover_text = formatEnumVariantHover(variant);
+                // Find the parent enum to get the variant's index
+                int idx = -1;
+                if (instance->ast_root())
+                {
+                    for (const auto &stmt : instance->ast_root()->statements())
+                    {
+                        if (!stmt)
+                            continue;
+                        Cryo::ASTNode *check = stmt.get();
+                        if (auto *ds = dynamic_cast<Cryo::DeclarationStatementNode *>(check))
+                            check = ds->declaration();
+                        if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(check))
+                        {
+                            idx = findVariantIndex(enm, variant->name());
+                            if (idx >= 0)
+                                break;
+                        }
+                    }
+                }
+                hover_text = formatEnumVariantHover(variant, idx);
             }
             else if (auto *pattern = dynamic_cast<Cryo::EnumPatternNode *>(found.node))
             {
@@ -1669,13 +1769,15 @@ namespace CryoLSP
                 Cryo::ASTNode *typeNode = declFinder.find(instance->ast_root());
                 if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(typeNode))
                 {
+                    int idx = 0;
                     for (const auto &v : enm->variants())
                     {
                         if (v && v->name() == found.identifier_name)
                         {
-                            hover_text = formatEnumVariantHover(v.get());
+                            hover_text = formatEnumVariantHover(v.get(), idx);
                             break;
                         }
+                        ++idx;
                     }
                 }
 
@@ -1690,13 +1792,15 @@ namespace CryoLSP
                         Cryo::ASTNode *modTypeNode = modDeclFinder.find(moduleInstance->ast_root());
                         if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(modTypeNode))
                         {
+                            int idx = 0;
                             for (const auto &v : enm->variants())
                             {
                                 if (v && v->name() == found.identifier_name)
                                 {
-                                    hover_text = formatEnumVariantHover(v.get());
+                                    hover_text = formatEnumVariantHover(v.get(), idx);
                                     break;
                                 }
+                                ++idx;
                             }
                         }
                     }
@@ -2033,13 +2137,15 @@ namespace CryoLSP
                     }
                     else if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(typeNode))
                     {
+                        int idx = 0;
                         for (const auto &variant : enm->variants())
                         {
                             if (variant && variant->name() == member_name)
                             {
-                                hover_text = formatEnumVariantHover(variant.get());
+                                hover_text = formatEnumVariantHover(variant.get(), idx);
                                 break;
                             }
+                            ++idx;
                         }
                     }
                 }
@@ -2130,9 +2236,50 @@ namespace CryoLSP
             }
             break;
         }
+        case FoundNode::Kind::ImportDecl:
+        {
+            auto *import_node = dynamic_cast<Cryo::ImportDeclarationNode *>(found.node);
+            if (import_node)
+            {
+                std::string mod_path = import_node->module_path();
+                Transport::log("[Hover] Import declaration: " + mod_path);
+
+                Cryo::ProgramNode *mod_ast = nullptr;
+
+                // 1. Check imported ASTs from module loader
+                if (instance->module_loader())
+                {
+                    const auto &imported = instance->module_loader()->get_imported_asts();
+                    auto it = imported.find(mod_path);
+                    if (it != imported.end() && it->second)
+                        mod_ast = it->second.get();
+                }
+
+                // 2. Check open instances by namespace context
+                if (!mod_ast)
+                {
+                    auto *mod_instance = _engine.findInstanceByNamespace(mod_path);
+                    if (mod_instance && mod_instance->ast_root())
+                        mod_ast = mod_instance->ast_root();
+                }
+
+                // 3. Check open instances by module declaration
+                if (!mod_ast)
+                {
+                    auto *mod_instance = _engine.findModuleInstance(mod_path);
+                    if (mod_instance && mod_instance->ast_root())
+                        mod_ast = mod_instance->ast_root();
+                }
+
+                if (mod_ast)
+                    hover_text = formatNamespaceHover(mod_path, mod_ast);
+                else
+                    hover_text = "```cryo\nimport " + mod_path + "\n```";
+            }
+            break;
+        }
         case FoundNode::Kind::Identifier:
         case FoundNode::Kind::TypeReference:
-        case FoundNode::Kind::ImportDecl:
         default:
         {
             // For type references from annotations, try primitive docs first (already done above)
@@ -2281,10 +2428,32 @@ namespace CryoLSP
         Transport::log("[Hover] After switch, hover_text empty=" + std::string(hover_text.empty() ? "true" : "false"));
         if (hover_text.empty() && !found.identifier_name.empty())
         {
+            // Try ModuleDeclarationNode match first (for _module.cryo files)
             auto *moduleInstance = _engine.findModuleInstance(found.identifier_name);
             if (moduleInstance && moduleInstance->ast_root())
             {
                 hover_text = formatNamespaceHover(found.identifier_name, moduleInstance->ast_root());
+            }
+
+            // Also try namespace context match (for `namespace X;` declarations)
+            if (hover_text.empty())
+            {
+                moduleInstance = _engine.findInstanceByNamespace(found.identifier_name);
+                if (moduleInstance && moduleInstance->ast_root())
+                {
+                    hover_text = formatNamespaceHover(found.identifier_name, moduleInstance->ast_root());
+                }
+            }
+
+            // Also try imported ASTs from the current file's module loader
+            if (hover_text.empty() && instance && instance->module_loader())
+            {
+                const auto &imported = instance->module_loader()->get_imported_asts();
+                auto it = imported.find(found.identifier_name);
+                if (it != imported.end() && it->second)
+                {
+                    hover_text = formatNamespaceHover(found.identifier_name, it->second.get());
+                }
             }
         }
 
@@ -2410,9 +2579,9 @@ namespace CryoLSP
                 else
                     range.start.character = position.character;
             }
-            else if (found.kind == FoundNode::Kind::EnumVariant && !dynamic_cast<Cryo::EnumVariantNode *>(found.node))
+            else if (found.kind == FoundNode::Kind::EnumVariant)
             {
-                // Enum variant from a match pattern - find word start from document
+                // Enum variant (declaration or match pattern) - find word start from document
                 auto content = _documents.getContent(uri);
                 if (content.has_value())
                     range.start.character = findWordStartColumn(content.value(), position.line, position.character);

@@ -6314,8 +6314,6 @@ namespace Cryo
 
     std::unique_ptr<StructFieldNode> Parser::parse_struct_field(Visibility default_visibility)
     {
-        SourceLocation start_loc = _current_token.location();
-
         // Use the visibility passed from the calling context
         // Don't try to parse visibility again if it was already parsed in the outer scope
         // WORKAROUND: Force struct fields to always be public to avoid LLVM codegen crash
@@ -6324,6 +6322,7 @@ namespace Cryo
 
         Token field_token = consume(TokenKind::TK_IDENTIFIER, "Expected field name");
         std::string field_name = std::string(field_token.text());
+        SourceLocation field_loc = field_token.location();
 
         consume(TokenKind::TK_COLON, "Expected ':' after field name");
 
@@ -6342,13 +6341,13 @@ namespace Cryo
             LOG_DEBUG(LogComponent::PARSER, "Struct field '{}' type '{}' deferred to type resolution phase",
                       field_name, type_string);
             auto annotation = std::make_unique<TypeAnnotation>(TypeAnnotation::named(type_string, type_loc));
-            field = _builder.create_struct_field(start_loc, field_name, std::move(annotation), visibility);
+            field = _builder.create_struct_field(field_loc, field_name, std::move(annotation), visibility);
         }
         else
         {
             // Even with resolved type, store annotation for LSP hover on the type name
             auto annotation = std::make_unique<TypeAnnotation>(TypeAnnotation::named(type_string, type_loc));
-            field = _builder.create_struct_field(start_loc, field_name, std::move(annotation), visibility);
+            field = _builder.create_struct_field(field_loc, field_name, std::move(annotation), visibility);
             field->set_resolved_type(field_type);
         }
 
