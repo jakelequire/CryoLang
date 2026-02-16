@@ -949,11 +949,20 @@ namespace Cryo
                                 Symbol method_symbol(qualified_method_name, SymbolKind::Function, method_type, module_id, method->location());
                                 method_symbol.scope = module_name;
                                 std::string map_key = qualified_method_name;
-                                if (symbol_map.find(map_key) != symbol_map.end())
+                                auto existing_it = symbol_map.find(map_key);
+                                if (existing_it != symbol_map.end())
                                 {
-                                    // Overload: disambiguate with arity suffix
-                                    auto *func_t = static_cast<const FunctionType *>(method_type.get());
-                                    map_key += "#" + std::to_string(func_t->param_count());
+                                    // Only disambiguate if arities differ (genuine overload)
+                                    auto *new_func = static_cast<const FunctionType *>(method_type.get());
+                                    bool same_arity = false;
+                                    if (existing_it->second.type.is_valid() && existing_it->second.type->kind() == TypeKind::Function)
+                                    {
+                                        auto *old_func = static_cast<const FunctionType *>(existing_it->second.type.get());
+                                        same_arity = (old_func->param_count() == new_func->param_count());
+                                    }
+                                    if (!same_arity)
+                                        map_key += "#" + std::to_string(new_func->param_count());
+                                    // If same arity, overwrite (original behavior)
                                 }
                                 symbol_map[map_key] = method_symbol;
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added struct method '{}' to symbol map (key='{}')", qualified_method_name, map_key);
@@ -1137,10 +1146,18 @@ namespace Cryo
                                 Symbol method_symbol(qualified_method_name, SymbolKind::Function, method_type, module_id, method->location());
                                 method_symbol.scope = module_name;
                                 std::string map_key = qualified_method_name;
-                                if (symbol_map.find(map_key) != symbol_map.end())
+                                auto existing_it = symbol_map.find(map_key);
+                                if (existing_it != symbol_map.end())
                                 {
-                                    auto *func_t = static_cast<const FunctionType *>(method_type.get());
-                                    map_key += "#" + std::to_string(func_t->param_count());
+                                    auto *new_func = static_cast<const FunctionType *>(method_type.get());
+                                    bool same_arity = false;
+                                    if (existing_it->second.type.is_valid() && existing_it->second.type->kind() == TypeKind::Function)
+                                    {
+                                        auto *old_func = static_cast<const FunctionType *>(existing_it->second.type.get());
+                                        same_arity = (old_func->param_count() == new_func->param_count());
+                                    }
+                                    if (!same_arity)
+                                        map_key += "#" + std::to_string(new_func->param_count());
                                 }
                                 symbol_map[map_key] = method_symbol;
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added class method '{}' to symbol map (key='{}')", qualified_method_name, map_key);
@@ -1422,10 +1439,20 @@ namespace Cryo
                                 Symbol method_symbol(qualified_method_name, SymbolKind::Function, method_type, module_id, method->location());
                                 method_symbol.scope = module_name;
                                 std::string map_key = qualified_method_name;
-                                if (symbol_map.find(map_key) != symbol_map.end())
+                                auto existing_it = symbol_map.find(map_key);
+                                if (existing_it != symbol_map.end())
                                 {
-                                    auto *func_t = static_cast<const FunctionType *>(method_type.get());
-                                    map_key += "#" + std::to_string(func_t->param_count());
+                                    // Only disambiguate if arities differ (genuine overload)
+                                    auto *new_func = static_cast<const FunctionType *>(method_type.get());
+                                    bool same_arity = false;
+                                    if (existing_it->second.type.is_valid() && existing_it->second.type->kind() == TypeKind::Function)
+                                    {
+                                        auto *old_func = static_cast<const FunctionType *>(existing_it->second.type.get());
+                                        same_arity = (old_func->param_count() == new_func->param_count());
+                                    }
+                                    if (!same_arity)
+                                        map_key += "#" + std::to_string(new_func->param_count());
+                                    // If same arity, overwrite (original behavior)
                                 }
                                 symbol_map[map_key] = method_symbol;
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added impl method '{}' to symbol map (key='{}')", qualified_method_name, map_key);
@@ -1437,9 +1464,18 @@ namespace Cryo
                                 Symbol method_symbol(qualified_method_name, SymbolKind::Function, TypeRef{}, module_id, method->location());
                                 method_symbol.scope = module_name;
                                 std::string map_key = qualified_method_name;
-                                if (symbol_map.find(map_key) != symbol_map.end())
+                                auto existing_it = symbol_map.find(map_key);
+                                if (existing_it != symbol_map.end())
                                 {
-                                    map_key += "#" + std::to_string(method->parameters().size());
+                                    // For placeholder types, compare arity from AST parameter count
+                                    bool same_arity = false;
+                                    if (existing_it->second.type.is_valid() && existing_it->second.type->kind() == TypeKind::Function)
+                                    {
+                                        auto *old_func = static_cast<const FunctionType *>(existing_it->second.type.get());
+                                        same_arity = (old_func->param_count() == method->parameters().size());
+                                    }
+                                    if (!same_arity)
+                                        map_key += "#" + std::to_string(method->parameters().size());
                                 }
                                 symbol_map[map_key] = method_symbol;
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added impl method '{}' to symbol map (key='{}', with placeholder type)", qualified_method_name, map_key);

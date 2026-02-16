@@ -121,6 +121,7 @@ namespace Cryo::CLI
                              flag_name == "debug" || flag_name == "d" ||
                              flag_name == "verbose" ||
                              flag_name == "trace" ||
+                             flag_name == "no-color" ||
                              flag_name == "lsp")
                     {
                         args.set_flag(flag_name, true);
@@ -321,6 +322,7 @@ namespace Cryo::CLI
         std::cout << "  --debug, -d                Enable debug-level logging\n";
         std::cout << "  --verbose                  Enable info-level logging\n";
         std::cout << "  --trace                    Enable trace-level logging (most verbose)\n";
+        std::cout << "  --no-color                 Disable colored output in logs\n";
         std::cout << "  --log-file <file>          Write logs to specified file\n";
         std::cout << "  --log-component <comp>     Filter logs by component (e.g., AST, CODEGEN)\n";
         std::cout << "\nUse 'cryo help <command>' for more information about a specific command.\n";
@@ -427,7 +429,7 @@ namespace Cryo::CLI
             config.console_level = log_level;
             config.file_level = log_level;
             config.log_file_path = log_file; // Empty string = no file
-            config.enable_colors = true;
+            config.enable_colors = !args.get_flag("no-color");
             config.enable_timestamps = true;
             config.enable_component_tags = true;
 

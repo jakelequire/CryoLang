@@ -178,7 +178,7 @@ namespace Cryo::CLI::Commands
             config.console_level = log_level;
             config.file_level = log_level;
             config.log_file_path = log_file; // Empty string = no file
-            config.enable_colors = true;
+            config.enable_colors = !args.get_flag("no-color");
             config.enable_timestamps = true;
             config.enable_component_tags = true;
 
@@ -928,7 +928,7 @@ namespace Cryo::CLI::Commands
             logger_config.console_level = log_level;
             logger_config.file_level = log_level;
             logger_config.log_file_path = ""; // No file logging by default
-            logger_config.enable_colors = true;
+            logger_config.enable_colors = !args.get_flag("no-color");
             logger_config.enable_timestamps = true;
             logger_config.enable_component_tags = true;
 

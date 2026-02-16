@@ -5321,19 +5321,43 @@ namespace Cryo::Codegen
     {
         if (args.size() != 2)
         {
-            report_error("nanosleep requires exactly 2 arguments (req, rem)");
+            report_error("nanosleep requires exactly 2 arguments (seconds, nanoseconds)");
             return nullptr;
         }
 
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
+        // The C nanosleep() takes struct timespec* arguments:
+        //   struct timespec { time_t tv_sec; long tv_nsec; };
+        // We accept integer args (seconds, nanoseconds) and build the struct on the stack.
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
         llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType *nanosleep_type = llvm::FunctionType::get(int_type, {void_ptr_type, void_ptr_type}, false);
 
+        // Create the timespec struct type: { i64, i64 }
+        llvm::StructType *timespec_type = llvm::StructType::get(context, {i64_type, i64_type});
+
+        // Allocate timespec on the stack for the request
+        llvm::Value *req = builder.CreateAlloca(timespec_type, nullptr, "nanosleep.req");
+
+        // Store seconds and nanoseconds into the struct
+        llvm::Value *secs_val = ensure_type(args[0], i64_type, "nanosleep.secs");
+        llvm::Value *nsecs_val = ensure_type(args[1], i64_type, "nanosleep.nsecs");
+
+        llvm::Value *sec_ptr = builder.CreateStructGEP(timespec_type, req, 0, "nanosleep.req.sec");
+        builder.CreateStore(secs_val, sec_ptr);
+
+        llvm::Value *nsec_ptr = builder.CreateStructGEP(timespec_type, req, 1, "nanosleep.req.nsec");
+        builder.CreateStore(nsecs_val, nsec_ptr);
+
+        // Pass null for the remainder pointer (we don't need to know remaining time)
+        llvm::Value *rem_null = llvm::ConstantPointerNull::get(llvm::PointerType::get(context, 0));
+
+        // Call the real nanosleep(struct timespec*, struct timespec*)
+        llvm::FunctionType *nanosleep_type = llvm::FunctionType::get(int_type, {void_ptr_type, void_ptr_type}, false);
         llvm::Function *nanosleep_func = get_or_create_libc_function("nanosleep", nanosleep_type);
-        return builder.CreateCall(nanosleep_func, {args[0], args[1]}, "nanosleep.result");
+        return builder.CreateCall(nanosleep_func, {req, rem_null}, "nanosleep.result");
     }
 
     llvm::Value *Intrinsics::generate_sleep(const std::vector<llvm::Value *> &args)

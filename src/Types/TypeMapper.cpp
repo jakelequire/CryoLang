@@ -21,8 +21,8 @@ namespace Cryo
     // ========================================================================
 
     TypeMapper::TypeMapper(TypeArena &arena,
-                             llvm::LLVMContext &llvm_ctx,
-                             llvm::Module *module)
+                           llvm::LLVMContext &llvm_ctx,
+                           llvm::Module *module)
         : _arena(arena),
           _llvm_ctx(llvm_ctx),
           _module(module),
@@ -62,6 +62,11 @@ namespace Cryo
                       "TypeMapper::map: CACHE HIT for TypeID={}, LLVM type ID={}",
                       type.id().id, cached->getTypeID());
             return cached;
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
+                      "TypeMapper::map: CACHE MISS for TypeID={}", type.id().id);
         }
 
         llvm::Type *result = nullptr;
@@ -194,8 +199,8 @@ namespace Cryo
     }
 
     llvm::FunctionType *TypeMapper::map_function(TypeRef return_type,
-                                                   const std::vector<TypeRef> &param_types,
-                                                   bool is_variadic)
+                                                 const std::vector<TypeRef> &param_types,
+                                                 bool is_variadic)
     {
         llvm::Type *ret = return_type.is_valid() ? map(return_type) : void_type();
         if (!ret)
@@ -418,8 +423,8 @@ namespace Cryo
     }
 
     void TypeMapper::complete_struct(llvm::StructType *st,
-                                       const std::vector<llvm::Type *> &fields,
-                                       bool packed)
+                                     const std::vector<llvm::Type *> &fields,
+                                     bool packed)
     {
         if (st && st->isOpaque())
         {
@@ -596,9 +601,9 @@ namespace Cryo
         }
 
         std::vector<llvm::Type *> fields = {
-            ptr_type(),  // elements: T*
-            i64_type(),  // length: u64
-            i64_type()   // capacity: u64
+            ptr_type(), // elements: T*
+            i64_type(), // length: u64
+            i64_type()  // capacity: u64
         };
 
         llvm::StructType *array_struct = llvm::StructType::create(
@@ -1355,7 +1360,8 @@ namespace Cryo
                     substituted_name += "<";
                     for (size_t i = 0; i < args.size(); ++i)
                     {
-                        if (i > 0) substituted_name += ", ";
+                        if (i > 0)
+                            substituted_name += ", ";
                         substituted_name += args[i]->display_name();
                     }
                     substituted_name += ">";
@@ -1472,7 +1478,7 @@ namespace Cryo
             }
             else if (c == '*')
             {
-                current_arg += 'p';  // Pointer marker: void* -> voidp
+                current_arg += 'p'; // Pointer marker: void* -> voidp
             }
             else if (c != ' ' || depth > 0)
             {
@@ -1530,7 +1536,8 @@ namespace Cryo
 
         // Helper: get size from LLVM type, falling back to Cryo type system
         // when LLVM types are opaque (e.g., during Pass 6.2 before TypeLoweringPass)
-        auto get_size = [this](TypeRef cryo_type) -> size_t {
+        auto get_size = [this](TypeRef cryo_type) -> size_t
+        {
             llvm::Type *mapped = map(cryo_type);
             if (mapped && mapped->isSized())
             {
@@ -1668,7 +1675,7 @@ namespace Cryo
     }
 
     TypeRef TypeMapper::substitute_generic_param(TypeRef type,
-                                                    const std::vector<TypeRef> &type_args)
+                                                 const std::vector<TypeRef> &type_args)
     {
         if (!type.is_valid())
             return type;
@@ -1759,8 +1766,8 @@ namespace Cryo
     // ========================================================================
 
     llvm::StructType *TypeMapper::create_tagged_union(const std::string &name,
-                                                        size_t discriminant_size,
-                                                        size_t payload_size)
+                                                      size_t discriminant_size,
+                                                      size_t payload_size)
     {
         // Compute the mangled form of the name for GenericCodegen compatibility.
         // GenericCodegen creates opaque structs with mangled names (e.g., "Option_()"),
@@ -2127,7 +2134,8 @@ namespace Cryo
         }
 
         // Helper lambda to compute type size, falling back to Cryo type info for opaque LLVM types
-        auto compute_type_size = [this](const std::string &type_name) -> size_t {
+        auto compute_type_size = [this](const std::string &type_name) -> size_t
+        {
             llvm::Type *llvm_type = resolve_and_map(type_name);
             if (llvm_type && llvm_type->isSized())
             {
@@ -2306,26 +2314,46 @@ namespace Cryo
         return ss.str();
     }
 
-    std::string TypeIDToString(llvm::Type::TypeID id) {
-        switch (id) {
-            case llvm::Type::VoidTyID: return "VoidTyID";
-            case llvm::Type::HalfTyID: return "HalfTyID";
-            case llvm::Type::FloatTyID: return "FloatTyID";
-            case llvm::Type::DoubleTyID: return "DoubleTyID";
-            case llvm::Type::X86_FP80TyID: return "X86_FP80TyID";
-            case llvm::Type::FP128TyID: return "FP128TyID";
-            case llvm::Type::PPC_FP128TyID: return "PPC_FP128TyID";
-            case llvm::Type::LabelTyID: return "LabelTyID";
-            case llvm::Type::MetadataTyID: return "MetadataTyID";
-            case llvm::Type::X86_AMXTyID: return "X86_AMXTyID";
-            case llvm::Type::IntegerTyID: return "IntegerTyID";
-            case llvm::Type::FunctionTyID: return "FunctionTyID";
-            case llvm::Type::StructTyID: return "StructTyID";
-            case llvm::Type::ArrayTyID: return "ArrayTyID";
-            case llvm::Type::PointerTyID: return "PointerTyID";
-            case llvm::Type::FixedVectorTyID: return "FixedVectorTyID";
-            case llvm::Type::ScalableVectorTyID: return "ScalableVectorTyID";
-            default: return "UnknownTypeID";
+    std::string TypeIDToString(llvm::Type::TypeID id)
+    {
+        switch (id)
+        {
+        case llvm::Type::VoidTyID:
+            return "VoidTyID";
+        case llvm::Type::HalfTyID:
+            return "HalfTyID";
+        case llvm::Type::FloatTyID:
+            return "FloatTyID";
+        case llvm::Type::DoubleTyID:
+            return "DoubleTyID";
+        case llvm::Type::X86_FP80TyID:
+            return "X86_FP80TyID";
+        case llvm::Type::FP128TyID:
+            return "FP128TyID";
+        case llvm::Type::PPC_FP128TyID:
+            return "PPC_FP128TyID";
+        case llvm::Type::LabelTyID:
+            return "LabelTyID";
+        case llvm::Type::MetadataTyID:
+            return "MetadataTyID";
+        case llvm::Type::X86_AMXTyID:
+            return "X86_AMXTyID";
+        case llvm::Type::IntegerTyID:
+            return "IntegerTyID";
+        case llvm::Type::FunctionTyID:
+            return "FunctionTyID";
+        case llvm::Type::StructTyID:
+            return "StructTyID";
+        case llvm::Type::ArrayTyID:
+            return "ArrayTyID";
+        case llvm::Type::PointerTyID:
+            return "PointerTyID";
+        case llvm::Type::FixedVectorTyID:
+            return "FixedVectorTyID";
+        case llvm::Type::ScalableVectorTyID:
+            return "ScalableVectorTyID";
+        default:
+            return "UnknownTypeID";
         }
     }
 

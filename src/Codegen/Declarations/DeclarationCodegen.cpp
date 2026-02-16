@@ -383,6 +383,8 @@ namespace Cryo::Codegen
             // Clear the builder's insert point before erasing the function
             // to prevent dangling pointers to the deleted basic blocks
             builder().ClearInsertionPoint();
+            // Unregister from context BEFORE erasing to prevent dangling pointers
+            ctx().unregister_function(fn);
             fn->eraseFromParent();
             return nullptr;
         }
