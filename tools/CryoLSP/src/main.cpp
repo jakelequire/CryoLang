@@ -1,5 +1,6 @@
 #include "LSP/Server.hpp"
 #include "LSP/Transport.hpp"
+#include "Utils/OS.hpp"
 #include <iostream>
 #include <string>
 #include <filesystem>
@@ -62,6 +63,9 @@ int main(int argc, char *argv[])
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
+
+    // Initialize the OS utility singleton (needed by ModuleLoader for path operations)
+    Cryo::Utils::OS::initialize(argv[0]);
 
     // Install crash handlers for diagnostic logging
     std::signal(SIGSEGV, crash_handler);
