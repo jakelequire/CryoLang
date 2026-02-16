@@ -563,10 +563,10 @@ namespace CryoLSP
     {
         // Check field name
         const auto &loc = node.has_name_location() ? node.name_location() : node.location();
-        Transport::log("[PositionFinder] StructFieldNode '" + node.name() +
-                       "' loc=(" + std::to_string(loc.line()) + "," + std::to_string(loc.column()) +
-                       ") name_len=" + std::to_string(node.name().size()) +
-                       " target=(" + std::to_string(_target_line) + "," + std::to_string(_target_col) + ")");
+        // Transport::log("[PositionFinder] StructFieldNode '" + node.name() +
+        //                "' loc=(" + std::to_string(loc.line()) + "," + std::to_string(loc.column()) +
+        //                ") name_len=" + std::to_string(node.name().size()) +
+        //                " target=(" + std::to_string(_target_line) + "," + std::to_string(_target_col) + ")");
         if (matchesPosition(loc, node.name().size()))
         {
             _result.node = &node;
