@@ -47,21 +47,53 @@ namespace CryoLSP
                 Transport::log("[Project] Detected project '" + project.config.project_name +
                                "' at " + project.project_root + " for file " + file_path);
 
-                bool use_stdlib = !project.config.no_std;
+                bool is_stdlib_project = project.config.stdlib_mode ||
+                                        project.config.target_type == "stdlib";
+                bool use_stdlib = !project.config.no_std && !is_stdlib_project;
 
                 instance->set_raw_mode(false);
                 instance->set_auto_imports_enabled(use_stdlib); // Only auto-import prelude when stdlib is used
                 instance->set_stdlib_linking(false);             // No codegen/linking in LSP
 
-                configureModuleLoader(instance.get(), project, file_path);
+                if (is_stdlib_project)
+                {
+                    instance->set_stdlib_compilation_mode(true);
+                    Transport::log("[Project] Stdlib project detected — using project root as stdlib root");
+                }
+
+                configureModuleLoader(instance.get(), project, file_path, is_stdlib_project);
                 instance->compile_for_lsp_from_content(file_path, content);
 
                 // After parse, run auto-imports (if stdlib enabled) and process explicit imports
                 if (instance->ast_root())
                 {
-                    if (use_stdlib)
-                        instance->run_auto_import_phase();
-                    processImportDeclarations(instance.get(), file_path);
+                    // Always run auto-import phase — this injects parent module
+                    // imports for submodules even in stdlib projects. The prelude/core
+                    // auto-imports are already guarded internally.
+                    instance->run_auto_import_phase();
+                    processImportDeclarations(instance.get(), project, file_path);
+
+                    // Run semantic analysis for real diagnostics (type checking, symbol resolution).
+                    // This runs pipeline stages 3-5 (declaration collection, type resolution,
+                    // semantic analysis) which catch type mismatches, unknown types, etc.
+                    // Wrapped in try/catch because incomplete code can crash analysis passes.
+                    try
+                    {
+                        size_t errors_before = instance->diagnostics() ? instance->diagnostics()->error_count() : 0;
+                        instance->run_lsp_semantic_analysis();
+                        size_t errors_after = instance->diagnostics() ? instance->diagnostics()->error_count() : 0;
+                        Transport::log("[Project] Semantic analysis complete: " +
+                                       std::to_string(errors_after - errors_before) + " new errors (total: " +
+                                       std::to_string(errors_after) + ")");
+                    }
+                    catch (const std::exception &e)
+                    {
+                        Transport::log("[Project] Analysis exception (non-fatal): " + std::string(e.what()));
+                    }
+                    catch (...)
+                    {
+                        Transport::log("[Project] Analysis exception (non-fatal, unknown)");
+                    }
                 }
             }
             else
@@ -69,6 +101,16 @@ namespace CryoLSP
                 // Raw mode (standalone file, no project)
                 instance->set_raw_mode(true);
                 instance->compile_for_lsp_from_content(file_path, content);
+
+                // Even in raw mode, try to run analysis for basic type checking
+                try
+                {
+                    if (instance->ast_root())
+                        instance->run_lsp_semantic_analysis();
+                }
+                catch (...)
+                {
+                }
             }
 
             // Convert diagnostics
@@ -321,7 +363,8 @@ namespace CryoLSP
         return {};
     }
 
-    void AnalysisEngine::configureModuleLoader(Cryo::CompilerInstance *instance, const ProjectInfo &project, const std::string &file_path)
+    void AnalysisEngine::configureModuleLoader(Cryo::CompilerInstance *instance, const ProjectInfo &project,
+                                               const std::string &file_path, bool is_stdlib_project)
     {
         auto *loader = instance->module_loader();
         if (!loader)
@@ -330,12 +373,19 @@ namespace CryoLSP
         // Set the current file so relative imports resolve correctly
         loader->set_current_file(file_path);
 
-        // Always auto-detect stdlib root — the module loader needs a valid stdlib
-        // path to properly fall through to local resolution. The no_std flag only
-        // controls whether we auto-import the prelude, not whether stdlib is known.
-        if (!loader->auto_detect_stdlib_root())
+        if (is_stdlib_project)
         {
-            Transport::log("[Project] Warning: could not auto-detect stdlib root");
+            // The project root IS the stdlib — don't auto-detect from executable path
+            loader->set_stdlib_root(project.project_root);
+            Transport::log("[Project] Set stdlib root to project root: " + project.project_root);
+        }
+        else
+        {
+            // Normal project: auto-detect stdlib from the compiler executable path
+            if (!loader->auto_detect_stdlib_root())
+            {
+                Transport::log("[Project] Warning: could not auto-detect stdlib root");
+            }
         }
 
         // Add the project source directory as an include path
@@ -349,7 +399,9 @@ namespace CryoLSP
         instance->add_include_path(project.project_root);
     }
 
-    void AnalysisEngine::processImportDeclarations(Cryo::CompilerInstance *instance, const std::string &file_path)
+    void AnalysisEngine::processImportDeclarations(Cryo::CompilerInstance *instance,
+                                                   const ProjectInfo &project,
+                                                   const std::string &file_path)
     {
         if (!instance || !instance->ast_root() || !instance->module_loader())
             return;
@@ -359,6 +411,28 @@ namespace CryoLSP
             return;
 
         auto *loader = instance->module_loader();
+
+        // Defense-in-depth: resolve the current file's path and mark it as "loading"
+        // so that if any transitive import chain leads back here, it hits the circular
+        // dependency check instead of re-parsing from disk.
+        std::string current_resolved;
+        try
+        {
+            auto canonical = std::filesystem::canonical(file_path);
+            current_resolved = canonical.string();
+        }
+        catch (...)
+        {
+            current_resolved = file_path;
+        }
+
+        // Insert current file into loaded modules as a no-op entry so it won't be re-loaded
+        auto *loading_set = loader->loading_modules_set();
+        bool inserted_guard = false;
+        if (loading_set)
+        {
+            inserted_guard = loading_set->insert(current_resolved).second;
+        }
 
         for (const auto &stmt : instance->ast_root()->statements())
         {
@@ -376,36 +450,6 @@ namespace CryoLSP
 
             try
             {
-                // Match the exact pattern from CompilerInstance::analyze() (lines 1619-1624):
-                // auto_detect_stdlib_root + set_current_file right before load_import
-                if (!loader->auto_detect_stdlib_root())
-                {
-                    loader->set_stdlib_root("./stdlib");
-                }
-                loader->set_current_file(file_path);
-
-                // Debug: dump internal state of module loader
-                Transport::log("[DEBUG] stdlib_root='" + loader->stdlib_root() + "'");
-                Transport::log("[DEBUG] current_file_dir='" + loader->current_file_dir() + "'");
-                Transport::log("[DEBUG] import module_path='" + import_decl->module_path() + "'");
-
-                // Manually test what resolve_module_file_path would compute for local path
-                std::string manual_local = loader->current_file_dir() + "\\" + import_decl->module_path() + ".cryo";
-                Transport::log("[DEBUG] manual_local='" + manual_local + "' exists=" +
-                               (std::filesystem::exists(manual_local) ? "Y" : "N"));
-
-                // Also try lowercase
-                std::string lower_name = import_decl->module_path();
-                std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
-                std::string manual_local_lower = loader->current_file_dir() + "\\" + lower_name + ".cryo";
-                Transport::log("[DEBUG] manual_local_lower='" + manual_local_lower + "' exists=" +
-                               (std::filesystem::exists(manual_local_lower) ? "Y" : "N"));
-
-                // Now call resolve_import_path and see what it returns
-                std::string resolved = loader->resolve_import_path(import_decl->module_path());
-                Transport::log("[DEBUG] resolve_import_path result='" + resolved + "'");
-                Transport::log("[DEBUG] after resolve: current_file_dir='" + loader->current_file_dir() + "'");
-
                 auto result = loader->load_import(*import_decl);
                 if (!result.success)
                 {
@@ -456,6 +500,12 @@ namespace CryoLSP
                                import_decl->module_path() + "'");
             }
         }
+
+        // Remove the guard so we don't leak state into the persistent loader
+        if (inserted_guard && loading_set)
+        {
+            loading_set->erase(current_resolved);
+        }
     }
 
     std::vector<Diagnostic> AnalysisEngine::convertDiagnostics(Cryo::CompilerInstance *instance, const std::string &file_path)
@@ -466,6 +516,10 @@ namespace CryoLSP
             return result;
 
         auto lsp_diags = instance->diagnostics()->to_lsp();
+
+        Transport::log("[Diagnostics] Converting " + std::to_string(lsp_diags.size()) +
+                       " diagnostics for " + file_path +
+                       " (error_count=" + std::to_string(instance->diagnostics()->error_count()) + ")");
 
         for (const auto &ld : lsp_diags)
         {

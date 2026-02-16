@@ -295,6 +295,10 @@ namespace Cryo
         /// Generate LLVM IR
         bool run_ir_generation_phase();
 
+        /// Run semantic analysis passes for LSP (stages 3-5: declarations, type resolution, semantic analysis)
+        /// Assumes frontend parsing and import resolution are already done.
+        bool run_lsp_semantic_analysis();
+
     private:
         void initialize_components();
         void initialize_standard_library(); // Initialize built-in functions and types
@@ -310,6 +314,7 @@ namespace Cryo
         void process_struct_declarations_recursive(ASTNode *node);
         std::string build_function_signature(FunctionDeclarationNode *func_decl);
         void inject_auto_imports(SymbolTable *current_scope, const std::string &scope_name); // Auto-import core types
+        void inject_parent_module_import(); // Auto-import parent _module.cryo for submodule files
 
         // SRM helper methods
         std::string generate_method_name(const std::string &scope_name, const std::string &class_name, const std::string &method_name);

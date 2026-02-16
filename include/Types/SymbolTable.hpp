@@ -107,6 +107,7 @@ namespace Cryo
     {
     private:
         std::unordered_map<std::string, Symbol> _symbols;
+        std::unordered_map<std::string, std::vector<Symbol>> _function_overloads;
         Scope *_parent;
         std::string _name;
         ModuleID _module;
@@ -124,6 +125,13 @@ namespace Cryo
         Symbol *lookup_local(const std::string &name);
         const Symbol *lookup_local(const std::string &name) const;
 
+        // Overload support
+        std::vector<const Symbol *> lookup_overloads(const std::string &name) const;
+        const std::unordered_map<std::string, std::vector<Symbol>> &function_overloads() const
+        {
+            return _function_overloads;
+        }
+
         // Scope info
         bool has_symbol(const std::string &name) const;
         bool has_symbol_local(const std::string &name) const;
@@ -138,7 +146,8 @@ namespace Cryo
             return _symbols;
         }
 
-        size_t symbol_count() const { return _symbols.size(); }
+        size_t symbol_count() const;
+        size_t primary_symbol_count() const { return _symbols.size(); }
     };
 
     /**************************************************************************
