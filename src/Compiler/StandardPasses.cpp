@@ -2179,25 +2179,15 @@ namespace Cryo
                     }
 
                     // For built-in static methods like ::default() and ::new(),
-                    // resolve the scope name as a type so codegen has the TypeRef
-                    if (!resolved.is_valid())
+                    // resolve the scope name as a type so codegen has the TypeRef.
+                    // But skip this fallback if the scope has unresolved generic args (e.g., Node<T>::new)
+                    // — the call should remain unresolved until monomorphization.
+                    if (!resolved.is_valid() && !scope_res->has_generic_args())
                     {
                         std::string member_name = scope_res->member_name();
                         if (member_name == "default" || member_name == "new")
                         {
                             std::string scope_name = scope_res->scope_name();
-                            // Try module registry first (handles cross-module types)
-                            // auto &module_registry = _compiler.symbol_table()->modules();
-                            // auto type_opt = module_registry.resolve_with_imports(
-                            //     scope_name,
-                            //     ctx.current_module,
-                            //     module_registry.get_module_info(ctx.current_module)
-                            //         ? module_registry.get_module_info(ctx.current_module)->imports
-                            //         : std::vector<ImportDecl>{});
-                            // if (type_opt.has_value())
-                            // {
-                            //     resolved = type_opt.value();
-                            // }
                             // Fallback: try symbol table
                             if (!resolved.is_valid())
                             {

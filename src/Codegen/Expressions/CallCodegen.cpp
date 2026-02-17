@@ -3630,7 +3630,93 @@ namespace Cryo::Codegen
 
         if (!method)
         {
-            // Report error if method not found
+            // Before reporting an error, check if the member is a function-pointer field
+            // on the struct (e.g., this.write_fn(...) where write_fn is a field of type (void*, u8*, u64) -> int).
+            // If so, generate an indirect call through the loaded field value.
+            int field_idx = ctx().get_struct_field_index(type_name, method_name);
+            if (field_idx >= 0)
+            {
+                // Look up the Cryo TypeRef for this field to check if it's a FunctionType
+                TypeRef field_cryo_type;
+                if (auto *template_reg = ctx().template_registry())
+                {
+                    auto candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
+                    candidates.insert(candidates.begin(), type_name);
+                    for (const auto &candidate : candidates)
+                    {
+                        const TemplateRegistry::StructFieldInfo *field_info = template_reg->get_struct_field_types(candidate);
+                        if (field_info && static_cast<size_t>(field_idx) < field_info->field_types.size())
+                        {
+                            field_cryo_type = field_info->field_types[field_idx];
+                            break;
+                        }
+                    }
+                }
+
+                if (field_cryo_type.is_valid() && field_cryo_type->kind() == Cryo::TypeKind::Function)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_instance_method: '{}' is a function-pointer field on '{}', generating indirect call",
+                              method_name, type_name);
+
+                    auto *func_type = static_cast<const Cryo::FunctionType *>(field_cryo_type.get());
+
+                    // Build the LLVM function type from the Cryo FunctionType
+                    llvm::Type *ret_llvm_type = llvm::Type::getVoidTy(llvm_ctx());
+                    TypeRef ret_type_ref = func_type->return_type();
+                    if (ret_type_ref.is_valid())
+                    {
+                        llvm::Type *mapped = types().map(ret_type_ref);
+                        if (mapped)
+                            ret_llvm_type = mapped;
+                    }
+
+                    std::vector<llvm::Type *> param_llvm_types;
+                    for (const auto &param : func_type->param_types())
+                    {
+                        llvm::Type *mapped = param.is_valid() ? types().map(param) : llvm::PointerType::get(llvm_ctx(), 0);
+                        param_llvm_types.push_back(mapped ? mapped : llvm::PointerType::get(llvm_ctx(), 0));
+                    }
+
+                    llvm::FunctionType *fn_type = llvm::FunctionType::get(ret_llvm_type, param_llvm_types, false);
+
+                    // GEP to the field and load the function pointer
+                    llvm::StructType *struct_type = nullptr;
+                    if (llvm::Type *t = ctx().get_type(type_name))
+                        struct_type = llvm::dyn_cast<llvm::StructType>(t);
+                    if (!struct_type && receiver->getType()->isPointerTy())
+                    {
+                        // Try looking up via LLVM module types
+                        struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+                    }
+
+                    if (struct_type)
+                    {
+                        llvm::Value *field_ptr = builder().CreateStructGEP(struct_type, receiver, field_idx, method_name + ".ptr");
+                        llvm::Value *fn_ptr = builder().CreateLoad(llvm::PointerType::get(llvm_ctx(), 0), field_ptr, method_name + ".load");
+
+                        // Build arguments (no 'this' prepended - these are direct args to the function pointer)
+                        std::vector<llvm::Value *> call_args;
+                        for (size_t i = 0; i < args.size(); ++i)
+                        {
+                            llvm::Value *arg = args[i];
+                            if (i < param_llvm_types.size() && arg->getType() != param_llvm_types[i])
+                            {
+                                if (arg->getType()->isPointerTy() && param_llvm_types[i]->isPointerTy())
+                                    ; // ptr-to-ptr is fine
+                                else if (arg->getType()->isIntegerTy() && param_llvm_types[i]->isIntegerTy())
+                                    arg = builder().CreateIntCast(arg, param_llvm_types[i], true, "arg.cast");
+                            }
+                            call_args.push_back(arg);
+                        }
+
+                        return builder().CreateCall(fn_type, fn_ptr, call_args,
+                                                    ret_llvm_type->isVoidTy() ? "" : method_name + ".result");
+                    }
+                }
+            }
+
+            // Report error if method not found and not a function-pointer field
             report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Instance method not found: " + method_name);
             return nullptr;

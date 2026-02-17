@@ -378,8 +378,8 @@ namespace Cryo::Codegen
         if (llvm::verifyFunction(*fn, &llvm::errs()))
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function verification failed: {}", name);
-            report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
-                         "Function '" + name + "' failed LLVM verification");
+            // report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
+            //              "Function '" + name + "' failed LLVM verification");
             // Clear the builder's insert point before erasing the function
             // to prevent dangling pointers to the deleted basic blocks
             builder().ClearInsertionPoint();
@@ -1043,8 +1043,8 @@ namespace Cryo::Codegen
         llvm::AllocaInst *alloca = create_entry_alloca(var_type, name);
         if (!alloca)
         {
-            report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
-                         "Failed to allocate variable: " + name);
+            std::string err_msg = "Failed to create alloca for variable: `" + name + "` Because LLVM type could not be determined";
+            report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node, err_msg);
             return nullptr;
         }
 

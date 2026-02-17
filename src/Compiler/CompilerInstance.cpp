@@ -2839,6 +2839,27 @@ namespace Cryo
             // Visit the struct declaration to register it with TypeMapper
             struct_decl->accept(*_codegen->get_visitor());
         }
+        // If this is a type alias declaration, register its target with TypeMapper
+        // so that map_struct() can redirect placeholder StructTypes to the real type.
+        // DeclarationCollection creates placeholder StructTypes for unresolved aliases
+        // (e.g., "AllocResult" as an empty struct). Without this registration,
+        // map_struct("AllocResult") creates an opaque LLVM struct instead of
+        // redirecting to the concrete Result<void*, AllocError> type.
+        else if (auto alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(node))
+        {
+            if (alias_decl->has_resolved_target_type() && !alias_decl->is_generic())
+            {
+                TypeRef resolved_target = alias_decl->get_resolved_target_type();
+                TypeMapper *type_mapper = _codegen->get_visitor()->get_type_mapper();
+                if (type_mapper)
+                {
+                    type_mapper->register_type_alias_target(alias_decl->alias_name(), resolved_target);
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                              "Pre-processing type alias: '{}' -> '{}'",
+                              alias_decl->alias_name(), resolved_target->display_name());
+                }
+            }
+        }
         // If this is a program node, process all its statements
         else if (auto program = dynamic_cast<ProgramNode *>(node))
         {
