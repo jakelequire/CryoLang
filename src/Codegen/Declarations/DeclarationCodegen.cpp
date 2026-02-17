@@ -1407,6 +1407,24 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Registered global variable: {}", name);
 
+        // Register constant in TemplateRegistry for cross-module generic method access
+        // This allows constants like BUCKET_EMPTY to be forwarded when generic structs
+        // reference them in methods that get instantiated in other modules
+        if (is_constant && !ns_context.empty() && initializer)
+        {
+            if (auto *template_reg = ctx().template_registry())
+            {
+                if (auto *const_int = llvm::dyn_cast<llvm::ConstantInt>(initializer))
+                {
+                    std::string type_ann;
+                    if (node->type_annotation())
+                        type_ann = node->type_annotation()->to_string();
+                    template_reg->register_module_constant(
+                        ns_context, name, type_ann, const_int->getZExtValue());
+                }
+            }
+        }
+
         // Register the variable type in variable_types_map for Array<T> detection
         if (cryo_type)
         {

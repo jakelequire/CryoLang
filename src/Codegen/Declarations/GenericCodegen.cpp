@@ -71,8 +71,7 @@ namespace Cryo::Codegen
         // Check if methods have already been generated for this instantiation
         // We track this separately from type caching because the LLVM type may exist
         // (created by Monomorphizer) but methods may not be generated yet
-        static std::unordered_set<std::string> generated_struct_methods;
-        if (generated_struct_methods.count(mangled))
+        if (_generated_struct_methods.count(mangled))
         {
             // Type and methods already generated, return cached type
             if (has_type_instantiation(mangled))
@@ -98,8 +97,7 @@ namespace Cryo::Codegen
         // If we're already in the middle of instantiating this struct (detected via recursion
         // through create_substituted_fields -> ensure_dependent_types_instantiated), we should
         // return the existing (possibly opaque) struct without trying to generate methods.
-        static std::unordered_set<std::string> structs_being_instantiated;
-        bool is_nested_instantiation = structs_being_instantiated.count(mangled) > 0;
+        bool is_nested_instantiation = _structs_being_instantiated.count(mangled) > 0;
         if (is_nested_instantiation)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -115,7 +113,7 @@ namespace Cryo::Codegen
         }
 
         // Add to tracking set - will be removed when we exit this function
-        structs_being_instantiated.insert(mangled);
+        _structs_being_instantiated.insert(mangled);
 
         // RAII guard to ensure we remove from tracking set even on early returns
         struct InstantiationGuard
@@ -124,7 +122,7 @@ namespace Cryo::Codegen
             std::unordered_set<std::string> &set;
             InstantiationGuard(const std::string &n, std::unordered_set<std::string> &s) : name(n), set(s) {}
             ~InstantiationGuard() { set.erase(name); }
-        } guard(mangled, structs_being_instantiated);
+        } guard(mangled, _structs_being_instantiated);
 
         // Check if LLVM type already exists (created by Monomorphizer)
         // If so, we still need to generate methods, but can reuse the type
@@ -386,123 +384,188 @@ namespace Cryo::Codegen
             auto saved_fn_ctx = ctx().release_current_function();
             llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
             std::string saved_type_name = ctx().current_type_name();
+            std::string saved_namespace = ctx().namespace_context();
 
+            // Set namespace context to the template's defining namespace
+            // This ensures SRM generates correct lookup candidates for module-level identifiers
+            if (!base_namespace.empty())
+            {
+                ctx().set_namespace_context(base_namespace);
+            }
+
+            // Ensure module-level constants from the defining namespace are available
+            // in the consumer module (e.g., BUCKET_EMPTY for hashmap generic methods)
+            if (!base_namespace.empty() && base_namespace != saved_namespace)
+            {
+                auto *template_reg = ctx().template_registry();
+                if (template_reg)
+                {
+                    const auto *constants = template_reg->get_module_constants(base_namespace);
+                    if (constants)
+                    {
+                        for (const auto &c : *constants)
+                        {
+                            if (!module()->getGlobalVariable(c.name))
+                            {
+                                // Map type annotation to LLVM type
+                                llvm::Type *const_type = nullptr;
+                                if (c.type_annotation == "u8" || c.type_annotation == "i8")
+                                    const_type = llvm::Type::getInt8Ty(llvm_ctx());
+                                else if (c.type_annotation == "u16" || c.type_annotation == "i16")
+                                    const_type = llvm::Type::getInt16Ty(llvm_ctx());
+                                else if (c.type_annotation == "u32" || c.type_annotation == "i32")
+                                    const_type = llvm::Type::getInt32Ty(llvm_ctx());
+                                else if (c.type_annotation == "u64" || c.type_annotation == "i64")
+                                    const_type = llvm::Type::getInt64Ty(llvm_ctx());
+                                else if (c.type_annotation == "bool")
+                                    const_type = llvm::Type::getInt1Ty(llvm_ctx());
+                                else
+                                    const_type = llvm::Type::getInt64Ty(llvm_ctx()); // default
+
+                                auto *gv = new llvm::GlobalVariable(
+                                    *module(), const_type, true,
+                                    llvm::GlobalValue::PrivateLinkage,
+                                    llvm::ConstantInt::get(const_type, c.int_value),
+                                    c.name);
+                                values().set_global_value(c.name, gv);
+                                // Also register with qualified name for SRM lookups
+                                std::string qualified = base_namespace + "::" + c.name;
+                                values().set_global_value(qualified, gv);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "GenericCodegen: Forwarded constant '{}' (={}) from namespace '{}' for struct '{}'",
+                                          c.name, c.int_value, base_namespace, mangled);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Two-pass method generation: declare all methods first so they can
+            // reference each other regardless of source order, then generate bodies.
+
+            // Pass 1: Generate all method declarations
+            std::vector<std::pair<Cryo::FunctionDeclarationNode*, llvm::Function*>> method_decls;
             for (const auto &method : struct_decl->methods())
             {
                 if (!method)
                     continue;
 
-                // Generate method with the mangled struct name as parent type
                 llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
                 if (fn && method->body() && fn->empty())
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "GenericCodegen: Generating method body: {}::{}",
-                              mangled, method->name());
-
-                    // Create entry block
-                    llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
-                    builder().SetInsertPoint(entry);
-
-                    // Set up function context
-                    auto fn_ctx = std::make_unique<FunctionContext>(fn, method.get());
-                    fn_ctx->entry_block = entry;
-                    ctx().set_current_function(std::move(fn_ctx));
-
-                    // Set current type name for this.field resolution
-                    ctx().set_current_type_name(mangled);
-
-                    // Enter function scope
-                    values().enter_scope(fn->getName().str());
-
-                    // Allocate parameters and register their types
-                    const auto &ast_params = method->parameters();
-                    unsigned param_idx = 0;
-                    for (auto &arg : fn->args())
-                    {
-                        std::string param_name = arg.getName().str();
-                        llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
-                        create_store(&arg, alloca);
-                        values().set_value(param_name, nullptr, alloca);
-
-                        // Register parameter type in variable_types_map for method resolution
-                        // Skip 'this' parameter (first param for instance methods)
-                        if (param_name == "this")
-                        {
-                            // 'this' is a pointer to the current type
-                            TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
-                            if (this_type.is_valid())
-                            {
-                                TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
-                                ctx().variable_types_map()[param_name] = this_ptr;
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "GenericCodegen: Registered 'this' type: {}",
-                                          this_ptr->display_name());
-                            }
-                        }
-                        else if (param_idx < ast_params.size() + 1)
-                        {
-                            // Get AST parameter - check if AST has explicit 'this' parameter
-                            // If AST includes 'this' explicitly, use param_idx directly
-                            // Otherwise, subtract 1 to account for implicit 'this' added by codegen
-                            bool ast_has_explicit_this = !ast_params.empty() &&
-                                ast_params[0]->name() == "this";
-                            size_t ast_idx = ast_has_explicit_this ? param_idx :
-                                (param_idx > 0 ? param_idx - 1 : param_idx);
-                            if (ast_idx < ast_params.size())
-                            {
-                                TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
-                                // Apply type substitution (T -> string, etc.)
-                                TypeRef substituted = substitute_type_params(param_type);
-                                if (substituted.is_valid())
-                                {
-                                    // Ensure dependent types are instantiated (e.g., &HashSet<string> needs HashSet<string>)
-                                    ensure_dependent_types_instantiated(substituted);
-                                    ctx().variable_types_map()[param_name] = substituted;
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                              "GenericCodegen: Registered param '{}' type: {} -> {}",
-                                              param_name,
-                                              param_type.is_valid() ? param_type->display_name() : "null",
-                                              substituted->display_name());
-                                }
-                            }
-                        }
-                        param_idx++;
-                    }
-
-                    // Generate method body - type params are still active so T->int works
-                    CodegenVisitor *visitor = ctx().visitor();
-                    if (visitor && method->body())
-                    {
-                        method->body()->accept(*visitor);
-                    }
-
-                    // Add implicit return if needed
-                    llvm::BasicBlock *current_block = builder().GetInsertBlock();
-                    if (current_block && !current_block->getTerminator())
-                    {
-                        if (fn->getReturnType()->isVoidTy())
-                        {
-                            builder().CreateRetVoid();
-                        }
-                        else
-                        {
-                            builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
-                        }
-                    }
-
-                    // Verify function - don't erase on failure as other methods may reference it
-                    if (llvm::verifyFunction(*fn, &llvm::errs()))
-                    {
-                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                                  "Generic struct method verification failed: {}::{}",
-                                  mangled, method->name());
-                    }
-
-                    // Clean up method scope
-                    values().exit_scope();
-                    ctx().set_result(nullptr);
+                    method_decls.push_back({method.get(), fn});
                 }
+            }
+
+            // Pass 2: Generate all method bodies (all declarations now exist)
+            for (auto &[method, fn] : method_decls)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Generating method body: {}::{}",
+                          mangled, method->name());
+
+                // Create entry block
+                llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+                builder().SetInsertPoint(entry);
+
+                // Set up function context
+                auto fn_ctx = std::make_unique<FunctionContext>(fn, method);
+                fn_ctx->entry_block = entry;
+                ctx().set_current_function(std::move(fn_ctx));
+
+                // Set current type name for this.field resolution
+                ctx().set_current_type_name(mangled);
+
+                // Enter function scope
+                values().enter_scope(fn->getName().str());
+
+                // Allocate parameters and register their types
+                const auto &ast_params = method->parameters();
+                unsigned param_idx = 0;
+                for (auto &arg : fn->args())
+                {
+                    std::string param_name = arg.getName().str();
+                    llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
+                    create_store(&arg, alloca);
+                    values().set_value(param_name, nullptr, alloca);
+
+                    // Register parameter type in variable_types_map for method resolution
+                    // Skip 'this' parameter (first param for instance methods)
+                    if (param_name == "this")
+                    {
+                        // 'this' is a pointer to the current type
+                        TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
+                        if (this_type.is_valid())
+                        {
+                            TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
+                            ctx().variable_types_map()[param_name] = this_ptr;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "GenericCodegen: Registered 'this' type: {}",
+                                      this_ptr->display_name());
+                        }
+                    }
+                    else if (param_idx < ast_params.size() + 1)
+                    {
+                        // Get AST parameter - check if AST has explicit 'this' parameter
+                        // If AST includes 'this' explicitly, use param_idx directly
+                        // Otherwise, subtract 1 to account for implicit 'this' added by codegen
+                        bool ast_has_explicit_this = !ast_params.empty() &&
+                            ast_params[0]->name() == "this";
+                        size_t ast_idx = ast_has_explicit_this ? param_idx :
+                            (param_idx > 0 ? param_idx - 1 : param_idx);
+                        if (ast_idx < ast_params.size())
+                        {
+                            TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
+                            // Apply type substitution (T -> string, etc.)
+                            TypeRef substituted = substitute_type_params(param_type);
+                            if (substituted.is_valid())
+                            {
+                                // Ensure dependent types are instantiated (e.g., &HashSet<string> needs HashSet<string>)
+                                ensure_dependent_types_instantiated(substituted);
+                                ctx().variable_types_map()[param_name] = substituted;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "GenericCodegen: Registered param '{}' type: {} -> {}",
+                                          param_name,
+                                          param_type.is_valid() ? param_type->display_name() : "null",
+                                          substituted->display_name());
+                            }
+                        }
+                    }
+                    param_idx++;
+                }
+
+                // Generate method body - type params are still active so T->int works
+                CodegenVisitor *visitor = ctx().visitor();
+                if (visitor && method->body())
+                {
+                    method->body()->accept(*visitor);
+                }
+
+                // Add implicit return if needed
+                llvm::BasicBlock *current_block = builder().GetInsertBlock();
+                if (current_block && !current_block->getTerminator())
+                {
+                    if (fn->getReturnType()->isVoidTy())
+                    {
+                        builder().CreateRetVoid();
+                    }
+                    else
+                    {
+                        builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+                    }
+                }
+
+                // Verify function - don't erase on failure as other methods may reference it
+                if (llvm::verifyFunction(*fn, &llvm::errs()))
+                {
+                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                              "Generic struct method verification failed: {}::{}",
+                              mangled, method->name());
+                }
+
+                // Clean up method scope
+                values().exit_scope();
+                ctx().set_result(nullptr);
             }
 
             // Restore parent context after generating all methods
@@ -515,6 +578,7 @@ namespace Cryo::Codegen
                 builder().SetInsertPoint(saved_insert_block);
             }
             ctx().set_current_type_name(saved_type_name);
+            ctx().set_namespace_context(saved_namespace);
         }
 
         // End type parameter scope AFTER methods are generated
@@ -618,7 +682,7 @@ namespace Cryo::Codegen
                   mangled, instantiated_name, field_names.size());
 
         // Mark methods as generated to prevent duplicate generation on next call
-        generated_struct_methods.insert(mangled);
+        _generated_struct_methods.insert(mangled);
 
         return struct_type;
     }
@@ -695,9 +759,7 @@ namespace Cryo::Codegen
         }
 
         // Track classes that are currently being instantiated to detect nested instantiation.
-        // Uses the same tracking set as structs since classes are represented as structs in LLVM.
-        static std::unordered_set<std::string> classes_being_instantiated;
-        bool is_nested_instantiation = classes_being_instantiated.count(mangled) > 0;
+        bool is_nested_instantiation = _classes_being_instantiated.count(mangled) > 0;
         if (is_nested_instantiation)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -711,7 +773,7 @@ namespace Cryo::Codegen
         }
 
         // Add to tracking set
-        classes_being_instantiated.insert(mangled);
+        _classes_being_instantiated.insert(mangled);
 
         // RAII guard to ensure we remove from tracking set even on early returns
         struct ClassInstantiationGuard
@@ -720,7 +782,7 @@ namespace Cryo::Codegen
             std::unordered_set<std::string> &set;
             ClassInstantiationGuard(const std::string &n, std::unordered_set<std::string> &s) : name(n), set(s) {}
             ~ClassInstantiationGuard() { set.erase(name); }
-        } class_guard(mangled, classes_being_instantiated);
+        } class_guard(mangled, _classes_being_instantiated);
 
         // Get generic definition - first check local registry, then TemplateRegistry
         Cryo::ASTNode *generic_def = get_generic_type_def(generic_name);
@@ -884,6 +946,58 @@ namespace Cryo::Codegen
             auto saved_fn_ctx = ctx().release_current_function();
             llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
             std::string saved_type_name = ctx().current_type_name();
+            std::string saved_namespace = ctx().namespace_context();
+
+            // Set namespace context to the template's defining namespace
+            // This ensures SRM generates correct lookup candidates for module-level identifiers
+            if (!base_namespace.empty())
+            {
+                ctx().set_namespace_context(base_namespace);
+            }
+
+            // Ensure module-level constants from the defining namespace are available
+            if (!base_namespace.empty() && base_namespace != saved_namespace)
+            {
+                auto *template_reg = ctx().template_registry();
+                if (template_reg)
+                {
+                    const auto *constants = template_reg->get_module_constants(base_namespace);
+                    if (constants)
+                    {
+                        for (const auto &c : *constants)
+                        {
+                            if (!module()->getGlobalVariable(c.name))
+                            {
+                                llvm::Type *const_type = nullptr;
+                                if (c.type_annotation == "u8" || c.type_annotation == "i8")
+                                    const_type = llvm::Type::getInt8Ty(llvm_ctx());
+                                else if (c.type_annotation == "u16" || c.type_annotation == "i16")
+                                    const_type = llvm::Type::getInt16Ty(llvm_ctx());
+                                else if (c.type_annotation == "u32" || c.type_annotation == "i32")
+                                    const_type = llvm::Type::getInt32Ty(llvm_ctx());
+                                else if (c.type_annotation == "u64" || c.type_annotation == "i64")
+                                    const_type = llvm::Type::getInt64Ty(llvm_ctx());
+                                else if (c.type_annotation == "bool")
+                                    const_type = llvm::Type::getInt1Ty(llvm_ctx());
+                                else
+                                    const_type = llvm::Type::getInt64Ty(llvm_ctx());
+
+                                auto *gv = new llvm::GlobalVariable(
+                                    *module(), const_type, true,
+                                    llvm::GlobalValue::PrivateLinkage,
+                                    llvm::ConstantInt::get(const_type, c.int_value),
+                                    c.name);
+                                values().set_global_value(c.name, gv);
+                                std::string qualified = base_namespace + "::" + c.name;
+                                values().set_global_value(qualified, gv);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "GenericCodegen: Forwarded constant '{}' (={}) from namespace '{}' for class '{}'",
+                                          c.name, c.int_value, base_namespace, mangled);
+                            }
+                        }
+                    }
+                }
+            }
 
             for (const auto &method : class_decl->methods())
             {
@@ -1000,6 +1114,7 @@ namespace Cryo::Codegen
                 builder().SetInsertPoint(saved_insert_block);
             }
             ctx().set_current_type_name(saved_type_name);
+            ctx().set_namespace_context(saved_namespace);
         }
 
         // End substitution scope AFTER methods are generated
@@ -1070,8 +1185,7 @@ namespace Cryo::Codegen
         // Check if methods have already been generated for this instantiation
         // We track this separately from type caching because the LLVM type may exist
         // (created by TypeMapper::map_enum) but methods may not be generated yet
-        static std::unordered_set<std::string> generated_enum_methods;
-        if (generated_enum_methods.count(mangled))
+        if (_generated_enum_methods.count(mangled))
         {
             // Type and methods already generated, return cached type
             if (has_type_instantiation(mangled))
@@ -1480,6 +1594,11 @@ namespace Cryo::Codegen
                     ctx().set_namespace_context(base_namespace);
                 }
 
+                // Two-pass method generation: declare all methods first so they can
+                // reference each other regardless of source order, then generate bodies.
+
+                // Pass 1: Generate all method declarations (with constrained-this filtering)
+                std::vector<std::pair<Cryo::FunctionDeclarationNode*, llvm::Function*>> enum_method_decls;
                 for (const auto &method : impl_block->method_implementations())
                 {
                     if (!method)
@@ -1609,125 +1728,131 @@ namespace Cryo::Codegen
                         }
                     }
 
-                    // Generate method with the mangled enum name as parent type
+                    // Generate method declaration with the mangled enum name as parent type
                     llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
                     if (fn && method->body() && fn->empty())
                     {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "GenericCodegen: Generating enum method body: {}::{}",
-                                  mangled, method->name());
-
-                        // Create entry block
-                        llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
-                        builder().SetInsertPoint(entry);
-
-                        // Set up function context
-                        auto fn_ctx = std::make_unique<FunctionContext>(fn, method.get());
-                        fn_ctx->entry_block = entry;
-                        ctx().set_current_function(std::move(fn_ctx));
-
-                        // Set current type name for this.field resolution
-                        ctx().set_current_type_name(mangled);
-
-                        // Enter function scope
-                        values().enter_scope(fn->getName().str());
-
-                        // Allocate parameters and register their types
-                        const auto &ast_params = method->parameters();
-                        unsigned param_idx = 0;
-                        for (auto &arg : fn->args())
-                        {
-                            std::string param_name = arg.getName().str();
-
-                            // Debug: Log LLVM argument type
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "GenericCodegen: Enum method arg '{}' LLVM type ID={}, isStruct={}, isInt={}",
-                                      param_name,
-                                      arg.getType()->getTypeID(),
-                                      arg.getType()->isStructTy(),
-                                      arg.getType()->isIntegerTy());
-
-                            llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
-                            create_store(&arg, alloca);
-                            values().set_value(param_name, nullptr, alloca);
-
-                            // Register parameter type in variable_types_map for method resolution
-                            // Skip 'this' parameter (first param for instance methods)
-                            if (param_name == "this")
-                            {
-                                // 'this' is a pointer to the current type
-                                TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
-                                if (this_type.is_valid())
-                                {
-                                    TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
-                                    ctx().variable_types_map()[param_name] = this_ptr;
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                              "GenericCodegen: Registered enum 'this' type: {}",
-                                              this_ptr->display_name());
-                                }
-                            }
-                            else if (param_idx < ast_params.size() + 1)
-                            {
-                                // Get AST parameter - check if AST has explicit 'this' parameter
-                                // If AST includes 'this' explicitly, use param_idx directly
-                                // Otherwise, subtract 1 to account for implicit 'this' added by codegen
-                                bool ast_has_explicit_this = !ast_params.empty() &&
-                                    ast_params[0]->name() == "this";
-                                size_t ast_idx = ast_has_explicit_this ? param_idx :
-                                    (param_idx > 0 ? param_idx - 1 : param_idx);
-                                if (ast_idx < ast_params.size())
-                                {
-                                    TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
-                                    // Apply type substitution (T -> i64, etc.)
-                                    TypeRef substituted = substitute_type_params(param_type);
-                                    if (substituted.is_valid())
-                                    {
-                                        ensure_dependent_types_instantiated(substituted);
-                                        ctx().variable_types_map()[param_name] = substituted;
-                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                  "GenericCodegen: Registered enum param '{}' type: {} -> {}",
-                                                  param_name,
-                                                  param_type.is_valid() ? param_type->display_name() : "null",
-                                                  substituted->display_name());
-                                    }
-                                }
-                            }
-                            param_idx++;
-                        }
-
-                        // Generate method body - type params are still active so T->i64 works
-                        CodegenVisitor *visitor = ctx().visitor();
-                        if (visitor && method->body())
-                        {
-                            method->body()->accept(*visitor);
-                        }
-
-                        // Add implicit return if needed
-                        llvm::BasicBlock *current_block = builder().GetInsertBlock();
-                        if (current_block && !current_block->getTerminator())
-                        {
-                            if (fn->getReturnType()->isVoidTy())
-                            {
-                                builder().CreateRetVoid();
-                            }
-                            else
-                            {
-                                builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
-                            }
-                        }
-
-                        // Verify function - don't erase on failure as other methods may reference it
-                        if (llvm::verifyFunction(*fn, &llvm::errs()))
-                        {
-                            LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                                      "Generic enum method verification failed: {}::{}",
-                                      mangled, method->name());
-                        }
-
-                        // Clean up method scope
-                        values().exit_scope();
-                        ctx().set_result(nullptr);
+                        enum_method_decls.push_back({method.get(), fn});
                     }
+                }
+
+                // Pass 2: Generate all method bodies (all declarations now exist)
+                for (auto &[method, fn] : enum_method_decls)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Generating enum method body: {}::{}",
+                              mangled, method->name());
+
+                    // Create entry block
+                    llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+                    builder().SetInsertPoint(entry);
+
+                    // Set up function context
+                    auto fn_ctx = std::make_unique<FunctionContext>(fn, method);
+                    fn_ctx->entry_block = entry;
+                    ctx().set_current_function(std::move(fn_ctx));
+
+                    // Set current type name for this.field resolution
+                    ctx().set_current_type_name(mangled);
+
+                    // Enter function scope
+                    values().enter_scope(fn->getName().str());
+
+                    // Allocate parameters and register their types
+                    const auto &ast_params = method->parameters();
+                    unsigned param_idx = 0;
+                    for (auto &arg : fn->args())
+                    {
+                        std::string param_name = arg.getName().str();
+
+                        // Debug: Log LLVM argument type
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "GenericCodegen: Enum method arg '{}' LLVM type ID={}, isStruct={}, isInt={}",
+                                  param_name,
+                                  arg.getType()->getTypeID(),
+                                  arg.getType()->isStructTy(),
+                                  arg.getType()->isIntegerTy());
+
+                        llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
+                        create_store(&arg, alloca);
+                        values().set_value(param_name, nullptr, alloca);
+
+                        // Register parameter type in variable_types_map for method resolution
+                        // Skip 'this' parameter (first param for instance methods)
+                        if (param_name == "this")
+                        {
+                            // 'this' is a pointer to the current type
+                            TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
+                            if (this_type.is_valid())
+                            {
+                                TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
+                                ctx().variable_types_map()[param_name] = this_ptr;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "GenericCodegen: Registered enum 'this' type: {}",
+                                          this_ptr->display_name());
+                            }
+                        }
+                        else if (param_idx < ast_params.size() + 1)
+                        {
+                            // Get AST parameter - check if AST has explicit 'this' parameter
+                            // If AST includes 'this' explicitly, use param_idx directly
+                            // Otherwise, subtract 1 to account for implicit 'this' added by codegen
+                            bool ast_has_explicit_this = !ast_params.empty() &&
+                                ast_params[0]->name() == "this";
+                            size_t ast_idx = ast_has_explicit_this ? param_idx :
+                                (param_idx > 0 ? param_idx - 1 : param_idx);
+                            if (ast_idx < ast_params.size())
+                            {
+                                TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
+                                // Apply type substitution (T -> i64, etc.)
+                                TypeRef substituted = substitute_type_params(param_type);
+                                if (substituted.is_valid())
+                                {
+                                    ensure_dependent_types_instantiated(substituted);
+                                    ctx().variable_types_map()[param_name] = substituted;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "GenericCodegen: Registered enum param '{}' type: {} -> {}",
+                                              param_name,
+                                              param_type.is_valid() ? param_type->display_name() : "null",
+                                              substituted->display_name());
+                                }
+                            }
+                        }
+                        param_idx++;
+                    }
+
+                    // Generate method body - type params are still active so T->i64 works
+                    CodegenVisitor *visitor = ctx().visitor();
+                    if (visitor && method->body())
+                    {
+                        method->body()->accept(*visitor);
+                    }
+
+                    // Add implicit return if needed
+                    llvm::BasicBlock *current_block = builder().GetInsertBlock();
+                    if (current_block && !current_block->getTerminator())
+                    {
+                        if (fn->getReturnType()->isVoidTy())
+                        {
+                            builder().CreateRetVoid();
+                        }
+                        else
+                        {
+                            builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+                        }
+                    }
+
+                    // Verify function - don't erase on failure as other methods may reference it
+                    if (llvm::verifyFunction(*fn, &llvm::errs()))
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                  "Generic enum method verification failed: {}::{}",
+                                  mangled, method->name());
+                    }
+
+                    // Clean up method scope
+                    values().exit_scope();
+                    ctx().set_result(nullptr);
                 }
 
                 // Restore parent context after generating all methods
@@ -1750,7 +1875,7 @@ namespace Cryo::Codegen
         }
 
         // Mark methods as generated for this instantiation
-        generated_enum_methods.insert(mangled);
+        _generated_enum_methods.insert(mangled);
 
         // End type parameter scope AFTER methods are generated
         end_type_params();

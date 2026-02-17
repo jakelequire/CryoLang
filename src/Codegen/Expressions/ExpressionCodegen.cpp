@@ -3570,15 +3570,43 @@ namespace Cryo::Codegen
                 args_str.pop_back();
             }
 
-            // Build mangled name: "Array_Token"
+            // Build mangled name matching GenericCodegen::mangle_type_name format
+            // Parse comma-separated args respecting angle bracket nesting, then join with '_'
             mangled_type_name = base_name + "_";
-            // Replace problematic characters in type arguments
-            std::replace(args_str.begin(), args_str.end(), '<', '_');
-            std::replace(args_str.begin(), args_str.end(), '>', '_');
-            std::replace(args_str.begin(), args_str.end(), ',', '_');
-            std::replace(args_str.begin(), args_str.end(), ' ', '_');
-            std::replace(args_str.begin(), args_str.end(), '*', 'p');
-            mangled_type_name += args_str;
+            std::vector<std::string> parsed_args;
+            int depth = 0;
+            size_t arg_start = 0;
+            for (size_t ci = 0; ci < args_str.length(); ++ci)
+            {
+                if (args_str[ci] == '<') depth++;
+                else if (args_str[ci] == '>') depth--;
+                else if (args_str[ci] == ',' && depth == 0)
+                {
+                    std::string arg = args_str.substr(arg_start, ci - arg_start);
+                    size_t f = arg.find_first_not_of(" \t");
+                    size_t l = arg.find_last_not_of(" \t");
+                    if (f != std::string::npos)
+                        parsed_args.push_back(arg.substr(f, l - f + 1));
+                    arg_start = ci + 1;
+                }
+            }
+            std::string last_arg = args_str.substr(arg_start);
+            size_t f = last_arg.find_first_not_of(" \t");
+            size_t l = last_arg.find_last_not_of(" \t");
+            if (f != std::string::npos)
+                parsed_args.push_back(last_arg.substr(f, l - f + 1));
+
+            for (size_t i = 0; i < parsed_args.size(); ++i)
+            {
+                if (i > 0) mangled_type_name += "_";
+                std::string arg = parsed_args[i];
+                std::replace(arg.begin(), arg.end(), '<', '_');
+                std::replace(arg.begin(), arg.end(), '>', '_');
+                std::replace(arg.begin(), arg.end(), ',', '_');
+                std::replace(arg.begin(), arg.end(), ' ', '_');
+                std::replace(arg.begin(), arg.end(), '*', 'p');
+                mangled_type_name += arg;
+            }
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "resolve_member_info: Converted generic type '{}' to mangled name '{}'",

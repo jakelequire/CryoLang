@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Cryo::Codegen
 {
@@ -324,6 +325,15 @@ namespace Cryo::Codegen
             std::string instantiated_name; // e.g., "Option_voidp" - the monomorphized name
         };
         std::vector<TypeParamScope> _type_param_stack;
+
+        //===================================================================
+        // Per-module instantiation tracking (reset with each new CodeGenerator)
+        //===================================================================
+
+        std::unordered_set<std::string> _generated_struct_methods;
+        std::unordered_set<std::string> _generated_enum_methods;
+        std::unordered_set<std::string> _structs_being_instantiated;
+        std::unordered_set<std::string> _classes_being_instantiated;
 
         //===================================================================
         // Caches
