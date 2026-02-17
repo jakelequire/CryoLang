@@ -1,0 +1,87 @@
+// @test: generic_method_with_short_circuit_and
+// @expect: compile_success
+// @mode: raw
+// @stdout: found: key=42 value=99
+// @stdout: not found
+// @tags: generics, structs, short_circuit, logical_and, stdlib_root_cause
+// @description: RC4+RC7 - Short-circuit && inside a generic method that also accesses members after array subscript. Mirrors HashMap::find_entry which uses (entry.state == OCCUPIED && entry.hash == hash && entry.key == key). The compiler must generate proper basic block terminators for short-circuit evaluation.
+
+namespace GenShortCircuitAnd;
+
+const STATE_EMPTY: u8 = 0;
+const STATE_OCCUPIED: u8 = 1;
+
+type struct Entry<K, V> {
+    key: K;
+    value: V;
+    hash: u64;
+    state: u8;
+}
+
+type struct Table<K, V> {
+    entries: Entry<K, V>*;
+    cap: u64;
+    len: u64;
+
+    static new(capacity: u64) -> Table<K, V> {
+        const entries: Entry<K, V>* = calloc(capacity, sizeof(Entry<K, V>));
+        return Table<K, V> {
+            entries: entries,
+            cap: capacity,
+            len: 0
+        };
+    }
+
+    insert(mut &this, key: K, value: V, key_hash: u64) -> void {
+        const index: u64 = key_hash % this.cap;
+        this.entries[index].key = key;
+        this.entries[index].value = value;
+        this.entries[index].hash = key_hash;
+        this.entries[index].state = STATE_OCCUPIED;
+        this.len = this.len + 1;
+    }
+
+    /// The critical pattern: short-circuit && with member access after subscript
+    find_entry(&this, key: K, key_hash: u64) -> i64 {
+        if (this.cap == 0) {
+            return -1;
+        }
+
+        mut index: u64 = key_hash % this.cap;
+        mut i: u64 = 0;
+        while (i < this.cap) {
+            if (this.entries[index].state == STATE_EMPTY) {
+                return -1;
+            }
+
+            // Short-circuit && with multiple member accesses after subscript
+            if (this.entries[index].state == STATE_OCCUPIED &&
+                this.entries[index].hash == key_hash &&
+                this.entries[index].key == key) {
+                return i64(index);
+            }
+
+            i = i + 1;
+            index = (index + 1) % this.cap;
+        }
+        return -1;
+    }
+}
+
+function main() -> int {
+    mut t: Table<int, int> = Table<int, int>::new(16);
+    t.insert(42, 99, 7);
+
+    const found: i64 = t.find_entry(42, 7);
+    if (found >= 0) {
+        const idx: u64 = u64(found);
+        printf("found: key=%d value=%d\n", t.entries[idx].key, t.entries[idx].value);
+    }
+
+    const not_found: i64 = t.find_entry(99, 3);
+    if (not_found < 0) {
+        printf("not found\n");
+    }
+
+    return 0;
+}

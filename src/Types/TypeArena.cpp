@@ -440,11 +440,8 @@ namespace Cryo
                                      std::vector<TypeRef> params,
                                      bool is_variadic)
     {
-        // Check for errors in return type or params
-        if (return_type.is_error())
-        {
-            return return_type;
-        }
+        // Check for errors in params (but allow error return types for function types like
+        // () -> Maybe<T> where the return type is an unresolved generic that will be resolved later)
         for (const auto &param : params)
         {
             if (param.is_error())

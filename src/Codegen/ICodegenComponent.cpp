@@ -1613,9 +1613,11 @@ namespace Cryo::Codegen
 
             if (source_bits < target_bits)
             {
-                // Extension - use zero-extend as the safe default for this LLVM-only path
-                // (callers with signedness info should use CastCodegen::cast_to instead)
-                return b.CreateZExt(value, target_type, "zext");
+                // Extension - use sign-extend as the safe default because Cryo's default
+                // integer type is signed (int/i32/i64). This correctly preserves negative
+                // values (e.g., return -1 from i32 to i64). For positive values, sext and
+                // zext produce identical results so this is safe for unsigned types too.
+                return b.CreateSExt(value, target_type, "sext");
             }
             else if (source_bits > target_bits)
             {

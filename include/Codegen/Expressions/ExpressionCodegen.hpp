@@ -423,6 +423,10 @@ namespace Cryo::Codegen
                                  llvm::StructType *&out_struct_type,
                                  unsigned &out_field_idx);
 
+        /// Resolve a TypeRef to the correct mangled struct name for member access.
+        /// Unwraps Pointer/Reference and handles InstantiatedType → monomorphized name.
+        std::string resolve_struct_type_name(Cryo::TypeRef type);
+
         /**
          * @brief Wrap a raw i32 discriminant in a tagged union struct
          *
