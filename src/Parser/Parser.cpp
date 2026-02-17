@@ -7500,7 +7500,9 @@ namespace Cryo
 
         // For generic types (e.g., "Array<int>"), defer to type resolution phase
         // The TypeAnnotation stored on the node will contain the full type info
-        if (type_str.find('<') != std::string::npos && type_str.find('>') != std::string::npos)
+        // Exclude function types like "()->Maybe<T>" or "(int)->Array<T>" which start with '(' and contain '->'
+        if (type_str.find('<') != std::string::npos && type_str.find('>') != std::string::npos
+            && !(type_str[0] == '(' && type_str.find("->") != std::string::npos))
         {
             LOG_DEBUG(LogComponent::PARSER, "Parser detected generic type syntax: '{}' - deferring to type resolution", type_str);
             // Return an error type with the type string - TypeResolver will handle it
@@ -7677,12 +7679,16 @@ namespace Cryo
             TypeRef return_type = resolve_type_from_string(return_type_str);
             if (return_type.is_error())
             {
-                LOG_DEBUG(LogComponent::PARSER, "Function type return type '{}' failed to resolve", return_type_str);
-                return return_type; // Propagate error
+                // Don't propagate the error — create the FunctionType with the unresolved return type.
+                // All function types lower to opaque ptr in LLVM, so the return type doesn't affect
+                // LLVM type lowering. TypeResolution will resolve the return type later.
+                LOG_DEBUG(LogComponent::PARSER, "Function type return type '{}' is unresolved, creating function type with placeholder", return_type_str);
             }
-
-            LOG_DEBUG(LogComponent::PARSER, "Successfully parsed function type: {} params, return='{}'",
-                      param_types.size(), return_type->display_name());
+            else
+            {
+                LOG_DEBUG(LogComponent::PARSER, "Successfully parsed function type: {} params, return='{}'",
+                          param_types.size(), return_type->display_name());
+            }
 
             return _context.types().get_function(return_type, std::move(param_types), false);
         }

@@ -1648,6 +1648,18 @@ namespace Cryo::Codegen
         case TokenKind::TK_EXCLAIMEQUAL:
             return b.CreateICmpNE(lhs, rhs, "ptr_ne");
 
+        case TokenKind::TK_L_ANGLE:
+            return b.CreateICmpULT(lhs, rhs, "ptr_lt");
+
+        case TokenKind::TK_R_ANGLE:
+            return b.CreateICmpUGT(lhs, rhs, "ptr_gt");
+
+        case TokenKind::TK_LESSEQUAL:
+            return b.CreateICmpULE(lhs, rhs, "ptr_le");
+
+        case TokenKind::TK_GREATEREQUAL:
+            return b.CreateICmpUGE(lhs, rhs, "ptr_ge");
+
         default:
         {
             std::string op_str = node ? std::string(node->operator_token().text()) : "comparison";

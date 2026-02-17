@@ -1,0 +1,107 @@
+// @test: generic_struct_method_ptr_len_args
+// @expect: compile_success
+// @mode: raw
+// @stdout: 3
+// @stdout: 10
+// @stdout: 20
+// @stdout: 30
+// @tags: generics, structs, methods, pointer_args, stdlib_root_cause
+// @description: RC1b - Generic struct method taking raw pointer + length arguments (like Array<T>::extend_from_slice). The compiler must correctly codegen the pointer and length arguments when calling monomorphized methods.
+
+namespace GenStructPtrLenArgs;
+
+type struct Vec<T> {
+    ptr: T*;
+    len: u64;
+    cap: u64;
+
+    static new() -> Vec<T> {
+        return Vec<T> {
+            ptr: null,
+            len: 0,
+            cap: 0
+        };
+    }
+
+    push(mut &this, value: T) -> void {
+        if (this.len == this.cap) {
+            mut new_cap: u64 = this.cap;
+            if (new_cap == 0) {
+                new_cap = 4;
+            } else {
+                new_cap = new_cap * 2;
+            }
+            const new_ptr: T* = malloc(sizeof(T) * new_cap);
+            if (this.len > 0) {
+                memcpy(new_ptr, this.ptr, sizeof(T) * this.len);
+            }
+            if (this.ptr != null) {
+                free(this.ptr);
+            }
+            this.ptr = new_ptr;
+            this.cap = new_cap;
+        }
+        this.ptr[this.len] = value;
+        this.len = this.len + 1;
+    }
+
+    /// Takes a raw pointer and a length - the pattern that fails in stdlib
+    extend_from_slice(mut &this, slice: T*, slice_len: u64) -> void {
+        if (slice_len == 0) {
+            return;
+        }
+
+        // Ensure capacity
+        const required: u64 = this.len + slice_len;
+        if (required > this.cap) {
+            mut new_cap: u64 = this.cap;
+            if (new_cap == 0) {
+                new_cap = 4;
+            }
+            while (new_cap < required) {
+                new_cap = new_cap * 2;
+            }
+            const new_ptr: T* = malloc(sizeof(T) * new_cap);
+            if (this.len > 0) {
+                memcpy(new_ptr, this.ptr, sizeof(T) * this.len);
+            }
+            if (this.ptr != null) {
+                free(this.ptr);
+            }
+            this.ptr = new_ptr;
+            this.cap = new_cap;
+        }
+
+        memcpy(&this.ptr[this.len], slice, sizeof(T) * slice_len);
+        this.len = this.len + slice_len;
+    }
+
+    get(&this, index: u64) -> T {
+        return this.ptr[index];
+    }
+
+    length(&this) -> u64 {
+        return this.len;
+    }
+}
+
+function main() -> int {
+    mut v: Vec<int> = Vec<int>::new();
+
+    // Create a raw array to extend from
+    const data: int* = malloc(sizeof(int) * 3);
+    data[0] = 10;
+    data[1] = 20;
+    data[2] = 30;
+
+    // Call extend_from_slice with pointer + length args
+    v.extend_from_slice(data, 3);
+
+    printf("%llu\n", v.length());
+    printf("%d\n", v.get(0));
+    printf("%d\n", v.get(1));
+    printf("%d\n", v.get(2));
+
+    free(data);
+    return 0;
+}
