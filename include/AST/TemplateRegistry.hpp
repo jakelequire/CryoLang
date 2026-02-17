@@ -92,6 +92,43 @@ namespace Cryo
             std::vector<MethodMetadata> methods;
         };
 
+        // Module-level constant metadata for cross-module generic instantiation
+        struct ModuleConstant
+        {
+            std::string name;
+            std::string type_annotation; // e.g., "u8", "u64"
+            uint64_t int_value;
+            bool is_integer;
+
+            ModuleConstant() : int_value(0), is_integer(false) {}
+            ModuleConstant(const std::string &n, const std::string &type_ann,
+                           uint64_t val, bool is_int = true)
+                : name(n), type_annotation(type_ann), int_value(val), is_integer(is_int) {}
+        };
+
+        //===================================================================
+        // Module Constants Registry (for cross-module generic instantiation)
+        //===================================================================
+
+        /**
+         * @brief Register a module-level constant for cross-module generic method access
+         * @param module_namespace Namespace of the module defining the constant
+         * @param name Constant name (e.g., "BUCKET_EMPTY")
+         * @param type_annotation Type annotation string (e.g., "u8")
+         * @param value Integer value of the constant
+         */
+        void register_module_constant(const std::string &module_namespace,
+                                      const std::string &name,
+                                      const std::string &type_annotation,
+                                      uint64_t value);
+
+        /**
+         * @brief Get all constants for a given module namespace
+         * @param module_namespace Namespace to look up
+         * @return Pointer to vector of ModuleConstant, or nullptr if none registered
+         */
+        const std::vector<ModuleConstant> *get_module_constants(const std::string &module_namespace) const;
+
     private:
         // Map from template base name to template info
         std::unordered_map<std::string, TemplateInfo> _templates;
@@ -119,6 +156,10 @@ namespace Cryo
         // Stores references to implementation blocks for generic enums
         // Used to generate methods during enum instantiation
         std::unordered_map<std::string, ImplementationBlockNode *> _enum_impl_blocks;
+
+        // Module-level constants: namespace -> list of constants
+        // Used to forward constants to consumer modules during cross-module generic instantiation
+        std::unordered_map<std::string, std::vector<ModuleConstant>> _module_constants;
 
     public:
         TemplateRegistry() = default;

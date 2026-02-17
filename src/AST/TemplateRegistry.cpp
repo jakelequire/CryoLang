@@ -590,6 +590,43 @@ namespace Cryo
         return _enum_impl_blocks.find(base_enum_name) != _enum_impl_blocks.end();
     }
 
+    //===================================================================
+    // Module Constants Registry Implementation
+    //===================================================================
+
+    void TemplateRegistry::register_module_constant(const std::string &module_namespace,
+                                                     const std::string &name,
+                                                     const std::string &type_annotation,
+                                                     uint64_t value)
+    {
+        if (module_namespace.empty() || name.empty())
+            return;
+
+        // Check if already registered (avoid duplicates)
+        auto &constants = _module_constants[module_namespace];
+        for (const auto &c : constants)
+        {
+            if (c.name == name)
+                return;
+        }
+
+        constants.emplace_back(name, type_annotation, value, true);
+        LOG_DEBUG(Cryo::LogComponent::AST,
+                  "Registered module constant: {}::{} (type: {}, value: {})",
+                  module_namespace, name, type_annotation, value);
+    }
+
+    const std::vector<TemplateRegistry::ModuleConstant> *TemplateRegistry::get_module_constants(
+        const std::string &module_namespace) const
+    {
+        auto it = _module_constants.find(module_namespace);
+        if (it != _module_constants.end() && !it->second.empty())
+        {
+            return &it->second;
+        }
+        return nullptr;
+    }
+
     std::string TemplateRegistry::find_type_namespace_from_methods(
         const std::string &type_name, const std::string &method_name) const
     {
