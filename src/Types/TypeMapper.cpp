@@ -50,23 +50,11 @@ namespace Cryo
         }
 
         TypeKind kind = t->kind();
-        LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
-                  "TypeMapper::map: TypeID={}, kind={}, name='{}'",
-                  type.id().id, static_cast<int>(kind), t->display_name());
-
         // Check cache first
         auto cached = lookup_cached(type);
         if (cached)
         {
-            LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
-                      "TypeMapper::map: CACHE HIT for TypeID={}, LLVM type ID={}",
-                      type.id().id, cached->getTypeID());
             return cached;
-        }
-        else
-        {
-            LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
-                      "TypeMapper::map: CACHE MISS for TypeID={}", type.id().id);
         }
 
         llvm::Type *result = nullptr;

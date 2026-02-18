@@ -2529,6 +2529,61 @@ namespace Cryo::Codegen
                         break;
                 }
             }
+
+            // Fallback for no-arg overloads: try the exact base name (no overload suffix)
+            // across all type candidates. No-arg methods are registered without a "()" suffix,
+            // so the suffix-based scan above won't find them.
+            if (method->getFunctionType()->getNumParams() != args.size())
+            {
+                for (const auto &type_candidate : type_candidates)
+                {
+                    std::string base_qualified = type_candidate + "::" + method_name;
+                    if (llvm::Function *fn = module()->getFunction(base_qualified))
+                    {
+                        if (fn->getFunctionType()->getNumParams() == args.size())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "generate_static_method: Found correct overload via exact base name: {}",
+                                      base_qualified);
+                            method = fn;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Ultimate fallback: scan all module functions for Type::method (any namespace prefix)
+            // matching the correct parameter count. This handles cases where the method was
+            // instantiated under a different namespace than expected.
+            if (method->getFunctionType()->getNumParams() != args.size())
+            {
+                for (const auto &type_candidate : type_candidates)
+                {
+                    // Extract simple type name (e.g., "Array_u8" from "std::collections::array::Array_u8")
+                    std::string simple_type = type_candidate;
+                    size_t last_sep = type_candidate.rfind("::");
+                    if (last_sep != std::string::npos)
+                        simple_type = type_candidate.substr(last_sep + 2);
+
+                    std::string target_suffix = simple_type + "::" + method_name;
+                    for (auto &fn : module()->functions())
+                    {
+                        std::string fn_name = fn.getName().str();
+                        // Match functions ending with "Type::method" (no overload suffix)
+                        if ((fn_name == target_suffix || fn_name.ends_with("::" + target_suffix)) &&
+                            fn_name.find('(') == std::string::npos &&
+                            fn.getFunctionType()->getNumParams() == args.size())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "generate_static_method: Found correct overload via module scan: {}", fn_name);
+                            method = &fn;
+                            break;
+                        }
+                    }
+                    if (method->getFunctionType()->getNumParams() == args.size())
+                        break;
+                }
+            }
         }
 
         if (method)

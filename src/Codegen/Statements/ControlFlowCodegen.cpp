@@ -1850,6 +1850,19 @@ namespace Cryo::Codegen
                                  "Return value is pointer but function expects struct by value. Loading struct.");
                         ret_val = builder().CreateLoad(expected_ret_type, ret_val, "ret.load");
                     }
+                    // Special case: both are struct types but different named structs
+                    // This happens when TypeMapper and GenericCodegen create equivalent structs
+                    // under different names (e.g., %"IoResult<u32>" vs %IoResult_u32).
+                    // Reinterpret via memory since they have the same layout.
+                    else if (expected_ret_type->isStructTy() && ret_val->getType()->isStructTy())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                 "Return type mismatch: both are structs but different named types. "
+                                 "Reinterpreting via memory store/load.");
+                        llvm::AllocaInst *tmp = create_entry_alloca(ret_val->getType(), "ret.reinterpret.tmp");
+                        builder().CreateStore(ret_val, tmp);
+                        ret_val = builder().CreateLoad(expected_ret_type, tmp, "ret.reinterpret");
+                    }
                     else
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
