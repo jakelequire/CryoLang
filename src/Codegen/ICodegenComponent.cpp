@@ -1755,6 +1755,22 @@ namespace Cryo::Codegen
             return b.CreatePtrToInt(value, target_type, "ptr2int");
         }
 
+        // Struct to struct: reinterpret via memory when both are struct types with
+        // compatible layouts but different LLVM named types (e.g., %IoResult_u32 vs
+        // %"IoResult<u32>" created by GenericCodegen and TypeMapper respectively).
+        if (source_type->isStructTy() && target_type->isStructTy())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                     "cast_if_needed: Reinterpreting struct '{}' as '{}' via memory",
+                     llvm::cast<llvm::StructType>(source_type)->hasName()
+                         ? llvm::cast<llvm::StructType>(source_type)->getName().str() : "<anon>",
+                     llvm::cast<llvm::StructType>(target_type)->hasName()
+                         ? llvm::cast<llvm::StructType>(target_type)->getName().str() : "<anon>");
+            llvm::AllocaInst *tmp = b.CreateAlloca(source_type, nullptr, "struct.cast.tmp");
+            b.CreateStore(value, tmp);
+            return b.CreateLoad(target_type, tmp, "struct.cast.val");
+        }
+
         // Can't cast - return null value of target type to avoid IR verification errors
         LOG_WARN(Cryo::LogComponent::CODEGEN, "Unable to cast between incompatible types, using null value");
         return llvm::Constant::getNullValue(target_type);
