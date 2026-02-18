@@ -505,18 +505,35 @@ namespace Cryo
         }
         else
         {
-            // Template not found by TypeID - this is a bug in the type system.
-            // Do NOT fall back to name-based lookup as that masks TypeID inconsistencies.
+            // TypeID-based lookup failed. This happens when the same type gets
+            // different TypeIDs across module boundaries (e.g., ModuleLoader creates
+            // with ModuleID::invalid() vs the defining module's actual ID).
+            // Fall back to name-based lookup to find the canonical template.
             std::string type_id_str = std::to_string(base_type.id().id);
 
-            LOG_ERROR(LogComponent::GENERAL,
-                "TypeResolver::resolve_generic: Template '{}' (TypeID={}) not found. "
-                "This indicates a TypeID mismatch - the type was likely registered with a different TypeID.",
+            LOG_DEBUG(LogComponent::GENERAL,
+                "TypeResolver::resolve_generic: Template '{}' (TypeID={}) not found by ID, "
+                "trying name-based fallback",
                 base_name, type_id_str);
 
-            return make_error("'" + base_name + "' is not a registered generic type (TypeID=" +
-                              type_id_str + ") - possible TypeID mismatch across modules",
-                              ctx.current_location);
+            auto name_lookup = _generic_registry.get_template_by_name(base_name);
+            if (name_lookup)
+            {
+                template_info = name_lookup;
+                LOG_DEBUG(LogComponent::GENERAL,
+                    "TypeResolver::resolve_generic: Found '{}' via name-based fallback (TypeID={})",
+                    base_name, std::to_string(name_lookup->generic_type.id().id));
+            }
+            else
+            {
+                LOG_ERROR(LogComponent::GENERAL,
+                    "TypeResolver::resolve_generic: Template '{}' (TypeID={}) not found by ID or name.",
+                    base_name, type_id_str);
+
+                return make_error("'" + base_name + "' is not a registered generic type (TypeID=" +
+                                  type_id_str + ")",
+                                  ctx.current_location);
+            }
         }
 
         // Check if this is a generic type alias - handle specially
