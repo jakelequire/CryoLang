@@ -1351,6 +1351,23 @@ namespace Cryo
                     symbol_map[alias_decl->alias_name()] = symbol;
                     LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added type alias '{}' to symbol map",
                               alias_decl->alias_name());
+
+                    // Register type alias base name for codegen (::default(), type resolution)
+                    // This ensures cross-module aliases are visible to generate_default_value()
+                    if (alias_decl->has_target_type_annotation())
+                    {
+                        std::string target_str = alias_decl->target_type_annotation()->to_string();
+                        _ast_context.modules().register_type_alias_base(alias_decl->alias_name(), target_str);
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered type alias base '{}' -> '{}' (from annotation)",
+                                  alias_decl->alias_name(), target_str);
+                    }
+                    else if (alias_decl->has_resolved_target_type())
+                    {
+                        std::string target_str = alias_decl->get_resolved_target_type()->display_name();
+                        _ast_context.modules().register_type_alias_base(alias_decl->alias_name(), target_str);
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered type alias base '{}' -> '{}' (from resolved type)",
+                                  alias_decl->alias_name(), target_str);
+                    }
                 }
                 else if (auto intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(decl))
                 {
