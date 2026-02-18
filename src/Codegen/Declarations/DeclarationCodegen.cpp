@@ -1239,6 +1239,27 @@ namespace Cryo::Codegen
                 {
                     existing->setInitializer(initializer);
                     existing->setConstant(!node->is_mutable());
+
+                    // Register constant in TemplateRegistry for cross-module generic method access
+                    // (mirrors the logic at line ~1415 for the non-pre-registered path)
+                    if (!node->is_mutable())
+                    {
+                        std::string ns_context = ctx().namespace_context();
+                        if (!ns_context.empty())
+                        {
+                            if (auto *template_reg = ctx().template_registry())
+                            {
+                                if (auto *const_int = llvm::dyn_cast<llvm::ConstantInt>(initializer))
+                                {
+                                    std::string type_ann;
+                                    if (node->type_annotation())
+                                        type_ann = node->type_annotation()->to_string();
+                                    template_reg->register_module_constant(
+                                        ns_context, name, type_ann, const_int->getZExtValue());
+                                }
+                            }
+                        }
+                    }
                 }
             }
             else
