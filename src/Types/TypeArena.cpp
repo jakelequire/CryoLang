@@ -523,7 +523,7 @@ namespace Cryo
 
     TypeRef TypeArena::create_struct(const QualifiedTypeName &name)
     {
-        // Check cache first for deduplication
+        // Check cache first for deduplication (exact module ID match)
         std::string key = make_user_type_key(name);
         auto it = _struct_types.find(key);
         if (it != _struct_types.end())
@@ -534,26 +534,32 @@ namespace Cryo
             return it->second;
         }
 
-        // Check if a struct with this name already exists under a different module ID
-        // This helps detect module ID mismatches
+        // Check if a struct with this name already exists under a different module ID.
+        // This happens when ModuleLoader creates a type with ModuleID::invalid() during
+        // import resolution, and then the defining module's compilation creates the same
+        // type with its actual module ID (or vice versa). Reuse the existing type to
+        // ensure a single TypeID, which is critical for GenericRegistry lookups.
         for (const auto &[existing_key, existing_ref] : _struct_types)
         {
-            // Check if the name portion matches (key format is "module_id::name")
             size_t pos = existing_key.find("::");
             if (pos != std::string::npos)
             {
                 std::string existing_name = existing_key.substr(pos + 2);
                 if (existing_name == name.name)
                 {
-                    LOG_ERROR(LogComponent::TYPECHECKER,
-                              "TypeArena::create_struct: WARNING - Creating duplicate struct '{}' with module={} "
-                              "but already exists with key='{}' TypeID={}",
-                              name.name, name.module.id, existing_key, existing_ref.id().id);
+                    LOG_DEBUG(LogComponent::TYPECHECKER,
+                              "TypeArena::create_struct: Reusing existing struct '{}' (existing key='{}' TypeID={}) "
+                              "for new module={} — caching under key '{}'",
+                              name.name, existing_key, existing_ref.id().id, name.module.id, key);
+                    // Cache the existing TypeRef under the new key so future lookups
+                    // with this module ID also hit the cache directly
+                    _struct_types[key] = existing_ref;
+                    return existing_ref;
                 }
             }
         }
 
-        // Create new struct type
+        // Create new struct type (genuinely new name, no existing match)
         TypeID id = allocate_id();
         auto type = std::make_unique<StructType>(id, name);
         TypeRef ref = register_type(std::move(type));
@@ -569,12 +575,33 @@ namespace Cryo
 
     TypeRef TypeArena::create_class(const QualifiedTypeName &name)
     {
-        // Check cache first for deduplication
+        // Check cache first for deduplication (exact module ID match)
         std::string key = make_user_type_key(name);
         auto it = _class_types.find(key);
         if (it != _class_types.end())
         {
             return it->second;
+        }
+
+        // Check if a class with this name already exists under a different module ID.
+        // Same rationale as create_struct: prevents TypeID duplication across module
+        // boundaries (ModuleLoader uses ModuleID::invalid(), defining module uses real ID).
+        for (const auto &[existing_key, existing_ref] : _class_types)
+        {
+            size_t pos = existing_key.find("::");
+            if (pos != std::string::npos)
+            {
+                std::string existing_name = existing_key.substr(pos + 2);
+                if (existing_name == name.name)
+                {
+                    LOG_DEBUG(LogComponent::TYPECHECKER,
+                              "TypeArena::create_class: Reusing existing class '{}' (existing key='{}' TypeID={}) "
+                              "for new module={}",
+                              name.name, existing_key, existing_ref.id().id, name.module.id);
+                    _class_types[key] = existing_ref;
+                    return existing_ref;
+                }
+            }
         }
 
         // Create new class type
@@ -589,12 +616,33 @@ namespace Cryo
 
     TypeRef TypeArena::create_enum(const QualifiedTypeName &name)
     {
-        // Check cache first for deduplication
+        // Check cache first for deduplication (exact module ID match)
         std::string key = make_user_type_key(name);
         auto it = _enum_types.find(key);
         if (it != _enum_types.end())
         {
             return it->second;
+        }
+
+        // Check if an enum with this name already exists under a different module ID.
+        // Same rationale as create_struct: prevents TypeID duplication across module
+        // boundaries (ModuleLoader uses ModuleID::invalid(), defining module uses real ID).
+        for (const auto &[existing_key, existing_ref] : _enum_types)
+        {
+            size_t pos = existing_key.find("::");
+            if (pos != std::string::npos)
+            {
+                std::string existing_name = existing_key.substr(pos + 2);
+                if (existing_name == name.name)
+                {
+                    LOG_DEBUG(LogComponent::TYPECHECKER,
+                              "TypeArena::create_enum: Reusing existing enum '{}' (existing key='{}' TypeID={}) "
+                              "for new module={}",
+                              name.name, existing_key, existing_ref.id().id, name.module.id);
+                    _enum_types[key] = existing_ref;
+                    return existing_ref;
+                }
+            }
         }
 
         // Create new enum type
@@ -609,12 +657,33 @@ namespace Cryo
 
     TypeRef TypeArena::create_trait(const QualifiedTypeName &name)
     {
-        // Check cache first for deduplication
+        // Check cache first for deduplication (exact module ID match)
         std::string key = make_user_type_key(name);
         auto it = _trait_types.find(key);
         if (it != _trait_types.end())
         {
             return it->second;
+        }
+
+        // Check if a trait with this name already exists under a different module ID.
+        // Same rationale as create_struct: prevents TypeID duplication across module
+        // boundaries (ModuleLoader uses ModuleID::invalid(), defining module uses real ID).
+        for (const auto &[existing_key, existing_ref] : _trait_types)
+        {
+            size_t pos = existing_key.find("::");
+            if (pos != std::string::npos)
+            {
+                std::string existing_name = existing_key.substr(pos + 2);
+                if (existing_name == name.name)
+                {
+                    LOG_DEBUG(LogComponent::TYPECHECKER,
+                              "TypeArena::create_trait: Reusing existing trait '{}' (existing key='{}' TypeID={}) "
+                              "for new module={}",
+                              name.name, existing_key, existing_ref.id().id, name.module.id);
+                    _trait_types[key] = existing_ref;
+                    return existing_ref;
+                }
+            }
         }
 
         // Create new trait type
