@@ -154,8 +154,12 @@ namespace Cryo::Codegen
             return generate_rename(args);
         else if (intrinsic_name == "symlink")
             return generate_symlink(args);
+        else if (intrinsic_name == "link")
+            return generate_link(args);
         else if (intrinsic_name == "readlink")
             return generate_readlink(args);
+        else if (intrinsic_name == "realpath")
+            return generate_realpath(args);
         else if (intrinsic_name == "truncate")
             return generate_truncate(args);
         else if (intrinsic_name == "ftruncate")
@@ -3889,6 +3893,25 @@ namespace Cryo::Codegen
         return builder.CreateCall(symlink_func, {args[0], args[1]}, "symlink.result");
     }
 
+    llvm::Value *Intrinsics::generate_link(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("link requires exactly 2 arguments (oldpath, newpath)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *char_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *link_type = llvm::FunctionType::get(int_type, {char_ptr_type, char_ptr_type}, false);
+
+        llvm::Function *link_func = get_or_create_libc_function("link", link_type);
+        return builder.CreateCall(link_func, {args[0], args[1]}, "link.result");
+    }
+
     llvm::Value *Intrinsics::generate_readlink(const std::vector<llvm::Value *> &args)
     {
         if (args.size() != 3)
@@ -3907,6 +3930,24 @@ namespace Cryo::Codegen
 
         llvm::Function *readlink_func = get_or_create_libc_function("readlink", readlink_type);
         return builder.CreateCall(readlink_func, {args[0], args[1], ensure_type(args[2], size_t_type, "readlink.size")}, "readlink.result");
+    }
+
+    llvm::Value *Intrinsics::generate_realpath(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("realpath requires exactly 2 arguments (path, resolved)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *char_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        llvm::FunctionType *realpath_type = llvm::FunctionType::get(char_ptr_type, {char_ptr_type, char_ptr_type}, false);
+
+        llvm::Function *realpath_func = get_or_create_libc_function("realpath", realpath_type);
+        return builder.CreateCall(realpath_func, {args[0], args[1]}, "realpath.result");
     }
 
     llvm::Value *Intrinsics::generate_truncate(const std::vector<llvm::Value *> &args)
