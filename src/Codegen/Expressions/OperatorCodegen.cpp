@@ -67,7 +67,7 @@ namespace Cryo::Codegen
         if (!lhs)
         {
             report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
-                         "Failed to generate left operand");
+                         "Failed to generate left operand, generate_operand returned nullptr.");
             return nullptr;
         }
 
@@ -75,7 +75,7 @@ namespace Cryo::Codegen
         if (!rhs)
         {
             report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
-                         "Failed to generate right operand");
+                         "Failed to generate right operand, generate_operand returned nullptr");
             return nullptr;
         }
 
