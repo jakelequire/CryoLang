@@ -768,8 +768,10 @@ namespace Cryo::Codegen
         ctx().register_function(llvm_fn_name, fn);
 
         // Only register with base name if this is not an overload
-        // (i.e., no other function exists with this base name)
-        if (llvm_fn_name != base_method_name && !module()->getFunction(base_method_name))
+        // (i.e., no other function exists with this base name in module OR context registry)
+        if (llvm_fn_name != base_method_name &&
+            !module()->getFunction(base_method_name) &&
+            !ctx().get_function(base_method_name))
         {
             ctx().register_function(base_method_name, fn);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
