@@ -104,7 +104,9 @@ namespace Cryo::Codegen
         llvm::Value *generate_unlink(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_rename(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_symlink(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_link(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_readlink(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_realpath(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_truncate(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_ftruncate(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_chmod(const std::vector<llvm::Value *> &args);
