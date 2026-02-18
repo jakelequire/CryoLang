@@ -1281,8 +1281,10 @@ namespace Cryo::Codegen
             return generate_float_arithmetic(op, lhs, rhs);
         }
 
-        report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
-                     "Arithmetic operations not supported for this type");
+        std::string type_name = type->isStructTy() ? type->getStructName().str() : "<unknown>";
+
+        report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, 
+                     "Arithmetic operations not supported for type: " + type_name);
         return nullptr;
     }
 
