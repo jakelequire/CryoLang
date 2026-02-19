@@ -1064,11 +1064,12 @@ namespace Cryo::CLI::Commands
             compiler->set_show_stdlib_diagnostics(true);
         }
 
-        // Handle no_std: disable stdlib linking and auto-imports
+        // Handle no_std: disable stdlib linking, auto-imports, and main transform
         if (config.no_std)
         {
             compiler->set_stdlib_linking(false);
             compiler->set_auto_imports_enabled(false);
+            compiler->set_raw_mode(true);
             if (use_verbose)
             {
                 std::cout << "Stdlib linking disabled (no-std mode)" << std::endl;

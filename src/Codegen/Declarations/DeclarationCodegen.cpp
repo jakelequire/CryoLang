@@ -679,6 +679,30 @@ namespace Cryo::Codegen
             }
         }
 
+        // Helper to ensure LLVM function arguments have names set from the AST.
+        // Pre-existing functions (e.g., extern declarations) may have unnamed arguments,
+        // which breaks parameter registration in GenericCodegen method body generation.
+        auto ensure_arg_names = [&](llvm::Function *fn) {
+            auto arg_it = fn->arg_begin();
+            if (!is_static && arg_it != fn->arg_end())
+            {
+                if (arg_it->getName().empty())
+                    arg_it->setName("this");
+                ++arg_it;
+            }
+            for (const auto &param : node->parameters())
+            {
+                if (param->name() == "this")
+                    continue;
+                if (arg_it != fn->arg_end())
+                {
+                    if (arg_it->getName().empty())
+                        arg_it->setName(param->name());
+                    ++arg_it;
+                }
+            }
+        };
+
         // Check if already declared with exact signature (for overload support)
         if (llvm::Function *existing = module()->getFunction(overload_name))
         {
@@ -688,6 +712,7 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Method '{}' already exists with correct types",
                           overload_name);
+                ensure_arg_names(validated);
                 return validated;
             }
             // Fall through to create fresh function
@@ -701,6 +726,7 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Method '{}' already exists with matching types",
                           llvm_fn_name);
+                ensure_arg_names(existing);
                 return existing;
             }
             // Types differ - this is an overload, use overload_name for the new function
@@ -717,6 +743,7 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Method '{}' already exists (base_method_name='{}') with matching types",
                           llvm_fn_name, base_method_name);
+                ensure_arg_names(existing);
                 return existing;
             }
             // Types differ - this is an overload, use overload_name

@@ -28,7 +28,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::StructType *GenericCodegen::instantiate_struct(const std::string &generic_name,
-                                                           const std::vector<TypeRef> &type_args)
+                                                         const std::vector<TypeRef> &type_args)
     {
         // Check if any type arguments are uninstantiated type parameters
         // This happens when compiling generic templates where K, V, T etc. aren't yet concrete
@@ -218,7 +218,7 @@ namespace Cryo::Codegen
         // Create struct type OR reuse existing one
         llvm::StructType *struct_type = nullptr;
         std::vector<std::string> field_names;
-        std::vector<TypeRef> substituted_field_types;  // For TemplateRegistry field type registration
+        std::vector<TypeRef> substituted_field_types; // For TemplateRegistry field type registration
 
         if (type_already_exists)
         {
@@ -237,6 +237,16 @@ namespace Cryo::Codegen
                     // generic types like Inner<T> that need T substituted to concrete args
                     TypeRef field_type = field->get_resolved_type();
                     TypeRef final_type = substitute_type_params(field_type);
+                    if (!final_type.is_valid() && field->has_type_annotation())
+                    {
+                        final_type = resolve_field_type_from_annotation(field->type_annotation());
+                        if (final_type.is_valid())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "GenericCodegen: Resolved field '{}' type from annotation: {}",
+                                      field->name(), final_type->display_name());
+                        }
+                    }
                     substituted_field_types.push_back(final_type.is_valid() ? final_type : TypeRef{});
                 }
             }
@@ -279,6 +289,16 @@ namespace Cryo::Codegen
                     // generic types like Inner<T> that need T substituted to concrete args
                     TypeRef field_type = field->get_resolved_type();
                     TypeRef final_type = substitute_type_params(field_type);
+                    if (!final_type.is_valid() && field->has_type_annotation())
+                    {
+                        final_type = resolve_field_type_from_annotation(field->type_annotation());
+                        if (final_type.is_valid())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "GenericCodegen: Resolved field '{}' type from annotation: {}",
+                                      field->name(), final_type->display_name());
+                        }
+                    }
                     substituted_field_types.push_back(final_type.is_valid() ? final_type : TypeRef{});
                 }
 
@@ -444,7 +464,7 @@ namespace Cryo::Codegen
             // reference each other regardless of source order, then generate bodies.
 
             // Pass 1: Generate all method declarations
-            std::vector<std::pair<Cryo::FunctionDeclarationNode*, llvm::Function*>> method_decls;
+            std::vector<std::pair<Cryo::FunctionDeclarationNode *, llvm::Function *>> method_decls;
             for (const auto &method : struct_decl->methods())
             {
                 if (!method)
@@ -510,9 +530,8 @@ namespace Cryo::Codegen
                         // If AST includes 'this' explicitly, use param_idx directly
                         // Otherwise, subtract 1 to account for implicit 'this' added by codegen
                         bool ast_has_explicit_this = !ast_params.empty() &&
-                            ast_params[0]->name() == "this";
-                        size_t ast_idx = ast_has_explicit_this ? param_idx :
-                            (param_idx > 0 ? param_idx - 1 : param_idx);
+                                                     ast_params[0]->name() == "this";
+                        size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
                         if (ast_idx < ast_params.size())
                         {
                             TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
@@ -581,6 +600,205 @@ namespace Cryo::Codegen
             ctx().set_namespace_context(saved_namespace);
         }
 
+        // Generate methods from struct implementation blocks (e.g., implement Array<T> { ... })
+        if (template_registry && _declarations)
+        {
+            Cryo::ImplementationBlockNode *impl_block = template_registry->get_struct_impl_block(generic_name);
+            if (impl_block)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Generating {} impl block methods for struct {}",
+                          impl_block->method_implementations().size(), mangled);
+
+                // Save parent context before generating methods
+                auto saved_fn_ctx = ctx().release_current_function();
+                llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
+                std::string saved_type_name = ctx().current_type_name();
+                std::string saved_namespace = ctx().namespace_context();
+
+                // Set namespace context to the template's defining namespace
+                if (!base_namespace.empty())
+                {
+                    ctx().set_namespace_context(base_namespace);
+                }
+
+                // Ensure module-level constants from the defining namespace are available
+                if (!base_namespace.empty() && base_namespace != saved_namespace)
+                {
+                    auto *template_reg = ctx().template_registry();
+                    if (template_reg)
+                    {
+                        const auto *constants = template_reg->get_module_constants(base_namespace);
+                        if (constants)
+                        {
+                            for (const auto &c : *constants)
+                            {
+                                if (!module()->getGlobalVariable(c.name))
+                                {
+                                    llvm::Type *const_type = nullptr;
+                                    if (c.type_annotation == "u8" || c.type_annotation == "i8")
+                                        const_type = llvm::Type::getInt8Ty(llvm_ctx());
+                                    else if (c.type_annotation == "u16" || c.type_annotation == "i16")
+                                        const_type = llvm::Type::getInt16Ty(llvm_ctx());
+                                    else if (c.type_annotation == "u32" || c.type_annotation == "i32")
+                                        const_type = llvm::Type::getInt32Ty(llvm_ctx());
+                                    else if (c.type_annotation == "u64" || c.type_annotation == "i64")
+                                        const_type = llvm::Type::getInt64Ty(llvm_ctx());
+                                    else if (c.type_annotation == "bool")
+                                        const_type = llvm::Type::getInt1Ty(llvm_ctx());
+                                    else
+                                        const_type = llvm::Type::getInt64Ty(llvm_ctx());
+
+                                    auto *gv = new llvm::GlobalVariable(
+                                        *module(), const_type, true,
+                                        llvm::GlobalValue::PrivateLinkage,
+                                        llvm::ConstantInt::get(const_type, c.int_value),
+                                        c.name);
+                                    values().set_global_value(c.name, gv);
+                                    std::string qualified = base_namespace + "::" + c.name;
+                                    values().set_global_value(qualified, gv);
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "GenericCodegen: Forwarded constant '{}' (={}) from namespace '{}' for struct impl '{}'",
+                                              c.name, c.int_value, base_namespace, mangled);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Two-pass method generation: declare all methods first, then generate bodies
+
+                // Pass 1: Declare all impl block methods
+                std::vector<std::pair<Cryo::FunctionDeclarationNode *, llvm::Function *>> impl_method_decls;
+                for (const auto &method : impl_block->method_implementations())
+                {
+                    if (!method)
+                        continue;
+
+                    llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
+                    if (fn && method->body() && fn->empty())
+                    {
+                        impl_method_decls.push_back({method.get(), fn});
+                    }
+                }
+
+                // Pass 2: Generate all impl block method bodies
+                for (auto &[method, fn] : impl_method_decls)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "GenericCodegen: Generating struct impl method body: {}::{}",
+                              mangled, method->name());
+
+                    // Create entry block
+                    llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+                    builder().SetInsertPoint(entry);
+
+                    // Set up function context
+                    auto fn_ctx = std::make_unique<FunctionContext>(fn, method);
+                    fn_ctx->entry_block = entry;
+                    ctx().set_current_function(std::move(fn_ctx));
+
+                    // Set current type name for this.field resolution
+                    ctx().set_current_type_name(mangled);
+
+                    // Enter function scope
+                    values().enter_scope(fn->getName().str());
+
+                    // Allocate parameters and register their types
+                    const auto &ast_params = method->parameters();
+                    unsigned param_idx = 0;
+                    for (auto &arg : fn->args())
+                    {
+                        std::string param_name = arg.getName().str();
+                        llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
+                        create_store(&arg, alloca);
+                        values().set_value(param_name, nullptr, alloca);
+
+                        if (param_name == "this")
+                        {
+                            // 'this' is a pointer to the current type
+                            TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
+                            if (this_type.is_valid())
+                            {
+                                TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
+                                ctx().variable_types_map()[param_name] = this_ptr;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "GenericCodegen: Registered impl 'this' type: {}",
+                                          this_ptr->display_name());
+                            }
+                        }
+                        else if (param_idx < ast_params.size() + 1)
+                        {
+                            bool ast_has_explicit_this = !ast_params.empty() &&
+                                                         ast_params[0]->name() == "this";
+                            size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
+                            if (ast_idx < ast_params.size())
+                            {
+                                TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
+                                TypeRef substituted = substitute_type_params(param_type);
+                                if (substituted.is_valid())
+                                {
+                                    ensure_dependent_types_instantiated(substituted);
+                                    ctx().variable_types_map()[param_name] = substituted;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "GenericCodegen: Registered impl param '{}' type: {} -> {}",
+                                              param_name,
+                                              param_type.is_valid() ? param_type->display_name() : "null",
+                                              substituted->display_name());
+                                }
+                            }
+                        }
+                        param_idx++;
+                    }
+
+                    // Generate method body - type params are still active so T->concrete works
+                    CodegenVisitor *visitor = ctx().visitor();
+                    if (visitor && method->body())
+                    {
+                        method->body()->accept(*visitor);
+                    }
+
+                    // Add implicit return if needed
+                    llvm::BasicBlock *current_block = builder().GetInsertBlock();
+                    if (current_block && !current_block->getTerminator())
+                    {
+                        if (fn->getReturnType()->isVoidTy())
+                        {
+                            builder().CreateRetVoid();
+                        }
+                        else
+                        {
+                            builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+                        }
+                    }
+
+                    // Verify function
+                    if (llvm::verifyFunction(*fn, &llvm::errs()))
+                    {
+                        LOG_ERROR(Cryo::LogComponent::CODEGEN,
+                                  "Generic struct impl method verification failed: {}::{}",
+                                  mangled, method->name());
+                    }
+
+                    // Clean up method scope
+                    values().exit_scope();
+                    ctx().set_result(nullptr);
+                }
+
+                // Restore parent context after generating all methods
+                if (saved_fn_ctx)
+                {
+                    ctx().set_current_function(std::move(saved_fn_ctx));
+                }
+                if (saved_insert_block)
+                {
+                    builder().SetInsertPoint(saved_insert_block);
+                }
+                ctx().set_current_type_name(saved_type_name);
+                ctx().set_namespace_context(saved_namespace);
+            }
+        }
+
         // End type parameter scope AFTER methods are generated
         end_type_params();
 
@@ -633,7 +851,36 @@ namespace Cryo::Codegen
                     {
                         for (const auto &method : tmpl_info->struct_template->methods())
                         {
-                            if (!method) continue;
+                            if (!method)
+                                continue;
+                            std::string base_key = base_namespace + "::" + generic_name + "::" + method->name();
+                            std::string inst_key = base_namespace + "::" + mangled + "::" + method->name();
+
+                            if (!tr->has_method_return_type_annotation(inst_key))
+                            {
+                                std::string annotation = tr->get_method_return_type_annotation(base_key);
+                                if (!annotation.empty())
+                                {
+                                    tr->register_method_return_type_annotation(inst_key, annotation);
+                                }
+                            }
+
+                            auto [is_static, found] = tr->get_method_is_static(inst_key);
+                            if (!found)
+                            {
+                                tr->register_method_is_static(inst_key, method->is_static());
+                            }
+                        }
+                    }
+
+                    // Also check struct impl block methods
+                    Cryo::ImplementationBlockNode *impl_block = tr->get_struct_impl_block(generic_name);
+                    if (impl_block)
+                    {
+                        for (const auto &method : impl_block->method_implementations())
+                        {
+                            if (!method)
+                                continue;
                             std::string base_key = base_namespace + "::" + generic_name + "::" + method->name();
                             std::string inst_key = base_namespace + "::" + mangled + "::" + method->name();
 
@@ -661,7 +908,8 @@ namespace Cryo::Codegen
         std::string instantiated_name = generic_name + "<";
         for (size_t i = 0; i < type_args.size(); ++i)
         {
-            if (i > 0) instantiated_name += ", ";
+            if (i > 0)
+                instantiated_name += ", ";
             if (type_args[i])
             {
                 instantiated_name += type_args[i].get()->display_name();
@@ -688,7 +936,7 @@ namespace Cryo::Codegen
     }
 
     llvm::StructType *GenericCodegen::instantiate_class(const std::string &generic_name,
-                                                          const std::vector<TypeRef> &type_args)
+                                                        const std::vector<TypeRef> &type_args)
     {
         // Classes are represented as structs in LLVM
         // Similar to struct instantiation but may include vtable pointer
@@ -829,7 +1077,7 @@ namespace Cryo::Codegen
 
         // Substitute type parameters in fields and collect field names
         std::vector<std::string> field_names;
-        std::vector<TypeRef> substituted_field_types;  // For TemplateRegistry field type registration
+        std::vector<TypeRef> substituted_field_types; // For TemplateRegistry field type registration
         if (class_decl)
         {
             std::vector<llvm::Type *> field_types = create_substituted_fields(class_decl->fields());
@@ -845,6 +1093,16 @@ namespace Cryo::Codegen
                 // Collect substituted TypeRef for TemplateRegistry
                 TypeRef field_type = field->get_resolved_type();
                 TypeRef substituted = substitute_type_params(field_type);
+                if (!substituted.is_valid() && field->has_type_annotation())
+                {
+                    substituted = resolve_field_type_from_annotation(field->type_annotation());
+                    if (substituted.is_valid())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "GenericCodegen: Resolved field '{}' type from annotation: {}",
+                                  field->name(), substituted->display_name());
+                    }
+                }
                 substituted_field_types.push_back(substituted.is_valid() ? substituted : TypeRef{});
             }
 
@@ -1054,9 +1312,8 @@ namespace Cryo::Codegen
                         {
                             // Check if AST has explicit 'this' parameter
                             bool ast_has_explicit_this = !ast_params.empty() &&
-                                ast_params[0]->name() == "this";
-                            size_t ast_idx = ast_has_explicit_this ? param_idx :
-                                (param_idx > 0 ? param_idx - 1 : param_idx);
+                                                         ast_params[0]->name() == "this";
+                            size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
                             if (ast_idx < ast_params.size())
                             {
                                 TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
@@ -1124,7 +1381,8 @@ namespace Cryo::Codegen
         std::string instantiated_name = generic_name + "<";
         for (size_t i = 0; i < type_args.size(); ++i)
         {
-            if (i > 0) instantiated_name += ", ";
+            if (i > 0)
+                instantiated_name += ", ";
             if (type_args[i])
             {
                 instantiated_name += type_args[i].get()->display_name();
@@ -1148,7 +1406,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Type *GenericCodegen::instantiate_enum(const std::string &generic_name,
-                                                   const std::vector<TypeRef> &type_args)
+                                                 const std::vector<TypeRef> &type_args)
     {
         // Check if any type arguments are uninstantiated type parameters
         for (const auto &arg : type_args)
@@ -1598,7 +1856,7 @@ namespace Cryo::Codegen
                 // reference each other regardless of source order, then generate bodies.
 
                 // Pass 1: Generate all method declarations (with constrained-this filtering)
-                std::vector<std::pair<Cryo::FunctionDeclarationNode*, llvm::Function*>> enum_method_decls;
+                std::vector<std::pair<Cryo::FunctionDeclarationNode *, llvm::Function *>> enum_method_decls;
                 for (const auto &method : impl_block->method_implementations())
                 {
                     if (!method)
@@ -1816,9 +2074,8 @@ namespace Cryo::Codegen
                             // If AST includes 'this' explicitly, use param_idx directly
                             // Otherwise, subtract 1 to account for implicit 'this' added by codegen
                             bool ast_has_explicit_this = !ast_params.empty() &&
-                                ast_params[0]->name() == "this";
-                            size_t ast_idx = ast_has_explicit_this ? param_idx :
-                                (param_idx > 0 ? param_idx - 1 : param_idx);
+                                                         ast_params[0]->name() == "this";
+                            size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
                             if (ast_idx < ast_params.size())
                             {
                                 TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
@@ -1946,7 +2203,8 @@ namespace Cryo::Codegen
                     {
                         for (const auto &method : impl_block->method_implementations())
                         {
-                            if (!method) continue;
+                            if (!method)
+                                continue;
                             std::string base_key = base_namespace + "::" + generic_name + "::" + method->name();
                             std::string inst_key = base_namespace + "::" + mangled + "::" + method->name();
 
@@ -1996,7 +2254,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Type *GenericCodegen::get_instantiated_type(const std::string &generic_name,
-                                                        const std::vector<TypeRef> &type_args)
+                                                      const std::vector<TypeRef> &type_args)
     {
         std::string mangled = mangle_type_name(generic_name, type_args);
 
@@ -2052,7 +2310,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     llvm::Function *GenericCodegen::instantiate_function(const std::string &generic_name,
-                                                           const std::vector<TypeRef> &type_args)
+                                                         const std::vector<TypeRef> &type_args)
     {
         // Check if any type arguments are uninstantiated type parameters
         for (const auto &arg : type_args)
@@ -2247,8 +2505,8 @@ namespace Cryo::Codegen
     }
 
     llvm::Function *GenericCodegen::instantiate_method(const std::string &type_name,
-                                                         const std::string &method_name,
-                                                         const std::vector<TypeRef> &type_args)
+                                                       const std::string &method_name,
+                                                       const std::vector<TypeRef> &type_args)
     {
         std::string qualified = type_name + "::" + method_name;
         return instantiate_function(qualified, type_args);
@@ -2442,9 +2700,8 @@ namespace Cryo::Codegen
                 else if (param_idx < ast_params.size() + 1)
                 {
                     bool ast_has_explicit_this = !ast_params.empty() &&
-                        ast_params[0]->name() == "this";
-                    size_t ast_idx = ast_has_explicit_this ? param_idx :
-                        (param_idx > 0 ? param_idx - 1 : param_idx);
+                                                 ast_params[0]->name() == "this";
+                    size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
                     if (ast_idx < ast_params.size())
                     {
                         TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
@@ -2516,9 +2773,9 @@ namespace Cryo::Codegen
     //===================================================================
 
     void GenericCodegen::begin_type_params(const std::vector<std::string> &params,
-                                             const std::vector<TypeRef> &args,
-                                             const std::string &generic_base,
-                                             const std::string &instantiated_name)
+                                           const std::vector<TypeRef> &args,
+                                           const std::string &generic_base,
+                                           const std::string &instantiated_name)
     {
         TypeParamScope scope;
         scope.generic_base = generic_base;
@@ -2542,9 +2799,8 @@ namespace Cryo::Codegen
         _type_param_stack.push_back(std::move(scope));
 
         // Set the type parameter resolver on TypeMapper so type lookups can resolve T, E, etc.
-        types().set_type_param_resolver([this](const std::string &name) -> TypeRef {
-            return this->resolve_type_param(name);
-        });
+        types().set_type_param_resolver([this](const std::string &name) -> TypeRef
+                                        { return this->resolve_type_param(name); });
     }
 
     std::string GenericCodegen::get_instantiated_scope_name(const std::string &generic_base) const
@@ -2641,8 +2897,10 @@ namespace Cryo::Codegen
         int depth = 0;
         for (char c : args_str)
         {
-            if (c == '<') depth++;
-            else if (c == '>') depth--;
+            if (c == '<')
+                depth++;
+            else if (c == '>')
+                depth--;
             else if (c == ',' && depth == 0)
             {
                 // Trim whitespace
@@ -2927,8 +3185,10 @@ namespace Cryo::Codegen
                                 for (size_t i = 0; i <= args_str.size(); ++i)
                                 {
                                     char c = (i < args_str.size()) ? args_str[i] : ',';
-                                    if (c == '<') depth++;
-                                    else if (c == '>') depth--;
+                                    if (c == '<')
+                                        depth++;
+                                    else if (c == '>')
+                                        depth--;
                                     else if ((c == ',' && depth == 0) || i == args_str.size())
                                     {
                                         // Trim whitespace
@@ -2939,7 +3199,8 @@ namespace Cryo::Codegen
                                             std::string arg = current_arg.substr(start, end - start + 1);
                                             // Resolve type parameter
                                             TypeRef resolved_param = resolve_type_param(arg);
-                                            if (!first) display_name += ", ";
+                                            if (!first)
+                                                display_name += ", ";
                                             first = false;
                                             if (resolved_param.is_valid())
                                             {
@@ -2994,7 +3255,7 @@ namespace Cryo::Codegen
     //===================================================================
 
     std::string GenericCodegen::mangle_type_name(const std::string &generic_name,
-                                                   const std::vector<TypeRef> &type_args)
+                                                 const std::vector<TypeRef> &type_args)
     {
         if (type_args.empty())
         {
@@ -3025,7 +3286,7 @@ namespace Cryo::Codegen
     }
 
     std::string GenericCodegen::mangle_function_name(const std::string &generic_name,
-                                                       const std::vector<TypeRef> &type_args)
+                                                     const std::vector<TypeRef> &type_args)
     {
         // Same mangling scheme as types
         return mangle_type_name(generic_name, type_args);
@@ -3208,6 +3469,12 @@ namespace Cryo::Codegen
             if (substituted.is_valid())
                 field_type = substituted;
 
+            // Fallback: resolve from annotation if type is still empty
+            if (!field_type.is_valid() && field->has_type_annotation())
+            {
+                field_type = resolve_field_type_from_annotation(field->type_annotation());
+            }
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "create_fields_from_specialized: Field '{}' has concrete type '{}'",
                       field->name(),
@@ -3336,6 +3603,274 @@ namespace Cryo::Codegen
         }
 
         return llvm::FunctionType::get(llvm_ret, param_types, is_variadic);
+    }
+
+    TypeRef GenericCodegen::resolve_field_type_from_annotation(const TypeAnnotation *annotation)
+    {
+        if (!annotation)
+            return TypeRef();
+
+        TypeArena &arena = symbols().arena();
+
+        switch (annotation->kind)
+        {
+        case TypeAnnotationKind::Primitive:
+        {
+            const std::string &name = annotation->name;
+
+            // Check type param bindings first (T could be annotated as a "primitive" name)
+            TypeRef param = resolve_type_param(name);
+            if (param.is_valid())
+                return param;
+
+            if (name == "void")
+                return arena.get_void();
+            if (name == "boolean")
+                return arena.get_bool();
+            if (name == "char")
+                return arena.get_char();
+            if (name == "string" || name == "String")
+                return arena.get_string();
+            if (name == "i8")
+                return arena.get_i8();
+            if (name == "i16")
+                return arena.get_i16();
+            if (name == "i32" || name == "int")
+                return arena.get_i32();
+            if (name == "i64")
+                return arena.get_i64();
+            if (name == "i128")
+                return arena.get_i128();
+            if (name == "u8")
+                return arena.get_u8();
+            if (name == "u16")
+                return arena.get_u16();
+            if (name == "u32" || name == "uint")
+                return arena.get_u32();
+            if (name == "u64")
+                return arena.get_u64();
+            if (name == "u128")
+                return arena.get_u128();
+            if (name == "f32" || name == "float")
+                return arena.get_f32();
+            if (name == "f64" || name == "double")
+                return arena.get_f64();
+
+            return TypeRef();
+        }
+
+        case TypeAnnotationKind::Named:
+        {
+            const std::string &name = annotation->name;
+
+            // Check type param bindings first (e.g., T -> string)
+            TypeRef param = resolve_type_param(name);
+            if (param.is_valid())
+                return param;
+
+            TypeRef resolved = symbols().lookup_struct_type(name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            resolved = symbols().lookup_class_type(name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            resolved = symbols().lookup_enum_type(name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            // Try with current namespace prefix
+            std::string ns = ctx().namespace_context();
+            if (!ns.empty())
+            {
+                std::string qualified = ns + "::" + name;
+                resolved = symbols().lookup_struct_type(qualified);
+                if (resolved.is_valid() && !resolved.is_error())
+                    return resolved;
+
+                resolved = symbols().lookup_class_type(qualified);
+                if (resolved.is_valid() && !resolved.is_error())
+                    return resolved;
+
+                resolved = symbols().lookup_enum_type(qualified);
+                if (resolved.is_valid() && !resolved.is_error())
+                    return resolved;
+            }
+
+            // Try arena name lookup
+            resolved = arena.lookup_type_by_name(name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            // Check generic templates in GenericRegistry
+            GenericRegistry *generics = types().generic_registry();
+            if (generics)
+            {
+                auto template_info = generics->get_template_by_name(name);
+                if (template_info)
+                    return template_info->generic_type;
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_field_type_from_annotation: Could not resolve named type '{}'", name);
+            return TypeRef();
+        }
+
+        case TypeAnnotationKind::Qualified:
+        {
+            std::string qualified_name;
+            for (size_t i = 0; i < annotation->qualified_path.size(); ++i)
+            {
+                if (i > 0)
+                    qualified_name += "::";
+                qualified_name += annotation->qualified_path[i];
+            }
+
+            TypeRef resolved = symbols().lookup_struct_type(qualified_name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            resolved = symbols().lookup_class_type(qualified_name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            resolved = symbols().lookup_enum_type(qualified_name);
+            if (resolved.is_valid() && !resolved.is_error())
+                return resolved;
+
+            return TypeRef();
+        }
+
+        case TypeAnnotationKind::Generic:
+        {
+            if (!annotation->inner)
+                return TypeRef();
+
+            TypeRef base_type = resolve_field_type_from_annotation(annotation->inner.get());
+            if (!base_type.is_valid() || base_type.is_error())
+                return base_type;
+
+            std::vector<TypeRef> type_args;
+            type_args.reserve(annotation->elements.size());
+
+            for (const auto &arg_annotation : annotation->elements)
+            {
+                TypeRef arg_type = resolve_field_type_from_annotation(&arg_annotation);
+                if (!arg_type.is_valid() || arg_type.is_error())
+                    return arg_type;
+                type_args.push_back(arg_type);
+            }
+
+            TypeRef instantiated = arena.create_instantiation(base_type, std::move(type_args));
+            arena.register_instantiated_by_name(instantiated);
+
+            // Ensure the LLVM struct for this nested generic is created
+            ensure_dependent_types_instantiated(instantiated);
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_field_type_from_annotation: Created instantiation '{}'",
+                      instantiated.is_valid() ? instantiated->display_name() : "invalid");
+
+            return instantiated;
+        }
+
+        case TypeAnnotationKind::Pointer:
+        {
+            if (!annotation->inner)
+                return TypeRef();
+
+            TypeRef inner = resolve_field_type_from_annotation(annotation->inner.get());
+            if (!inner.is_valid() || inner.is_error())
+                return inner;
+
+            return arena.get_pointer_to(inner);
+        }
+
+        case TypeAnnotationKind::Reference:
+        {
+            if (!annotation->inner)
+                return TypeRef();
+
+            TypeRef inner = resolve_field_type_from_annotation(annotation->inner.get());
+            if (!inner.is_valid() || inner.is_error())
+                return inner;
+
+            return arena.get_reference_to(inner,
+                                          annotation->is_mutable ? RefMutability::Mutable : RefMutability::Immutable);
+        }
+
+        case TypeAnnotationKind::Array:
+        {
+            if (!annotation->inner)
+                return TypeRef();
+
+            TypeRef element = resolve_field_type_from_annotation(annotation->inner.get());
+            if (!element.is_valid() || element.is_error())
+                return element;
+
+            return arena.get_array_of(element, annotation->array_size);
+        }
+
+        case TypeAnnotationKind::Optional:
+        {
+            if (!annotation->inner)
+                return TypeRef();
+
+            TypeRef inner = resolve_field_type_from_annotation(annotation->inner.get());
+            if (!inner.is_valid() || inner.is_error())
+                return inner;
+
+            return arena.get_optional_of(inner);
+        }
+
+        case TypeAnnotationKind::Tuple:
+        {
+            std::vector<TypeRef> elements;
+            elements.reserve(annotation->elements.size());
+
+            for (const auto &elem : annotation->elements)
+            {
+                TypeRef resolved = resolve_field_type_from_annotation(&elem);
+                if (!resolved.is_valid() || resolved.is_error())
+                    return resolved;
+                elements.push_back(resolved);
+            }
+
+            return arena.get_tuple(std::move(elements));
+        }
+
+        case TypeAnnotationKind::Function:
+        {
+            TypeRef return_type;
+            if (annotation->return_type)
+            {
+                return_type = resolve_field_type_from_annotation(annotation->return_type.get());
+                if (!return_type.is_valid() || return_type.is_error())
+                    return return_type;
+            }
+            else
+            {
+                return_type = arena.get_void();
+            }
+
+            std::vector<TypeRef> param_types;
+            param_types.reserve(annotation->elements.size());
+
+            for (const auto &param : annotation->elements)
+            {
+                TypeRef resolved = resolve_field_type_from_annotation(&param);
+                if (!resolved.is_valid() || resolved.is_error())
+                    return resolved;
+                param_types.push_back(resolved);
+            }
+
+            return arena.get_function(return_type, std::move(param_types), annotation->is_variadic);
+        }
+
+        default:
+            return TypeRef();
+        }
     }
 
 } // namespace Cryo::Codegen
