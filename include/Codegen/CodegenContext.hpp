@@ -346,6 +346,12 @@ namespace Cryo::Codegen
         /** @brief Set current type being processed */
         void set_current_type_name(const std::string &name) { _current_type_name = name; }
 
+        /** @brief Get display name for current type (e.g., "Array<String>" instead of "Array_String") */
+        const std::string &current_type_display_name() const { return _current_type_display_name; }
+
+        /** @brief Set display name for current type */
+        void set_current_type_display_name(const std::string &name) { _current_type_display_name = name; }
+
         /** @brief Set the call site that triggered the current generic instantiation */
         void set_instantiation_source(const std::string &file, const SourceLocation &loc)
         {
@@ -438,6 +444,7 @@ namespace Cryo::Codegen
         std::string _source_file;
         std::string _namespace_context;
         std::string _current_type_name;
+        std::string _current_type_display_name;
 
         // Generic instantiation call site (where the user wrote e.g. HashSet<string>)
         std::string _instantiation_file;

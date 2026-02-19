@@ -29,16 +29,10 @@ namespace Cryo::Codegen
 
     void GenericCodegen::set_instantiation_context_from_type(
         const std::string &generic_name,
-        const std::vector<TypeRef> &type_args)
+        const std::vector<TypeRef> &type_args,
+        const std::string &parent_mangled)
     {
-        // If an external caller (CallCodegen, ExpressionCodegen) already set
-        // the instantiation source, don't overwrite it — the outermost call
-        // site is the one the user cares about.
-        if (!ctx().instantiation_file().empty())
-            return;
-
-        // Build the display name the same way InstantiatedType::display_name() does:
-        //   "Array<String>", "HashMap<string, String>", etc.
+        // Build display name (always needed for user-facing messages)
         std::string display = generic_name + "<";
         for (size_t i = 0; i < type_args.size(); ++i)
         {
@@ -47,6 +41,13 @@ namespace Cryo::Codegen
             display += type_args[i].is_valid() ? type_args[i]->display_name() : "<invalid>";
         }
         display += ">";
+        ctx().set_current_type_display_name(display);
+
+        // If an external caller (CallCodegen, ExpressionCodegen) already set
+        // the instantiation source, don't overwrite it — the outermost call
+        // site is the one the user cares about.
+        if (!ctx().instantiation_file().empty())
+            return;
 
         // Look up the dedicated call-site map.  This was populated during
         // TypeResolution (Stage 4) via GenericRegistry::instantiate() and is
@@ -55,25 +56,31 @@ namespace Cryo::Codegen
         SourceLocation site_loc;
         auto &arena = ctx().symbols().arena();
 
+        // 1. Direct lookup (from TypeResolution Stage 4)
         if (arena.get_instantiation_site(display, site_file, site_loc))
         {
             ctx().set_instantiation_source(site_file, site_loc);
 
-            // Also register under the mangled name so child types (e.g.,
-            // HashMapIter<K,V> instantiated while generating HashMap<K,V>
-            // methods) can inherit this call site via current_type_name().
+            // Also register under the mangled name so child types can
+            // inherit this call site via parent lookup.
             std::string mangled = mangle_type_name(generic_name, type_args);
             arena.store_instantiation_site(mangled, site_file, site_loc);
             return;
         }
 
-        // Direct lookup failed — this type was created during monomorphization
-        // (not TypeResolution), so there's no direct call site.  Inherit the
-        // call site of the parent type whose methods triggered this instantiation.
-        const std::string &parent = ctx().current_type_name();
+        // 2. Parent lookup (for child types created during monomorphization).
+        //    Use the explicitly-passed parent_mangled if available (the saved
+        //    outer type name before the TypeMapper lambda cleared it), falling
+        //    back to current_type_name() for backward compatibility.
+        const std::string &parent = parent_mangled.empty()
+            ? ctx().current_type_name() : parent_mangled;
         if (!parent.empty() && arena.get_instantiation_site(parent, site_file, site_loc))
         {
             ctx().set_instantiation_source(site_file, site_loc);
+
+            // Register under the mangled name so further child types inherit.
+            std::string mangled = mangle_type_name(generic_name, type_args);
+            arena.store_instantiation_site(mangled, site_file, site_loc);
             return;
         }
     }
@@ -459,6 +466,7 @@ namespace Cryo::Codegen
             auto saved_fn_ctx = ctx().release_current_function();
             llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
             std::string saved_type_name = ctx().current_type_name();
+            std::string saved_display_name = ctx().current_type_display_name();
             std::string saved_namespace = ctx().namespace_context();
 
             // Set namespace context to the template's defining namespace
@@ -515,6 +523,12 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Set type name and instantiation context BEFORE method declarations.
+            // This ensures child types instantiated during return/param type mapping
+            // (e.g., HashSetIter<T> from iter() return type) can inherit our call site.
+            ctx().set_current_type_name(mangled);
+            set_instantiation_context_from_type(generic_name, type_args, saved_type_name);
+
             // Two-pass method generation: declare all methods first so they can
             // reference each other regardless of source order, then generate bodies.
 
@@ -554,7 +568,7 @@ namespace Cryo::Codegen
 
                 // Set current type name and instantiation context for error reporting
                 ctx().set_current_type_name(mangled);
-                set_instantiation_context_from_type(generic_name, type_args);
+                set_instantiation_context_from_type(generic_name, type_args, saved_type_name);
 
                 // Enter function scope
                 values().enter_scope(fn->getName().str());
@@ -657,6 +671,7 @@ namespace Cryo::Codegen
                 builder().SetInsertPoint(saved_insert_block);
             }
             ctx().set_current_type_name(saved_type_name);
+            ctx().set_current_type_display_name(saved_display_name);
 
             ctx().set_namespace_context(saved_namespace);
         }
@@ -675,6 +690,7 @@ namespace Cryo::Codegen
                 auto saved_fn_ctx = ctx().release_current_function();
                 llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
                 std::string saved_type_name = ctx().current_type_name();
+                std::string saved_display_name = ctx().current_type_display_name();
                 std::string saved_namespace = ctx().namespace_context();
 
                 // Set namespace context to the template's defining namespace
@@ -727,6 +743,10 @@ namespace Cryo::Codegen
                     }
                 }
 
+                // Set type name and instantiation context before Pass 1 (same rationale as inline methods)
+                ctx().set_current_type_name(mangled);
+                set_instantiation_context_from_type(generic_name, type_args, saved_type_name);
+
                 // Two-pass method generation: declare all methods first, then generate bodies
 
                 // Pass 1: Declare all impl block methods
@@ -763,7 +783,7 @@ namespace Cryo::Codegen
 
                     // Set current type name and instantiation context for error reporting
                     ctx().set_current_type_name(mangled);
-                    set_instantiation_context_from_type(generic_name, type_args);
+                    set_instantiation_context_from_type(generic_name, type_args, saved_type_name);
 
                     // Enter function scope
                     values().enter_scope(fn->getName().str());
@@ -859,7 +879,8 @@ namespace Cryo::Codegen
                     builder().SetInsertPoint(saved_insert_block);
                 }
                 ctx().set_current_type_name(saved_type_name);
-    
+                ctx().set_current_type_display_name(saved_display_name);
+
                 ctx().set_namespace_context(saved_namespace);
             }
         }
@@ -1269,6 +1290,7 @@ namespace Cryo::Codegen
             auto saved_fn_ctx = ctx().release_current_function();
             llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
             std::string saved_type_name = ctx().current_type_name();
+            std::string saved_display_name = ctx().current_type_display_name();
             std::string saved_namespace = ctx().namespace_context();
 
             // Set namespace context to the template's defining namespace
@@ -1322,6 +1344,11 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Set type name and instantiation context before method generation so
+            // child types instantiated during declaration mapping inherit our call site.
+            ctx().set_current_type_name(mangled);
+            set_instantiation_context_from_type(generic_name, type_args, saved_type_name);
+
             for (const auto &method : class_decl->methods())
             {
                 if (!method)
@@ -1349,7 +1376,7 @@ namespace Cryo::Codegen
 
                     // Set current type name and instantiation context for error reporting
                     ctx().set_current_type_name(mangled);
-                    set_instantiation_context_from_type(generic_name, type_args);
+                    set_instantiation_context_from_type(generic_name, type_args, saved_type_name);
 
                     // Enter function scope
                     values().enter_scope(fn->getName().str());
@@ -1440,6 +1467,7 @@ namespace Cryo::Codegen
                 builder().SetInsertPoint(saved_insert_block);
             }
             ctx().set_current_type_name(saved_type_name);
+            ctx().set_current_type_display_name(saved_display_name);
 
             ctx().set_namespace_context(saved_namespace);
         }
@@ -1913,6 +1941,7 @@ namespace Cryo::Codegen
                 auto saved_fn_ctx = ctx().release_current_function();
                 llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
                 std::string saved_type_name = ctx().current_type_name();
+                std::string saved_display_name = ctx().current_type_display_name();
                 std::string saved_namespace = ctx().namespace_context();
 
                 // Set namespace context to the template's defining namespace
@@ -1921,6 +1950,10 @@ namespace Cryo::Codegen
                 {
                     ctx().set_namespace_context(base_namespace);
                 }
+
+                // Set type name and instantiation context before Pass 1 (same rationale as struct methods)
+                ctx().set_current_type_name(mangled);
+                set_instantiation_context_from_type(generic_name, type_args, saved_type_name);
 
                 // Two-pass method generation: declare all methods first so they can
                 // reference each other regardless of source order, then generate bodies.
@@ -2085,7 +2118,7 @@ namespace Cryo::Codegen
 
                     // Set current type name and instantiation context for error reporting
                     ctx().set_current_type_name(mangled);
-                    set_instantiation_context_from_type(generic_name, type_args);
+                    set_instantiation_context_from_type(generic_name, type_args, saved_type_name);
 
                     // Enter function scope
                     values().enter_scope(fn->getName().str());
@@ -2214,7 +2247,8 @@ namespace Cryo::Codegen
                     builder().SetInsertPoint(saved_insert_block);
                 }
                 ctx().set_current_type_name(saved_type_name);
-    
+                ctx().set_current_type_display_name(saved_display_name);
+
                 ctx().set_namespace_context(saved_namespace);
             }
             else
@@ -2606,6 +2640,7 @@ namespace Cryo::Codegen
         auto saved_fn_ctx = ctx().release_current_function();
         llvm::BasicBlock *saved_insert_block = builder().GetInsertBlock();
         std::string saved_type_name = ctx().current_type_name();
+        std::string saved_display_name = ctx().current_type_display_name();
         std::string saved_namespace = ctx().namespace_context();
 
         // Set namespace context
@@ -2735,7 +2770,7 @@ namespace Cryo::Codegen
 
             // Set current type name and instantiation context for error reporting
             ctx().set_current_type_name(mangled_type);
-            set_instantiation_context_from_type(generic_base, all_type_args);
+            set_instantiation_context_from_type(generic_base, all_type_args, saved_type_name);
 
             // Enter function scope
             values().enter_scope(fn->getName().str());
@@ -2842,6 +2877,7 @@ namespace Cryo::Codegen
             builder().SetInsertPoint(saved_insert_block);
         }
         ctx().set_current_type_name(saved_type_name);
+        ctx().set_current_type_display_name(saved_display_name);
         ctx().set_namespace_context(saved_namespace);
 
         return fn;

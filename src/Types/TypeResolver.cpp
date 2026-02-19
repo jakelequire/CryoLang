@@ -464,6 +464,9 @@ namespace Cryo
                                            const std::vector<TypeAnnotation> &args,
                                            ResolutionContext &ctx)
     {
+        // Save the location of the generic expression before sub-resolves overwrite it
+        SourceLocation generic_loc = ctx.current_location;
+
         LOG_DEBUG(LogComponent::GENERAL, "TypeResolver: resolve_generic called with base '{}' and {} args",
             base.to_string(), args.size());
 
@@ -532,7 +535,7 @@ namespace Cryo
 
                 return make_error("'" + base_name + "' is not a registered generic type (TypeID=" +
                                   type_id_str + ")",
-                                  ctx.current_location);
+                                  generic_loc);
             }
         }
 
@@ -580,7 +583,7 @@ namespace Cryo
                     {
                         return make_error("'" + base_name + "' expects " +
                             std::to_string(param_names.size()) + " type argument(s), got " +
-                            std::to_string(type_args.size()), ctx.current_location);
+                            std::to_string(type_args.size()), generic_loc);
                     }
 
                     // Perform substitution: replace each type parameter with its concrete type
@@ -607,7 +610,7 @@ namespace Cryo
         // For non-alias templates, use standard instantiation
         TypeRef template_base = template_info ? template_info->generic_type : base_type;
         return _generic_registry.instantiate(template_base, std::move(type_args), _arena,
-                                             ctx.source_file, ctx.current_location);
+                                             ctx.source_file, generic_loc);
     }
 
     bool TypeResolver::is_primitive_name(const std::string &name) const
