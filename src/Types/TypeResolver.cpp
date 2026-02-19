@@ -606,7 +606,8 @@ namespace Cryo
 
         // For non-alias templates, use standard instantiation
         TypeRef template_base = template_info ? template_info->generic_type : base_type;
-        return _generic_registry.instantiate(template_base, std::move(type_args), _arena);
+        return _generic_registry.instantiate(template_base, std::move(type_args), _arena,
+                                             ctx.source_file, ctx.current_location);
     }
 
     bool TypeResolver::is_primitive_name(const std::string &name) const

@@ -346,6 +346,26 @@ namespace Cryo::Codegen
         /** @brief Set current type being processed */
         void set_current_type_name(const std::string &name) { _current_type_name = name; }
 
+        /** @brief Set the call site that triggered the current generic instantiation */
+        void set_instantiation_source(const std::string &file, const SourceLocation &loc)
+        {
+            _instantiation_file = file;
+            _instantiation_loc = loc;
+        }
+
+        /** @brief Clear instantiation source (when leaving generic context) */
+        void clear_instantiation_source()
+        {
+            _instantiation_file.clear();
+            _instantiation_loc = SourceLocation{};
+        }
+
+        /** @brief Get instantiation source file */
+        const std::string &instantiation_file() const { return _instantiation_file; }
+
+        /** @brief Get instantiation source location */
+        const SourceLocation &instantiation_loc() const { return _instantiation_loc; }
+
         /** @brief Register an enum variant constant */
         void register_enum_variant(const std::string &name, llvm::Value *value) { _enum_variants[name] = value; }
 
@@ -418,6 +438,10 @@ namespace Cryo::Codegen
         std::string _source_file;
         std::string _namespace_context;
         std::string _current_type_name;
+
+        // Generic instantiation call site (where the user wrote e.g. HashSet<string>)
+        std::string _instantiation_file;
+        SourceLocation _instantiation_loc;
 
         //===================================================================
         // Cached Mappings

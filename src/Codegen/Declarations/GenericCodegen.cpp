@@ -24,6 +24,56 @@ namespace Cryo::Codegen
     }
 
     //===================================================================
+    // Instantiation Context Helper
+    //===================================================================
+
+    void GenericCodegen::set_instantiation_context_from_type(
+        const std::string &generic_name,
+        const std::vector<TypeRef> &type_args)
+    {
+        // If an external caller (CallCodegen, ExpressionCodegen) already set
+        // the instantiation source, don't overwrite it — the outermost call
+        // site is the one the user cares about.
+        if (!ctx().instantiation_file().empty())
+            return;
+
+        // Try to find the InstantiatedType in the arena for its stored call site.
+        std::string display = generic_name + "<";
+        for (size_t i = 0; i < type_args.size(); ++i)
+        {
+            if (i > 0)
+                display += ", ";
+            display += type_args[i].is_valid() ? type_args[i]->display_name() : "<invalid>";
+        }
+        display += ">";
+
+        TypeRef inst = ctx().symbols().arena().lookup_type_by_name(display);
+        if (inst.is_valid() && inst->kind() == TypeKind::InstantiatedType)
+        {
+            auto *inst_type = static_cast<const InstantiatedType *>(inst.get());
+            if (inst_type->has_instantiation_site())
+            {
+                ctx().set_instantiation_source(
+                    inst_type->instantiation_file(),
+                    inst_type->instantiation_loc());
+                return;
+            }
+        }
+
+        // Last resort: try the current AST node for a better location, otherwise
+        // use the module source file with line 0 (renders as file-only, no source block).
+        auto *node = ctx().current_node();
+        if (node && !node->source_file().empty() && node->location().line() > 1)
+        {
+            ctx().set_instantiation_source(node->source_file(), node->location());
+        }
+        else if (!ctx().source_file().empty())
+        {
+            ctx().set_instantiation_source(ctx().source_file(), SourceLocation(0, 0));
+        }
+    }
+
+    //===================================================================
     // Generic Type Instantiation
     //===================================================================
 
@@ -493,8 +543,9 @@ namespace Cryo::Codegen
                 fn_ctx->entry_block = entry;
                 ctx().set_current_function(std::move(fn_ctx));
 
-                // Set current type name for this.field resolution
+                // Set current type name and instantiation context for error reporting
                 ctx().set_current_type_name(mangled);
+                set_instantiation_context_from_type(generic_name, type_args);
 
                 // Enter function scope
                 values().enter_scope(fn->getName().str());
@@ -597,6 +648,7 @@ namespace Cryo::Codegen
                 builder().SetInsertPoint(saved_insert_block);
             }
             ctx().set_current_type_name(saved_type_name);
+
             ctx().set_namespace_context(saved_namespace);
         }
 
@@ -698,8 +750,9 @@ namespace Cryo::Codegen
                     fn_ctx->entry_block = entry;
                     ctx().set_current_function(std::move(fn_ctx));
 
-                    // Set current type name for this.field resolution
+                    // Set current type name and instantiation context for error reporting
                     ctx().set_current_type_name(mangled);
+                    set_instantiation_context_from_type(generic_name, type_args);
 
                     // Enter function scope
                     values().enter_scope(fn->getName().str());
@@ -795,6 +848,7 @@ namespace Cryo::Codegen
                     builder().SetInsertPoint(saved_insert_block);
                 }
                 ctx().set_current_type_name(saved_type_name);
+    
                 ctx().set_namespace_context(saved_namespace);
             }
         }
@@ -1279,8 +1333,9 @@ namespace Cryo::Codegen
                     fn_ctx->entry_block = entry;
                     ctx().set_current_function(std::move(fn_ctx));
 
-                    // Set current type name for this.field resolution
+                    // Set current type name and instantiation context for error reporting
                     ctx().set_current_type_name(mangled);
+                    set_instantiation_context_from_type(generic_name, type_args);
 
                     // Enter function scope
                     values().enter_scope(fn->getName().str());
@@ -1371,6 +1426,7 @@ namespace Cryo::Codegen
                 builder().SetInsertPoint(saved_insert_block);
             }
             ctx().set_current_type_name(saved_type_name);
+
             ctx().set_namespace_context(saved_namespace);
         }
 
@@ -2010,8 +2066,9 @@ namespace Cryo::Codegen
                     fn_ctx->entry_block = entry;
                     ctx().set_current_function(std::move(fn_ctx));
 
-                    // Set current type name for this.field resolution
+                    // Set current type name and instantiation context for error reporting
                     ctx().set_current_type_name(mangled);
+                    set_instantiation_context_from_type(generic_name, type_args);
 
                     // Enter function scope
                     values().enter_scope(fn->getName().str());
@@ -2140,6 +2197,7 @@ namespace Cryo::Codegen
                     builder().SetInsertPoint(saved_insert_block);
                 }
                 ctx().set_current_type_name(saved_type_name);
+    
                 ctx().set_namespace_context(saved_namespace);
             }
             else
@@ -2655,8 +2713,9 @@ namespace Cryo::Codegen
             fn_ctx->entry_block = entry;
             ctx().set_current_function(std::move(fn_ctx));
 
-            // Set current type name for this.field resolution
+            // Set current type name and instantiation context for error reporting
             ctx().set_current_type_name(mangled_type);
+            set_instantiation_context_from_type(generic_base, all_type_args);
 
             // Enter function scope
             values().enter_scope(fn->getName().str());

@@ -673,8 +673,13 @@ namespace Cryo::Codegen
                     type_args.push_back(arg_type);
                 }
 
-                // Instantiate the generic struct type
+                // Instantiate the generic struct type — record call site for error reporting
+                bool had_inst_source = !ctx().instantiation_file().empty();
+                if (!had_inst_source && node)
+                    ctx().set_instantiation_source(node->source_file(), node->location());
                 llvm::StructType *instantiated_type = generics->instantiate_struct(base_name, type_args);
+                if (!had_inst_source)
+                    ctx().clear_instantiation_source();
                 if (!instantiated_type)
                 {
                     report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
@@ -1896,7 +1901,12 @@ namespace Cryo::Codegen
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                           "generate_enum_variant: Instantiating enum '{}'",
                                           instantiated_enum_name);
+                                bool had_inst_source = !ctx().instantiation_file().empty();
+                                if (!had_inst_source && node)
+                                    ctx().set_instantiation_source(node->source_file(), node->location());
                                 generics->instantiate_enum(resolved_enum_name, inferred_type_args);
+                                if (!had_inst_source)
+                                    ctx().clear_instantiation_source();
                             }
                         }
                         else
@@ -2649,8 +2659,13 @@ namespace Cryo::Codegen
 
                     if (!type_args.empty())
                     {
-                        // Trigger on-demand instantiation
+                        // Trigger on-demand instantiation — record call site for error reporting
+                        bool had_inst_source = !ctx().instantiation_file().empty();
+                        if (!had_inst_source && node)
+                            ctx().set_instantiation_source(node->source_file(), node->location());
                         llvm::StructType *instantiated = gen_codegen->instantiate_struct(base_name, type_args);
+                        if (!had_inst_source)
+                            ctx().clear_instantiation_source();
 
                         if (instantiated)
                         {

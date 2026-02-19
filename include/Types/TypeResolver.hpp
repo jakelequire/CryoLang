@@ -49,6 +49,9 @@ namespace Cryo
         // Current source location for error reporting
         SourceLocation current_location;
 
+        // Source file path (for tracking instantiation call sites)
+        std::string source_file;
+
         ResolutionContext() : current_module(ModuleID::invalid()) {}
 
         explicit ResolutionContext(ModuleID mod) : current_module(mod) {}
@@ -81,6 +84,7 @@ namespace Cryo
             ctx.current_module = current_module;
             ctx.imports = imports;
             ctx.generic_bindings = generic_bindings;
+            ctx.source_file = source_file;
             // Don't copy in_progress - start fresh for nested resolution
             return ctx;
         }
