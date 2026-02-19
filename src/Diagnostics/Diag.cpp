@@ -494,6 +494,13 @@ namespace Cryo
             }
             out << "\n";
 
+            // Try to load source file if not already cached (handles path mismatches
+            // between relative paths in the source cache and absolute paths from AST nodes)
+            if (span.start_line > 0 && !has_source(span.file))
+            {
+                add_source_file(span.file);
+            }
+
             // Show source snippet when we have a valid line number and source
             if (span.start_line > 0 && has_source(span.file))
             {
@@ -699,7 +706,7 @@ namespace Cryo
     // Source file management
     //=========================================================================
 
-    void DiagEmitter::add_source(std::string_view filename, std::string_view content)
+    void DiagEmitter::add_source(std::string_view filename, std::string_view content) const
     {
         std::vector<std::string> lines;
         std::string current_line;
@@ -726,7 +733,7 @@ namespace Cryo
         _source_cache[std::string(filename)] = std::move(lines);
     }
 
-    void DiagEmitter::add_source_file(std::string_view filename)
+    void DiagEmitter::add_source_file(std::string_view filename) const
     {
         auto file = make_file_from_path(std::string(filename));
         if (file && file->load())
