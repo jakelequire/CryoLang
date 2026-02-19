@@ -84,6 +84,9 @@ namespace Cryo
         const std::string &current_namespace() const { return _current_namespace; }
         ModuleID current_module() const { return _current_module_id; }
 
+        // Transfer ownership of the lexer's source file (for preserving source buffers in stdlib mode)
+        std::unique_ptr<File> take_lexer_file() { return _lexer ? _lexer->take_file() : nullptr; }
+
         // Scope tracking
         bool is_global_scope() const { return _scope_depth == 0; }
         void enter_scope() { _scope_depth++; }
