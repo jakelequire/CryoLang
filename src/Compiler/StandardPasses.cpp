@@ -2837,6 +2837,42 @@ namespace Cryo
             }
             break;
         }
+        case NodeKind::MemberAccess:
+        {
+            auto *member = static_cast<MemberAccessNode *>(expr);
+            // Recurse into the object expression first
+            resolve_expression(member->object(), TypeRef{}, ctx);
+            // Resolve and cache the type of this member access
+            TypeRef member_type = resolve_member_access_type(member, ctx);
+            if (member_type.is_valid())
+                member->set_resolved_type(member_type);
+            break;
+        }
+        case NodeKind::ArrayAccess:
+        {
+            auto *array_access = static_cast<ArrayAccessNode *>(expr);
+            // Resolve child expressions first
+            resolve_expression(array_access->array(), TypeRef{}, ctx);
+            resolve_expression(array_access->index(), TypeRef{}, ctx);
+            // Get the array/pointer type and extract the element type
+            TypeRef array_type = array_access->array()->get_resolved_type();
+            if (array_type.is_valid())
+            {
+                if (array_type->kind() == TypeKind::Pointer)
+                {
+                    auto *ptr = static_cast<const PointerType *>(array_type.get());
+                    if (ptr->pointee().is_valid())
+                        array_access->set_resolved_type(ptr->pointee());
+                }
+                else if (array_type->kind() == TypeKind::Array)
+                {
+                    auto *arr = static_cast<const ArrayType *>(array_type.get());
+                    if (arr->element().is_valid())
+                        array_access->set_resolved_type(arr->element());
+                }
+            }
+            break;
+        }
         default:
             // For other expressions, continue walking child expressions
             break;
@@ -3298,10 +3334,25 @@ namespace Cryo
             {
                 obj_type = resolve_member_access_type(nested_access, ctx);
             }
+            // Handle array index access (e.g., arr[i].field)
+            else if (auto *array_access = dynamic_cast<ArrayAccessNode *>(member_access->object()))
+            {
+                TypeRef array_type = array_access->get_resolved_type();
+                if (array_type.is_valid())
+                    obj_type = array_type;
+            }
         }
 
         if (!obj_type.is_valid())
             return TypeRef{};
+
+        // Unwrap pointer to get the underlying struct/class type
+        if (obj_type->kind() == TypeKind::Pointer)
+        {
+            auto *ptr = static_cast<const PointerType *>(obj_type.get());
+            if (ptr->pointee().is_valid())
+                obj_type = ptr->pointee();
+        }
 
         const std::string &field_name = member_access->member();
 
