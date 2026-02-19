@@ -228,6 +228,9 @@ namespace Cryo
         // File access
         const File &file() const { return *_file; }
 
+        // Transfer ownership of the source file (for preserving source buffers)
+        std::unique_ptr<File> take_file() { return std::move(_file); }
+
     private:
         // Core lexing methods
         Token lex_token();

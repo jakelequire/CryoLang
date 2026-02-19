@@ -591,6 +591,109 @@ namespace Cryo
     }
 
     //===================================================================
+    // Struct Implementation Block Registry Implementation
+    //===================================================================
+
+    void TemplateRegistry::register_struct_impl_block(const std::string &base_struct_name,
+                                                      ImplementationBlockNode *impl_block,
+                                                      const std::string &module_namespace)
+    {
+        if (base_struct_name.empty() || !impl_block)
+            return;
+
+        _struct_impl_blocks[base_struct_name] = impl_block;
+        LOG_DEBUG(Cryo::LogComponent::AST,
+                  "Registered struct impl block: {} (namespace: {}, methods: {})",
+                  base_struct_name, module_namespace, impl_block->method_implementations().size());
+
+        // Also extract and store method metadata for cross-module access
+        // This merges with any existing method info (e.g., from inline struct methods)
+        auto existing_it = _template_method_info.find(base_struct_name);
+        if (existing_it != _template_method_info.end())
+        {
+            // Merge impl block methods into existing method info
+            for (const auto &method : impl_block->method_implementations())
+            {
+                if (!method)
+                    continue;
+
+                MethodMetadata mm;
+                mm.name = method->name();
+                mm.return_type_annotation = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "void";
+                mm.is_static = method->is_static();
+
+                const auto &params = method->parameters();
+                for (const auto &param : params)
+                {
+                    if (param)
+                    {
+                        mm.parameter_names.push_back(param->name());
+                        mm.parameter_type_annotations.push_back(param->type_annotation() ? param->type_annotation()->to_string() : "unknown");
+                    }
+                }
+
+                existing_it->second.methods.push_back(std::move(mm));
+                LOG_TRACE(Cryo::LogComponent::AST, "Merged struct impl method metadata: {}::{} -> {}",
+                          base_struct_name, mm.name, mm.return_type_annotation);
+            }
+        }
+        else
+        {
+            // Create new method info entry
+            TemplateMethodInfo method_info;
+            method_info.module_namespace = module_namespace;
+
+            for (const auto &method : impl_block->method_implementations())
+            {
+                if (!method)
+                    continue;
+
+                MethodMetadata mm;
+                mm.name = method->name();
+                mm.return_type_annotation = method->return_type_annotation() ? method->return_type_annotation()->to_string() : "void";
+                mm.is_static = method->is_static();
+
+                const auto &params = method->parameters();
+                for (const auto &param : params)
+                {
+                    if (param)
+                    {
+                        mm.parameter_names.push_back(param->name());
+                        mm.parameter_type_annotations.push_back(param->type_annotation() ? param->type_annotation()->to_string() : "unknown");
+                    }
+                }
+
+                method_info.methods.push_back(std::move(mm));
+                LOG_TRACE(Cryo::LogComponent::AST, "Extracted struct impl method metadata: {}::{} -> {}",
+                          base_struct_name, mm.name, mm.return_type_annotation);
+            }
+
+            _template_method_info[base_struct_name] = std::move(method_info);
+        }
+
+        LOG_DEBUG(Cryo::LogComponent::AST, "Stored {} total method(s) metadata for struct template '{}'",
+                  _template_method_info[base_struct_name].methods.size(), base_struct_name);
+    }
+
+    ImplementationBlockNode *TemplateRegistry::get_struct_impl_block(const std::string &base_struct_name) const
+    {
+        auto it = _struct_impl_blocks.find(base_struct_name);
+        if (it != _struct_impl_blocks.end())
+        {
+            LOG_TRACE(Cryo::LogComponent::AST,
+                      "Found struct impl block: {} with {} methods",
+                      base_struct_name, it->second->method_implementations().size());
+            return it->second;
+        }
+        return nullptr;
+    }
+
+    bool TemplateRegistry::has_struct_impl_block(const std::string &base_struct_name) const
+    {
+        return _struct_impl_blocks.find(base_struct_name) != _struct_impl_blocks.end();
+    }
+
+    //===================================================================
     // Module Constants Registry Implementation
     //===================================================================
 

@@ -104,6 +104,12 @@ namespace Cryo
         // so that templates registered with ast_node pointers remain valid
         std::vector<std::unique_ptr<ProgramNode>> _compiled_asts;
 
+        // Storage for source files whose content backs Token string_views in preserved ASTs.
+        // Token._text is std::string_view into File._content. Without preserving the File,
+        // destroying the Parser/Lexer frees the content and leaves dangling string_views
+        // in BinaryExpressionNode._operator and UnaryExpressionNode._operator.
+        std::vector<std::unique_ptr<File>> _preserved_source_files;
+
         // Cross-module function registry for stdlib compilation.
         // Stores lightweight type descriptors from completed modules so that
         // later modules can create ExternalLinkage declarations without sharing

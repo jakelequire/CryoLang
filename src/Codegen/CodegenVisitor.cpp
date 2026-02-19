@@ -326,7 +326,7 @@ namespace Cryo::Codegen
                     base_type_name = type_name.substr(0, angle_pos);
                     qualified_type = ns_context.empty() ? base_type_name : ns_context + "::" + base_type_name;
 
-                    // Register enum impl blocks for generic enums
+                    // Register impl blocks for generic enums and structs
                     // This allows the monomorphizer to generate methods during instantiation
                     const Cryo::TemplateRegistry::TemplateInfo *tmpl_info = template_registry->find_template(base_type_name);
                     if (tmpl_info && tmpl_info->enum_template)
@@ -334,6 +334,13 @@ namespace Cryo::Codegen
                         template_registry->register_enum_impl_block(base_type_name, impl_block, ns_context);
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Pass 2.5: Registered enum impl block for '{}' (base: {})",
+                                  type_name, base_type_name);
+                    }
+                    if (tmpl_info && tmpl_info->struct_template)
+                    {
+                        template_registry->register_struct_impl_block(base_type_name, impl_block, ns_context);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Pass 2.5: Registered struct impl block for '{}' (base: {})",
                                   type_name, base_type_name);
                     }
                 }

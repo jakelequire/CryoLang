@@ -157,6 +157,11 @@ namespace Cryo
         // Used to generate methods during enum instantiation
         std::unordered_map<std::string, ImplementationBlockNode *> _enum_impl_blocks;
 
+        // Struct implementation blocks: base struct name -> impl block
+        // Stores references to implementation blocks for generic structs
+        // Used to generate methods during struct instantiation
+        std::unordered_map<std::string, ImplementationBlockNode *> _struct_impl_blocks;
+
         // Module-level constants: namespace -> list of constants
         // Used to forward constants to consumer modules during cross-module generic instantiation
         std::unordered_map<std::string, std::vector<ModuleConstant>> _module_constants;
@@ -385,6 +390,37 @@ namespace Cryo
          * @return true if registered
          */
         bool has_enum_impl_block(const std::string &base_enum_name) const;
+
+        //===================================================================
+        // Struct Implementation Block Registry (for generic struct instantiation)
+        //===================================================================
+
+        /**
+         * @brief Register an implementation block for a generic struct
+         * @param base_struct_name Base name of the generic struct (e.g., "Array", "HashMap")
+         * @param impl_block Pointer to the implementation block node
+         * @param module_namespace Namespace where the impl block is defined
+         *
+         * This allows the monomorphizer to find and generate methods when
+         * instantiating generic structs like Array<i64>.
+         */
+        void register_struct_impl_block(const std::string &base_struct_name,
+                                        ImplementationBlockNode *impl_block,
+                                        const std::string &module_namespace);
+
+        /**
+         * @brief Get the implementation block for a generic struct
+         * @param base_struct_name Base name of the generic struct
+         * @return Pointer to ImplementationBlockNode, or nullptr if not registered
+         */
+        ImplementationBlockNode *get_struct_impl_block(const std::string &base_struct_name) const;
+
+        /**
+         * @brief Check if an implementation block is registered for a generic struct
+         * @param base_struct_name Base name of the generic struct
+         * @return true if registered
+         */
+        bool has_struct_impl_block(const std::string &base_struct_name) const;
 
         /**
          * @brief Find the namespace of a type by searching method annotation keys

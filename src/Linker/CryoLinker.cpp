@@ -273,6 +273,8 @@ namespace Cryo::Linker
 #if defined(_WIN32) || defined(_WIN64)
         // Windows socket library (Winsock2)
         linker_args.push_back("-lws2_32");
+        // Use console subsystem so the C runtime expects main(), not WinMain()
+        linker_args.push_back("-mconsole");
 #endif
 
         // Add output specification

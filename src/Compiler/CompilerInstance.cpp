@@ -1080,6 +1080,20 @@ namespace Cryo
         if (_stdlib_compilation_mode && _ast_root)
         {
             _compiled_asts.push_back(std::move(_ast_root));
+
+            // Also preserve the source file backing Token string_views in the AST.
+            // Token._text is std::string_view into File._content. Destroying the
+            // Parser/Lexer/File would free the content and leave dangling string_views
+            // in preserved AST nodes (BinaryExpressionNode._operator, etc.).
+            if (_parser)
+            {
+                auto file = _parser->take_lexer_file();
+                if (file)
+                {
+                    _preserved_source_files.push_back(std::move(file));
+                }
+            }
+
             LOG_DEBUG(LogComponent::GENERAL, "CompilerInstance: Preserved AST for stdlib mode (total: {} ASTs)",
                       _compiled_asts.size());
         }
