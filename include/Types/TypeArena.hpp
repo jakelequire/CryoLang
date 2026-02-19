@@ -27,6 +27,7 @@
 #include <optional>
 #include <atomic>
 #include <string>
+#include <utility>
 
 namespace Cryo
 {
@@ -190,6 +191,13 @@ namespace Cryo
         std::unordered_map<std::string, TypeRef> _enum_types;
         std::unordered_map<std::string, TypeRef> _trait_types;
 
+        // Dedicated map for generic instantiation call sites.
+        // Keyed by display name (e.g., "Array<String>").  First-write-wins:
+        // the entry from TypeResolution (Stage 4) is preserved even when
+        // later stages (Monomorphizer, TypeMapper) create new TypeRef objects
+        // for the same logical instantiation.
+        std::unordered_map<std::string, std::pair<std::string, SourceLocation>> _instantiation_sites;
+
         // Generate key for user-defined types
         static std::string make_user_type_key(const QualifiedTypeName &name);
 
@@ -235,6 +243,19 @@ namespace Cryo
 
         // Look up a type by name (searches struct, enum, class, trait caches)
         TypeRef lookup_type_by_name(const std::string &name) const;
+
+        // Store the call site where a generic instantiation was first requested.
+        // First-write-wins: subsequent calls for the same display name are ignored
+        // so that the original call site (from TypeResolution) is never overwritten.
+        void store_instantiation_site(const std::string &display_name,
+                                      const std::string &file,
+                                      SourceLocation loc);
+
+        // Retrieve the call site for a generic instantiation by display name.
+        // Returns true and fills out_file/out_loc if found.
+        bool get_instantiation_site(const std::string &display_name,
+                                    std::string &out_file,
+                                    SourceLocation &out_loc) const;
 
         // Get the number of types in the arena
         size_t type_count() const { return _types.size(); }

@@ -300,6 +300,11 @@ namespace Cryo
             auto *inst = const_cast<InstantiatedType *>(
                 static_cast<const InstantiatedType *>(instantiated.get()));
             inst->set_instantiation_site(instantiation_file, instantiation_loc);
+
+            // Also store in the dedicated site map (first-write-wins, survives
+            // later TypeRef overwrites by Monomorphizer/TypeMapper)
+            arena.store_instantiation_site(
+                instantiated->display_name(), instantiation_file, instantiation_loc);
         }
 
         // Register in name caches so lookup_type_by_name() can find it

@@ -37,7 +37,8 @@ namespace Cryo::Codegen
         if (!ctx().instantiation_file().empty())
             return;
 
-        // Try to find the InstantiatedType in the arena for its stored call site.
+        // Build the display name the same way InstantiatedType::display_name() does:
+        //   "Array<String>", "HashMap<string, String>", etc.
         std::string display = generic_name + "<";
         for (size_t i = 0; i < type_args.size(); ++i)
         {
@@ -47,29 +48,33 @@ namespace Cryo::Codegen
         }
         display += ">";
 
-        TypeRef inst = ctx().symbols().arena().lookup_type_by_name(display);
-        if (inst.is_valid() && inst->kind() == TypeKind::InstantiatedType)
+        // Look up the dedicated call-site map.  This was populated during
+        // TypeResolution (Stage 4) via GenericRegistry::instantiate() and is
+        // immune to the TypeRef overwrites that happen in later stages.
+        std::string site_file;
+        SourceLocation site_loc;
+        auto &arena = ctx().symbols().arena();
+
+        if (arena.get_instantiation_site(display, site_file, site_loc))
         {
-            auto *inst_type = static_cast<const InstantiatedType *>(inst.get());
-            if (inst_type->has_instantiation_site())
-            {
-                ctx().set_instantiation_source(
-                    inst_type->instantiation_file(),
-                    inst_type->instantiation_loc());
-                return;
-            }
+            ctx().set_instantiation_source(site_file, site_loc);
+
+            // Also register under the mangled name so child types (e.g.,
+            // HashMapIter<K,V> instantiated while generating HashMap<K,V>
+            // methods) can inherit this call site via current_type_name().
+            std::string mangled = mangle_type_name(generic_name, type_args);
+            arena.store_instantiation_site(mangled, site_file, site_loc);
+            return;
         }
 
-        // Last resort: try the current AST node for a better location, otherwise
-        // use the module source file with line 0 (renders as file-only, no source block).
-        auto *node = ctx().current_node();
-        if (node && !node->source_file().empty() && node->location().line() > 1)
+        // Direct lookup failed — this type was created during monomorphization
+        // (not TypeResolution), so there's no direct call site.  Inherit the
+        // call site of the parent type whose methods triggered this instantiation.
+        const std::string &parent = ctx().current_type_name();
+        if (!parent.empty() && arena.get_instantiation_site(parent, site_file, site_loc))
         {
-            ctx().set_instantiation_source(node->source_file(), node->location());
-        }
-        else if (!ctx().source_file().empty())
-        {
-            ctx().set_instantiation_source(ctx().source_file(), SourceLocation(0, 0));
+            ctx().set_instantiation_source(site_file, site_loc);
+            return;
         }
     }
 
@@ -520,6 +525,8 @@ namespace Cryo::Codegen
                 if (!method)
                     continue;
 
+                // Track the method node so TypeMapper callbacks get the method location
+                NodeTracker method_tracker(ctx(), method.get());
                 llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
                 if (fn && method->body() && fn->empty())
                 {
@@ -530,6 +537,8 @@ namespace Cryo::Codegen
             // Pass 2: Generate all method bodies (all declarations now exist)
             for (auto &[method, fn] : method_decls)
             {
+                // Track the method node for precise error locations
+                NodeTracker method_tracker(ctx(), method);
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "GenericCodegen: Generating method body: {}::{}",
                           mangled, method->name());
@@ -727,6 +736,7 @@ namespace Cryo::Codegen
                     if (!method)
                         continue;
 
+                    NodeTracker method_tracker(ctx(), method.get());
                     llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
                     if (fn && method->body() && fn->empty())
                     {
@@ -737,6 +747,7 @@ namespace Cryo::Codegen
                 // Pass 2: Generate all impl block method bodies
                 for (auto &[method, fn] : impl_method_decls)
                 {
+                    NodeTracker method_tracker(ctx(), method);
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "GenericCodegen: Generating struct impl method body: {}::{}",
                               mangled, method->name());
@@ -1315,6 +1326,9 @@ namespace Cryo::Codegen
             {
                 if (!method)
                     continue;
+
+                // Track the method node for precise error locations
+                NodeTracker method_tracker(ctx(), method.get());
 
                 // Generate method with the mangled class name as parent type
                 llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
@@ -2042,6 +2056,9 @@ namespace Cryo::Codegen
                         }
                     }
 
+                    // Track the method node for precise error locations
+                    NodeTracker method_tracker(ctx(), method.get());
+
                     // Generate method declaration with the mangled enum name as parent type
                     llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
                     if (fn && method->body() && fn->empty())
@@ -2695,6 +2712,9 @@ namespace Cryo::Codegen
                 // substitute_type_annotation redirecting "Maybe_U" → "Maybe_i32" at call sites
             }
         }
+
+        // Track the method node for precise error locations
+        NodeTracker method_tracker(ctx(), method);
 
         // Generate method declaration (force_allow_generic = true to bypass generic skip)
         llvm::Function *fn = _declarations->generate_method_declaration(method, mangled_type, /*force_allow_generic=*/true);

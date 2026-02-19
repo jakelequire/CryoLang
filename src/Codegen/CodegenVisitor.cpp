@@ -110,24 +110,18 @@ namespace Cryo::Codegen
             [generics_ptr, ctx_raw](const std::string &generic_name,
                            const std::vector<TypeRef> &type_args) -> llvm::StructType *
             {
-                // Set instantiation source from the current AST node if not already set.
-                // This captures the call site (e.g., function using a generic return type)
-                // so error messages can show where the instantiation was required from.
-                bool set_source = false;
-                if (ctx_raw->instantiation_file().empty())
-                {
-                    auto *node = ctx_raw->current_node();
-                    if (node && !node->source_file().empty())
-                    {
-                        ctx_raw->set_instantiation_source(node->source_file(), node->location());
-                        set_source = true;
-                    }
-                }
+                // Save the instantiation source so this call doesn't leak
+                // context into subsequent, unrelated instantiations.
+                std::string saved_file = ctx_raw->instantiation_file();
+                SourceLocation saved_loc = ctx_raw->instantiation_loc();
 
                 llvm::Type *type = generics_ptr->get_instantiated_type(generic_name, type_args);
 
-                if (set_source)
+                // Restore previous source (empty if none was set)
+                if (saved_file.empty())
                     ctx_raw->clear_instantiation_source();
+                else
+                    ctx_raw->set_instantiation_source(saved_file, saved_loc);
 
                 return llvm::dyn_cast_or_null<llvm::StructType>(type);
             });

@@ -293,7 +293,8 @@ namespace Cryo
         size_t _warning_count = 0;
 
         // Source file cache for rendering (filename -> lines)
-        std::unordered_map<std::string, std::vector<std::string>> _source_cache;
+        // Mutable because it's a lazy cache populated during rendering
+        mutable std::unordered_map<std::string, std::vector<std::string>> _source_cache;
 
     public:
         DiagEmitter() = default;
@@ -356,10 +357,10 @@ namespace Cryo
         //=====================================================================
 
         // Add source file content for rendering
-        void add_source(std::string_view filename, std::string_view content);
+        void add_source(std::string_view filename, std::string_view content) const;
 
         // Add source file by reading from disk
-        void add_source_file(std::string_view filename);
+        void add_source_file(std::string_view filename) const;
 
         // Get a specific line from cached source
         std::string_view get_line(std::string_view filename, size_t line) const;

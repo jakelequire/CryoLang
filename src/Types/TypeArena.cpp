@@ -815,6 +815,52 @@ namespace Cryo
     }
 
     // ========================================================================
+    // Instantiation call-site tracking
+    // ========================================================================
+
+    void TypeArena::store_instantiation_site(const std::string &display_name,
+                                             const std::string &file,
+                                             SourceLocation loc)
+    {
+        if (display_name.empty() || file.empty())
+            return;
+
+        // First-write-wins: preserve the original call site from TypeResolution.
+        // Later stages (Monomorphizer, TypeMapper) must not overwrite it.
+        _instantiation_sites.try_emplace(display_name, std::make_pair(file, loc));
+    }
+
+    bool TypeArena::get_instantiation_site(const std::string &display_name,
+                                           std::string &out_file,
+                                           SourceLocation &out_loc) const
+    {
+        // Exact match
+        auto it = _instantiation_sites.find(display_name);
+        if (it != _instantiation_sites.end())
+        {
+            out_file = it->second.first;
+            out_loc = it->second.second;
+            return true;
+        }
+
+        // Suffix match: handles module-qualified keys like "collections::Array<String>"
+        // when the query is just "Array<String>"
+        std::string suffix = "::" + display_name;
+        for (const auto &[key, value] : _instantiation_sites)
+        {
+            if (key.size() > suffix.size() &&
+                key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0)
+            {
+                out_file = value.first;
+                out_loc = value.second;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // ========================================================================
     // Error type creation
     // ========================================================================
 
