@@ -1781,8 +1781,26 @@ namespace Cryo::Codegen
                         // Skip 'this' parameter (first param for instance methods)
                         if (param_name == "this")
                         {
-                            // 'this' is a pointer to the current type
+                            // Robust lookup chain for monomorphized enum 'this' type.
+                            // The Monomorphizer may not have created the concrete enum TypeRef
+                            // (e.g., due to TypeID mismatches on imported generic types),
+                            // so we try multiple strategies and create as last resort.
                             TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
+                            if (!this_type.is_valid())
+                                this_type = symbols().lookup_enum_type(mangled);
+                            if (!this_type.is_valid())
+                                this_type = symbols().lookup_struct_type(mangled);
+                            // Fallback: look up the base generic type (e.g., "Option")
+                            if (!this_type.is_valid())
+                                this_type = symbols().arena().lookup_type_by_name(generic_name);
+                            // Last resort: create a bare enum TypeRef so 'this' is resolvable
+                            if (!this_type.is_valid())
+                            {
+                                Cryo::QualifiedTypeName qname;
+                                qname.name = mangled;
+                                qname.module = Cryo::ModuleID::invalid();
+                                this_type = symbols().arena().create_enum(qname);
+                            }
                             if (this_type.is_valid())
                             {
                                 TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
@@ -2398,7 +2416,23 @@ namespace Cryo::Codegen
 
                 if (param_name == "this")
                 {
+                    // Robust lookup chain for monomorphized 'this' type.
+                    // Same strategy as instantiate_enum: try multiple lookups,
+                    // fall back to base generic type, create as last resort.
                     TypeRef this_type = symbols().arena().lookup_type_by_name(mangled_type);
+                    if (!this_type.is_valid())
+                        this_type = symbols().lookup_enum_type(mangled_type);
+                    if (!this_type.is_valid())
+                        this_type = symbols().lookup_struct_type(mangled_type);
+                    if (!this_type.is_valid())
+                        this_type = symbols().arena().lookup_type_by_name(generic_base);
+                    if (!this_type.is_valid())
+                    {
+                        Cryo::QualifiedTypeName qname;
+                        qname.name = mangled_type;
+                        qname.module = Cryo::ModuleID::invalid();
+                        this_type = symbols().arena().create_enum(qname);
+                    }
                     if (this_type.is_valid())
                     {
                         TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);

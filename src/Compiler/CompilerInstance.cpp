@@ -3024,10 +3024,18 @@ namespace Cryo
         case SimpleTypeDesc::NamedStruct:
         {
             auto *existing = llvm::StructType::getTypeByName(ctx, desc.struct_name);
-            return existing; // nullptr if not found in this context
+            if (existing)
+                return existing;
+            // Struct not yet defined in this context — create an opaque (identified) struct
+            // so the function declaration can still be created. The linker will resolve
+            // the actual struct body when bitcode files are merged via llvm-link.
+            return llvm::StructType::create(ctx, desc.struct_name);
         }
         default:
-            return nullptr;
+            // For unrecognized types (arrays, vectors, etc.), use opaque pointer
+            // as a safe fallback. Most non-primitive types are passed by pointer
+            // in Cryo, and LLVM 20's opaque pointers make this always valid.
+            return llvm::PointerType::get(ctx, 0);
         }
     }
 
@@ -3312,8 +3320,11 @@ namespace Cryo
                 }
             }
 
-            // Save function signatures from this module for cross-module resolution
-            if (module_success && _codegen)
+            // Save cross-module function signatures even from partially failed modules.
+            // The LLVM module may contain valid function definitions whose signatures
+            // are needed by later modules. Function signatures (types) are set at
+            // creation time and remain correct even if the function body has errors.
+            if (_codegen && _codegen->get_module())
             {
                 save_cross_module_functions();
             }
@@ -3818,6 +3829,12 @@ namespace Cryo
         {
             LOG_DEBUG(LogComponent::GENERAL, "Function declaration phase: Pre-registering functions in LLVM module");
             _codegen->get_visitor()->pre_register_functions_from_symbol_table();
+
+            // Declare functions from previously compiled modules (cross-module resolution)
+            if (_stdlib_compilation_mode && !_cross_module_functions.empty())
+            {
+                declare_cross_module_functions();
+            }
         }
         else
         {
