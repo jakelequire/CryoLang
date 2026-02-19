@@ -39,12 +39,12 @@ namespace Cryo
 
         // Context tracking
         bool _in_implementation_block = false;
-        bool _parsing_method_body = false;         // Track if we're inside a method body (for synchronize context)
-        bool _parsing_class_members = false;       // Track if we're parsing class/struct members (for synchronize context)
-        std::string _current_namespace = "Global"; // Current namespace context
-        std::string _current_parsing_type_name;    // Track current struct/class being parsed (for self-referential types)
-        ModuleID _current_module_id;               // Current module ID for proper type qualification
-        int _scope_depth = 0;                      // Track nesting depth (0 = global scope)
+        bool _parsing_method_body = false;                // Track if we're inside a method body (for synchronize context)
+        bool _parsing_class_members = false;              // Track if we're parsing class/struct members (for synchronize context)
+        std::string _current_namespace = "Global";        // Current namespace context
+        std::string _current_parsing_type_name;           // Track current struct/class being parsed (for self-referential types)
+        ModuleID _current_module_id;                      // Current module ID for proper type qualification
+        int _scope_depth = 0;                             // Track nesting depth (0 = global scope)
         std::vector<std::string> _current_generic_params; // Track generic params of current type being parsed (e.g., T, U in struct Foo<T, U>)
 
         // Bracket depth tracking for improved error recovery
