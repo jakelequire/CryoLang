@@ -53,7 +53,10 @@ namespace Cryo::Codegen
             //   2. A secondary span at the call site (if we recorded one)
             if (!_current_type_name.empty())
             {
-                diag.with_note("in instantiation of '" + _current_type_name + "'");
+                const std::string &display = _current_type_display_name.empty()
+                    ? _current_type_name : _current_type_display_name;
+
+                diag.with_note("in instantiation of '" + display + "'");
 
                 // Show the call site as a secondary span.  When we have the
                 // exact line number we create a proper span; otherwise we
@@ -66,7 +69,7 @@ namespace Cryo::Codegen
                     call_site.start_col = _instantiation_loc.column();
                     call_site.end_line = call_site.start_line;
                     call_site.end_col = call_site.start_col + 1;
-                    call_site.label = "instantiation of '" + _current_type_name + "' required here";
+                    call_site.label = "instantiation of '" + display + "' required here";
                     call_site.is_primary = false;
                     diag.also_at(std::move(call_site));
                 }
@@ -74,8 +77,18 @@ namespace Cryo::Codegen
                          !node->source_file().empty() &&
                          node->source_file() != _source_file)
                 {
-                    // Fallback: no instantiation info at all, but we know which module
-                    diag.with_note("required from " + _source_file);
+                    // Fallback: no exact instantiation site, but the error is
+                    // in a different file from the source context.  Create a
+                    // file-level secondary span so it renders with :: formatting.
+                    Span fallback;
+                    fallback.file = _source_file;
+                    fallback.start_line = 0;
+                    fallback.start_col = 0;
+                    fallback.end_line = 0;
+                    fallback.end_col = 0;
+                    fallback.label = "required from this module";
+                    fallback.is_primary = false;
+                    diag.also_at(std::move(fallback));
                 }
             }
             _diagnostics->emit(std::move(diag));

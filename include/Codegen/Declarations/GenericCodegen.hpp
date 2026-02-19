@@ -409,7 +409,8 @@ namespace Cryo::Codegen
          *        info on CodegenContext for better error messages.
          */
         void set_instantiation_context_from_type(const std::string &generic_name,
-                                                  const std::vector<TypeRef> &type_args);
+                                                  const std::vector<TypeRef> &type_args,
+                                                  const std::string &parent_mangled = "");
     };
 
 } // namespace Cryo::Codegen
