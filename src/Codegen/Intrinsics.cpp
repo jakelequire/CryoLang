@@ -29,6 +29,16 @@ namespace Cryo::Codegen
         // Store current node for error context
         _current_node = node;
 
+        // Check for null arguments — upstream codegen failures can produce nulls
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            if (!args[i])
+            {
+                report_error("Intrinsic '" + intrinsic_name + "' has null argument at index " + std::to_string(i));
+                return nullptr;
+            }
+        }
+
         // Memory allocation intrinsics
         if (intrinsic_name == "malloc")
             return generate_malloc(args);
