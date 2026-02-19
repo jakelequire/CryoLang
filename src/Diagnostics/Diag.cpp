@@ -477,19 +477,93 @@ namespace Cryo
             }
         }
 
-        // Secondary spans with their own source snippets
+        // Secondary spans — render with full source snippets when possible
         for (const auto &span : diagnostic.spans())
         {
-            if (span.is_primary || !span.is_valid())
+            if (span.is_primary)
                 continue;
 
-            out << "  " << BLUE << "::" << RESET << " "
-                << span.file << ":" << span.start_line << ":" << span.start_col;
-            if (!span.label.empty())
+            if (span.file.empty())
+                continue;
+
+            // Header line:  :: file:line:col
+            out << "  " << BLUE << "::" << RESET << " " << span.file;
+            if (span.start_line > 0)
             {
-                out << " - " << CYAN << span.label << RESET;
+                out << ":" << span.start_line << ":" << span.start_col;
             }
             out << "\n";
+
+            // Show source snippet when we have a valid line number and source
+            if (span.start_line > 0 && has_source(span.file))
+            {
+                size_t sec_max_line = span.end_line + _config.context_lines;
+                size_t sec_line_width = std::max(size_t(3), std::to_string(sec_max_line).length());
+
+                // Empty margin
+                out << std::string(sec_line_width, ' ') << " " << BLUE << "|" << RESET << "\n";
+
+                size_t sec_start = span.start_line > _config.context_lines
+                                       ? span.start_line - _config.context_lines
+                                       : 1;
+                size_t sec_end = span.end_line + _config.context_lines;
+
+                for (size_t ln = sec_start; ln <= sec_end; ++ln)
+                {
+                    std::string_view lc = get_line(span.file, ln);
+                    if (lc.empty() && ln > span.end_line)
+                        break;
+
+                    std::string num = std::to_string(ln);
+                    bool is_sec_error = (ln >= span.start_line && ln <= span.end_line);
+
+                    out << std::string(sec_line_width - num.length(), ' ');
+                    if (is_sec_error)
+                        out << BOLD << BLUE << num << RESET;
+                    else
+                        out << GREY << num << RESET;
+                    out << " " << BLUE << "|" << RESET << " ";
+
+                    std::string line_str(lc);
+                    if (_config.colors)
+                        out << highlighter.highlight_line(line_str) << "\n";
+                    else
+                        out << line_str << "\n";
+
+                    // Underline on the target line
+                    if (is_sec_error && ln == span.start_line)
+                    {
+                        out << std::string(sec_line_width, ' ') << " " << BLUE << "|" << RESET << " ";
+
+                        size_t us = (span.start_col > 0 ? span.start_col - 1 : 0);
+                        if (us > lc.length()) us = lc.length();
+
+                        // Spaces before underline (handle tabs)
+                        for (size_t i = 0; i < us && i < lc.length(); ++i)
+                            out << (lc[i] == '\t' ? "    " : " ");
+
+                        // Underline length — extend to cover token
+                        size_t ue = us;
+                        while (ue < lc.length() && (std::isalnum(lc[ue]) || lc[ue] == '_' || lc[ue] == ':' || lc[ue] == '<' || lc[ue] == '>'))
+                            ++ue;
+                        if (ue <= us) ue = us + 1;
+
+                        out << BOLD << CYAN << "^" << std::string(ue - us > 1 ? ue - us - 1 : 0, '~') << RESET;
+
+                        if (!span.label.empty())
+                            out << " " << BOLD << CYAN << span.label << RESET;
+                        out << "\n";
+                    }
+                }
+
+                // Empty margin after
+                out << std::string(sec_line_width, ' ') << " " << BLUE << "|" << RESET << "\n";
+            }
+            else if (!span.label.empty())
+            {
+                // No source available — just show the label as a note
+                out << "    " << CYAN << span.label << RESET << "\n";
+            }
         }
 
         // Notes (indented with marker)

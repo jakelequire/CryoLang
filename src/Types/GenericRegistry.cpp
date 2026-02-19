@@ -4,6 +4,7 @@
  ******************************************************************************/
 
 #include "Types/GenericRegistry.hpp"
+#include "Types/GenericTypes.hpp"
 #include "Types/TypeArena.hpp"
 #include "Types/CompoundTypes.hpp"
 #include "Types/UserDefinedTypes.hpp"
@@ -272,7 +273,9 @@ namespace Cryo
 
     TypeRef GenericRegistry::instantiate(TypeRef generic_type,
                                           std::vector<TypeRef> type_args,
-                                          TypeArena &arena)
+                                          TypeArena &arena,
+                                          const std::string &instantiation_file,
+                                          SourceLocation instantiation_loc)
     {
         // Check cache first
         auto cached = get_cached_instantiation(generic_type, type_args);
@@ -290,6 +293,14 @@ namespace Cryo
 
         // Create the instantiated type
         TypeRef instantiated = arena.create_instantiation(generic_type, type_args);
+
+        // Store the call site where this instantiation was requested
+        if (!instantiation_file.empty())
+        {
+            auto *inst = const_cast<InstantiatedType *>(
+                static_cast<const InstantiatedType *>(instantiated.get()));
+            inst->set_instantiation_site(instantiation_file, instantiation_loc);
+        }
 
         // Register in name caches so lookup_type_by_name() can find it
         arena.register_instantiated_by_name(instantiated);

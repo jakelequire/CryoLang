@@ -46,6 +46,38 @@ namespace Cryo::Codegen
             {
                 diag.at(node);
             }
+            // If we're inside a generic instantiation, add context so the user
+            // knows which instantiation triggered the error.  The primary span
+            // points at the generic template definition; we add:
+            //   1. A note naming the concrete instantiation
+            //   2. A secondary span at the call site (if we recorded one)
+            if (!_current_type_name.empty())
+            {
+                diag.with_note("in instantiation of '" + _current_type_name + "'");
+
+                // Show the call site as a secondary span.  When we have the
+                // exact line number we create a proper span; otherwise we
+                // create a file-only span (line 0) that the renderer handles.
+                if (!_instantiation_file.empty())
+                {
+                    Span call_site;
+                    call_site.file = _instantiation_file;
+                    call_site.start_line = _instantiation_loc.line();
+                    call_site.start_col = _instantiation_loc.column();
+                    call_site.end_line = call_site.start_line;
+                    call_site.end_col = call_site.start_col + 1;
+                    call_site.label = "instantiation of '" + _current_type_name + "' required here";
+                    call_site.is_primary = false;
+                    diag.also_at(std::move(call_site));
+                }
+                else if (node && !_source_file.empty() &&
+                         !node->source_file().empty() &&
+                         node->source_file() != _source_file)
+                {
+                    // Fallback: no instantiation info at all, but we know which module
+                    diag.with_note("required from " + _source_file);
+                }
+            }
             _diagnostics->emit(std::move(diag));
         }
         else

@@ -4889,8 +4889,13 @@ namespace Cryo::Codegen
                 }
             }
 
-            // Instantiate the generic type
+            // Instantiate the generic type — record call site for error reporting
+            bool had_inst_source = !ctx().instantiation_file().empty();
+            if (!had_inst_source && node)
+                ctx().set_instantiation_source(node->source_file(), node->location());
             llvm::StructType *instantiated_type = generics->instantiate_struct(node->type_name(), type_args);
+            if (!had_inst_source)
+                ctx().clear_instantiation_source();
             if (!instantiated_type)
             {
                 report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
@@ -5144,8 +5149,15 @@ namespace Cryo::Codegen
                                 generic_display += ">";
                                 std::string mangled = mangle_generic_type_name(generic_display);
 
-                                // Ensure the enum is instantiated (creates LLVM type + registers variants)
-                                generics->instantiate_enum(effective_scope_name, resolved_args);
+                                // Ensure the enum is instantiated — record call site for error reporting
+                                {
+                                    bool had_inst_source = !ctx().instantiation_file().empty();
+                                    if (!had_inst_source && node)
+                                        ctx().set_instantiation_source(node->source_file(), node->location());
+                                    generics->instantiate_enum(effective_scope_name, resolved_args);
+                                    if (!had_inst_source)
+                                        ctx().clear_instantiation_source();
+                                }
 
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                           "ExpressionCodegen: Cross-type generic resolution {} -> {} in generic context",
