@@ -268,11 +268,11 @@ namespace Cryo
             if (_config.enable_colors)
             {
                 std::cerr << log_level_to_color(level) << final_message
-                          << "\033[0m" << std::endl;
+                          << "\033[0m" << '\n';
             }
             else
             {
-                std::cerr << final_message << std::endl;
+                std::cerr << final_message << '\n';
             }
 
             if (_config.auto_flush)
@@ -284,7 +284,7 @@ namespace Cryo
         // Write to file if enabled and level is sufficient
         if (_log_file.is_open() && level >= _config.file_level)
         {
-            _log_file << final_message << std::endl;
+            _log_file << final_message << '\n';
             _current_file_size += final_message.size() + 1;
 
             if (_config.auto_flush)
