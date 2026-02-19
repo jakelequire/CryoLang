@@ -234,7 +234,9 @@ namespace Cryo
         // Returns the instantiated type, creating it if necessary
         TypeRef instantiate(TypeRef generic_type,
                             std::vector<TypeRef> type_args,
-                            TypeArena &arena);
+                            TypeArena &arena,
+                            const std::string &instantiation_file = "",
+                            SourceLocation instantiation_loc = SourceLocation{});
 
         // Check if an instantiation already exists
         std::optional<TypeRef> get_cached_instantiation(TypeRef base,

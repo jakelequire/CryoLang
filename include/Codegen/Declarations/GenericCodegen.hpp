@@ -403,6 +403,13 @@ namespace Cryo::Codegen
          * @return Resolved TypeRef, or empty if resolution fails
          */
         TypeRef resolve_field_type_from_annotation(const TypeAnnotation *annotation);
+
+        /**
+         * @brief Look up the InstantiatedType for the given generic and set call-site
+         *        info on CodegenContext for better error messages.
+         */
+        void set_instantiation_context_from_type(const std::string &generic_name,
+                                                  const std::vector<TypeRef> &type_args);
     };
 
 } // namespace Cryo::Codegen

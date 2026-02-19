@@ -13,6 +13,7 @@
 #include "Types/TypeID.hpp"
 #include "Types/TypeKind.hpp"
 #include "Types/CompoundTypes.hpp"
+#include "Lexer/lexer.hpp" // SourceLocation
 
 #include <vector>
 #include <string>
@@ -160,6 +161,10 @@ namespace Cryo
         std::vector<TypeRef> _type_args;  // Concrete type arguments [int]
         TypeRef _resolved_type;           // The monomorphized concrete type (optional)
 
+        // Where this instantiation was requested (call site)
+        std::string _instantiation_file;
+        SourceLocation _instantiation_loc;
+
     public:
         InstantiatedType(TypeID id,
                          TypeRef generic_base,
@@ -177,6 +182,16 @@ namespace Cryo
         // Set the resolved type after monomorphization
         void set_resolved_type(TypeRef resolved) { _resolved_type = resolved; }
         bool has_resolved_type() const { return _resolved_type.is_valid(); }
+
+        // Call site tracking: where this instantiation was requested
+        void set_instantiation_site(const std::string &file, SourceLocation loc)
+        {
+            _instantiation_file = file;
+            _instantiation_loc = loc;
+        }
+        const std::string &instantiation_file() const { return _instantiation_file; }
+        const SourceLocation &instantiation_loc() const { return _instantiation_loc; }
+        bool has_instantiation_site() const { return !_instantiation_file.empty(); }
 
         // Type properties
         bool is_instantiated() const override { return true; }
