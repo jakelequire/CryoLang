@@ -232,6 +232,15 @@ namespace Cryo::Codegen
         /** @brief Report an error without node context */
         void report_error(ErrorCode code, const std::string &msg);
 
+        /**
+         * @brief Emit a pre-built diagnostic, enriching it with instantiation context
+         *
+         * Appends "in instantiation of 'X'" note and secondary span at the
+         * instantiation call site (if available). Callers build a Diag with
+         * their own notes first, then hand it off here for the common enrichment.
+         */
+        void emit_diagnostic(Diag diag);
+
         /** @brief Check if errors have occurred */
         bool has_errors() const { return _has_errors; }
 

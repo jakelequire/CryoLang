@@ -421,7 +421,8 @@ namespace Cryo::Codegen
         bool resolve_member_info(Cryo::ExpressionNode *object,
                                  const std::string &member_name,
                                  llvm::StructType *&out_struct_type,
-                                 unsigned &out_field_idx);
+                                 unsigned &out_field_idx,
+                                 std::string *out_failure_reason = nullptr);
 
         /// Resolve a TypeRef to the correct mangled struct name for member access.
         /// Unwraps Pointer/Reference and handles InstantiatedType → monomorphized name.
