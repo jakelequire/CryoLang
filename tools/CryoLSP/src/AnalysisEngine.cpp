@@ -375,6 +375,12 @@ namespace CryoLSP
         // Set the current file so relative imports resolve correctly
         loader->set_current_file(file_path);
 
+        // Set project root for project-local module resolution
+        if (!project.project_root.empty())
+        {
+            loader->set_project_root(project.project_root);
+        }
+
         if (is_stdlib_project)
         {
             // The project root IS the stdlib — don't auto-detect from executable path

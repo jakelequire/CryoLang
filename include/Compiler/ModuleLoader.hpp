@@ -41,6 +41,7 @@ namespace Cryo
     private:
         std::string _stdlib_root;                                      // Root directory for standard library
         std::string _current_file_dir;                                 // Directory of currently compiling file
+        std::string _project_root;                                     // Root directory of the project (contains cryoconfig)
         bool _last_resolve_was_local = false;                          // Whether the last resolve_import_path found a local file
         std::unordered_map<std::string, ImportResult> _loaded_modules; // Cache of loaded modules
         std::unordered_set<std::string> _loading_modules;              // Track modules currently being loaded (cycle detection)
@@ -107,9 +108,16 @@ namespace Cryo
          */
         void set_current_file(const std::string &current_file_path);
 
+        /**
+         * @brief Set the project root directory for project-local imports
+         * @param project_root Path to the project root (directory containing cryoconfig)
+         */
+        void set_project_root(const std::string &project_root);
+
         // Temporary debug getter for LSP
         const std::string &current_file_dir() const { return _current_file_dir; }
         const std::string &stdlib_root() const { return _stdlib_root; }
+        const std::string &project_root() const { return _project_root; }
 
         // Access loading modules set for external cycle-guard insertion (used by LSP)
         std::unordered_set<std::string> *loading_modules_set() { return &_loading_modules; }
