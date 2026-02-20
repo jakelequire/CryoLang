@@ -88,7 +88,7 @@ namespace Cryo
         size_t _column;
 
     public:
-        SourceLocation(size_t line = 1, size_t column = 1);
+        SourceLocation(size_t line = 0, size_t column = 0);
 
         // Getters
         size_t line() const { return _line; }

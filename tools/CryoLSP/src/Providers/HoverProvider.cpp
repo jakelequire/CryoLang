@@ -2338,6 +2338,44 @@ namespace CryoLSP
             {
                 Transport::log("[Hover] Formatting symbol ref hover...");
                 hover_text = formatSymbolRefHover(sym, instance->ast_root(), type_args);
+
+                // If the declaration wasn't found in the current file (got minimal "type X" hover),
+                // search imported module ASTs for the full declaration (struct/enum/class/trait body)
+                if ((sym->kind == Cryo::SymbolKind::Type || sym->kind == Cryo::SymbolKind::TypeAlias) &&
+                    instance->module_loader())
+                {
+                    // Check if we only got the minimal fallback (no rich info)
+                    std::string minimal = "```cryo\ntype " + sym->name + "\n```";
+                    if (hover_text == minimal)
+                    {
+                        const auto &imported = instance->module_loader()->get_imported_asts();
+                        for (const auto &[mod_name, mod_ast] : imported)
+                        {
+                            if (!mod_ast)
+                                continue;
+                            DeclarationFinder modDeclFinder(lookup_name);
+                            Cryo::ASTNode *modDecl = modDeclFinder.find(mod_ast.get());
+                            if (!modDecl)
+                                continue;
+
+                            std::string rich_hover;
+                            if (auto *enm = dynamic_cast<Cryo::EnumDeclarationNode *>(modDecl))
+                                rich_hover = formatEnumHover(enm);
+                            else if (auto *strct = dynamic_cast<Cryo::StructDeclarationNode *>(modDecl))
+                                rich_hover = formatStructHover(strct, type_args);
+                            else if (auto *cls = dynamic_cast<Cryo::ClassDeclarationNode *>(modDecl))
+                                rich_hover = formatClassHover(cls, type_args);
+                            else if (auto *trait = dynamic_cast<Cryo::TraitDeclarationNode *>(modDecl))
+                                rich_hover = formatTraitHover(trait);
+
+                            if (!rich_hover.empty())
+                            {
+                                hover_text = rich_hover;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             else
             {

@@ -242,8 +242,14 @@ namespace CryoLSP
             const auto &loc = node.has_name_location() ? node.name_location() : node.location();
             addToken(loc, node.name().size(), TT_Function, TM_Declaration | TM_Definition);
             for (const auto &param : node.parameters())
-                if (param)
-                    param->accept(*this);
+            {
+                if (!param || param->name() == "this")
+                    continue;
+                const auto &ploc = param->has_name_location() ? param->name_location() : param->location();
+                addToken(ploc, param->name().size(), TT_Parameter, TM_Declaration);
+                if (param->initializer())
+                    param->initializer()->accept(*this);
+            }
             if (node.body())
                 node.body()->accept(*this);
         }
@@ -307,8 +313,14 @@ namespace CryoLSP
             const auto &loc = node.has_name_location() ? node.name_location() : node.location();
             addToken(loc, node.name().size(), TT_Method, TM_Declaration | TM_Definition);
             for (const auto &param : node.parameters())
-                if (param)
-                    param->accept(*this);
+            {
+                if (!param || param->name() == "this")
+                    continue;
+                const auto &ploc = param->has_name_location() ? param->name_location() : param->location();
+                addToken(ploc, param->name().size(), TT_Parameter, TM_Declaration);
+                if (param->initializer())
+                    param->initializer()->accept(*this);
+            }
             if (node.body())
                 node.body()->accept(*this);
         }
@@ -343,8 +355,7 @@ namespace CryoLSP
                 else if (auto *scope = dynamic_cast<Cryo::ScopeResolutionNode *>(node.callee()))
                 {
                     // Static call: Type::method()
-                    addToken(scope->location(), scope->scope_name().size(), TT_Type);
-                    // member_name location not stored on ScopeResolutionNode, skip for now
+                    emitScopeTokens(*scope, TT_Method);
                 }
                 else
                 {
@@ -378,9 +389,69 @@ namespace CryoLSP
                 addToken(node.member_location(), node.member().size(), TT_Property);
         }
 
+        // Helper: emit scope segments as individual TT_Type tokens, then member_name
+        void emitScopeTokens(Cryo::ScopeResolutionNode &node, int member_type)
+        {
+            const std::string &scope_name = node.scope_name();
+            int line = static_cast<int>(node.location().line() > 0 ? node.location().line() - 1 : 0);
+            size_t current_col = node.location().column() > 0 ? node.location().column() - 1 : 0;
+
+            // Split scope_name by "::" and emit each segment
+            size_t start = 0;
+            while (true)
+            {
+                size_t pos = scope_name.find("::", start);
+                std::string segment = (pos == std::string::npos)
+                                          ? scope_name.substr(start)
+                                          : scope_name.substr(start, pos - start);
+
+                RawToken t;
+                t.line = line;
+                t.startChar = static_cast<int>(current_col);
+                t.length = static_cast<int>(segment.size());
+                t.tokenType = TT_Type;
+                t.modifiers = 0;
+                tokens.push_back(t);
+
+                current_col += segment.size();
+                if (pos == std::string::npos)
+                    break;
+                current_col += 2; // "::"
+                start = pos + 2;
+            }
+
+            // Skip generic args: <arg1, arg2, ...>
+            if (node.has_generic_args())
+            {
+                current_col += 1; // <
+                for (size_t i = 0; i < node.generic_args().size(); ++i)
+                {
+                    if (i > 0)
+                        current_col += 2; // ", "
+                    current_col += node.generic_args()[i].size();
+                }
+                current_col += 1; // >
+            }
+
+            // Skip "::" before member_name
+            current_col += 2;
+
+            // Emit member_name
+            if (!node.member_name().empty())
+            {
+                RawToken mt;
+                mt.line = line;
+                mt.startChar = static_cast<int>(current_col);
+                mt.length = static_cast<int>(node.member_name().size());
+                mt.tokenType = member_type;
+                mt.modifiers = 0;
+                tokens.push_back(mt);
+            }
+        }
+
         void visit(Cryo::ScopeResolutionNode &node) override
         {
-            addToken(node.location(), node.scope_name().size(), TT_Type);
+            emitScopeTokens(node, TT_EnumMember);
         }
 
         void visit(Cryo::IfStatementNode &node) override
@@ -438,6 +509,166 @@ namespace CryoLSP
         {
             const auto &loc = node.has_name_location() ? node.name_location() : node.location();
             addToken(loc, node.module_path().size(), TT_Namespace);
+        }
+
+        void visit(Cryo::ModuleDeclarationNode &node) override
+        {
+            const auto &loc = node.has_name_location() ? node.name_location() : node.location();
+            addToken(loc, node.module_path().size(), TT_Namespace);
+        }
+
+        void visit(Cryo::MatchStatementNode &node) override
+        {
+            if (node.expr())
+                node.expr()->accept(*this);
+            for (const auto &arm : node.arms())
+                if (arm)
+                    arm->accept(*this);
+        }
+
+        void visit(Cryo::MatchExpressionNode &node) override
+        {
+            if (node.expression())
+                node.expression()->accept(*this);
+            for (const auto &arm : node.arms())
+                if (arm)
+                    arm->accept(*this);
+        }
+
+        void visit(Cryo::MatchArmNode &node) override
+        {
+            for (const auto &pattern : node.patterns())
+                if (pattern)
+                    pattern->accept(*this);
+            if (node.body())
+                node.body()->accept(*this);
+        }
+
+        void visit(Cryo::EnumPatternNode &node) override
+        {
+            const std::string &enum_name = node.enum_name();
+            int line = static_cast<int>(node.location().line() > 0 ? node.location().line() - 1 : 0);
+            size_t current_col = node.location().column() > 0 ? node.location().column() - 1 : 0;
+
+            // Split enum_name by "::" and emit each segment as TT_Type
+            size_t start = 0;
+            while (true)
+            {
+                size_t pos = enum_name.find("::", start);
+                std::string segment = (pos == std::string::npos)
+                                          ? enum_name.substr(start)
+                                          : enum_name.substr(start, pos - start);
+
+                RawToken t;
+                t.line = line;
+                t.startChar = static_cast<int>(current_col);
+                t.length = static_cast<int>(segment.size());
+                t.tokenType = TT_Type;
+                t.modifiers = 0;
+                tokens.push_back(t);
+
+                current_col += segment.size();
+                if (pos == std::string::npos)
+                    break;
+                current_col += 2; // "::"
+                start = pos + 2;
+            }
+
+            // Skip "::" before variant_name
+            current_col += 2;
+
+            // Emit variant_name as TT_EnumMember
+            if (!node.variant_name().empty())
+            {
+                RawToken vt;
+                vt.line = line;
+                vt.startChar = static_cast<int>(current_col);
+                vt.length = static_cast<int>(node.variant_name().size());
+                vt.tokenType = TT_EnumMember;
+                vt.modifiers = 0;
+                tokens.push_back(vt);
+            }
+        }
+
+        void visit(Cryo::SwitchStatementNode &node) override
+        {
+            if (node.expression())
+                node.expression()->accept(*this);
+            for (const auto &case_stmt : node.cases())
+                if (case_stmt)
+                    case_stmt->accept(*this);
+        }
+
+        void visit(Cryo::CaseStatementNode &node) override
+        {
+            if (node.value())
+                node.value()->accept(*this);
+            for (const auto &stmt : node.statements())
+                if (stmt)
+                    stmt->accept(*this);
+        }
+
+        void visit(Cryo::StructLiteralNode &node) override
+        {
+            // Color struct type name
+            addToken(node.location(), node.struct_type().size(), TT_Struct);
+
+            // Color field names and visit value expressions
+            for (const auto &field : node.field_initializers())
+            {
+                if (!field)
+                    continue;
+                if (field->has_location())
+                    addToken(field->location(), field->field_name().size(), TT_Property);
+                if (field->value())
+                    field->value()->accept(*this);
+            }
+        }
+
+        void visit(Cryo::ArrayAccessNode &node) override
+        {
+            if (node.array())
+                node.array()->accept(*this);
+            if (node.index())
+                node.index()->accept(*this);
+        }
+
+        void visit(Cryo::CastExpressionNode &node) override
+        {
+            if (node.expression())
+                node.expression()->accept(*this);
+        }
+
+        void visit(Cryo::ArrayLiteralNode &node) override
+        {
+            for (const auto &elem : node.elements())
+                if (elem)
+                    elem->accept(*this);
+        }
+
+        void visit(Cryo::SizeofExpressionNode &node) override
+        {
+            if (node.has_type_location())
+                addToken(node.type_location(), node.type_name().size(), TT_Type);
+        }
+
+        void visit(Cryo::AlignofExpressionNode &node) override
+        {
+            if (node.has_type_location())
+                addToken(node.type_location(), node.type_name().size(), TT_Type);
+        }
+
+        void visit(Cryo::LambdaExpressionNode &node) override
+        {
+            // Lambda parameters don't have source locations in the AST, so we skip them
+            if (node.body())
+                node.body()->accept(*this);
+        }
+
+        void visit(Cryo::UnsafeBlockStatementNode &node) override
+        {
+            if (node.block())
+                node.block()->accept(*this);
         }
     };
 
