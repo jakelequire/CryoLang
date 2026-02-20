@@ -2088,6 +2088,19 @@ namespace CryoLSP
                     }
                 }
 
+                // Also try imported ASTs from the current instance's module loader
+                // (covers modules loaded during import processing but not open in editor)
+                if (!typeNode && instance->module_loader())
+                {
+                    const auto &imported = instance->module_loader()->get_imported_asts();
+                    auto it = imported.find(namespace_prefix);
+                    if (it != imported.end() && it->second)
+                    {
+                        DeclarationFinder modFinder(actual_type);
+                        typeNode = modFinder.find(it->second.get());
+                    }
+                }
+
                 // Search for the member in the type's methods/fields
                 if (typeNode)
                 {
@@ -2214,6 +2227,20 @@ namespace CryoLSP
                         {
                             ImplMemberFinder modImplFinder(actual_type, member_name);
                             Cryo::ASTNode *modImplNode = modImplFinder.find(moduleInstance->ast_root());
+                            if (auto *method = dynamic_cast<Cryo::FunctionDeclarationNode *>(modImplNode))
+                                hover_text = formatFunctionHover(method);
+                        }
+                    }
+
+                    // Also search impl blocks in imported ASTs from the module loader
+                    if (!implNode && hover_text.empty() && instance->module_loader())
+                    {
+                        const auto &imported = instance->module_loader()->get_imported_asts();
+                        auto it = imported.find(namespace_prefix);
+                        if (it != imported.end() && it->second)
+                        {
+                            ImplMemberFinder modImplFinder(actual_type, member_name);
+                            Cryo::ASTNode *modImplNode = modImplFinder.find(it->second.get());
                             if (auto *method = dynamic_cast<Cryo::FunctionDeclarationNode *>(modImplNode))
                                 hover_text = formatFunctionHover(method);
                         }
