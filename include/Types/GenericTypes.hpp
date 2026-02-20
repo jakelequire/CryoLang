@@ -13,6 +13,7 @@
 #include "Types/TypeID.hpp"
 #include "Types/TypeKind.hpp"
 #include "Types/CompoundTypes.hpp"
+#include "Types/ErrorType.hpp"
 #include "Lexer/lexer.hpp" // SourceLocation
 
 #include <vector>
@@ -330,6 +331,90 @@ namespace Cryo
             for (const auto &arg : inst->type_args())
             {
                 if (contains_generic_params(arg))
+                    return true;
+            }
+            return false;
+        }
+        default:
+            // ErrorTypes from unresolved generics should be treated as containing generic params
+            if (t->kind() == TypeKind::Error)
+            {
+                auto *err = static_cast<const ErrorType *>(t);
+                if (err->reason().find("unresolved generic") != std::string::npos)
+                    return true;
+            }
+            return false;
+        }
+    }
+
+    /**************************************************************************
+     * @brief Helper to check if a type contains any ErrorType nodes
+     *
+     * Used to prevent pre-registration of functions whose types contain
+     * unresolved ErrorTypes that would map to wrong LLVM types (e.g., void).
+     **************************************************************************/
+    inline bool contains_error_types(TypeRef type)
+    {
+        if (!type.is_valid())
+            return false;
+
+        const Type *t = type.get();
+
+        // Direct error type
+        if (t->is_error())
+            return true;
+
+        // Check based on type kind
+        switch (t->kind())
+        {
+        case TypeKind::Pointer:
+        {
+            auto *ptr = static_cast<const PointerType *>(t);
+            return contains_error_types(ptr->pointee());
+        }
+        case TypeKind::Reference:
+        {
+            auto *ref = static_cast<const ReferenceType *>(t);
+            return contains_error_types(ref->referent());
+        }
+        case TypeKind::Array:
+        {
+            auto *arr = static_cast<const ArrayType *>(t);
+            return contains_error_types(arr->element());
+        }
+        case TypeKind::Optional:
+        {
+            auto *opt = static_cast<const OptionalType *>(t);
+            return contains_error_types(opt->wrapped());
+        }
+        case TypeKind::Function:
+        {
+            auto *fn = static_cast<const FunctionType *>(t);
+            if (contains_error_types(fn->return_type()))
+                return true;
+            for (const auto &param : fn->param_types())
+            {
+                if (contains_error_types(param))
+                    return true;
+            }
+            return false;
+        }
+        case TypeKind::Tuple:
+        {
+            auto *tup = static_cast<const TupleType *>(t);
+            for (const auto &elem : tup->elements())
+            {
+                if (contains_error_types(elem))
+                    return true;
+            }
+            return false;
+        }
+        case TypeKind::InstantiatedType:
+        {
+            auto *inst = static_cast<const InstantiatedType *>(t);
+            for (const auto &arg : inst->type_args())
+            {
+                if (contains_error_types(arg))
                     return true;
             }
             return false;

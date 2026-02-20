@@ -3829,6 +3829,10 @@ namespace Cryo::Codegen
             if (param.is_valid())
                 return param;
 
+            // Handle unit type "()" - common in IoResult<()>, Result<(), E>, etc.
+            if (name == "()")
+                return arena.get_unit();
+
             TypeRef resolved = symbols().lookup_struct_type(name);
             if (resolved.is_valid() && !resolved.is_error())
                 return resolved;
