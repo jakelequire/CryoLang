@@ -226,6 +226,12 @@ namespace Cryo::Codegen
         bool in_type_param_scope() const { return !_type_param_stack.empty(); }
 
         /**
+         * @brief Get current type parameter bindings (innermost scope wins)
+         * @return Vector of (param_name, arg_display_name) pairs, e.g., [("T", "String")]
+         */
+        std::vector<std::pair<std::string, std::string>> get_current_type_param_bindings() const;
+
+        /**
          * @brief Substitute type parameters in a type annotation string
          *
          * When inside a type parameter substitution scope, this substitutes

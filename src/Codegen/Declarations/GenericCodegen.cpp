@@ -3095,6 +3095,23 @@ namespace Cryo::Codegen
         }
     }
 
+    std::vector<std::pair<std::string, std::string>> GenericCodegen::get_current_type_param_bindings() const
+    {
+        std::vector<std::pair<std::string, std::string>> result;
+        if (_type_param_stack.empty())
+            return result;
+
+        // Use innermost scope (back of stack)
+        const auto &scope = _type_param_stack.back();
+        result.reserve(scope.bindings.size());
+        for (const auto &[param, type_ref] : scope.bindings)
+        {
+            std::string arg_name = type_ref.is_valid() ? type_ref->display_name() : "<unknown>";
+            result.emplace_back(param, arg_name);
+        }
+        return result;
+    }
+
     TypeRef GenericCodegen::resolve_type_param(const std::string &param_name)
     {
         // Search from innermost to outermost scope

@@ -3787,8 +3787,16 @@ namespace Cryo::Codegen
             }
 
             // Report error if method not found and not a function-pointer field
-            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
-                         "Instance method not found: " + method_name);
+            {
+                std::string msg = type_name.empty()
+                    ? "no method '" + method_name + "' found"
+                    : "no method '" + method_name + "' found for type '" + type_name + "'";
+                auto diag = Diag::error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, msg);
+                diag.at(node);
+                add_type_derivation_context(diag, callee->object());
+                diag.with_note("looked up as instance method on '" + type_name + "'");
+                emit_diagnostic(std::move(diag));
+            }
             return nullptr;
         }
 

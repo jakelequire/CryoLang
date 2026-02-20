@@ -745,10 +745,22 @@ namespace Cryo::Codegen
         // First resolve the member info to get struct type and field index
         llvm::StructType *struct_type = nullptr;
         unsigned field_idx = 0;
-        if (!resolve_member_info(node->object(), member_name, struct_type, field_idx))
+        std::string failure_reason;
+        if (!resolve_member_info(node->object(), member_name, struct_type, field_idx, &failure_reason))
         {
-            report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
-                         "Cannot resolve member: " + member_name);
+            std::string display_type = ctx().current_type_display_name();
+            if (display_type.empty() && node->object() && node->object()->get_resolved_type())
+                display_type = node->object()->get_resolved_type()->display_name();
+            std::string msg = display_type.empty()
+                ? "no field '" + member_name + "' found"
+                : "no field '" + member_name + "' found on type '" + display_type + "'";
+
+            auto diag = Diag::error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, msg);
+            diag.at(node);
+            add_type_derivation_context(diag, node->object());
+            if (!failure_reason.empty())
+                diag.with_note(failure_reason);
+            emit_diagnostic(std::move(diag));
             return nullptr;
         }
 
@@ -899,10 +911,22 @@ namespace Cryo::Codegen
         // Resolve struct type and field index
         llvm::StructType *struct_type = nullptr;
         unsigned field_idx = 0;
-        if (!resolve_member_info(node->object(), member_name, struct_type, field_idx))
+        std::string failure_reason;
+        if (!resolve_member_info(node->object(), member_name, struct_type, field_idx, &failure_reason))
         {
-            report_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, node,
-                         "Cannot resolve member: " + member_name);
+            std::string display_type = ctx().current_type_display_name();
+            if (display_type.empty() && node->object() && node->object()->get_resolved_type())
+                display_type = node->object()->get_resolved_type()->display_name();
+            std::string msg = display_type.empty()
+                ? "no field '" + member_name + "' found"
+                : "no field '" + member_name + "' found on type '" + display_type + "'";
+
+            auto diag = Diag::error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, msg);
+            diag.at(node);
+            add_type_derivation_context(diag, node->object());
+            if (!failure_reason.empty())
+                diag.with_note(failure_reason);
+            emit_diagnostic(std::move(diag));
             return nullptr;
         }
 
@@ -1613,8 +1637,20 @@ namespace Cryo::Codegen
             llvm::Value *array_val = generate(node->array());
             if (!array_val)
             {
-                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
-                             "Failed to generate array expression");
+                std::string arr_name;
+                if (auto *id = dynamic_cast<Cryo::IdentifierNode *>(node->array()))
+                    arr_name = id->name();
+                else if (auto *ma = dynamic_cast<Cryo::MemberAccessNode *>(node->array()))
+                    arr_name = ma->member();
+
+                std::string msg = arr_name.empty()
+                    ? "failed to generate array expression"
+                    : "failed to generate array expression for '" + arr_name + "'";
+                auto diag = Diag::error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, msg);
+                diag.at(node);
+                if (node->array() && node->array()->get_resolved_type())
+                    diag.with_note("array type is '" + node->array()->get_resolved_type()->display_name() + "'");
+                emit_diagnostic(std::move(diag));
                 return nullptr;
             }
 
@@ -2014,8 +2050,20 @@ namespace Cryo::Codegen
             array_ptr = generate(node->array());
             if (!array_ptr)
             {
-                report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
-                             "Failed to generate array expression");
+                std::string arr_name;
+                if (auto *id = dynamic_cast<Cryo::IdentifierNode *>(node->array()))
+                    arr_name = id->name();
+                else if (auto *ma = dynamic_cast<Cryo::MemberAccessNode *>(node->array()))
+                    arr_name = ma->member();
+
+                std::string msg = arr_name.empty()
+                    ? "failed to generate array expression"
+                    : "failed to generate array expression for '" + arr_name + "'";
+                auto diag = Diag::error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, msg);
+                diag.at(node);
+                if (node->array() && node->array()->get_resolved_type())
+                    diag.with_note("array type is '" + node->array()->get_resolved_type()->display_name() + "'");
+                emit_diagnostic(std::move(diag));
                 return nullptr;
             }
 
@@ -2904,10 +2952,14 @@ namespace Cryo::Codegen
     bool ExpressionCodegen::resolve_member_info(Cryo::ExpressionNode *object,
                                                 const std::string &member_name,
                                                 llvm::StructType *&out_struct_type,
-                                                unsigned &out_field_idx)
+                                                unsigned &out_field_idx,
+                                                std::string *out_failure_reason)
     {
         if (!object)
+        {
+            if (out_failure_reason) *out_failure_reason = "null object expression";
             return false;
+        }
 
         // Special handling for 'this' - prefer current_type_name for generic instantiations
         if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(object))
@@ -3492,6 +3544,7 @@ namespace Cryo::Codegen
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "resolve_member_info: No resolved type for object");
+                if (out_failure_reason) *out_failure_reason = "could not determine the type of the object expression";
                 return false;
             }
         }
@@ -3675,6 +3728,8 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "resolve_member_info: Struct type '{}' (mangled: '{}') not found",
                       type_name, mangled_type_name);
+            if (out_failure_reason)
+                *out_failure_reason = "type '" + type_name + "' not found in LLVM module (mangled: '" + mangled_type_name + "')";
             return false;
         }
 
@@ -3684,6 +3739,8 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "resolve_member_info: Struct type '{}' is opaque (being instantiated), cannot access members",
                       type_name);
+            if (out_failure_reason)
+                *out_failure_reason = "type '" + type_name + "' is opaque (currently being instantiated)";
             return false;
         }
 
@@ -3784,6 +3841,29 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "resolve_member_info: Field '{}' not found in struct '{}' (also checked TemplateRegistry)",
                           member_name, type_name);
+                if (out_failure_reason)
+                {
+                    std::string reason = "no field '" + member_name + "' on type '" + type_name + "'";
+                    // List available fields if we can find them
+                    if (auto *template_reg = ctx().template_registry())
+                    {
+                        const auto *field_info = template_reg->get_struct_field_types(type_name);
+                        if (!field_info && mangled_type_name != type_name)
+                            field_info = template_reg->get_struct_field_types(mangled_type_name);
+                        if (field_info && !field_info->field_names.empty())
+                        {
+                            reason += "; available fields: ";
+                            for (size_t i = 0; i < field_info->field_names.size() && i < 10; ++i)
+                            {
+                                if (i > 0) reason += ", ";
+                                reason += field_info->field_names[i];
+                            }
+                            if (field_info->field_names.size() > 10)
+                                reason += ", ...";
+                        }
+                    }
+                    *out_failure_reason = reason;
+                }
                 return false;
             }
         }
@@ -5269,9 +5349,27 @@ namespace Cryo::Codegen
         }
 
         // Report error for unresolved enum variants (no placeholders - fail early and clearly)
-        report_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR, node,
-                     "Cannot resolve enum variant: " + qualified_name +
-                         " (generic enum variants must be instantiated before use)");
+        {
+            auto diag = Diag::error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR,
+                                    "cannot resolve enum variant '" + qualified_name + "'");
+            diag.at(node);
+
+            // List available variants (limited to 10 to avoid flooding)
+            auto &enum_variants_map = ctx().enum_variants_map();
+            std::string available;
+            size_t count = 0;
+            for (const auto &[name, val] : enum_variants_map)
+            {
+                if (count >= 10) { available += ", ..."; break; }
+                if (!available.empty()) available += ", \n";
+                available += name;
+                ++count;
+            }
+            if (!available.empty())
+                diag.with_note("available variants in scope: \n" + available);
+            diag.help("generic enum variants must be instantiated before use");
+            emit_diagnostic(std::move(diag));
+        }
         return nullptr;
     }
 

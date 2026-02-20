@@ -621,8 +621,19 @@ namespace Cryo::Codegen
         llvm::Value *member_ptr = get_lvalue_address(target);
         if (!member_ptr)
         {
-            report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, target,
-                         "Failed to get member address for assignment");
+            std::string member = target->member();
+            std::string obj_name;
+            if (auto *id = dynamic_cast<Cryo::IdentifierNode *>(target->object()))
+                obj_name = id->name();
+            else
+                obj_name = "<expr>";
+
+            std::string msg = "cannot get address of member '" + member + "' on '" + obj_name + "' for assignment";
+            auto diag = Diag::error(ErrorCode::E0614_ASSIGNMENT_ERROR, msg);
+            diag.at(target);
+            if (target->object() && target->object()->get_resolved_type())
+                diag.with_note("object type is '" + target->object()->get_resolved_type()->display_name() + "'");
+            emit_diagnostic(std::move(diag));
             return nullptr;
         }
 
@@ -1455,7 +1466,7 @@ namespace Cryo::Codegen
                   "generate_comparison: lhs type = {}, rhs type = {}",
                   lhs->getType()->getTypeID(), rhs->getType()->getTypeID());
 
-        // Get type names from AST for better error messages
+        // Get type names from AST for better error messages, with LLVM fallbacks
         std::string lhs_type_name = "unknown";
         std::string rhs_type_name = "unknown";
         if (node)
@@ -1464,6 +1475,23 @@ namespace Cryo::Codegen
                 lhs_type_name = node->left()->get_resolved_type()->display_name();
             if (node->right() && node->right()->get_resolved_type())
                 rhs_type_name = node->right()->get_resolved_type()->display_name();
+        }
+        // LLVM struct name fallback when AST resolved type is missing
+        if (lhs_type_name == "unknown")
+        {
+            if (auto *st = llvm::dyn_cast<llvm::StructType>(lhs->getType()))
+            {
+                if (st->hasName()) lhs_type_name = st->getName().str();
+            }
+            else if (!ctx().current_type_display_name().empty())
+                lhs_type_name = ctx().current_type_display_name();
+        }
+        if (rhs_type_name == "unknown")
+        {
+            if (auto *st = llvm::dyn_cast<llvm::StructType>(rhs->getType()))
+            {
+                if (st->hasName()) rhs_type_name = st->getName().str();
+            }
         }
 
         // Ensure compatible types
@@ -1508,11 +1536,13 @@ namespace Cryo::Codegen
             // Only support equality/inequality for structs
             if (op != TokenKind::TK_EQUALEQUAL && op != TokenKind::TK_EXCLAIMEQUAL)
             {
-                std::string e = "Ordering comparison (<, >, <=, >=) not supported for struct type `" + lhs_type_name + "`";
-                if (node)
-                    report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node, e);
-                else
-                    report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, e.c_str());
+                {
+                    auto diag = Diag::error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
+                                            "binary operation cannot be applied to type '" + lhs_type_name + "'");
+                    if (node) diag.at(node);
+                    diag.with_note("struct types do not support ordering comparisons (<, >, <=, >=)");
+                    emit_diagnostic(std::move(diag));
+                }
                 return nullptr;
             }
 
