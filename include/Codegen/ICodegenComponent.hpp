@@ -274,6 +274,30 @@ namespace Cryo::Codegen
         //===================================================================
 
         /**
+         * @brief Find the parameter declaration span for an expression's root identifier.
+         *
+         * Peels MemberAccessNode/CallExpressionNode layers to extract the root
+         * IdentifierNode, then looks it up in the current function's parameter list
+         * to build a secondary Span showing the original type annotation.
+         *
+         * @param expr The expression to trace back (e.g., `other.len()` → `other`)
+         * @return A Span at the parameter declaration, or an invalid Span if not found
+         */
+        Span find_parameter_declaration_span(Cryo::ExpressionNode *expr);
+
+        /**
+         * @brief Add type derivation context (declaration span + resolved type note) to a diagnostic.
+         *
+         * Given an expression, finds where its root variable was declared as a parameter
+         * and adds a secondary span showing the original type annotation, plus a note
+         * showing the variable's actual resolved type.
+         *
+         * @param diag The diagnostic to enrich
+         * @param expr The expression whose root variable to trace
+         */
+        void add_type_derivation_context(Diag &diag, Cryo::ExpressionNode *expr);
+
+        /**
          * @brief Report an error with node context
          * @param code Error code
          * @param node AST node for location info
@@ -287,6 +311,21 @@ namespace Cryo::Codegen
          * @param msg Error message
          */
         void report_error(ErrorCode code, const std::string &msg);
+
+        /**
+         * @brief Emit a pre-built diagnostic with type parameter binding notes
+         *
+         * Appends "where T = String" notes from the current generic scope,
+         * then delegates to CodegenContext::emit_diagnostic() for instantiation
+         * context enrichment.
+         */
+        void emit_diagnostic(Diag diag);
+
+        /**
+         * @brief Build a "where T = ..." note string from current type param bindings
+         * @return Formatted string, e.g., "where T = String, U = i32", or empty if not in generic scope
+         */
+        std::string build_type_param_bindings_note();
 
         //===================================================================
         // Value Registration

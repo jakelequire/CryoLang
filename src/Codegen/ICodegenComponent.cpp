@@ -1,4 +1,6 @@
 #include "Codegen/ICodegenComponent.hpp"
+#include "Codegen/CodegenVisitor.hpp"
+#include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Utils/Logger.hpp"
 #include "Utils/SymbolResolutionManager.hpp"
 
@@ -1793,6 +1795,260 @@ namespace Cryo::Codegen
     void ICodegenComponent::report_error(ErrorCode code, const std::string &msg)
     {
         _ctx.report_error(code, msg);
+    }
+
+    //===================================================================
+    // Type Derivation Context
+    //===================================================================
+
+    /**
+     * Helper: peel MemberAccess/CallExpression layers to find the root identifier name.
+     * Returns empty string if the root is not an IdentifierNode or is "this".
+     */
+    static std::string extract_root_identifier_name(Cryo::ExpressionNode *expr)
+    {
+        if (!expr)
+            return "";
+
+        // Peel layers: other.ptr.len() → other.ptr → other
+        while (true)
+        {
+            if (auto *member = dynamic_cast<Cryo::MemberAccessNode *>(expr))
+            {
+                expr = member->object();
+                continue;
+            }
+            if (auto *call = dynamic_cast<Cryo::CallExpressionNode *>(expr))
+            {
+                expr = call->callee();
+                continue;
+            }
+            break;
+        }
+
+        auto *ident = dynamic_cast<Cryo::IdentifierNode *>(expr);
+        if (!ident)
+            return "";
+
+        const std::string &name = ident->name();
+        if (name == "this")
+            return "";
+
+        return name;
+    }
+
+    Span ICodegenComponent::find_parameter_declaration_span(Cryo::ExpressionNode *expr)
+    {
+        std::string root_name = extract_root_identifier_name(expr);
+        if (root_name.empty())
+            return Span{}; // invalid
+
+        auto *fn_ctx = ctx().current_function();
+        if (!fn_ctx || !fn_ctx->ast_node)
+            return Span{};
+
+        const auto &params = fn_ctx->ast_node->parameters();
+        for (const auto &param : params)
+        {
+            if (param->name() == root_name)
+            {
+                std::string annotation_str;
+                if (param->has_type_annotation())
+                    annotation_str = param->type_annotation()->to_string();
+
+                std::string label = "'" + root_name + "' declared as '" + annotation_str + "'";
+
+                const auto &loc = param->location();
+                const auto &file = param->source_file();
+
+                Span span(file, loc.line(), loc.column(), loc.line(), loc.column());
+                span.with_label(label).as_secondary();
+                return span;
+            }
+        }
+
+        return Span{}; // not found
+    }
+
+    /**
+     * Helper: perform whole-word substitution of type param names in a string.
+     * e.g., "&mut Array<T>" with {T → String} → "&mut Array<String>"
+     */
+    static std::string substitute_type_params(
+        const std::string &input,
+        const std::vector<std::pair<std::string, std::string>> &bindings)
+    {
+        std::string result = input;
+        for (const auto &[param_name, param_value] : bindings)
+        {
+            size_t pos = 0;
+            while ((pos = result.find(param_name, pos)) != std::string::npos)
+            {
+                bool at_start = (pos == 0 || !std::isalnum(static_cast<unsigned char>(result[pos - 1])));
+                bool at_end = (pos + param_name.size() >= result.size() ||
+                               !std::isalnum(static_cast<unsigned char>(result[pos + param_name.size()])));
+                if (at_start && at_end)
+                {
+                    result.replace(pos, param_name.size(), param_value);
+                    pos += param_value.size();
+                }
+                else
+                {
+                    pos += param_name.size();
+                }
+            }
+        }
+        return result;
+    }
+
+    void ICodegenComponent::add_type_derivation_context(Diag &diag, Cryo::ExpressionNode *expr)
+    {
+        std::string root_name = extract_root_identifier_name(expr);
+        if (root_name.empty())
+            return;
+
+        auto *fn_ctx = ctx().current_function();
+        if (!fn_ctx || !fn_ctx->ast_node)
+            return;
+
+        // Find the parameter declaration
+        const Cryo::VariableDeclarationNode *found_param = nullptr;
+        std::string annotation_str;
+        for (const auto &param : fn_ctx->ast_node->parameters())
+        {
+            if (param->name() == root_name)
+            {
+                found_param = param.get();
+                if (param->has_type_annotation())
+                    annotation_str = param->type_annotation()->to_string();
+                break;
+            }
+        }
+        if (!found_param)
+            return;
+
+        // Collect the three type sources for provenance comparison:
+        //   1. annotation_str        — what the user wrote (e.g., "&mut Array<T>")
+        //   2. ast_resolved_str      — what type resolution/monomorphization set on the AST node
+        //   3. codegen_resolved_str  — what codegen put in variable_types_map (what's actually used)
+
+        std::string ast_resolved_str;
+        if (found_param->has_resolved_type())
+            ast_resolved_str = found_param->get_resolved_type().get()->display_name();
+
+        std::string codegen_resolved_str;
+        auto &var_types = ctx().variable_types_map();
+        auto it = var_types.find(root_name);
+        if (it != var_types.end() && it->second.is_valid())
+            codegen_resolved_str = it->second.get()->display_name();
+
+        // Use whichever resolved type is available (codegen map takes priority since that's what's used)
+        const std::string &resolved_str = !codegen_resolved_str.empty() ? codegen_resolved_str : ast_resolved_str;
+
+        // Build span label: 'other' declared as '&mut Array<T>' but resolved to 'Option<String>'
+        std::string label = "'" + root_name + "' declared as '" + annotation_str + "'";
+        if (!resolved_str.empty())
+            label += " but resolved to '" + resolved_str + "'";
+
+        const auto &loc = found_param->location();
+        const auto &file = found_param->source_file();
+        Span span(file, loc.line(), loc.column(), loc.line(), loc.column());
+        span.with_label(label).as_secondary();
+        diag.also_at(std::move(span));
+
+        // Compute expected type after substitution (e.g., "&mut Array<T>" + {T=String} → "&mut Array<String>")
+        std::string expected_str;
+        if (!annotation_str.empty())
+        {
+            auto *visitor = _ctx.visitor();
+            if (visitor)
+            {
+                auto *generics = visitor->get_generics();
+                if (generics && generics->in_type_param_scope())
+                {
+                    auto bindings = generics->get_current_type_param_bindings();
+                    if (!bindings.empty())
+                        expected_str = substitute_type_params(annotation_str, bindings);
+                }
+            }
+        }
+
+        // Add "expected X after substitution, got Y" note when there's a mismatch
+        if (!expected_str.empty() && !resolved_str.empty() && expected_str != resolved_str)
+        {
+            diag.with_note("expected '" + expected_str + "' after substitution, got '" + resolved_str + "'");
+        }
+
+        // Type provenance: narrow down WHICH pipeline stage produced the wrong type
+        if (!expected_str.empty() && !resolved_str.empty() && expected_str != resolved_str)
+        {
+            if (!ast_resolved_str.empty() && !codegen_resolved_str.empty())
+            {
+                if (ast_resolved_str != expected_str && codegen_resolved_str == ast_resolved_str)
+                {
+                    // AST node already had the wrong type, codegen faithfully copied it.
+                    // Bug is in type resolution or monomorphization (before codegen).
+                    diag.with_note("AST node resolved type is '" + ast_resolved_str +
+                                   "' (set during type resolution or monomorphization)");
+                }
+                else if (ast_resolved_str == expected_str && codegen_resolved_str != expected_str)
+                {
+                    // AST node had the correct type, but codegen overwrote it.
+                    // Bug is in codegen parameter registration.
+                    diag.with_note("AST node has correct type '" + ast_resolved_str +
+                                   "' but codegen registered '" + codegen_resolved_str +
+                                   "' (bug in codegen parameter registration)");
+                }
+                else if (ast_resolved_str != expected_str && codegen_resolved_str != ast_resolved_str)
+                {
+                    // Both are wrong and different from each other — multiple issues.
+                    diag.with_note("AST node resolved to '" + ast_resolved_str +
+                                   "', codegen registered '" + codegen_resolved_str +
+                                   "' (both differ from expected '" + expected_str + "')");
+                }
+            }
+            else if (ast_resolved_str.empty() && !codegen_resolved_str.empty())
+            {
+                // No resolved type on the AST node — type resolution never ran for this param.
+                diag.with_note("parameter has no resolved type on AST node "
+                               "(type resolution may have been skipped)");
+            }
+        }
+    }
+
+    void ICodegenComponent::emit_diagnostic(Diag diag)
+    {
+        // Append type parameter binding notes (e.g., "where T = String")
+        std::string bindings_note = build_type_param_bindings_note();
+        if (!bindings_note.empty())
+        {
+            diag.with_note(bindings_note);
+        }
+        _ctx.emit_diagnostic(std::move(diag));
+    }
+
+    std::string ICodegenComponent::build_type_param_bindings_note()
+    {
+        auto *visitor = _ctx.visitor();
+        if (!visitor)
+            return "";
+
+        auto *generics = visitor->get_generics();
+        if (!generics || !generics->in_type_param_scope())
+            return "";
+
+        auto bindings = generics->get_current_type_param_bindings();
+        if (bindings.empty())
+            return "";
+
+        std::string result = "where ";
+        for (size_t i = 0; i < bindings.size(); ++i)
+        {
+            if (i > 0)
+                result += ", ";
+            result += bindings[i].first + " = " + bindings[i].second;
+        }
+        return result;
     }
 
     //===================================================================

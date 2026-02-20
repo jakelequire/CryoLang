@@ -34,52 +34,62 @@ namespace Cryo::Codegen
     // Error Reporting
     //===================================================================
 
-    void CodegenContext::report_error(ErrorCode code, Cryo::ASTNode *node, const std::string &msg)
+    void CodegenContext::emit_diagnostic(Diag diag)
     {
-        _has_errors = true;
-        _last_error = msg;
+        _has_errors = diag.is_error() || _has_errors;
+        if (diag.is_error())
+            _last_error = diag.message();
 
-        if (_diagnostics)
+        if (!_diagnostics)
         {
-            auto diag = Diag::error(code, msg);
-            if (node)
-            {
-                diag.at(node);
-            }
-            // If we're inside a generic instantiation, add context so the user
-            // knows which instantiation triggered the error.  The primary span
-            // points at the generic template definition; we add:
-            //   1. A note naming the concrete instantiation
-            //   2. A secondary span at the call site (if we recorded one)
-            if (!_current_type_name.empty())
-            {
-                const std::string &display = _current_type_display_name.empty()
-                    ? _current_type_name : _current_type_display_name;
+            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Codegen error: {}", diag.message());
+            return;
+        }
 
-                diag.with_note("in instantiation of '" + display + "'");
+        // Enrich with generic instantiation context
+        if (!_current_type_name.empty())
+        {
+            const std::string &display = _current_type_display_name.empty()
+                ? _current_type_name : _current_type_display_name;
 
-                // Show the call site as a secondary span.  When we have the
-                // exact line number we create a proper span; otherwise we
-                // create a file-only span (line 0) that the renderer handles.
-                if (!_instantiation_file.empty())
+            diag.with_note("in instantiation of '" + display + "'");
+
+            // Show the call site as a secondary span with a descriptive label
+            // that explains the binding (e.g., "Array<T> instantiated as Array<String> here")
+            if (!_instantiation_file.empty())
+            {
+                // Build a label that shows the generic→concrete binding
+                // Extract the base generic name from display (e.g., "Array" from "Array<String>")
+                std::string label;
+                size_t angle = display.find('<');
+                if (angle != std::string::npos)
                 {
-                    Span call_site;
-                    call_site.file = _instantiation_file;
-                    call_site.start_line = _instantiation_loc.line();
-                    call_site.start_col = _instantiation_loc.column();
-                    call_site.end_line = call_site.start_line;
-                    call_site.end_col = call_site.start_col + 1;
-                    call_site.label = "instantiation of '" + display + "' required here";
-                    call_site.is_primary = false;
-                    diag.also_at(std::move(call_site));
+                    std::string base = display.substr(0, angle);
+                    label = base + "<T> instantiated as " + display + " here";
                 }
-                else if (node && !_source_file.empty() &&
-                         !node->source_file().empty() &&
-                         node->source_file() != _source_file)
+                else
                 {
-                    // Fallback: no exact instantiation site, but the error is
-                    // in a different file from the source context.  Create a
-                    // file-level secondary span so it renders with :: formatting.
+                    label = "'" + display + "' instantiated here";
+                }
+
+                Span call_site;
+                call_site.file = _instantiation_file;
+                call_site.start_line = _instantiation_loc.line();
+                call_site.start_col = _instantiation_loc.column();
+                call_site.end_line = call_site.start_line;
+                call_site.end_col = call_site.start_col + 1;
+                call_site.label = label;
+                call_site.is_primary = false;
+                diag.also_at(std::move(call_site));
+            }
+            else
+            {
+                // Fallback: no exact instantiation site, but the error is
+                // in a different file from the source context
+                auto primary = diag.primary_span();
+                if (primary && !_source_file.empty() &&
+                    !primary->file.empty() && primary->file != _source_file)
+                {
                     Span fallback;
                     fallback.file = _source_file;
                     fallback.start_line = 0;
@@ -91,27 +101,23 @@ namespace Cryo::Codegen
                     diag.also_at(std::move(fallback));
                 }
             }
-            _diagnostics->emit(std::move(diag));
         }
-        else
+        _diagnostics->emit(std::move(diag));
+    }
+
+    void CodegenContext::report_error(ErrorCode code, Cryo::ASTNode *node, const std::string &msg)
+    {
+        auto diag = Diag::error(code, msg);
+        if (node)
         {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Codegen error: {}", msg);
+            diag.at(node);
         }
+        emit_diagnostic(std::move(diag));
     }
 
     void CodegenContext::report_error(ErrorCode code, const std::string &msg)
     {
-        _has_errors = true;
-        _last_error = msg;
-
-        if (_diagnostics)
-        {
-            _diagnostics->emit(Diag::error(code, msg));
-        }
-        else
-        {
-            LOG_ERROR(Cryo::LogComponent::CODEGEN, "Codegen error: {}", msg);
-        }
+        emit_diagnostic(Diag::error(code, msg));
     }
 
     void CodegenContext::clear_errors()
