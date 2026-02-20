@@ -792,4 +792,15 @@ namespace CryoLSP
         }
     }
 
+    void PositionFinder::visit(Cryo::ModuleDeclarationNode &node)
+    {
+        const auto &loc = node.has_name_location() ? node.name_location() : node.location();
+        if (matchesPosition(loc, node.module_path().size()))
+        {
+            _result.node = &node;
+            _result.identifier_name = node.module_path();
+            _result.kind = FoundNode::Kind::ImportDecl;
+        }
+    }
+
 } // namespace CryoLSP

@@ -54,7 +54,7 @@ namespace CryoLSP
                                          project.config.target_type == "stdlib";
                 bool use_stdlib = !project.config.no_std && !is_stdlib_project;
 
-                instance->set_raw_mode(project.config.no_std); // no-std: skip main→_user_main_ transform (no runtime)
+                instance->set_raw_mode(true); // LSP never needs main→_user_main_ transform (no codegen)
                 instance->set_auto_imports_enabled(use_stdlib); // Only auto-import prelude when stdlib is used
                 instance->set_stdlib_linking(false);            // No codegen/linking in LSP
 
