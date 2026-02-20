@@ -1101,6 +1101,9 @@ namespace Cryo::CLI::Commands
         {
             // For regular files, use single-file compilation
             compiler->module_loader()->set_current_file(std::filesystem::absolute(main_file).string());
+            // Set project root for module resolution (directory containing cryoconfig)
+            compiler->module_loader()->set_project_root(
+                std::filesystem::absolute(config_path).parent_path().string());
             if (use_verbose)
             {
                 std::cout << "Compiling " << main_file << " -> " << output_path << std::endl;
@@ -1290,7 +1293,15 @@ namespace Cryo::CLI::Commands
     int RunCommand::run_project(const ParsedArgs &args)
     {
         bool verbose = args.get_flag("verbose");
-        std::string exe_args = args.get_arg("args");
+
+        // Collect positional arguments to forward to the executable
+        std::string exe_args;
+        for (const auto &pos_arg : args.positional())
+        {
+            if (!exe_args.empty())
+                exe_args += " ";
+            exe_args += pos_arg;
+        }
 
         // Find cryoconfig file
         std::string config_path;

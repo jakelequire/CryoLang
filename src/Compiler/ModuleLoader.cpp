@@ -178,6 +178,11 @@ namespace Cryo
         _current_file_dir = get_parent_directory(current_file_path);
     }
 
+    void ModuleLoader::set_project_root(const std::string &project_root)
+    {
+        _project_root = project_root;
+    }
+
     ModuleLoader::ImportResult ModuleLoader::load_import(const ImportDeclarationNode &import_node)
     {
         std::string import_path = import_node.path();
@@ -352,56 +357,28 @@ namespace Cryo
         auto &os = Cryo::Utils::OS::instance();
         _last_resolve_was_local = false;
 
-        // TEMP DEBUG: write to file for full visibility
-        auto dbg_write = [](const std::string &msg) {
-            static FILE *f = fopen("C:/Programming/apps/CryoLang/resolve_debug.log", "a");
-            if (f) { fprintf(f, "%s\n", msg.c_str()); fflush(f); }
-        };
-        dbg_write("--- resolve_import_path ---");
-        dbg_write("import='" + import_path + "' file_path='" + file_path + "'");
-        dbg_write("_stdlib_root='" + _stdlib_root + "'");
-        dbg_write("_current_file_dir='" + _current_file_dir + "'");
+        // Precompute lowercase variant for case-insensitive fallback
+        std::string lower_file_path = file_path;
+        std::transform(lower_file_path.begin(), lower_file_path.end(), lower_file_path.begin(), ::tolower);
+        bool has_lower_variant = (lower_file_path != file_path);
 
-        // 1. Try stdlib root first (standard library imports)
-        std::string stdlib_resolved = os.join_path(_stdlib_root, file_path);
-        dbg_write("step1: stdlib_resolved='" + stdlib_resolved + "'");
-        std::string result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
-        dbg_write("step1: resolve_module_file_path result='" + result + "'");
-        bool step1_exists = std::filesystem::exists(result);
-        dbg_write("step1: exists=" + std::string(step1_exists ? "Y" : "N"));
-        if (std::filesystem::exists(result))
+        // 1. Try project root first (project-local imports shadow stdlib)
+        if (!_project_root.empty())
         {
-            _last_resolve_was_local = false;
-            return result;
-        }
-
-        // 2. Try current file's directory (local project imports)
-        if (!_current_file_dir.empty())
-        {
-            // Try exact case first (import Foo → Foo.cryo or Foo/_module.cryo)
-            std::string local_resolved = os.join_path(_current_file_dir, file_path);
-            dbg_write("step2: local_resolved='" + local_resolved + "'");
-            result = resolve_module_file_path(local_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
-            dbg_write("step2: resolve_module_file_path result='" + result + "'");
-            bool step2_exists = std::filesystem::exists(result);
-            dbg_write("step2: exists=" + std::string(step2_exists ? "Y" : "N"));
+            // Exact case (import Compiler → Compiler/_module.cryo)
+            std::string project_resolved = os.join_path(_project_root, file_path);
+            std::string result = resolve_module_file_path(project_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
             if (std::filesystem::exists(result))
             {
                 _last_resolve_was_local = true;
                 return result;
             }
 
-            // Try lowercase (import Foo → foo.cryo or foo/_module.cryo)
-            std::string lower_file_path = file_path;
-            std::transform(lower_file_path.begin(), lower_file_path.end(), lower_file_path.begin(), ::tolower);
-            if (lower_file_path != file_path)
+            // Lowercase (import Compiler → compiler/_module.cryo)
+            if (has_lower_variant)
             {
-                local_resolved = os.join_path(_current_file_dir, lower_file_path);
-                dbg_write("step2-lower: local_resolved='" + local_resolved + "'");
-                result = resolve_module_file_path(local_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
-                dbg_write("step2-lower: resolve_module_file_path result='" + result + "'");
-                bool step2l_exists = std::filesystem::exists(result);
-                dbg_write("step2-lower: exists=" + std::string(step2l_exists ? "Y" : "N"));
+                project_resolved = os.join_path(_project_root, lower_file_path);
+                result = resolve_module_file_path(project_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
                 if (std::filesystem::exists(result))
                 {
                     _last_resolve_was_local = true;
@@ -409,13 +386,42 @@ namespace Cryo
                 }
             }
         }
-        else
+
+        // 2. Try current file's directory (relative imports within a project)
+        if (!_current_file_dir.empty())
         {
-            dbg_write("step2 SKIPPED: _current_file_dir is empty!");
+            // Exact case
+            std::string local_resolved = os.join_path(_current_file_dir, file_path);
+            std::string result = resolve_module_file_path(local_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+            if (std::filesystem::exists(result))
+            {
+                _last_resolve_was_local = true;
+                return result;
+            }
+
+            // Lowercase
+            if (has_lower_variant)
+            {
+                local_resolved = os.join_path(_current_file_dir, lower_file_path);
+                result = resolve_module_file_path(local_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
         }
 
-        // Fall back to stdlib path (will fail at load time with proper error)
-        dbg_write("FALLBACK to stdlib");
+        // 3. Try stdlib root (standard library imports)
+        std::string stdlib_resolved = os.join_path(_stdlib_root, file_path);
+        std::string result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+        if (std::filesystem::exists(result))
+        {
+            _last_resolve_was_local = false;
+            return result;
+        }
+
+        // 4. Fallback to stdlib path (will fail at load time with proper error)
         _last_resolve_was_local = false;
         return resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
     }

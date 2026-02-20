@@ -3,6 +3,7 @@
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
 #include "Types/ErrorType.hpp"
+#include "Types/GenericTypes.hpp"
 #include "Types/GenericRegistry.hpp"
 #include "Utils/Logger.hpp"
 
@@ -3382,6 +3383,22 @@ namespace Cryo::Codegen
             for (const auto &param : func_type->param_types())
             {
                 if (Cryo::contains_generic_params(param))
+                {
+                    skipped_generic++;
+                    return;
+                }
+            }
+
+            // Skip functions whose types contain ErrorType nodes —
+            // these are unresolved generics that would map to wrong types (e.g., void).
+            if (Cryo::contains_error_types(func_type->return_type()))
+            {
+                skipped_generic++;
+                return;
+            }
+            for (const auto &param : func_type->param_types())
+            {
+                if (Cryo::contains_error_types(param))
                 {
                     skipped_generic++;
                     return;
