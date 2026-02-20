@@ -6369,8 +6369,8 @@ namespace Cryo
             field->set_default_value(std::move(default_value));
         }
 
-        consume(TokenKind::TK_SEMICOLON, "Expected ';' after field declaration");
         attach_documentation(field.get());
+        consume(TokenKind::TK_SEMICOLON, "Expected ';' after field declaration");
         return field;
     }
 
