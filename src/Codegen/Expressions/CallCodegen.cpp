@@ -4729,6 +4729,15 @@ namespace Cryo::Codegen
                     type_name = ptr_type->pointee()->display_name();
                 }
             }
+            // Handle reference types - get the referent type name
+            else if (obj_type->kind() == Cryo::TypeKind::Reference)
+            {
+                auto *ref_type = dynamic_cast<const Cryo::ReferenceType *>(obj_type.get());
+                if (ref_type && ref_type->referent().is_valid())
+                {
+                    type_name = ref_type->referent()->display_name();
+                }
+            }
             else if (!type_name.empty() && type_name.back() == '*')
             {
                 type_name.pop_back();
@@ -4746,11 +4755,30 @@ namespace Cryo::Codegen
                 auto it = var_types.find(var_name);
                 if (it != var_types.end() && it->second.is_valid())
                 {
-                    type_name = it->second->display_name();
-                    // Handle InstantiatedType
-                    if (it->second->kind() == Cryo::TypeKind::InstantiatedType)
+                    Cryo::TypeRef resolved_var_type = it->second;
+                    // Unwrap reference types to get the referent
+                    if (resolved_var_type->kind() == Cryo::TypeKind::Reference)
                     {
-                        auto *inst = static_cast<const Cryo::InstantiatedType *>(it->second.get());
+                        auto *ref_type = dynamic_cast<const Cryo::ReferenceType *>(resolved_var_type.get());
+                        if (ref_type && ref_type->referent().is_valid())
+                        {
+                            resolved_var_type = ref_type->referent();
+                        }
+                    }
+                    // Unwrap pointer types to get the pointee
+                    else if (resolved_var_type->kind() == Cryo::TypeKind::Pointer)
+                    {
+                        auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(resolved_var_type.get());
+                        if (ptr_type && ptr_type->pointee().is_valid())
+                        {
+                            resolved_var_type = ptr_type->pointee();
+                        }
+                    }
+                    type_name = resolved_var_type->display_name();
+                    // Handle InstantiatedType
+                    if (resolved_var_type->kind() == Cryo::TypeKind::InstantiatedType)
+                    {
+                        auto *inst = static_cast<const Cryo::InstantiatedType *>(resolved_var_type.get());
                         if (inst->has_resolved_type())
                         {
                             type_name = inst->resolved_type()->display_name();
@@ -4853,6 +4881,14 @@ namespace Cryo::Codegen
                                                 type_name = ptr_type->pointee()->display_name();
                                             }
                                         }
+                                        else if (field_type->kind() == Cryo::TypeKind::Reference)
+                                        {
+                                            auto *ref_type = dynamic_cast<const Cryo::ReferenceType *>(field_type.get());
+                                            if (ref_type && ref_type->referent().is_valid())
+                                            {
+                                                type_name = ref_type->referent()->display_name();
+                                            }
+                                        }
                                         else if (!type_name.empty() && type_name.back() == '*')
                                         {
                                             type_name.pop_back();
@@ -4886,6 +4922,14 @@ namespace Cryo::Codegen
                                     if (ptr_type && ptr_type->pointee().is_valid())
                                     {
                                         type_name = ptr_type->pointee()->display_name();
+                                    }
+                                }
+                                else if (field_type->kind() == Cryo::TypeKind::Reference)
+                                {
+                                    auto *ref_type = dynamic_cast<const Cryo::ReferenceType *>(field_type.get());
+                                    if (ref_type && ref_type->referent().is_valid())
+                                    {
+                                        type_name = ref_type->referent()->display_name();
                                     }
                                 }
                                 else if (!type_name.empty() && type_name.back() == '*')

@@ -752,8 +752,8 @@ namespace Cryo::Codegen
             if (display_type.empty() && node->object() && node->object()->get_resolved_type())
                 display_type = node->object()->get_resolved_type()->display_name();
             std::string msg = display_type.empty()
-                ? "no field '" + member_name + "' found"
-                : "no field '" + member_name + "' found on type '" + display_type + "'";
+                                  ? "no field '" + member_name + "' found"
+                                  : "no field '" + member_name + "' found on type '" + display_type + "'";
 
             auto diag = Diag::error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, msg);
             diag.at(node);
@@ -918,8 +918,8 @@ namespace Cryo::Codegen
             if (display_type.empty() && node->object() && node->object()->get_resolved_type())
                 display_type = node->object()->get_resolved_type()->display_name();
             std::string msg = display_type.empty()
-                ? "no field '" + member_name + "' found"
-                : "no field '" + member_name + "' found on type '" + display_type + "'";
+                                  ? "no field '" + member_name + "' found"
+                                  : "no field '" + member_name + "' found on type '" + display_type + "'";
 
             auto diag = Diag::error(ErrorCode::E0622_MEMBER_ACCESS_ERROR, msg);
             diag.at(node);
@@ -1644,8 +1644,8 @@ namespace Cryo::Codegen
                     arr_name = ma->member();
 
                 std::string msg = arr_name.empty()
-                    ? "failed to generate array expression"
-                    : "failed to generate array expression for '" + arr_name + "'";
+                                      ? "failed to generate array expression"
+                                      : "failed to generate array expression for '" + arr_name + "'";
                 auto diag = Diag::error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, msg);
                 diag.at(node);
                 if (node->array() && node->array()->get_resolved_type())
@@ -2057,8 +2057,8 @@ namespace Cryo::Codegen
                     arr_name = ma->member();
 
                 std::string msg = arr_name.empty()
-                    ? "failed to generate array expression"
-                    : "failed to generate array expression for '" + arr_name + "'";
+                                      ? "failed to generate array expression"
+                                      : "failed to generate array expression for '" + arr_name + "'";
                 auto diag = Diag::error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, msg);
                 diag.at(node);
                 if (node->array() && node->array()->get_resolved_type())
@@ -2925,7 +2925,8 @@ namespace Cryo::Codegen
                     mangled += "_";
                     for (size_t i = 0; i < args.size(); ++i)
                     {
-                        if (i > 0) mangled += "_";
+                        if (i > 0)
+                            mangled += "_";
                         if (args[i].is_valid())
                         {
                             std::string arg_name = args[i]->display_name();
@@ -2957,7 +2958,8 @@ namespace Cryo::Codegen
     {
         if (!object)
         {
-            if (out_failure_reason) *out_failure_reason = "null object expression";
+            if (out_failure_reason)
+                *out_failure_reason = "null object expression";
             return false;
         }
 
@@ -3138,7 +3140,8 @@ namespace Cryo::Codegen
                                     mangled += "_";
                                     for (size_t i = 0; i < args.size(); ++i)
                                     {
-                                        if (i > 0) mangled += "_";
+                                        if (i > 0)
+                                            mangled += "_";
                                         if (args[i].is_valid())
                                         {
                                             std::string arg_name = args[i]->display_name();
@@ -3200,7 +3203,8 @@ namespace Cryo::Codegen
                                         mangled += "_";
                                         for (size_t i = 0; i < args.size(); ++i)
                                         {
-                                            if (i > 0) mangled += "_";
+                                            if (i > 0)
+                                                mangled += "_";
                                             if (args[i].is_valid())
                                             {
                                                 std::string arg_name = args[i]->display_name();
@@ -3365,7 +3369,8 @@ namespace Cryo::Codegen
                                             mangled += "_";
                                             for (size_t i = 0; i < args.size(); ++i)
                                             {
-                                                if (i > 0) mangled += "_";
+                                                if (i > 0)
+                                                    mangled += "_";
                                                 if (args[i].is_valid())
                                                 {
                                                     std::string arg_name = args[i]->display_name();
@@ -3544,7 +3549,8 @@ namespace Cryo::Codegen
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "resolve_member_info: No resolved type for object");
-                if (out_failure_reason) *out_failure_reason = "could not determine the type of the object expression";
+                if (out_failure_reason)
+                    *out_failure_reason = "could not determine the type of the object expression";
                 return false;
             }
         }
@@ -3665,8 +3671,10 @@ namespace Cryo::Codegen
             size_t arg_start = 0;
             for (size_t ci = 0; ci < args_str.length(); ++ci)
             {
-                if (args_str[ci] == '<') depth++;
-                else if (args_str[ci] == '>') depth--;
+                if (args_str[ci] == '<')
+                    depth++;
+                else if (args_str[ci] == '>')
+                    depth--;
                 else if (args_str[ci] == ',' && depth == 0)
                 {
                     std::string arg = args_str.substr(arg_start, ci - arg_start);
@@ -3685,7 +3693,8 @@ namespace Cryo::Codegen
 
             for (size_t i = 0; i < parsed_args.size(); ++i)
             {
-                if (i > 0) mangled_type_name += "_";
+                if (i > 0)
+                    mangled_type_name += "_";
                 std::string arg = parsed_args[i];
                 std::replace(arg.begin(), arg.end(), '<', '_');
                 std::replace(arg.begin(), arg.end(), '>', '_');
@@ -3855,7 +3864,8 @@ namespace Cryo::Codegen
                             reason += "; available fields: ";
                             for (size_t i = 0; i < field_info->field_names.size() && i < 10; ++i)
                             {
-                                if (i > 0) reason += ", ";
+                                if (i > 0)
+                                    reason += ", ";
                                 reason += field_info->field_names[i];
                             }
                             if (field_info->field_names.size() > 10)
@@ -5360,13 +5370,16 @@ namespace Cryo::Codegen
             size_t count = 0;
             for (const auto &[name, val] : enum_variants_map)
             {
-                if (count >= 10) { available += ", ..."; break; }
-                if (!available.empty()) available += ", \n";
+                if (count >= 10)
+                {
+                    available += ", ...";
+                    break;
+                }
+                if (!available.empty())
+                    available += ", \n";
                 available += name;
                 ++count;
             }
-            if (!available.empty())
-                diag.with_note("available variants in scope: \n" + available);
             diag.help("generic enum variants must be instantiated before use");
             emit_diagnostic(std::move(diag));
         }

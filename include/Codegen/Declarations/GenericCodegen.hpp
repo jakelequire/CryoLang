@@ -411,6 +411,18 @@ namespace Cryo::Codegen
         TypeRef resolve_field_type_from_annotation(const TypeAnnotation *annotation);
 
         /**
+         * @brief Resolve a method parameter's type using substitution with annotation fallback
+         *
+         * Tries get_resolved_type() + substitute_type_params() first. If that yields
+         * an invalid type (common for cross-module generic instantiations where the
+         * original AST has no resolved_type), falls back to resolve_field_type_from_annotation().
+         *
+         * @param param The parameter's VariableDeclarationNode
+         * @return Substituted TypeRef, or empty if resolution fails
+         */
+        TypeRef resolve_param_type(const VariableDeclarationNode *param);
+
+        /**
          * @brief Look up the InstantiatedType for the given generic and set call-site
          *        info on CodegenContext for better error messages.
          */

@@ -1741,11 +1741,249 @@ namespace Cryo
 
     llvm::Type *TypeMapper::map_error(const ErrorType *type)
     {
-        // Error types indicate compilation failure - use void as placeholder
-        if (type)
+        if (!type)
+            return void_type();
+
+        const std::string &reason = type->reason();
+
+        // Check if this is an "unresolved generic" error — these often have
+        // concrete instantiated types available under a mangled name.
+        // Example reasons: "unresolved generic: Option<Layout>", "unresolved generic: IoResult<()>"
+        const std::string prefix = "unresolved generic: ";
+        size_t prefix_pos = reason.find(prefix);
+        if (prefix_pos != std::string::npos)
         {
-            report_error("Mapping error type: " + type->reason());
+            std::string generic_name = reason.substr(prefix_pos + prefix.size());
+
+            // Step 1: If we have a type_param_resolver, substitute any remaining
+            // generic params (T, U, V, E, K, etc.) with their concrete bindings.
+            // This handles cases like "Option<T>" inside an Array<String> instantiation
+            // where T should resolve to String.
+            if (_type_param_resolver && generic_name.find('<') != std::string::npos)
+            {
+                size_t angle_start = generic_name.find('<');
+                size_t angle_end = generic_name.rfind('>');
+                if (angle_start != std::string::npos && angle_end != std::string::npos && angle_end > angle_start)
+                {
+                    std::string base = generic_name.substr(0, angle_start);
+                    std::string args_str = generic_name.substr(angle_start + 1, angle_end - angle_start - 1);
+
+                    // Parse args respecting nesting
+                    std::vector<std::string> arg_names;
+                    int depth = 0;
+                    size_t start = 0;
+                    for (size_t i = 0; i < args_str.size(); ++i)
+                    {
+                        if (args_str[i] == '<')
+                            depth++;
+                        else if (args_str[i] == '>')
+                            depth--;
+                        else if (args_str[i] == ',' && depth == 0)
+                        {
+                            std::string arg = args_str.substr(start, i - start);
+                            while (!arg.empty() && arg.front() == ' ')
+                                arg.erase(arg.begin());
+                            while (!arg.empty() && arg.back() == ' ')
+                                arg.pop_back();
+                            arg_names.push_back(arg);
+                            start = i + 1;
+                        }
+                    }
+                    std::string last_arg = args_str.substr(start);
+                    while (!last_arg.empty() && last_arg.front() == ' ')
+                        last_arg.erase(last_arg.begin());
+                    while (!last_arg.empty() && last_arg.back() == ' ')
+                        last_arg.pop_back();
+                    if (!last_arg.empty())
+                        arg_names.push_back(last_arg);
+
+                    // Try to resolve each arg — substitute type params
+                    bool any_substituted = false;
+                    std::vector<std::string> resolved_arg_names;
+                    std::vector<TypeRef> resolved_arg_types;
+                    bool all_resolved = true;
+                    for (const auto &arg : arg_names)
+                    {
+                        // First try type param resolver (handles T, U, V, E, K, etc.)
+                        TypeRef resolved = _type_param_resolver(arg);
+                        if (resolved.is_valid())
+                        {
+                            resolved_arg_names.push_back(resolved->display_name());
+                            resolved_arg_types.push_back(resolved);
+                            any_substituted = true;
+                        }
+                        else
+                        {
+                            // Try pointer forms like "T*"
+                            if (arg.size() > 1 && arg.back() == '*')
+                            {
+                                std::string inner = arg.substr(0, arg.size() - 1);
+                                TypeRef inner_resolved = _type_param_resolver(inner);
+                                if (inner_resolved.is_valid())
+                                {
+                                    resolved_arg_names.push_back(inner_resolved->display_name() + "*");
+                                    resolved_arg_types.push_back(_arena.get_pointer_to(inner_resolved));
+                                    any_substituted = true;
+                                    continue;
+                                }
+                            }
+                            // Not a type param — keep as-is and try to resolve as concrete type
+                            TypeRef concrete = resolve_type_from_string(arg);
+                            if (concrete.is_valid())
+                            {
+                                resolved_arg_names.push_back(arg);
+                                resolved_arg_types.push_back(concrete);
+                            }
+                            else
+                            {
+                                all_resolved = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (all_resolved && !resolved_arg_types.empty())
+                    {
+                        // Build substituted name and try to find/create the type
+                        std::string substituted_name = base + "<";
+                        for (size_t i = 0; i < resolved_arg_names.size(); ++i)
+                        {
+                            if (i > 0)
+                                substituted_name += ", ";
+                            substituted_name += resolved_arg_names[i];
+                        }
+                        substituted_name += ">";
+
+                        // Try mangled name lookup in LLVM context
+                        std::string mangled = mangle_display_name(substituted_name);
+                        if (llvm::StructType *existing = llvm::StructType::getTypeByName(_llvm_ctx, mangled))
+                        {
+                            if (!existing->isOpaque())
+                            {
+                                LOG_DEBUG(LogComponent::CODEGEN,
+                                          "TypeMapper::map_error: Resolved '{}' -> '{}' via mangled name",
+                                          reason, mangled);
+                                return existing;
+                            }
+                        }
+
+                        // Try the generic instantiator
+                        if (!_skip_generic_instantiation && _generic_instantiator)
+                        {
+                            // Look up the base type
+                            TypeRef base_type = _arena.lookup_type_by_name(base);
+                            if (!base_type.is_valid())
+                                base_type = _arena.lookup_type_by_name("std::core::option::" + base);
+                            if (!base_type.is_valid())
+                                base_type = _arena.lookup_type_by_name("std::core::result::" + base);
+                            if (!base_type.is_valid())
+                                base_type = _arena.lookup_type_by_name("std::io::error::" + base);
+
+                            if (base_type.is_valid())
+                            {
+                                llvm::StructType *result = _generic_instantiator(base, resolved_arg_types);
+                                if (result && !result->isOpaque())
+                                {
+                                    LOG_DEBUG(LogComponent::CODEGEN,
+                                              "TypeMapper::map_error: Resolved '{}' -> '{}' via instantiator",
+                                              reason, result->getName().str());
+                                    return result;
+                                }
+                            }
+                        }
+
+                        // Try resolve_and_map with the substituted name
+                        llvm::Type *mapped = try_instantiate_generic_from_string(substituted_name);
+                        if (mapped && (!llvm::isa<llvm::StructType>(mapped) ||
+                                       !llvm::cast<llvm::StructType>(mapped)->isOpaque()))
+                        {
+                            LOG_DEBUG(LogComponent::CODEGEN,
+                                      "TypeMapper::map_error: Resolved '{}' -> '{}' via string instantiation",
+                                      reason, substituted_name);
+                            return mapped;
+                        }
+                    }
+                }
+            }
+
+            // Step 2: For already-concrete names (no type params to substitute),
+            // try direct mangled name lookup
+            {
+                std::string mangled = mangle_display_name(generic_name);
+                if (llvm::StructType *existing = llvm::StructType::getTypeByName(_llvm_ctx, mangled))
+                {
+                    if (!existing->isOpaque())
+                    {
+                        LOG_DEBUG(LogComponent::CODEGEN,
+                                  "TypeMapper::map_error: Resolved concrete '{}' -> '{}'",
+                                  reason, mangled);
+                        return existing;
+                    }
+                }
+
+                // Try display name too
+                if (mangled != generic_name)
+                {
+                    if (llvm::StructType *existing = llvm::StructType::getTypeByName(_llvm_ctx, generic_name))
+                    {
+                        if (!existing->isOpaque())
+                        {
+                            LOG_DEBUG(LogComponent::CODEGEN,
+                                      "TypeMapper::map_error: Resolved concrete '{}' by display name",
+                                      reason);
+                            return existing;
+                        }
+                    }
+                }
+
+                // Only try string instantiation if all type args are resolvable
+                // as concrete types. If any arg fails to resolve, it's unresolved.
+                bool all_args_concrete = true;
+                {
+                    size_t as = generic_name.find('<');
+                    size_t ae = generic_name.rfind('>');
+                    if (as != std::string::npos && ae != std::string::npos && ae > as)
+                    {
+                        std::string args_check = generic_name.substr(as + 1, ae - as - 1);
+                        int depth = 0;
+                        size_t seg_start = 0;
+                        for (size_t ci = 0; ci <= args_check.size(); ++ci)
+                        {
+                            if (ci < args_check.size() && args_check[ci] == '<') depth++;
+                            else if (ci < args_check.size() && args_check[ci] == '>') depth--;
+                            else if ((ci == args_check.size() || (args_check[ci] == ',' && depth == 0)))
+                            {
+                                std::string seg = args_check.substr(seg_start, ci - seg_start);
+                                while (!seg.empty() && seg.front() == ' ') seg.erase(seg.begin());
+                                while (!seg.empty() && seg.back() == ' ') seg.pop_back();
+                                if (!seg.empty() && !resolve_type_from_string(seg).is_valid())
+                                {
+                                    all_args_concrete = false;
+                                    break;
+                                }
+                                seg_start = ci + 1;
+                            }
+                        }
+                    }
+                }
+
+                if (all_args_concrete)
+                {
+                    llvm::Type *mapped = try_instantiate_generic_from_string(generic_name);
+                    if (mapped && (!llvm::isa<llvm::StructType>(mapped) ||
+                                   !llvm::cast<llvm::StructType>(mapped)->isOpaque()))
+                    {
+                        LOG_DEBUG(LogComponent::CODEGEN,
+                                  "TypeMapper::map_error: Created concrete '{}' via string instantiation",
+                                  reason);
+                        return mapped;
+                    }
+                }
+            }
         }
+
+        // Fallback — genuine error type, use void as placeholder
+        report_error("Mapping error type: " + reason);
         return void_type();
     }
 
@@ -2216,6 +2454,8 @@ namespace Cryo
     TypeRef TypeMapper::resolve_type_from_string(const std::string &name)
     {
         // Try primitives first
+        if (name == "()" || name == "unit")
+            return _arena.get_unit();
         if (name == "void")
             return _arena.get_void();
         if (name == "boolean" || name == "bool")
@@ -2250,6 +2490,17 @@ namespace Cryo
         if (found.is_valid())
         {
             return found;
+        }
+
+        // Handle pointer types (e.g., "void*", "u8*")
+        if (name.size() > 1 && name.back() == '*')
+        {
+            std::string inner_name = name.substr(0, name.size() - 1);
+            TypeRef inner = resolve_type_from_string(inner_name);
+            if (inner.is_valid())
+            {
+                return _arena.get_pointer_to(inner);
+            }
         }
 
         // Check if it's a generic type itself

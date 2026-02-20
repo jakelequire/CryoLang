@@ -608,19 +608,21 @@ namespace Cryo::Codegen
                         size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
                         if (ast_idx < ast_params.size())
                         {
-                            TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
-                            // Apply type substitution (T -> string, etc.)
-                            TypeRef substituted = substitute_type_params(param_type);
+                            TypeRef substituted = resolve_param_type(ast_params[ast_idx].get());
                             if (substituted.is_valid())
                             {
                                 // Ensure dependent types are instantiated (e.g., &HashSet<string> needs HashSet<string>)
                                 ensure_dependent_types_instantiated(substituted);
                                 ctx().variable_types_map()[param_name] = substituted;
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "GenericCodegen: Registered param '{}' type: {} -> {}",
+                                          "GenericCodegen: Registered param '{}' type: {}",
                                           param_name,
-                                          param_type.is_valid() ? param_type->display_name() : "null",
                                           substituted->display_name());
+                            }
+                            else
+                            {
+                                // Erase stale entry to prevent phantom method dispatch from previous methods
+                                ctx().variable_types_map().erase(param_name);
                             }
                         }
                     }
@@ -818,17 +820,20 @@ namespace Cryo::Codegen
                             size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
                             if (ast_idx < ast_params.size())
                             {
-                                TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
-                                TypeRef substituted = substitute_type_params(param_type);
+                                TypeRef substituted = resolve_param_type(ast_params[ast_idx].get());
                                 if (substituted.is_valid())
                                 {
                                     ensure_dependent_types_instantiated(substituted);
                                     ctx().variable_types_map()[param_name] = substituted;
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                              "GenericCodegen: Registered impl param '{}' type: {} -> {}",
+                                              "GenericCodegen: Registered impl param '{}' type: {}",
                                               param_name,
-                                              param_type.is_valid() ? param_type->display_name() : "null",
                                               substituted->display_name());
+                                }
+                                else
+                                {
+                                    // Erase stale entry to prevent phantom method dispatch from previous methods
+                                    ctx().variable_types_map().erase(param_name);
                                 }
                             }
                         }
@@ -1412,18 +1417,21 @@ namespace Cryo::Codegen
                             size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
                             if (ast_idx < ast_params.size())
                             {
-                                TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
-                                TypeRef substituted = substitute_type_params(param_type);
+                                TypeRef substituted = resolve_param_type(ast_params[ast_idx].get());
                                 if (substituted.is_valid())
                                 {
                                     // Ensure dependent types are instantiated (e.g., &HashSet<string> needs HashSet<string>)
                                     ensure_dependent_types_instantiated(substituted);
                                     ctx().variable_types_map()[param_name] = substituted;
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                              "GenericCodegen: Registered param '{}' type: {} -> {}",
+                                              "GenericCodegen: Registered param '{}' type: {}",
                                               param_name,
-                                              param_type.is_valid() ? param_type->display_name() : "null",
                                               substituted->display_name());
+                                }
+                                else
+                                {
+                                    // Erase stale entry to prevent phantom method dispatch from previous methods
+                                    ctx().variable_types_map().erase(param_name);
                                 }
                             }
                         }
@@ -2185,18 +2193,20 @@ namespace Cryo::Codegen
                             size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
                             if (ast_idx < ast_params.size())
                             {
-                                TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
-                                // Apply type substitution (T -> i64, etc.)
-                                TypeRef substituted = substitute_type_params(param_type);
+                                TypeRef substituted = resolve_param_type(ast_params[ast_idx].get());
                                 if (substituted.is_valid())
                                 {
                                     ensure_dependent_types_instantiated(substituted);
                                     ctx().variable_types_map()[param_name] = substituted;
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                              "GenericCodegen: Registered enum param '{}' type: {} -> {}",
+                                              "GenericCodegen: Registered enum param '{}' type: {}",
                                               param_name,
-                                              param_type.is_valid() ? param_type->display_name() : "null",
                                               substituted->display_name());
+                                }
+                                else
+                                {
+                                    // Erase stale entry to prevent phantom method dispatch from previous methods
+                                    ctx().variable_types_map().erase(param_name);
                                 }
                             }
                         }
@@ -2554,11 +2564,15 @@ namespace Cryo::Codegen
 
                 if (param_idx < ast_params.size())
                 {
-                    TypeRef param_type = ast_params[param_idx]->get_resolved_type();
-                    TypeRef substituted = substitute_type_params(param_type);
+                    TypeRef substituted = resolve_param_type(ast_params[param_idx].get());
                     if (substituted.is_valid())
                     {
                         ctx().variable_types_map()[param_name] = substituted;
+                    }
+                    else
+                    {
+                        // Erase stale entry to prevent phantom method dispatch from previous methods
+                        ctx().variable_types_map().erase(param_name);
                     }
                 }
                 param_idx++;
@@ -2818,12 +2832,16 @@ namespace Cryo::Codegen
                     size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
                     if (ast_idx < ast_params.size())
                     {
-                        TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
-                        TypeRef substituted = substitute_type_params(param_type);
+                        TypeRef substituted = resolve_param_type(ast_params[ast_idx].get());
                         if (substituted.is_valid())
                         {
                             ensure_dependent_types_instantiated(substituted);
                             ctx().variable_types_map()[param_name] = substituted;
+                        }
+                        else
+                        {
+                            // Erase stale entry to prevent phantom method dispatch from previous methods
+                            ctx().variable_types_map().erase(param_name);
                         }
                     }
                 }
@@ -3737,6 +3755,17 @@ namespace Cryo::Codegen
         return llvm::FunctionType::get(llvm_ret, param_types, is_variadic);
     }
 
+    TypeRef GenericCodegen::resolve_param_type(const VariableDeclarationNode *param)
+    {
+        TypeRef param_type = param->get_resolved_type();
+        TypeRef substituted = substitute_type_params(param_type);
+        if (!substituted.is_valid() && param->has_type_annotation())
+        {
+            substituted = resolve_field_type_from_annotation(param->type_annotation());
+        }
+        return substituted;
+    }
+
     TypeRef GenericCodegen::resolve_field_type_from_annotation(const TypeAnnotation *annotation)
     {
         if (!annotation)
@@ -3842,6 +3871,135 @@ namespace Cryo::Codegen
                 auto template_info = generics->get_template_by_name(name);
                 if (template_info)
                     return template_info->generic_type;
+            }
+
+            // Fallback: Handle flattened type annotation strings (e.g., "&mut Array<T>" stored as Named)
+            // This handles cases where cross-module template cloning flattens structured annotations
+
+            // Handle mutable reference prefix: "&mut X" or "&mut X<T>"
+            if (name.size() > 5 && name.substr(0, 5) == "&mut ")
+            {
+                std::string inner_name = name.substr(5);
+                TypeAnnotation inner_ann = TypeAnnotation::named(inner_name, annotation->location);
+                TypeRef inner = resolve_field_type_from_annotation(&inner_ann);
+                if (inner.is_valid())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_field_type_from_annotation: Parsed flattened '{}' -> &mut {}",
+                              name, inner->display_name());
+                    return arena.get_reference_to(inner, RefMutability::Mutable);
+                }
+                return TypeRef();
+            }
+
+            // Handle immutable reference prefix: "&X" or "&X<T>"
+            if (name.size() > 1 && name[0] == '&')
+            {
+                std::string inner_name = name.substr(1);
+                TypeAnnotation inner_ann = TypeAnnotation::named(inner_name, annotation->location);
+                TypeRef inner = resolve_field_type_from_annotation(&inner_ann);
+                if (inner.is_valid())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_field_type_from_annotation: Parsed flattened '{}' -> &{}",
+                              name, inner->display_name());
+                    return arena.get_reference_to(inner, RefMutability::Immutable);
+                }
+                return TypeRef();
+            }
+
+            // Handle pointer suffix: "X*"
+            if (name.size() > 1 && name.back() == '*')
+            {
+                std::string inner_name = name.substr(0, name.size() - 1);
+                TypeAnnotation inner_ann = TypeAnnotation::named(inner_name, annotation->location);
+                TypeRef inner = resolve_field_type_from_annotation(&inner_ann);
+                if (inner.is_valid())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_field_type_from_annotation: Parsed flattened '{}' -> {}*",
+                              name, inner->display_name());
+                    return arena.get_pointer_to(inner);
+                }
+                return TypeRef();
+            }
+
+            // Handle generic: "Name<A, B, ...>"
+            {
+                auto angle_pos = name.find('<');
+                if (angle_pos != std::string::npos && name.back() == '>')
+                {
+                    std::string base_name = name.substr(0, angle_pos);
+                    std::string args_str = name.substr(angle_pos + 1, name.size() - angle_pos - 2);
+
+                    // Parse comma-separated type arguments (respecting nested angle brackets)
+                    std::vector<std::string> arg_names;
+                    int depth = 0;
+                    size_t start = 0;
+                    for (size_t i = 0; i < args_str.size(); ++i)
+                    {
+                        if (args_str[i] == '<')
+                            depth++;
+                        else if (args_str[i] == '>')
+                            depth--;
+                        else if (args_str[i] == ',' && depth == 0)
+                        {
+                            std::string arg = args_str.substr(start, i - start);
+                            // Trim whitespace
+                            while (!arg.empty() && arg.front() == ' ')
+                                arg.erase(arg.begin());
+                            while (!arg.empty() && arg.back() == ' ')
+                                arg.pop_back();
+                            arg_names.push_back(arg);
+                            start = i + 1;
+                        }
+                    }
+                    // Last argument
+                    std::string last_arg = args_str.substr(start);
+                    while (!last_arg.empty() && last_arg.front() == ' ')
+                        last_arg.erase(last_arg.begin());
+                    while (!last_arg.empty() && last_arg.back() == ' ')
+                        last_arg.pop_back();
+                    if (!last_arg.empty())
+                        arg_names.push_back(last_arg);
+
+                    // Resolve base type as a generic template
+                    TypeAnnotation base_ann = TypeAnnotation::named(base_name, annotation->location);
+                    TypeRef base_type = resolve_field_type_from_annotation(&base_ann);
+                    if (!base_type.is_valid() || base_type.is_error())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_field_type_from_annotation: Could not resolve generic base '{}'", base_name);
+                        return TypeRef();
+                    }
+
+                    // Resolve type arguments
+                    std::vector<TypeRef> type_args;
+                    type_args.reserve(arg_names.size());
+                    for (const auto &arg_name : arg_names)
+                    {
+                        TypeAnnotation arg_ann = TypeAnnotation::named(arg_name, annotation->location);
+                        TypeRef arg_type = resolve_field_type_from_annotation(&arg_ann);
+                        if (!arg_type.is_valid() || arg_type.is_error())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_field_type_from_annotation: Could not resolve generic arg '{}'", arg_name);
+                            return TypeRef();
+                        }
+                        type_args.push_back(arg_type);
+                    }
+
+                    // Create instantiation
+                    TypeRef instantiated = arena.create_instantiation(base_type, std::move(type_args));
+                    arena.register_instantiated_by_name(instantiated);
+                    ensure_dependent_types_instantiated(instantiated);
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_field_type_from_annotation: Parsed flattened generic '{}' -> '{}'",
+                              name, instantiated.is_valid() ? instantiated->display_name() : "invalid");
+
+                    return instantiated;
+                }
             }
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
