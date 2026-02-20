@@ -54,7 +54,7 @@ namespace CryoLSP
                                          project.config.target_type == "stdlib";
                 bool use_stdlib = !project.config.no_std && !is_stdlib_project;
 
-                instance->set_raw_mode(false);
+                instance->set_raw_mode(project.config.no_std); // no-std: skip main→_user_main_ transform (no runtime)
                 instance->set_auto_imports_enabled(use_stdlib); // Only auto-import prelude when stdlib is used
                 instance->set_stdlib_linking(false);            // No codegen/linking in LSP
 
@@ -162,14 +162,32 @@ namespace CryoLSP
     {
         _intrinsics_loaded = true;
 
-        if (_workspace_root.empty())
-            return;
+        // Try to find intrinsics.cryo: first in workspace, then via stdlib auto-detection
+        std::string intrinsics_path;
 
-        std::string intrinsics_path = _workspace_root + "/stdlib/core/intrinsics.cryo";
-
-        if (!std::filesystem::exists(intrinsics_path))
+        // 1. Check workspace root (works when workspace IS the CryoLang repo)
+        if (!_workspace_root.empty())
         {
-            Transport::log("[Intrinsics] File not found: " + intrinsics_path);
+            std::string ws_path = _workspace_root + "/stdlib/core/intrinsics.cryo";
+            if (std::filesystem::exists(ws_path))
+                intrinsics_path = ws_path;
+        }
+
+        // 2. Fall back to stdlib auto-detection (finds stdlib relative to compiler executable)
+        if (intrinsics_path.empty())
+        {
+            std::string stdlib_root = Cryo::ModuleLoader::find_stdlib_directory();
+            if (!stdlib_root.empty())
+            {
+                std::string detected_path = stdlib_root + "/core/intrinsics.cryo";
+                if (std::filesystem::exists(detected_path))
+                    intrinsics_path = detected_path;
+            }
+        }
+
+        if (intrinsics_path.empty())
+        {
+            Transport::log("[Intrinsics] File not found in workspace or stdlib");
             return;
         }
 
