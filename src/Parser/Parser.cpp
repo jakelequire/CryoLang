@@ -307,7 +307,9 @@ namespace Cryo
         // Parse optional namespace declaration
         if (_current_token.is(TokenKind::TK_KW_NAMESPACE))
         {
-            std::string namespace_name = parse_namespace();
+            auto ns_node = parse_namespace();
+            std::string namespace_name = ns_node->module_path();
+            program->add_statement(std::move(ns_node));
             _current_namespace = namespace_name; // Store the namespace in parser state
 
             // Get or create a ModuleID for this namespace and update context
@@ -1245,11 +1247,13 @@ namespace Cryo
     }
 
     // Namespace parsing
-    std::string Parser::parse_namespace()
+    std::unique_ptr<ModuleDeclarationNode> Parser::parse_namespace()
     {
+        SourceLocation start_loc = _current_token.location();
         consume(TokenKind::TK_KW_NAMESPACE, "Expected 'namespace'");
 
         std::string namespace_name;
+        SourceLocation name_loc = _current_token.location(); // Location of the first identifier
 
         // Parse namespace identifier (can be scoped like Std::Runtime)
         // Keywords like 'string' are allowed as namespace segments
@@ -1281,7 +1285,10 @@ namespace Cryo
         }
 
         consume(TokenKind::TK_SEMICOLON, "Expected ';' after namespace declaration");
-        return namespace_name;
+
+        auto node = std::make_unique<ModuleDeclarationNode>(start_loc, namespace_name, false);
+        node->set_name_location(name_loc);
+        return node;
     }
 
     // Statement parsing
@@ -2096,6 +2103,7 @@ namespace Cryo
             throw ParseError("Expected module path after 'module'", _current_token.location());
         }
 
+        SourceLocation module_path_loc = _current_token.location();
         std::string module_path = std::string(_current_token.text());
         advance(); // consume first identifier/keyword
 
@@ -2119,7 +2127,9 @@ namespace Cryo
             advance(); // consume ';'
         }
 
-        return std::make_unique<ModuleDeclarationNode>(start_loc, module_path, is_public);
+        auto module_node = std::make_unique<ModuleDeclarationNode>(start_loc, module_path, is_public);
+        module_node->set_name_location(module_path_loc);
+        return module_node;
     }
 
     std::unique_ptr<ReturnStatementNode> Parser::parse_return_statement()

@@ -229,15 +229,17 @@ namespace CryoLSP
             Transport::log("[Definition] Cursor on declaration node");
             return buildLocationFromNode(found.node, lookup_name, file_path);
 
-        // ---- Import declaration: navigate to the imported file ----
+        // ---- Import / Module declaration: navigate to the imported/declared module file ----
         case Kind::ImportDecl:
         {
-            Transport::log("[Definition] Import declaration");
-            auto *import_node = dynamic_cast<Cryo::ImportDeclarationNode *>(found.node);
-            if (!import_node)
+            Transport::log("[Definition] Import/module declaration");
+            std::string import_path;
+            if (auto *import_node = dynamic_cast<Cryo::ImportDeclarationNode *>(found.node))
+                import_path = import_node->module_path();
+            else if (auto *module_node = dynamic_cast<Cryo::ModuleDeclarationNode *>(found.node))
+                import_path = module_node->module_path();
+            else
                 return std::nullopt;
-
-            std::string import_path = import_node->module_path();
             Transport::log("[Definition] Import module_path: '" + import_path + "'");
 
             // Try to resolve the import to a file path

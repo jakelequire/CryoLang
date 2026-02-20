@@ -91,6 +91,7 @@ namespace CryoLSP
         void visit(Cryo::SwitchStatementNode &node) override;
         void visit(Cryo::CaseStatementNode &node) override;
         void visit(Cryo::ArrayAccessNode &node) override;
+        void visit(Cryo::ModuleDeclarationNode &node) override;
 
     private:
         size_t _target_line;

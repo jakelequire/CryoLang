@@ -152,7 +152,7 @@ namespace Cryo
         void attach_documentation(DeclarationNode *node);
 
         // Namespace parsing
-        std::string parse_namespace();
+        std::unique_ptr<ModuleDeclarationNode> parse_namespace();
 
         // Statement parsing
         std::unique_ptr<ASTNode> parse_statement();
