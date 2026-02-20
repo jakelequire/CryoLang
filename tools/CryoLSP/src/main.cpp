@@ -1,5 +1,6 @@
 #include "LSP/Server.hpp"
 #include "LSP/Transport.hpp"
+#include "Compiler/ModuleLoader.hpp"
 #include "Utils/OS.hpp"
 #include <iostream>
 #include <string>
@@ -66,6 +67,10 @@ int main(int argc, char *argv[])
 
     // Initialize the OS utility singleton (needed by ModuleLoader for path operations)
     Cryo::Utils::OS::initialize(argv[0]);
+
+    // Set global executable path so ModuleLoader::find_stdlib_directory() can search
+    // relative to the LSP binary (which lives alongside the compiler in bin/)
+    Cryo::ModuleLoader::set_global_executable_path(argv[0]);
 
     // Install crash handlers for diagnostic logging
     std::signal(SIGSEGV, crash_handler);

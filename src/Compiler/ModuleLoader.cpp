@@ -59,16 +59,19 @@ namespace Cryo
 
     std::string ModuleLoader::find_stdlib_directory(const std::string &executable_path)
     {
+        // Use provided path or fall back to global path (set by set_global_executable_path)
+        const std::string &exe_path = executable_path.empty() ? _global_executable_path : executable_path;
+
         std::vector<std::string> search_paths;
 
-        // If executable path is provided, search relative to it
-        if (!executable_path.empty())
+        // If executable path is available, search relative to it
+        if (!exe_path.empty())
         {
             try
             {
                 // Get the directory containing the executable using OS utility
                 auto &os = Cryo::Utils::OS::instance();
-                std::string exe_dir = std::filesystem::path(os.absolute_path(executable_path)).parent_path().string();
+                std::string exe_dir = std::filesystem::path(os.absolute_path(exe_path)).parent_path().string();
 
                 // Common relative locations from binary directory:
                 // 1. ../stdlib (development setup: bin/cryo, stdlib/)
