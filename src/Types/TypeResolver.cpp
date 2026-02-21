@@ -327,6 +327,32 @@ namespace Cryo
             return resolve_generic(base_ann, arg_anns, ctx);
         }
 
+        // Check if the name contains a qualified path (e.g., "Types::Outcome")
+        // This happens when generic syntax parsing extracts a base like "Types::Outcome"
+        // from "Types::Outcome<boolean,string>". We need to split on "::" and delegate
+        // to resolve_qualified which knows how to look up types across modules.
+        {
+            size_t sep_pos = name.find("::");
+            if (sep_pos != std::string::npos)
+            {
+                LOG_DEBUG(LogComponent::GENERAL, "TypeResolver: Detected qualified name '{}' in resolve_named, delegating to resolve_qualified", name);
+                std::vector<std::string> path;
+                size_t start = 0;
+                while (true)
+                {
+                    size_t pos = name.find("::", start);
+                    if (pos == std::string::npos)
+                    {
+                        path.push_back(name.substr(start));
+                        break;
+                    }
+                    path.push_back(name.substr(start, pos - start));
+                    start = pos + 2;
+                }
+                return resolve_qualified(path, ctx);
+            }
+        }
+
         // Check if it's a generic parameter in scope
         auto generic_binding = ctx.lookup_generic(name);
         if (generic_binding)
