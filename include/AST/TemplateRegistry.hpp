@@ -61,6 +61,7 @@ namespace Cryo
         {
             std::vector<std::string> field_names;
             std::vector<TypeRef> field_types;
+            std::vector<std::string> field_type_annotations; // Raw annotation strings for fallback resolution
             std::string source_namespace; // The namespace where the struct was originally defined
         };
 
@@ -317,7 +318,8 @@ namespace Cryo
         void register_struct_field_types(const std::string &qualified_struct_name,
                                          const std::vector<std::string> &field_names,
                                          const std::vector<TypeRef> &field_types,
-                                         const std::string &source_namespace = "");
+                                         const std::string &source_namespace = "",
+                                         const std::vector<std::string> &field_type_annotations = {});
 
         /**
          * @brief Get a struct's field types for LLVM struct body definition
