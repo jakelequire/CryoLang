@@ -301,9 +301,15 @@ namespace Cryo
         /// Generate LLVM IR
         bool run_ir_generation_phase();
 
-        /// Run semantic analysis passes for LSP (stages 3-5: declarations, type resolution, semantic analysis)
+        /// Run semantic analysis passes for LSP (stages 3-8: declarations through IR generation)
         /// Assumes frontend parsing and import resolution are already done.
+        /// Stages 6-8 (specialization, codegen prep, IR gen) are wrapped in try/catch
+        /// to provide full diagnostic coverage without crashing on incomplete code.
         bool run_lsp_semantic_analysis();
+
+        /// Initialize CodeGenerator for extended LSP analysis (stages 7-8).
+        /// Called lazily by run_lsp_semantic_analysis() after stages 3-5 complete.
+        bool init_codegen_for_lsp();
 
     private:
         void initialize_components();
