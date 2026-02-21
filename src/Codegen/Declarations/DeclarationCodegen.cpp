@@ -600,8 +600,19 @@ namespace Cryo::Codegen
         std::string llvm_fn_name = base_method_name;
         if (!ns_context.empty())
         {
-            // Use fully-qualified name: namespace::Type::method
-            llvm_fn_name = ns_context + "::" + base_method_name;
+            // Guard against double-namespacing: if base_method_name already starts
+            // with the namespace prefix (e.g., parent_type was already qualified),
+            // don't prepend it again.
+            std::string ns_prefix = ns_context + "::";
+            if (base_method_name.substr(0, ns_prefix.size()) == ns_prefix)
+            {
+                llvm_fn_name = base_method_name;
+            }
+            else
+            {
+                // Use fully-qualified name: namespace::Type::method
+                llvm_fn_name = ns_context + "::" + base_method_name;
+            }
         }
 
         // IMPORTANT: Register method return type annotation BEFORE early return check
@@ -2777,7 +2788,11 @@ namespace Cryo::Codegen
         std::string method_name = base_method_name;
         if (!ns_context.empty())
         {
-            method_name = ns_context + "::" + base_method_name;
+            std::string ns_prefix = ns_context + "::";
+            if (base_method_name.substr(0, ns_prefix.size()) != ns_prefix)
+            {
+                method_name = ns_context + "::" + base_method_name;
+            }
         }
 
         // Generate method declaration (will return existing if already created)
@@ -3467,7 +3482,17 @@ namespace Cryo::Codegen
                 }
                 else if (!sym.scope.empty())
                 {
-                    llvm_name = sym.scope + "::" + sym.name;
+                    // Guard against double-namespacing: if sym.name already starts
+                    // with the scope prefix, don't prepend it again.
+                    std::string scope_prefix = sym.scope + "::";
+                    if (sym.name.substr(0, scope_prefix.size()) == scope_prefix)
+                    {
+                        llvm_name = sym.name;
+                    }
+                    else
+                    {
+                        llvm_name = sym.scope + "::" + sym.name;
+                    }
                 }
                 else
                 {

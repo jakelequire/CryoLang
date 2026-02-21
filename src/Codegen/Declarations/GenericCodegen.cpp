@@ -3536,8 +3536,29 @@ namespace Cryo::Codegen
 
     Cryo::ASTNode *GenericCodegen::get_generic_function_def(const std::string &name)
     {
+        // Check local registry first
         auto it = _generic_functions.find(name);
-        return (it != _generic_functions.end()) ? it->second : nullptr;
+        if (it != _generic_functions.end())
+        {
+            return it->second;
+        }
+
+        // Fallback: check TemplateRegistry for cross-module function templates
+        Cryo::TemplateRegistry *template_registry = ctx().template_registry();
+        if (template_registry)
+        {
+            const Cryo::TemplateRegistry::TemplateInfo *tmpl_info =
+                template_registry->find_template(name);
+            if (tmpl_info && tmpl_info->function_template)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Found cross-module generic function '{}' in TemplateRegistry",
+                          name);
+                return tmpl_info->function_template;
+            }
+        }
+
+        return nullptr;
     }
 
     //===================================================================
