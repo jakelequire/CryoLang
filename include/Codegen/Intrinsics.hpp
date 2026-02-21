@@ -388,6 +388,11 @@ namespace Cryo::Codegen
         // String conversion intrinsics (legacy)
         llvm::Value *generate_sprintf(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_fprintf(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_fgets(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_fputs(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_fgetc(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_fputc(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_sscanf(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_panic(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_float32_to_string(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_float64_to_string(const std::vector<llvm::Value *> &args);

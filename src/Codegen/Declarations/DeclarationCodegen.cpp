@@ -2340,6 +2340,20 @@ namespace Cryo::Codegen
                                   param_name, param_type.get()->display_name());
                     }
                 }
+                else if (ast_params[param_idx]->has_type_annotation())
+                {
+                    // Fallback: resolve from type annotation (cross-module params may lack resolved types)
+                    TypeRef resolved = resolve_type_annotation(ast_params[param_idx]->type_annotation());
+                    if (resolved.is_valid())
+                    {
+                        std::string param_name = arg.getName().str();
+                        ctx().variable_types_map()[param_name] = resolved;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Resolved function parameter type from annotation: {} -> {} (kind: {})",
+                                  param_name, resolved->display_name(),
+                                  static_cast<int>(resolved->kind()));
+                    }
+                }
             }
             param_idx++;
         }
@@ -2919,6 +2933,20 @@ namespace Cryo::Codegen
                                       param_name, param_type->display_name());
                         }
                     }
+                    else if (ast_params[param_idx]->has_type_annotation())
+                    {
+                        // Fallback: resolve from type annotation (cross-module params may lack resolved types)
+                        TypeRef resolved = resolve_type_annotation(ast_params[param_idx]->type_annotation());
+                        if (resolved.is_valid())
+                        {
+                            std::string param_name = arg.getName().str();
+                            ctx().variable_types_map()[param_name] = resolved;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "DeclarationCodegen: Resolved method parameter type from annotation: {} -> {} (kind: {})",
+                                      param_name, resolved->display_name(),
+                                      static_cast<int>(resolved->kind()));
+                        }
+                    }
                 }
                 param_idx++;
             }
@@ -3259,6 +3287,19 @@ namespace Cryo::Codegen
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                           "Registered impl method parameter type: {} -> {}",
                                           param_name, param_type->display_name());
+                            }
+                            else if (ast_params[param_idx]->has_type_annotation())
+                            {
+                                // Fallback: resolve from type annotation (cross-module params may lack resolved types)
+                                TypeRef resolved = resolve_type_annotation(ast_params[param_idx]->type_annotation());
+                                if (resolved.is_valid())
+                                {
+                                    std::string param_name = arg.getName().str();
+                                    ctx().variable_types_map()[param_name] = resolved;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Resolved impl method parameter type from annotation: {} -> {}",
+                                              param_name, resolved->display_name());
+                                }
                             }
                         }
                         param_idx++;

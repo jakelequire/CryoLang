@@ -39,9 +39,10 @@ namespace Cryo::Codegen
         "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat",
         "strchr", "strrchr", "strstr", "strdup",
         // I/O operations
-        "printf", "snprintf", "sprintf", "fprintf", "getchar", "putchar", "puts",
+        "printf", "snprintf", "sprintf", "fprintf", "sscanf", "getchar", "putchar", "puts",
         // File I/O
         "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush", "feof", "ferror",
+        "fgets", "fputs", "fgetc", "fputc",
         // Low-level file descriptor I/O
         "read", "write", "open", "close", "lseek", "dup", "dup2", "pipe", "fcntl",
         // Filesystem operations
@@ -3846,6 +3847,87 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Check if this is a built-in array method (push, pop)
+            // Detect array types by type_name ending with "[]" (e.g., "i32[]", "string[]")
+            // This is more robust than checking TypeRef, which may be invalid after AST cloning
+            if (type_name.size() > 2 && type_name.compare(type_name.size() - 2, 2, "[]") == 0)
+            {
+                // First try TypeRef (most reliable when available)
+                TypeRef obj_type_ref;
+                if (callee && callee->object())
+                    obj_type_ref = callee->object()->get_resolved_type();
+
+                if (obj_type_ref.is_valid() && obj_type_ref->kind() == Cryo::TypeKind::Array)
+                {
+                    llvm::Value *result = generate_builtin_array_method(node, receiver, method_name, args, obj_type_ref);
+                    if (result)
+                        return result;
+                }
+                else
+                {
+                    // TypeRef not available (cross-module generic instantiation) -
+                    // resolve element type from the type_name string
+                    std::string elem_name = type_name.substr(0, type_name.size() - 2);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Built-in array method: TypeRef unavailable, resolving element type from string '{}'",
+                              elem_name);
+
+                    // Map element type name to LLVM type
+                    llvm::Type *elem_type = nullptr;
+                    if (elem_name == "i8" || elem_name == "u8") elem_type = types().i8_type();
+                    else if (elem_name == "i16" || elem_name == "u16") elem_type = types().i16_type();
+                    else if (elem_name == "i32" || elem_name == "u32" || elem_name == "int" || elem_name == "uint") elem_type = types().i32_type();
+                    else if (elem_name == "i64" || elem_name == "u64") elem_type = types().i64_type();
+                    else if (elem_name == "i128" || elem_name == "u128") elem_type = llvm::Type::getInt128Ty(llvm_ctx());
+                    else if (elem_name == "f32" || elem_name == "float") elem_type = llvm::Type::getFloatTy(llvm_ctx());
+                    else if (elem_name == "f64" || elem_name == "double") elem_type = llvm::Type::getDoubleTy(llvm_ctx());
+                    else if (elem_name == "boolean" || elem_name == "bool") elem_type = types().bool_type();
+                    else if (elem_name == "string") elem_type = types().ptr_type();
+                    else if (elem_name == "char") elem_type = types().i8_type();
+                    else
+                    {
+                        // Try looking up as a struct type in the LLVM module
+                        elem_type = llvm::StructType::getTypeByName(llvm_ctx(), elem_name);
+                        if (!elem_type)
+                        {
+                            // Try with common namespace prefixes
+                            auto candidates = generate_lookup_candidates(elem_name, Cryo::SymbolKind::Type);
+                            for (const auto &c : candidates)
+                            {
+                                elem_type = llvm::StructType::getTypeByName(llvm_ctx(), c);
+                                if (elem_type) break;
+                            }
+                        }
+                        if (!elem_type)
+                            elem_type = types().ptr_type(); // fallback: treat as pointer-sized
+                    }
+
+                    // Look up the Array<T> struct type
+                    llvm::StructType *array_struct = llvm::dyn_cast_or_null<llvm::StructType>(
+                        llvm::StructType::getTypeByName(llvm_ctx(), "Array<" + elem_name + ">"));
+                    if (!array_struct)
+                    {
+                        // Try alternate naming: normalize int->i32 etc.
+                        std::string normalized = elem_name;
+                        if (normalized == "int") normalized = "i32";
+                        else if (normalized == "uint") normalized = "u32";
+                        else if (normalized == "float") normalized = "f32";
+                        else if (normalized == "double") normalized = "f64";
+                        else if (normalized == "boolean") normalized = "bool";
+                        array_struct = llvm::dyn_cast_or_null<llvm::StructType>(
+                            llvm::StructType::getTypeByName(llvm_ctx(), "Array<" + normalized + ">"));
+                    }
+
+                    if (elem_type && array_struct)
+                    {
+                        llvm::Value *result = generate_builtin_array_method_raw(
+                            node, receiver, method_name, args, elem_type, array_struct);
+                        if (result)
+                            return result;
+                    }
+                }
+            }
+
             // Report error if method not found and not a function-pointer field
             {
                 std::string msg = type_name.empty()
@@ -4330,6 +4412,17 @@ namespace Cryo::Codegen
             return fn;
         }
 
+        if (name == "sscanf")
+        {
+            llvm::Function *fn = module()->getFunction("sscanf");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type, ptr_type}, true);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "sscanf", module());
+            }
+            return fn;
+        }
+
         if (name == "puts")
         {
             llvm::Function *fn = module()->getFunction("puts");
@@ -4337,6 +4430,50 @@ namespace Cryo::Codegen
             {
                 llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type}, false);
                 fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "puts", module());
+            }
+            return fn;
+        }
+
+        if (name == "fgets")
+        {
+            llvm::Function *fn = module()->getFunction("fgets");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(ptr_type, {ptr_type, i32_type, ptr_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "fgets", module());
+            }
+            return fn;
+        }
+
+        if (name == "fputs")
+        {
+            llvm::Function *fn = module()->getFunction("fputs");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type, ptr_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "fputs", module());
+            }
+            return fn;
+        }
+
+        if (name == "fgetc")
+        {
+            llvm::Function *fn = module()->getFunction("fgetc");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {ptr_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "fgetc", module());
+            }
+            return fn;
+        }
+
+        if (name == "fputc")
+        {
+            llvm::Function *fn = module()->getFunction("fputc");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(i32_type, {i32_type, ptr_type}, false);
+                fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, "fputc", module());
             }
             return fn;
         }
@@ -5684,6 +5821,150 @@ namespace Cryo::Codegen
         }
 
         return fn;
+    }
+
+    //===================================================================
+    // Built-in Array Methods (push, pop)
+    //===================================================================
+
+    llvm::Value *CallCodegen::generate_builtin_array_method(
+        Cryo::CallExpressionNode *node,
+        llvm::Value *receiver,
+        const std::string &method_name,
+        const std::vector<llvm::Value *> &args,
+        TypeRef obj_type)
+    {
+        auto *arr_type = static_cast<const Cryo::ArrayType *>(obj_type.get());
+        if (!arr_type || arr_type->is_fixed_size())
+            return nullptr;
+
+        TypeRef elem_type_ref = arr_type->element();
+        llvm::Type *elem_type = types().map(elem_type_ref);
+        if (!elem_type)
+            return nullptr;
+
+        llvm::Type *mapped = types().map(obj_type);
+        llvm::StructType *array_struct = llvm::dyn_cast_or_null<llvm::StructType>(mapped);
+        if (!array_struct)
+            return nullptr;
+
+        return generate_builtin_array_method_raw(node, receiver, method_name, args, elem_type, array_struct);
+    }
+
+    llvm::Value *CallCodegen::generate_builtin_array_method_raw(
+        Cryo::CallExpressionNode *node,
+        llvm::Value *receiver,
+        const std::string &method_name,
+        const std::vector<llvm::Value *> &args,
+        llvm::Type *elem_type,
+        llvm::StructType *array_struct)
+    {
+        auto *i64_ty = llvm::Type::getInt64Ty(llvm_ctx());
+
+        if (method_name == "push")
+        {
+            if (args.empty())
+            {
+                report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
+                             "Array::push requires one argument");
+                return nullptr;
+            }
+
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating built-in Array::push");
+
+            llvm::Value *value = cast_if_needed(args[0], elem_type);
+
+            // Load current length and capacity
+            llvm::Value *len_ptr = builder().CreateStructGEP(array_struct, receiver, 1, "arr.len.ptr");
+            llvm::Value *len = builder().CreateLoad(i64_ty, len_ptr, "arr.len");
+
+            llvm::Value *cap_ptr = builder().CreateStructGEP(array_struct, receiver, 2, "arr.cap.ptr");
+            llvm::Value *cap = builder().CreateLoad(i64_ty, cap_ptr, "arr.cap");
+
+            // Check if we need to grow: len >= cap
+            llvm::Value *needs_grow = builder().CreateICmpUGE(len, cap, "needs.grow");
+
+            llvm::Function *func = builder().GetInsertBlock()->getParent();
+            llvm::BasicBlock *grow_bb = llvm::BasicBlock::Create(llvm_ctx(), "arr.grow", func);
+            llvm::BasicBlock *store_bb = llvm::BasicBlock::Create(llvm_ctx(), "arr.store", func);
+
+            builder().CreateCondBr(needs_grow, grow_bb, store_bb);
+
+            // === Grow block ===
+            builder().SetInsertPoint(grow_bb);
+
+            // new_cap = (cap == 0) ? 8 : cap * 2
+            llvm::Value *is_zero = builder().CreateICmpEQ(cap, llvm::ConstantInt::get(i64_ty, 0), "cap.is.zero");
+            llvm::Value *doubled = builder().CreateMul(cap, llvm::ConstantInt::get(i64_ty, 2), "cap.doubled");
+            llvm::Value *new_cap = builder().CreateSelect(is_zero, llvm::ConstantInt::get(i64_ty, 8), doubled, "new.cap");
+
+            // Calculate byte size: new_cap * sizeof(element)
+            const llvm::DataLayout &dl = module()->getDataLayout();
+            uint64_t elem_size = dl.getTypeAllocSize(elem_type);
+            llvm::Value *byte_size = builder().CreateMul(new_cap, llvm::ConstantInt::get(i64_ty, elem_size), "byte.size");
+
+            // Load current elements pointer
+            llvm::Value *elems_ptr_gep = builder().CreateStructGEP(array_struct, receiver, 0, "arr.elems.ptr");
+            llvm::Value *old_ptr = builder().CreateLoad(llvm::PointerType::get(llvm_ctx(), 0), elems_ptr_gep, "old.ptr");
+
+            // If cap was 0, the data pointer may be a stack address (from empty array literal).
+            // Pass null to realloc in that case, which is equivalent to malloc.
+            llvm::Value *safe_ptr = builder().CreateSelect(is_zero,
+                llvm::ConstantPointerNull::get(llvm::PointerType::get(llvm_ctx(), 0)),
+                old_ptr, "safe.ptr");
+
+            // realloc(safe_ptr, byte_size) - handles both malloc (null) and realloc (heap) cases
+            llvm::Function *realloc_fn = get_or_create_function("realloc",
+                llvm::PointerType::get(llvm_ctx(), 0),
+                {llvm::PointerType::get(llvm_ctx(), 0), i64_ty});
+            llvm::Value *new_ptr = builder().CreateCall(realloc_fn, {safe_ptr, byte_size}, "new.ptr");
+
+            // Store new pointer and capacity
+            builder().CreateStore(new_ptr, elems_ptr_gep);
+            builder().CreateStore(new_cap, cap_ptr);
+            builder().CreateBr(store_bb);
+
+            // === Store block ===
+            builder().SetInsertPoint(store_bb);
+
+            // Reload elements pointer (may have been updated in grow block)
+            llvm::Value *elems_ptr2 = builder().CreateStructGEP(array_struct, receiver, 0, "arr.elems.ptr2");
+            llvm::Value *elems = builder().CreateLoad(llvm::PointerType::get(llvm_ctx(), 0), elems_ptr2, "arr.elems");
+
+            // Store value at elements[length]
+            llvm::Value *elem_ptr = builder().CreateInBoundsGEP(elem_type, elems, len, "arr.elem.ptr");
+            builder().CreateStore(value, elem_ptr);
+
+            // Increment length
+            llvm::Value *new_len = builder().CreateAdd(len, llvm::ConstantInt::get(i64_ty, 1), "arr.new.len");
+            builder().CreateStore(new_len, len_ptr);
+
+            // push returns void - return non-null sentinel
+            return receiver;
+        }
+        else if (method_name == "pop")
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating built-in Array::pop");
+
+            // Load length
+            llvm::Value *len_ptr = builder().CreateStructGEP(array_struct, receiver, 1, "arr.len.ptr");
+            llvm::Value *len = builder().CreateLoad(i64_ty, len_ptr, "arr.len");
+
+            // Decrement length
+            llvm::Value *new_len = builder().CreateSub(len, llvm::ConstantInt::get(i64_ty, 1), "arr.new.len");
+            builder().CreateStore(new_len, len_ptr);
+
+            // Load elements pointer
+            llvm::Value *elems_ptr = builder().CreateStructGEP(array_struct, receiver, 0, "arr.elems.ptr");
+            llvm::Value *elems = builder().CreateLoad(llvm::PointerType::get(llvm_ctx(), 0), elems_ptr, "arr.elems");
+
+            // Load value at elements[new_length]
+            llvm::Value *elem_ptr = builder().CreateInBoundsGEP(elem_type, elems, new_len, "arr.elem.ptr");
+            return builder().CreateLoad(elem_type, elem_ptr, "pop.val");
+        }
+
+        // Not a built-in array method
+        return nullptr;
     }
 
 } // namespace Cryo::Codegen

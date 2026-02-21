@@ -1,0 +1,144 @@
+namespace Utils::File;
+
+/// The `File` struct represents a file in the filesystem or an in-memory file with content. It provides methods to load, access, and manage file content.
+/// This struct is designed to be flexible, allowing for both file-based and in-memory content management. 
+/// It includes methods for loading content from a file path, creating a file from in-memory content, and accessing various properties of the file.
+type struct File {
+private:
+    path:         string;
+    file_name:    string;
+    extension:    string;
+    content:      string;
+    content_size: u64;
+    loaded:       boolean;
+
+public:
+    /// Factory method to create a `File` instance from a file path. It extracts the file name and extension from the path.
+    static new(path: string) -> File {
+        const file_name: string = File::extract_file_name(path);
+        const extension: string = File::extract_extension(file_name);
+
+        return File {
+            path:         path,
+            file_name:    file_name,
+            extension:    extension,
+            content:      "",
+            content_size: 0,
+            loaded:       false,
+        };
+    }
+
+    /// Factory method to create a `File` instance from in-memory content. 
+    /// This is useful for testing or when you want to work with content that doesn't come from an actual file.
+    static from_content(name: string, extension: string, content: string) -> File {
+        return File {
+            path:         "",
+            file_name:    name,
+            extension:    extension,
+            content:      content,
+            content_size: strlen(content),
+            loaded:       true,
+        };
+    }
+
+    // --- File operations ---
+    load(this: File*) -> Result<boolean, string> {
+        if (this.loaded) {
+            return ok(true);
+        }
+
+        const handle: void* = fopen(this.path, "r");
+        if (handle == null) {
+            const err_msg: string = sprintf("Failed to open file at path: %s", this.path);
+            return err(err_msg);
+        }
+
+        fseek(handle, 0 as i64, 2);
+        const file_size: i64 = ftell(handle);
+        fseek(handle, 0 as i64, 0);
+
+        if (file_size < 0 as i64) {
+            fclose(handle);
+            const err_msg: string = sprintf("Failed to determine file size for file at path: %s", this.path);
+            return err(err_msg);
+        }
+
+        const size: u64 = file_size as u64;
+
+        const buffer: i8* = malloc(size + 1) as i8*;
+        if (buffer == null) {
+            fclose(handle);
+            const err_msg: string = sprintf("Failed to allocate memory for file content for file at path: %s", this.path);
+            return err(err_msg);
+        }
+
+        const bytes_read: u64 = fread(buffer as void*, 1, size, handle);
+        fclose(handle);
+
+        const term_ptr: i8* = ptr_add(buffer as void*, bytes_read as i64) as i8*;
+        memset(term_ptr as void*, 0, 1);
+
+        this.content = buffer as string;
+        this.content_size = bytes_read;
+        this.loaded = true;
+
+        return ok(true);
+    }
+
+    close(this: File*) -> boolean {
+        this.loaded = false;
+        this.content = "";
+        this.content_size = 0;
+        return true;
+    }
+
+    // --- Getters ---
+    path(this: File*) -> string {
+        return this.path;
+    }
+
+    name(this: File*) -> string {
+        return this.file_name;
+    }
+
+    extension(this: File*) -> string {
+        return this.extension;
+    }
+
+    content(this: File*) -> string {
+        return this.content;
+    }
+
+    is_loaded(this: File*) -> boolean {
+        return this.loaded;
+    }
+
+    size(this: File*) -> u64 {
+        return this.content_size;
+    }
+
+    data(this: File*) -> i8* {
+        return this.content as i8*;
+    }
+
+private:
+    // --- Internal helpers ---
+    static extract_file_name(path: string) -> string {
+        const slash: i8* = strrchr(path, 47);
+        if (slash == null) {
+            return path;
+        }
+        const name_ptr: i8* = ptr_add(slash as void*, 1) as i8*;
+        return strdup(name_ptr as string) as string;
+    }
+
+    static extract_extension(file_name: string) -> string {
+        const dot: i8* = strrchr(file_name, 46);
+        if (dot == null) {
+            return "";
+        }
+        const ext_ptr: i8* = ptr_add(dot as void*, 1) as i8*;
+        return strdup(ext_ptr as string) as string;
+    }
+}
+

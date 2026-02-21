@@ -88,6 +88,8 @@ namespace Cryo::Codegen
         // I/O intrinsics
         else if (intrinsic_name == "printf")
             return generate_printf(args);
+        else if (intrinsic_name == "sprintf")
+            return generate_sprintf(args);
         else if (intrinsic_name == "snprintf")
             return generate_snprintf(args);
         else if (intrinsic_name == "getchar")
@@ -96,6 +98,8 @@ namespace Cryo::Codegen
             return generate_putchar(args);
         else if (intrinsic_name == "puts")
             return generate_puts(args);
+        else if (intrinsic_name == "fprintf")
+            return generate_fprintf(args);
 
         // File I/O intrinsics
         else if (intrinsic_name == "fopen")
@@ -116,6 +120,16 @@ namespace Cryo::Codegen
             return generate_feof(args);
         else if (intrinsic_name == "ferror")
             return generate_ferror(args);
+        else if (intrinsic_name == "fgets")
+            return generate_fgets(args);
+        else if (intrinsic_name == "fputs")
+            return generate_fputs(args);
+        else if (intrinsic_name == "fgetc")
+            return generate_fgetc(args);
+        else if (intrinsic_name == "fputc")
+            return generate_fputc(args);
+        else if (intrinsic_name == "sscanf")
+            return generate_sscanf(args);
 
         // Low-level file descriptor I/O
         else if (intrinsic_name == "read")
@@ -3189,13 +3203,13 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        // Create fclose function type: int fclose(int fd)
-        // Using i32 for fd to match common user declarations (fd-style)
+        // Create fclose function type: int fclose(FILE* file)
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType *fclose_type = llvm::FunctionType::get(int_type, {int_type}, false);
+        llvm::FunctionType *fclose_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
 
         llvm::Function *fclose_func = get_or_create_libc_function("fclose", fclose_type);
-        return builder.CreateCall(fclose_func, {ensure_type(args[0], int_type, "fclose.fd")}, "fclose.result");
+        return builder.CreateCall(fclose_func, {args[0]}, "fclose.result");
     }
 
     llvm::Value *Intrinsics::generate_fread(const std::vector<llvm::Value *> &args)
@@ -3267,18 +3281,18 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        // Create fseek function type: int fseek(int fd, int offset, int whence)
-        // Using i32 for all parameters to match common user declarations
-        // (user may be using fd-style fseek, similar to lseek)
+        // Create fseek function type: int fseek(FILE* file, long offset, int whence)
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
         llvm::FunctionType *fseek_type = llvm::FunctionType::get(
-            int_type, {int_type, int_type, int_type}, false);
+            int_type, {void_ptr_type, i64_type, int_type}, false);
 
         llvm::Function *fseek_func = get_or_create_libc_function("fseek", fseek_type);
 
         std::vector<llvm::Value *> call_args = {
-            ensure_type(args[0], int_type, "fseek.fd"),
-            ensure_type(args[1], int_type, "fseek.offset"),
+            args[0],
+            ensure_type(args[1], i64_type, "fseek.offset"),
             ensure_type(args[2], int_type, "fseek.whence")};
 
         return builder.CreateCall(fseek_func, call_args, "fseek.result");
@@ -3295,13 +3309,13 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        // Create ftell function type: int ftell(int fd)
-        // Using i32 for fd and return type to match common user declarations
-        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
-        llvm::FunctionType *ftell_type = llvm::FunctionType::get(int_type, {int_type}, false);
+        // Create ftell function type: long ftell(FILE* file)
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::FunctionType *ftell_type = llvm::FunctionType::get(i64_type, {void_ptr_type}, false);
 
         llvm::Function *ftell_func = get_or_create_libc_function("ftell", ftell_type);
-        return builder.CreateCall(ftell_func, {ensure_type(args[0], int_type, "ftell.fd")}, "ftell.result");
+        return builder.CreateCall(ftell_func, {args[0]}, "ftell.result");
     }
 
     llvm::Value *Intrinsics::generate_fflush(const std::vector<llvm::Value *> &args)
@@ -3362,6 +3376,128 @@ namespace Cryo::Codegen
 
         llvm::Function *ferror_func = get_or_create_libc_function("ferror", ferror_type);
         return builder.CreateCall(ferror_func, {args[0]}, "ferror.result");
+    }
+
+    llvm::Value *Intrinsics::generate_fgets(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("fgets requires exactly 3 arguments (buffer, size, file)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create fgets function type: char* fgets(char* str, int n, FILE* stream)
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *fgets_type = llvm::FunctionType::get(
+            void_ptr_type, {void_ptr_type, int_type, void_ptr_type}, false);
+
+        llvm::Function *fgets_func = get_or_create_libc_function("fgets", fgets_type);
+
+        std::vector<llvm::Value *> call_args = {
+            args[0],
+            ensure_type(args[1], int_type, "fgets.size"),
+            args[2]};
+
+        return builder.CreateCall(fgets_func, call_args, "fgets.result");
+    }
+
+    llvm::Value *Intrinsics::generate_fputs(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("fputs requires exactly 2 arguments (str, file)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create fputs function type: int fputs(const char* str, FILE* stream)
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *fputs_type = llvm::FunctionType::get(
+            int_type, {void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *fputs_func = get_or_create_libc_function("fputs", fputs_type);
+        return builder.CreateCall(fputs_func, {args[0], args[1]}, "fputs.result");
+    }
+
+    llvm::Value *Intrinsics::generate_fgetc(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("fgetc requires exactly 1 argument (file)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create fgetc function type: int fgetc(FILE* stream)
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *fgetc_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
+
+        llvm::Function *fgetc_func = get_or_create_libc_function("fgetc", fgetc_type);
+        return builder.CreateCall(fgetc_func, {args[0]}, "fgetc.result");
+    }
+
+    llvm::Value *Intrinsics::generate_fputc(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("fputc requires exactly 2 arguments (char, file)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create fputc function type: int fputc(int c, FILE* stream)
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *fputc_type = llvm::FunctionType::get(
+            int_type, {int_type, void_ptr_type}, false);
+
+        llvm::Function *fputc_func = get_or_create_libc_function("fputc", fputc_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], int_type, "fputc.char"),
+            args[1]};
+
+        return builder.CreateCall(fputc_func, call_args, "fputc.result");
+    }
+
+    llvm::Value *Intrinsics::generate_sscanf(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() < 2)
+        {
+            report_error("sscanf requires at least 2 arguments (str, format, ...)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create sscanf function type: int sscanf(const char* str, const char* format, ...)
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *sscanf_type = llvm::FunctionType::get(
+            int_type, {char_ptr_type, char_ptr_type}, true);
+
+        llvm::Function *sscanf_func = get_or_create_libc_function("sscanf", sscanf_type);
+
+        if (!args[0]->getType()->isPointerTy() || !args[1]->getType()->isPointerTy())
+        {
+            report_error("sscanf str and format arguments must be pointers");
+            return nullptr;
+        }
+
+        return builder.CreateCall(sscanf_func, args, "sscanf.result");
     }
 
     // ========================================
