@@ -400,6 +400,34 @@ namespace Cryo::Codegen
             const std::string &type_name,
             const std::string &method_name);
 
+        /**
+         * @brief Generate a built-in array method (push, pop) as inline IR
+         * @param node Call expression for error reporting
+         * @param receiver Pointer to the Array<T> struct
+         * @param method_name Method name ("push" or "pop")
+         * @param args Method arguments (already generated)
+         * @param obj_type The resolved ArrayType of the receiver
+         * @return Generated value, or nullptr if not a handled built-in
+         */
+        llvm::Value *generate_builtin_array_method(
+            Cryo::CallExpressionNode *node,
+            llvm::Value *receiver,
+            const std::string &method_name,
+            const std::vector<llvm::Value *> &args,
+            TypeRef obj_type);
+
+        /**
+         * @brief Generate a built-in array method using raw LLVM types
+         * Used when TypeRef is unavailable (cross-module generic instantiation)
+         */
+        llvm::Value *generate_builtin_array_method_raw(
+            Cryo::CallExpressionNode *node,
+            llvm::Value *receiver,
+            const std::string &method_name,
+            const std::vector<llvm::Value *> &args,
+            llvm::Type *elem_type,
+            llvm::StructType *array_struct);
+
         // Static sets for type checking
         static const std::unordered_set<std::string> _primitive_types;
         static const std::unordered_set<std::string> _runtime_functions;

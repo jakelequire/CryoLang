@@ -1,10 +1,113 @@
 #include "Codegen/Declarations/TypeCodegen.hpp"
+#include "Codegen/CodegenVisitor.hpp"
+#include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Types/Types.hpp"
 #include "Utils/Logger.hpp"
 #include "AST/TemplateRegistry.hpp"
 
 namespace Cryo::Codegen
 {
+    // Helper: parse type arguments from an annotation string like "string, int" into TypeRefs.
+    // Handles nested generics (e.g., "Array<u8>, int") and pointer modifiers (e.g., "Expr*").
+    static std::vector<TypeRef> parse_type_args_for_field(
+        const std::string &type_args_str,
+        Cryo::SymbolTable &symbols)
+    {
+        std::vector<TypeRef> type_args;
+        if (type_args_str.empty())
+            return type_args;
+
+        // Parse comma-separated type arguments, handling nested generics
+        std::vector<std::string> arg_names;
+        size_t start = 0;
+        int depth = 0;
+        for (size_t i = 0; i <= type_args_str.length(); ++i)
+        {
+            if (i == type_args_str.length() || (type_args_str[i] == ',' && depth == 0))
+            {
+                std::string arg = type_args_str.substr(start, i - start);
+                while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.front())))
+                    arg.erase(0, 1);
+                while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.back())))
+                    arg.pop_back();
+                if (!arg.empty())
+                    arg_names.push_back(arg);
+                start = i + 1;
+            }
+            else if (type_args_str[i] == '<')
+                depth++;
+            else if (type_args_str[i] == '>')
+                depth--;
+        }
+
+        for (const auto &arg_name : arg_names)
+        {
+            TypeRef arg_type{};
+            std::string base_name = arg_name;
+
+            // Strip pointer modifiers
+            int pointer_depth = 0;
+            while (!base_name.empty() && base_name.back() == '*')
+            {
+                base_name.pop_back();
+                pointer_depth++;
+            }
+            while (!base_name.empty() && std::isspace(static_cast<unsigned char>(base_name.back())))
+                base_name.pop_back();
+
+            // Try symbol table lookup
+            Symbol *type_sym = symbols.lookup_symbol(base_name);
+            if (type_sym && type_sym->kind == SymbolKind::Type && type_sym->type.is_valid())
+                arg_type = type_sym->type;
+
+            // Try common primitive types
+            if (!arg_type.is_valid())
+            {
+                if (base_name == "int" || base_name == "i32")
+                    arg_type = symbols.arena().get_i32();
+                else if (base_name == "i8")
+                    arg_type = symbols.arena().get_i8();
+                else if (base_name == "i16")
+                    arg_type = symbols.arena().get_i16();
+                else if (base_name == "i64")
+                    arg_type = symbols.arena().get_i64();
+                else if (base_name == "u8")
+                    arg_type = symbols.arena().get_u8();
+                else if (base_name == "u16")
+                    arg_type = symbols.arena().get_u16();
+                else if (base_name == "u32")
+                    arg_type = symbols.arena().get_u32();
+                else if (base_name == "u64")
+                    arg_type = symbols.arena().get_u64();
+                else if (base_name == "f32" || base_name == "float")
+                    arg_type = symbols.arena().get_f32();
+                else if (base_name == "f64" || base_name == "double")
+                    arg_type = symbols.arena().get_f64();
+                else if (base_name == "string" || base_name == "String")
+                    arg_type = symbols.arena().get_string();
+                else if (base_name == "bool" || base_name == "boolean")
+                    arg_type = symbols.arena().get_bool();
+            }
+
+            // Try TypeArena name lookup
+            if (!arg_type.is_valid())
+                arg_type = symbols.arena().lookup_type_by_name(base_name);
+
+            // Wrap in pointer type(s)
+            if (arg_type.is_valid() && pointer_depth > 0)
+            {
+                for (int p = 0; p < pointer_depth; ++p)
+                    arg_type = symbols.arena().get_pointer_to(arg_type);
+            }
+
+            if (arg_type.is_valid())
+                type_args.push_back(arg_type);
+            else
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "parse_type_args_for_field: Could not resolve type argument '{}'", arg_name);
+        }
+        return type_args;
+    }
     //===================================================================
     // Construction
     //===================================================================
@@ -658,6 +761,8 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Mapping {} fields for struct '{}' ===", node->fields().size(), name);
         for (const auto &field : node->fields())
         {
+            llvm::Type *field_llvm_type = nullptr;
+
             TypeRef cryo_field_type = field->get_resolved_type();
             if (cryo_field_type)
             {
@@ -665,13 +770,13 @@ namespace Cryo::Codegen
                           field->name(), cryo_field_type.get()->display_name(),
                           cryo_field_type.id().id, static_cast<int>(cryo_field_type->kind()));
                 // Use the main type mapping method like the old implementation did
-                llvm::Type *field_type = types().map(cryo_field_type);
-                if (field_type)
+                field_llvm_type = types().map(cryo_field_type);
+                if (field_llvm_type)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Field '{}' -> LLVM type ID={} ===",
-                              field->name(), field_type->getTypeID());
+                              field->name(), field_llvm_type->getTypeID());
                     // Check if the mapped type is opaque
-                    if (auto st = llvm::dyn_cast<llvm::StructType>(field_type))
+                    if (auto st = llvm::dyn_cast<llvm::StructType>(field_llvm_type))
                     {
                         if (st->isOpaque())
                         {
@@ -679,19 +784,60 @@ namespace Cryo::Codegen
                                       field->name(), st->getName().str());
                         }
                     }
-                    field_types.push_back(field_type);
                 }
                 else
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Field '{}' mapping returned NULL ===", field->name());
-                    // Default to i64 for unknown types
-                    field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
                 }
             }
             else
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Field '{}' has no resolved type ===", field->name());
-                // Default to i64 for unresolved types
+            }
+
+            // Fallback: try on-demand generic instantiation from annotation
+            if (!field_llvm_type && field->has_type_annotation())
+            {
+                std::string annotation = field->type_annotation()->to_string();
+                size_t angle_pos = annotation.find('<');
+                if (angle_pos != std::string::npos)
+                {
+                    size_t close_pos = annotation.rfind('>');
+                    std::string base_name = annotation.substr(0, angle_pos);
+                    std::string type_args_str = annotation.substr(angle_pos + 1, close_pos - angle_pos - 1);
+
+                    CodegenVisitor *visitor = ctx().visitor();
+                    GenericCodegen *gen_codegen = visitor ? visitor->get_generics() : nullptr;
+
+                    if (gen_codegen && gen_codegen->is_generic_template(base_name))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "=== STRUCT_GEN: Field '{}' attempting on-demand instantiation of '{}' ===",
+                                  field->name(), annotation);
+
+                        std::vector<TypeRef> type_args = parse_type_args_for_field(type_args_str, symbols());
+                        if (!type_args.empty())
+                        {
+                            llvm::StructType *instantiated = gen_codegen->instantiate_struct(base_name, type_args);
+                            if (instantiated)
+                            {
+                                field_llvm_type = instantiated;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "=== STRUCT_GEN: Field '{}' instantiated generic '{}' -> LLVM struct '{}' ===",
+                                          field->name(), annotation, instantiated->getName().str());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (field_llvm_type)
+            {
+                field_types.push_back(field_llvm_type);
+            }
+            else
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "=== STRUCT_GEN: Field '{}' falling back to i64 ===", field->name());
                 field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
             }
         }
