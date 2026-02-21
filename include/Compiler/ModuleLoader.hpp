@@ -216,6 +216,11 @@ namespace Cryo
         void resolve_this_parameters_in_ast(ProgramNode &ast);
 
         /**
+         * @brief Resolve struct/class method return types that are "unresolved generic" errors.
+         */
+        void resolve_method_return_types_in_ast(ProgramNode &ast, const std::string &module_name);
+
+        /**
          * @brief Create a FunctionType from a FunctionDeclarationNode
          * @param func_decl The function declaration node
          * @param type_arena TypeArena for creating type objects

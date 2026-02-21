@@ -10,6 +10,7 @@
 #include "Types/UserDefinedTypes.hpp"
 #include "Types/GenericRegistry.hpp"
 #include "Types/GenericTypes.hpp"
+#include "Types/TypeResolver.hpp"
 #include "Diagnostics/Diag.hpp"
 
 #include <algorithm>
@@ -608,6 +609,13 @@ namespace Cryo
             // 2.5. Resolve 'this' parameters that have error types
             //      This must happen AFTER create_symbol_map registers types
             resolve_this_parameters_in_ast(*ast);
+
+            // 2.6. Resolve struct/class method return types that are "unresolved generic" errors
+            //      The parser creates ErrorType placeholders for generic return types like
+            //      "Types::Outcome<boolean,string>" because it can't resolve generics at parse time.
+            //      Since imported modules don't go through the TypeResolutionPass, we must resolve
+            //      these here using the TypeResolver after all types and templates are registered.
+            resolve_method_return_types_in_ast(*ast, result.module_name);
 
             // 3. Extract symbols from the original AST
             result.exported_symbols = extract_exported_symbols(*ast);
@@ -2644,6 +2652,117 @@ namespace Cryo
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void ModuleLoader::resolve_method_return_types_in_ast(ProgramNode &ast, const std::string &module_name)
+    {
+        // Imported modules don't go through the TypeResolutionPass, so struct/class
+        // method return types that are "unresolved generic" ErrorType placeholders
+        // (created by the parser for generic type annotations like "Types::Outcome<boolean,string>")
+        // never get resolved. We fix them up here using the TypeResolver.
+
+        if (!_generic_registry)
+            return;
+
+        TypeArena &arena = _ast_context.types();
+        ModuleTypeRegistry &module_registry = _ast_context.modules();
+        GenericRegistry &generic_registry = *_generic_registry;
+
+        TypeResolver resolver(arena, module_registry, generic_registry, _diagnostics);
+
+        // Set up resolution context for this module
+        ResolutionContext res_ctx;
+        ModuleID module_id = module_registry.get_or_create_module(module_name);
+        res_ctx.current_module = module_id;
+
+        // Collect imports from the AST for the resolution context
+        auto module_info = module_registry.get_module_info(module_id);
+        if (module_info)
+        {
+            res_ctx.imports = module_info->imports;
+        }
+
+        const std::string error_prefix = "unresolved generic: ";
+
+        for (auto &stmt : ast.statements())
+        {
+            // Process struct declarations
+            auto *struct_decl = dynamic_cast<StructDeclarationNode *>(stmt.get());
+            if (struct_decl)
+            {
+                for (auto &method : struct_decl->methods())
+                {
+                    TypeRef ret_type = method->get_resolved_return_type();
+                    auto *ann = method->return_type_annotation();
+                    if (ret_type.is_error() && ann)
+                    {
+                        const ErrorType *err = static_cast<const ErrorType *>(ret_type.get());
+                        if (err && err->reason().find(error_prefix) != std::string::npos)
+                        {
+                            TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                            if (resolved.is_valid() && !resolved.is_error())
+                            {
+                                method->set_resolved_return_type(resolved);
+                                LOG_DEBUG(LogComponent::GENERAL,
+                                          "ModuleLoader: Resolved method '{}::{}' return type to '{}'",
+                                          struct_decl->name(), method->name(), resolved->display_name());
+                            }
+                        }
+                    }
+
+                    // Also resolve parameter types that are unresolved generics
+                    for (auto &param : method->parameters())
+                    {
+                        if (!param->has_resolved_type())
+                            continue;
+                        TypeRef param_type = param->get_resolved_type();
+                        auto *param_ann = param->type_annotation();
+                        if (param_type.is_error() && param_ann)
+                        {
+                            const ErrorType *err = static_cast<const ErrorType *>(param_type.get());
+                            if (err && err->reason().find(error_prefix) != std::string::npos)
+                            {
+                                TypeRef resolved = resolver.resolve(*param_ann, res_ctx);
+                                if (resolved.is_valid() && !resolved.is_error())
+                                {
+                                    param->set_resolved_type(resolved);
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                              "ModuleLoader: Resolved param '{}::{}::{}' type to '{}'",
+                                              struct_decl->name(), method->name(), param->name(), resolved->display_name());
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Process class declarations
+            auto *class_decl = dynamic_cast<ClassDeclarationNode *>(stmt.get());
+            if (class_decl)
+            {
+                for (auto &method : class_decl->methods())
+                {
+                    TypeRef ret_type = method->get_resolved_return_type();
+                    auto *ann = method->return_type_annotation();
+                    if (ret_type.is_error() && ann)
+                    {
+                        const ErrorType *err = static_cast<const ErrorType *>(ret_type.get());
+                        if (err && err->reason().find(error_prefix) != std::string::npos)
+                        {
+                            TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                            if (resolved.is_valid() && !resolved.is_error())
+                            {
+                                method->set_resolved_return_type(resolved);
+                                LOG_DEBUG(LogComponent::GENERAL,
+                                          "ModuleLoader: Resolved method '{}::{}' return type to '{}'",
+                                          class_decl->name(), method->name(), resolved->display_name());
                             }
                         }
                     }

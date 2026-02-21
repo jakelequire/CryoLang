@@ -409,12 +409,222 @@ namespace Cryo::Codegen
         case CallKind::FreeFunction:
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "FreeFunction: resolving '{}'", function_name);
+
+            // First, check if this is a call to a generic function template.
+            // Generic functions need instantiation with concrete type arguments before they
+            // can be called. This must happen BEFORE resolve_function, which might create
+            // an incorrect forward declaration for the uninstantiated generic.
+            {
+                CodegenVisitor *visitor = ctx().visitor();
+                GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
+
+                if (generics)
+                {
+                    // Strip namespace prefix to get the base function name
+                    std::string base_name = function_name;
+                    size_t sep = function_name.rfind("::");
+                    if (sep != std::string::npos)
+                        base_name = function_name.substr(sep + 2);
+
+                    Cryo::ASTNode *generic_def = generics->get_generic_function_def(base_name);
+                    if (generic_def)
+                    {
+                        auto *func_decl = dynamic_cast<Cryo::FunctionDeclarationNode *>(generic_def);
+                        if (func_decl && !func_decl->generic_parameters().empty())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "FreeFunction: '{}' is a generic function template, attempting type inference",
+                                      function_name);
+
+                            // Collect generic parameter names in order
+                            std::vector<std::string> param_names;
+                            for (const auto &gp : func_decl->generic_parameters())
+                                param_names.push_back(gp->name());
+
+                            std::unordered_map<std::string, TypeRef> inferred;
+
+                            // Phase 1: Infer from return type context
+                            // If the current function's return type is an InstantiatedType (e.g., Result<boolean, string>)
+                            // and the generic function's return type annotation uses generic params,
+                            // we can match position-wise to infer type arguments.
+                            auto *fn_ctx = ctx().current_function();
+                            if (fn_ctx && fn_ctx->ast_node)
+                            {
+                                TypeRef enclosing_return = fn_ctx->ast_node->get_resolved_return_type();
+                                auto *ret_ann = func_decl->return_type_annotation();
+
+                                if (enclosing_return.is_valid() &&
+                                    enclosing_return->kind() == Cryo::TypeKind::InstantiatedType && ret_ann)
+                                {
+                                    auto *inst = static_cast<const Cryo::InstantiatedType *>(enclosing_return.get());
+                                    const auto &type_args = inst->type_args();
+
+                                    // Extract generic param names from the return type annotation.
+                                    // Handle two cases:
+                                    // 1. TypeAnnotationKind::Generic - elements contain the type params
+                                    // 2. TypeAnnotationKind::Named with embedded generics - parse from name string
+                                    std::vector<std::string> ret_type_params;
+
+                                    if (ret_ann->kind == Cryo::TypeAnnotationKind::Generic)
+                                    {
+                                        for (const auto &elem : ret_ann->elements)
+                                            ret_type_params.push_back(elem.name);
+                                    }
+                                    else if (ret_ann->kind == Cryo::TypeAnnotationKind::Named)
+                                    {
+                                        // Parse "Result<T, E>" from the annotation name string
+                                        const std::string &ann_name = ret_ann->name;
+                                        size_t open = ann_name.find('<');
+                                        size_t close = ann_name.rfind('>');
+                                        if (open != std::string::npos && close != std::string::npos && close > open)
+                                        {
+                                            std::string args_str = ann_name.substr(open + 1, close - open - 1);
+                                            // Split by comma, handling spaces
+                                            size_t start = 0;
+                                            while (start < args_str.size())
+                                            {
+                                                size_t comma = args_str.find(',', start);
+                                                std::string arg = (comma != std::string::npos)
+                                                    ? args_str.substr(start, comma - start)
+                                                    : args_str.substr(start);
+                                                // Trim whitespace
+                                                size_t first = arg.find_first_not_of(" \t");
+                                                size_t last = arg.find_last_not_of(" \t");
+                                                if (first != std::string::npos)
+                                                    ret_type_params.push_back(arg.substr(first, last - first + 1));
+                                                start = (comma != std::string::npos) ? comma + 1 : args_str.size();
+                                            }
+                                        }
+                                    }
+
+                                    // Match parsed return type params to InstantiatedType type_args by position
+                                    for (size_t i = 0; i < ret_type_params.size() && i < type_args.size(); i++)
+                                    {
+                                        const std::string &rtp = ret_type_params[i];
+                                        for (const auto &pn : param_names)
+                                        {
+                                            if (rtp == pn && type_args[i].is_valid())
+                                            {
+                                                inferred[pn] = type_args[i];
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "FreeFunction: Inferred generic param '{}' = '{}' from return type",
+                                                          pn, type_args[i]->display_name());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Phase 2: Infer from argument types (for any still-unresolved params)
+                            const auto &func_params = func_decl->parameters();
+                            const auto &call_args = node->arguments();
+                            for (size_t i = 0; i < func_params.size() && i < call_args.size(); i++)
+                            {
+                                auto *param_ann = func_params[i]->type_annotation();
+                                if (!param_ann || param_ann->kind != Cryo::TypeAnnotationKind::Named)
+                                    continue;
+
+                                const std::string &ann_name = param_ann->name;
+                                if (inferred.find(ann_name) != inferred.end())
+                                    continue;
+
+                                bool is_generic_param = false;
+                                for (const auto &pn : param_names)
+                                {
+                                    if (ann_name == pn)
+                                    {
+                                        is_generic_param = true;
+                                        break;
+                                    }
+                                }
+                                if (!is_generic_param)
+                                    continue;
+
+                                TypeRef arg_type{};
+                                // Try multiple sources for the argument's type
+                                if (call_args[i]->has_resolved_type())
+                                {
+                                    arg_type = call_args[i]->get_resolved_type();
+                                }
+                                else if (auto *lit = dynamic_cast<Cryo::LiteralNode *>(call_args[i].get()))
+                                {
+                                    // Infer from literal kind
+                                    auto lk = lit->literal_kind();
+                                    if (lk == Cryo::TokenKind::TK_KW_TRUE || lk == Cryo::TokenKind::TK_KW_FALSE ||
+                                        lk == Cryo::TokenKind::TK_BOOLEAN_LITERAL)
+                                        arg_type = symbols().arena().get_bool();
+                                    else if (lk == Cryo::TokenKind::TK_NUMERIC_CONSTANT)
+                                        arg_type = symbols().arena().get_i32();
+                                    else if (lk == Cryo::TokenKind::TK_STRING_LITERAL)
+                                        arg_type = symbols().arena().get_string();
+                                }
+                                else if (auto *id = dynamic_cast<Cryo::IdentifierNode *>(call_args[i].get()))
+                                {
+                                    // Look up variable type from variable_types_map or symbol table
+                                    auto &var_types = ctx().variable_types_map();
+                                    auto vt_it = var_types.find(id->name());
+                                    if (vt_it != var_types.end() && vt_it->second.is_valid())
+                                    {
+                                        arg_type = vt_it->second;
+                                    }
+                                    else
+                                    {
+                                        Cryo::Symbol *sym = symbols().lookup_symbol(id->name());
+                                        if (sym && sym->type.is_valid())
+                                            arg_type = sym->type;
+                                    }
+                                }
+
+                                if (arg_type.is_valid())
+                                {
+                                    inferred[ann_name] = arg_type;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "FreeFunction: Inferred generic param '{}' = '{}' from argument",
+                                              ann_name, arg_type->display_name());
+                                }
+                            }
+
+                            // Build type_args vector in generic parameter order
+                            std::vector<TypeRef> type_args;
+                            bool all_resolved = true;
+                            for (const auto &pn : param_names)
+                            {
+                                auto it = inferred.find(pn);
+                                if (it != inferred.end())
+                                {
+                                    type_args.push_back(it->second);
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "FreeFunction: Could not infer generic param '{}'", pn);
+                                    all_resolved = false;
+                                    break;
+                                }
+                            }
+
+                            if (all_resolved && !type_args.empty())
+                            {
+                                llvm::Function *instantiated = generics->instantiate_function(base_name, type_args);
+                                if (instantiated)
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "FreeFunction: Successfully instantiated generic function '{}' -> '{}'",
+                                              function_name, instantiated->getName().str());
+                                    return generate_free_function(node, instantiated);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Normal resolution path for non-generic free functions
             llvm::Function *fn = resolve_function(function_name);
             if (!fn)
             {
                 // Fallback: if the function name looks like a namespace-qualified static method
                 // (e.g., "Foo::Bar::method"), try resolving as a static method call.
-                // This handles cases where classify_call couldn't determine the type during classification.
                 size_t last_sep = function_name.rfind("::");
                 if (last_sep != std::string::npos && function_name.find("::") != last_sep)
                 {
@@ -426,7 +636,6 @@ namespace Cryo::Codegen
                     llvm::Function *method = resolve_method_by_name(type_name, method_name);
                     if (method)
                     {
-                        // Generate arguments and call
                         auto args = generate_arguments(node->arguments());
                         std::vector<llvm::Value *> coerced_args;
                         llvm::FunctionType *fn_type = method->getFunctionType();
@@ -4697,6 +4906,23 @@ namespace Cryo::Codegen
                               "is_enum_type: Found '{}' as enum type via symbol table '{}'", name, candidate);
                     return true;
                 }
+            }
+        }
+
+        // Check TemplateRegistry for cross-module generic enum templates.
+        // This handles the case where a generic function body references an enum
+        // by unqualified name (e.g., "Outcome::Ok(value)") but the enum is from
+        // another module and not in the local symbol table.
+        Cryo::TemplateRegistry *template_registry = non_const_ctx.template_registry();
+        if (template_registry)
+        {
+            const Cryo::TemplateRegistry::TemplateInfo *tmpl_info =
+                template_registry->find_template(name);
+            if (tmpl_info && tmpl_info->enum_template)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "is_enum_type: Found '{}' as generic enum template in TemplateRegistry", name);
+                return true;
             }
         }
 
