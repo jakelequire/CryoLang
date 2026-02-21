@@ -422,7 +422,8 @@ namespace Cryo
     void TemplateRegistry::register_struct_field_types(const std::string &qualified_struct_name,
                                                        const std::vector<std::string> &field_names,
                                                        const std::vector<TypeRef> &field_types,
-                                                       const std::string &source_namespace)
+                                                       const std::string &source_namespace,
+                                                       const std::vector<std::string> &field_type_annotations)
     {
         if (qualified_struct_name.empty())
             return;
@@ -430,6 +431,7 @@ namespace Cryo
         StructFieldInfo info;
         info.field_names = field_names;
         info.field_types = field_types;
+        info.field_type_annotations = field_type_annotations;
         info.source_namespace = source_namespace;
 
         _struct_field_types[qualified_struct_name] = std::move(info);

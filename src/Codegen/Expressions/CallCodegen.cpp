@@ -3323,6 +3323,66 @@ namespace Cryo::Codegen
                                                           parent_type_name, member_name, type_name, candidate);
                                                 break;
                                             }
+                                            else
+                                            {
+                                                // Field found by name but TypeRef is invalid (cross-module generic)
+                                                // Use stored annotation string to trigger on-demand instantiation
+                                                std::string annotation;
+                                                if (i < field_info->field_type_annotations.size())
+                                                    annotation = field_info->field_type_annotations[i];
+
+                                                if (!annotation.empty())
+                                                {
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                              "Field '{}' type unresolved, using annotation fallback: '{}'",
+                                                              member_name, annotation);
+
+                                                    size_t angle_pos = annotation.find('<');
+                                                    if (angle_pos != std::string::npos)
+                                                    {
+                                                        // Generic type - parse and on-demand instantiate
+                                                        size_t close_pos = annotation.rfind('>');
+                                                        std::string base_name = annotation.substr(0, angle_pos);
+                                                        std::string type_args_str = annotation.substr(angle_pos + 1, close_pos - angle_pos - 1);
+
+                                                        CodegenVisitor *visitor = ctx().visitor();
+                                                        GenericCodegen *gen_codegen = visitor ? visitor->get_generics() : nullptr;
+
+                                                        if (gen_codegen && gen_codegen->is_generic_template(base_name))
+                                                        {
+                                                            std::vector<TypeRef> type_args = parse_type_args_from_string(type_args_str, symbols());
+                                                            if (!type_args.empty())
+                                                            {
+                                                                bool had_inst_source = !ctx().instantiation_file().empty();
+                                                                if (!had_inst_source && node)
+                                                                    ctx().set_instantiation_source(node->source_file(), node->location());
+                                                                llvm::StructType *instantiated = gen_codegen->instantiate_struct(base_name, type_args);
+                                                                if (!had_inst_source)
+                                                                    ctx().clear_instantiation_source();
+
+                                                                if (instantiated)
+                                                                {
+                                                                    type_name = gen_codegen->mangle_type_name(base_name, type_args);
+                                                                    // Qualify with source namespace from template
+                                                                    if (auto *template_reg2 = ctx().template_registry())
+                                                                    {
+                                                                        const auto *tmpl = template_reg2->find_template(base_name);
+                                                                        if (tmpl && !tmpl->module_namespace.empty())
+                                                                            type_name = tmpl->module_namespace + "::" + type_name;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        type_name = annotation;
+                                                    }
+                                                }
+
+                                                if (!type_name.empty())
+                                                    break;
+                                            }
                                         }
                                     }
                                     if (!type_name.empty())
