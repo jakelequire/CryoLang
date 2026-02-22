@@ -448,7 +448,7 @@ namespace CryoLSP
     std::string HoverProvider::formatStructHover(Cryo::StructDeclarationNode *decl,
                                                  const std::vector<std::string> &type_args)
     {
-        size_t prop_limit = 3;
+        size_t prop_limit = 10;
         size_t method_limit = 5;
 
         // Build generic substitution map if concrete type args are provided
@@ -483,6 +483,11 @@ namespace CryoLSP
                 continue;
             std::string type_str = getFieldTypeStr(field.get());
             result += "    " + field->name() + ": " + substituteTypeStr(type_str, subst) + ",\n";
+            if (i == prop_limit - 1 && decl->fields().size() > prop_limit)
+            {
+                result += "    //... and " + std::to_string(decl->fields().size() - prop_limit) + " more fields\n";
+                break;
+            }
         }
 
         // Show methods
@@ -492,9 +497,13 @@ namespace CryoLSP
             for (size_t i = 0; i < decl->methods().size() && i < method_limit; ++i)
             {
                 const auto &method = decl->methods()[i];
-                if (!method || method->name() != "new")
+                if (!method || !method->is_static())
                     continue;
                 result += "\t" + substituteTypeStr(buildFunctionSignature(method.get()), subst) + "\n";
+            }
+            if (decl->methods().size() > method_limit)
+            {
+                result += "\t//... and " + std::to_string(decl->methods().size() - method_limit) + " more methods\n";
             }
         }
 
@@ -506,7 +515,7 @@ namespace CryoLSP
     std::string HoverProvider::formatClassHover(Cryo::ClassDeclarationNode *decl,
                                                 const std::vector<std::string> &type_args)
     {
-        size_t prop_limit = 3;
+        size_t prop_limit = 10;
         size_t method_limit = 5;
 
         // Build generic substitution map if concrete type args are provided
