@@ -78,6 +78,7 @@ namespace Cryo::Codegen
         llvm::Value *generate_fflush(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_feof(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_ferror(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_fileno(const std::vector<llvm::Value *> &args);
 
         // Low-level file descriptor I/O
         llvm::Value *generate_read(const std::vector<llvm::Value *> &args);

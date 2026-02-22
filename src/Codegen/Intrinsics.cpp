@@ -120,6 +120,8 @@ namespace Cryo::Codegen
             return generate_feof(args);
         else if (intrinsic_name == "ferror")
             return generate_ferror(args);
+        else if (intrinsic_name == "fileno")
+            return generate_fileno(args);
         else if (intrinsic_name == "fgets")
             return generate_fgets(args);
         else if (intrinsic_name == "fputs")
@@ -3376,6 +3378,26 @@ namespace Cryo::Codegen
 
         llvm::Function *ferror_func = get_or_create_libc_function("ferror", ferror_type);
         return builder.CreateCall(ferror_func, {args[0]}, "ferror.result");
+    }
+
+    llvm::Value *Intrinsics::generate_fileno(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("fileno requires exactly 1 argument (file)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create fileno function type: int fileno(FILE* file)
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *fileno_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
+
+        llvm::Function *fileno_func = get_or_create_libc_function("fileno", fileno_type);
+        return builder.CreateCall(fileno_func, {args[0]}, "fileno.result");
     }
 
     llvm::Value *Intrinsics::generate_fgets(const std::vector<llvm::Value *> &args)
