@@ -1,2 +1,236 @@
+///! Logger Module
+///!
+///! Console-only logger for the Cryo compiler.
+///! Supports log levels, component filtering, timestamps, and ANSI colors.
 namespace Utils::Logger;
 
+// ============================================================================
+// Log Level
+// ============================================================================
+
+type enum LogLevel {
+    Trace;   // Most verbose - internal state tracking
+    Debug;   // Debug information for development
+    Info;    // General informational messages
+    Warn;    // Warning messages (potential issues)
+    Error;   // Error messages (recoverable errors)
+    Fatal;   // Fatal errors (unrecoverable)
+    None;    // Disable all logging
+}
+
+implement enum LogLevel {
+    label(&this) -> string {
+        match (this) {
+            LogLevel::Trace => { "TRACE" }
+            LogLevel::Debug => { "DEBUG" }
+            LogLevel::Info  => { "INFO " }
+            LogLevel::Warn  => { "WARN " }
+            LogLevel::Error => { "ERROR" }
+            LogLevel::Fatal => { "FATAL" }
+            LogLevel::None  => { "NONE " }
+        }
+        return "UNKNOWN";
+    }
+
+    // ANSI color codes
+    color(&this) -> string {
+        match (this) {
+            LogLevel::Trace => { "\033[0;37m" }  // White
+            LogLevel::Debug => { "\033[0;36m" }  // Cyan
+            LogLevel::Info  => { "\033[0;32m" }  // Green
+            LogLevel::Warn  => { "\033[0;33m" }  // Yellow
+            LogLevel::Error => { "\033[0;31m" }  // Red
+            LogLevel::Fatal => { "\033[1;31m" }  // Bold Red
+            LogLevel::None  => { "\033[0m" }     // Reset
+        }
+        return "\033[0m"; // Default to reset
+    }
+
+    reset(&this) -> string {
+        return "\033[0m";
+    }
+
+    to_int(&this) -> int {
+        match (this) {
+            LogLevel::Trace => { 0 } 
+            LogLevel::Debug => { 1 } 
+            LogLevel::Info  => { 2 } 
+            LogLevel::Warn  => { 3 } 
+            LogLevel::Error => { 4 } 
+            LogLevel::Fatal => { 5 } 
+            LogLevel::None  => { 6 } 
+        }
+        return 6; // Default to None
+    }
+
+    // Returns true if `candidate` meets or exceeds the `threshold`
+    meets_threshold(&this, threshold: LogLevel) -> boolean {
+        const c: int = this.to_int();
+        const t: int = threshold.to_int();
+        return c >= t;
+    }
+}
+
+// ============================================================================
+// Log Component
+// ============================================================================
+
+type enum LogComponent {
+    General;
+    Lexer;
+    Parser;
+    AST;
+    TypeChecker;
+    CodeGen;
+    Linker;
+    Optimizer;
+    Diagnostic;
+    Runtime;
+    StdLib;
+    CLI;
+    LSP;
+}
+
+implement enum LogComponent {
+    label(&this) -> string {
+        match (this) {
+            LogComponent::General     => { "GENERAL" }
+            LogComponent::Lexer       => { "LEXER" }
+            LogComponent::Parser      => { "PARSER" }
+            LogComponent::AST         => { "AST" }
+            LogComponent::TypeChecker => { "TYPECHECKER" }
+            LogComponent::CodeGen     => { "CODEGEN" }
+            LogComponent::Linker      => { "LINKER" }
+            LogComponent::Optimizer   => { "OPTIMIZER" }
+            LogComponent::Diagnostic  => { "DIAGNOSTIC" }
+            LogComponent::Runtime     => { "RUNTIME" }
+            LogComponent::StdLib      => { "STDLIB" }
+            LogComponent::CLI         => { "CLI" }
+            LogComponent::LSP         => { "LSP" }
+        }
+        return "UNKNOWN";
+    }
+}
+
+// ============================================================================
+// Logger Config
+// ============================================================================
+
+type struct LoggerConfig {
+    min_level:              LogLevel;
+    enable_colors:          boolean;
+    enable_timestamps:      boolean;
+    enable_component_tags:  boolean;
+
+    static default() -> LoggerConfig {
+        return LoggerConfig {
+            min_level:             LogLevel::None,
+            enable_colors:         true,
+            enable_timestamps:     true,
+            enable_component_tags: true,
+        };
+    }
+
+    static debug_config() -> LoggerConfig {
+        return LoggerConfig {
+            min_level:             LogLevel::Debug,
+            enable_colors:         true,
+            enable_timestamps:     true,
+            enable_component_tags: true,
+        };
+    }
+}
+
+// ============================================================================
+// Logger
+// ============================================================================
+
+type struct Logger {
+private:
+    config: LoggerConfig;
+
+public:
+    static new(config: LoggerConfig) -> Logger {
+        return Logger { config: config };
+    }
+
+    static default() -> Logger {
+        return Logger { config: LoggerConfig::default() };
+    }
+
+    // ----------------------------------------------------------------
+    // Configuration
+    // ----------------------------------------------------------------
+
+    set_level(&this, level: LogLevel) -> void {
+        this.config.min_level = level;
+    }
+
+    set_colors(&this, enabled: boolean) -> void {
+        this.config.enable_colors = enabled;
+    }
+
+    // ----------------------------------------------------------------
+    // Logging Methods
+    // ----------------------------------------------------------------
+
+    trace(&this, component: LogComponent, msg: string) -> void {
+        this.write_log(LogLevel::Trace, component, msg);
+    }
+
+    debug(&this, component: LogComponent, msg: string) -> void {
+        this.write_log(LogLevel::Debug, component, msg);
+    }
+
+    info(&this, component: LogComponent, msg: string) -> void {
+        this.write_log(LogLevel::Info, component, msg);
+    }
+
+    warn(&this, component: LogComponent, msg: string) -> void {
+        this.write_log(LogLevel::Warn, component, msg);
+    }
+
+    error(&this, component: LogComponent, msg: string) -> void {
+        this.write_log(LogLevel::Error, component, msg);
+    }
+
+    fatal(&this, component: LogComponent, msg: string) -> void {
+        this.write_log(LogLevel::Fatal, component, msg);
+        // Fatal is unrecoverable — flush stderr and abort
+        exit(1);
+    }
+
+private:
+    // ----------------------------------------------------------------
+    // Core write - always writes to stderr (fd 2) so stdout stays
+    // clean for any LSP/JSON-RPC usage
+    // ----------------------------------------------------------------
+    write_log(&this, level: LogLevel, component: LogComponent, msg: string) -> void {
+        if (!level.meets_threshold(level, this.config.min_level)) {
+            return;
+        }
+
+        // Build the prefix: [LEVEL] [COMPONENT] message
+        // Using fprintf to stderr (fd 2 via the void* stderr handle).
+        // We write each part separately to avoid needing string concat.
+
+        if (this.config.enable_colors) {
+            const color: string = level.color();
+            fprintf(2 as void *, "%s", color);
+        }
+
+        fprintf(2 as void *, "[%s]", level.label());
+
+        if (this.config.enable_component_tags) {
+            fprintf(2 as void *, "[%s]", component.label());
+        }
+
+        fprintf(2 as void *, " %s", msg);
+
+        if (this.config.enable_colors) {
+            fprintf(2 as void *, "%s", level.reset());
+        }
+
+        fprintf(2 as void *, "\n");
+    }
+}

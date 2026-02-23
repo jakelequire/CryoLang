@@ -349,6 +349,27 @@ namespace Cryo
             std::string qualified_name = namespace_name + "::" + base_name;
             Symbol qualified_sym = symbol;
             qualified_sym.name = qualified_name;
+
+            // Set the LLVM-matching qualified_name using the symbol's original module scope.
+            // namespace_name may be an import alias (e.g., "U") or a partial import path
+            // (e.g., "Baz" when the module declares "namespace Baz::Qix"), so sym.name
+            // could be "U::add" or "Baz::Bang::print" which don't match the definition.
+            // The definition uses scope + "::" + base_name (e.g., "Utils::add", "Baz::Qix::Bang::print").
+            if (!symbol.scope.empty() && symbol.scope != "Global")
+            {
+                std::string scope_prefix = symbol.scope + "::";
+                if (base_name.substr(0, scope_prefix.size()) == scope_prefix)
+                {
+                    // base_name already starts with scope (e.g., scope="Pair", base_name="Pair::new")
+                    // Use base_name as-is to avoid doubling: "Pair::new" not "Pair::Pair::new"
+                    qualified_sym.qualified_name = base_name;
+                }
+                else
+                {
+                    qualified_sym.qualified_name = symbol.scope + "::" + base_name;
+                }
+            }
+
             _current_scope->declare(qualified_name, qualified_sym);
         }
     }

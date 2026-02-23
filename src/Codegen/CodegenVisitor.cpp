@@ -203,6 +203,34 @@ namespace Cryo::Codegen
         //   Pass 3: Struct/Class METHOD BODIES (now globals are available)
         //   Pass 4: Functions, impl blocks, etc.
 
+        // Pre-pass: Register import declarations with the SRM so that cross-module
+        // name resolution works correctly in all subsequent passes (especially Pass 3
+        // where method bodies are generated before Pass 4 processes imports).
+        for (const auto &stmt : node.statements())
+        {
+            if (!stmt)
+                continue;
+            auto *import_decl = dynamic_cast<Cryo::ImportDeclarationNode *>(stmt.get());
+            if (!import_decl)
+            {
+                if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+                {
+                    if (decl_stmt->declaration())
+                        import_decl = dynamic_cast<Cryo::ImportDeclarationNode *>(decl_stmt->declaration());
+                }
+            }
+            if (import_decl)
+            {
+                std::string import_path = import_decl->path();
+                if (!import_path.empty())
+                {
+                    _ctx->srm_context().add_imported_namespace(import_path);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Pre-pass: Registered imported namespace '{}' with SRM", import_path);
+                }
+            }
+        }
+
         // Pass 0: Process all enum declarations first (for enum variant resolution)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 0: Processing enum declarations");
         int enum_count = 0;
@@ -354,6 +382,19 @@ namespace Cryo::Codegen
                         template_registry->register_struct_impl_block(base_type_name, impl_block, ns_context);
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Pass 2.5: Registered struct impl block for '{}' (base: {})",
+                                  type_name, base_type_name);
+                    }
+                }
+                else
+                {
+                    // Non-generic type — check if it's an enum and register its impl block
+                    // so resolve_method_by_name can look up parameter types
+                    TypeRef enum_type = _ctx->symbols().lookup_enum_type(base_type_name);
+                    if (enum_type.is_valid() && enum_type->kind() == Cryo::TypeKind::Enum)
+                    {
+                        template_registry->register_enum_impl_block(base_type_name, impl_block, ns_context);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Pass 2.5: Registered non-generic enum impl block for '{}' (base: {})",
                                   type_name, base_type_name);
                     }
                 }
@@ -736,7 +777,10 @@ namespace Cryo::Codegen
 
         // Generate method declarations even in "type only" mode to enable forward references
         // This allows global variables and other code to call struct methods before their bodies are generated
-        if (!node.methods().empty())
+        // SKIP method declarations in pre-registration mode (type lowering phase) because
+        // the namespace context is wrong (Main) for imported modules. Method declarations
+        // will be created during the actual IR generation pass with correct namespaces.
+        if (!node.methods().empty() && !_pre_registration_mode)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "CodegenVisitor: Generating method declarations for struct {} (defer_bodies={})",
@@ -876,7 +920,8 @@ namespace Cryo::Codegen
 
         // Generate method declarations even in "type only" mode to enable forward references
         // This allows global variables and other code to call class methods before their bodies are generated
-        if (!node.methods().empty())
+        // SKIP in pre-registration mode (same reason as structs - wrong namespace context)
+        if (!node.methods().empty() && !_pre_registration_mode)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "CodegenVisitor: Generating method declarations for class {} (defer_bodies={})",

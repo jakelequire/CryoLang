@@ -73,7 +73,8 @@ namespace Cryo::Codegen
         //    outer type name before the TypeMapper lambda cleared it), falling
         //    back to current_type_name() for backward compatibility.
         const std::string &parent = parent_mangled.empty()
-            ? ctx().current_type_name() : parent_mangled;
+                                        ? ctx().current_type_name()
+                                        : parent_mangled;
         if (!parent.empty() && arena.get_instantiation_site(parent, site_file, site_loc))
         {
             ctx().set_instantiation_source(site_file, site_loc);
@@ -500,7 +501,7 @@ namespace Cryo::Codegen
                                     const_type = llvm::Type::getInt32Ty(llvm_ctx());
                                 else if (c.type_annotation == "u64" || c.type_annotation == "i64")
                                     const_type = llvm::Type::getInt64Ty(llvm_ctx());
-                                else if (c.type_annotation == "bool")
+                                else if (c.type_annotation == "boolean")
                                     const_type = llvm::Type::getInt1Ty(llvm_ctx());
                                 else
                                     const_type = llvm::Type::getInt64Ty(llvm_ctx()); // default
