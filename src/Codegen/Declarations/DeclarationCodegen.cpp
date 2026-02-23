@@ -1319,8 +1319,16 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Global '{}' has Cryo type: {} (kind={})",
                   name, cryo_type.get()->display_name(), Cryo::type_kind_to_string(cryo_type->kind()));
 
+        // Bail out early if the type failed to resolve — continuing would crash codegen
+        if (cryo_type->kind() == Cryo::TypeKind::Error)
+        {
+            report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
+                         "Unresolved type for global variable '" + name + "': " + cryo_type->display_name());
+            return nullptr;
+        }
+
         llvm::Type *var_type = get_llvm_type(cryo_type);
-        if (!var_type)
+        if (!var_type || var_type->isVoidTy())
         {
             report_error(ErrorCode::E0634_VARIABLE_INITIALIZATION_ERROR, node,
                          "Unknown type for global variable: " + name);
