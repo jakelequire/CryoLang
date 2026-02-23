@@ -1123,6 +1123,30 @@ namespace Cryo
                     }
                 }
             }
+            // Handle top-level variable declarations (e.g., global variables)
+            else if (auto *var_decl = dynamic_cast<VariableDeclarationNode *>(stmt.get()))
+            {
+                const auto *ann = var_decl->type_annotation();
+                if (ann && (!var_decl->get_resolved_type().is_valid() || var_decl->get_resolved_type().is_error()))
+                {
+                    TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                    if (!resolved.is_error())
+                    {
+                        var_decl->set_resolved_type(resolved);
+                        resolved_count++;
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Resolved global variable '{}' type to '{}'",
+                            var_decl->name(), resolved->display_name());
+                    }
+                    else
+                    {
+                        error_count++;
+                        LOG_DEBUG(LogComponent::GENERAL,
+                            "TypeResolutionPass: Failed to resolve global variable '{}' type annotation '{}'",
+                            var_decl->name(), ann->to_string());
+                    }
+                }
+            }
             // Type alias declarations are handled in Phase 2a - skip them here
             else if (dynamic_cast<TypeAliasDeclarationNode *>(stmt.get()))
             {

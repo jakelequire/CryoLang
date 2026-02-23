@@ -197,21 +197,13 @@ namespace Cryo
         bool peek_variadic_parameter();
         std::unique_ptr<VariableDeclarationNode> parse_variadic_parameter();
 
-        // Expression parsing (precedence climbing)
+        // Expression parsing (Pratt / precedence-climbing)
         std::unique_ptr<ExpressionNode> parse_expression();
         std::unique_ptr<ExpressionNode> parse_assignment();
         std::unique_ptr<ExpressionNode> parse_conditional();
-        std::unique_ptr<ExpressionNode> parse_logical_or();
-        std::unique_ptr<ExpressionNode> parse_logical_and();
-        std::unique_ptr<ExpressionNode> parse_equality();
-        std::unique_ptr<ExpressionNode> parse_bitwise_or();
-        std::unique_ptr<ExpressionNode> parse_bitwise_xor();
-        std::unique_ptr<ExpressionNode> parse_bitwise_and();
+        std::unique_ptr<ExpressionNode> parse_binary_expression(int min_precedence);
+        static int get_binary_precedence(TokenKind kind);
         std::unique_ptr<ExpressionNode> parse_cast();
-        std::unique_ptr<ExpressionNode> parse_relational();
-        std::unique_ptr<ExpressionNode> parse_shift();
-        std::unique_ptr<ExpressionNode> parse_additive();
-        std::unique_ptr<ExpressionNode> parse_multiplicative();
         std::unique_ptr<ExpressionNode> parse_unary();
         std::unique_ptr<ExpressionNode> parse_primary();
         std::unique_ptr<ExpressionNode> parse_call_expression(std::unique_ptr<ExpressionNode> expr);

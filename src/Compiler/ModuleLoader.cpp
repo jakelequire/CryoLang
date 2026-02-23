@@ -216,6 +216,19 @@ namespace Cryo
                 {
                     result = cached->second;
                 }
+                else if (has_circular_dependency(parent_resolved))
+                {
+                    // The parent module is already being loaded (we are inside it).
+                    // This happens when e.g. CLI/_module.cryo imports CLI::Commands and
+                    // the resolution falls back to loading the CLI parent module — which
+                    // is the file we are currently parsing. Return failure to avoid
+                    // infinite recursion.
+                    result.success = false;
+                    result.error_message = "Circular dependency in fallback: " + parent_resolved + " is already being loaded";
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "ModuleLoader: Fallback skipped - '{}' is already being loaded (circular)",
+                              parent_resolved);
+                }
                 else
                 {
                     _loading_modules.insert(parent_resolved);
@@ -385,10 +398,34 @@ namespace Cryo
         auto &os = Cryo::Utils::OS::instance();
         _last_resolve_was_local = false;
 
-        // Precompute lowercase variant for case-insensitive fallback
+        // Precompute case-insensitive variants for fallback on case-sensitive filesystems.
+        // We try two variants:
+        //   1. Fully lowercased path (e.g., CLI/Commands → cli/commands)
+        //   2. Only the last segment lowercased (e.g., CLI/Commands → CLI/commands)
+        // Variant 2 is critical on Linux where directory names preserve their original case
+        // but file names may differ (e.g., directory "CLI" with file "commands.cryo").
         std::string lower_file_path = file_path;
         std::transform(lower_file_path.begin(), lower_file_path.end(), lower_file_path.begin(), ::tolower);
         bool has_lower_variant = (lower_file_path != file_path);
+
+        // Build a variant with only the last path segment lowercased
+        std::string last_seg_lower_path;
+        bool has_last_seg_lower = false;
+        {
+            size_t last_slash = file_path.rfind('/');
+            if (last_slash != std::string::npos)
+            {
+                std::string dir_part = file_path.substr(0, last_slash + 1);
+                std::string file_part = file_path.substr(last_slash + 1);
+                std::string lower_file_part = file_part;
+                std::transform(lower_file_part.begin(), lower_file_part.end(), lower_file_part.begin(), ::tolower);
+                if (lower_file_part != file_part)
+                {
+                    last_seg_lower_path = dir_part + lower_file_part;
+                    has_last_seg_lower = (last_seg_lower_path != file_path && last_seg_lower_path != lower_file_path);
+                }
+            }
+        }
 
         // 1. Try project root first (project-local imports shadow stdlib)
         if (!_project_root.empty())
@@ -402,7 +439,19 @@ namespace Cryo
                 return result;
             }
 
-            // Lowercase (import Compiler → compiler/_module.cryo)
+            // Last-segment lowercase (import CLI::Commands → CLI/commands.cryo)
+            if (has_last_seg_lower)
+            {
+                project_resolved = os.join_path(_project_root, last_seg_lower_path);
+                result = resolve_module_file_path(project_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
+
+            // Fully lowercase (import Compiler → compiler/_module.cryo)
             if (has_lower_variant)
             {
                 project_resolved = os.join_path(_project_root, lower_file_path);
@@ -427,7 +476,19 @@ namespace Cryo
                 return result;
             }
 
-            // Lowercase
+            // Last-segment lowercase
+            if (has_last_seg_lower)
+            {
+                local_resolved = os.join_path(_current_file_dir, last_seg_lower_path);
+                result = resolve_module_file_path(local_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
+
+            // Fully lowercase
             if (has_lower_variant)
             {
                 local_resolved = os.join_path(_current_file_dir, lower_file_path);
@@ -447,6 +508,30 @@ namespace Cryo
         {
             _last_resolve_was_local = false;
             return result;
+        }
+
+        // Last-segment lowercase for stdlib
+        if (has_last_seg_lower)
+        {
+            stdlib_resolved = os.join_path(_stdlib_root, last_seg_lower_path);
+            result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+            if (std::filesystem::exists(result))
+            {
+                _last_resolve_was_local = false;
+                return result;
+            }
+        }
+
+        // Fully lowercase for stdlib
+        if (has_lower_variant)
+        {
+            stdlib_resolved = os.join_path(_stdlib_root, lower_file_path);
+            result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+            if (std::filesystem::exists(result))
+            {
+                _last_resolve_was_local = false;
+                return result;
+            }
         }
 
         // 4. Fallback to stdlib path (will fail at load time with proper error)
