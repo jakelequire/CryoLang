@@ -2292,7 +2292,7 @@ namespace Cryo
 
     std::unique_ptr<ExpressionNode> Parser::parse_conditional()
     {
-        auto expr = parse_logical_or();
+        auto expr = parse_binary_expression(0);
 
         // Check for ternary operator: condition ? true_expr : false_expr
         if (_current_token.is(TokenKind::TK_QUESTION))
@@ -2312,90 +2312,54 @@ namespace Cryo
         return expr;
     }
 
-    std::unique_ptr<ExpressionNode> Parser::parse_logical_or()
+    // Precedence table for binary operators (higher = tighter binding).
+    // Returns -1 for tokens that are not binary operators.
+    int Parser::get_binary_precedence(TokenKind kind)
     {
-        auto expr = parse_logical_and();
-
-        while (_current_token.is(TokenKind::TK_PIPEPIPE))
+        switch (kind)
         {
-            Token op = _current_token;
-            advance();
-            auto right = parse_logical_and();
-            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
+        case TokenKind::TK_PIPEPIPE:        return 1;  // ||
+        case TokenKind::TK_AMPAMP:          return 2;  // &&
+        case TokenKind::TK_PIPE:            return 3;  // |
+        case TokenKind::TK_CARET:           return 4;  // ^
+        case TokenKind::TK_AMP:             return 5;  // &
+        case TokenKind::TK_EQUALEQUAL:      return 6;  // ==
+        case TokenKind::TK_EXCLAIMEQUAL:    return 6;  // !=
+        case TokenKind::TK_L_ANGLE:         return 7;  // <
+        case TokenKind::TK_R_ANGLE:         return 7;  // >
+        case TokenKind::TK_LESSEQUAL:       return 7;  // <=
+        case TokenKind::TK_GREATEREQUAL:    return 7;  // >=
+        case TokenKind::TK_LESSLESS:        return 8;  // <<
+        case TokenKind::TK_GREATERGREATER:  return 8;  // >>
+        case TokenKind::TK_PLUS:            return 9;  // +
+        case TokenKind::TK_MINUS:           return 9;  // -
+        case TokenKind::TK_STAR:            return 10; // *
+        case TokenKind::TK_SLASH:           return 10; // /
+        case TokenKind::TK_PERCENT:         return 10; // %
+        default:                            return -1; // not a binary operator
         }
-
-        return expr;
     }
 
-    std::unique_ptr<ExpressionNode> Parser::parse_logical_and()
+    // Pratt (precedence-climbing) parser for all binary operators.
+    // Replaces the 10 separate recursive-descent functions (parse_logical_or
+    // through parse_multiplicative), collapsing them into a single iterative
+    // loop. This reduces per-expression stack depth from ~16 frames to ~4.
+    std::unique_ptr<ExpressionNode> Parser::parse_binary_expression(int min_precedence)
     {
-        auto expr = parse_equality();
+        auto expr = parse_cast();
 
-        while (_current_token.is(TokenKind::TK_AMPAMP))
+        while (true)
         {
+            int prec = get_binary_precedence(_current_token.kind());
+            if (prec < min_precedence)
+                break;
+
             Token op = _current_token;
             advance();
-            auto right = parse_equality();
-            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
-        }
 
-        return expr;
-    }
-
-    std::unique_ptr<ExpressionNode> Parser::parse_equality()
-    {
-        auto expr = parse_bitwise_or();
-
-        while (_current_token.is(TokenKind::TK_EQUALEQUAL) || _current_token.is(TokenKind::TK_EXCLAIMEQUAL))
-        {
-            Token op = _current_token;
-            advance();
-            auto right = parse_bitwise_or();
-            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
-        }
-
-        return expr;
-    }
-
-    std::unique_ptr<ExpressionNode> Parser::parse_bitwise_or()
-    {
-        auto expr = parse_bitwise_xor();
-
-        while (_current_token.is(TokenKind::TK_PIPE))
-        {
-            Token op = _current_token;
-            advance();
-            auto right = parse_bitwise_xor();
-            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
-        }
-
-        return expr;
-    }
-
-    std::unique_ptr<ExpressionNode> Parser::parse_bitwise_xor()
-    {
-        auto expr = parse_bitwise_and();
-
-        while (_current_token.is(TokenKind::TK_CARET))
-        {
-            Token op = _current_token;
-            advance();
-            auto right = parse_bitwise_and();
-            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
-        }
-
-        return expr;
-    }
-
-    std::unique_ptr<ExpressionNode> Parser::parse_bitwise_and()
-    {
-        auto expr = parse_relational();
-
-        while (_current_token.is(TokenKind::TK_AMP))
-        {
-            Token op = _current_token;
-            advance();
-            auto right = parse_relational();
+            // All binary operators are left-associative, so the right operand
+            // binds at one precedence level higher than the current operator.
+            auto right = parse_binary_expression(prec + 1);
             expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
         }
 
@@ -2453,67 +2417,6 @@ namespace Cryo
             // Create TypeAnnotation from the target type string
             auto target_annotation = std::make_unique<TypeAnnotation>(TypeAnnotation::named(target_type, cast_loc));
             expr = _builder.create_cast_expression(cast_loc, std::move(expr), std::move(target_annotation));
-        }
-
-        return expr;
-    }
-
-    std::unique_ptr<ExpressionNode> Parser::parse_relational()
-    {
-        auto expr = parse_shift();
-
-        while (_current_token.is(TokenKind::TK_L_ANGLE) || _current_token.is(TokenKind::TK_R_ANGLE) ||
-               _current_token.is(TokenKind::TK_LESSEQUAL) || _current_token.is(TokenKind::TK_GREATEREQUAL))
-        {
-            Token op = _current_token;
-            advance();
-            auto right = parse_shift();
-            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
-        }
-
-        return expr;
-    }
-
-    std::unique_ptr<ExpressionNode> Parser::parse_shift()
-    {
-        auto expr = parse_additive();
-
-        while (_current_token.is(TokenKind::TK_LESSLESS) || _current_token.is(TokenKind::TK_GREATERGREATER))
-        {
-            Token op = _current_token;
-            advance();
-            auto right = parse_additive();
-            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
-        }
-
-        return expr;
-    }
-
-    std::unique_ptr<ExpressionNode> Parser::parse_additive()
-    {
-        auto expr = parse_multiplicative();
-
-        while (_current_token.is(TokenKind::TK_PLUS) || _current_token.is(TokenKind::TK_MINUS))
-        {
-            Token op = _current_token;
-            advance();
-            auto right = parse_multiplicative();
-            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
-        }
-
-        return expr;
-    }
-
-    std::unique_ptr<ExpressionNode> Parser::parse_multiplicative()
-    {
-        auto expr = parse_cast();
-
-        while (_current_token.is(TokenKind::TK_STAR) || _current_token.is(TokenKind::TK_SLASH) || _current_token.is(TokenKind::TK_PERCENT))
-        {
-            Token op = _current_token;
-            advance();
-            auto right = parse_cast();
-            expr = _builder.create_binary_expression(op, std::move(expr), std::move(right));
         }
 
         return expr;
