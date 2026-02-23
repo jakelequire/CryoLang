@@ -437,13 +437,9 @@ namespace Cryo::Codegen
                 // Error types map to void in LLVM, which is invalid as a parameter type
                 if (ptype.is_error())
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "DeclarationCodegen: Skipping method '{}' - param '{}' has error type '{}'",
-                              node->name(), param->name(), ptype.get()->display_name());
-                    // Emit actual error so it shows up in diagnostics
-                    report_error(ErrorCode::E0642_PARAM_TYPE_ERROR, node,
-                                 "Method '" + node->name() + "' parameter '" + param->name() +
-                                     "' has unresolved type: " + ptype.get()->display_name());
+                    LOG_WARN(Cryo::LogComponent::CODEGEN,
+                             "DeclarationCodegen: Skipping method '{}' - param '{}' has error type '{}'",
+                             node->name(), param->name(), ptype.get()->display_name());
                     return nullptr;
                 }
                 // Check for Generic type kind or undefined struct/class types
@@ -540,14 +536,10 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    // No annotation - we can't resolve the type, skip
-                    LOG_ERROR(Cryo::LogComponent::CODEGEN,
-                              "DeclarationCodegen: Skipping method declaration '{}::{}' - return type is error '{}' with no annotation",
-                              parent_type, node->name(), ret_type->display_name());
-                    // Emit actual error so it shows up in diagnostics
-                    report_error(ErrorCode::E0643_RETURN_TYPE_ERROR, node,
-                                 "Method '" + parent_type + "::" + node->name() +
-                                     "' has unresolved return type: " + ret_type->display_name());
+                    // No annotation - we can't resolve the type, skip this method
+                    LOG_WARN(Cryo::LogComponent::CODEGEN,
+                             "DeclarationCodegen: Skipping method declaration '{}::{}' - return type is error '{}' with no annotation",
+                             parent_type, node->name(), ret_type->display_name());
                     return nullptr;
                 }
             }
@@ -2771,13 +2763,23 @@ namespace Cryo::Codegen
             // Check if return type is an error type (unresolved generics, undefined types, etc.)
             if (ret_type.is_error())
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Skipping method '{}' - return type is error: '{}'",
-                          node->name(), ret_type->display_name());
-                // Emit actual error so it shows up in diagnostics
-                report_error(ErrorCode::E0643_RETURN_TYPE_ERROR, node,
-                             "Method '" + node->name() + "' has unresolved return type: " + ret_type->display_name());
-                return;
+                // If we have a valid annotation, the declaration was already generated
+                // using the annotation - proceed with body generation since the LLVM
+                // function type is correct (it was resolved from the annotation).
+                if (node->return_type_annotation())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Method '{}' has error return type '{}' but has annotation '{}' - proceeding with body",
+                              node->name(), ret_type->display_name(),
+                              node->return_type_annotation()->to_string());
+                }
+                else
+                {
+                    LOG_WARN(Cryo::LogComponent::CODEGEN,
+                             "DeclarationCodegen: Skipping method '{}' - return type is error: '{}' with no annotation",
+                             node->name(), ret_type->display_name());
+                    return;
+                }
             }
         }
 
@@ -3536,10 +3538,51 @@ namespace Cryo::Codegen
             if (ret->isFunctionTy())
                 ret = llvm::PointerType::get(llvm_ctx(), 0);
 
+            // For instance methods (non-static struct/class methods), the symbol's
+            // FunctionType may or may not include the 'this' parameter:
+            //   - Explicit `&this` syntax: parser adds it, FunctionType already has it
+            //   - Implicit `this`: parser omits it, FunctionType does NOT have it
+            // Detect the case where 'this' is missing and prepend a ptr parameter so
+            // the forward declaration matches the eventual definition signature.
+            bool needs_this = false;
+            if (llvm_name.find("::") != std::string::npos)
+            {
+                if (auto *tr = ctx().template_registry())
+                {
+                    auto [is_static, found] = tr->get_method_is_static(llvm_name);
+                    if (found && !is_static)
+                    {
+                        // Check if the FunctionType already includes 'this'.
+                        // When the parser uses explicit `&this` syntax, the first param
+                        // is a ReferenceType (TypeKind::Reference) — don't add another.
+                        bool already_has_this = false;
+                        const auto &param_types = func_type->param_types();
+                        if (!param_types.empty())
+                        {
+                            auto first_kind = param_types[0]->kind();
+                            if (first_kind == Cryo::TypeKind::Reference ||
+                                first_kind == Cryo::TypeKind::Pointer)
+                            {
+                                already_has_this = true;
+                            }
+                        }
+                        if (!already_has_this)
+                        {
+                            needs_this = true;
+                        }
+                    }
+                }
+            }
+
             // Map parameter types.  LLVM requires all function parameters to be
             // first-class types.  FunctionType and VoidType are not first-class,
             // so we lower them to opaque pointers (function pointers) or skip.
             std::vector<llvm::Type *> params;
+            if (needs_this)
+            {
+                // Prepend opaque ptr for the implicit 'this' parameter
+                params.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+            }
             bool all_mapped = true;
             for (const auto &p : func_type->param_types())
             {
@@ -3921,17 +3964,126 @@ namespace Cryo::Codegen
             GenericRegistry *generics = types().generic_registry();
             if (generics)
             {
-                auto template_info = generics->get_template_by_name(name);
+                // Handle generic syntax in Named annotations (parser defers "Result<boolean,string>" as Named)
+                size_t angle_pos = name.find('<');
+                std::string base_name = (angle_pos != std::string::npos) ? name.substr(0, angle_pos) : name;
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_type_annotation: Named '{}', base_name='{}', looking up in GenericRegistry",
+                          name, base_name);
+
+                auto template_info = generics->get_template_by_name(base_name);
+                if (!template_info)
+                {
+                    // Try with namespace prefix
+                    std::string ns_base = ns.empty() ? base_name : ns + "::" + base_name;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_type_annotation: Template '{}' not found, trying '{}'",
+                              base_name, ns_base);
+                    template_info = generics->get_template_by_name(ns_base);
+                }
+                if (!template_info)
+                {
+                    // Dump available templates for debugging
+                    auto all_templates = generics->get_all_templates();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_type_annotation: Template '{}' not found in {} registered templates:",
+                              base_name, all_templates.size());
+                    for (const auto &t : all_templates)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "  - '{}' (TypeID={})",
+                                  t.name, t.generic_type.id().id);
+                    }
+                }
                 if (template_info)
                 {
+                    // If there are type arguments, try to instantiate the generic
+                    if (angle_pos != std::string::npos && name.back() == '>')
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_type_annotation: Found generic template '{}', instantiating from '{}'",
+                                  base_name, name);
+
+                        // Parse type arguments from the name string
+                        std::string args_str = name.substr(angle_pos + 1, name.size() - angle_pos - 2);
+                        std::vector<TypeRef> type_args;
+                        int depth = 0;
+                        size_t start = 0;
+                        for (size_t i = 0; i <= args_str.size(); ++i)
+                        {
+                            char c = (i < args_str.size()) ? args_str[i] : ',';
+                            if (c == '<')
+                                depth++;
+                            else if (c == '>')
+                                depth--;
+                            else if ((c == ',' && depth == 0) || i == args_str.size())
+                            {
+                                std::string arg = args_str.substr(start, i - start);
+                                // Trim whitespace
+                                while (!arg.empty() && std::isspace(arg.front()))
+                                    arg.erase(0, 1);
+                                while (!arg.empty() && std::isspace(arg.back()))
+                                    arg.pop_back();
+
+                                if (!arg.empty())
+                                {
+                                    // Resolve each type argument
+                                    TypeAnnotation arg_ann = TypeAnnotation::named(arg, SourceLocation{});
+                                    TypeRef arg_type = resolve_type_annotation(&arg_ann);
+                                    if (arg_type.is_valid() && !arg_type.is_error())
+                                    {
+                                        type_args.push_back(arg_type);
+                                    }
+                                    else
+                                    {
+                                        // Try primitives directly
+                                        TypeArena &arena = ctx().types().arena();
+                                        if (arg == "boolean" || arg == "bool")
+                                            type_args.push_back(arena.get_bool());
+                                        else if (arg == "string")
+                                            type_args.push_back(arena.get_string());
+                                        else if (arg == "int" || arg == "i32")
+                                            type_args.push_back(arena.get_i32());
+                                        else if (arg == "i64")
+                                            type_args.push_back(arena.get_i64());
+                                        else
+                                        {
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "resolve_type_annotation: Could not resolve generic arg '{}'", arg);
+                                            return TypeRef();
+                                        }
+                                    }
+                                }
+                                start = i + 1;
+                            }
+                        }
+
+                        // Instantiate through the GenericRegistry
+                        if (!type_args.empty())
+                        {
+                            TypeArena &arena = ctx().types().arena();
+                            TypeRef instantiated = generics->instantiate(
+                                template_info->generic_type, type_args, arena);
+                            if (instantiated.is_valid() && !instantiated.is_error())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_type_annotation: Instantiated generic '{}' -> '{}'",
+                                          name, instantiated->display_name());
+                                return instantiated;
+                            }
+                        }
+                    }
+
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "resolve_type_annotation: Found generic template '{}' in GenericRegistry", name);
+                              "resolve_type_annotation: Found generic template '{}' in GenericRegistry", base_name);
                     return template_info->generic_type;
                 }
             }
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "resolve_type_annotation: Could not resolve named type '{}'", name);
+                      "resolve_type_annotation: Could not resolve named type '{}' (ns='{}', has_generics={})",
+                      name, ns, generics ? "yes" : "no");
             return TypeRef();
         }
 

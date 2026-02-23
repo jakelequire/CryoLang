@@ -84,6 +84,8 @@ namespace Cryo::Codegen
             return generate_strstr(args);
         else if (intrinsic_name == "strdup")
             return generate_strdup(args);
+        else if (intrinsic_name == "substr")
+            return generate_substr(args);
 
         // I/O intrinsics
         else if (intrinsic_name == "printf")
@@ -240,6 +242,18 @@ namespace Cryo::Codegen
         // Error handling intrinsics
         else if (intrinsic_name == "errno")
             return generate_errno(args);
+
+        // Environment intrinsics
+        else if (intrinsic_name == "getenv")
+            return generate_getenv(args);
+        else if (intrinsic_name == "setenv")
+            return generate_setenv(args);
+        else if (intrinsic_name == "unsetenv")
+            return generate_unsetenv(args);
+        else if (intrinsic_name == "clearenv")
+            return generate_clearenv(args);
+        else if (intrinsic_name == "environ")
+            return generate_environ(args);
 
         // Math intrinsics
         else if (intrinsic_name == "sqrt")
@@ -826,6 +840,9 @@ namespace Cryo::Codegen
 
         else if (intrinsic_name == "panic")
             return generate_panic(args);
+
+        else if (intrinsic_name == "todo")
+            return generate_todo(args);
 
         // Variadic argument intrinsics
         else if (intrinsic_name == "va_arg_i32")
@@ -1710,8 +1727,9 @@ namespace Cryo::Codegen
             llvm::AllocaInst *alloca = builder.CreateAlloca(array_type, nullptr, "strcmp.arr1");
             builder.CreateStore(str1_arg, alloca);
             str1_arg = builder.CreateInBoundsGEP(array_type, alloca,
-                {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0),
-                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0)}, "strcmp.ptr1");
+                                                 {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0),
+                                                  llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0)},
+                                                 "strcmp.ptr1");
         }
 
         if (str2_arg->getType()->isArrayTy())
@@ -1720,8 +1738,9 @@ namespace Cryo::Codegen
             llvm::AllocaInst *alloca = builder.CreateAlloca(array_type, nullptr, "strcmp.arr2");
             builder.CreateStore(str2_arg, alloca);
             str2_arg = builder.CreateInBoundsGEP(array_type, alloca,
-                {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0),
-                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0)}, "strcmp.ptr2");
+                                                 {llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0),
+                                                  llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0)},
+                                                 "strcmp.ptr2");
         }
 
         if (!str1_arg->getType()->isPointerTy() || !str2_arg->getType()->isPointerTy())
@@ -1932,7 +1951,7 @@ namespace Cryo::Codegen
     {
         if (args.size() < 2)
         {
-            report_error("__fprintf__ requires at least 2 arguments (file, format, ...)");
+            report_error("`fprintf` requires at least 2 arguments (file, format, ...)");
             return nullptr;
         }
 
@@ -1952,7 +1971,7 @@ namespace Cryo::Codegen
         // Ensure first two arguments are pointers
         if (!args[0]->getType()->isPointerTy() || !args[1]->getType()->isPointerTy())
         {
-            report_error("__fprintf__ file and format arguments must be pointers");
+            report_error("`fprintf` file and format arguments must be pointers");
             return nullptr;
         }
 
@@ -1971,7 +1990,7 @@ namespace Cryo::Codegen
 
         if (args.size() != 0 && args.size() != 1 && args.size() != 3)
         {
-            report_error("__panic__ requires 0, 1, or 3 arguments (message, file, line)");
+            report_error("`panic` requires 0, 1, or 3 arguments (message, file, line)");
             return nullptr;
         }
 
@@ -2011,6 +2030,31 @@ namespace Cryo::Codegen
         std::vector<llvm::Value *> exit_args = {exit_code};
 
         return generate_syscall_exit(exit_args);
+    }
+
+    llvm::Value *Intrinsics::generate_todo(const std::vector<llvm::Value *> &args)
+    {
+        // Expected 3 args: (msg, file, line) — file and line injected by the compiler
+        if (args.size() != 3)
+        {
+            report_error("`todo` requires exactly 3 arguments (message, file, line)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+        llvm::FunctionType *printf_type = llvm::FunctionType::get(
+            int_type, {char_ptr_type}, true); // variadic
+        llvm::Function *printf_func = get_or_create_libc_function("printf", printf_type);
+
+        llvm::Module *module = _context_manager.get_module();
+        llvm::Constant *fmt = builder.CreateGlobalStringPtr("[TODO::%s::%u]: %s\n", "todo.fmt", 0, module);
+
+        return builder.CreateCall(printf_func, {fmt, args[1], args[2], args[0]}, "todo.print");
     }
 
     // ========================================
@@ -3037,6 +3081,47 @@ namespace Cryo::Codegen
         return builder.CreateCall(strdup_func, {str}, "strdup.result");
     }
 
+    llvm::Value *Intrinsics::generate_substr(const std::vector<llvm::Value *> &args)
+    {
+        // substr(str, start, len) -> string
+        // Allocates a new string of `len` bytes copied from str+start, null-terminated.
+        if (args.size() != 3)
+        {
+            report_error("substr requires exactly 3 arguments (str, start, len)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *i8_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *i8_type = llvm::Type::getInt8Ty(context);
+
+        llvm::Value *str = args[0];
+        llvm::Value *start = ensure_type(args[1], i64_type, "substr.start");
+        llvm::Value *len = ensure_type(args[2], i64_type, "substr.len");
+
+        // Allocate len + 1 bytes for the result (including null terminator)
+        llvm::Value *alloc_size = builder.CreateAdd(len, llvm::ConstantInt::get(i64_type, 1), "substr.alloc_size");
+
+        llvm::FunctionType *malloc_type = llvm::FunctionType::get(i8_ptr_type, {i64_type}, false);
+        llvm::Function *malloc_func = get_or_create_libc_function("malloc", malloc_type);
+        llvm::Value *buf = builder.CreateCall(malloc_func, {alloc_size}, "substr.buf");
+
+        // Compute src pointer: str + start
+        llvm::Value *src = builder.CreateGEP(i8_type, str, {start}, "substr.src");
+
+        // memcpy(buf, src, len)
+        builder.CreateMemCpy(buf, llvm::MaybeAlign(1), src, llvm::MaybeAlign(1), len);
+
+        // Null-terminate: buf[len] = 0
+        llvm::Value *term_ptr = builder.CreateGEP(i8_type, buf, {len}, "substr.term");
+        builder.CreateStore(llvm::ConstantInt::get(i8_type, 0), term_ptr);
+
+        return buf;
+    }
+
     // ========================================
     // Additional I/O Intrinsics
     // ========================================
@@ -3070,8 +3155,9 @@ namespace Cryo::Codegen
             llvm::AllocaInst *alloca = builder.CreateAlloca(array_type, nullptr, "snprintf.buf.arr");
             builder.CreateStore(buffer_arg, alloca);
             buffer_arg = builder.CreateInBoundsGEP(array_type, alloca,
-                {llvm::ConstantInt::get(int_type, 0),
-                 llvm::ConstantInt::get(int_type, 0)}, "snprintf.buf.ptr");
+                                                   {llvm::ConstantInt::get(int_type, 0),
+                                                    llvm::ConstantInt::get(int_type, 0)},
+                                                   "snprintf.buf.ptr");
         }
 
         // Prepare arguments
@@ -3676,8 +3762,9 @@ namespace Cryo::Codegen
             llvm::AllocaInst *alloca = builder.CreateAlloca(array_type, nullptr, "open.path.arr");
             builder.CreateStore(path_arg, alloca);
             path_arg = builder.CreateInBoundsGEP(array_type, alloca,
-                {llvm::ConstantInt::get(int_type, 0),
-                 llvm::ConstantInt::get(int_type, 0)}, "open.path.ptr");
+                                                 {llvm::ConstantInt::get(int_type, 0),
+                                                  llvm::ConstantInt::get(int_type, 0)},
+                                                 "open.path.ptr");
         }
 
         std::vector<llvm::Value *> call_args;
@@ -5130,14 +5217,12 @@ namespace Cryo::Codegen
             int_type, {int_type, void_ptr_type, int_type, int_type, void_ptr_type, int_type}, false);
 
         llvm::Function *sendto_func = get_or_create_libc_function("sendto", sendto_type);
-        return builder.CreateCall(sendto_func, {
-            ensure_type(args[0], int_type, "sendto.sockfd"),
-            args[1], // buf
-            ensure_type(args[2], int_type, "sendto.len"),
-            ensure_type(args[3], int_type, "sendto.flags"),
-            args[4], // dest_addr
-            ensure_type(args[5], int_type, "sendto.addrlen")
-        }, "sendto.result");
+        return builder.CreateCall(sendto_func, {ensure_type(args[0], int_type, "sendto.sockfd"),
+                                                args[1], // buf
+                                                ensure_type(args[2], int_type, "sendto.len"), ensure_type(args[3], int_type, "sendto.flags"),
+                                                args[4], // dest_addr
+                                                ensure_type(args[5], int_type, "sendto.addrlen")},
+                                  "sendto.result");
     }
 
     llvm::Value *Intrinsics::generate_recvfrom(const std::vector<llvm::Value *> &args)
@@ -5158,13 +5243,13 @@ namespace Cryo::Codegen
 
         llvm::Function *recvfrom_func = get_or_create_libc_function("recvfrom", recvfrom_type);
         return builder.CreateCall(recvfrom_func, {
-            ensure_type(args[0], int_type, "recvfrom.sockfd"),
-            args[1], // buf
-            ensure_type(args[2], int_type, "recvfrom.len"),
-            ensure_type(args[3], int_type, "recvfrom.flags"),
-            args[4], // src_addr
-            args[5]  // addrlen (pointer to socklen_t)
-        }, "recvfrom.result");
+                                                     ensure_type(args[0], int_type, "recvfrom.sockfd"),
+                                                     args[1], // buf
+                                                     ensure_type(args[2], int_type, "recvfrom.len"), ensure_type(args[3], int_type, "recvfrom.flags"),
+                                                     args[4], // src_addr
+                                                     args[5]  // addrlen (pointer to socklen_t)
+                                                 },
+                                  "recvfrom.result");
     }
 
     llvm::Value *Intrinsics::generate_shutdown(const std::vector<llvm::Value *> &args)
@@ -5182,10 +5267,7 @@ namespace Cryo::Codegen
         llvm::FunctionType *shutdown_type = llvm::FunctionType::get(int_type, {int_type, int_type}, false);
 
         llvm::Function *shutdown_func = get_or_create_libc_function("shutdown", shutdown_type);
-        return builder.CreateCall(shutdown_func, {
-            ensure_type(args[0], int_type, "shutdown.sockfd"),
-            ensure_type(args[1], int_type, "shutdown.how")
-        }, "shutdown.result");
+        return builder.CreateCall(shutdown_func, {ensure_type(args[0], int_type, "shutdown.sockfd"), ensure_type(args[1], int_type, "shutdown.how")}, "shutdown.result");
     }
 
     llvm::Value *Intrinsics::generate_getsockopt(const std::vector<llvm::Value *> &args)
@@ -5206,12 +5288,11 @@ namespace Cryo::Codegen
 
         llvm::Function *getsockopt_func = get_or_create_libc_function("getsockopt", getsockopt_type);
         return builder.CreateCall(getsockopt_func, {
-            ensure_type(args[0], int_type, "getsockopt.sockfd"),
-            ensure_type(args[1], int_type, "getsockopt.level"),
-            ensure_type(args[2], int_type, "getsockopt.optname"),
-            args[3], // optval
-            args[4]  // optlen
-        }, "getsockopt.result");
+                                                       ensure_type(args[0], int_type, "getsockopt.sockfd"), ensure_type(args[1], int_type, "getsockopt.level"), ensure_type(args[2], int_type, "getsockopt.optname"),
+                                                       args[3], // optval
+                                                       args[4]  // optlen
+                                                   },
+                                  "getsockopt.result");
     }
 
     llvm::Value *Intrinsics::generate_getsockname(const std::vector<llvm::Value *> &args)
@@ -5232,10 +5313,11 @@ namespace Cryo::Codegen
 
         llvm::Function *getsockname_func = get_or_create_libc_function("getsockname", getsockname_type);
         return builder.CreateCall(getsockname_func, {
-            ensure_type(args[0], int_type, "getsockname.sockfd"),
-            args[1], // addr
-            args[2]  // addrlen
-        }, "getsockname.result");
+                                                        ensure_type(args[0], int_type, "getsockname.sockfd"),
+                                                        args[1], // addr
+                                                        args[2]  // addrlen
+                                                    },
+                                  "getsockname.result");
     }
 
     llvm::Value *Intrinsics::generate_getpeername(const std::vector<llvm::Value *> &args)
@@ -5256,10 +5338,11 @@ namespace Cryo::Codegen
 
         llvm::Function *getpeername_func = get_or_create_libc_function("getpeername", getpeername_type);
         return builder.CreateCall(getpeername_func, {
-            ensure_type(args[0], int_type, "getpeername.sockfd"),
-            args[1], // addr
-            args[2]  // addrlen
-        }, "getpeername.result");
+                                                        ensure_type(args[0], int_type, "getpeername.sockfd"),
+                                                        args[1], // addr
+                                                        args[2]  // addrlen
+                                                    },
+                                  "getpeername.result");
     }
 
     llvm::Value *Intrinsics::generate_poll(const std::vector<llvm::Value *> &args)
@@ -5281,11 +5364,9 @@ namespace Cryo::Codegen
             int_type, {void_ptr_type, i64_type, int_type}, false);
 
         llvm::Function *poll_func = get_or_create_libc_function("poll", poll_type);
-        return builder.CreateCall(poll_func, {
-            args[0], // fds
-            ensure_type(args[1], i64_type, "poll.nfds"),
-            ensure_type(args[2], int_type, "poll.timeout")
-        }, "poll.result");
+        return builder.CreateCall(poll_func, {args[0], // fds
+                                              ensure_type(args[1], i64_type, "poll.nfds"), ensure_type(args[2], int_type, "poll.timeout")},
+                                  "poll.result");
     }
 
     llvm::Value *Intrinsics::generate_setsockopt(const std::vector<llvm::Value *> &args)
@@ -6658,8 +6739,7 @@ namespace Cryo::Codegen
         llvm::Function *send_func = get_or_create_libc_function("send", send_type);
         return builder.CreateCall(send_func, {ensure_type(args[0], int_type, "send.sockfd"),
                                               args[1], // buf
-                                              ensure_type(args[2], int_type, "send.len"),
-                                              ensure_type(args[3], int_type, "send.flags")},
+                                              ensure_type(args[2], int_type, "send.len"), ensure_type(args[3], int_type, "send.flags")},
                                   "send.result");
     }
 
@@ -6683,8 +6763,7 @@ namespace Cryo::Codegen
         llvm::Function *recv_func = get_or_create_libc_function("recv", recv_type);
         return builder.CreateCall(recv_func, {ensure_type(args[0], int_type, "recv.sockfd"),
                                               args[1], // buf
-                                              ensure_type(args[2], int_type, "recv.len"),
-                                              ensure_type(args[3], int_type, "recv.flags")},
+                                              ensure_type(args[2], int_type, "recv.len"), ensure_type(args[3], int_type, "recv.flags")},
                                   "recv.result");
     }
 
@@ -7620,6 +7699,141 @@ namespace Cryo::Codegen
         builder.CreateStore(next_ptr, va_list_ptr);
 
         return result;
+    }
+
+    // ========================================
+    // Environment Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_getenv(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("getenv requires exactly 1 argument (name)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *char_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        llvm::FunctionType *getenv_type = llvm::FunctionType::get(char_ptr_type, {char_ptr_type}, false);
+
+        llvm::Function *getenv_func = get_or_create_libc_function("getenv", getenv_type);
+        return builder.CreateCall(getenv_func, {args[0]}, "getenv.result");
+    }
+
+    llvm::Value *Intrinsics::generate_setenv(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("setenv requires exactly 3 arguments (name, value, overwrite)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *char_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+#if defined(_WIN32) || defined(_WIN64)
+        // Windows doesn't have setenv, use _putenv_s instead
+        // _putenv_s(name, value) returns errno_t (int), ignores overwrite
+        llvm::FunctionType *putenv_s_type = llvm::FunctionType::get(int_type, {char_ptr_type, char_ptr_type}, false);
+        llvm::Function *putenv_s_func = get_or_create_libc_function("_putenv_s", putenv_s_type);
+        return builder.CreateCall(putenv_s_func, {args[0], args[1]}, "setenv.result");
+#else
+        llvm::FunctionType *setenv_type = llvm::FunctionType::get(int_type, {char_ptr_type, char_ptr_type, int_type}, false);
+        llvm::Function *setenv_func = get_or_create_libc_function("setenv", setenv_type);
+        return builder.CreateCall(setenv_func, {args[0], args[1], ensure_type(args[2], int_type, "setenv.overwrite")}, "setenv.result");
+#endif
+    }
+
+    llvm::Value *Intrinsics::generate_unsetenv(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("unsetenv requires exactly 1 argument (name)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *char_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+#if defined(_WIN32) || defined(_WIN64)
+        // Windows: _putenv_s(name, "") to unset
+        llvm::FunctionType *putenv_s_type = llvm::FunctionType::get(int_type, {char_ptr_type, char_ptr_type}, false);
+        llvm::Function *putenv_s_func = get_or_create_libc_function("_putenv_s", putenv_s_type);
+        llvm::Value *empty_str = builder.CreateGlobalStringPtr("", "empty.str");
+        return builder.CreateCall(putenv_s_func, {args[0], empty_str}, "unsetenv.result");
+#else
+        llvm::FunctionType *unsetenv_type = llvm::FunctionType::get(int_type, {char_ptr_type}, false);
+        llvm::Function *unsetenv_func = get_or_create_libc_function("unsetenv", unsetenv_type);
+        return builder.CreateCall(unsetenv_func, {args[0]}, "unsetenv.result");
+#endif
+    }
+
+    llvm::Value *Intrinsics::generate_clearenv(const std::vector<llvm::Value *> &args)
+    {
+        if (!args.empty())
+        {
+            report_error("clearenv requires no arguments");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+#if defined(_WIN32) || defined(_WIN64)
+        // Windows doesn't have clearenv - return 0 (success) as a no-op
+        // A full implementation would require iterating GetEnvironmentStrings
+        return llvm::ConstantInt::get(int_type, 0);
+#else
+        llvm::FunctionType *clearenv_type = llvm::FunctionType::get(int_type, false);
+        llvm::Function *clearenv_func = get_or_create_libc_function("clearenv", clearenv_type);
+        return builder.CreateCall(clearenv_func, {}, "clearenv.result");
+#endif
+    }
+
+    llvm::Value *Intrinsics::generate_environ(const std::vector<llvm::Value *> &args)
+    {
+        if (!args.empty())
+        {
+            report_error("environ requires no arguments");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        auto *module = _context_manager.get_module();
+
+        // environ is a global variable (char**), not a function
+        // On both Windows (_environ) and POSIX (environ), it's an extern char**
+        llvm::Type *char_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        llvm::Type *char_ptr_ptr_type = llvm::PointerType::get(char_ptr_type, 0);
+
+#if defined(_WIN32) || defined(_WIN64)
+        const char *environ_name = "_environ";
+#else
+        const char *environ_name = "environ";
+#endif
+
+        // Get or create the extern global variable
+        llvm::GlobalVariable *environ_var = module->getGlobalVariable(environ_name);
+        if (!environ_var)
+        {
+            environ_var = new llvm::GlobalVariable(
+                *module, char_ptr_ptr_type, false,
+                llvm::GlobalValue::ExternalLinkage, nullptr, environ_name);
+        }
+
+        return builder.CreateLoad(char_ptr_ptr_type, environ_var, "environ.result");
     }
 
 } // namespace Cryo::Codegen

@@ -942,10 +942,10 @@ namespace Cryo
                 if (_current + 1 < _buffer_end && *(_current + 1) == '.')
                 {
                     advance();
-                    advance(); // consume ".."
+                    advance();                     // consume ".."
                     return TokenKind::TK_ELLIPSIS; // "..."
                 }
-                advance(); // consume second '.'
+                advance();                   // consume second '.'
                 return TokenKind::TK_DOTDOT; // ".."
             }
             return TokenKind::TK_PERIOD;

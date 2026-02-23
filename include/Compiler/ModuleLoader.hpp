@@ -54,6 +54,9 @@ namespace Cryo
         // Storage for imported ASTs to keep them alive for template registration
         std::unordered_map<std::string, std::unique_ptr<ProgramNode>> _imported_asts;
 
+        // Track ALL local import module names (including transitive imports)
+        std::unordered_set<std::string> _all_local_import_names;
+
         // Callback for triggering auto-imports on dependencies
         std::function<void(SymbolTable *, const std::string &, const std::string &)> _auto_import_callback;
 
@@ -167,6 +170,12 @@ namespace Cryo
          * @return Map of module names to their parsed AST nodes
          */
         const std::unordered_map<std::string, std::unique_ptr<ProgramNode>> &get_imported_asts() const;
+
+        /**
+         * @brief Get all local import module names discovered during import resolution
+         * @return Set of module names that were resolved as local project imports (includes transitive)
+         */
+        const std::unordered_set<std::string> &get_all_local_import_names() const { return _all_local_import_names; }
 
     private:
         /**

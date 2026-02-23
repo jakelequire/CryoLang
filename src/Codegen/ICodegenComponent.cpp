@@ -157,7 +157,7 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "resolve_method_by_name: Trying '{}'", qualified_method);
 
-            // Try LLVM module
+            // Try LLVM module - exact match first
             if (llvm::Function *fn = module()->getFunction(qualified_method))
             {
                 if (!fn->isDeclaration())
@@ -170,6 +170,29 @@ namespace Cryo::Codegen
                 // Remember declaration as fallback but keep looking for a definition
                 if (!declaration_fallback)
                     declaration_fallback = fn;
+            }
+
+            // Try LLVM module - with param signature suffix (e.g., "Type::method(i32)")
+            // Definitions may include parameter types in the name for overload disambiguation
+            {
+                std::string prefix = qualified_method + "(";
+                for (auto &fn : module()->functions())
+                {
+                    std::string fn_name = fn.getName().str();
+                    if (fn_name.size() > qualified_method.size() &&
+                        fn_name.substr(0, prefix.size()) == prefix)
+                    {
+                        if (!fn.isDeclaration())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_method_by_name: Found definition '{}.{}' with param suffix as '{}'",
+                                      type_name, method_name, fn_name);
+                            return &fn;
+                        }
+                        if (!declaration_fallback)
+                            declaration_fallback = &fn;
+                    }
+                }
             }
 
             // Try context's function registry
@@ -289,6 +312,17 @@ namespace Cryo::Codegen
             // Do NOT create extern declarations with guessed return types
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "resolve_method_by_name: Primitive method '{}' not found", simple_method);
+        }
+
+        // If SRM lookup found a namespace-correct declaration (but no definition yet),
+        // prefer it over the pattern-match fallback which may find a wrong-namespace declaration
+        // created during type lowering (e.g., "Main::Lexer::error_token" vs correct "Compiler::Lex::Lexer::error_token").
+        if (declaration_fallback)
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_method_by_name: Returning SRM declaration fallback for '{}.{}' as '{}'",
+                      type_name, method_name, declaration_fallback->getName().str());
+            return declaration_fallback;
         }
 
         // Pattern-based method lookup: scan module for functions matching *::MangledType::method
@@ -1049,14 +1083,74 @@ namespace Cryo::Codegen
                 // Only add 'this' parameter for non-static methods
                 if (!is_static_method)
                 {
-                    param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "resolve_method_by_name: Added 'this' parameter for instance method '{}'", full_method_name);
+                    // Check if the type is a simple enum - if so, pass 'this' by value as i32
+                    // (matching how impl block methods are actually generated)
+                    bool use_value_this = false;
+                    TypeRef enum_type_ref = symbols().lookup_enum_type(base_type);
+                    if (enum_type_ref.is_valid() && enum_type_ref->kind() == Cryo::TypeKind::Enum)
+                    {
+                        auto *enum_type = static_cast<const Cryo::EnumType *>(enum_type_ref.get());
+                        if (enum_type->is_simple_enum())
+                            use_value_this = true;
+                    }
+
+                    if (use_value_this)
+                    {
+                        param_types.push_back(llvm::Type::getInt32Ty(llvm_ctx()));
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_method_by_name: Added 'this' as i32 value for simple enum instance method '{}'", full_method_name);
+                    }
+                    else
+                    {
+                        param_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_method_by_name: Added 'this' as ptr for instance method '{}'", full_method_name);
+                    }
                 }
                 else
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "resolve_method_by_name: Skipping 'this' parameter for static method '{}'", full_method_name);
+                }
+
+                // Add explicit parameter types from the impl block AST.
+                // The 'this' parameter was handled above; now we need the remaining
+                // explicit parameters (e.g., 'threshold: LogLevel' in meets_threshold(&this, threshold: LogLevel)).
+                // Without this, the extern declaration would only have 'this' and miss all explicit args.
+                if (template_registry)
+                {
+                    // Try enum impl block first (most common case for this path)
+                    Cryo::ImplementationBlockNode *impl_block = template_registry->get_enum_impl_block(base_type);
+                    if (!impl_block)
+                        impl_block = template_registry->get_enum_impl_block(simple_type_name);
+                    if (impl_block)
+                    {
+                        for (const auto &method_impl : impl_block->method_implementations())
+                        {
+                            if (method_impl->name() == method_name)
+                            {
+                                // Iterate the AST parameters, skipping 'this'
+                                for (const auto &param : method_impl->parameters())
+                                {
+                                    if (param->name() == "this")
+                                        continue;
+                                    TypeRef param_type = param->get_resolved_type();
+                                    if (param_type.is_valid())
+                                    {
+                                        llvm::Type *pt = types().map(param_type);
+                                        if (pt)
+                                        {
+                                            param_types.push_back(pt);
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "resolve_method_by_name: Added explicit param '{}' type for '{}'",
+                                                      param->name(), full_method_name);
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 // Try to get return type from method registry (populated from impl blocks)

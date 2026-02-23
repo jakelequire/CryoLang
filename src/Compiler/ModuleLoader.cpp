@@ -232,6 +232,8 @@ namespace Cryo
                 if (result.success)
                 {
                     result.is_local_import = _last_resolve_was_local;
+                    if (result.is_local_import && !result.module_name.empty())
+                        _all_local_import_names.insert(result.module_name);
                     result = filter_specific_imports(std::move(result), {symbol_name});
                     result.resolved_as_specific = true;
                 }
@@ -266,6 +268,10 @@ namespace Cryo
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Using cached module");
             LOG_DEBUG(LogComponent::GENERAL, "=== IMPORT_CACHE: Module '{}' already cached, skipping registration ===", resolved_path);
 
+            // Track cached local imports for transitive dependency IR generation
+            if (cached->second.is_local_import && cached->second.success && !cached->second.module_name.empty())
+                _all_local_import_names.insert(cached->second.module_name);
+
             // Create a copy of the cached result to return
             ImportResult cached_result;
             cached_result.success = cached->second.success;
@@ -274,6 +280,7 @@ namespace Cryo
             cached_result.namespace_alias = cached->second.namespace_alias;
             cached_result.symbol_map = cached->second.symbol_map;
             cached_result.exported_symbols = cached->second.exported_symbols;
+            cached_result.is_local_import = cached->second.is_local_import;
 
             // Apply filtering for specific imports if needed
             if (import_node.is_specific_import() && cached_result.success)
@@ -294,9 +301,24 @@ namespace Cryo
         // Check for circular dependency
         if (has_circular_dependency(resolved_path))
         {
+            auto get_import_stack = [this]()
+            {
+                std::string stack = "\n";
+                size_t count = 0;
+                for (const auto &mod : _loading_modules)
+                {
+                    if (count >= 0)
+                        stack += "[" + std::to_string(count) + "] -> ";
+                    stack += mod;
+                    stack += "\n";
+                    ++count;
+                }
+                return stack.empty() ? "(empty)" : stack;
+            };
             ImportResult result;
             result.success = false;
-            result.error_message = "Circular import dependency detected for: " + import_path;
+            std::string err_msg = "Circular import detected: " + resolved_path + " is already being loaded" + " (import stack: " + get_import_stack() + ")";
+            result.error_message = err_msg;
             if (_diagnostics)
             {
                 _diagnostics->emit(Diag::error(ErrorCode::E0501_CIRCULAR_IMPORT, result.error_message));
@@ -311,6 +333,8 @@ namespace Cryo
 
         // Mark whether this is a local project import (not from stdlib)
         result.is_local_import = _last_resolve_was_local;
+        if (result.is_local_import && result.success && !result.module_name.empty())
+            _all_local_import_names.insert(result.module_name);
 
         // Handle specific imports - distinguish between namespace aliases and symbol imports
         if (import_node.is_specific_import() && result.success)
@@ -625,17 +649,63 @@ namespace Cryo
             // Note: Template registry has raw pointers to nodes in this AST
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Storing AST to keep template nodes alive");
 
-            // Check if we're about to overwrite an existing AST - this would cause dangling pointers!
-            auto existing_ast_it = _imported_asts.find(result.module_name);
+            // Handle namespace collision between a parent _module.cryo and its submodule files.
+            // When _module.cryo declares "namespace Compiler::Lex;" and "public module Lexer;",
+            // the submodule lexer.cryo (also "namespace Compiler::Lex;") gets loaded first during
+            // extract_exported_symbols. Both would map to the same AST key "Compiler::Lex".
+            //
+            // The submodule's AST was stored first (no collision at that time). Now the parent
+            // _module.cryo is trying to store under the same key. The parent should keep the
+            // namespace key since it defines the core types (e.g., TokenType, Token, SourceLocation)
+            // that the submodule depends on. Move the existing submodule AST to a disambiguated key.
+            std::string ast_key = result.module_name;
+            auto existing_ast_it = _imported_asts.find(ast_key);
             if (existing_ast_it != _imported_asts.end())
             {
-                LOG_ERROR(LogComponent::GENERAL, "ModuleLoader: WARNING - About to overwrite existing AST for module '{}'. "
-                                                 "This could cause dangling ast_node pointers in GenericRegistry!",
-                          result.module_name);
+                // The existing AST is from a submodule that was loaded during extract_exported_symbols.
+                // Derive a disambiguated key from the source file path of the existing AST.
+                std::string submodule_key;
+                auto *existing_program = existing_ast_it->second.get();
+                if (existing_program && !existing_program->statements().empty())
+                {
+                    // Try to find a unique type name from the submodule AST to build a key.
+                    // Look for struct/class declarations to identify it.
+                    for (const auto &stmt : existing_program->statements())
+                    {
+                        if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(stmt.get()))
+                        {
+                            submodule_key = ast_key + "::" + struct_decl->name();
+                            break;
+                        }
+                        else if (auto *class_decl = dynamic_cast<ClassDeclarationNode *>(stmt.get()))
+                        {
+                            submodule_key = ast_key + "::" + class_decl->name();
+                            break;
+                        }
+                    }
+                }
+
+                if (submodule_key.empty())
+                {
+                    // Fallback: use a counter-based suffix
+                    submodule_key = ast_key + "::_submodule_" + std::to_string(_imported_asts.size());
+                }
+
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "ModuleLoader: Namespace collision for '{}'. Moving existing submodule AST to '{}', "
+                          "parent _module.cryo keeps '{}'",
+                          ast_key, submodule_key, ast_key);
+
+                // Move the existing submodule AST to the disambiguated key
+                _imported_asts[submodule_key] = std::move(existing_ast_it->second);
+                _imported_asts.erase(existing_ast_it);
+
+                // Track the submodule under its new key for IR generation
+                _all_local_import_names.insert(submodule_key);
             }
 
-            _imported_asts[result.module_name] = std::move(ast); // Move is necessary to transfer ownership
-            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Stored AST successfully. Map now has {} entries", _imported_asts.size());
+            _imported_asts[ast_key] = std::move(ast); // Move is necessary to transfer ownership
+            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Stored AST under key '{}'. Map now has {} entries", ast_key, _imported_asts.size());
 
             // CRITICAL: Restore the saved module context after import processing.
             // This ensures the importing module's compilation continues with its own module ID,
@@ -780,6 +850,35 @@ namespace Cryo
                     Symbol symbol(var_decl->name(), SymbolKind::Variable, TypeRef{}, module_id, var_decl->location());
                     symbol.scope = module_name;
                     symbol_map[var_decl->name()] = symbol;
+
+                    // Register module-level constants in TemplateRegistry for cross-module
+                    // generic instantiation. Constants with simple integer literal initializers
+                    // are registered so that generic methods can reference them when instantiated
+                    // in other modules (before the defining module's IR is generated).
+                    if (!var_decl->is_mutable() && var_decl->initializer())
+                    {
+                        auto *literal = dynamic_cast<LiteralNode *>(var_decl->initializer());
+                        if (literal && (literal->literal_kind() == TokenKind::TK_NUMERIC_CONSTANT ||
+                                        literal->literal_kind() == TokenKind::TK_BOOLEAN_LITERAL))
+                        {
+                            std::string type_ann;
+                            if (var_decl->type_annotation())
+                                type_ann = var_decl->type_annotation()->to_string();
+
+                            uint64_t int_value = 0;
+                            if (literal->literal_kind() == TokenKind::TK_BOOLEAN_LITERAL)
+                                int_value = (literal->value() == "true") ? 1 : 0;
+                            else
+                                int_value = std::stoull(literal->value());
+
+                            _template_registry.register_module_constant(
+                                module_name, var_decl->name(), type_ann, int_value);
+
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                      "ModuleLoader: Registered constant '{}::{}' = {} (type: {}) in TemplateRegistry",
+                                      module_name, var_decl->name(), int_value, type_ann);
+                        }
+                    }
                 }
                 else if (auto struct_decl = dynamic_cast<StructDeclarationNode *>(decl))
                 {
@@ -2220,6 +2319,19 @@ namespace Cryo
                                       type_name, base_type_name, impl_block->method_implementations().size());
                         }
                     }
+                    // Also register non-generic enum impl blocks so resolve_method_by_name
+                    // can look up parameter types when creating forward declarations
+                    else
+                    {
+                        TypeRef enum_type = _symbol_table.lookup_enum_type(base_type_name);
+                        if (enum_type.is_valid() && enum_type->kind() == TypeKind::Enum)
+                        {
+                            _template_registry.register_enum_impl_block(base_type_name, impl_block, module_name);
+                            LOG_DEBUG(LogComponent::GENERAL,
+                                      "ModuleLoader: Registered non-generic enum impl block for '{}' with {} methods",
+                                      base_type_name, impl_block->method_implementations().size());
+                        }
+                    }
 
                     for (const auto &method : impl_block->method_implementations())
                     {
@@ -2688,7 +2800,18 @@ namespace Cryo
             res_ctx.imports = module_info->imports;
         }
 
-        const std::string error_prefix = "unresolved generic: ";
+        // Check for both "unresolved generic: ..." and "unresolved type: ..." errors.
+        // The parser creates "unresolved generic" for generic type annotations (e.g., Result<T,E>)
+        // and "unresolved type" for simple imported types (e.g., File from Utils::File).
+        // Both need resolution since imported modules skip the TypeResolutionPass.
+        auto is_resolvable_error = [](const ErrorType *err) -> bool
+        {
+            if (!err)
+                return false;
+            const std::string &reason = err->reason();
+            return reason.find("unresolved generic: ") != std::string::npos ||
+                   reason.find("unresolved type: ") != std::string::npos;
+        };
 
         for (auto &stmt : ast.statements())
         {
@@ -2703,9 +2826,16 @@ namespace Cryo
                     if (ret_type.is_error() && ann)
                     {
                         const ErrorType *err = static_cast<const ErrorType *>(ret_type.get());
-                        if (err && err->reason().find(error_prefix) != std::string::npos)
+                        if (is_resolvable_error(err))
                         {
                             TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                            if (!resolved.is_valid() || resolved.is_error())
+                            {
+                                std::string type_str = ann->to_string();
+                                Symbol *type_sym = _symbol_table.lookup_symbol(type_str);
+                                if (type_sym && type_sym->type.is_valid() && !type_sym->type.is_error())
+                                    resolved = type_sym->type;
+                            }
                             if (resolved.is_valid() && !resolved.is_error())
                             {
                                 method->set_resolved_return_type(resolved);
@@ -2716,7 +2846,7 @@ namespace Cryo
                         }
                     }
 
-                    // Also resolve parameter types that are unresolved generics
+                    // Also resolve parameter types that are unresolved
                     for (auto &param : method->parameters())
                     {
                         if (!param->has_resolved_type())
@@ -2726,9 +2856,21 @@ namespace Cryo
                         if (param_type.is_error() && param_ann)
                         {
                             const ErrorType *err = static_cast<const ErrorType *>(param_type.get());
-                            if (err && err->reason().find(error_prefix) != std::string::npos)
+                            if (is_resolvable_error(err))
                             {
+                                // First try the TypeResolver
                                 TypeRef resolved = resolver.resolve(*param_ann, res_ctx);
+                                // If TypeResolver fails (e.g., no imports in context), fall back
+                                // to symbol table lookup — imported types are registered there.
+                                if (!resolved.is_valid() || resolved.is_error())
+                                {
+                                    std::string type_str = param_ann->to_string();
+                                    Symbol *type_sym = _symbol_table.lookup_symbol(type_str);
+                                    if (type_sym && type_sym->type.is_valid() && !type_sym->type.is_error())
+                                    {
+                                        resolved = type_sym->type;
+                                    }
+                                }
                                 if (resolved.is_valid() && !resolved.is_error())
                                 {
                                     param->set_resolved_type(resolved);
@@ -2754,15 +2896,55 @@ namespace Cryo
                     if (ret_type.is_error() && ann)
                     {
                         const ErrorType *err = static_cast<const ErrorType *>(ret_type.get());
-                        if (err && err->reason().find(error_prefix) != std::string::npos)
+                        if (is_resolvable_error(err))
                         {
                             TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                            if (!resolved.is_valid() || resolved.is_error())
+                            {
+                                std::string type_str = ann->to_string();
+                                Symbol *type_sym = _symbol_table.lookup_symbol(type_str);
+                                if (type_sym && type_sym->type.is_valid() && !type_sym->type.is_error())
+                                    resolved = type_sym->type;
+                            }
                             if (resolved.is_valid() && !resolved.is_error())
                             {
                                 method->set_resolved_return_type(resolved);
                                 LOG_DEBUG(LogComponent::GENERAL,
                                           "ModuleLoader: Resolved method '{}::{}' return type to '{}'",
                                           class_decl->name(), method->name(), resolved->display_name());
+                            }
+                        }
+                    }
+
+                    // Also resolve parameter types that are unresolved
+                    for (auto &param : method->parameters())
+                    {
+                        if (!param->has_resolved_type())
+                            continue;
+                        TypeRef param_type = param->get_resolved_type();
+                        auto *param_ann = param->type_annotation();
+                        if (param_type.is_error() && param_ann)
+                        {
+                            const ErrorType *err = static_cast<const ErrorType *>(param_type.get());
+                            if (is_resolvable_error(err))
+                            {
+                                TypeRef resolved = resolver.resolve(*param_ann, res_ctx);
+                                if (!resolved.is_valid() || resolved.is_error())
+                                {
+                                    std::string type_str = param_ann->to_string();
+                                    Symbol *type_sym = _symbol_table.lookup_symbol(type_str);
+                                    if (type_sym && type_sym->type.is_valid() && !type_sym->type.is_error())
+                                    {
+                                        resolved = type_sym->type;
+                                    }
+                                }
+                                if (resolved.is_valid() && !resolved.is_error())
+                                {
+                                    param->set_resolved_type(resolved);
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                              "ModuleLoader: Resolved param '{}::{}::{}' type to '{}'",
+                                              class_decl->name(), method->name(), param->name(), resolved->display_name());
+                                }
                             }
                         }
                     }

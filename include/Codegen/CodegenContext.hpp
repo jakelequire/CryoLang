@@ -209,6 +209,15 @@ namespace Cryo::Codegen
         /** @brief Get monomorphizer (may be null) */
         Cryo::Monomorphizer *monomorphizer() { return _monomorphizer; }
 
+        /** @brief Set generic registry for generic type resolution during codegen */
+        void set_generic_registry(Cryo::GenericRegistry *registry)
+        {
+            if (_type_mapper)
+            {
+                _type_mapper->set_generic_registry(registry);
+            }
+        }
+
         //===================================================================
         // Symbol Resolution
         //===================================================================

@@ -60,6 +60,7 @@ namespace Cryo::Codegen
         llvm::Value *generate_strrchr(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_strstr(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_strdup(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_substr(const std::vector<llvm::Value *> &args);
 
         // I/O intrinsics
         llvm::Value *generate_printf(const std::vector<llvm::Value *> &args);
@@ -137,6 +138,13 @@ namespace Cryo::Codegen
 
         // Error handling intrinsics
         llvm::Value *generate_errno(const std::vector<llvm::Value *> &args);
+
+        // Environment intrinsics
+        llvm::Value *generate_getenv(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_setenv(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_unsetenv(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_clearenv(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_environ(const std::vector<llvm::Value *> &args);
 
         // Math intrinsics
         llvm::Value *generate_sqrt(const std::vector<llvm::Value *> &args);
@@ -395,6 +403,7 @@ namespace Cryo::Codegen
         llvm::Value *generate_fputc(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_sscanf(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_panic(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_todo(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_float32_to_string(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_float64_to_string(const std::vector<llvm::Value *> &args);
 
