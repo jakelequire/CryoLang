@@ -37,12 +37,12 @@ namespace Cryo::Codegen
         "ptr_add", "ptr_sub", "ptr_diff",
         // String operations
         "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat",
-        "strchr", "strrchr", "strstr", "strdup",
+        "strchr", "strrchr", "strstr", "strdup", "substr",
         // I/O operations
         "printf", "snprintf", "sprintf", "fprintf", "sscanf", "getchar", "putchar", "puts",
         // File I/O
         "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush", "feof", "ferror",
-        "fgets", "fputs", "fgetc", "fputc",
+        "fgets", "fputs", "fgetc", "fputc", "fileno",
         // Low-level file descriptor I/O
         "read", "write", "open", "close", "lseek", "dup", "dup2", "pipe", "fcntl",
         // Filesystem operations
@@ -116,8 +116,10 @@ namespace Cryo::Codegen
         // Syscalls
         "syscall_write", "syscall_read", "syscall_exit",
         "syscall_open", "syscall_close", "syscall_lseek",
+        // Environment
+        "getenv", "setenv", "unsetenv", "clearenv", "environ",
         // Misc
-        "panic", "float32_to_string", "float64_to_string", "sizeof"};
+        "panic", "todo", "float32_to_string", "float64_to_string", "sizeof"};
 
     //===================================================================
     // Forward Declarations
@@ -509,6 +511,107 @@ namespace Cryo::Codegen
                                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                                           "FreeFunction: Inferred generic param '{}' = '{}' from return type",
                                                           pn, type_args[i]->display_name());
+                                            }
+                                        }
+                                    }
+                                }
+                                // Fallback: if the enclosing return type is an error (unresolved generic from imported modules),
+                                // parse the concrete type args from the enclosing function's return type annotation string.
+                                // e.g., annotation "Result<boolean, string>" + generic func returning "Result<T, E>"
+                                // → infer T=boolean, E=string
+                                else if (enclosing_return.is_valid() && enclosing_return.is_error() && ret_ann)
+                                {
+                                    auto *enclosing_ret_ann = fn_ctx->ast_node->return_type_annotation();
+                                    if (enclosing_ret_ann)
+                                    {
+                                        // Parse concrete type args from the enclosing function's annotation
+                                        std::string enc_ann_str = enclosing_ret_ann->to_string();
+                                        size_t enc_open = enc_ann_str.find('<');
+                                        size_t enc_close = enc_ann_str.rfind('>');
+
+                                        // Parse the generic function's return annotation params
+                                        std::string gen_ret_str = ret_ann->to_string();
+                                        size_t gen_open = gen_ret_str.find('<');
+                                        size_t gen_close = gen_ret_str.rfind('>');
+
+                                        if (enc_open != std::string::npos && enc_close != std::string::npos &&
+                                            gen_open != std::string::npos && gen_close != std::string::npos)
+                                        {
+                                            // Parse concrete args from enclosing: "boolean, string"
+                                            std::string enc_args = enc_ann_str.substr(enc_open + 1, enc_close - enc_open - 1);
+                                            std::vector<std::string> concrete_args;
+                                            {
+                                                size_t s = 0;
+                                                int depth = 0;
+                                                for (size_t ci = 0; ci <= enc_args.size(); ci++)
+                                                {
+                                                    if (ci == enc_args.size() || (enc_args[ci] == ',' && depth == 0))
+                                                    {
+                                                        std::string a = enc_args.substr(s, ci - s);
+                                                        size_t f = a.find_first_not_of(" \t");
+                                                        size_t l = a.find_last_not_of(" \t");
+                                                        if (f != std::string::npos)
+                                                            concrete_args.push_back(a.substr(f, l - f + 1));
+                                                        s = ci + 1;
+                                                    }
+                                                    else if (enc_args[ci] == '<') depth++;
+                                                    else if (enc_args[ci] == '>') depth--;
+                                                }
+                                            }
+
+                                            // Parse generic params from the callee: "T, E"
+                                            std::string gen_args = gen_ret_str.substr(gen_open + 1, gen_close - gen_open - 1);
+                                            std::vector<std::string> generic_ret_params;
+                                            {
+                                                size_t s = 0;
+                                                for (size_t ci = 0; ci <= gen_args.size(); ci++)
+                                                {
+                                                    if (ci == gen_args.size() || gen_args[ci] == ',')
+                                                    {
+                                                        std::string a = gen_args.substr(s, ci - s);
+                                                        size_t f = a.find_first_not_of(" \t");
+                                                        size_t l = a.find_last_not_of(" \t");
+                                                        if (f != std::string::npos)
+                                                            generic_ret_params.push_back(a.substr(f, l - f + 1));
+                                                        s = ci + 1;
+                                                    }
+                                                }
+                                            }
+
+                                            // Match: if generic param name matches a param_name, infer it
+                                            for (size_t i = 0; i < generic_ret_params.size() && i < concrete_args.size(); i++)
+                                            {
+                                                for (const auto &pn : param_names)
+                                                {
+                                                    if (generic_ret_params[i] == pn && inferred.find(pn) == inferred.end())
+                                                    {
+                                                        // Resolve the concrete type name to a TypeRef
+                                                        TypeRef resolved = symbols().arena().lookup_type_by_name(concrete_args[i]);
+                                                        if (!resolved.is_valid())
+                                                        {
+                                                            // Try common type aliases
+                                                            if (concrete_args[i] == "boolean" || concrete_args[i] == "bool")
+                                                                resolved = symbols().arena().get_bool();
+                                                            else if (concrete_args[i] == "i32" || concrete_args[i] == "int")
+                                                                resolved = symbols().arena().get_i32();
+                                                            else if (concrete_args[i] == "i64")
+                                                                resolved = symbols().arena().get_i64();
+                                                            else if (concrete_args[i] == "string")
+                                                                resolved = symbols().arena().get_string();
+                                                            else if (concrete_args[i] == "u32")
+                                                                resolved = symbols().arena().get_u32();
+                                                            else if (concrete_args[i] == "u64")
+                                                                resolved = symbols().arena().get_u64();
+                                                        }
+                                                        if (resolved.is_valid())
+                                                        {
+                                                            inferred[pn] = resolved;
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                                      "FreeFunction: Inferred generic param '{}' = '{}' from enclosing annotation",
+                                                                      pn, resolved->display_name());
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1358,10 +1461,9 @@ namespace Cryo::Codegen
                 return CallKind::StaticMethod;
             }
 
-            // For ::default() and ::new(), treat as StaticMethod even for type aliases
-            // to non-struct types (e.g., PThreadCond = void[48])
-            // The symbol table knows about all imported types including aliases
-            if (member_name == "default" || member_name == "new")
+            // Check if the scope name is a known type in the symbol table or type arena.
+            // This handles imported types whose LLVM struct may not exist yet at classify time
+            // (e.g., File::exists where File is imported from another module).
             {
                 Symbol *sym = symbols().lookup_symbol(scope_name);
                 if (sym && sym->kind == SymbolKind::Type)
@@ -1370,6 +1472,21 @@ namespace Cryo::Codegen
                               "classify_call: '{}::{}' - scope is a known type (kind={}), treating as StaticMethod",
                               scope_name, member_name,
                               sym->type.is_valid() ? static_cast<int>(sym->type->kind()) : -1);
+                    return CallKind::StaticMethod;
+                }
+
+                TypeRef type_ref = ctx().symbols().arena().lookup_type_by_name(scope_name);
+                if (type_ref.is_valid())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "classify_call: '{}' found in type arena, treating as StaticMethod", scope_name);
+                    return CallKind::StaticMethod;
+                }
+
+                if (ctx().is_type_alias(scope_name))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "classify_call: '{}' is a type alias, treating as StaticMethod", scope_name);
                     return CallKind::StaticMethod;
                 }
             }
@@ -2484,6 +2601,21 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating memcpy intrinsic");
             Intrinsics intrinsic_gen(ctx().llvm_manager(), ctx().diagnostics());
             return intrinsic_gen.generate_intrinsic_call(node, "memcpy", args);
+        }
+
+        if (intrinsic_name == "todo")
+        {
+            // User writes: todo("message")
+            // Compiler injects file and line: todo(msg, file, line)
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating todo intrinsic with injected file/line");
+            std::string file = node->source_file();
+            size_t line = node->location().line();
+            llvm::Value *file_val = builder().CreateGlobalStringPtr(file, "todo.file", 0, module());
+            llvm::Value *line_val = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), line);
+            args.push_back(file_val);
+            args.push_back(line_val);
+            Intrinsics intrinsic_gen(ctx().llvm_manager(), ctx().diagnostics());
+            return intrinsic_gen.generate_intrinsic_call(node, "todo", args);
         }
 
         // Delegate to the comprehensive Intrinsics class
@@ -3966,6 +4098,7 @@ namespace Cryo::Codegen
             llvm::Function *instantiated = try_instantiate_generic_method(node, type_name, method_name);
             if (instantiated)
                 method = instantiated;
+
         }
 
         if (!method)
@@ -4470,9 +4603,12 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    // Construct the qualified name the same way function definitions do:
-                    // Use the current namespace context from codegen (not from symbol table)
-                    // This ensures forward declarations match the actual function definitions.
+                    // Construct the qualified name to match the actual function definition.
+                    // The symbol's scope field contains the original module namespace where
+                    // the function was defined (e.g., "Utils", "Baz::Qix", "App::Core::Math").
+                    // We must use that scope, NOT the current file's namespace context,
+                    // to produce LLVM names that match the function definitions.
+                    std::string symbol_scope = found_symbol->scope;
                     std::string ns_context = ctx().namespace_context();
                     std::string simple_name = found_symbol->name;
 
@@ -4488,9 +4624,14 @@ namespace Cryo::Codegen
                     {
                         llvm_name = simple_name;
                     }
+                    else if (!symbol_scope.empty() && symbol_scope != "Global" && symbol_scope != ns_context)
+                    {
+                        // Cross-module function: use the symbol's original scope (the defining module's namespace)
+                        llvm_name = symbol_scope + "::" + simple_name;
+                    }
                     else if (!ns_context.empty())
                     {
-                        // Use the namespace context to qualify the name
+                        // Same-module function: use current namespace context
                         llvm_name = ns_context + "::" + simple_name;
                     }
                     else if (found_candidate.find("::") != std::string::npos)

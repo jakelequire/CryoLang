@@ -18,6 +18,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <queue>
 #include <unordered_set>
 
 namespace Cryo
@@ -473,6 +474,13 @@ namespace Cryo
             {
                 _codegen->get_visitor()->context().set_monomorphizer(_monomorphization_pass.get());
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Set Monomorphizer in CodegenContext for specialized AST access");
+            }
+
+            // Set GenericRegistry for generic type resolution during codegen
+            if (_codegen->ensure_visitor_initialized() && _generic_registry)
+            {
+                _codegen->get_visitor()->context().set_generic_registry(_generic_registry.get());
+                LOG_DEBUG(Cryo::LogComponent::GENERAL, "Set GenericRegistry in CodegenContext for generic type resolution");
             }
 
             if (_debug_mode)
@@ -1709,8 +1717,11 @@ namespace Cryo
 
                         for (const auto &[symbol_name, symbol] : result.symbol_map)
                         {
-                            // Register each symbol directly in the current scope
-                            _symbol_table->declare_symbol(symbol_name, symbol.kind, symbol.location, symbol.type, scope_name);
+                            // Use the symbol's original scope (the defining module's namespace, e.g., "Baz::Qix")
+                            // instead of the importing file's scope ("Global") so that LLVM name generation
+                            // produces correct qualified names like "Baz::Qix::Buz::new".
+                            std::string sym_scope = symbol.scope.empty() ? scope_name : symbol.scope;
+                            _symbol_table->declare_symbol(symbol_name, symbol.kind, symbol.location, symbol.type, sym_scope);
                             LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered specific symbol: {}", symbol_name);
                         }
 
@@ -1763,7 +1774,11 @@ namespace Cryo
 
                     for (const auto &[symbol_name, symbol] : result.symbol_map)
                     {
-                        _symbol_table->declare_symbol(symbol_name, symbol.kind, symbol.location, symbol.type, scope_name);
+                        // Use the symbol's original scope (the defining module's namespace, e.g., "Baz::Qix")
+                        // instead of the importing file's scope ("Global") so that LLVM name generation
+                        // produces correct qualified names like "Baz::Qix::Buz::new".
+                        std::string sym_scope = symbol.scope.empty() ? scope_name : symbol.scope;
+                        _symbol_table->declare_symbol(symbol_name, symbol.kind, symbol.location, symbol.type, sym_scope);
                         LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered resolved-as-specific symbol: {}", symbol_name);
                     }
                 }
@@ -1804,7 +1819,11 @@ namespace Cryo
                         for (const auto &[symbol_name, symbol] : result.symbol_map)
                         {
                             // Register each symbol directly in the current scope for unqualified access
-                            _symbol_table->declare_symbol(symbol_name, symbol.kind, symbol.location, symbol.type, scope_name);
+                            // Use the symbol's original scope (the defining module) rather than the
+                            // importing file's scope ("Global"), so pre_register_functions generates
+                            // correct LLVM names (e.g., "Handler::new" instead of "Global::Handler::new").
+                            std::string sym_scope = symbol.scope.empty() ? scope_name : symbol.scope;
+                            _symbol_table->declare_symbol(symbol_name, symbol.kind, symbol.location, symbol.type, sym_scope);
                             LOG_TRACE(Cryo::LogComponent::GENERAL, "Registered wildcard symbol for unqualified access: {}", symbol_name);
                         }
 
@@ -1893,6 +1912,19 @@ namespace Cryo
                     LOG_DEBUG(Cryo::LogComponent::GENERAL,
                               "Pass 1: Registered enum impl block for '{}' (base: {}) with {} methods",
                               type_name, base_type_name, impl_block->method_implementations().size());
+                }
+            }
+            // Also register non-generic enum impl blocks so that resolve_method_by_name
+            // can look up parameter types when creating forward declarations
+            else if (!is_generic && _template_registry && _symbol_table)
+            {
+                TypeRef enum_type = _symbol_table->lookup_enum_type(base_type_name);
+                if (enum_type.is_valid() && enum_type->kind() == Cryo::TypeKind::Enum)
+                {
+                    _template_registry->register_enum_impl_block(base_type_name, impl_block, _current_namespace);
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                              "Pass 1: Registered non-generic enum impl block for '{}' with {} methods",
+                              base_type_name, impl_block->method_implementations().size());
                 }
             }
 
@@ -3691,6 +3723,13 @@ namespace Cryo
                 LOG_DEBUG(LogComponent::GENERAL, "Set Monomorphizer in CodegenContext for specialized AST access");
             }
 
+            // Set GenericRegistry for generic type resolution during codegen
+            if (_codegen->ensure_visitor_initialized() && _generic_registry)
+            {
+                _codegen->get_visitor()->context().set_generic_registry(_generic_registry.get());
+                LOG_DEBUG(LogComponent::GENERAL, "Set GenericRegistry in CodegenContext for generic type resolution");
+            }
+
             LOG_DEBUG(LogComponent::GENERAL, "Parsing phase: AST created with module name '{}'", namespace_for_module);
 
             // Register struct/class AST nodes with TypeMapper immediately after CodeGenerator creation
@@ -3798,11 +3837,19 @@ namespace Cryo
             process_struct_declarations_for_preregistration(_ast_root.get());
 
             // Also pre-register imported module structs so they exist during main module codegen
-            if (_module_loader && !_local_import_modules.empty())
+            if (_module_loader && (!_local_import_modules.empty() || !_module_loader->get_all_local_import_names().empty()))
             {
                 const auto &imported_asts = _module_loader->get_imported_asts();
                 std::unordered_set<std::string> seen;
-                for (const auto &module_name : _local_import_modules)
+
+                // Collect all local import module names (direct + transitive)
+                std::vector<std::string> all_local_modules(_local_import_modules.begin(), _local_import_modules.end());
+                for (const auto &name : _module_loader->get_all_local_import_names())
+                {
+                    all_local_modules.push_back(name);
+                }
+
+                for (const auto &module_name : all_local_modules)
                 {
                     if (seen.insert(module_name).second)
                     {
@@ -3911,30 +3958,191 @@ namespace Cryo
                 _codegen->get_visitor()->set_imported_asts(&_module_loader->get_imported_asts());
             }
 
-            // Generate IR for local project imports FIRST so that all imported types
-            // and functions exist in the LLVM module before main module codegen runs.
-            if (_module_loader && !_local_import_modules.empty())
+            // Generate main module IR FIRST. This sets up:
+            // - Prelude functions (ok, err, some, none, etc.)
+            // - Intrinsic declarations (fileno, fopen, fclose, etc.)
+            // - All main module types and function declarations
+            // Main module calls to imported functions will create extern declarations
+            // that get resolved when imported module IR is generated afterward.
+            LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Generating main module LLVM IR");
+            bool success = _codegen->generate_ir(_ast_root.get());
+
+            // Now generate IR for local project imports AFTER main module.
+            // The prelude/intrinsic functions are now available in the LLVM module,
+            // so imported method bodies can reference ok(), err(), fileno(), etc.
+            if (_module_loader && (!_local_import_modules.empty() || !_module_loader->get_all_local_import_names().empty()))
             {
                 const auto &imported_asts = _module_loader->get_imported_asts();
 
-                // Build complete list: explicit imports + any submodules (e.g., "Baz" → also "Baz::Qix")
-                std::vector<std::string> modules_to_generate;
-                std::unordered_set<std::string> seen;
-                for (const auto &module_name : _local_import_modules)
+                // Collect all local modules that need IR generation
+                std::unordered_set<std::string> all_local_modules;
+                for (const auto &m : _module_loader->get_all_local_import_names())
+                    all_local_modules.insert(m);
+                for (const auto &m : _local_import_modules)
+                    all_local_modules.insert(m);
+
+                // Also find submodule ASTs (prefix match: "Baz" → "Baz::Qix", "Baz::Qix::Sub")
                 {
-                    if (seen.insert(module_name).second)
-                        modules_to_generate.push_back(module_name);
-                    // Also find submodule ASTs (prefix match: "Baz" → "Baz::Qix", "Baz::Qix::Sub")
-                    std::string prefix = module_name + "::";
-                    for (const auto &[ast_name, ast_ptr] : imported_asts)
+                    std::vector<std::string> to_scan(all_local_modules.begin(), all_local_modules.end());
+                    for (size_t i = 0; i < to_scan.size(); ++i)
                     {
-                        if (ast_ptr && ast_name.compare(0, prefix.size(), prefix) == 0 &&
-                            seen.insert(ast_name).second)
+                        std::string prefix = to_scan[i] + "::";
+                        for (const auto &[ast_name, ast_ptr] : imported_asts)
                         {
-                            modules_to_generate.push_back(ast_name);
+                            if (ast_ptr && ast_name.compare(0, prefix.size(), prefix) == 0 &&
+                                all_local_modules.insert(ast_name).second)
+                            {
+                                to_scan.push_back(ast_name);
+                            }
                         }
                     }
                 }
+
+                // Build dependency graph from AST import declarations.
+                // For each module, scan its AST for ImportDeclarationNodes and record
+                // edges: module -> [modules it depends on]. This lets us topologically
+                // sort so dependencies are compiled before dependents.
+                std::unordered_map<std::string, std::vector<std::string>> deps;
+                std::unordered_map<std::string, int> in_degree;
+                for (const auto &mod : all_local_modules)
+                {
+                    deps[mod];     // ensure entry exists
+                    if (in_degree.find(mod) == in_degree.end())
+                        in_degree[mod] = 0;
+                }
+
+                for (const auto &mod : all_local_modules)
+                {
+                    auto ast_it = imported_asts.find(mod);
+                    if (ast_it == imported_asts.end() || !ast_it->second)
+                        continue;
+
+                    for (const auto &stmt : ast_it->second->statements())
+                    {
+                        if (!stmt || stmt->kind() != NodeKind::ImportDeclaration)
+                            continue;
+                        auto *import_node = static_cast<ImportDeclarationNode *>(stmt.get());
+                        const std::string &import_path = import_node->module_path();
+
+                        // Check if this import refers to another local module
+                        if (all_local_modules.count(import_path))
+                        {
+                            deps[mod].push_back(import_path);
+                            in_degree[import_path]; // ensure entry
+                            in_degree[mod];         // ensure entry
+                        }
+                        // Also check for parent namespace imports (e.g., "Utils" when "Utils::File" exists)
+                        // and submodule imports (e.g., "Utils::File" when "Utils" is the import)
+                        for (const auto &candidate : all_local_modules)
+                        {
+                            if (candidate == mod)
+                                continue;
+                            // "Utils::File" starts with "Utils::" (import_path = "Utils")
+                            if (candidate.compare(0, import_path.size() + 2, import_path + "::") == 0 ||
+                                import_path.compare(0, candidate.size() + 2, candidate + "::") == 0)
+                            {
+                                // This module depends on the candidate (or vice versa for parent)
+                                if (candidate.compare(0, import_path.size() + 2, import_path + "::") == 0)
+                                {
+                                    // import_path is parent of candidate, mod depends on candidate
+                                    deps[mod].push_back(candidate);
+                                    in_degree[candidate]; // ensure entry
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Add implicit dependency: a disambiguated submodule depends on its parent namespace.
+                // e.g., "Compiler::Lex::Lexer" depends on "Compiler::Lex" because the Lexer struct
+                // uses types (Token, TokenType, SourceLocation) defined in the parent _module.cryo.
+                for (const auto &mod : all_local_modules)
+                {
+                    // Check if this module name is a child of another module in the set
+                    // by seeing if removing the last "::Segment" yields another module in the set.
+                    auto last_sep = mod.rfind("::");
+                    if (last_sep != std::string::npos)
+                    {
+                        std::string parent = mod.substr(0, last_sep);
+                        if (all_local_modules.count(parent))
+                        {
+                            deps[mod].push_back(parent);
+                            in_degree[parent]; // ensure entry
+                        }
+                    }
+                }
+
+                // Remove self-edges and deduplicate
+                for (auto &[mod, dep_list] : deps)
+                {
+                    std::sort(dep_list.begin(), dep_list.end());
+                    dep_list.erase(std::unique(dep_list.begin(), dep_list.end()), dep_list.end());
+                    dep_list.erase(std::remove(dep_list.begin(), dep_list.end(), mod), dep_list.end());
+                }
+
+                // Recompute in-degrees after dedup
+                for (auto &[mod, _] : in_degree)
+                    in_degree[mod] = 0;
+                for (const auto &[mod, dep_list] : deps)
+                {
+                    for (const auto &dep : dep_list)
+                        in_degree[dep]++;
+                }
+
+                // Topological sort (Kahn's algorithm) - modules with no dependents first
+                // Note: in_degree here counts how many modules depend ON this module.
+                // We want leaf modules (depended on by others, but depend on nothing) first.
+                // So we sort by: modules whose own dependencies are all satisfied.
+                // Recompute: in_degree = number of deps this module has that haven't been generated yet
+                std::unordered_map<std::string, int> remaining_deps;
+                for (const auto &mod : all_local_modules)
+                    remaining_deps[mod] = static_cast<int>(deps[mod].size());
+
+                std::vector<std::string> modules_to_generate;
+                std::queue<std::string> ready;
+                for (const auto &mod : all_local_modules)
+                {
+                    if (remaining_deps[mod] == 0)
+                        ready.push(mod);
+                }
+
+                while (!ready.empty())
+                {
+                    std::string mod = ready.front();
+                    ready.pop();
+                    modules_to_generate.push_back(mod);
+
+                    // For all modules that depend on this one, decrement their remaining count
+                    for (const auto &[other, dep_list] : deps)
+                    {
+                        if (other == mod)
+                            continue;
+                        for (const auto &dep : dep_list)
+                        {
+                            if (dep == mod)
+                            {
+                                remaining_deps[other]--;
+                                if (remaining_deps[other] == 0)
+                                    ready.push(other);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Handle any remaining modules (cycles) - add them anyway
+                for (const auto &mod : all_local_modules)
+                {
+                    if (std::find(modules_to_generate.begin(), modules_to_generate.end(), mod) == modules_to_generate.end())
+                    {
+                        LOG_WARN(LogComponent::GENERAL, "IR generation phase: Module '{}' has circular dependency, adding anyway", mod);
+                        modules_to_generate.push_back(mod);
+                    }
+                }
+
+                LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Module order after dependency sort:");
+                for (size_t i = 0; i < modules_to_generate.size(); ++i)
+                    LOG_DEBUG(LogComponent::GENERAL, "  [{}] {}", i, modules_to_generate[i]);
 
                 for (const auto &module_name : modules_to_generate)
                 {
@@ -3945,11 +4153,11 @@ namespace Cryo
                         bool import_success = _codegen->generate_imported_ir(it->second.get(), module_name);
                         if (!import_success)
                         {
-                            LOG_ERROR(LogComponent::GENERAL, "IR generation phase: Failed to generate IR for local import '{}': {}",
-                                      module_name, _codegen->get_last_error());
-                            _diagnostics->emit(Diag::error(ErrorCode::E0600_CODEGEN_FAILED,
-                                                           "IR generation failed for imported module '" + module_name + "': " + _codegen->get_last_error()));
-                            return false;
+                            // Don't abort compilation for transitive import failures.
+                            // Methods that couldn't be generated will surface as linker errors
+                            // only if they're actually called.
+                            LOG_WARN(LogComponent::GENERAL, "IR generation phase: Partial failure for local import '{}': {} (continuing)",
+                                     module_name, _codegen->get_last_error());
                         }
                         LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Successfully generated IR for local import '{}'", module_name);
                     }
@@ -3959,10 +4167,6 @@ namespace Cryo
                     }
                 }
             }
-
-            // Now generate main module IR (imported types and functions already available)
-            LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Generating LLVM IR");
-            bool success = _codegen->generate_ir(_ast_root.get());
 
             if (!success)
             {
@@ -4005,6 +4209,9 @@ namespace Cryo
 
             if (_codegen->ensure_visitor_initialized() && _monomorphization_pass)
                 _codegen->get_visitor()->context().set_monomorphizer(_monomorphization_pass.get());
+
+            if (_codegen->ensure_visitor_initialized() && _generic_registry)
+                _codegen->get_visitor()->context().set_generic_registry(_generic_registry.get());
 
             register_ast_nodes_with_typemapper();
 

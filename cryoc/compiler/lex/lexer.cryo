@@ -1,0 +1,671 @@
+namespace Compiler::Lex;
+
+type struct Lexer {
+private:
+    file:             File;
+    buffer:           string;
+    current:          string;
+    buffer_start:     string;
+    buffer_end:       string;
+    spot_content:     string;
+    current_location: SourceLocation;
+    current_token:    Token;
+    previous_token:   Token;
+    token_count:      u64;
+    string_pool:      string[];
+
+public:
+    static new(file: File) -> Lexer {
+        return Lexer {
+            file:             file,
+            buffer:           "",
+            current:          "",
+            buffer_start:     "",
+            buffer_end:       "",
+            spot_content:     "",
+            current_location: SourceLocation::new(file, 1, 1),
+            current_token:    Token::new(TokenType::Unknown, "", 1, 1),
+            previous_token:   Token::new(TokenType::Unknown, "", 1, 1),
+            token_count:      0,
+            string_pool:      [],
+        };
+    }
+
+    lex(&this) -> Token[] {
+        printf("Starting lexing process for file: %s\n", this.file.path());
+        // --- Load file content ---
+        const load_result: Result<boolean, string> = this.file.load();
+        match (load_result) {
+            Result::Ok(_) => { /* File loaded successfully */ }
+            Result::Err(err) => {
+                printf("Error loading file: %s\n", err);
+                return [];
+            }
+        }
+
+        printf("File loaded successfully. Size: %d bytes\n", this.file.size());
+        printf("File Contents: ---------- \n%s\n-------------------------\n", this.file.content());
+
+        // --- Initialize buffer pointers ---
+        this.buffer       = this.file.content();
+        this.buffer_start = this.buffer;
+        this.buffer_end   = ptr_add(this.buffer as void*, this.file.size() as i64) as string;
+        this.current      = this.buffer_start;
+
+        // --- Lex all tokens ---
+        mut tokens: Token[] = [];
+
+        while (!this.at_end()) {
+            const tok: Token = this.lex_token();
+            printf("Lexed token: Kind=%d, Lexeme='%s', Line=%d, Column=%d\n", 
+                tok.kind, tok.lexeme, tok.line, tok.column);
+            tokens.push(tok);
+            this.previous_token = tok;
+        }
+
+        // --- Append EOF ---
+        const eof: Token = this.make_token(TokenType::EOF, "");
+        tokens.push(eof);
+
+        printf("Lexing complete. Total tokens: %d\n", tokens.length);
+        return tokens;
+    }
+
+private:
+    lex_token(&this) -> Token {
+        this.skip_whitespace();
+
+        if (this.at_end()) {
+            return this.make_token(TokenType::EOF, "");
+        }
+
+        const token_start: string = this.current;
+        const c: char = this.advance();
+
+        // --- Identifier or keyword ---
+        if (Lexer::is_alpha(c)) {
+            return this.lex_identifier();
+        }
+
+        // --- Number ---
+        if (Lexer::is_digit(c)) {
+            return this.lex_number();
+        }
+
+        // --- String literal ---
+        if (c == '"') {
+            return this.lex_string(c);
+        }
+
+        // --- Character literal ---
+        if (c == '\'') {
+            return this.lex_character();
+        }
+
+        // --- Line comments and doc comments (// and ///) ---
+        if (c == '/' && this.peek() == '/') {
+            if (this.peek_ahead(1) == '/') {
+                return this.lex_doc_comment();
+            }
+            return this.lex_comment();
+        }
+
+        // --- Block comments and doc comments (/* and /**) ---
+        if (c == '/' && this.peek() == '*') {
+            if (this.peek_ahead(1) == '*') {
+                return this.lex_doc_comment();
+            }
+            return this.lex_comment();
+        }
+
+        // --- Punctuators ---
+        const punct_kind: TokenType = this.lex_punctuator(c);
+        if (punct_kind != TokenType::Unknown) {
+            return this.make_token(punct_kind, token_start);
+        }
+
+        return this.error_token("Unexpected character");
+    }
+
+    // --- Internal helper methods for lexing ---
+    lex_identifier(&this) -> Token {
+        const start: string = this.current;
+
+        while (!this.at_end() && Lexer::is_alnum(this.peek())) {
+            this.advance();
+        }
+
+        const len: u64 = (this.current as i64 - start as i64) as u64;
+        const text: string = substr(start, 0, len);
+        const kind: TokenType = keyword_from_str(text);
+
+        return this.make_token(kind, text);
+    }
+
+    lex_number(&this) -> Token {
+        const start: string = this.current;
+
+        mut is_special_base: boolean = false;
+
+        // --- Special base prefixes (0x, 0b, 0o) ---
+        if (*(this.current - 1) == '0' && !this.at_end()) {
+            const prefix: char = this.peek();
+
+            if (prefix == 'x' || prefix == 'X') {
+                this.advance(); // consume 'x'/'X'
+                const hex_start: string = this.current;
+
+                while (!this.at_end() && (Lexer::is_hex_digit(this.peek()) || this.peek() == '_')) {
+                    this.advance();
+                }
+
+                if (this.current == hex_start) {
+                    return this.error_token("Invalid hexadecimal number");
+                }
+
+                is_special_base = true;
+
+            } else if (prefix == 'b' || prefix == 'B') {
+                this.advance(); // consume 'b'/'B'
+                const bin_start: string = this.current;
+
+                while (!this.at_end() && (this.peek() == '0' || this.peek() == '1' || this.peek() == '_')) {
+                    this.advance();
+                }
+
+                if (this.current == bin_start) {
+                    return this.error_token("Invalid binary number");
+                }
+
+                is_special_base = true;
+
+            } else if (prefix == 'o' || prefix == 'O') {
+                this.advance(); // consume 'o'/'O'
+                const oct_start: string = this.current;
+
+                while (!this.at_end() && ((this.peek() >= '0' && this.peek() <= '7') || this.peek() == '_')) {
+                    this.advance();
+                }
+
+                if (this.current == oct_start) {
+                    return this.error_token("Invalid octal number");
+                }
+
+                is_special_base = true;
+            }
+        }
+
+        // --- Decimal digits (skipped for special bases) ---
+        if (!is_special_base) {
+            while (!this.at_end() && (Lexer::is_digit(this.peek()) || this.peek() == '_')) {
+                this.advance();
+            }
+
+            // --- Decimal point ---
+            if (!this.at_end() && this.peek() == '.') {
+                const next: char = this.peek_ahead(1);
+                if (Lexer::is_digit(next)) {
+                    this.advance(); // consume '.'
+                    while (!this.at_end() && (Lexer::is_digit(this.peek()) || this.peek() == '_')) {
+                        this.advance();
+                    }
+                }
+            }
+
+            // --- Exponent ---
+            if (!this.at_end() && (this.peek() == 'e' || this.peek() == 'E')) {
+                this.advance();
+                if (!this.at_end() && (this.peek() == '+' || this.peek() == '-')) {
+                    this.advance();
+                }
+                while (!this.at_end() && (Lexer::is_digit(this.peek()) || this.peek() == '_')) {
+                    this.advance();
+                }
+            }
+        }
+
+        // --- Type suffixes (u8, i32, f64, etc.) ---
+        if (!this.at_end() && Lexer::is_alpha(this.peek())) {
+            const suffix_start: string = this.current;
+
+            while (!this.at_end() && Lexer::is_alnum(this.peek())) {
+                this.advance();
+            }
+
+            const suffix_len: u64 = (this.current as i64 - suffix_start as i64) as u64;
+            const suffix: string = substr(suffix_start, 0, suffix_len);
+
+            const valid: boolean = 
+                suffix == "u8"    || suffix == "u16"   || suffix == "u32" || suffix == "u64"  ||
+                suffix == "i8"    || suffix == "i16"   || suffix == "i32" || suffix == "i64"  ||
+                suffix == "f32"   || suffix == "f64"   ||
+                suffix == "usize" || suffix == "isize";
+
+            if (!valid) {
+                // Not a valid suffix, backtrack
+                this.current = suffix_start;
+            }
+        }
+
+        // --- Build token ---
+        const len: u64 = (this.current as i64 - start as i64) as u64;
+        const lexeme: string = substr(start, 0, len);
+
+        return this.make_token(TokenType::NumericConstant, lexeme);
+    }
+
+    lex_string(&this, quote: char) -> Token {
+        const start: string = this.current;
+
+        // --- Consume string body ---
+        while (!this.at_end() && this.peek() != quote) {
+            if (this.peek() == '\\' && !this.at_end()) {
+                this.advance(); // consume backslash
+                if (!this.at_end()) {
+                    this.advance(); // consume escaped character
+                }
+            } else {
+                if (this.peek() == '\n') {
+                    this.current_location.newline();
+                }
+                this.advance();
+            }
+        }
+
+        // --- Unterminated check ---
+        if (this.at_end()) {
+            return this.error_token("Unterminated string literal");
+        }
+
+        this.advance(); // consume closing quote
+
+        // --- Extract raw content (without surrounding quotes) ---
+        const raw_len: u64 = (this.current as i64 - start as i64 - 2) as u64;
+        const raw_text: string = substr(start, 1, raw_len);
+
+        // TODO: process_escape_sequences(raw_text)
+        // TODO: store in string pool
+
+        return this.make_token(TokenType::StringLiteral, raw_text);
+    }
+
+    lex_character(&this) -> Token {
+        const start: string = this.current;
+
+        // --- Escape sequence ---
+        if (this.peek() == '\\') {
+            this.advance(); // consume backslash
+            if (!this.at_end()) {
+                const escape_char: char = this.peek();
+                this.advance(); // consume the escape character (n, t, r, etc.)
+
+                // Handle hex escape sequences (\xHH)
+                if (escape_char == 'x') {
+                    mut i: int = 0;
+                    while (i < 2 && !this.at_end() && Lexer::is_hex_digit(this.peek())) {
+                        this.advance();
+                        i++;
+                    }
+                }
+            }
+        } else {
+            // --- UTF-8 multi-byte character handling ---
+            const first_byte: u8 = this.peek() as u8;
+
+            if (first_byte < 0x80 as u8) {
+                // ASCII (0xxxxxxx)
+                this.advance();
+            } else if ((first_byte & 0xE0 as u8) == (0xC0 as u8)) {
+                // 2-byte UTF-8 (110xxxxx 10xxxxxx)
+                this.advance();
+                if (!this.at_end() && ((this.peek() as u8) & (0xC0 as u8)) == (0x80 as u8)) {
+                    this.advance();
+                }
+            } else if ((first_byte & 0xF0 as u8) == (0xE0 as u8)) {
+                // 3-byte UTF-8 (1110xxxx 10xxxxxx 10xxxxxx)
+                this.advance();
+                if (!this.at_end() && ((this.peek() as u8) & (0xC0 as u8)) == (0x80 as u8)) {
+                    this.advance();
+                    if (!this.at_end() && ((this.peek() as u8) & (0xC0 as u8)) == (0x80 as u8)) {
+                        this.advance();
+                    }
+                }
+            } else if ((first_byte & 0xF8 as u8) == (0xF0 as u8)) {
+                // 4-byte UTF-8 (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
+                this.advance();
+                if (!this.at_end() && ((this.peek() as u8) & (0xC0 as u8)) == (0x80 as u8)) {
+                    this.advance();
+                    if (!this.at_end() && ((this.peek() as u8) & (0xC0 as u8)) == (0x80 as u8)) {
+                        this.advance();
+                        if (!this.at_end() && ((this.peek() as u8) & (0xC0 as u8)) == (0x80 as u8)) {
+                            this.advance();
+                        }
+                    }
+                }
+            } else {
+                // Invalid UTF-8 byte, consume it anyway
+                this.advance();
+            }
+        }
+
+        // --- Expect closing quote ---
+        if (this.at_end() || this.peek() != '\'') {
+            return this.error_token("Unterminated character literal");
+        }
+        this.advance(); // consume closing '\''
+
+        // --- Build the lexeme from start to current ---
+        const len: u64 = (this.current as i64 - start as i64) as u64;
+        const lexeme: string = substr(start, 0, len);
+
+        return this.make_token(TokenType::CharConstant, lexeme);
+    }
+
+    lex_comment(&this) -> Token {
+        const start: string = this.current - 1;
+
+        // --- Line comment (//) ---
+        if (*(this.current - 1) == '/' && *this.current == '/') {
+            this.advance(); // consume second '/'
+            while (!this.at_end() && this.peek() != '\n') {
+                this.advance();
+            }
+
+        // --- Block comment (/* ... */) ---
+        } else if (*(this.current - 1) == '/' && *this.current == '*') {
+            this.advance(); // consume '*'
+
+            while (!this.at_end() && this.peek_ahead(1) != '\0') {
+                if (this.peek() == '*' && this.peek_ahead(1) == '/') {
+                    this.advance(); // consume '*'
+                    this.advance(); // consume '/'
+                    break;
+                }
+                if (this.peek() == '\n') {
+                    this.current_location.newline();
+                }
+                this.advance();
+            }
+        }
+
+        // --- Build token ---
+        const len: u64 = (this.current as i64 - start as i64) as u64;
+        const lexeme: string = substr(start, 0, len);
+
+        return this.make_token(TokenType::Comment, lexeme);
+    }
+
+    lex_doc_comment(&this) -> Token {
+        const start: string = this.current - 1;
+        mut doc_kind: TokenType = TokenType::Unknown;
+
+        // --- Line doc comment (///) ---
+        if (this.peek() == '/' && this.peek_ahead(1) == '/') {
+            doc_kind = TokenType::DocCommentLine;
+            this.advance(); // consume second '/'
+            this.advance(); // consume third '/'
+
+            // Skip optional space after ///
+            if (this.peek() == ' ') {
+                this.advance();
+            }
+
+            while (!this.at_end() && this.peek() != '\n') {
+                this.advance();
+            }
+
+        // --- Block doc comment (/**) ---
+        } else if (this.peek() == '*' && this.peek_ahead(1) == '*') {
+            doc_kind = TokenType::DocCommentBlock;
+            this.advance(); // consume '*'
+            this.advance(); // consume second '*'
+
+            // Skip optional space or newline after /**
+            if (this.peek() == ' ' || this.peek() == '\n') {
+                if (this.peek() == '\n') {
+                    this.current_location.newline();
+                }
+                this.advance();
+            }
+
+            while (!this.at_end() && this.peek_ahead(1) != '\0') {
+                if (this.peek() == '*' && this.peek_ahead(1) == '/') {
+                    this.advance(); // consume '*'
+                    this.advance(); // consume '/'
+                    break;
+                }
+                if (this.peek() == '\n') {
+                    this.current_location.newline();
+                }
+                this.advance();
+            }
+
+        // --- Fallback ---
+        } else {
+            return this.lex_comment();
+        }
+
+        // --- Build token ---
+        const len: u64 = (this.current as i64 - start as i64) as u64;
+        const lexeme: string = substr(start, 0, len);
+
+        return this.make_token(doc_kind, lexeme);
+    }
+
+    lex_punctuator(this: Lexer*, c: i8) -> TokenType {
+        match (c) {
+            '('  => { return TokenType::LParen;     }
+            ')'  => { return TokenType::RParen;     }
+            '{'  => { return TokenType::LBrace;     }
+            '}'  => { return TokenType::RBrace;     }
+            '['  => { return TokenType::LSquare;    }
+            ']'  => { return TokenType::RSquare;    }
+            ';'  => { return TokenType::Semicolon;  }
+            ','  => { return TokenType::Comma;      }
+            '%'  => { return TokenType::Percent;    }
+            '^'  => { return TokenType::Caret;      }
+            '~'  => { return TokenType::Tilde;      }
+            '!'  => { return TokenType::Exclaim;    }
+            '@'  => { return TokenType::At;         }
+            '#'  => { return TokenType::Hash;       }
+            '$'  => { return TokenType::Dollar;     }
+            '\\' => { return TokenType::Backslash;  }
+
+            '.' => {
+                if (this.peek() == '.') {
+                    if (this.peek_ahead(1) == '.') {
+                        this.advance();
+                        this.advance();
+                        return TokenType::Ellipsis;
+                    }
+                    this.advance();
+                    return TokenType::DotDot;
+                }
+                return TokenType::Period;
+            }
+
+            '+' => {
+                if (this.peek() == '+') { this.advance(); return TokenType::PlusPlus;   }
+                if (this.peek() == '=') { this.advance(); return TokenType::PlusEqual;  }
+                return TokenType::Plus;
+            }
+
+            '-' => {
+                if (this.peek() == '-') { this.advance(); return TokenType::MinusMinus; }
+                if (this.peek() == '=') { this.advance(); return TokenType::MinusEqual; }
+                if (this.peek() == '>') { this.advance(); return TokenType::Arrow;      }
+                return TokenType::Minus;
+            }
+
+            '*' => {
+                if (this.peek() == '=') { this.advance(); return TokenType::StarEqual; }
+                return TokenType::Star;
+            }
+
+            '/' => {
+                if (this.peek() == '=') { this.advance(); return TokenType::SlashEqual; }
+                return TokenType::Slash;
+            }
+
+            '=' => {
+                if (this.peek() == '=') { this.advance(); return TokenType::EqualEqual; }
+                if (this.peek() == '>') { this.advance(); return TokenType::FatArrow;   }
+                return TokenType::Equal;
+            }
+
+            '<' => {
+                if (this.peek() == '=') {
+                    this.advance();
+                    if (this.peek() == '>') { this.advance(); return TokenType::Spaceship;      }
+                    return TokenType::LessEqual;
+                }
+                if (this.peek() == '<') {
+                    this.advance();
+                    if (this.peek() == '=') { this.advance(); return TokenType::LessLessEqual;  }
+                    return TokenType::LessLess;
+                }
+                return TokenType::LAngle;
+            }
+
+            '>' => {
+                if (this.peek() == '=') {
+                    this.advance();
+                    return TokenType::GreaterEqual;
+                }
+                if (this.peek() == '>') {
+                    this.advance();
+                    if (this.peek() == '=') { this.advance(); return TokenType::GreaterGreaterEqual; }
+                    return TokenType::GreaterGreater;
+                }
+                return TokenType::RAngle;
+            }
+
+            '&' => {
+                if (this.peek() == '&') { this.advance(); return TokenType::AmpAmp;   }
+                if (this.peek() == '=') { this.advance(); return TokenType::AmpEqual; }
+                return TokenType::Amp;
+            }
+
+            '|' => {
+                if (this.peek() == '|') { this.advance(); return TokenType::PipePipe;     }
+                if (this.peek() == '=') { this.advance(); return TokenType::PipeEqual;    }
+                if (this.peek() == '>') { this.advance(); return TokenType::PipeGreater;  }
+                return TokenType::Pipe;
+            }
+
+            '?' => {
+                if (this.peek() == '?') { this.advance(); return TokenType::QuestionQuestion; }
+                if (this.peek() == '.') { this.advance(); return TokenType::QuestionDot;      }
+                return TokenType::Question;
+            }
+
+            ':' => {
+                if (this.peek() == ':') { this.advance(); return TokenType::ColonColon; }
+                return TokenType::Colon;
+            }
+
+            '#' => {
+                if (this.peek() == '#') { this.advance(); return TokenType::HashHash; }
+                return TokenType::Hash;
+            }
+
+            _ => { return TokenType::Unknown; }
+        }
+    }
+
+    skip_whitespace(&this) -> void {
+        while(!this.at_end() && Lexer::is_whitespace(this.peek())) {
+            const c: char = this.peek();
+            if (c == '\n') {
+                // Advance the string pointer on `current`
+                this.current = ptr_add(this.current as void*, 1) as string;
+                this.current_location.newline();
+            } else {
+                this.advance();
+            }
+        }
+    }
+
+    advance(&this) -> char {
+        if (this.at_end()) {
+            return '\0';
+        }
+
+        mut c: char = *this.current;
+        this.current = ptr_add(this.current as void*, 1) as string;
+
+        this.current_location.increment_char(c);
+
+        return c;
+    }
+
+    peek(&this) -> char {
+        const offset: int = 0;
+        if (this.current + offset >= this.buffer_end) {
+            return '\0';
+        }
+        return *(this.current + offset);
+    }
+
+    peek_ahead(&this, offset: int) -> char {
+        if (this.current + offset >= this.buffer_end) {
+            return '\0';
+        }
+        return *(this.current + offset);
+    }
+
+    at_end(&this) -> boolean {
+        return this.current >= this.buffer_end;
+    }
+
+    make_token(&this, kind: TokenType, lexeme: string) -> Token {
+        return Token::new(
+            kind,
+            lexeme,
+            this.current_location.line,
+            this.current_location.column - strlen(lexeme)
+        );
+    }
+
+    error_token(&this, message: string) -> Token {
+        return Token::new(
+            TokenType::Unknown,
+            message,
+            this.current_location.line,
+            this.current_location.column
+        );
+    }
+
+private:
+    // --- Internal static helper methods ---
+    static is_alpha(c: char) -> boolean {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    }
+
+    static is_digit(c: char) -> boolean {
+        return c >= '0' && c <= '9';
+    }
+
+    static is_alnum(c: char) -> boolean {
+        return Lexer::is_alpha(c) || Lexer::is_digit(c);
+    }
+
+    static is_hex_digit(c: char) -> boolean {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    }
+
+    static is_whitespace(c: char) -> boolean {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    }
+
+    static is_punctuator(c: char) -> boolean {
+        // Placeholder implementation for checking if a character is a punctuation character.
+        todo("Unimplemented");
+    }
+
+    static is_operator(c: char) -> boolean {
+        // Placeholder implementation for checking if a character is an operator character.
+        todo("Unimplemented");
+    }
+}
+

@@ -2252,19 +2252,29 @@ namespace Cryo::Codegen
         if (!current)
             return nullptr;
 
-        // Get increment value
-        llvm::Value *one = get_increment_value(current->getType());
-        if (!one)
-            return nullptr;
-
         // Create new value
         llvm::Value *new_val;
-        if (current->getType()->isIntegerTy())
+        if (current->getType()->isPointerTy())
         {
+            // Pointer increment: advance by one element (byte-level GEP)
+            new_val = builder().CreateGEP(
+                llvm::Type::getInt8Ty(builder().getContext()),
+                current,
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(builder().getContext()), 1),
+                "ptr.inc");
+        }
+        else if (current->getType()->isIntegerTy())
+        {
+            llvm::Value *one = get_increment_value(current->getType());
+            if (!one)
+                return nullptr;
             new_val = builder().CreateAdd(current, one, "inc");
         }
         else if (current->getType()->isFloatingPointTy())
         {
+            llvm::Value *one = get_increment_value(current->getType());
+            if (!one)
+                return nullptr;
             new_val = builder().CreateFAdd(current, one, "finc");
         }
         else
@@ -2306,19 +2316,29 @@ namespace Cryo::Codegen
         if (!current)
             return nullptr;
 
-        // Get decrement value
-        llvm::Value *one = get_increment_value(current->getType());
-        if (!one)
-            return nullptr;
-
         // Create new value
         llvm::Value *new_val;
-        if (current->getType()->isIntegerTy())
+        if (current->getType()->isPointerTy())
         {
+            // Pointer decrement: move back by one element (byte-level GEP with -1)
+            new_val = builder().CreateGEP(
+                llvm::Type::getInt8Ty(builder().getContext()),
+                current,
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(builder().getContext()), -1ULL),
+                "ptr.dec");
+        }
+        else if (current->getType()->isIntegerTy())
+        {
+            llvm::Value *one = get_increment_value(current->getType());
+            if (!one)
+                return nullptr;
             new_val = builder().CreateSub(current, one, "dec");
         }
         else if (current->getType()->isFloatingPointTy())
         {
+            llvm::Value *one = get_increment_value(current->getType());
+            if (!one)
+                return nullptr;
             new_val = builder().CreateFSub(current, one, "fdec");
         }
         else

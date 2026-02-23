@@ -4158,8 +4158,36 @@ namespace Cryo::Codegen
         const auto &elements = node->elements();
         if (elements.empty())
         {
-            // Empty array - return null pointer for now
-            return llvm::ConstantPointerNull::get(llvm::PointerType::get(llvm_ctx(), 0));
+            // Empty array literal [] - create a zero-initialized Array<T> struct {ptr, i64, i64}
+            // instead of returning null (which causes segfaults when loaded/stored).
+            // All Array<T> types share the same layout {ptr, i64, i64}, so we can build
+            // the struct type directly without needing the resolved element type.
+            llvm::Type *array_struct_type = nullptr;
+
+            // First try: use the node's resolved type if available
+            TypeRef resolved_type = node->get_resolved_type();
+            if (resolved_type.is_valid() && !resolved_type.is_error())
+            {
+                array_struct_type = get_llvm_type(resolved_type);
+            }
+
+            // Second try: build a generic Array struct type {ptr, i64, i64}
+            if (!array_struct_type || !array_struct_type->isStructTy())
+            {
+                array_struct_type = llvm::StructType::get(
+                    llvm_ctx(),
+                    {llvm::PointerType::get(llvm_ctx(), 0),
+                     llvm::Type::getInt64Ty(llvm_ctx()),
+                     llvm::Type::getInt64Ty(llvm_ctx())});
+            }
+
+            // Create a zero-initialized alloca for the empty array struct
+            llvm::AllocaInst *empty_array = create_entry_alloca(array_struct_type, "empty.array");
+            auto &DL = module()->getDataLayout();
+            uint64_t size = DL.getTypeAllocSize(array_struct_type);
+            builder().CreateMemSet(empty_array, builder().getInt8(0), size,
+                                   llvm::MaybeAlign(DL.getABITypeAlign(array_struct_type)));
+            return empty_array;
         }
 
         // Check for [value; count] repeat syntax
@@ -5604,6 +5632,57 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "ExpressionCodegen: Found '{}' via scope lookup as '{}'", qualified_name, full_variant_name);
                 return result;
+            }
+        }
+
+        // Try to resolve as a cross-module constant from TemplateRegistry.
+        // Constants from imported modules are registered during module loading
+        // but their LLVM globals may not exist yet (imported module IR is generated after main).
+        if (auto *template_reg = ctx().template_registry())
+        {
+            // effective_scope_name is the module/type name (e.g., "Config")
+            // Try resolving it as a module namespace for constant lookup
+            auto scope_ns_candidates = generate_lookup_candidates(effective_scope_name, Cryo::SymbolKind::Type);
+            for (const auto &ns_candidate : scope_ns_candidates)
+            {
+                const auto *constants = template_reg->get_module_constants(ns_candidate);
+                if (constants)
+                {
+                    for (const auto &c : *constants)
+                    {
+                        if (c.name == node->member_name())
+                        {
+                            // Create the global variable on-the-fly from the registered constant
+                            llvm::Type *const_type = nullptr;
+                            if (c.type_annotation == "u8" || c.type_annotation == "i8")
+                                const_type = llvm::Type::getInt8Ty(llvm_ctx());
+                            else if (c.type_annotation == "u16" || c.type_annotation == "i16")
+                                const_type = llvm::Type::getInt16Ty(llvm_ctx());
+                            else if (c.type_annotation == "u32" || c.type_annotation == "i32")
+                                const_type = llvm::Type::getInt32Ty(llvm_ctx());
+                            else if (c.type_annotation == "u64" || c.type_annotation == "i64")
+                                const_type = llvm::Type::getInt64Ty(llvm_ctx());
+                            else if (c.type_annotation == "int")
+                                const_type = llvm::Type::getInt32Ty(llvm_ctx());
+                            else if (c.type_annotation == "boolean")
+                                const_type = llvm::Type::getInt1Ty(llvm_ctx());
+                            else
+                                const_type = llvm::Type::getInt64Ty(llvm_ctx());
+
+                            auto *gv = new llvm::GlobalVariable(
+                                *module(), const_type, true,
+                                llvm::GlobalValue::PrivateLinkage,
+                                llvm::ConstantInt::get(const_type, c.int_value),
+                                c.name);
+                            values().set_global_value(c.name, gv);
+                            values().set_global_value(qualified_name, gv);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "ExpressionCodegen: Created constant '{}' = {} from TemplateRegistry",
+                                      qualified_name, c.int_value);
+                            return builder().CreateLoad(const_type, gv, qualified_name + ".val");
+                        }
+                    }
+                }
             }
         }
 
