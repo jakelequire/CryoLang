@@ -6394,7 +6394,24 @@ namespace Cryo::Codegen
                   "CallCodegen: Variadic forwarding {} -> {} (va_list at arg index {})",
                   intrinsic_name, v_name, va_list_index);
 
-        // Build args: everything before va_list stays, va_list replaces rest
+        // The v* functions (vsprintf, vprintf, etc.) expect a pointer to the va_list
+        // storage, not the loaded value. We need to get the alloca directly.
+        llvm::Value *va_list_ptr = nullptr;
+        if (va_list_index < static_cast<int>(node->arguments().size()))
+        {
+            auto *id_node = dynamic_cast<Cryo::IdentifierNode *>(node->arguments()[va_list_index].get());
+            if (id_node)
+            {
+                // Get the alloca (pointer) instead of the loaded value
+                va_list_ptr = values().get_alloca(id_node->name());
+                if (!va_list_ptr)
+                    va_list_ptr = values().get_value(id_node->name());
+            }
+        }
+        if (!va_list_ptr)
+            va_list_ptr = args[va_list_index]; // fallback
+
+        // Build args: everything before va_list stays, va_list pointer replaces rest
         std::vector<llvm::Value *> v_args;
 
         if (v_name == "vsprintf" && va_list_index == 1)
@@ -6406,14 +6423,14 @@ namespace Cryo::Codegen
                 llvm::Type::getInt8Ty(llvm_ctx()),
                 llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 4096),
                 "sprintf.buf");
-            v_args = {buffer, args[0], args[va_list_index]};
+            v_args = {buffer, args[0], va_list_ptr};
         }
         else
         {
             // General case: args before va_list + va_list pointer
             for (int i = 0; i < va_list_index; ++i)
                 v_args.push_back(args[i]);
-            v_args.push_back(args[va_list_index]);
+            v_args.push_back(va_list_ptr);
         }
 
         // Create v* function type (all ptr params + va_list ptr, returns i32)
