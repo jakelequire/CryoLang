@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <vector>
 #include <stack>
+#include <unordered_set>
 
 namespace Cryo::Codegen
 {
@@ -343,6 +344,19 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, TypeRef> &variable_types_map() { return _variable_types; }
 
         //===================================================================
+        // Variadic (va_list) Parameter Tracking
+        //===================================================================
+
+        /** @brief Mark a parameter as a va_list (variadic forwarding) */
+        void mark_as_va_list(const std::string &name) { _va_list_params.insert(name); }
+
+        /** @brief Check if a parameter is a va_list */
+        bool is_va_list_param(const std::string &name) const { return _va_list_params.count(name) > 0; }
+
+        /** @brief Clear all va_list parameter markers (called at function exit) */
+        void clear_va_list_params() { _va_list_params.clear(); }
+
+        //===================================================================
         // Source Context
         //===================================================================
 
@@ -480,6 +494,9 @@ namespace Cryo::Codegen
         std::unordered_map<std::string, llvm::Value *> _enum_variants;
         std::unordered_map<std::string, std::vector<std::string>> _enum_variant_fields;
         std::unordered_map<std::string, TypeRef> _variable_types;
+
+        // Variadic (va_list) parameter names for the current function
+        std::unordered_set<std::string> _va_list_params;
 
         // Struct field index mapping: type_name -> (field_name -> field_index)
         std::unordered_map<std::string, std::unordered_map<std::string, unsigned>> _struct_field_indices;

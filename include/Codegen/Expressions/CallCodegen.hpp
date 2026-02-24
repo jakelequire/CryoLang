@@ -281,6 +281,20 @@ namespace Cryo::Codegen
         MemoryCodegen *_memory = nullptr;
 
         /**
+         * @brief Generate a v* variant intrinsic call for variadic forwarding
+         * Maps printf→vprintf, fprintf→vfprintf, sprintf→vsprintf, snprintf→vsnprintf
+         * @param node Call expression
+         * @param intrinsic_name Original intrinsic name (e.g., "sprintf")
+         * @param args Generated argument values
+         * @param va_list_index Index of the va_list argument
+         * @return Result value
+         */
+        llvm::Value *generate_va_forwarding_intrinsic(Cryo::CallExpressionNode *node,
+                                                       const std::string &intrinsic_name,
+                                                       std::vector<llvm::Value *> &args,
+                                                       int va_list_index);
+
+        /**
          * @brief Extract function name from callee expression
          * @param callee Callee expression
          * @return Function name, or empty string if not identifiable

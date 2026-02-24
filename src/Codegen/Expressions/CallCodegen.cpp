@@ -2527,6 +2527,26 @@ namespace Cryo::Codegen
         // Generate arguments
         auto args = generate_arguments(node->arguments());
 
+        // Check if any argument is a va_list parameter (variadic forwarding)
+        int va_list_arg_index = -1;
+        for (size_t i = 0; i < node->arguments().size(); ++i)
+        {
+            if (node->arguments()[i]->kind() == Cryo::NodeKind::Identifier)
+            {
+                auto *id_node = static_cast<Cryo::IdentifierNode *>(node->arguments()[i].get());
+                if (ctx().is_va_list_param(id_node->name()))
+                {
+                    va_list_arg_index = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+
+        if (va_list_arg_index >= 0)
+        {
+            return generate_va_forwarding_intrinsic(node, intrinsic_name, args, va_list_arg_index);
+        }
+
         // Delegate to the Intrinsics class via context if available
         // For now, handle common intrinsics inline
 
@@ -6332,6 +6352,83 @@ namespace Cryo::Codegen
 
         // Not a built-in array method
         return nullptr;
+    }
+
+    //===================================================================
+    // Variadic Forwarding (va_list → v* variant)
+    //===================================================================
+
+    llvm::Value *CallCodegen::generate_va_forwarding_intrinsic(
+        Cryo::CallExpressionNode *node,
+        const std::string &intrinsic_name,
+        std::vector<llvm::Value *> &args,
+        int va_list_index)
+    {
+        static const std::unordered_map<std::string, std::string> va_variants = {
+            {"printf", "vprintf"},
+            {"fprintf", "vfprintf"},
+            {"sprintf", "vsprintf"},
+            {"snprintf", "vsnprintf"},
+        };
+
+        auto it = va_variants.find(intrinsic_name);
+        if (it == va_variants.end())
+        {
+            report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
+                         "Cannot forward va_list to non-printf-family intrinsic: " + intrinsic_name);
+            return nullptr;
+        }
+
+        const std::string &v_name = it->second;
+        llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(llvm_ctx());
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "CallCodegen: Variadic forwarding {} -> {} (va_list at arg index {})",
+                  intrinsic_name, v_name, va_list_index);
+
+        // Build args: everything before va_list stays, va_list replaces rest
+        std::vector<llvm::Value *> v_args;
+
+        if (v_name == "vsprintf" && va_list_index == 1)
+        {
+            // sprintf(format, args) → vsprintf(buffer, format, va_list)
+            // User called sprintf(msg, args) with only format + va_list,
+            // so we need to allocate a temp buffer
+            llvm::Value *buffer = builder().CreateAlloca(
+                llvm::Type::getInt8Ty(llvm_ctx()),
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 4096),
+                "sprintf.buf");
+            v_args = {buffer, args[0], args[va_list_index]};
+        }
+        else
+        {
+            // General case: args before va_list + va_list pointer
+            for (int i = 0; i < va_list_index; ++i)
+                v_args.push_back(args[i]);
+            v_args.push_back(args[va_list_index]);
+        }
+
+        // Create v* function type (all ptr params + va_list ptr, returns i32)
+        std::vector<llvm::Type *> param_types;
+        for (auto *a : v_args)
+            param_types.push_back(a->getType());
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(int_type, param_types, false);
+
+        llvm::Function *v_func = module()->getFunction(v_name);
+        if (!v_func)
+        {
+            v_func = llvm::Function::Create(
+                fn_type, llvm::Function::ExternalLinkage, v_name, module());
+        }
+
+        llvm::Value *result = builder().CreateCall(v_func, v_args, v_name + ".result");
+
+        // For vsprintf, return the buffer pointer (string), not the int result
+        if (v_name == "vsprintf")
+            return v_args[0]; // buffer pointer
+
+        return result;
     }
 
 } // namespace Cryo::Codegen
