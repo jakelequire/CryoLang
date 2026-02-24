@@ -7,6 +7,7 @@
 #include "Types/GenericRegistry.hpp"
 #include "Utils/Logger.hpp"
 
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Verifier.h>
 
 namespace Cryo::Codegen
@@ -2342,6 +2343,43 @@ namespace Cryo::Codegen
             values().set_value(arg.getName().str(), nullptr, alloca);
         }
 
+        // If function is variadic, set up va_list for the variadic parameter
+        std::string va_param_name;
+        if (node->is_variadic())
+        {
+            // Find the variadic parameter name (its type annotation is "...")
+            for (const auto &param : node->parameters())
+            {
+                if (param->has_type_annotation() && param->type_annotation()->name == "...")
+                {
+                    va_param_name = param->name();
+                    break;
+                }
+            }
+
+            if (!va_param_name.empty())
+            {
+                // On x86_64 Linux, va_list is [1 x %struct.__va_list_tag] = 24 bytes
+                llvm::Type *va_list_type = llvm::ArrayType::get(
+                    llvm::Type::getInt8Ty(llvm_ctx()), 24);
+                llvm::AllocaInst *va_list_alloca = create_entry_alloca(fn, va_list_type, va_param_name);
+
+                // Call @llvm.va_start(ptr %va_list)
+                llvm::Function *va_start_fn = llvm::Intrinsic::getDeclaration(
+                    module(), llvm::Intrinsic::vastart);
+                builder().CreateCall(va_start_fn, {va_list_alloca});
+
+                // Register as a named variable so the variadic identifier resolves
+                values().set_value(va_param_name, nullptr, va_list_alloca);
+
+                // Mark in context so call codegen can detect va_list forwarding
+                ctx().mark_as_va_list(va_param_name);
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Set up va_list for variadic parameter '{}'", va_param_name);
+            }
+        }
+
         // Register parameter types in variable_types_map for Array<T> detection
         // This is critical for array access to correctly determine element types
         const auto &ast_params = node->parameters();
@@ -2400,6 +2438,22 @@ namespace Cryo::Codegen
         CodegenVisitor *visitor = ctx().visitor();
         node->body()->accept(*visitor);
 
+        // If variadic, call va_end before return
+        if (!va_param_name.empty())
+        {
+            llvm::BasicBlock *va_block = builder().GetInsertBlock();
+            if (va_block && !va_block->getTerminator())
+            {
+                llvm::Value *va_alloca = values().get_value(va_param_name);
+                if (va_alloca)
+                {
+                    llvm::Function *va_end_fn = llvm::Intrinsic::getDeclaration(
+                        module(), llvm::Intrinsic::vaend);
+                    builder().CreateCall(va_end_fn, {va_alloca});
+                }
+            }
+        }
+
         // Add implicit return if needed
         llvm::BasicBlock *current_block = builder().GetInsertBlock();
         if (current_block && !current_block->getTerminator())
@@ -2419,7 +2473,8 @@ namespace Cryo::Codegen
         // Exit function scope
         values().exit_scope();
 
-        // Clear function context
+        // Clear va_list params and function context
+        ctx().clear_va_list_params();
         ctx().clear_current_function();
     }
 
