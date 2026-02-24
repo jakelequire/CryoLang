@@ -28,8 +28,55 @@ public:
     set_arg(&this, key: string, arg: Argument) -> void {
         this.args.set(key, arg);
     }
-}
 
+    get_arg(&this, key: string) -> Argument* {
+        return this.args.get(key);
+    }
+
+    has_arg(&this, key: string) -> boolean {
+        return this.args.get(key) != null;
+    }
+
+    set_flag(&this, key: string, value: string) -> void {
+        const flag: Argument = Argument {
+            name:          key,
+            description:   "",
+            default_value: value,
+            aliases:       [],
+            required:      false,
+            is_flag:       true,
+        };
+        this.flags.set(key, flag);
+    }
+
+    has_flag(&this, key: string) -> boolean {
+        return this.flags.get(key) != null;
+    }
+
+    add_positional(&this, value: string) -> void {
+        const arg: Argument = Argument {
+            name:          value,
+            description:   "",
+            default_value: "",
+            aliases:       [],
+            required:      false,
+            is_flag:       false,
+        };
+        const idx: int = this.positionals.length;
+        this.positionals[idx] = arg;
+    }
+
+    positional_count(&this) -> int {
+        return this.positionals.length;
+    }
+
+    input_file(&this) -> string {
+        if (this.positionals.length > 0) {
+            return this.positionals[0].name;
+        }
+        return "";
+    }
+}
 
 type struct Command {
     name:        string;
@@ -53,32 +100,59 @@ type struct Command {
 }
 
 
+
 type struct ArgumentParser {
-    static parse(argc: int, argv: string[], command: Command) -> ParsedArgs {
-        // Placeholder implementation for argument parsing logic.
-        return ParsedArgs {
+    /// Parses command-line arguments starting from the given index in argv.
+    /// Flags (starting with '-') go into the flags map, `-D` prefixed args
+    /// go into defines, and everything else is collected as a positional.
+    static parse(argc: int, argv: string*, start: int) -> ParsedArgs {
+        mut result: ParsedArgs = ParsedArgs {
             args:        Map<string, Argument>::new(),
             flags:       Map<string, Argument>::new(),
             defines:     Map<string, Argument>::new(),
             positionals: [],
         };
+
+        for (mut i: int = start; i < argc; i++) {
+            const arg: string = argv[i];
+            const len: int = strlen(arg) as int;
+
+            // -D defines: -DFOO=bar or -DFOO (defaults to "true")
+            if (len > 2 && strncmp(arg, "-D", 2) == 0) {
+                const define_str: string = ptr_add(arg as void*, 2) as string;
+                result.defines.set(define_str, Argument {
+                    name:          define_str,
+                    description:   "",
+                    default_value: "true",
+                    aliases:       [],
+                    required:      false,
+                    is_flag:       false,
+                });
+                continue;
+            }
+
+            // Flags: anything starting with '-'
+            if (len >= 2 && strncmp(arg, "-", 1) == 0) {
+                const name: string = ArgumentParser::normalize_flag_name(arg);
+                result.set_flag(name, "true");
+                continue;
+            }
+
+            // Positional argument
+            result.add_positional(arg);
+        }
+
+        return result;
     }
 
-    static validate_args(args: ParsedArgs, command: Command) -> boolean {
-        // Placeholder implementation for argument validation logic.
-        return true;
-    }
-
-    static print_validation_error(error: string) -> void {
-        printf("Argument validation error: %s\n", error);
-    }
-
-    static is_flag(arg: Argument) -> boolean {
-        return arg.is_flag;
-    }
-
+    /// Strips leading '--' or '-' from a flag string.
     static normalize_flag_name(name: string) -> string {
-        // Placeholder implementation for normalizing flag names.
+        if (strncmp(name, "--", 2) == 0) {
+            return ptr_add(name as void*, 2) as string;
+        }
+        if (strncmp(name, "-", 1) == 0) {
+            return ptr_add(name as void*, 1) as string;
+        }
         return name;
     }
 }
@@ -86,55 +160,75 @@ type struct ArgumentParser {
 
 type struct Runner {
 private:
-    commands:     Map<string, Command>;
-    program_name: string;
-    version:      string;
-
+    commands:      Map<string, Command>;
+    program_name:  string;
+    version:       string;
 
 public:
     static new(program_name: string, version: string) -> Runner {
         return Runner {
-            commands:     Map<string, Command>::new(),
-            program_name: program_name,
-            version:      version,
+            commands:      Map<string, Command>::new(),
+            program_name:  program_name,
+            version:       version,
         };
     }
 
+    /// Main entry point. Parses argv and dispatches to the appropriate
+    /// command or falls back to direct file compilation.
     run(&this, argc: int, argv: string*) -> int {
-        printf("Running %s version %s\n", this.program_name, this.version);
-        if (argc < 1) {
+        // No arguments — show help
+        if (argc < 2) {
             this.print_help();
             return 0;
         }
 
-        // Check if the first thing passed is a file to execute directly.
         const first_arg: string = argv[1];
-        if (File::exists(first_arg)) {
-            printf("[CLI::DEBUG] Detected file argument: %s. Attempting to execute it directly.\n", first_arg);
-            return this.execute_single_file(first_arg);
+
+        // Global flags: --help / -h
+        if (first_arg == "--help" || first_arg == "-h") {
+            this.print_help();
+            return 0;
         }
 
-        printf("[CLI::DEBUG] No file detected, proceeding with command parsing.\n");
-        // Placeholder for command execution logic.
-        return 0;
+        // Global flags: --version / -v
+        if (first_arg == "--version" || first_arg == "-v") {
+            this.print_version();
+            return 0;
+        }
+
+        // Try to match a registered command by name
+        const cmd: Command* = this.commands.get(first_arg);
+        if (cmd != null) {
+            const args: ParsedArgs = ArgumentParser::parse(argc, argv, 2);
+            return this.dispatch(first_arg, args);
+        }
+
+        // Not a known command — check if it's a file for direct compilation
+        if (File::exists(first_arg)) {
+            const args: ParsedArgs = ArgumentParser::parse(argc, argv, 2);
+            return CLI::Commands::Executor::compile_file(first_arg, args);
+        }
+
+        // Nothing matched
+        printf("Error: Unknown command or file '%s'\n\n", first_arg);
+        this.print_help();
+        return 1;
     }
 
+    /// Registers the built-in commands.
     init_commands(&this) -> Runner {
-        const help_cmd: Command = Command::new(
+        this.add_command(Command::new(
             "help",
-            "Displays help information about the program and its commands.",
+            "Display help information",
             "cryoc help [command]"
-        );
-        this.add_command(help_cmd);
+        ));
 
-        const version_cmd: Command = Command::new(
+        this.add_command(Command::new(
             "version",
-            "Displays the current version of the program.",
+            "Display version information",
             "cryoc version"
-        );
-        this.add_command(version_cmd);
-        
-        printf("Initialized commands: help, version\n");
+        ));
+
         return this;
     }
 
@@ -143,20 +237,38 @@ public:
     }
 
     print_help(&this) -> void {
-        printf("%s version %s\n", this.program_name, this.version);
-        printf("Available commands:\n");
+        printf("%s %s\n\n", this.program_name, this.version);
+        printf("Usage: %s <command> [options]\n", this.program_name);
+        printf("       %s <file.cryo> [options]\n\n", this.program_name);
+        printf("Commands:\n");
         for (mut i: int = 0; i < this.commands.keys.length; i++) {
             const cmd_name: string = this.commands.keys[i];
             const cmd: Command = this.commands.values[i];
-            printf("  %s: %s\n", cmd_name, cmd.description);
+            printf("  %-12s %s\n", cmd_name, cmd.description);
         }
+        printf("\nFlags:\n");
+        printf("  --help, -h     Display this help message\n");
+        printf("  --version, -v  Display version information\n");
+    }
+
+    print_version(&this) -> void {
+        printf("%s version %s\n", this.program_name, this.version);
     }
 
 private:
-    execute_single_file(&this, file_path: string) -> int {
-        printf("Executing file: %s\n", file_path);
-        CLI::Commands::execute_single_file(file_path);
-        // Placeholder for logic to execute a single file.
-        return 0;
+    /// Routes a named command to the appropriate handler.
+    dispatch(&this, cmd_name: string, args: ParsedArgs) -> int {
+        if (cmd_name == "help") {
+            this.print_help();
+            return 0;
+        }
+        if (cmd_name == "version") {
+            this.print_version();
+            return 0;
+        }
+
+        printf("Error: Command '%s' is not yet implemented.\n", cmd_name);
+        return 1;
     }
 }
+
