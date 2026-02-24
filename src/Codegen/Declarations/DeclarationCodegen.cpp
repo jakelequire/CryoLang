@@ -380,15 +380,10 @@ namespace Cryo::Codegen
         if (llvm::verifyFunction(*fn, &llvm::errs()))
         {
             LOG_ERROR(Cryo::LogComponent::CODEGEN, "Function verification failed: {}", name);
-            // report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
-            //              "Function '" + name + "' failed LLVM verification");
-            // Clear the builder's insert point before erasing the function
-            // to prevent dangling pointers to the deleted basic blocks
-            builder().ClearInsertionPoint();
-            // Unregister from context BEFORE erasing to prevent dangling pointers
-            ctx().unregister_function(fn);
-            fn->eraseFromParent();
-            return nullptr;
+            // Do NOT erase the function from the module. Other functions may still
+            // reference it (e.g., as a call target). Erasing it would create dangling
+            // references that crash verifyModule later. Instead, leave the broken IR
+            // in place — the module-level verification will report the error cleanly.
         }
 
         return fn;

@@ -631,6 +631,12 @@ namespace Cryo
         if (!type)
             return nullptr;
 
+        // Zero-element tuple is the unit type () — use an anonymous empty struct
+        // like unit_type() rather than creating a named "tuple()" that could
+        // conflict with (or shadow) an existing opaque struct of the same name.
+        if (type->elements().empty())
+            return unit_type();
+
         std::vector<llvm::Type *> fields;
         std::ostringstream name_stream;
         name_stream << "tuple(";
@@ -681,8 +687,19 @@ namespace Cryo
             return it->second;
         }
 
-        llvm::StructType *tuple_struct = llvm::StructType::create(
-            _llvm_ctx, fields, tuple_name);
+        // Check if a struct with this name already exists in the LLVM context
+        // (e.g., created as opaque by get_or_create_struct). If so, set its body
+        // rather than creating a duplicate with a suffixed name.
+        llvm::StructType *tuple_struct = llvm::StructType::getTypeByName(_llvm_ctx, tuple_name);
+        if (tuple_struct)
+        {
+            if (tuple_struct->isOpaque())
+                tuple_struct->setBody(fields, false);
+        }
+        else
+        {
+            tuple_struct = llvm::StructType::create(_llvm_ctx, fields, tuple_name);
+        }
 
         _struct_cache[tuple_name] = tuple_struct;
         return tuple_struct;
