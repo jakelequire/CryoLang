@@ -2548,6 +2548,13 @@ namespace Cryo
                     // Member access
                     expr = parse_member_access(std::move(expr));
                 }
+                else if (_current_token.is(TokenKind::TK_PLUSPLUS) || _current_token.is(TokenKind::TK_MINUSMINUS))
+                {
+                    // Postfix increment/decrement (e.g., this.value++)
+                    Token op = _current_token;
+                    advance();
+                    expr = _builder.create_unary_expression(op, std::move(expr));
+                }
                 else
                 {
                     // No more postfix operations
