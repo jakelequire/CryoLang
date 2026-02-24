@@ -2380,6 +2380,13 @@ namespace Cryo::Codegen
                     size_t byte_offset = 0;
                     for (size_t i = 0; i < args.size(); i++)
                     {
+                        if (!args[i])
+                        {
+                            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                     "generate_enum_variant: Skipping null payload arg {} for '{}'",
+                                     i, qualified_variant);
+                            continue;
+                        }
                         llvm::Value *field_ptr = builder().CreateConstGEP1_32(
                             llvm::Type::getInt8Ty(llvm_ctx()), payload_ptr, byte_offset, "field_ptr");
                         builder().CreateStore(args[i], field_ptr);
