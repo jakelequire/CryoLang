@@ -734,13 +734,17 @@ namespace Cryo::Codegen
                 ensure_arg_names(existing);
                 return existing;
             }
-            // Types differ. If the existing function is a declaration-only extern,
-            // we still want to reuse it (keeping the same name) so that callers
-            // don't end up with an orphaned extern. Generate the body using the
-            // extern's existing signature - in opaque pointer mode, the argument
-            // types are interchangeable since all pointers and integers are passed
-            // through the same calling convention.
-            if (existing->isDeclaration())
+            // Types differ. If the existing function is a declaration-only extern
+            // AND has the same number of parameters, we still want to reuse it
+            // (keeping the same name) so that callers don't end up with an
+            // orphaned extern. Generate the body using the extern's existing
+            // signature - in opaque pointer mode, the argument types are
+            // interchangeable since all pointers and integers are passed through
+            // the same calling convention.
+            // IMPORTANT: If the param counts differ, this is a genuine overload
+            // (e.g., no-arg vs with-arg constructor), not just a type mismatch.
+            if (existing->isDeclaration() && fn_type &&
+                existing->getFunctionType()->getNumParams() == fn_type->getNumParams())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Reusing extern declaration '{}' despite type mismatch "
@@ -749,7 +753,7 @@ namespace Cryo::Codegen
                 ensure_arg_names(existing);
                 return existing;
             }
-            // Types differ and existing has a body - this is a true overload
+            // Types differ and existing has a body (or different param count) - this is a true overload
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "DeclarationCodegen: Method '{}' exists with different types (overload), using '{}'",
                       llvm_fn_name, overload_name);
@@ -766,8 +770,10 @@ namespace Cryo::Codegen
                 ensure_arg_names(existing);
                 return existing;
             }
-            // Same logic: reuse extern declarations to avoid orphaned symbols
-            if (existing->isDeclaration())
+            // Same logic: reuse extern declarations to avoid orphaned symbols,
+            // but only when param counts match (different count = genuine overload)
+            if (existing->isDeclaration() && fn_type &&
+                existing->getFunctionType()->getNumParams() == fn_type->getNumParams())
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Reusing extern declaration (base='{}') despite type mismatch",
