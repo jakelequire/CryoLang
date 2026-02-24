@@ -348,6 +348,21 @@ namespace Cryo::Codegen
 
         // Get or create declaration
         llvm::Function *fn = module()->getFunction(name);
+        if (fn)
+        {
+            // If the definition is variadic but the pre-existing declaration is not,
+            // replace the declaration with a correct variadic one. This happens when
+            // cross-module stubs or call-site declarations are created before the
+            // defining module is compiled.
+            if (node->is_variadic() && !fn->isVarArg() && fn->empty())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Replacing non-variadic declaration of '{}' with variadic version",
+                          name);
+                fn->eraseFromParent();
+                fn = nullptr;
+            }
+        }
         if (!fn)
         {
             fn = generate_function_declaration(node);
