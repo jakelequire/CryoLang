@@ -4262,80 +4262,32 @@ namespace Cryo
         size_t errs5 = _diagnostics ? _diagnostics->error_count() : 0;
         LOG_DEBUG(LogComponent::LSP, "LSP Stage 5 (SemanticAnalysis): {} -> errs={}", s5, errs5 - errs4);
 
-        // Extended analysis: stages 6-8 for full diagnostic coverage.
-        // These stages catch codegen errors (undefined functions, member access errors, etc.)
-        // that only surface during specialization and IR generation.
+        // Stage 6: Specialization (monomorphization, generic expression resolution)
+        // This stage is purely AST-level and doesn't need CodeGenerator.
         try
         {
-            // Stage 6: Specialization (monomorphization, generic expression resolution)
-            // This stage is purely AST-level and doesn't need CodeGenerator.
             bool s6 = pipeline->run_stage(ctx, PassStage::Specialization);
             size_t errs6 = _diagnostics ? _diagnostics->error_count() : 0;
             LOG_DEBUG(LogComponent::LSP, "LSP Stage 6 (Specialization): {} -> errs={}", s6, errs6 - errs5);
-
-            // Initialize CodeGenerator for stages 7-8 (type lowering + IR generation)
-            if (!init_codegen_for_lsp())
-            {
-                LOG_DEBUG(LogComponent::LSP, "LSP: CodeGenerator init failed, skipping stages 7-8");
-                return true;
-            }
-
-            // Sync imported namespaces from compiler SRM to codegen SRM
-            if (_symbol_resolution_manager && _codegen->ensure_visitor_initialized())
-            {
-                auto *compiler_srm_ctx = _symbol_resolution_manager->get_context();
-                auto *codegen_srm_ctx = _codegen->get_visitor()->get_srm_context();
-                if (compiler_srm_ctx && codegen_srm_ctx)
-                {
-                    for (const auto &ns : compiler_srm_ctx->get_imported_namespaces())
-                        codegen_srm_ctx->add_imported_namespace(ns);
-                    for (const auto &[alias, target] : compiler_srm_ctx->get_namespace_aliases())
-                        codegen_srm_ctx->register_namespace_alias(alias, target);
-                }
-            }
-
-            // Pass imported ASTs to CodegenVisitor for dynamic enum variant extraction
-            if (_codegen->get_visitor() && _module_loader)
-                _codegen->get_visitor()->set_imported_asts(&_module_loader->get_imported_asts());
-
-            // Create a fresh PassContext that picks up the newly-initialized codegen pointer.
-            // The original ctx was created before codegen existed, so ctx._codegen is null.
-            PassContext codegen_ctx(*this);
-            // Pre-seed with all provisions from stages 1-6
-            codegen_ctx.mark_provided(PassProvides::TOKENS);
-            codegen_ctx.mark_provided(PassProvides::AST);
-            codegen_ctx.mark_provided(PassProvides::AST_VALIDATED);
-            codegen_ctx.mark_provided(PassProvides::IMPORTS_DISCOVERED);
-            codegen_ctx.mark_provided(PassProvides::MODULES_LOADED);
-            codegen_ctx.mark_provided(PassProvides::MODULE_ORDER);
-            codegen_ctx.mark_provided(PassProvides::TYPE_DECLARATIONS);
-            codegen_ctx.mark_provided(PassProvides::FUNCTION_SIGNATURES);
-            codegen_ctx.mark_provided(PassProvides::TEMPLATES_REGISTERED);
-            codegen_ctx.mark_provided(PassProvides::TYPES_RESOLVED);
-            codegen_ctx.mark_provided(PassProvides::FIELD_TYPES_RESOLVED);
-            codegen_ctx.mark_provided(PassProvides::DIRECTIVES_PROCESSED);
-            codegen_ctx.mark_provided(PassProvides::BODIES_TYPE_CHECKED);
-            codegen_ctx.mark_provided(PassProvides::MONOMORPHIZATION_COMPLETE);
-            codegen_ctx.mark_provided(PassProvides::GENERIC_EXPRESSIONS_RESOLVED);
-
-            // Stage 7: Codegen Preparation (type lowering, function declaration)
-            bool s7 = pipeline->run_stage(codegen_ctx, PassStage::CodegenPreparation);
-            size_t errs7 = _diagnostics ? _diagnostics->error_count() : 0;
-            LOG_DEBUG(LogComponent::LSP, "LSP Stage 7 (CodegenPreparation): {} -> errs={}", s7, errs7 - errs6);
-
-            // Stage 8: IR Generation (where most codegen errors are caught)
-            bool s8 = pipeline->run_stage(codegen_ctx, PassStage::IRGeneration);
-            size_t errs8 = _diagnostics ? _diagnostics->error_count() : 0;
-            LOG_DEBUG(LogComponent::LSP, "LSP Stage 8 (IRGeneration): {} -> errs={}", s8, errs8 - errs7);
         }
         catch (const std::exception &e)
         {
-            LOG_DEBUG(LogComponent::LSP, "LSP extended analysis exception (non-fatal): {}", e.what());
+            LOG_DEBUG(LogComponent::LSP, "LSP Stage 6 exception (non-fatal): {}", e.what());
         }
         catch (...)
         {
-            LOG_DEBUG(LogComponent::LSP, "LSP extended analysis exception (non-fatal, unknown)");
+            LOG_DEBUG(LogComponent::LSP, "LSP Stage 6 exception (non-fatal, unknown)");
         }
+
+        // Stages 7-8 (CodegenPreparation + IRGeneration) are intentionally SKIPPED.
+        // The LSP analyzes files individually with a fresh CompilerInstance per file.
+        // IR generation requires the full LLVM module populated with ALL imported
+        // modules' globals, functions, and types (via generate_imported_ir in
+        // topological order). The LSP doesn't do this, so codegen produces false
+        // errors like E0607 "Unknown identifier" for any cross-module global or
+        // function that exists in an imported module but wasn't generated in the
+        // LLVM module. Stages 3-6 already provide all meaningful semantic
+        // diagnostics (type errors, unknown types, undeclared variables, etc.).
 
         // Always return true — diagnostics are accumulated in DiagEmitter regardless
         // of whether individual passes succeed. The LSP will read them via convertDiagnostics.
