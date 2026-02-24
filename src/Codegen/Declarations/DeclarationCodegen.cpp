@@ -2347,26 +2347,47 @@ namespace Cryo::Codegen
         std::string va_param_name;
         if (node->is_variadic())
         {
-            // Find the variadic parameter name (its type annotation is "...")
-            for (const auto &param : node->parameters())
+            // Find the variadic parameter name.
+            // The variadic parameter is always the last one. It can be identified by:
+            // 1. TypeAnnotation with name "..." (when created via TypeAnnotation overload)
+            // 2. Resolved type of void with no type annotation (when created via TypeRef overload)
+            // 3. As a fallback, just take the last parameter when is_variadic() is true
+            const auto &params = node->parameters();
+            for (const auto &param : params)
             {
                 if (param->has_type_annotation() && param->type_annotation()->name == "...")
                 {
                     va_param_name = param->name();
                     break;
                 }
+                // Variadic params created with resolved void type and no annotation
+                if (!param->has_type_annotation() && param->get_resolved_type().is_valid() &&
+                    param->get_resolved_type()->kind() == Cryo::TypeKind::Void)
+                {
+                    va_param_name = param->name();
+                    break;
+                }
+            }
+            // Fallback: if is_variadic but no param matched, use the last parameter
+            if (va_param_name.empty() && !params.empty())
+            {
+                va_param_name = params.back()->name();
             }
 
             if (!va_param_name.empty())
             {
-                // On x86_64 Linux, va_list is [1 x %struct.__va_list_tag] = 24 bytes
+                // Allocate va_list storage. On Windows x86_64 va_list is char* (8 bytes),
+                // on Linux x86_64 it's [1 x %struct.__va_list_tag] (24 bytes).
+                // We allocate 24 bytes which is sufficient for both platforms.
                 llvm::Type *va_list_type = llvm::ArrayType::get(
                     llvm::Type::getInt8Ty(llvm_ctx()), 24);
                 llvm::AllocaInst *va_list_alloca = create_entry_alloca(fn, va_list_type, va_param_name);
 
                 // Call @llvm.va_start(ptr %va_list)
-                llvm::Function *va_start_fn = llvm::Intrinsic::getDeclaration(
-                    module(), llvm::Intrinsic::vastart);
+                llvm::Module *mod = fn->getParent();
+                llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
+                llvm::Function *va_start_fn = llvm::Intrinsic::getOrInsertDeclaration(
+                    mod, llvm::Intrinsic::vastart, {ptr_type});
                 builder().CreateCall(va_start_fn, {va_list_alloca});
 
                 // Register as a named variable so the variadic identifier resolves
@@ -2447,8 +2468,10 @@ namespace Cryo::Codegen
                 llvm::Value *va_alloca = values().get_value(va_param_name);
                 if (va_alloca)
                 {
-                    llvm::Function *va_end_fn = llvm::Intrinsic::getDeclaration(
-                        module(), llvm::Intrinsic::vaend);
+                    llvm::Module *end_mod = fn->getParent();
+                    llvm::Type *end_ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
+                    llvm::Function *va_end_fn = llvm::Intrinsic::getOrInsertDeclaration(
+                        end_mod, llvm::Intrinsic::vaend, {end_ptr_type});
                     builder().CreateCall(va_end_fn, {va_alloca});
                 }
             }
@@ -3712,6 +3735,7 @@ namespace Cryo::Codegen
             // Detect the case where 'this' is missing and prepend a ptr parameter so
             // the forward declaration matches the eventual definition signature.
             bool needs_this = false;
+            bool this_is_simple_enum = false;
             if (llvm_name.find("::") != std::string::npos)
             {
                 if (auto *tr = ctx().template_registry())
@@ -3719,6 +3743,27 @@ namespace Cryo::Codegen
                     auto [is_static, found] = tr->get_method_is_static(llvm_name);
                     if (found && !is_static)
                     {
+                        // Determine the parent type name from the qualified method name.
+                        // e.g., "Utils::Logger::LogLevel::label" -> "LogLevel"
+                        size_t last_sep = llvm_name.rfind("::");
+                        if (last_sep != std::string::npos)
+                        {
+                            std::string before_method = llvm_name.substr(0, last_sep);
+                            size_t type_sep = before_method.rfind("::");
+                            std::string parent_type = (type_sep != std::string::npos)
+                                ? before_method.substr(type_sep + 2)
+                                : before_method;
+
+                            // Check if the parent type is a simple enum
+                            TypeRef enum_type_ref = symbols().lookup_enum_type(parent_type);
+                            if (enum_type_ref.is_valid() && enum_type_ref->kind() == Cryo::TypeKind::Enum)
+                            {
+                                auto *enum_type = static_cast<const Cryo::EnumType *>(enum_type_ref.get());
+                                if (enum_type->is_simple_enum())
+                                    this_is_simple_enum = true;
+                            }
+                        }
+
                         // Check if the FunctionType already includes 'this'.
                         // When the parser uses explicit `&this` syntax, the first param
                         // is a ReferenceType (TypeKind::Reference) — don't add another.
@@ -3747,12 +3792,33 @@ namespace Cryo::Codegen
             std::vector<llvm::Type *> params;
             if (needs_this)
             {
-                // Prepend opaque ptr for the implicit 'this' parameter
-                params.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+                if (this_is_simple_enum)
+                {
+                    // Simple enum 'this' is passed by value as i32
+                    params.push_back(llvm::Type::getInt32Ty(llvm_ctx()));
+                }
+                else
+                {
+                    // Struct/class 'this' is passed as pointer
+                    params.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+                }
             }
             bool all_mapped = true;
+            bool is_first_param = true;
             for (const auto &p : func_type->param_types())
             {
+                // For simple enum methods, the first parameter (&this) is a reference
+                // that would map to ptr, but the actual definition uses i32 by value.
+                // Replace the first param with i32 to match.
+                if (is_first_param && this_is_simple_enum && !needs_this &&
+                    (p->kind() == Cryo::TypeKind::Reference || p->kind() == Cryo::TypeKind::Pointer))
+                {
+                    params.push_back(llvm::Type::getInt32Ty(llvm_ctx()));
+                    is_first_param = false;
+                    continue;
+                }
+                is_first_param = false;
+
                 llvm::Type *pt = types().map(p);
                 if (!pt)
                 {
