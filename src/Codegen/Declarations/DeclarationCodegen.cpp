@@ -733,7 +733,22 @@ namespace Cryo::Codegen
                 ensure_arg_names(existing);
                 return existing;
             }
-            // Types differ - this is an overload, use overload_name for the new function
+            // Types differ. If the existing function is a declaration-only extern,
+            // we still want to reuse it (keeping the same name) so that callers
+            // don't end up with an orphaned extern. Generate the body using the
+            // extern's existing signature - in opaque pointer mode, the argument
+            // types are interchangeable since all pointers and integers are passed
+            // through the same calling convention.
+            if (existing->isDeclaration())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Reusing extern declaration '{}' despite type mismatch "
+                          "(definition will use extern's signature)",
+                          llvm_fn_name);
+                ensure_arg_names(existing);
+                return existing;
+            }
+            // Types differ and existing has a body - this is a true overload
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "DeclarationCodegen: Method '{}' exists with different types (overload), using '{}'",
                       llvm_fn_name, overload_name);
@@ -747,6 +762,15 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Method '{}' already exists (base_method_name='{}') with matching types",
                           llvm_fn_name, base_method_name);
+                ensure_arg_names(existing);
+                return existing;
+            }
+            // Same logic: reuse extern declarations to avoid orphaned symbols
+            if (existing->isDeclaration())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Reusing extern declaration (base='{}') despite type mismatch",
+                          base_method_name);
                 ensure_arg_names(existing);
                 return existing;
             }
@@ -1442,7 +1466,10 @@ namespace Cryo::Codegen
         }
 
         // Create global variable
-        bool is_constant = !node->is_mutable();
+        // A global without an initializer must be writable even if declared `const`,
+        // because it will be assigned at runtime (e.g., `const g_logger: Logger*;`
+        // followed by `g_logger = malloc(...)` in an init function).
+        bool is_constant = !node->is_mutable() && node->initializer() != nullptr;
         llvm::GlobalValue::LinkageTypes linkage = get_linkage(node);
 
         llvm::GlobalVariable *global = new llvm::GlobalVariable(
@@ -3184,6 +3211,83 @@ namespace Cryo::Codegen
                                 method_name = namespaced_name;
                             }
                         }
+                    }
+                }
+
+                // Fallback: scan the LLVM module for any function matching the pattern
+                // *::TypeName::method_name (with or without param suffix).
+                // This catches extern declarations created by resolve_method_by_name
+                // that may have a different name qualification or param suffix than what
+                // generate_method_declaration produced.
+                // Prefer declaration-only functions (externs that need bodies).
+                if (!fn)
+                {
+                    std::string suffix = "::" + type_name + "::" + fn_node->name();
+                    llvm::Function *scan_decl = nullptr;   // declaration-only match
+                    llvm::Function *scan_any = nullptr;     // any match
+                    std::string scan_decl_name, scan_any_name;
+
+                    for (auto &mod_fn : module()->functions())
+                    {
+                        std::string fn_name = mod_fn.getName().str();
+                        if (fn_name.size() >= suffix.size())
+                        {
+                            size_t pos = fn_name.find(suffix);
+                            if (pos != std::string::npos &&
+                                (pos + suffix.size() == fn_name.size() ||
+                                 fn_name[pos + suffix.size()] == '('))
+                            {
+                                if (mod_fn.isDeclaration() && !scan_decl)
+                                {
+                                    scan_decl = &mod_fn;
+                                    scan_decl_name = fn_name;
+                                }
+                                if (!scan_any)
+                                {
+                                    scan_any = &mod_fn;
+                                    scan_any_name = fn_name;
+                                }
+                                // If we found a declaration-only function, prefer it
+                                if (scan_decl)
+                                    break;
+                            }
+                        }
+                    }
+
+                    // Prefer the declaration-only match (extern that needs a body)
+                    if (scan_decl)
+                    {
+                        fn = scan_decl;
+                        method_name = scan_decl_name;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Pass 2: Found extern declaration '{}::{}' via module scan as '{}'",
+                                  type_name, fn_node->name(), scan_decl_name);
+                    }
+                    else if (scan_any)
+                    {
+                        fn = scan_any;
+                        method_name = scan_any_name;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Pass 2: Found method '{}::{}' via module scan as '{}'",
+                                  type_name, fn_node->name(), scan_any_name);
+                    }
+                }
+
+                // Last resort: if the function still wasn't found (e.g., generate_method_declaration
+                // returned nullptr due to a parameter type check), create it now.
+                // This ensures that impl block methods are always generated, even when Pass 1 skipped them.
+                if (!fn)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Pass 2: Method '{}::{}' not found after all lookups, attempting late declaration",
+                              type_name, fn_node->name());
+                    fn = generate_method_declaration(fn_node, type_name);
+                    if (fn)
+                    {
+                        method_name = fn->getName().str();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Pass 2: Late-declared method '{}::{}' as '{}'",
+                                  type_name, fn_node->name(), method_name);
                     }
                 }
 

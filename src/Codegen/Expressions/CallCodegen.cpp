@@ -42,7 +42,7 @@ namespace Cryo::Codegen
         "printf", "snprintf", "sprintf", "fprintf", "sscanf", "getchar", "putchar", "puts",
         // File I/O
         "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush", "feof", "ferror",
-        "fgets", "fputs", "fgetc", "fputc", "fileno",
+        "fgets", "fputs", "fgetc", "fputc", "fileno", "fdopen",
         // Low-level file descriptor I/O
         "read", "write", "open", "close", "lseek", "dup", "dup2", "pipe", "fcntl",
         // Filesystem operations
