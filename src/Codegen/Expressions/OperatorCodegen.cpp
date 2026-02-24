@@ -2428,6 +2428,17 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Fallback: use SRM to generate all possible candidates including parent namespaces.
+            // This handles cases like accessing Utils::g_logger from Utils::Logger namespace.
+            auto srm_candidates = generate_lookup_candidates(name, Cryo::SymbolKind::Variable);
+            for (const auto &srm_candidate : srm_candidates)
+            {
+                if (llvm::GlobalVariable *global = module()->getGlobalVariable(srm_candidate))
+                {
+                    return global;
+                }
+            }
+
             return nullptr;
         }
 

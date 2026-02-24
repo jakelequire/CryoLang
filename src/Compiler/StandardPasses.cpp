@@ -1266,6 +1266,409 @@ namespace Cryo
             }
         }
 
+        // === PHASE 4: Resolve type annotations in imported local module ASTs ===
+        // Imported modules don't go through the TypeResolutionPass, so their
+        // VariableDeclarationNode, FunctionDeclarationNode, StructDeclarationNode,
+        // and ImplementationBlockNode type annotations are never resolved.
+        // We fix that here using the same resolver + context (main module context
+        // has all imported types registered from Phase 0 above).
+        auto *module_loader = _compiler.module_loader();
+        if (module_loader)
+        {
+            const auto &imported_asts = module_loader->get_imported_asts();
+            const auto &local_names = module_loader->get_all_local_import_names();
+
+            if (!imported_asts.empty() && !local_names.empty())
+            {
+                LOG_DEBUG(LogComponent::GENERAL,
+                    "TypeResolutionPass: Phase 4 - Resolving types in {} imported local module ASTs",
+                    local_names.size());
+
+                for (const auto &[mod_name, ast_ptr] : imported_asts)
+                {
+                    if (!ast_ptr)
+                        continue;
+
+                    // Only process local project imports, not stdlib modules
+                    bool is_local = local_names.count(mod_name) > 0;
+                    if (!is_local)
+                    {
+                        // Also check prefix match (e.g., "Utils::Logger" when "Utils" is local)
+                        for (const auto &local_name : local_names)
+                        {
+                            if (mod_name.compare(0, local_name.size() + 2, local_name + "::") == 0 ||
+                                local_name.compare(0, mod_name.size() + 2, mod_name + "::") == 0)
+                            {
+                                is_local = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!is_local)
+                        continue;
+
+                    LOG_DEBUG(LogComponent::GENERAL,
+                        "TypeResolutionPass: Phase 4 - Processing imported module '{}'", mod_name);
+
+                    // --- Phase 2b equivalent: resolve type annotations ---
+                    for (auto &stmt : ast_ptr->statements())
+                    {
+                        // Handle implement blocks
+                        if (auto *impl = dynamic_cast<ImplementationBlockNode *>(stmt.get()))
+                        {
+                            ResolutionContext impl_ctx = res_ctx.child();
+                            const std::string &target = impl->target_type();
+                            size_t angle_pos = target.find('<');
+                            if (angle_pos != std::string::npos && target.back() == '>')
+                            {
+                                std::string params_str = target.substr(angle_pos + 1, target.size() - angle_pos - 2);
+                                std::vector<std::string> param_names;
+                                size_t start = 0;
+                                for (size_t i = 0; i <= params_str.size(); ++i)
+                                {
+                                    if (i == params_str.size() || params_str[i] == ',')
+                                    {
+                                        std::string param = params_str.substr(start, i - start);
+                                        while (!param.empty() && (param.front() == ' ' || param.front() == '\t'))
+                                            param.erase(0, 1);
+                                        while (!param.empty() && (param.back() == ' ' || param.back() == '\t'))
+                                            param.pop_back();
+                                        if (!param.empty())
+                                            param_names.push_back(param);
+                                        start = i + 1;
+                                    }
+                                }
+                                for (size_t i = 0; i < param_names.size(); ++i)
+                                {
+                                    TypeRef param_type = arena.create_generic_param(param_names[i], i);
+                                    impl_ctx.bind_generic(param_names[i], param_type);
+                                }
+                            }
+
+                            for (auto &method : impl->method_implementations())
+                            {
+                                ResolutionContext method_ctx = impl_ctx.child();
+                                const auto &method_generic_params = method->generic_parameters();
+                                size_t impl_param_count = 0;
+                                for (const auto &[name, _] : impl_ctx.generic_bindings)
+                                    impl_param_count++;
+
+                                if (!method_generic_params.empty())
+                                {
+                                    for (size_t i = 0; i < method_generic_params.size(); ++i)
+                                    {
+                                        const std::string &param_name = method_generic_params[i]->name();
+                                        TypeRef param_type = arena.create_generic_param(param_name, impl_param_count + i);
+                                        method_ctx.bind_generic(param_name, param_type);
+                                    }
+                                }
+
+                                // Resolve return type
+                                auto *ann = method->return_type_annotation();
+                                if (ann && type_needs_resolution(method->get_resolved_return_type(), ann))
+                                {
+                                    TypeRef resolved = resolver.resolve(*ann, method_ctx);
+                                    if (!resolved.is_error())
+                                    {
+                                        method->set_resolved_return_type(resolved);
+                                        resolved_count++;
+                                    }
+                                    else
+                                    {
+                                        error_count++;
+                                    }
+                                }
+
+                                // Resolve parameter types
+                                for (auto &param : method->parameters())
+                                {
+                                    if (param->name() == "this" && param->has_resolved_type())
+                                    {
+                                        TypeRef current_type = param->get_resolved_type();
+                                        bool needs_reconstruction = current_type.is_error();
+                                        bool impl_is_generic = !impl_ctx.generic_bindings.empty();
+
+                                        if (!needs_reconstruction && impl_is_generic)
+                                        {
+                                            TypeRef inner_type = current_type;
+                                            if (current_type->kind() == TypeKind::Reference)
+                                            {
+                                                auto *ref = static_cast<const ReferenceType *>(current_type.get());
+                                                inner_type = ref->referent();
+                                            }
+                                            if (!inner_type->is_instantiated() && !contains_generic_params(inner_type))
+                                                needs_reconstruction = true;
+                                        }
+
+                                        if (needs_reconstruction)
+                                        {
+                                            std::string base_name = target;
+                                            std::vector<std::string> generic_arg_names;
+                                            size_t ap = target.find('<');
+                                            if (ap != std::string::npos && target.back() == '>')
+                                            {
+                                                base_name = target.substr(0, ap);
+                                                std::string ps = target.substr(ap + 1, target.size() - ap - 2);
+                                                size_t s = 0;
+                                                for (size_t i = 0; i <= ps.size(); ++i)
+                                                {
+                                                    if (i == ps.size() || ps[i] == ',')
+                                                    {
+                                                        std::string a = ps.substr(s, i - s);
+                                                        while (!a.empty() && (a.front() == ' ' || a.front() == '\t'))
+                                                            a.erase(0, 1);
+                                                        while (!a.empty() && (a.back() == ' ' || a.back() == '\t'))
+                                                            a.pop_back();
+                                                        if (!a.empty())
+                                                            generic_arg_names.push_back(a);
+                                                        s = i + 1;
+                                                    }
+                                                }
+                                            }
+
+                                            if (!generic_arg_names.empty())
+                                            {
+                                                TypeAnnotation base_ann = TypeAnnotation::named(base_name, param->location());
+                                                std::vector<TypeAnnotation> arg_annotations;
+                                                for (const auto &arg_name : generic_arg_names)
+                                                    arg_annotations.push_back(TypeAnnotation::named(arg_name, param->location()));
+                                                TypeAnnotation generic_ann = TypeAnnotation::generic(
+                                                    std::move(base_ann), std::move(arg_annotations), param->location());
+                                                TypeRef resolved_type = resolver.resolve(generic_ann, method_ctx);
+                                                if (resolved_type.is_valid() && !resolved_type.is_error())
+                                                {
+                                                    TypeRef this_type = arena.get_reference_to(resolved_type);
+                                                    param->set_resolved_type(this_type);
+                                                    resolved_count++;
+                                                }
+                                            }
+                                            else
+                                            {
+                                                TypeRef base_type = arena.lookup_type_by_name(base_name);
+                                                if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                                    base_type = symbols->lookup_enum_type(base_name);
+                                                if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                                    base_type = symbols->lookup_struct_type(base_name);
+                                                if ((!base_type.is_valid() || base_type.is_error()) && symbols)
+                                                    base_type = symbols->lookup_class_type(base_name);
+                                                if (base_type.is_valid() && !base_type.is_error())
+                                                {
+                                                    TypeRef this_type = arena.get_reference_to(base_type);
+                                                    param->set_resolved_type(this_type);
+                                                    resolved_count++;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    else
+                                    {
+                                        const auto *param_ann = param->type_annotation();
+                                        if (param_ann && (!param->has_resolved_type() || param->get_resolved_type().is_error()))
+                                        {
+                                            TypeRef resolved = resolver.resolve(*param_ann, method_ctx);
+                                            if (!resolved.is_error())
+                                            {
+                                                param->set_resolved_type(resolved);
+                                                resolved_count++;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Resolve local variable types in method body
+                                if (method->body())
+                                {
+                                    TypeRef return_type = method->get_resolved_return_type();
+                                    resolve_variable_types_in_statement(method->body(), resolver, method_ctx, return_type, resolved_count, error_count, _compiler.diagnostics());
+                                }
+                            }
+                        }
+                        // Handle struct declarations
+                        else if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(stmt.get()))
+                        {
+                            ResolutionContext struct_ctx = res_ctx.child();
+                            const auto &struct_generic_params = struct_decl->generic_parameters();
+                            if (!struct_generic_params.empty())
+                            {
+                                for (size_t i = 0; i < struct_generic_params.size(); ++i)
+                                {
+                                    const std::string &param_name = struct_generic_params[i]->name();
+                                    TypeRef param_type = arena.create_generic_param(param_name, i);
+                                    struct_ctx.bind_generic(param_name, param_type);
+                                }
+                            }
+
+                            // Register struct type for self-referential resolution
+                            if (symbols)
+                            {
+                                TypeRef struct_type = symbols->lookup_struct_type(struct_decl->name());
+                                if (struct_type.is_valid())
+                                    module_registry.register_type(struct_ctx.current_module, struct_decl->name(), struct_type);
+                            }
+
+                            for (auto &method : struct_decl->methods())
+                            {
+                                ResolutionContext method_ctx = struct_ctx.child();
+                                const auto &method_generic_params = method->generic_parameters();
+                                if (!method_generic_params.empty())
+                                {
+                                    size_t base_index = struct_generic_params.size();
+                                    for (size_t i = 0; i < method_generic_params.size(); ++i)
+                                    {
+                                        const std::string &param_name = method_generic_params[i]->name();
+                                        TypeRef param_type = arena.create_generic_param(param_name, base_index + i);
+                                        method_ctx.bind_generic(param_name, param_type);
+                                    }
+                                }
+
+                                // Resolve return type
+                                auto *ann = method->return_type_annotation();
+                                if (ann && type_needs_resolution(method->get_resolved_return_type(), ann))
+                                {
+                                    TypeRef resolved = resolver.resolve(*ann, method_ctx);
+                                    if (!resolved.is_error())
+                                    {
+                                        method->set_resolved_return_type(resolved);
+                                        resolved_count++;
+                                    }
+                                    else
+                                    {
+                                        error_count++;
+                                    }
+                                }
+
+                                // Resolve parameter types
+                                for (auto &param : method->parameters())
+                                {
+                                    const auto *param_ann = param->type_annotation();
+                                    if (param_ann && (!param->has_resolved_type() || param->get_resolved_type().is_error()))
+                                    {
+                                        TypeRef resolved = resolver.resolve(*param_ann, method_ctx);
+                                        if (!resolved.is_error())
+                                        {
+                                            param->set_resolved_type(resolved);
+                                            resolved_count++;
+                                        }
+                                        else
+                                        {
+                                            error_count++;
+                                        }
+                                    }
+                                }
+
+                                // Resolve local variable types in method body
+                                if (method->body())
+                                {
+                                    TypeRef return_type = method->get_resolved_return_type();
+                                    resolve_variable_types_in_statement(method->body(), resolver, method_ctx, return_type, resolved_count, error_count, _compiler.diagnostics());
+                                }
+                            }
+
+                            // Resolve struct field types
+                            for (auto &field : struct_decl->fields())
+                            {
+                                const auto *ann = field->type_annotation();
+                                if (ann && (!field->has_resolved_type() || field->get_resolved_type().is_error()))
+                                {
+                                    TypeRef resolved = resolver.resolve(*ann, struct_ctx);
+                                    if (!resolved.is_error())
+                                    {
+                                        field->set_resolved_type(resolved);
+                                        resolved_count++;
+                                    }
+                                    else
+                                    {
+                                        error_count++;
+                                    }
+                                }
+                            }
+                        }
+                        // Handle function declarations
+                        else if (auto *func = dynamic_cast<FunctionDeclarationNode *>(stmt.get()))
+                        {
+                            ResolutionContext func_ctx = res_ctx.child();
+                            const auto &generic_params = func->generic_parameters();
+                            if (!generic_params.empty())
+                            {
+                                for (size_t i = 0; i < generic_params.size(); ++i)
+                                {
+                                    const std::string &param_name = generic_params[i]->name();
+                                    TypeRef param_type = arena.create_generic_param(param_name, i);
+                                    func_ctx.bind_generic(param_name, param_type);
+                                }
+                            }
+
+                            // Resolve return type
+                            auto *ann = func->return_type_annotation();
+                            if (ann && type_needs_resolution(func->get_resolved_return_type(), ann))
+                            {
+                                TypeRef resolved = resolver.resolve(*ann, func_ctx);
+                                if (!resolved.is_error())
+                                {
+                                    func->set_resolved_return_type(resolved);
+                                    resolved_count++;
+                                }
+                                else
+                                {
+                                    error_count++;
+                                }
+                            }
+
+                            // Resolve parameter types
+                            for (auto &param : func->parameters())
+                            {
+                                const auto *param_ann = param->type_annotation();
+                                if (param_ann && (!param->has_resolved_type() || param->get_resolved_type().is_error()))
+                                {
+                                    TypeRef resolved = resolver.resolve(*param_ann, func_ctx);
+                                    if (!resolved.is_error())
+                                    {
+                                        param->set_resolved_type(resolved);
+                                        resolved_count++;
+                                    }
+                                }
+                            }
+
+                            // Resolve local variable types in function body
+                            if (func->body())
+                            {
+                                TypeRef return_type = func->get_resolved_return_type();
+                                resolve_variable_types_in_statement(func->body(), resolver, func_ctx, return_type, resolved_count, error_count, _compiler.diagnostics());
+                            }
+                        }
+                        // Handle global variable declarations
+                        else if (auto *var_decl = dynamic_cast<VariableDeclarationNode *>(stmt.get()))
+                        {
+                            const auto *ann = var_decl->type_annotation();
+                            if (ann && (!var_decl->get_resolved_type().is_valid() || var_decl->get_resolved_type().is_error()))
+                            {
+                                TypeRef resolved = resolver.resolve(*ann, res_ctx);
+                                if (!resolved.is_error())
+                                {
+                                    var_decl->set_resolved_type(resolved);
+                                    resolved_count++;
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                        "TypeResolutionPass: Phase 4 - Resolved global variable '{}' type to '{}' in module '{}'",
+                                        var_decl->name(), resolved->display_name(), mod_name);
+                                }
+                                else
+                                {
+                                    error_count++;
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                        "TypeResolutionPass: Phase 4 - Failed to resolve global variable '{}' type in module '{}'",
+                                        var_decl->name(), mod_name);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                LOG_DEBUG(LogComponent::GENERAL,
+                    "TypeResolutionPass: Phase 4 complete - resolved {} types total, {} errors total",
+                    resolved_count, error_count);
+            }
+        }
+
         LOG_DEBUG(LogComponent::GENERAL,
             "TypeResolutionPass: Resolved {} types, {} errors", resolved_count, error_count);
 
@@ -1306,6 +1709,51 @@ namespace Cryo
             {
                 sync_class_fields(class_decl, ctx);
                 synced_count++;
+            }
+        }
+
+        // Also sync struct/class fields from imported local module ASTs
+        auto *module_loader = _compiler.module_loader();
+        if (module_loader)
+        {
+            const auto &imported_asts = module_loader->get_imported_asts();
+            const auto &local_names = module_loader->get_all_local_import_names();
+
+            for (const auto &[mod_name, ast_ptr] : imported_asts)
+            {
+                if (!ast_ptr)
+                    continue;
+
+                // Only process local project imports
+                bool is_local = local_names.count(mod_name) > 0;
+                if (!is_local)
+                {
+                    for (const auto &local_name : local_names)
+                    {
+                        if (mod_name.compare(0, local_name.size() + 2, local_name + "::") == 0 ||
+                            local_name.compare(0, mod_name.size() + 2, mod_name + "::") == 0)
+                        {
+                            is_local = true;
+                            break;
+                        }
+                    }
+                }
+                if (!is_local)
+                    continue;
+
+                for (auto &decl : ast_ptr->statements())
+                {
+                    if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(decl.get()))
+                    {
+                        sync_struct_fields(struct_decl, ctx);
+                        synced_count++;
+                    }
+                    else if (auto *class_decl = dynamic_cast<ClassDeclarationNode *>(decl.get()))
+                    {
+                        sync_class_fields(class_decl, ctx);
+                        synced_count++;
+                    }
+                }
             }
         }
 

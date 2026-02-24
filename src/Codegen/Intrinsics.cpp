@@ -124,6 +124,8 @@ namespace Cryo::Codegen
             return generate_ferror(args);
         else if (intrinsic_name == "fileno")
             return generate_fileno(args);
+        else if (intrinsic_name == "fdopen")
+            return generate_fdopen(args);
         else if (intrinsic_name == "fgets")
             return generate_fgets(args);
         else if (intrinsic_name == "fputs")
@@ -3484,6 +3486,28 @@ namespace Cryo::Codegen
 
         llvm::Function *fileno_func = get_or_create_libc_function("fileno", fileno_type);
         return builder.CreateCall(fileno_func, {args[0]}, "fileno.result");
+    }
+
+    llvm::Value *Intrinsics::generate_fdopen(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("fdopen requires exactly 2 arguments (fd, mode)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create fdopen function type: FILE* fdopen(int fd, const char* mode)
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *char_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(context), 0);
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0); // FILE*
+        llvm::FunctionType *fdopen_type = llvm::FunctionType::get(
+            void_ptr_type, {int_type, char_ptr_type}, false);
+
+        llvm::Function *fdopen_func = get_or_create_libc_function("fdopen", fdopen_type);
+        return builder.CreateCall(fdopen_func, {args[0], args[1]}, "fdopen.result");
     }
 
     llvm::Value *Intrinsics::generate_fgets(const std::vector<llvm::Value *> &args)
