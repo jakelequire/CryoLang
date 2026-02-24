@@ -5692,10 +5692,25 @@ namespace Cryo::Codegen
         // Pass null for the remainder pointer (we don't need to know remaining time)
         llvm::Value *rem_null = llvm::ConstantPointerNull::get(llvm::PointerType::get(context, 0));
 
-        // Call the real nanosleep(struct timespec*, struct timespec*)
-        llvm::FunctionType *nanosleep_type = llvm::FunctionType::get(int_type, {void_ptr_type, void_ptr_type}, false);
-        llvm::Function *nanosleep_func = get_or_create_libc_function("nanosleep", nanosleep_type);
-        return builder.CreateCall(nanosleep_func, {req, rem_null}, "nanosleep.result");
+        // Call the POSIX nanosleep(struct timespec*, struct timespec*).
+        // The Cryo intrinsic declaration creates @nanosleep with (i64, i64) signature
+        // in the LLVM module. The real C function takes (ptr, ptr). With LLVM opaque
+        // pointers we can call through the existing @nanosleep symbol using a different
+        // function type — LLVM will emit the call with the correct (ptr, ptr) signature
+        // and the linker resolves @nanosleep to the C library symbol.
+        llvm::FunctionType *c_nanosleep_type = llvm::FunctionType::get(int_type, {void_ptr_type, void_ptr_type}, false);
+
+        auto *module = _context_manager.get_module();
+        llvm::Function *nanosleep_func = module->getFunction("nanosleep");
+        if (!nanosleep_func)
+        {
+            nanosleep_func = llvm::Function::Create(
+                c_nanosleep_type, llvm::Function::ExternalLinkage,
+                "nanosleep", module);
+        }
+        // Call with the correct C type signature (ptr, ptr), even if the LLVM function
+        // was declared with (i64, i64). Opaque pointers make this safe.
+        return builder.CreateCall(c_nanosleep_type, nanosleep_func, {req, rem_null}, "nanosleep.result");
     }
 
     llvm::Value *Intrinsics::generate_sleep(const std::vector<llvm::Value *> &args)

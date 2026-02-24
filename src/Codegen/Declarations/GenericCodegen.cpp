@@ -2148,8 +2148,20 @@ namespace Cryo::Codegen
                                   arg.getType()->isIntegerTy());
 
                         llvm::AllocaInst *alloca = create_entry_alloca(fn, arg.getType(), param_name);
-                        create_store(&arg, alloca);
-                        values().set_value(param_name, nullptr, alloca);
+                        if (alloca)
+                        {
+                            create_store(&arg, alloca);
+                            values().set_value(param_name, nullptr, alloca);
+                        }
+                        else
+                        {
+                            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                     "GenericCodegen: Failed to create alloca for enum method param '{}', "
+                                     "registering arg directly",
+                                     param_name);
+                            // Register the raw argument so lookups don't fail
+                            values().set_value(param_name, nullptr, nullptr);
+                        }
 
                         // Register parameter type in variable_types_map for method resolution
                         // Skip 'this' parameter (first param for instance methods)
