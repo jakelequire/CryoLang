@@ -1268,6 +1268,10 @@ namespace Cryo
         bool _is_destructor;
         bool _is_static;
         bool _is_default_destructor; // For ~TypeName() default; syntax
+        bool _is_virtual = false;
+        bool _is_override = false;
+        std::string _base_ctor_name;
+        std::vector<std::unique_ptr<ExpressionNode>> _base_ctor_args;
 
     public:
         // Constructor with TypeAnnotation (preferred - parser should use this)
@@ -1292,6 +1296,16 @@ namespace Cryo
         bool is_destructor() const { return _is_destructor; }
         bool is_static() const { return _is_static; }
         bool is_default_destructor() const { return _is_default_destructor; }
+        bool is_virtual() const { return _is_virtual; }
+        bool is_override() const { return _is_override; }
+        void set_virtual(bool v) { _is_virtual = v; }
+        void set_override(bool v) { _is_override = v; }
+
+        // Base constructor call support
+        const std::string &base_ctor_name() const { return _base_ctor_name; }
+        void set_base_ctor_name(const std::string &name) { _base_ctor_name = name; }
+        const std::vector<std::unique_ptr<ExpressionNode>> &base_ctor_args() const { return _base_ctor_args; }
+        void add_base_ctor_arg(std::unique_ptr<ExpressionNode> arg) { _base_ctor_args.push_back(std::move(arg)); }
 
         void print(std::ostream &os, int indent = 0) const override
         {
@@ -1302,8 +1316,16 @@ namespace Cryo
                 os << "protected ";
             if (_is_static)
                 os << "static ";
+            if (_is_virtual)
+                os << "virtual ";
+            if (_is_override)
+                os << "override ";
             if (_is_constructor)
+            {
                 os << "constructor ";
+                if (!_base_ctor_name.empty())
+                    os << ": " << _base_ctor_name << "(...) ";
+            }
             if (_is_destructor)
             {
                 os << "destructor ";

@@ -167,6 +167,7 @@ namespace Cryo
         size_t _computed_size = 0;
         size_t _computed_alignment = 1;
         bool _has_virtual_methods = false;
+        bool _is_abstract = false;
 
     public:
         ClassType(TypeID id, QualifiedTypeName name)
@@ -203,6 +204,13 @@ namespace Cryo
         const std::vector<MethodInfo> &methods() const { return _methods; }
         const MethodInfo *get_method(const std::string &name) const;
         bool has_virtual_methods() const { return _has_virtual_methods; }
+        bool is_abstract() const { return _is_abstract; }
+        void set_abstract(bool v) { _is_abstract = v; }
+
+        // Build the ordered vtable method list (base class methods first, overrides replace)
+        std::vector<MethodInfo> build_vtable() const;
+        // Get the vtable index for a given method name, or -1 if not found
+        int vtable_index(const std::string &method_name) const;
 
         // Type properties
         bool is_user_defined() const override { return true; }

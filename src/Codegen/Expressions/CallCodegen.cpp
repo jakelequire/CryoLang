@@ -229,33 +229,121 @@ namespace Cryo::Codegen
                               "Generated member address for nested receiver: {}",
                               nested_member->member());
 
-                    // CRITICAL FIX: For primitive type members (string, i32, etc.), the field contains
-                    // a pointer value that we need to LOAD before passing to the method.
-                    // For example: this.input_buffer.length() where input_buffer is a string (ptr)
-                    //   - GEP gives us the address of the input_buffer field
-                    //   - But string::length expects the actual string pointer, not the field address
-                    //   - So we need to load the pointer value from the field
+                    // CRITICAL FIX: generate_member_receiver_address returns a GEP (address of the
+                    // field within the struct). If the field itself stores a pointer value (e.g., ASTNode*,
+                    // string, etc.), we need to LOAD the pointer from the field before using it as a
+                    // method receiver.
+                    //
+                    // Check the LLVM struct field type to determine if a load is needed.
+                    // The GEP gives us ptr-to-field; if the field is ptr type, we need to load it.
                     if (receiver)
                     {
-                        TypeRef nested_type = nested_member->get_resolved_type();
-                        if (nested_type.is_valid())
-                        {
-                            std::string type_name = nested_type->display_name();
-                            // Check if it's a primitive type that stores a pointer value
-                            static const std::unordered_set<std::string> primitive_ptr_types = {
-                                "string", "i8*", "u8*", "char*"};
-                            bool is_string_type = (nested_type->kind() == Cryo::TypeKind::String ||
-                                                   primitive_ptr_types.find(type_name) != primitive_ptr_types.end());
+                        bool needs_load = false;
 
-                            if (is_string_type)
+                        // Look up the parent object's LLVM struct type and check the field type
+                        std::string parent_type_name;
+                        TypeRef parent_cryo_type;
+
+                        // Get the parent object's type name to find the LLVM struct type.
+                        // Try AST resolved types first, then fall back to codegen variable_types_map.
+                        if (auto *inner_id = dynamic_cast<Cryo::IdentifierNode *>(nested_member->object()))
+                        {
+                            parent_cryo_type = inner_id->get_resolved_type();
+                            // Fall back to variable_types_map (parameters/locals often have types here)
+                            if (!parent_cryo_type.is_valid())
                             {
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "Loading string pointer from member field for primitive method call: {}",
-                                          nested_member->member());
-                                receiver = builder().CreateLoad(
-                                    llvm::PointerType::get(llvm_ctx(), 0), receiver,
-                                    nested_member->member() + ".str.load");
+                                auto &var_types = ctx().variable_types_map();
+                                auto it = var_types.find(inner_id->name());
+                                if (it != var_types.end())
+                                    parent_cryo_type = it->second;
                             }
+                        }
+                        else if (auto *inner_mem = dynamic_cast<Cryo::MemberAccessNode *>(nested_member->object()))
+                        {
+                            parent_cryo_type = inner_mem->get_resolved_type();
+                        }
+
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Nested receiver load check: parent_cryo_type valid={}, kind={}",
+                                  parent_cryo_type.is_valid(),
+                                  parent_cryo_type.is_valid() ? static_cast<int>(parent_cryo_type->kind()) : -1);
+
+                        // Unwrap pointer to get the base type name
+                        if (parent_cryo_type.is_valid() && parent_cryo_type->kind() == Cryo::TypeKind::Pointer)
+                        {
+                            auto *ptr_t = static_cast<const Cryo::PointerType *>(parent_cryo_type.get());
+                            if (ptr_t->pointee().is_valid())
+                                parent_type_name = ptr_t->pointee()->display_name();
+                        }
+                        else if (parent_cryo_type.is_valid())
+                        {
+                            parent_type_name = parent_cryo_type->display_name();
+                        }
+
+                        // Try LLVM struct type lookup to check field type
+                        if (!parent_type_name.empty())
+                        {
+                            llvm::StructType *parent_llvm_type = llvm::StructType::getTypeByName(llvm_ctx(), parent_type_name);
+                            if (parent_llvm_type)
+                            {
+                                // Find the field index by name using the class/struct metadata
+                                TypeRef base_type = ctx().symbols().lookup_class_type(parent_type_name);
+                                if (!base_type.is_valid())
+                                    base_type = ctx().symbols().lookup_struct_type(parent_type_name);
+
+                                if (base_type.is_valid())
+                                {
+                                    auto *cls = dynamic_cast<const Cryo::ClassType *>(base_type.get());
+                                    auto *st = cls ? nullptr : dynamic_cast<const Cryo::StructType *>(base_type.get());
+                                    std::optional<size_t> field_idx;
+                                    if (cls)
+                                        field_idx = cls->field_index(nested_member->member());
+                                    else if (st)
+                                        field_idx = st->field_index(nested_member->member());
+
+                                    if (field_idx.has_value())
+                                    {
+                                        // Account for vtable pointer offset (field 0 is vptr for classes with vtable)
+                                        size_t llvm_idx = *field_idx;
+                                        if (cls && (cls->has_virtual_methods() || cls->has_base_class()))
+                                            llvm_idx += 1; // vtable pointer is at index 0
+
+                                        if (llvm_idx < parent_llvm_type->getNumElements())
+                                        {
+                                            llvm::Type *field_llvm_type = parent_llvm_type->getElementType(llvm_idx);
+                                            if (field_llvm_type->isPointerTy())
+                                            {
+                                                needs_load = true;
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "Field '{}' in '{}' at LLVM index {} is pointer type, will load for chained access",
+                                                          nested_member->member(), parent_type_name, llvm_idx);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Fallback: check the AST resolved type
+                        if (!needs_load)
+                        {
+                            TypeRef nested_type = nested_member->get_resolved_type();
+                            if (nested_type.is_valid() &&
+                                (nested_type->kind() == Cryo::TypeKind::Pointer ||
+                                 nested_type->kind() == Cryo::TypeKind::String))
+                            {
+                                needs_load = true;
+                            }
+                        }
+
+                        if (needs_load)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Loading pointer from member field for chained method call: {}",
+                                      nested_member->member());
+                            receiver = builder().CreateLoad(
+                                llvm::PointerType::get(llvm_ctx(), 0), receiver,
+                                nested_member->member() + ".ptr.load");
                         }
                     }
                     else
@@ -1992,6 +2080,27 @@ namespace Cryo::Codegen
             report_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED, node,
                          "Failed to allocate class instance");
             return nullptr;
+        }
+
+        // Initialize vtable pointer if this class has virtual methods
+        {
+            TypeRef cryo_type = ctx().symbols().lookup_class_type(effective_type_name);
+            if (cryo_type.is_valid())
+            {
+                auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
+                if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
+                {
+                    std::string vtable_name = "vtable." + effective_type_name;
+                    llvm::GlobalVariable *vtable_global = module()->getGlobalVariable(vtable_name, /*AllowInternal=*/true);
+                    if (vtable_global)
+                    {
+                        llvm::Value *vptr_gep = builder().CreateStructGEP(class_type, alloca, 0, "vptr");
+                        builder().CreateStore(vtable_global, vptr_gep);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Initialized vtable pointer for class '{}' (stack alloc)", effective_type_name);
+                    }
+                }
+            }
         }
 
         // Generate arguments
@@ -4039,17 +4148,29 @@ namespace Cryo::Codegen
                             }
                         }
 
-                        // Fallback: try StructType::field_type from symbols
+                        // Fallback: try StructType/ClassType::field_type from symbols
                         if (type_name.empty())
                         {
                             for (const auto &candidate : type_candidates)
                             {
-                                TypeRef struct_type_ref = ctx().symbols().lookup_struct_type(candidate);
-                                if (struct_type_ref.is_valid() && struct_type_ref->kind() == Cryo::TypeKind::Struct)
+                                // Try struct first, then class
+                                std::optional<TypeRef> field_type_opt;
+                                TypeRef type_ref = ctx().symbols().lookup_struct_type(candidate);
+                                if (type_ref.is_valid() && type_ref->kind() == Cryo::TypeKind::Struct)
                                 {
-                                    auto *struct_ty = static_cast<const Cryo::StructType *>(struct_type_ref.get());
-                                    auto field_type_opt = struct_ty->field_type(member_name);
-                                    if (field_type_opt.has_value() && field_type_opt->is_valid())
+                                    auto *struct_ty = static_cast<const Cryo::StructType *>(type_ref.get());
+                                    field_type_opt = struct_ty->field_type(member_name);
+                                }
+                                if (!field_type_opt.has_value() || !field_type_opt->is_valid())
+                                {
+                                    type_ref = ctx().symbols().lookup_class_type(candidate);
+                                    if (type_ref.is_valid() && type_ref->kind() == Cryo::TypeKind::Class)
+                                    {
+                                        auto *class_ty = static_cast<const Cryo::ClassType *>(type_ref.get());
+                                        field_type_opt = class_ty->field_type(member_name);
+                                    }
+                                }
+                                if (field_type_opt.has_value() && field_type_opt->is_valid())
                                     {
                                         type_name = field_type_opt->get()->display_name();
                                         if (!type_name.empty() && type_name.back() == '*')
@@ -4081,11 +4202,10 @@ namespace Cryo::Codegen
                                         }
 
                                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                  "Resolved nested member access: {}.{} -> {} (via StructType, found as '{}')",
+                                                  "Resolved nested member access: {}.{} -> {} (via type lookup, found as '{}')",
                                                   parent_type_name, member_name, type_name, candidate);
                                         break;
                                     }
-                                }
                             }
                         }
                     }
@@ -4382,6 +4502,31 @@ namespace Cryo::Codegen
                               "Direct fallback failed - function std::Runtime::StackTrace::capture not found in module");
                 }
             }
+
+            // Walk the class inheritance chain to find methods defined on a base class
+            if (!method)
+            {
+                TypeRef class_type_ref = ctx().symbols().lookup_class_type(type_name);
+                if (class_type_ref.is_valid())
+                {
+                    auto *cls = dynamic_cast<const Cryo::ClassType *>(class_type_ref.get());
+                    if (cls && cls->has_base_class())
+                    {
+                        auto *walk = dynamic_cast<const Cryo::ClassType *>(cls->base_class().get());
+                        while (walk && !method)
+                        {
+                            std::string base_name = walk->name();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "generate_instance_method: trying base class '{}' for method '{}'",
+                                      base_name, method_name);
+                            method = resolve_method(base_name, method_name);
+                            walk = walk->has_base_class()
+                                       ? dynamic_cast<const Cryo::ClassType *>(walk->base_class().get())
+                                       : nullptr;
+                        }
+                    }
+                }
+            }
         }
 
         if (!method || method->empty())
@@ -4581,6 +4726,114 @@ namespace Cryo::Codegen
                 emit_diagnostic(std::move(diag));
             }
             return nullptr;
+        }
+
+        // Check for virtual dispatch: if the method is virtual/override on a class type,
+        // call indirectly through the vtable instead of directly
+        {
+            TypeRef cryo_type = ctx().symbols().lookup_class_type(type_name);
+            if (cryo_type.is_valid())
+            {
+                auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
+                if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
+                {
+                    int vtable_idx = cryo_class->vtable_index(method_name);
+                    if (vtable_idx >= 0)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Virtual dispatch: method '{}' on class '{}' at vtable index {}",
+                                  method_name, type_name, vtable_idx);
+
+                        // Get the LLVM class type
+                        llvm::StructType *class_llvm_type =
+                            llvm::StructType::getTypeByName(llvm_ctx(), type_name);
+
+                        // Also try base class types for proper vtable lookup
+                        if (!class_llvm_type)
+                        {
+                            // Walk up the hierarchy
+                            auto *walk = cryo_class;
+                            while (walk && !class_llvm_type)
+                            {
+                                class_llvm_type = llvm::StructType::getTypeByName(llvm_ctx(), walk->name());
+                                if (walk->has_base_class())
+                                {
+                                    walk = dynamic_cast<const Cryo::ClassType *>(walk->base_class().get());
+                                }
+                                else
+                                {
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (class_llvm_type)
+                        {
+                            llvm::Type *ptr_ty = llvm::PointerType::get(llvm_ctx(), 0);
+
+                            // Load vtable pointer (field 0 of the object)
+                            llvm::Value *vptr_gep = builder().CreateStructGEP(
+                                class_llvm_type, receiver, 0, "vptr.gep");
+                            llvm::Value *vtable = builder().CreateLoad(ptr_ty, vptr_gep, "vtable.load");
+
+                            // Get vtable type
+                            std::string vtable_type_name = "VTable." + type_name;
+                            llvm::StructType *vtable_type =
+                                llvm::StructType::getTypeByName(llvm_ctx(), vtable_type_name);
+
+                            // If vtable type not found with this class name, walk up hierarchy
+                            if (!vtable_type && cryo_class->has_base_class())
+                            {
+                                auto *walk = cryo_class;
+                                while (walk && !vtable_type)
+                                {
+                                    vtable_type = llvm::StructType::getTypeByName(
+                                        llvm_ctx(), "VTable." + walk->name());
+                                    if (walk->has_base_class())
+                                    {
+                                        walk = dynamic_cast<const Cryo::ClassType *>(walk->base_class().get());
+                                    }
+                                    else
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (vtable_type)
+                            {
+                                // GEP into vtable for the method at vtable_idx
+                                llvm::Value *method_ptr = builder().CreateStructGEP(
+                                    vtable_type, vtable, vtable_idx, "vmethod.gep");
+                                llvm::Value *method_fn = builder().CreateLoad(
+                                    ptr_ty, method_ptr, "vmethod.load");
+
+                                // Build call arguments: this + args
+                                llvm::FunctionType *fn_type = method->getFunctionType();
+                                std::vector<llvm::Value *> call_args;
+                                call_args.push_back(receiver);
+                                for (size_t i = 0; i < args.size(); ++i)
+                                {
+                                    size_t param_idx = i + 1;
+                                    if (param_idx < fn_type->getNumParams())
+                                    {
+                                        call_args.push_back(
+                                            cast_if_needed(args[i], fn_type->getParamType(param_idx)));
+                                    }
+                                    else
+                                    {
+                                        call_args.push_back(args[i]);
+                                    }
+                                }
+
+                                std::string result_name = fn_type->getReturnType()->isVoidTy()
+                                    ? "" : method_name + ".vresult";
+                                return builder().CreateCall(fn_type, method_fn, call_args, result_name);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Prepare arguments: receiver (this) + method args

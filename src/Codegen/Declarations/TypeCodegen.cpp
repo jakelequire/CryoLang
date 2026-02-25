@@ -2,6 +2,7 @@
 #include "Codegen/CodegenVisitor.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Types/Types.hpp"
+#include "Types/UserDefinedTypes.hpp"
 #include "Utils/Logger.hpp"
 #include "AST/TemplateRegistry.hpp"
 
@@ -923,19 +924,48 @@ namespace Cryo::Codegen
             {
                 // Even if class already exists, we need to ensure field names are registered
                 // This can happen when class is generated during pre-registration but fields
-                // aren't registered until Pass 1
-                if (!node->fields().empty() && ctx().get_struct_field_index(name, node->fields()[0]->name()) < 0)
+                // aren't registered until Pass 1.
+                // Use ClassType::fields() (includes inherited fields) and account for vtable offset.
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registering field names for existing class: {}", name);
-                    std::vector<std::string> field_names;
-                    field_names.reserve(node->fields().size());
-                    for (const auto &field : node->fields())
+                    TypeRef cryo_ref = ctx().symbols().lookup_class_type(name);
+                    const Cryo::ClassType *cls = cryo_ref.is_valid()
+                        ? dynamic_cast<const Cryo::ClassType *>(cryo_ref.get())
+                        : nullptr;
+
+                    // Determine the first real field name to check registration
+                    std::string first_field;
+                    if (cls && !cls->fields().empty())
+                        first_field = cls->fields().front().name;
+                    else if (!node->fields().empty())
+                        first_field = node->fields()[0]->name();
+
+                    if (!first_field.empty() && ctx().get_struct_field_index(name, first_field) < 0)
                     {
-                        field_names.push_back(field->name());
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registering field names for existing class: {}", name);
+
+                        // Check if this class has a vtable pointer (first LLVM element)
+                        bool has_vtable = false;
+                        if (cls && (cls->has_virtual_methods() || cls->has_base_class()))
+                            has_vtable = true;
+
+                        std::vector<std::string> field_names;
+                        if (has_vtable)
+                            field_names.push_back("__vtable_ptr"); // placeholder for vtable slot
+
+                        if (cls && !cls->fields().empty())
+                        {
+                            for (const auto &field : cls->fields())
+                                field_names.push_back(field.name);
+                        }
+                        else
+                        {
+                            for (const auto &field : node->fields())
+                                field_names.push_back(field->name());
+                        }
+                        ctx().register_struct_fields(name, field_names);
+                        types().register_struct(name, existing);
+                        ctx().register_type(name, existing);
                     }
-                    ctx().register_struct_fields(name, field_names);
-                    types().register_struct(name, existing);
-                    ctx().register_type(name, existing);
                 }
                 return existing;
             }
@@ -949,55 +979,80 @@ namespace Cryo::Codegen
             class_type = llvm::StructType::create(llvm_ctx(), name);
         }
 
-        // Collect field types
-        std::vector<llvm::Type *> field_types;
-
-        for (const auto &field : node->fields())
+        // Check if this class needs a vtable pointer
+        bool needs_vtable = false;
         {
-            TypeRef cryo_field_type = field->get_resolved_type();
-            if (cryo_field_type)
+            TypeRef cryo_type = ctx().symbols().lookup_class_type(name);
+            if (cryo_type.is_valid())
             {
-                // DEBUG: Log the actual type kind for class fields
-                std::string type_kind_str = "unknown";
-                switch (cryo_field_type->kind())
+                auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
+                if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
                 {
-                case Cryo::TypeKind::Class:
-                    type_kind_str = "Class";
-                    break;
-                case Cryo::TypeKind::Pointer:
-                    type_kind_str = "Pointer";
-                    break;
-                case Cryo::TypeKind::Struct:
-                    type_kind_str = "Struct";
-                    break;
-                case Cryo::TypeKind::Int:
-                    type_kind_str = "Integer";
-                    break;
-                default:
-                    type_kind_str = type_kind_to_string(cryo_field_type->kind());
-                    break;
+                    needs_vtable = true;
                 }
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': type='{}', kind='{}'",
-                          field->name(), cryo_field_type->display_name(), type_kind_str);
+            }
+        }
 
-                // Use the main type mapping method like the old implementation did
-                llvm::Type *field_type = types().map(cryo_field_type);
+        // Collect field types — use ClassType fields (includes inherited fields) if available
+        std::vector<llvm::Type *> field_types;
+        std::vector<std::string> all_field_names; // for registration
+
+        // Add vtable pointer as first element if needed
+        if (needs_vtable)
+        {
+            field_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Added vtable pointer to class '{}'", name);
+        }
+
+        // Use the ClassType's resolved fields (which include inherited fields from base classes)
+        TypeRef cryo_type_ref = ctx().symbols().lookup_class_type(name);
+        const Cryo::ClassType *cryo_class = nullptr;
+        if (cryo_type_ref.is_valid())
+        {
+            cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type_ref.get());
+        }
+
+        if (cryo_class && !cryo_class->fields().empty())
+        {
+            for (const auto &field : cryo_class->fields())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': type='{}'",
+                          field.name, field.type.is_valid() ? field.type->display_name() : "NULL");
+                llvm::Type *field_type = field.type.is_valid() ? types().map(field.type) : nullptr;
                 if (field_type)
                 {
                     field_types.push_back(field_type);
                 }
                 else
                 {
-                    // Default to i64 for unknown types
                     field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
                 }
+                all_field_names.push_back(field.name);
             }
-            else
+        }
+        else
+        {
+            // Fallback to AST node fields (no inheritance info)
+            for (const auto &field : node->fields())
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': resolved type is NULL",
-                          field->name());
-                // Default to i64 for unresolved types
-                field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
+                TypeRef cryo_field_type = field->get_resolved_type();
+                if (cryo_field_type)
+                {
+                    llvm::Type *field_type = types().map(cryo_field_type);
+                    if (field_type)
+                    {
+                        field_types.push_back(field_type);
+                    }
+                    else
+                    {
+                        field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
+                    }
+                }
+                else
+                {
+                    field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
+                }
+                all_field_names.push_back(field->name());
             }
         }
 
@@ -1009,16 +1064,20 @@ namespace Cryo::Codegen
         ctx().register_type(name, class_type);
         types().register_struct(name, class_type);
 
-        // Register field names for member access resolution
-        std::vector<std::string> field_names;
-        field_names.reserve(node->fields().size());
-        for (const auto &field : node->fields())
+        // Register field names for member access resolution (already built above)
+        std::vector<std::string> field_names = std::move(all_field_names);
+        // Legacy fallback path (shouldn't reach here but keep for safety)
+        if (field_names.empty())
         {
-            field_names.push_back(field->name());
+            for (const auto &field : node->fields())
+            {
+                field_names.push_back(field->name());
+            }
         }
-        ctx().register_struct_fields(name, field_names);
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered {} field names for class {}",
-                  field_names.size(), name);
+        unsigned field_offset = needs_vtable ? 1 : 0;
+        ctx().register_struct_fields(name, field_names, field_offset);
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered {} field names for class {} (vtable_offset={})",
+                  field_names.size(), name, field_offset);
 
         return class_type;
     }

@@ -5,6 +5,8 @@
 
 #include "Types/TypeChecker.hpp"
 #include "Types/GenericTypes.hpp"
+#include "Types/UserDefinedTypes.hpp"
+#include "Types/CompoundTypes.hpp"
 
 #include <sstream>
 #include <algorithm>
@@ -352,6 +354,28 @@ namespace Cryo
         if (are_identical(sub, super))
         {
             return true;
+        }
+
+        // Class inheritance: walk up the base class chain
+        if (sub->kind() == TypeKind::Class)
+        {
+            auto *class_type = dynamic_cast<const ClassType *>(sub.get());
+            if (class_type && class_type->has_base_class())
+            {
+                return is_subtype(class_type->base_class(), super);
+            }
+        }
+
+        // Pointer covariance: Derived* -> Base*
+        if (sub->kind() == TypeKind::Pointer && super->kind() == TypeKind::Pointer)
+        {
+            auto *sub_ptr = dynamic_cast<const PointerType *>(sub.get());
+            auto *super_ptr = dynamic_cast<const PointerType *>(super.get());
+            if (sub_ptr && super_ptr &&
+                sub_ptr->pointee().is_valid() && super_ptr->pointee().is_valid())
+            {
+                return is_subtype(sub_ptr->pointee(), super_ptr->pointee());
+            }
         }
 
         // TODO: Implement trait-based subtyping when trait system is complete

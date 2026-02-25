@@ -2118,13 +2118,86 @@ namespace Cryo
         {
             TypeRef class_type = _symbol_table->lookup_class_type(class_decl->name());
 
-            if (class_type.is_valid() && !class_decl->fields().empty())
+            if (class_type.is_valid())
             {
                 auto *class_ptr = const_cast<ClassType *>(dynamic_cast<const ClassType *>(class_type.get()));
                 if (class_ptr && !class_ptr->is_complete())
                 {
+                    // Resolve base class if specified
+                    if (!class_decl->base_class().empty() && !class_ptr->has_base_class())
+                    {
+                        TypeRef base_type = _symbol_table->lookup_class_type(class_decl->base_class());
+                        if (!base_type.is_valid())
+                        {
+                            base_type = _ast_context->types().lookup_type_by_name(class_decl->base_class());
+                        }
+                        if (base_type.is_valid())
+                        {
+                            class_ptr->set_base_class(base_type);
+                            LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                      "CompilerInstance: Set base class '{}' for class '{}'",
+                                      class_decl->base_class(), class_decl->name());
+                        }
+                        else
+                        {
+                            LOG_ERROR(Cryo::LogComponent::GENERAL,
+                                      "CompilerInstance: Base class '{}' not found for class '{}'",
+                                      class_decl->base_class(), class_decl->name());
+                        }
+                    }
+
+                    // Register virtual/override method info
+                    for (const auto &method : class_decl->methods())
+                    {
+                        if (method && (method->is_virtual() || method->is_override()))
+                        {
+                            MethodInfo mi(
+                                method->name(),
+                                method->get_resolved_return_type(),
+                                (method->visibility() == Visibility::Public),
+                                method->is_static());
+                            mi.is_virtual = method->is_virtual();
+                            mi.is_override = method->is_override();
+                            class_ptr->add_method(mi);
+                            LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                      "CompilerInstance: Registered {} method '{}' on class '{}'",
+                                      method->is_virtual() ? "virtual" : "override",
+                                      method->name(), class_decl->name());
+                        }
+                    }
+
+                    // Detect abstract class: any virtual method without a body is pure virtual
+                    bool is_abstract = false;
+                    for (const auto &method : class_decl->methods())
+                    {
+                        if (method && method->is_virtual() && !method->body())
+                        {
+                            is_abstract = true;
+                            LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                      "CompilerInstance: Class '{}' is abstract (pure virtual method '{}')",
+                                      class_decl->name(), method->name());
+                        }
+                    }
+                    class_ptr->set_abstract(is_abstract);
+
                     std::vector<FieldInfo> fields;
                     bool is_generic = !class_decl->generic_parameters().empty();
+
+                    // Inherit base class fields
+                    if (class_ptr->has_base_class())
+                    {
+                        auto *base_class = dynamic_cast<const ClassType *>(class_ptr->base_class().get());
+                        if (base_class)
+                        {
+                            for (const auto &base_field : base_class->fields())
+                            {
+                                fields.push_back(base_field);
+                            }
+                            LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                      "CompilerInstance: Inherited {} fields from base class '{}' for '{}'",
+                                      base_class->fields().size(), class_decl->base_class(), class_decl->name());
+                        }
+                    }
 
                     for (const auto &field : class_decl->fields())
                     {
