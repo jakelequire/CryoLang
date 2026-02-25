@@ -418,7 +418,6 @@ The prelude provides `Option<T>`, `Result<T, E>`, `Array<T>`, `String`, `print`,
 | `alloc` | Arena, heap, stack, and pool allocators |
 | `io::stdio` | `print`, `println`, `printf` |
 | `io::file` | File reading and writing |
-| `net` | TCP, HTTP, sockets, DNS |
 | `thread` | Threads, mutexes, condition variables |
 | `sync` | Atomics, channels, semaphores |
 | `fs` | File system operations, paths |
