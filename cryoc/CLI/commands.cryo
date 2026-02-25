@@ -1,24 +1,123 @@
 namespace CLI::Commands;
 
-import Compiler::Lex::Lexer;
+import Compiler::Instance;
+import Utils;
 import Utils::File;
 import Utils::Logger;
 
+// ============================================================================
+// Command Kind
+// ============================================================================
+
+type enum CommandKind {
+    Help;
+    Version;
+    Unknown;
+}
+
+implement enum CommandKind {
+    name(&this) -> string {
+        return match (this) {
+            CommandKind::Help    => { "help"    }
+            CommandKind::Version => { "version" }
+            _ => { "" }
+        };
+    }
+
+    description(&this) -> string {
+        return match (this) {
+            CommandKind::Help    => { "Display help information"    }
+            CommandKind::Version => { "Display version information" }
+            _ => { "" }
+        };
+    }
+
+    usage(&this) -> string {
+        return match (this) {
+            CommandKind::Help    => { "cryoc help [command]" }
+            CommandKind::Version => { "cryoc version"        }
+            _ => { "" }
+        };
+    }
+}
+
+// ============================================================================
+// Executor
+// ============================================================================
+
 type struct Executor {
+    /// Registers all built-in commands with the Runner.
+    static register_commands(runner: Runner*) -> void {
+        const help: CommandKind = CommandKind::Help;
+        runner.add_command(
+            Command::new(
+                help.name(),
+                help.description(),
+                help.usage()
+            )
+        );
+
+        const version: CommandKind = CommandKind::Version;
+        runner.add_command(
+            Command::new(
+                version.name(),
+                version.description(),
+                version.usage()
+            )
+        );
+    }
+
+    /// Resolves a command name string to a CommandKind.
+    static resolve(name: string) -> CommandKind {
+        if (name == "help")    { return CommandKind::Help; }
+        if (name == "version") { return CommandKind::Version; }
+        return CommandKind::Unknown;
+    }
+
+    /// Entry point from Runner — resolves the name and dispatches.
+    static dispatch(cmd_name: string, runner: Runner*, args: ParsedArgs) -> int {
+        const kind: CommandKind = Executor::resolve(cmd_name);
+        return Executor::execute(kind, runner, args);
+    }
+
+    /// Executes a command by its kind.
+    static execute(kind: CommandKind, runner: Runner*, args: ParsedArgs) -> int {
+        match (kind) {
+            CommandKind::Help    => { runner.print_help();    return 0; }
+            CommandKind::Version => { runner.print_version(); return 0; }
+            CommandKind::Unknown => {
+                printf("Error: Command is not yet implemented.\n");
+                return 1;
+            }
+        }
+        return 1;
+    }
+
+    // ================================================================
+    // Direct File Compilation
+    // ================================================================
+
     /// Compiles a single file directly from a path.
-    /// Entry point for `cryoc <file>` usage.
+    /// Routes through CompilerInstance for proper phase management.
     static compile_file(file_path: string, args: ParsedArgs) -> int {
-        printf("Compiling: %s\n", file_path);
-        const file: File = File::new(file_path);
-        const lexer: Lexer = Lexer::new(file);
-        const tokens: Token[] = lexer.lex();
+        mut config: CompilerConfig = CompilerConfig::default();
 
-        LOG_DEBUG(LogComponent::CLI, "Lexed %d tokens from %s", tokens.length, file_path);
+        if (args.has_flag("debug")) {
+            config = CompilerConfig::debug_config();
+        }
 
-        for (mut i: int = 0; i < tokens.length; i++) {
-            const tok: Token = tokens[i];
-            LOG_DEBUG(LogComponent::CLI, "Token %d: Lexeme='%s', Line=%d, Column=%d",
-                i, tok.lexeme, tok.line, tok.column);
+        mut compiler: CompilerInstance = CompilerInstance::new(config);
+        const result: Result<CompilePhase, CompilePhase> = compiler.compile_file(file_path);
+
+        match (result) {
+            Result::Ok(phase) => {
+                printf("Compilation succeeded. Final phase: %s\n", phase.label());
+                return 0;
+            }
+            Result::Err(phase) => {
+                printf("Compilation failed during %s phase\n", phase.label());
+                return 1;
+            }
         }
 
         return 0;
