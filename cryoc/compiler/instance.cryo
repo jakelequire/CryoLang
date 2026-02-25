@@ -1,9 +1,28 @@
+///! Compiler Instance
+///!
+///! Thin orchestrator that creates a CompilationContext with the right
+///! CompileMode, builds the appropriate PassRegistry pipeline, validates
+///! it, and runs it.  Every entry point follows the same flow:
+///!   create context → build pipeline → validate → run → return result
+///!
+///! Mode-specific behavior comes from CompileMode policy methods queried
+///! by individual passes, not from flags on this struct.
+
 namespace Compiler::Instance;
 
+
+import Compiler::CompileMode;
+import Compiler::CompilationContext;
+import Compiler::Diagnostics;
+import Compiler::Artifacts;
+import Compiler::PassID;
+import Compiler::PassRegistry;
+import Compiler::ModuleGraph;
 import Compiler::Lex;
 import Compiler::Lex::Lexer;
 import Utils;
 import Utils::File;
+import Utils::Logger;
 
 
 // ============================================================================
@@ -12,91 +31,71 @@ import Utils::File;
 
 type struct CompilerConfig {
     debug:          boolean;
-    stdlib_mode:    boolean;
-    stdlib_linking: boolean;
-    auto_imports:   boolean;
-    raw_mode:       boolean;
-    dump_ast:       boolean;
+    show_ast:       boolean;
+    verbose_passes: boolean;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
             debug:          false,
-            stdlib_mode:    false,
-            stdlib_linking: true,
-            auto_imports:   true,
-            raw_mode:       false,
-            dump_ast:       false,
+            show_ast:       false,
+            verbose_passes: false,
         };
     }
 
     static debug_config() -> CompilerConfig {
         return CompilerConfig {
             debug:          true,
-            stdlib_mode:    false,
-            stdlib_linking: true,
-            auto_imports:   true,
-            raw_mode:       false,
-            dump_ast:       true,
+            show_ast:       true,
+            verbose_passes: true,
         };
     }
 }
 
 
 // ============================================================================
-// Compile Phase
+// Compilation Result
 // ============================================================================
 
-type enum CompilePhase {
-    Init;
-    Lexing;
-    Parsing;
-    Analysis;
-    CodeGen;
-    Linking;
-    Done;
-}
+type struct CompilationResult {
+    success:       boolean;
+    error_count:   u32;
+    warning_count: u32;
+    output_path:   string;
 
-implement enum CompilePhase {
-    label(&this) -> string {
-        return match (this) {
-            CompilePhase::Init     => { "init"     }
-            CompilePhase::Lexing   => { "lexing"   }
-            CompilePhase::Parsing  => { "parsing"  }
-            CompilePhase::Analysis => { "analysis" }
-            CompilePhase::CodeGen  => { "codegen"  }
-            CompilePhase::Linking  => { "linking"  }
-            CompilePhase::Done     => { "done"     }
+    static ok(output_path: string) -> CompilationResult {
+        return CompilationResult {
+            success:       true,
+            error_count:   0,
+            warning_count: 0,
+            output_path:   output_path,
         };
     }
 
-    to_int(&this) -> int {
-        return match (this) {
-            CompilePhase::Init     => { 0 }
-            CompilePhase::Lexing   => { 1 }
-            CompilePhase::Parsing  => { 2 }
-            CompilePhase::Analysis => { 3 }
-            CompilePhase::CodeGen  => { 4 }
-            CompilePhase::Linking  => { 5 }
-            CompilePhase::Done     => { 6 }
+    static failed(errors: u32, warnings: u32) -> CompilationResult {
+        return CompilationResult {
+            success:       false,
+            error_count:   errors,
+            warning_count: warnings,
+            output_path:   "",
         };
     }
 }
 
 
 // ============================================================================
-// Compiler State (per-compilation mutable state)
+// Stdlib Batch Result
 // ============================================================================
 
-type struct CompilerState {
-    source_file:       string;
-    current_namespace: string;
-    phase:             CompilePhase;
+type struct StdlibBatchResult {
+    success:          boolean;
+    modules_compiled: u32;
+    modules_failed:   u32;
 
-    static new() -> CompilerState {
-        return CompilerState {
-            source_file:       "",
-            current_namespace: "",
-            phase:             CompilePhase::Init,
+    static new(compiled: u32, failed: u32) -> StdlibBatchResult {
+        return StdlibBatchResult {
+            success:          failed == 0,
+            modules_compiled: compiled,
+            modules_failed:   failed,
         };
     }
 }
@@ -107,218 +106,185 @@ type struct CompilerState {
 // ============================================================================
 
 type struct CompilerInstance {
-public:
     config: CompilerConfig;
-    state:  CompilerState;
 
     static new(config: CompilerConfig) -> CompilerInstance {
         return CompilerInstance {
             config: config,
-            state:  CompilerState::new(),
         };
     }
 
-    /// Main entry point: compiles a single source file through all available phases.
-    compile_file(&this, file_path: string) -> Result<CompilePhase, CompilePhase> {
-        this.state.source_file = file_path;
-        this.state.phase = CompilePhase::Init;
+    /// Compile a single source file with stdlib linking and prelude.
+    compile_file(&this, source: string) -> CompilationResult {
+        LOG_DEBUG(LogComponent::General, "[Compiler] compile_file: %s", source);
 
         if (this.config.debug) {
-            printf("[Compiler] Compiling: %s\n", file_path);
+            printf("[Compiler] Compiling: %s (mode: single-file)\n", source);
         }
 
-        if (!File::exists(file_path)) {
-            printf("[Compiler] Error: File not found: %s\n", file_path);
-            return Err(CompilePhase::Init);
+        if (!File::exists(source)) {
+            printf("[Compiler] Error: File not found: %s\n", source);
+            return CompilationResult::failed(1, 0);
         }
 
-        const file: File = File::new(file_path);
+        LOG_DEBUG(LogComponent::General, "[Compiler] Creating CompilationContext");
+        mut ctx: CompilationContext = CompilationContext::new(
+            CompileMode::SingleFile, source);
+        ctx.debug_mode = this.config.debug;
 
-        // Phase 1: Lexing
-        if (!this.run_lexing(file)) {
-            return Err(CompilePhase::Lexing);
+        LOG_DEBUG(LogComponent::General, "[Compiler] Building standard pipeline");
+        mut pipeline: PassRegistry = build_standard_pipeline();
+        LOG_DEBUG(LogComponent::General, "[Compiler] Pipeline built, setting verbose");
+        pipeline.set_verbose(this.config.verbose_passes);
+
+        LOG_DEBUG(LogComponent::General, "[Compiler] Validating pipeline");
+        if (!pipeline.validate()) {
+            LOG_DEBUG(LogComponent::General, "[Compiler] Pipeline validation FAILED");
+            return CompilationResult::failed(1, 0);
+        }
+        LOG_DEBUG(LogComponent::General, "[Compiler] Pipeline validated OK");
+
+        const success: boolean = pipeline.run_all(&ctx);
+
+        if (this.config.debug) {
+            printf("[Compiler] Finished: %s (%u errors, %u warnings)\n",
+                source, ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
 
-        // Phase 2: Parsing
-        if (!this.run_parsing()) {
-            return Err(CompilePhase::Parsing);
+        if (success) {
+            return CompilationResult::ok(ctx.artifacts.linked.object_file_path);
         }
-
-        // Phase 3: Semantic Analysis
-        if (!this.run_analysis()) {
-            return Err(CompilePhase::Analysis);
-        }
-
-        // Phase 4: Code Generation
-        if (!this.run_codegen()) {
-            return Err(CompilePhase::CodeGen);
-        }
-
-        // Phase 5: Linking
-        if (!this.run_linking()) {
-            return Err(CompilePhase::Linking);
-        }
-
-        this.state.phase = CompilePhase::Done;
-
-        return Ok(CompilePhase::Done);
+        return CompilationResult::failed(
+            ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
     }
 
-    /// Returns the current compilation phase.
-    current_phase(&this) -> CompilePhase {
-        return this.state.phase;
+    /// Compile a single source file in raw mode (no stdlib, no prelude).
+    compile_raw(&this, source: string) -> CompilationResult {
+        if (this.config.debug) {
+            printf("[Compiler] Compiling: %s (mode: raw)\n", source);
+        }
+
+        if (!File::exists(source)) {
+            printf("[Compiler] Error: File not found: %s\n", source);
+            return CompilationResult::failed(1, 0);
+        }
+
+        mut ctx: CompilationContext = CompilationContext::new(
+            CompileMode::Raw, source);
+        ctx.debug_mode = this.config.debug;
+
+        mut pipeline: PassRegistry = build_raw_pipeline();
+        pipeline.set_verbose(this.config.verbose_passes);
+
+        if (!pipeline.validate()) {
+            return CompilationResult::failed(1, 0);
+        }
+
+        const success: boolean = pipeline.run_all(&ctx);
+
+        if (success) {
+            return CompilationResult::ok(ctx.artifacts.linked.object_file_path);
+        }
+        return CompilationResult::failed(
+            ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
     }
 
-
-private:
-    // ----------------------------------------------------------------
-    // Phase 1: Lexing
-    // ----------------------------------------------------------------
-
-    run_lexing(&this, file: File) -> boolean {
-        this.state.phase = CompilePhase::Lexing;
-
-        if (this.config.debug) {
-            printf("[Compiler] Phase: %s\n", this.state.phase.label());
+    /// Compile for LSP: frontend + semantic analysis, no codegen.
+    compile_for_lsp(&this, source: string) -> CompilationResult {
+        if (!File::exists(source)) {
+            return CompilationResult::failed(1, 0);
         }
 
-        const lexer: Lexer = Lexer::new(file);
-        const tokens: Token[] = lexer.lex();
-        for (mut i: int = 0; i < tokens.length; i++) {
-            const tok: Token = tokens[i];
-            LOG_DEBUG(LogComponent::Lexer, "Token: %s at %d:%d",
-                tok.lexeme, tok.line, tok.column);
+        mut ctx: CompilationContext = CompilationContext::new(
+            CompileMode::Lsp, source);
+
+        mut pipeline: PassRegistry = build_frontend_pipeline();
+        if (!pipeline.validate()) {
+            return CompilationResult::failed(1, 0);
         }
 
-        return true;
+        const success: boolean = pipeline.run_all(&ctx);
+
+        if (success) {
+            return CompilationResult::ok("");
+        }
+        return CompilationResult::failed(
+            ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
     }
 
-    // ----------------------------------------------------------------
-    // Phase 2: Parsing
-    // ----------------------------------------------------------------
+    /// Compile for LSP from in-memory content (no file on disk).
+    compile_for_lsp_content(&this, virtual_path: string, content: string) -> CompilationResult {
+        mut ctx: CompilationContext = CompilationContext::new(
+            CompileMode::Lsp, virtual_path);
 
-    /// Parses the token stream into an AST.
-    /// Expects run_lexing() to have populated state.tokens.
-    run_parsing(&this) -> boolean {
-        this.state.phase = CompilePhase::Parsing;
+        // Set up in-memory source content in artifacts
+        ctx.artifacts.tokens = TokenStream::new([], virtual_path, content);
 
-        if (this.config.debug) {
-            printf("[Compiler] Phase: %s\n", this.state.phase.label());
+        mut pipeline: PassRegistry = build_frontend_pipeline();
+        if (!pipeline.validate()) {
+            return CompilationResult::failed(1, 0);
         }
 
-        // TODO: Create Parser from token stream
-        // const parser: Parser = Parser::new(this.state.tokens);
-        // this.state.ast = parser.parse();
-        // return this.state.ast != null;
+        const success: boolean = pipeline.run_all(&ctx);
 
-        if (this.config.debug) {
-            printf("[Compiler] Parsing: skipped (not yet implemented)\n");
+        if (success) {
+            return CompilationResult::ok("");
         }
-
-        return true;
+        return CompilationResult::failed(
+            ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
     }
 
-    // ----------------------------------------------------------------
-    // Phase 3: Semantic Analysis
-    // ----------------------------------------------------------------
-
-    /// Runs semantic analysis on the AST.
-    /// Includes: declaration collection, type resolution, type checking,
-    /// and monomorphization of generics.
-    run_analysis(&this) -> boolean {
-        this.state.phase = CompilePhase::Analysis;
-
+    /// Batch-compile the stdlib: iterate modules in dependency order,
+    /// preserving ASTs across modules for cross-module template access.
+    compile_stdlib(&this, source_dir: string, output_path: string) -> StdlibBatchResult {
         if (this.config.debug) {
-            printf("[Compiler] Phase: %s\n", this.state.phase.label());
+            printf("[Compiler] Stdlib batch: %s -> %s\n", source_dir, output_path);
         }
 
-        // TODO: Phase 3a — Declaration Collection
-        // Register all type and function names (forward reference support).
-        // this.collect_declarations();
+        mut ctx: CompilationContext = CompilationContext::new(
+            CompileMode::StdlibBatch, "");
+        ctx.debug_mode = this.config.debug;
 
-        // TODO: Phase 3b — Type Resolution
-        // Resolve type annotations, populate struct fields.
-        // this.resolve_types();
+        mut pipeline: PassRegistry = build_stdlib_pipeline();
+        pipeline.set_verbose(this.config.verbose_passes);
 
-        // TODO: Phase 3c — Type Checking
-        // Type-check function bodies, validate expressions.
-        // this.check_types();
-
-        // TODO: Phase 3d — Monomorphization
-        // Specialize generic types and functions.
-        // this.monomorphize();
-
-        if (this.config.debug) {
-            printf("[Compiler] Analysis: skipped (not yet implemented)\n");
+        if (!pipeline.validate()) {
+            return StdlibBatchResult::new(0, 1);
         }
 
-        return true;
-    }
-
-    // ----------------------------------------------------------------
-    // Phase 4: Code Generation
-    // ----------------------------------------------------------------
-
-    /// Generates IR from the type-checked AST.
-    /// Includes: type lowering, function declaration stubs, and
-    /// full IR generation for all function bodies.
-    run_codegen(&this) -> boolean {
-        this.state.phase = CompilePhase::CodeGen;
-
-        if (this.config.debug) {
-            printf("[Compiler] Phase: %s\n", this.state.phase.label());
+        // TODO: Discover stdlib modules from source_dir and populate module_graph.
+        // For now, returns success with zero modules.
+        const graph: ModuleGraph = ctx.module_graph;
+        if (graph.module_count() == 0) {
+            if (this.config.debug) {
+                printf("[Compiler] Stdlib batch: no modules discovered\n");
+            }
+            return StdlibBatchResult::new(0, 0);
         }
 
-        // TODO: Phase 4a — Type Lowering
-        // Convert high-level types to target representations.
-        // this.lower_types();
+        mut compiled: u32 = 0;
+        mut failed: u32 = 0;
 
-        // TODO: Phase 4b — Function Declaration
-        // Pre-register function signatures for forward calls.
-        // this.declare_functions();
+        for (mut i: u32 = 0; i < graph.module_count(); i = i + 1) {
+            const mod_info: ModuleInfo = graph.modules[i];
 
-        // TODO: Phase 4c — IR Generation
-        // Generate IR for all function bodies and global initializers.
-        // this.generate_ir();
+            if (this.config.debug) {
+                printf("[Compiler] Stdlib module %u/%u: %s\n",
+                    i + 1, graph.module_count(), mod_info.name);
+            }
 
-        if (this.config.debug) {
-            printf("[Compiler] CodeGen: skipped (not yet implemented)\n");
+            ctx.reset_for_next_module(mod_info.file_path);
+            pipeline.reset();
+
+            const success: boolean = pipeline.run_all(&ctx);
+
+            if (success) {
+                compiled = compiled + 1;
+            } else {
+                failed = failed + 1;
+            }
         }
 
-        return true;
-    }
-
-    // ----------------------------------------------------------------
-    // Phase 5: Linking
-    // ----------------------------------------------------------------
-
-    /// Emits object code and links the final executable.
-    /// Handles stdlib linking and runtime attachment.
-    run_linking(&this) -> boolean {
-        this.state.phase = CompilePhase::Linking;
-
-        if (this.config.debug) {
-            printf("[Compiler] Phase: %s\n", this.state.phase.label());
-        }
-
-        // TODO: Phase 5a — Object Emission
-        // Emit IR to object file (.o).
-        // this.emit_object();
-
-        // TODO: Phase 5b — Stdlib Linking
-        // Link against libcryo.a if stdlib_linking is enabled.
-        // if (this.config.stdlib_linking) {
-        //     this.link_stdlib();
-        // }
-
-        // TODO: Phase 5c — Final Link
-        // Link all object files into the final executable.
-        // this.link_executable();
-
-        if (this.config.debug) {
-            printf("[Compiler] Linking: skipped (not yet implemented)\n");
-        }
-
-        return true;
+        return StdlibBatchResult::new(compiled, failed);
     }
 }

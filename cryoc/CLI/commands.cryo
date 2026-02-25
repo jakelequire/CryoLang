@@ -12,6 +12,9 @@ import Utils::Logger;
 type enum CommandKind {
     Help;
     Version;
+    Build;
+    Check;
+    Raw;
     Unknown;
 }
 
@@ -20,22 +23,31 @@ implement enum CommandKind {
         return match (this) {
             CommandKind::Help    => { "help"    }
             CommandKind::Version => { "version" }
+            CommandKind::Build   => { "build"   }
+            CommandKind::Check   => { "check"   }
+            CommandKind::Raw     => { "raw"     }
             _ => { "" }
         };
     }
 
     description(&this) -> string {
         return match (this) {
-            CommandKind::Help    => { "Display help information"    }
-            CommandKind::Version => { "Display version information" }
+            CommandKind::Help    => { "Display help information"              }
+            CommandKind::Version => { "Display version information"           }
+            CommandKind::Build   => { "Build a source file (single-file)"    }
+            CommandKind::Check   => { "Check a file for errors (no codegen)" }
+            CommandKind::Raw     => { "Compile without stdlib or prelude"    }
             _ => { "" }
         };
     }
 
     usage(&this) -> string {
         return match (this) {
-            CommandKind::Help    => { "cryoc help [command]" }
-            CommandKind::Version => { "cryoc version"        }
+            CommandKind::Help    => { "cryoc help [command]"       }
+            CommandKind::Version => { "cryoc version"              }
+            CommandKind::Build   => { "cryoc build <file> [flags]" }
+            CommandKind::Check   => { "cryoc check <file> [flags]" }
+            CommandKind::Raw     => { "cryoc raw <file> [flags]"   }
             _ => { "" }
         };
     }
@@ -49,28 +61,28 @@ type struct Executor {
     /// Registers all built-in commands with the Runner.
     static register_commands(runner: Runner*) -> void {
         const help: CommandKind = CommandKind::Help;
-        runner.add_command(
-            Command::new(
-                help.name(),
-                help.description(),
-                help.usage()
-            )
-        );
+        runner.add_command(Command::new(help.name(), help.description(), help.usage()));
 
         const version: CommandKind = CommandKind::Version;
-        runner.add_command(
-            Command::new(
-                version.name(),
-                version.description(),
-                version.usage()
-            )
-        );
+        runner.add_command(Command::new(version.name(), version.description(), version.usage()));
+
+        const build: CommandKind = CommandKind::Build;
+        runner.add_command(Command::new(build.name(), build.description(), build.usage()));
+
+        const check: CommandKind = CommandKind::Check;
+        runner.add_command(Command::new(check.name(), check.description(), check.usage()));
+
+        const raw: CommandKind = CommandKind::Raw;
+        runner.add_command(Command::new(raw.name(), raw.description(), raw.usage()));
     }
 
     /// Resolves a command name string to a CommandKind.
     static resolve(name: string) -> CommandKind {
         if (name == "help")    { return CommandKind::Help; }
         if (name == "version") { return CommandKind::Version; }
+        if (name == "build")   { return CommandKind::Build; }
+        if (name == "check")   { return CommandKind::Check; }
+        if (name == "raw")     { return CommandKind::Raw; }
         return CommandKind::Unknown;
     }
 
@@ -85,11 +97,80 @@ type struct Executor {
         match (kind) {
             CommandKind::Help    => { runner.print_help();    return 0; }
             CommandKind::Version => { runner.print_version(); return 0; }
+            CommandKind::Build   => { return Executor::cmd_build(args); }
+            CommandKind::Check   => { return Executor::cmd_check(args); }
+            CommandKind::Raw     => { return Executor::cmd_raw(args); }
             CommandKind::Unknown => {
-                printf("Error: Command is not yet implemented.\n");
+                printf("Error: Unknown command. Run 'cryoc help' for usage.\n");
                 return 1;
             }
         }
+        return 1;
+    }
+
+    // ================================================================
+    // Command Implementations
+    // ================================================================
+
+    /// `cryoc build <file>` — full single-file compilation with stdlib.
+    static cmd_build(args: ParsedArgs) -> int {
+        const file: string = args.input_file();
+        if (file == "") {
+            printf("Error: No input file specified.\nUsage: cryoc build <file> [flags]\n");
+            return 1;
+        }
+        return Executor::compile_file(file, args);
+    }
+
+    /// `cryoc check <file>` — frontend + semantic analysis, no codegen.
+    static cmd_check(args: ParsedArgs) -> int {
+        const file: string = args.input_file();
+        if (file == "") {
+            printf("Error: No input file specified.\nUsage: cryoc check <file> [flags]\n");
+            return 1;
+        }
+
+        mut config: CompilerConfig = CompilerConfig::default();
+        if (args.has_flag("debug")) {
+            config = CompilerConfig::debug_config();
+        }
+
+        mut compiler: CompilerInstance = CompilerInstance::new(config);
+        const result: CompilationResult = compiler.compile_for_lsp(file);
+
+        if (result.success) {
+            printf("No errors found.\n");
+            return 0;
+        }
+
+        printf("Check failed (%u errors, %u warnings)\n",
+            result.error_count, result.warning_count);
+        return 1;
+    }
+
+    /// `cryoc raw <file>` — compile without stdlib or prelude.
+    static cmd_raw(args: ParsedArgs) -> int {
+        const file: string = args.input_file();
+        if (file == "") {
+            printf("Error: No input file specified.\nUsage: cryoc raw <file> [flags]\n");
+            return 1;
+        }
+
+        mut config: CompilerConfig = CompilerConfig::default();
+        if (args.has_flag("debug")) {
+            config = CompilerConfig::debug_config();
+        }
+
+        mut compiler: CompilerInstance = CompilerInstance::new(config);
+        const result: CompilationResult = compiler.compile_raw(file);
+
+        if (result.success) {
+            printf("Compilation succeeded.\n");
+            return 0;
+        }
+
+        printf("Compilation failed (%u errors, %u warnings)\n",
+            result.error_count, result.warning_count);
         return 1;
     }
 
@@ -107,19 +188,15 @@ type struct Executor {
         }
 
         mut compiler: CompilerInstance = CompilerInstance::new(config);
-        const result: Result<CompilePhase, CompilePhase> = compiler.compile_file(file_path);
+        const result: CompilationResult = compiler.compile_file(file_path);
 
-        match (result) {
-            Result::Ok(phase) => {
-                printf("Compilation succeeded. Final phase: %s\n", phase.label());
-                return 0;
-            }
-            Result::Err(phase) => {
-                printf("Compilation failed during %s phase\n", phase.label());
-                return 1;
-            }
+        if (result.success) {
+            printf("Compilation succeeded.\n");
+            return 0;
         }
 
-        return 0;
+        printf("Compilation failed (%u errors, %u warnings)\n",
+            result.error_count, result.warning_count);
+        return 1;
     }
 }

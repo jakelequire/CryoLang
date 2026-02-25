@@ -3,6 +3,7 @@
 #include "Codegen/CodegenVisitor.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
+#include "AST/ASTNode.hpp"
 #include "AST/ASTVisitor.hpp"
 #include "AST/TemplateRegistry.hpp"
 #include "Types/UserDefinedTypes.hpp"
@@ -134,6 +135,101 @@ namespace Cryo::Codegen
             if (lhs_is_char && rhs_is_string)
             {
                 return generate_char_string_concat(lhs, rhs);
+            }
+
+            // Array<T> + Array<T> concatenation
+            // First try semantic types from AST
+            auto is_array_type = [](TypeRef type) -> bool
+            {
+                if (!type)
+                    return false;
+                return type->kind() == Cryo::TypeKind::Array;
+            };
+
+            bool lhs_is_array = is_array_type(lhs_type);
+            bool rhs_is_array = is_array_type(rhs_type);
+
+            // Debug: log what we see for PLUS operations on non-primitive types
+            if (!lhs_is_string && !lhs_is_char)
+            {
+                std::string lhs_llvm_str, rhs_llvm_str;
+                llvm::raw_string_ostream lhs_os(lhs_llvm_str), rhs_os(rhs_llvm_str);
+                lhs->getType()->print(lhs_os);
+                rhs->getType()->print(rhs_os);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Array concat check: lhs_is_array={}, rhs_is_array={}, "
+                          "lhs_type_valid={}, rhs_type_valid={}, "
+                          "lhs_llvm={}, rhs_llvm={}",
+                          lhs_is_array, rhs_is_array,
+                          (bool)lhs_type, (bool)rhs_type,
+                          lhs_llvm_str, rhs_llvm_str);
+            }
+
+            if (lhs_is_array && rhs_is_array)
+            {
+                return generate_array_concat(lhs, rhs, lhs_type);
+            }
+
+            // Fallback: check LLVM types for Array<T> struct pattern
+            // Common case: Array<T> + [element] where LHS is Array<T> struct
+            // and RHS is a ptr (raw array literal)
+            auto get_array_struct_type = [](llvm::Value *val) -> llvm::StructType *
+            {
+                llvm::Type *ty = val->getType();
+                if (ty->isStructTy())
+                {
+                    auto *st = llvm::cast<llvm::StructType>(ty);
+                    if (!st->isLiteral() && st->hasName() && st->getName().starts_with("Array<"))
+                        return st;
+                }
+                return static_cast<llvm::StructType *>(nullptr);
+            };
+
+            llvm::StructType *lhs_arr_st = get_array_struct_type(lhs);
+            llvm::StructType *rhs_arr_st = get_array_struct_type(rhs);
+
+            // Case 1: Array<T> + Array<T>
+            if (lhs_arr_st && rhs_arr_st)
+            {
+                TypeRef best_type = node->get_resolved_type();
+                if (!best_type || best_type->kind() != Cryo::TypeKind::Array)
+                    best_type = lhs_type;
+                if (!best_type || best_type->kind() != Cryo::TypeKind::Array)
+                    best_type = rhs_type;
+                return generate_array_concat(lhs, rhs, best_type);
+            }
+
+            // Case 2: Array<T> + ptr (array + single-element literal like [val])
+            // Wrap the RHS ptr into a temporary Array<T> with length from the
+            // original array literal, then concat
+            if (lhs_arr_st && rhs->getType()->isPointerTy())
+            {
+                // The RHS is a pointer to element data from a C-style array literal.
+                // We need to figure out the element count. For `arr + [x]` the literal
+                // has 1 element; for `arr + [x, y]` it has 2, etc.
+                // The BinaryExpressionNode's right child is an ArrayLiteralNode.
+                size_t rhs_count = 1; // default
+                if (auto *arr_lit = dynamic_cast<Cryo::ArrayLiteralNode *>(node->right()))
+                {
+                    rhs_count = arr_lit->size();
+                }
+
+                // Build a temporary Array<T> struct for the RHS
+                llvm::Type *i64_t = llvm::Type::getInt64Ty(llvm_ctx());
+                llvm::AllocaInst *rhs_arr = create_entry_alloca(lhs_arr_st, "rhs.wrap");
+                llvm::Value *rhs_data_field = builder().CreateStructGEP(lhs_arr_st, rhs_arr, 0, "rhs.wrap.data");
+                builder().CreateStore(rhs, rhs_data_field);
+                llvm::Value *rhs_len_val = llvm::ConstantInt::get(i64_t, rhs_count);
+                llvm::Value *rhs_len_field = builder().CreateStructGEP(lhs_arr_st, rhs_arr, 1, "rhs.wrap.len");
+                builder().CreateStore(rhs_len_val, rhs_len_field);
+                llvm::Value *rhs_cap_field = builder().CreateStructGEP(lhs_arr_st, rhs_arr, 2, "rhs.wrap.cap");
+                builder().CreateStore(rhs_len_val, rhs_cap_field);
+                llvm::Value *rhs_struct = create_load(rhs_arr, lhs_arr_st, "rhs.wrap.val");
+
+                TypeRef best_type = node->get_resolved_type();
+                if (!best_type || best_type->kind() != Cryo::TypeKind::Array)
+                    best_type = lhs_type;
+                return generate_array_concat(lhs, rhs_struct, best_type);
             }
         }
 
@@ -1916,6 +2012,181 @@ namespace Cryo::Codegen
         default:
             return nullptr;
         }
+    }
+
+    //===================================================================
+    // Array Operations
+    //===================================================================
+
+    llvm::Value *OperatorCodegen::generate_array_concat(llvm::Value *lhs, llvm::Value *rhs, TypeRef array_type)
+    {
+        if (!lhs || !rhs)
+            return nullptr;
+
+        llvm::IRBuilder<> &b = builder();
+        llvm::LLVMContext &ctx = llvm_ctx();
+        llvm::Module *mod = module();
+
+        // Determine the Array<T> struct type — prefer from LLVM values directly
+        llvm::StructType *struct_type = nullptr;
+        llvm::Type *lhs_ty = lhs->getType();
+
+        if (lhs_ty->isStructTy())
+        {
+            struct_type = llvm::cast<llvm::StructType>(lhs_ty);
+        }
+        else if (array_type)
+        {
+            llvm::Type *mapped = get_llvm_type(array_type);
+            if (mapped && mapped->isStructTy())
+                struct_type = llvm::cast<llvm::StructType>(mapped);
+        }
+
+        if (!struct_type || struct_type->getNumElements() < 3)
+        {
+            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
+                         "Array concat: cannot determine Array<T> struct type");
+            return nullptr;
+        }
+
+        // Get element LLVM type from the Cryo type system if available,
+        // otherwise infer from the struct name by looking up the mapped type
+        llvm::Type *elem_llvm_type = nullptr;
+
+        if (array_type)
+        {
+            auto *arr_type = dynamic_cast<const Cryo::ArrayType *>(array_type.get());
+            if (arr_type && arr_type->element())
+            {
+                elem_llvm_type = get_llvm_type(arr_type->element());
+            }
+        }
+
+        // Fallback: look up element type from the struct name (e.g. "Array<ModuleInfo>")
+        if (!elem_llvm_type && struct_type->hasName())
+        {
+            llvm::StringRef name = struct_type->getName();
+            if (name.starts_with("Array<") && name.ends_with(">"))
+            {
+                std::string elem_name = name.substr(6, name.size() - 7).str();
+
+                // Map primitive type names directly to LLVM types
+                if (elem_name == "string")
+                    elem_llvm_type = llvm::PointerType::get(ctx, 0); // string = ptr (char*)
+                else if (elem_name == "i8" || elem_name == "u8")
+                    elem_llvm_type = llvm::Type::getInt8Ty(ctx);
+                else if (elem_name == "i16" || elem_name == "u16")
+                    elem_llvm_type = llvm::Type::getInt16Ty(ctx);
+                else if (elem_name == "i32" || elem_name == "u32" || elem_name == "int")
+                    elem_llvm_type = llvm::Type::getInt32Ty(ctx);
+                else if (elem_name == "i64" || elem_name == "u64")
+                    elem_llvm_type = llvm::Type::getInt64Ty(ctx);
+                else if (elem_name == "i128" || elem_name == "u128")
+                    elem_llvm_type = llvm::Type::getInt128Ty(ctx);
+                else if (elem_name == "f32" || elem_name == "float")
+                    elem_llvm_type = llvm::Type::getFloatTy(ctx);
+                else if (elem_name == "f64" || elem_name == "double")
+                    elem_llvm_type = llvm::Type::getDoubleTy(ctx);
+                else if (elem_name == "boolean" || elem_name == "bool")
+                    elem_llvm_type = llvm::Type::getInt1Ty(ctx);
+                else if (elem_name == "char")
+                    elem_llvm_type = llvm::Type::getInt8Ty(ctx);
+                else if (elem_name == "void*")
+                    elem_llvm_type = llvm::PointerType::get(ctx, 0);
+                else
+                    elem_llvm_type = resolve_type_by_name(elem_name);
+            }
+        }
+
+        if (!elem_llvm_type)
+        {
+            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
+                         "Array concat: failed to resolve element LLVM type");
+            return nullptr;
+        }
+
+        // Types we'll need
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(ctx);
+        llvm::Type *ptr_type = llvm::PointerType::get(ctx, 0);
+
+        // Get element size via DataLayout
+        const llvm::DataLayout &DL = mod->getDataLayout();
+        uint64_t elem_size = DL.getTypeAllocSize(elem_llvm_type);
+        llvm::Value *elem_size_val = llvm::ConstantInt::get(i64_type, elem_size);
+
+        // If operands are struct values (not pointers), we need to store them
+        // to allocas so we can extract fields via GEP
+        auto ensure_pointer = [&](llvm::Value *val) -> llvm::Value *
+        {
+            if (val->getType()->isPointerTy())
+                return val;
+            // Store the struct value into a temporary alloca
+            llvm::AllocaInst *tmp = create_entry_alloca(struct_type, "arr.tmp");
+            b.CreateStore(val, tmp);
+            return tmp;
+        };
+
+        llvm::Value *lhs_ptr = ensure_pointer(lhs);
+        llvm::Value *rhs_ptr = ensure_pointer(rhs);
+
+        // Extract fields from LHS: { ptr, len, cap }
+        llvm::Value *lhs_data_ptr_field = b.CreateStructGEP(struct_type, lhs_ptr, 0, "lhs.data.field");
+        llvm::Value *lhs_data = b.CreateLoad(ptr_type, lhs_data_ptr_field, "lhs.data");
+        llvm::Value *lhs_len_field = b.CreateStructGEP(struct_type, lhs_ptr, 1, "lhs.len.field");
+        llvm::Value *lhs_len = b.CreateLoad(i64_type, lhs_len_field, "lhs.len");
+
+        // Extract fields from RHS
+        llvm::Value *rhs_data_ptr_field = b.CreateStructGEP(struct_type, rhs_ptr, 0, "rhs.data.field");
+        llvm::Value *rhs_data = b.CreateLoad(ptr_type, rhs_data_ptr_field, "rhs.data");
+        llvm::Value *rhs_len_field = b.CreateStructGEP(struct_type, rhs_ptr, 1, "rhs.len.field");
+        llvm::Value *rhs_len = b.CreateLoad(i64_type, rhs_len_field, "rhs.len");
+
+        // Compute total length and allocation size
+        llvm::Value *total_len = b.CreateAdd(lhs_len, rhs_len, "concat.len");
+        llvm::Value *alloc_bytes = b.CreateMul(total_len, elem_size_val, "concat.bytes");
+
+        // Get or declare malloc
+        llvm::Function *malloc_fn = mod->getFunction("malloc");
+        if (!malloc_fn)
+        {
+            llvm::FunctionType *malloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
+            malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage, "malloc", mod);
+        }
+
+        // Get or declare memcpy
+        llvm::Function *memcpy_fn = mod->getFunction("memcpy");
+        if (!memcpy_fn)
+        {
+            llvm::FunctionType *memcpy_type = llvm::FunctionType::get(ptr_type, {ptr_type, ptr_type, i64_type}, false);
+            memcpy_fn = llvm::Function::Create(memcpy_type, llvm::Function::ExternalLinkage, "memcpy", mod);
+        }
+
+        // Allocate new buffer for combined elements
+        llvm::Value *new_data = b.CreateCall(malloc_fn, {alloc_bytes}, "concat.data");
+
+        // Copy LHS elements to new buffer
+        llvm::Value *lhs_bytes = b.CreateMul(lhs_len, elem_size_val, "lhs.bytes");
+        b.CreateCall(memcpy_fn, {new_data, lhs_data, lhs_bytes});
+
+        // Copy RHS elements after LHS elements
+        llvm::Value *rhs_offset = b.CreateGEP(llvm::Type::getInt8Ty(ctx), new_data, lhs_bytes, "rhs.dst");
+        llvm::Value *rhs_bytes = b.CreateMul(rhs_len, elem_size_val, "rhs.bytes");
+        b.CreateCall(memcpy_fn, {rhs_offset, rhs_data, rhs_bytes});
+
+        // Build new Array<T> struct: { ptr, len, cap }
+        llvm::AllocaInst *result = create_entry_alloca(struct_type, "concat.result");
+
+        llvm::Value *result_data_field = b.CreateStructGEP(struct_type, result, 0, "concat.data.field");
+        b.CreateStore(new_data, result_data_field);
+
+        llvm::Value *result_len_field = b.CreateStructGEP(struct_type, result, 1, "concat.len.field");
+        b.CreateStore(total_len, result_len_field);
+
+        llvm::Value *result_cap_field = b.CreateStructGEP(struct_type, result, 2, "concat.cap.field");
+        b.CreateStore(total_len, result_cap_field);
+
+        // Return the struct value (not the pointer)
+        return create_load(result, struct_type, "concat.array");
     }
 
     //===================================================================

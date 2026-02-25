@@ -1,0 +1,187 @@
+///! Phase Artifacts
+///!
+///! Explicit data-flow containers for each compilation phase's output.
+///! Replaces scattered state on CompilerInstance (_ast_root, _loaded_file,
+///! _compiled_asts, etc.) with typed structs that make the data pipeline
+///! visible: Lexing writes tokens, Parsing reads tokens and writes ast, etc.
+
+namespace Compiler::Artifacts;
+
+import Compiler::Lex;
+
+
+// ============================================================================
+// TokenStream — Output of Lexing
+// ============================================================================
+
+/// The result of lexing a source file.
+type struct TokenStream {
+    tokens:         Token[];
+    source_file:    string;
+    source_content: string;
+
+    static empty() -> TokenStream {
+        return TokenStream {
+            tokens:         [],
+            source_file:    "",
+            source_content: "",
+        };
+    }
+
+    static new(tokens: Token[], source_file: string, source_content: string) -> TokenStream {
+        return TokenStream {
+            tokens:         tokens,
+            source_file:    source_file,
+            source_content: source_content,
+        };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.tokens.length > 0;
+    }
+
+    token_count(&this) -> int {
+        return this.tokens.length;
+    }
+}
+
+
+// ============================================================================
+// ASTOutput — Output of Parsing
+// ============================================================================
+
+/// The result of parsing a token stream into an AST.
+type struct ASTOutput {
+    root:           void*;     // ProgramNode* (typed once AST types exist)
+    namespace_name: string;
+
+    static empty() -> ASTOutput {
+        return ASTOutput {
+            root:           null,
+            namespace_name: "",
+        };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.root != null;
+    }
+}
+
+
+// ============================================================================
+// TypedAST — Output of Type Resolution + Semantic Analysis
+// ============================================================================
+
+/// AST annotated with type information and populated registries.
+type struct TypedAST {
+    root:              void*;   // ProgramNode* with type annotations
+    type_arena:        void*;
+    symbol_table:      void*;
+    template_registry: void*;
+    generic_registry:  void*;
+
+    static empty() -> TypedAST {
+        return TypedAST {
+            root:              null,
+            type_arena:        null,
+            symbol_table:      null,
+            template_registry: null,
+            generic_registry:  null,
+        };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.root != null;
+    }
+}
+
+
+// ============================================================================
+// IROutput — Output of Code Generation
+// ============================================================================
+
+/// Generated LLVM IR module.
+type struct IROutput {
+    llvm_module: void*;    // Opaque until @cImport available
+    module_name: string;
+
+    static empty() -> IROutput {
+        return IROutput {
+            llvm_module: null,
+            module_name: "",
+        };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.llvm_module != null;
+    }
+}
+
+
+// ============================================================================
+// LinkedOutput — Output of Linking
+// ============================================================================
+
+/// Path to the emitted object file or executable.
+type struct LinkedOutput {
+    object_file_path: string;
+
+    static empty() -> LinkedOutput {
+        return LinkedOutput {
+            object_file_path: "",
+        };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.object_file_path != "";
+    }
+}
+
+
+// ============================================================================
+// PhaseArtifacts — All phase outputs in one container
+// ============================================================================
+
+/// Collects outputs from every compilation phase.
+/// Passes write their results here; downstream passes read from here.
+type struct PhaseArtifacts {
+    tokens:     TokenStream;
+    ast:        ASTOutput;
+    typed_ast:  TypedAST;
+    ir:         IROutput;
+    linked:     LinkedOutput;
+
+    // Batch mode preservation (driven by CompileMode.preserve_asts())
+    preserved_asts:    void*[];
+    preserved_sources: string[];
+
+    static new() -> PhaseArtifacts {
+        return PhaseArtifacts {
+            tokens:            TokenStream::empty(),
+            ast:               ASTOutput::empty(),
+            typed_ast:         TypedAST::empty(),
+            ir:                IROutput::empty(),
+            linked:            LinkedOutput::empty(),
+            preserved_asts:    [],
+            preserved_sources: [],
+        };
+    }
+
+    /// Reset per-module artifacts for the next module in a batch.
+    /// Preserved ASTs and sources are NOT cleared.
+    reset_for_next_module(mut &this) -> void {
+        this.tokens    = TokenStream::empty();
+        this.ast       = ASTOutput::empty();
+        this.typed_ast = TypedAST::empty();
+        this.ir        = IROutput::empty();
+        this.linked    = LinkedOutput::empty();
+    }
+
+    /// Save the current AST for cross-module template access in stdlib batch mode.
+    preserve_current_ast(mut &this) -> void {
+        if (this.ast.is_valid()) {
+            this.preserved_asts    = this.preserved_asts + [this.ast.root];
+            this.preserved_sources = this.preserved_sources + [this.tokens.source_file];
+        }
+    }
+}
