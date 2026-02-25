@@ -1,23 +1,324 @@
 namespace Compiler::Instance;
 
-type struct InstanceState {
-    source_file: string;
-    debug: boolean;
-}
+import Compiler::Lex;
+import Compiler::Lex::Lexer;
+import Utils;
+import Utils::File;
 
-type struct CompilerInstance {
-public:
-    state: InstanceState;
 
-    /// The default constructor for CompilerInstance initializes the state with default values.
-    static new() -> CompilerInstance {
-        return CompilerInstance {
-            state: InstanceState {
-                source_file: "",
-                debug: false,
-            },
+// ============================================================================
+// Compiler Configuration
+// ============================================================================
+
+type struct CompilerConfig {
+    debug:          boolean;
+    stdlib_mode:    boolean;
+    stdlib_linking: boolean;
+    auto_imports:   boolean;
+    raw_mode:       boolean;
+    dump_ast:       boolean;
+
+    static default() -> CompilerConfig {
+        return CompilerConfig {
+            debug:          false,
+            stdlib_mode:    false,
+            stdlib_linking: true,
+            auto_imports:   true,
+            raw_mode:       false,
+            dump_ast:       false,
         };
     }
 
+    static debug_config() -> CompilerConfig {
+        return CompilerConfig {
+            debug:          true,
+            stdlib_mode:    false,
+            stdlib_linking: true,
+            auto_imports:   true,
+            raw_mode:       false,
+            dump_ast:       true,
+        };
+    }
+}
+
+
+// ============================================================================
+// Compile Phase
+// ============================================================================
+
+type enum CompilePhase {
+    Init;
+    Lexing;
+    Parsing;
+    Analysis;
+    CodeGen;
+    Linking;
+    Done;
+}
+
+implement enum CompilePhase {
+    label(&this) -> string {
+        return match (this) {
+            CompilePhase::Init     => { "init"     }
+            CompilePhase::Lexing   => { "lexing"   }
+            CompilePhase::Parsing  => { "parsing"  }
+            CompilePhase::Analysis => { "analysis" }
+            CompilePhase::CodeGen  => { "codegen"  }
+            CompilePhase::Linking  => { "linking"  }
+            CompilePhase::Done     => { "done"     }
+        };
+    }
+
+    to_int(&this) -> int {
+        return match (this) {
+            CompilePhase::Init     => { 0 }
+            CompilePhase::Lexing   => { 1 }
+            CompilePhase::Parsing  => { 2 }
+            CompilePhase::Analysis => { 3 }
+            CompilePhase::CodeGen  => { 4 }
+            CompilePhase::Linking  => { 5 }
+            CompilePhase::Done     => { 6 }
+        };
+    }
+}
+
+
+// ============================================================================
+// Compiler State (per-compilation mutable state)
+// ============================================================================
+
+type struct CompilerState {
+    source_file:       string;
+    current_namespace: string;
+    phase:             CompilePhase;
+
+    static new() -> CompilerState {
+        return CompilerState {
+            source_file:       "",
+            current_namespace: "",
+            phase:             CompilePhase::Init,
+        };
+    }
+}
+
+
+// ============================================================================
+// Compiler Instance
+// ============================================================================
+
+type struct CompilerInstance {
+public:
+    config: CompilerConfig;
+    state:  CompilerState;
+
+    static new(config: CompilerConfig) -> CompilerInstance {
+        return CompilerInstance {
+            config: config,
+            state:  CompilerState::new(),
+        };
+    }
+
+    /// Main entry point: compiles a single source file through all available phases.
+    compile_file(&this, file_path: string) -> Result<CompilePhase, CompilePhase> {
+        this.state.source_file = file_path;
+        this.state.phase = CompilePhase::Init;
+
+        if (this.config.debug) {
+            printf("[Compiler] Compiling: %s\n", file_path);
+        }
+
+        if (!File::exists(file_path)) {
+            printf("[Compiler] Error: File not found: %s\n", file_path);
+            return Err(CompilePhase::Init);
+        }
+
+        const file: File = File::new(file_path);
+
+        // Phase 1: Lexing
+        if (!this.run_lexing(file)) {
+            return Err(CompilePhase::Lexing);
+        }
+
+        // Phase 2: Parsing
+        if (!this.run_parsing()) {
+            return Err(CompilePhase::Parsing);
+        }
+
+        // Phase 3: Semantic Analysis
+        if (!this.run_analysis()) {
+            return Err(CompilePhase::Analysis);
+        }
+
+        // Phase 4: Code Generation
+        if (!this.run_codegen()) {
+            return Err(CompilePhase::CodeGen);
+        }
+
+        // Phase 5: Linking
+        if (!this.run_linking()) {
+            return Err(CompilePhase::Linking);
+        }
+
+        this.state.phase = CompilePhase::Done;
+
+        return Ok(CompilePhase::Done);
+    }
+
+    /// Returns the current compilation phase.
+    current_phase(&this) -> CompilePhase {
+        return this.state.phase;
+    }
+
+
 private:
+    // ----------------------------------------------------------------
+    // Phase 1: Lexing
+    // ----------------------------------------------------------------
+
+    run_lexing(&this, file: File) -> boolean {
+        this.state.phase = CompilePhase::Lexing;
+
+        if (this.config.debug) {
+            printf("[Compiler] Phase: %s\n", this.state.phase.label());
+        }
+
+        const lexer: Lexer = Lexer::new(file);
+        const tokens: Token[] = lexer.lex();
+        for (mut i: int = 0; i < tokens.length; i++) {
+            const tok: Token = tokens[i];
+            LOG_DEBUG(LogComponent::Lexer, "Token: %s at %d:%d",
+                tok.lexeme, tok.line, tok.column);
+        }
+
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 2: Parsing
+    // ----------------------------------------------------------------
+
+    /// Parses the token stream into an AST.
+    /// Expects run_lexing() to have populated state.tokens.
+    run_parsing(&this) -> boolean {
+        this.state.phase = CompilePhase::Parsing;
+
+        if (this.config.debug) {
+            printf("[Compiler] Phase: %s\n", this.state.phase.label());
+        }
+
+        // TODO: Create Parser from token stream
+        // const parser: Parser = Parser::new(this.state.tokens);
+        // this.state.ast = parser.parse();
+        // return this.state.ast != null;
+
+        if (this.config.debug) {
+            printf("[Compiler] Parsing: skipped (not yet implemented)\n");
+        }
+
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3: Semantic Analysis
+    // ----------------------------------------------------------------
+
+    /// Runs semantic analysis on the AST.
+    /// Includes: declaration collection, type resolution, type checking,
+    /// and monomorphization of generics.
+    run_analysis(&this) -> boolean {
+        this.state.phase = CompilePhase::Analysis;
+
+        if (this.config.debug) {
+            printf("[Compiler] Phase: %s\n", this.state.phase.label());
+        }
+
+        // TODO: Phase 3a — Declaration Collection
+        // Register all type and function names (forward reference support).
+        // this.collect_declarations();
+
+        // TODO: Phase 3b — Type Resolution
+        // Resolve type annotations, populate struct fields.
+        // this.resolve_types();
+
+        // TODO: Phase 3c — Type Checking
+        // Type-check function bodies, validate expressions.
+        // this.check_types();
+
+        // TODO: Phase 3d — Monomorphization
+        // Specialize generic types and functions.
+        // this.monomorphize();
+
+        if (this.config.debug) {
+            printf("[Compiler] Analysis: skipped (not yet implemented)\n");
+        }
+
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 4: Code Generation
+    // ----------------------------------------------------------------
+
+    /// Generates IR from the type-checked AST.
+    /// Includes: type lowering, function declaration stubs, and
+    /// full IR generation for all function bodies.
+    run_codegen(&this) -> boolean {
+        this.state.phase = CompilePhase::CodeGen;
+
+        if (this.config.debug) {
+            printf("[Compiler] Phase: %s\n", this.state.phase.label());
+        }
+
+        // TODO: Phase 4a — Type Lowering
+        // Convert high-level types to target representations.
+        // this.lower_types();
+
+        // TODO: Phase 4b — Function Declaration
+        // Pre-register function signatures for forward calls.
+        // this.declare_functions();
+
+        // TODO: Phase 4c — IR Generation
+        // Generate IR for all function bodies and global initializers.
+        // this.generate_ir();
+
+        if (this.config.debug) {
+            printf("[Compiler] CodeGen: skipped (not yet implemented)\n");
+        }
+
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 5: Linking
+    // ----------------------------------------------------------------
+
+    /// Emits object code and links the final executable.
+    /// Handles stdlib linking and runtime attachment.
+    run_linking(&this) -> boolean {
+        this.state.phase = CompilePhase::Linking;
+
+        if (this.config.debug) {
+            printf("[Compiler] Phase: %s\n", this.state.phase.label());
+        }
+
+        // TODO: Phase 5a — Object Emission
+        // Emit IR to object file (.o).
+        // this.emit_object();
+
+        // TODO: Phase 5b — Stdlib Linking
+        // Link against libcryo.a if stdlib_linking is enabled.
+        // if (this.config.stdlib_linking) {
+        //     this.link_stdlib();
+        // }
+
+        // TODO: Phase 5c — Final Link
+        // Link all object files into the final executable.
+        // this.link_executable();
+
+        if (this.config.debug) {
+            printf("[Compiler] Linking: skipped (not yet implemented)\n");
+        }
+
+        return true;
+    }
 }
