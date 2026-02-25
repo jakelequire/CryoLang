@@ -281,6 +281,19 @@ namespace Cryo::Codegen
                                       llvm::Value *rhs);
 
         //===================================================================
+        // Array Operations
+        //===================================================================
+
+        /**
+         * @brief Generate array concatenation (Array<T> + Array<T>)
+         * @param lhs Left array operand (Array<T> struct value)
+         * @param rhs Right array operand (Array<T> struct value)
+         * @param array_type The Cryo ArrayType for element type info
+         * @return New Array<T> struct value with concatenated elements
+         */
+        llvm::Value *generate_array_concat(llvm::Value *lhs, llvm::Value *rhs, TypeRef array_type);
+
+        //===================================================================
         // String Operations
         //===================================================================
 

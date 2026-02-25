@@ -1,0 +1,424 @@
+///! Pass Registry
+///!
+///! Pipeline builder and executor.  Replaces the PassManager class with a
+///! data-driven approach: PassRegistry holds a list of PassIDs, validates
+///! their dependency graph, and runs them in order via enum dispatch.
+///!
+///! Pipeline construction is a pure function (build_standard_pipeline, etc.)
+///! so each CompileMode gets exactly the passes it needs.
+
+namespace Compiler::PassRegistry;
+
+import Compiler::PassID;
+import Compiler::Diagnostics;
+import Compiler::Artifacts;
+import Compiler::CompilationContext;
+import Compiler::Lex;
+import Compiler::Lex::Lexer;
+import Utils;
+import Utils::File;
+import Utils::Logger;
+
+
+// ============================================================================
+// PassStats — Per-pass execution statistics
+// ============================================================================
+
+type struct PassStats {
+    id:              PassID;
+    executed:        boolean;
+    success:         boolean;
+    errors_emitted:  u32;
+    warnings_emitted: u32;
+
+    static new(id: PassID) -> PassStats {
+        return PassStats {
+            id:               id,
+            executed:         false,
+            success:          false,
+            errors_emitted:   0,
+            warnings_emitted: 0,
+        };
+    }
+}
+
+
+// ============================================================================
+// PassResult — Return value from running a single pass
+// ============================================================================
+
+type struct PassResult {
+    success:          boolean;
+    provisions:       Provision[];
+    errors_emitted:   u32;
+    warnings_emitted: u32;
+
+    /// The pass succeeded and produced these provisions.
+    static ok(provisions: Provision[]) -> PassResult {
+        return PassResult {
+            success:          true,
+            provisions:       provisions,
+            errors_emitted:   0,
+            warnings_emitted: 0,
+        };
+    }
+
+    /// The pass failed, emitting this many errors.
+    static failure(errors: u32) -> PassResult {
+        return PassResult {
+            success:          false,
+            provisions:       [],
+            errors_emitted:   errors,
+            warnings_emitted: 0,
+        };
+    }
+
+    /// Build a PassResult from a DiagnosticSink snapshot comparison.
+    static from_snapshot(sink: DiagnosticSink, before: DiagnosticSnapshot,
+                         provisions: Provision[]) -> PassResult {
+        const errors: u32   = sink.errors_since(before);
+        const warnings: u32 = sink.warnings_since(before);
+        return PassResult {
+            success:          errors == 0,
+            provisions:       provisions,
+            errors_emitted:   errors,
+            warnings_emitted: warnings,
+        };
+    }
+}
+
+
+// ============================================================================
+// PassRegistry — Pipeline container and executor
+// ============================================================================
+
+type struct PassRegistry {
+    passes:     PassID[];
+    stats:      PassStats[];
+    provisions: ProvisionSet;
+    validated:  boolean;
+    verbose:    boolean;
+
+    static new() -> PassRegistry {
+        return PassRegistry {
+            passes:     [],
+            stats:      [],
+            provisions: ProvisionSet::empty(),
+            validated:  false,
+            verbose:    false,
+        };
+    }
+
+    /// Set the list of passes to run.
+    set_passes(mut &this, passes: PassID[]) -> void {
+        LOG_DEBUG(LogComponent::General, "[PassRegistry] set_passes called with %lld passes", passes.length);
+        this.passes = passes;
+        this.validated = false;
+        LOG_DEBUG(LogComponent::General, "[PassRegistry] passes assigned, length = %lld", this.passes.length);
+
+        // Initialize stats array
+        mut stats: PassStats[] = [];
+        for (mut i: int = 0; i < passes.length; i = i + 1) {
+            stats = stats + [PassStats::new(passes[i])];
+        }
+        this.stats = stats;
+        LOG_DEBUG(LogComponent::General, "[PassRegistry] stats initialized, count = %lld", this.stats.length);
+    }
+
+    /// Enable verbose logging of pass execution.
+    set_verbose(mut &this, v: boolean) -> void {
+        this.verbose = v;
+    }
+
+    /// Validate the dependency graph: for each pass, check that all required
+    /// provisions will be satisfied by earlier passes.
+    validate(mut &this) -> boolean {
+        LOG_DEBUG(LogComponent::General, "[PassRegistry] validate() called, passes.length = %lld", this.passes.length);
+        mut available: ProvisionSet = ProvisionSet::empty();
+
+        for (mut i: int = 0; i < this.passes.length; i = i + 1) {
+            LOG_DEBUG(LogComponent::General, "[PassRegistry] validating pass %lld/%lld", i + 1, this.passes.length);
+            const meta: PassMetadata = get_pass_metadata(this.passes[i]);
+
+            // Check required dependencies
+            for (mut j: int = 0; j < meta.requirements.length; j = j + 1) {
+                const req: PassRequirement = meta.requirements[j];
+                if (req.is_required && !available.has(req.provision)) {
+                    printf("[PassRegistry] Validation failed: %s requires %s but it won't be available\n",
+                        meta.name, req.provision.name());
+                    this.validated = false;
+                    return false;
+                }
+            }
+
+            // Register this pass's provisions
+            for (mut k: int = 0; k < meta.provisions.length; k = k + 1) {
+                available.mark(meta.provisions[k]);
+            }
+        }
+
+        this.validated = true;
+        return true;
+    }
+
+    /// Run all passes in order.  Returns true if no fatal pass failed.
+    run_all(mut &this, ctx: CompilationContext*) -> boolean {
+        if (!this.validated) {
+            printf("[PassRegistry] Error: pipeline not validated before run_all\n");
+            return false;
+        }
+
+        for (mut i: int = 0; i < this.passes.length; i = i + 1) {
+            const id: PassID = this.passes[i];
+            const meta: PassMetadata = get_pass_metadata(id);
+
+            if (this.verbose) {
+                printf("[Pass %d/%d] %s (%s)\n",
+                    i + 1, this.passes.length, meta.name, meta.stage.label());
+            }
+
+            // Take diagnostic snapshot before the pass
+            const snap: DiagnosticSnapshot = ctx->diagnostics.snapshot();
+
+            // Dispatch to the pass implementation
+            const result: PassResult = run_pass(id, ctx);
+
+            // Update stats
+            this.stats[i].executed = true;
+            this.stats[i].success = result.success;
+            this.stats[i].errors_emitted = result.errors_emitted;
+            this.stats[i].warnings_emitted = result.warnings_emitted;
+
+            // Register provisions on success
+            if (result.success) {
+                for (mut j: int = 0; j < result.provisions.length; j = j + 1) {
+                    this.provisions.mark(result.provisions[j]);
+                    ctx->provisions.mark(result.provisions[j]);
+                }
+            }
+
+            // Abort on fatal failure
+            if (!result.success && meta.fatal_on_failure) {
+                if (this.verbose) {
+                    printf("[Pass %d/%d] %s FAILED (fatal) — aborting pipeline\n",
+                        i + 1, this.passes.length, meta.name);
+                }
+                return false;
+            }
+        }
+
+        return !ctx->diagnostics.has_errors();
+    }
+
+    /// Run passes until (and including) all passes in the given stage.
+    run_until(mut &this, ctx: CompilationContext*, until: PassStage) -> boolean {
+        if (!this.validated) {
+            printf("[PassRegistry] Error: pipeline not validated before run_until\n");
+            return false;
+        }
+
+        const until_int: u32 = until.to_int();
+
+        for (mut i: int = 0; i < this.passes.length; i = i + 1) {
+            const id: PassID = this.passes[i];
+            const meta: PassMetadata = get_pass_metadata(id);
+
+            // Stop after the target stage
+            if (meta.stage.to_int() > until_int) {
+                break;
+            }
+
+            if (this.verbose) {
+                printf("[Pass %d] %s (%s)\n", i + 1, meta.name, meta.stage.label());
+            }
+
+            const snap: DiagnosticSnapshot = ctx->diagnostics.snapshot();
+            const result: PassResult = run_pass(id, ctx);
+
+            this.stats[i].executed = true;
+            this.stats[i].success = result.success;
+            this.stats[i].errors_emitted = result.errors_emitted;
+            this.stats[i].warnings_emitted = result.warnings_emitted;
+
+            if (result.success) {
+                for (mut j: int = 0; j < result.provisions.length; j = j + 1) {
+                    this.provisions.mark(result.provisions[j]);
+                    ctx->provisions.mark(result.provisions[j]);
+                }
+            }
+
+            if (!result.success && meta.fatal_on_failure) {
+                return false;
+            }
+        }
+
+        return !ctx->diagnostics.has_errors();
+    }
+
+    /// Reset provisions and stats for the next module in a batch.
+    reset(mut &this) -> void {
+        this.provisions.clear();
+        for (mut i: int = 0; i < this.stats.length; i = i + 1) {
+            this.stats[i] = PassStats::new(this.passes[i]);
+        }
+    }
+}
+
+
+// ============================================================================
+// run_pass — Central dispatch function
+// ============================================================================
+
+/// Dispatches to the pass implementation for the given PassID.
+/// Pass implementations are inlined here to avoid cross-namespace
+/// free function resolution issues.  As the compiler matures, these
+/// can be refactored into separate modules.
+function run_pass(id: PassID, ctx: CompilationContext*) -> PassResult {
+    const meta: PassMetadata = get_pass_metadata(id);
+
+    return match (id) {
+        PassID::Lexing => {
+            run_lexing_pass_impl(ctx)
+        }
+        _ => {
+            PassResult::ok(meta.provisions)
+        }
+    };
+}
+
+/// Lexing pass: reads source file and tokenizes it.
+function run_lexing_pass_impl(ctx: CompilationContext*) -> PassResult {
+    const snap: DiagnosticSnapshot = ctx->diagnostics.snapshot();
+    const source_path: string = ctx->source_file;
+
+    if (ctx->debug_mode) {
+        printf("[Lexing] Tokenizing: %s\n", source_path);
+    }
+
+    if (!File::exists(source_path)) {
+        ctx->emit_error(1001, sprintf("Source file not found: %s", source_path));
+        return PassResult::failure(1);
+    }
+
+    const file: File = File::new(source_path);
+    const lexer: Lexer = Lexer::new(file);
+    const tokens: Token[] = lexer.lex();
+
+    if (tokens.length == 0) {
+        ctx->emit_error(1002, sprintf("Lexer produced no tokens for: %s", source_path));
+        return PassResult::failure(1);
+    }
+
+    ctx->artifacts.tokens = TokenStream::new(tokens, source_path, "");
+
+    if (ctx->debug_mode) {
+        printf("[Lexing] Produced %d tokens\n", tokens.length);
+    }
+
+    return PassResult::from_snapshot(ctx->diagnostics, snap, [Provision::Tokens]);
+}
+
+
+// ============================================================================
+// Pipeline Builders
+// ============================================================================
+
+/// Full compilation pipeline: lex → parse → analyze → codegen → link.
+function build_standard_pipeline() -> PassRegistry {
+    LOG_DEBUG(LogComponent::General, "[PassRegistry] Building standard pipeline");
+    mut reg: PassRegistry = PassRegistry::new();
+    reg.set_passes([
+        PassID::Lexing,
+        PassID::Parsing,
+        PassID::ASTValidation,
+        PassID::AutoImport,
+        PassID::ImportResolution,
+        PassID::TypeDeclaration,
+        PassID::FunctionSignature,
+        PassID::TemplateRegistration,
+        PassID::TypeResolution,
+        PassID::StructFieldTypeSync,
+        PassID::DirectiveProcessing,
+        PassID::FunctionBodyTypeCheck,
+        PassID::Monomorphization,
+        PassID::GenericExpressionResolution,
+        PassID::TypeLowering,
+        PassID::FunctionDeclaration,
+        PassID::IRGeneration,
+        PassID::Optimization,
+        PassID::ObjectEmission,
+        PassID::Linking,
+    ]);
+    return reg;
+}
+
+/// Frontend-only pipeline for LSP: lex → parse → analyze (no codegen).
+function build_frontend_pipeline() -> PassRegistry {
+    mut reg: PassRegistry = PassRegistry::new();
+    reg.set_passes([
+        PassID::Lexing,
+        PassID::Parsing,
+        PassID::ASTValidation,
+        PassID::AutoImport,
+        PassID::ImportResolution,
+        PassID::TypeDeclaration,
+        PassID::FunctionSignature,
+        PassID::TemplateRegistration,
+        PassID::TypeResolution,
+        PassID::StructFieldTypeSync,
+        PassID::DirectiveProcessing,
+        PassID::FunctionBodyTypeCheck,
+    ]);
+    return reg;
+}
+
+/// Stdlib batch pipeline: same as standard but without linking.
+function build_stdlib_pipeline() -> PassRegistry {
+    mut reg: PassRegistry = PassRegistry::new();
+    reg.set_passes([
+        PassID::Lexing,
+        PassID::Parsing,
+        PassID::ASTValidation,
+        PassID::TypeDeclaration,
+        PassID::FunctionSignature,
+        PassID::TemplateRegistration,
+        PassID::TypeResolution,
+        PassID::StructFieldTypeSync,
+        PassID::DirectiveProcessing,
+        PassID::FunctionBodyTypeCheck,
+        PassID::Monomorphization,
+        PassID::GenericExpressionResolution,
+        PassID::TypeLowering,
+        PassID::FunctionDeclaration,
+        PassID::IRGeneration,
+        PassID::Optimization,
+        PassID::ObjectEmission,
+    ]);
+    return reg;
+}
+
+/// Raw pipeline: no auto-imports or module resolution.
+function build_raw_pipeline() -> PassRegistry {
+    mut reg: PassRegistry = PassRegistry::new();
+    reg.set_passes([
+        PassID::Lexing,
+        PassID::Parsing,
+        PassID::ASTValidation,
+        PassID::TypeDeclaration,
+        PassID::FunctionSignature,
+        PassID::TemplateRegistration,
+        PassID::TypeResolution,
+        PassID::StructFieldTypeSync,
+        PassID::DirectiveProcessing,
+        PassID::FunctionBodyTypeCheck,
+        PassID::Monomorphization,
+        PassID::GenericExpressionResolution,
+        PassID::TypeLowering,
+        PassID::FunctionDeclaration,
+        PassID::IRGeneration,
+        PassID::Optimization,
+        PassID::ObjectEmission,
+        PassID::Linking,
+    ]);
+    return reg;
+}

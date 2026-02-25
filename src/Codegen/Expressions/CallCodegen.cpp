@@ -762,6 +762,48 @@ namespace Cryo::Codegen
                                 builder().CreateStore(arg, temp);
                                 arg = temp;
                             }
+                            // Handle raw [N x T] array → Array<T> struct conversion
+                            if (arg && param_type->isStructTy() && arg->getType()->isPointerTy())
+                            {
+                                llvm::StructType *param_st = llvm::cast<llvm::StructType>(param_type);
+                                std::string st_name = param_st->hasName() ? param_st->getName().str() : "";
+                                if (st_name.find("Array<") != std::string::npos)
+                                {
+                                    llvm::AllocaInst *alloca_arg = llvm::dyn_cast<llvm::AllocaInst>(arg);
+                                    if (alloca_arg && alloca_arg->getAllocatedType()->isArrayTy())
+                                    {
+                                        llvm::ArrayType *arr_ty = llvm::cast<llvm::ArrayType>(alloca_arg->getAllocatedType());
+                                        uint64_t num_elems = arr_ty->getNumElements();
+                                        auto &DL = module()->getDataLayout();
+                                        uint64_t elem_size = DL.getTypeAllocSize(arr_ty->getElementType());
+                                        uint64_t total_bytes = num_elems * elem_size;
+
+                                        llvm::Function *malloc_fn = module()->getFunction("malloc");
+                                        if (!malloc_fn)
+                                        {
+                                            llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+                                                llvm::PointerType::get(llvm_ctx(), 0),
+                                                {llvm::Type::getInt64Ty(llvm_ctx())}, false);
+                                            malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
+                                                                               "malloc", module());
+                                        }
+                                        llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), total_bytes);
+                                        llvm::Value *heap_ptr = builder().CreateCall(malloc_fn, {size_val}, "array.heap");
+                                        builder().CreateMemCpy(heap_ptr, llvm::MaybeAlign(1),
+                                                               alloca_arg, llvm::MaybeAlign(1), size_val);
+
+                                        llvm::AllocaInst *wrapper = create_entry_alloca(param_st, "array.wrap");
+                                        llvm::Value *f0 = builder().CreateStructGEP(param_st, wrapper, 0, "array.wrap.data");
+                                        builder().CreateStore(heap_ptr, f0);
+                                        llvm::Value *len_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), num_elems);
+                                        llvm::Value *f1 = builder().CreateStructGEP(param_st, wrapper, 1, "array.wrap.len");
+                                        builder().CreateStore(len_val, f1);
+                                        llvm::Value *f2 = builder().CreateStructGEP(param_st, wrapper, 2, "array.wrap.cap");
+                                        builder().CreateStore(len_val, f2);
+                                        arg = create_load(wrapper, param_st, "array.wrapped");
+                                    }
+                                }
+                            }
                             coerced_args.push_back(cast_if_needed(arg, param_type));
                         }
                         std::string result_name = method->getReturnType()->isVoidTy() ? "" : method_name + ".result";
@@ -2724,6 +2766,49 @@ namespace Cryo::Codegen
                     arg = temp;
                 }
 
+                // Handle raw [N x T] array → Array<T> struct conversion
+                if (arg && param_type->isStructTy() && arg->getType()->isPointerTy())
+                {
+                    llvm::StructType *param_st = llvm::cast<llvm::StructType>(param_type);
+                    std::string st_name = param_st->hasName() ? param_st->getName().str() : "";
+                    if (st_name.find("Array<") != std::string::npos)
+                    {
+                        llvm::AllocaInst *alloca_arg = llvm::dyn_cast<llvm::AllocaInst>(arg);
+                        if (alloca_arg && alloca_arg->getAllocatedType()->isArrayTy())
+                        {
+                            llvm::ArrayType *arr_ty = llvm::cast<llvm::ArrayType>(alloca_arg->getAllocatedType());
+                            uint64_t num_elems = arr_ty->getNumElements();
+                            auto &DL = module()->getDataLayout();
+                            uint64_t elem_size = DL.getTypeAllocSize(arr_ty->getElementType());
+                            uint64_t total_bytes = num_elems * elem_size;
+
+                            llvm::Function *malloc_fn = module()->getFunction("malloc");
+                            if (!malloc_fn)
+                            {
+                                llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+                                    llvm::PointerType::get(llvm_ctx(), 0),
+                                    {llvm::Type::getInt64Ty(llvm_ctx())}, false);
+                                malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
+                                                                   "malloc", module());
+                            }
+                            llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), total_bytes);
+                            llvm::Value *heap_ptr = builder().CreateCall(malloc_fn, {size_val}, "array.heap");
+                            builder().CreateMemCpy(heap_ptr, llvm::MaybeAlign(1),
+                                                   alloca_arg, llvm::MaybeAlign(1), size_val);
+
+                            llvm::AllocaInst *wrapper = create_entry_alloca(param_st, "array.wrap");
+                            llvm::Value *f0 = builder().CreateStructGEP(param_st, wrapper, 0, "array.wrap.data");
+                            builder().CreateStore(heap_ptr, f0);
+                            llvm::Value *len_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), num_elems);
+                            llvm::Value *f1 = builder().CreateStructGEP(param_st, wrapper, 1, "array.wrap.len");
+                            builder().CreateStore(len_val, f1);
+                            llvm::Value *f2 = builder().CreateStructGEP(param_st, wrapper, 2, "array.wrap.cap");
+                            builder().CreateStore(len_val, f2);
+                            arg = create_load(wrapper, param_st, "array.wrapped");
+                        }
+                    }
+                }
+
                 coerced_args.push_back(cast_if_needed(arg, param_type));
             }
             else if (fn_type->isVarArg())
@@ -2994,6 +3079,49 @@ namespace Cryo::Codegen
                     arg = temp;
                 }
 
+                // Handle raw [N x T] array → Array<T> struct conversion
+                if (arg && param_type->isStructTy() && arg->getType()->isPointerTy())
+                {
+                    llvm::StructType *param_st = llvm::cast<llvm::StructType>(param_type);
+                    std::string st_name = param_st->hasName() ? param_st->getName().str() : "";
+                    if (st_name.find("Array<") != std::string::npos)
+                    {
+                        llvm::AllocaInst *alloca_arg = llvm::dyn_cast<llvm::AllocaInst>(arg);
+                        if (alloca_arg && alloca_arg->getAllocatedType()->isArrayTy())
+                        {
+                            llvm::ArrayType *arr_ty = llvm::cast<llvm::ArrayType>(alloca_arg->getAllocatedType());
+                            uint64_t num_elems = arr_ty->getNumElements();
+                            auto &DL = module()->getDataLayout();
+                            uint64_t elem_size = DL.getTypeAllocSize(arr_ty->getElementType());
+                            uint64_t total_bytes = num_elems * elem_size;
+
+                            llvm::Function *malloc_fn = module()->getFunction("malloc");
+                            if (!malloc_fn)
+                            {
+                                llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+                                    llvm::PointerType::get(llvm_ctx(), 0),
+                                    {llvm::Type::getInt64Ty(llvm_ctx())}, false);
+                                malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
+                                                                   "malloc", module());
+                            }
+                            llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), total_bytes);
+                            llvm::Value *heap_ptr = builder().CreateCall(malloc_fn, {size_val}, "array.heap");
+                            builder().CreateMemCpy(heap_ptr, llvm::MaybeAlign(1),
+                                                   alloca_arg, llvm::MaybeAlign(1), size_val);
+
+                            llvm::AllocaInst *wrapper = create_entry_alloca(param_st, "array.wrap");
+                            llvm::Value *f0 = builder().CreateStructGEP(param_st, wrapper, 0, "array.wrap.data");
+                            builder().CreateStore(heap_ptr, f0);
+                            llvm::Value *len_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), num_elems);
+                            llvm::Value *f1 = builder().CreateStructGEP(param_st, wrapper, 1, "array.wrap.len");
+                            builder().CreateStore(len_val, f1);
+                            llvm::Value *f2 = builder().CreateStructGEP(param_st, wrapper, 2, "array.wrap.cap");
+                            builder().CreateStore(len_val, f2);
+                            arg = create_load(wrapper, param_st, "array.wrapped");
+                        }
+                    }
+                }
+
                 coerced_args.push_back(cast_if_needed(arg, param_type));
             }
 
@@ -3078,6 +3206,49 @@ namespace Cryo::Codegen
                                         llvm::AllocaInst *temp = create_entry_alloca(arg->getType(), "struct.arg.tmp");
                                         builder().CreateStore(arg, temp);
                                         arg = temp;
+                                    }
+
+                                    // Handle raw [N x T] array → Array<T> struct conversion
+                                    if (arg && param_type->isStructTy() && arg->getType()->isPointerTy())
+                                    {
+                                        llvm::StructType *param_st = llvm::cast<llvm::StructType>(param_type);
+                                        std::string st_name = param_st->hasName() ? param_st->getName().str() : "";
+                                        if (st_name.find("Array<") != std::string::npos)
+                                        {
+                                            llvm::AllocaInst *alloca_arg = llvm::dyn_cast<llvm::AllocaInst>(arg);
+                                            if (alloca_arg && alloca_arg->getAllocatedType()->isArrayTy())
+                                            {
+                                                llvm::ArrayType *arr_ty = llvm::cast<llvm::ArrayType>(alloca_arg->getAllocatedType());
+                                                uint64_t num_elems = arr_ty->getNumElements();
+                                                auto &DL = module()->getDataLayout();
+                                                uint64_t elem_size = DL.getTypeAllocSize(arr_ty->getElementType());
+                                                uint64_t total_bytes = num_elems * elem_size;
+
+                                                llvm::Function *malloc_fn = module()->getFunction("malloc");
+                                                if (!malloc_fn)
+                                                {
+                                                    llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+                                                        llvm::PointerType::get(llvm_ctx(), 0),
+                                                        {llvm::Type::getInt64Ty(llvm_ctx())}, false);
+                                                    malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
+                                                                                       "malloc", module());
+                                                }
+                                                llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), total_bytes);
+                                                llvm::Value *heap_ptr = builder().CreateCall(malloc_fn, {size_val}, "array.heap");
+                                                builder().CreateMemCpy(heap_ptr, llvm::MaybeAlign(1),
+                                                                       alloca_arg, llvm::MaybeAlign(1), size_val);
+
+                                                llvm::AllocaInst *wrapper = create_entry_alloca(param_st, "array.wrap");
+                                                llvm::Value *f0 = builder().CreateStructGEP(param_st, wrapper, 0, "array.wrap.data");
+                                                builder().CreateStore(heap_ptr, f0);
+                                                llvm::Value *len_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), num_elems);
+                                                llvm::Value *f1 = builder().CreateStructGEP(param_st, wrapper, 1, "array.wrap.len");
+                                                builder().CreateStore(len_val, f1);
+                                                llvm::Value *f2 = builder().CreateStructGEP(param_st, wrapper, 2, "array.wrap.cap");
+                                                builder().CreateStore(len_val, f2);
+                                                arg = create_load(wrapper, param_st, "array.wrapped");
+                                            }
+                                        }
                                     }
 
                                     coerced_args.push_back(cast_if_needed(arg, param_type));
@@ -4452,6 +4623,54 @@ namespace Cryo::Codegen
                     arg = temp;
                 }
 
+                // Handle raw [N x T] array → Array<T> struct conversion
+                if (arg && param_type->isStructTy() && arg->getType()->isPointerTy())
+                {
+                    llvm::StructType *param_st = llvm::cast<llvm::StructType>(param_type);
+                    std::string st_name = param_st->hasName() ? param_st->getName().str() : "";
+                    if (st_name.find("Array<") != std::string::npos)
+                    {
+                        llvm::AllocaInst *alloca_arg = llvm::dyn_cast<llvm::AllocaInst>(arg);
+                        if (alloca_arg && alloca_arg->getAllocatedType()->isArrayTy())
+                        {
+                            llvm::ArrayType *arr_ty = llvm::cast<llvm::ArrayType>(alloca_arg->getAllocatedType());
+                            uint64_t num_elems = arr_ty->getNumElements();
+                            auto &DL = module()->getDataLayout();
+                            uint64_t elem_size = DL.getTypeAllocSize(arr_ty->getElementType());
+                            uint64_t total_bytes = num_elems * elem_size;
+
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "generate_instance_method: Wrapping raw [{}x T] array into {} struct (heap copy, {} bytes)",
+                                      num_elems, st_name, total_bytes);
+
+                            // Heap-allocate so data survives beyond the current stack frame
+                            llvm::Function *malloc_fn = module()->getFunction("malloc");
+                            if (!malloc_fn)
+                            {
+                                llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+                                    llvm::PointerType::get(llvm_ctx(), 0),
+                                    {llvm::Type::getInt64Ty(llvm_ctx())}, false);
+                                malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
+                                                                    "malloc", module());
+                            }
+                            llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), total_bytes);
+                            llvm::Value *heap_ptr = builder().CreateCall(malloc_fn, {size_val}, "array.heap");
+                            builder().CreateMemCpy(heap_ptr, llvm::MaybeAlign(1),
+                                                    alloca_arg, llvm::MaybeAlign(1), size_val);
+
+                            llvm::AllocaInst *wrapper = create_entry_alloca(param_st, "array.wrap");
+                            llvm::Value *f0 = builder().CreateStructGEP(param_st, wrapper, 0, "array.wrap.data");
+                            builder().CreateStore(heap_ptr, f0);
+                            llvm::Value *len_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), num_elems);
+                            llvm::Value *f1 = builder().CreateStructGEP(param_st, wrapper, 1, "array.wrap.len");
+                            builder().CreateStore(len_val, f1);
+                            llvm::Value *f2 = builder().CreateStructGEP(param_st, wrapper, 2, "array.wrap.cap");
+                            builder().CreateStore(len_val, f2);
+                            arg = create_load(wrapper, param_st, "array.wrapped");
+                        }
+                    }
+                }
+
                 call_args.push_back(cast_if_needed(arg, param_type));
             }
             else if (fn_type->isVarArg())
@@ -4496,6 +4715,66 @@ namespace Cryo::Codegen
                     llvm::AllocaInst *temp = create_entry_alloca(arg->getType(), "struct.arg.tmp");
                     builder().CreateStore(arg, temp);
                     arg = temp;
+                }
+
+                // Handle raw [N x T] array → Array<T> struct conversion
+                // When an array literal produces a raw [N x T] alloca but the parameter
+                // expects an Array<T> struct { ptr, i64, i64 }, wrap it.
+                if (arg && param_type->isStructTy() && arg->getType()->isPointerTy())
+                {
+                    llvm::StructType *param_st = llvm::cast<llvm::StructType>(param_type);
+                    std::string st_name = param_st->hasName() ? param_st->getName().str() : "";
+                    if (st_name.find("Array<") != std::string::npos)
+                    {
+                        // Check if the argument is a pointer to a raw [N x T] array
+                        llvm::AllocaInst *alloca_arg = llvm::dyn_cast<llvm::AllocaInst>(arg);
+                        if (alloca_arg)
+                        {
+                            llvm::Type *alloc_type = alloca_arg->getAllocatedType();
+                            if (alloc_type->isArrayTy())
+                            {
+                                llvm::ArrayType *arr_ty = llvm::cast<llvm::ArrayType>(alloc_type);
+                                uint64_t num_elems = arr_ty->getNumElements();
+                                auto &DL = module()->getDataLayout();
+                                uint64_t elem_size = DL.getTypeAllocSize(arr_ty->getElementType());
+                                uint64_t total_bytes = num_elems * elem_size;
+
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_free_function: Wrapping raw [{}x T] array into {} struct (heap copy, {} bytes)",
+                                          num_elems, st_name, total_bytes);
+
+                                // Heap-allocate the data so it survives beyond the current stack frame
+                                llvm::Function *malloc_fn = module()->getFunction("malloc");
+                                if (!malloc_fn)
+                                {
+                                    llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+                                        llvm::PointerType::get(llvm_ctx(), 0),
+                                        {llvm::Type::getInt64Ty(llvm_ctx())}, false);
+                                    malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
+                                                                       "malloc", module());
+                                }
+                                llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), total_bytes);
+                                llvm::Value *heap_ptr = builder().CreateCall(malloc_fn, {size_val}, "array.heap");
+
+                                // Copy stack data to heap
+                                builder().CreateMemCpy(heap_ptr, llvm::MaybeAlign(1),
+                                                       alloca_arg, llvm::MaybeAlign(1), size_val);
+
+                                // Build the Array<T> struct: { ptr, i64 len, i64 cap }
+                                llvm::AllocaInst *wrapper = create_entry_alloca(param_st, "array.wrap");
+                                llvm::Value *f0 = builder().CreateStructGEP(param_st, wrapper, 0, "array.wrap.data");
+                                builder().CreateStore(heap_ptr, f0);
+                                llvm::Value *len_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), num_elems);
+                                llvm::Value *f1 = builder().CreateStructGEP(param_st, wrapper, 1, "array.wrap.len");
+                                builder().CreateStore(len_val, f1);
+                                llvm::Value *f2 = builder().CreateStructGEP(param_st, wrapper, 2, "array.wrap.cap");
+                                builder().CreateStore(len_val, f2);
+
+                                // Load the struct value to pass by value
+                                arg = create_load(wrapper, param_st, "array.wrapped");
+                            }
+                        }
+                    }
                 }
 
                 coerced_args.push_back(cast_if_needed(arg, param_type));
@@ -6495,8 +6774,11 @@ namespace Cryo::Codegen
                   "CallCodegen: Variadic forwarding {} -> {} (va_list at arg index {})",
                   intrinsic_name, v_name, va_list_index);
 
-        // The v* functions (vsprintf, vprintf, etc.) expect a pointer to the va_list
-        // storage, not the loaded value. We need to get the alloca directly.
+        // Get the va_list alloca, then handle platform-specific ABI:
+        // - Win64: va_list = char* (8 bytes), v* functions expect the char* by value,
+        //   so we must LOAD the pointer from the alloca.
+        // - System V x86-64: va_list = __va_list_tag[1] (24 bytes), v* functions expect
+        //   a pointer to the tag array, so we pass the alloca directly.
         llvm::Value *va_list_ptr = nullptr;
         if (va_list_index < static_cast<int>(node->arguments().size()))
         {
@@ -6511,6 +6793,16 @@ namespace Cryo::Codegen
         }
         if (!va_list_ptr)
             va_list_ptr = args[va_list_index]; // fallback
+
+        // On Win64, va_list is char* — load the pointer value from the alloca
+        // so that v* functions receive the char* by value, not a pointer-to-pointer.
+#ifdef _WIN32
+        if (va_list_ptr && llvm::isa<llvm::AllocaInst>(va_list_ptr))
+        {
+            va_list_ptr = builder().CreateLoad(
+                llvm::PointerType::get(llvm_ctx(), 0), va_list_ptr, "va_list.loaded");
+        }
+#endif
 
         // Build args: everything before va_list stays, va_list pointer replaces rest
         std::vector<llvm::Value *> v_args;

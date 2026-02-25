@@ -1,0 +1,182 @@
+///! Module Graph
+///!
+///! Manages multi-module compilation state: module discovery, topological
+///! ordering, and cross-module function descriptors.  Replaces the ad-hoc
+///! SimpleTypeDesc / CrossModuleFnEntry maps on the C++ CompilerInstance.
+
+namespace Compiler::ModuleGraph;
+
+
+// ============================================================================
+// ModuleInfo
+// ============================================================================
+
+/// Metadata about a single compilation module (source file).
+type struct ModuleInfo {
+    name:           string;
+    file_path:      string;
+    namespace_name: string;
+    dependencies:   string[];
+    processed:      boolean;
+
+    static new(name: string, path: string) -> ModuleInfo {
+        return ModuleInfo {
+            name:           name,
+            file_path:      path,
+            namespace_name: "",
+            dependencies:   [],
+            processed:      false,
+        };
+    }
+
+    static with_namespace(name: string, path: string, ns: string) -> ModuleInfo {
+        return ModuleInfo {
+            name:           name,
+            file_path:      path,
+            namespace_name: ns,
+            dependencies:   [],
+            processed:      false,
+        };
+    }
+
+    add_dependency(mut &this, dep: string) -> void {
+        this.dependencies = this.dependencies + [dep];
+    }
+
+    mark_processed(mut &this) -> void {
+        this.processed = true;
+    }
+}
+
+
+// TODO: This will be replaced when the type system is fully implemented and cross-module
+// function re-declaration can reference actual type descriptors instead of SimpleTypeKind.
+// ============================================================================
+// SimpleTypeKind — Lightweight cross-module type representation
+// ============================================================================
+
+/// Simplified type descriptors for cross-module function declarations.
+/// Avoids depending on the full type system for function re-declaration.
+type enum SimpleTypeKind {
+    Void;
+    Int8;
+    Int16;
+    Int32;
+    Int64;
+    Float;
+    Double;
+    Boolean;
+    Ptr;
+    NamedStruct;
+    Other;
+}
+
+implement enum SimpleTypeKind {
+    label(&this) -> string {
+        return match (this) {
+            SimpleTypeKind::Void        => { "void"    }
+            SimpleTypeKind::Int8        => { "i8"      }
+            SimpleTypeKind::Int16       => { "i16"     }
+            SimpleTypeKind::Int32       => { "i32"     }
+            SimpleTypeKind::Int64       => { "i64"     }
+            SimpleTypeKind::Float       => { "float"   }
+            SimpleTypeKind::Double      => { "double"  }
+            SimpleTypeKind::Boolean     => { "boolean" }
+            SimpleTypeKind::Ptr         => { "ptr"     }
+            SimpleTypeKind::NamedStruct => { "struct"  }
+            SimpleTypeKind::Other       => { "other"   }
+        };
+    }
+}
+
+
+// TODO: This will be replaced when the module system and import resolution are implemented 
+// and the graph can be populated with actual dependencies instead of a simple linear order.
+// ============================================================================
+// CrossModuleFnDescriptor
+// ============================================================================
+
+/// Lightweight function descriptor saved between compilation units.
+/// Enough information to re-declare a function in a downstream module's
+/// LLVM IR without access to the original AST or type arena.
+type struct CrossModuleFnDescriptor {
+    name:        string;
+    return_type: SimpleTypeKind;
+    param_types: SimpleTypeKind[];
+    is_var_arg:  boolean;
+    struct_name: string;    // Non-empty for NamedStruct return types
+
+    static new(name: string, ret: SimpleTypeKind) -> CrossModuleFnDescriptor {
+        return CrossModuleFnDescriptor {
+            name:        name,
+            return_type: ret,
+            param_types: [],
+            is_var_arg:  false,
+            struct_name: "",
+        };
+    }
+}
+
+
+// ============================================================================
+// ModuleGraph
+// ============================================================================
+
+/// Tracks modules and their dependency relationships for multi-module and
+/// stdlib batch compilation.
+type struct ModuleGraph {
+    modules:          ModuleInfo[];
+    topo_order:       u32[];
+    cross_module_fns: CrossModuleFnDescriptor[];
+
+    static new() -> ModuleGraph {
+        return ModuleGraph {
+            modules:          [],
+            topo_order:       [],
+            cross_module_fns: [],
+        };
+    }
+
+    /// Register a module for compilation.
+    add_module(mut &this, info: ModuleInfo) -> void {
+        this.modules = this.modules + [info];
+    }
+
+    /// Number of registered modules.
+    module_count(&this) -> u32 {
+        return this.modules.length;
+    }
+
+    /// Compute topological order from dependency edges.
+    /// Returns false if a cycle is detected.
+    compute_order(mut &this) -> boolean {
+        const n: u32 = this.modules.length;
+        if (n == 0) {
+            return true;
+        }
+
+        // Simple linear order for now (dependencies not yet wired).
+        // Full Kahn's algorithm will be added when import resolution populates deps.
+        mut order: u32[] = [];
+        for (mut i: u32 = 0; i < n; i++) {
+            order = order + [i];
+        }
+        this.topo_order = order;
+        return true;
+    }
+
+    /// Register a cross-module function descriptor.
+    register_cross_module_fn(mut &this, desc: CrossModuleFnDescriptor) -> void {
+        this.cross_module_fns = this.cross_module_fns + [desc];
+    }
+
+    /// Look up a cross-module function by name.  Returns null if not found.
+    find_cross_module_fn(&this, name: string) -> CrossModuleFnDescriptor* {
+        for (mut i: int = 0; i < this.cross_module_fns.length; i++) {
+            if (this.cross_module_fns[i].name == name) {
+                return &this.cross_module_fns[i];
+            }
+        }
+        return null;
+    }
+}

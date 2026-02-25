@@ -200,8 +200,9 @@ namespace Cryo::Codegen
         //   Pass 0: Enums (so enum variants can be used in types and code)
         //   Pass 1: Struct/Class TYPES only (so types can be used for globals and parameters)
         //   Pass 2: Global variables (so they can be used in struct methods and functions)
-        //   Pass 3: Struct/Class METHOD BODIES (now globals are available)
-        //   Pass 4: Functions, impl blocks, etc.
+        //   Pass 2.7: Pre-declare free function signatures (so struct methods can call them)
+        //   Pass 3: Struct/Class METHOD BODIES (now globals and free functions are available)
+        //   Pass 4: Functions, impl blocks, etc. (full definitions)
 
         // Pre-pass: Register import declarations with the SRM so that cross-module
         // name resolution works correctly in all subsequent passes (especially Pass 3
@@ -588,6 +589,43 @@ namespace Cryo::Codegen
             }
         }
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2.6: Pre-registered {} struct/class method return types", struct_method_count);
+
+        // Pass 2.7: Pre-declare free functions (signatures only, no bodies)
+        // This ensures that struct methods in Pass 3 can call free functions
+        // defined in the same namespace (which are otherwise only processed in Pass 4).
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2.7: Pre-declaring free function signatures");
+        {
+            int fn_predecl_count = 0;
+            for (const auto &stmt : node.statements())
+            {
+                if (!stmt)
+                    continue;
+                Cryo::FunctionDeclarationNode *fn_node = nullptr;
+                if (auto *fn = dynamic_cast<Cryo::FunctionDeclarationNode *>(stmt.get()))
+                {
+                    fn_node = fn;
+                }
+                else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+                {
+                    if (decl_stmt->declaration())
+                        fn_node = dynamic_cast<Cryo::FunctionDeclarationNode *>(decl_stmt->declaration());
+                }
+                if (fn_node && fn_node->body())
+                {
+                    // Only forward-declare: create the LLVM function signature without generating the body
+                    llvm::Function *existing = _ctx->module()->getFunction(
+                        _ctx->namespace_context().empty()
+                            ? fn_node->name()
+                            : _ctx->namespace_context() + "::" + fn_node->name());
+                    if (!existing)
+                    {
+                        _declarations->generate_function_declaration(fn_node);
+                        fn_predecl_count++;
+                    }
+                }
+            }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 2.7: Pre-declared {} free function signatures", fn_predecl_count);
+        }
 
         // Pass 3: Generate struct/class METHOD BODIES (now globals are available)
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Pass 3: Processing struct/class method bodies");
