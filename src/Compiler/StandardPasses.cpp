@@ -1884,6 +1884,19 @@ namespace Cryo
         std::vector<FieldInfo> new_fields;
         bool has_changes = false;
 
+        // Prepend inherited base class fields
+        if (class_ptr->has_base_class())
+        {
+            auto *base_class = dynamic_cast<const ClassType *>(class_ptr->base_class().get());
+            if (base_class)
+            {
+                for (const auto &base_field : base_class->fields())
+                {
+                    new_fields.push_back(base_field);
+                }
+            }
+        }
+
         for (const auto &field : class_decl->fields())
         {
             if (!field)

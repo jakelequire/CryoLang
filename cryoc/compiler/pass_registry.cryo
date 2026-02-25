@@ -198,7 +198,7 @@ type struct PassRegistry {
             }
 
             // Abort on fatal failure
-            if (!result.success && meta.fatal_on_failure) {
+            if (!result.success && id.fatal_on_failure()) {
                 if (this.verbose) {
                     printf("[Pass %d/%d] %s FAILED (fatal) — aborting pipeline\n",
                         i + 1, this.passes.length, meta.name);
@@ -247,7 +247,7 @@ type struct PassRegistry {
                 }
             }
 
-            if (!result.success && meta.fatal_on_failure) {
+            if (!result.success && id.fatal_on_failure()) {
                 return false;
             }
         }
@@ -278,46 +278,13 @@ function run_pass(id: PassID, ctx: CompilationContext*) -> PassResult {
 
     return match (id) {
         PassID::Lexing => {
-            run_lexing_pass_impl(ctx)
+            run_lexing_pass(ctx)
         }
         _ => {
             PassResult::ok(meta.provisions)
         }
     };
 }
-
-/// Lexing pass: reads source file and tokenizes it.
-function run_lexing_pass_impl(ctx: CompilationContext*) -> PassResult {
-    const snap: DiagnosticSnapshot = ctx->diagnostics.snapshot();
-    const source_path: string = ctx->source_file;
-
-    if (ctx->debug_mode) {
-        printf("[Lexing] Tokenizing: %s\n", source_path);
-    }
-
-    if (!File::exists(source_path)) {
-        ctx->emit_error(1001, sprintf("Source file not found: %s", source_path));
-        return PassResult::failure(1);
-    }
-
-    const file: File = File::new(source_path);
-    const lexer: Lexer = Lexer::new(file);
-    const tokens: Token[] = lexer.lex();
-
-    if (tokens.length == 0) {
-        ctx->emit_error(1002, sprintf("Lexer produced no tokens for: %s", source_path));
-        return PassResult::failure(1);
-    }
-
-    ctx->artifacts.tokens = TokenStream::new(tokens, source_path, "");
-
-    if (ctx->debug_mode) {
-        printf("[Lexing] Produced %d tokens\n", tokens.length);
-    }
-
-    return PassResult::from_snapshot(ctx->diagnostics, snap, [Provision::Tokens]);
-}
-
 
 // ============================================================================
 // Pipeline Builders
@@ -421,4 +388,88 @@ function build_raw_pipeline() -> PassRegistry {
         PassID::Linking,
     ]);
     return reg;
+}
+
+
+// ============================================================================
+// Lexing Pass
+// ============================================================================
+
+/// Reads the source file and tokenizes it.  Populates ctx.artifacts.tokens.
+function run_lexing_pass(ctx: CompilationContext*) -> PassResult {
+    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+    const source_path: string = ctx.source_file;
+
+    if (ctx.debug_mode) {
+        printf("[Lexing] Tokenizing: %s\n", source_path);
+    }
+
+    // Check if source content was already provided (LSP in-memory mode)
+    if (ctx.artifacts.tokens.source_content != "") {
+        // TODO: Lex from in-memory content when Lexer supports it
+        if (ctx.debug_mode) {
+            printf("[Lexing] In-memory source provided, using existing content\n");
+        }
+    }
+
+    // Read and tokenize the source file
+    if (!File::exists(source_path)) {
+        ctx.emit_error(1001, sprintf("Source file not found: %s", source_path));
+        return PassResult::failure(1);
+    }
+
+    const file: File = File::new(source_path);
+    const lexer: Lexer = Lexer::new(file);
+    const tokens: Token[] = lexer.lex();
+
+    if (tokens.length == 0) {
+        ctx.emit_error(1002, sprintf("Lexer produced no tokens for: %s", source_path));
+        return PassResult::failure(1);
+    }
+
+    // Store results in artifacts
+    ctx.artifacts.tokens = TokenStream::new(tokens, source_path, "");
+
+    if (true) {
+        printf("[Lexing] Produced %d tokens\n", tokens.length);
+        for (mut i: int = 0; i < tokens.length; i = i + 1) {
+            const tok: Token = tokens[i];
+            printf("  [%d] %s at %d:%d\n", i, tok.lexeme, tok.line, tok.column);
+        }
+    }
+
+    return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::Tokens]);
+}
+
+
+// ============================================================================
+// Parsing Pass (stub)
+// ============================================================================
+
+/// Parses the token stream into an AST.
+function run_parsing_pass(ctx: CompilationContext*) -> PassResult {
+    if (ctx.debug_mode) {
+        printf("[Parsing] Parsing: %s (not yet implemented)\n", ctx.source_file);
+    }
+
+    // TODO: Build parser from ctx.artifacts.tokens
+    // ctx.artifacts.ast = ASTOutput { root: parser.parse(), ... };
+
+    return PassResult::ok([Provision::AST]);
+}
+
+
+// ============================================================================
+// AST Validation Pass (stub)
+// ============================================================================
+
+/// Validates the parsed AST for structural correctness.
+function run_ast_validation_pass(ctx: CompilationContext*) -> PassResult {
+    if (ctx.debug_mode) {
+        printf("[ASTValidation] Validating AST (not yet implemented)\n");
+    }
+
+    // TODO: Walk AST and check for structural issues
+
+    return PassResult::ok([Provision::ASTValidated]);
 }

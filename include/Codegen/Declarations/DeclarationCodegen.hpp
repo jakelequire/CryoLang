@@ -201,6 +201,11 @@ namespace Cryo::Codegen
         llvm::StructType *generate_class_declaration(Cryo::ClassDeclarationNode *node);
 
         /**
+         * @brief Generate vtable global for a class with virtual methods
+         */
+        void generate_vtable(const std::string &class_name, const Cryo::ClassType *cryo_class);
+
+        /**
          * @brief Generate an enum declaration
          * @param node Enum declaration node
          * @return Generated enum type

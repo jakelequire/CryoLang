@@ -522,12 +522,13 @@ namespace Cryo::Codegen
 
         /** @brief Register a struct's field indices */
         void register_struct_fields(const std::string &type_name,
-                                    const std::vector<std::string> &field_names)
+                                    const std::vector<std::string> &field_names,
+                                    unsigned offset = 0)
         {
             auto &field_map = _struct_field_indices[type_name];
             for (unsigned i = 0; i < field_names.size(); ++i)
             {
-                field_map[field_names[i]] = i;
+                field_map[field_names[i]] = i + offset;
             }
         }
 

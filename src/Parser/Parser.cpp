@@ -5510,6 +5510,18 @@ namespace Cryo
                 {
                     is_method = true;
                 }
+                // Case 4: virtual method - virtual followed by identifier
+                else if (_current_token.is(TokenKind::TK_KW_VIRTUAL) &&
+                         (next.is(TokenKind::TK_IDENTIFIER) || next.is_keyword()))
+                {
+                    is_method = true;
+                }
+                // Case 5: override method - override followed by identifier
+                else if (_current_token.is(TokenKind::TK_KW_OVERRIDE) &&
+                         (next.is(TokenKind::TK_IDENTIFIER) || next.is_keyword()))
+                {
+                    is_method = true;
+                }
 
                 if (is_method)
                 {
@@ -6300,6 +6312,22 @@ namespace Cryo
             advance(); // consume 'static'
         }
 
+        // Check for virtual keyword
+        bool is_virtual = false;
+        if (_current_token.is(TokenKind::TK_KW_VIRTUAL))
+        {
+            is_virtual = true;
+            advance(); // consume 'virtual'
+        }
+
+        // Check for override keyword
+        bool is_override = false;
+        if (_current_token.is(TokenKind::TK_KW_OVERRIDE))
+        {
+            is_override = true;
+            advance(); // consume 'override'
+        }
+
         // Check for constructor
         bool is_constructor = false;
 
@@ -6381,27 +6409,27 @@ namespace Cryo
         consume(TokenKind::TK_R_PAREN, "Expected ')' after parameters");
 
         // Parse constructor initialization list (for inheritance)
-        std::vector<std::string> base_constructor_args;
+        std::string base_ctor_name;
+        std::vector<std::unique_ptr<ExpressionNode>> base_ctor_args;
         if (is_constructor && _current_token.is(TokenKind::TK_COLON))
         {
             advance(); // consume ':'
             // Parse base class constructor call: BaseClass(args)
-            if (_current_token.is(TokenKind::TK_IDENTIFIER))
+            if (_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword())
             {
+                base_ctor_name = std::string(_current_token.text());
                 advance(); // consume base class name
                 if (_current_token.is(TokenKind::TK_L_PAREN))
                 {
                     advance(); // consume '('
-                    // Skip over the arguments for now - we'll parse them properly later
-                    int paren_count = 1;
-                    while (paren_count > 0 && !is_at_end())
+                    // Parse arguments as expressions
+                    while (!_current_token.is(TokenKind::TK_R_PAREN) && !is_at_end())
                     {
-                        if (_current_token.is(TokenKind::TK_L_PAREN))
-                            paren_count++;
-                        else if (_current_token.is(TokenKind::TK_R_PAREN))
-                            paren_count--;
-                        advance();
+                        base_ctor_args.push_back(parse_expression());
+                        if (_current_token.is(TokenKind::TK_COMMA))
+                            advance(); // consume ','
                     }
+                    consume(TokenKind::TK_R_PAREN, "Expected ')' after base constructor args");
                 }
             }
         }
@@ -6418,22 +6446,9 @@ namespace Cryo
         }
         else if (is_constructor)
         {
-            // Constructors implicitly return a pointer to the struct type
-            // Use the struct name passed to this method
-            if (!struct_name.empty())
-            {
-                // Create struct type for this constructor/destructor
-                // TypeChecker will resolve this properly later
-                QualifiedTypeName qname{_current_module_id, struct_name};
-                TypeRef struct_type = _context.types().create_struct(qname);
-                return_type = _context.types().get_pointer_to(struct_type);
-            }
-            else
-            {
-                // No struct context - use placeholder error type
-                return_type = _context.types().get_pointer_to(
-                    _context.types().create_error("__unresolved_self__", start_loc));
-            }
+            // Constructors return void - they operate on a 'this' pointer passed as first arg
+            return_type = _context.types().get_void();
+            return_type_string = "void";
         }
 
         // Check for default destructor syntax: ~TypeName() default;
@@ -6446,7 +6461,19 @@ namespace Cryo
 
         auto method = _builder.create_struct_method(start_loc, method_name, return_type, visibility, is_constructor, is_destructor, is_static, is_default_destructor);
         method->set_name_location(method_token.location());
+        method->set_virtual(is_virtual);
+        method->set_override(is_override);
         attach_documentation(method.get());
+
+        // Set base constructor call info (for inheritance)
+        if (!base_ctor_name.empty())
+        {
+            method->set_base_ctor_name(base_ctor_name);
+            for (auto &arg : base_ctor_args)
+            {
+                method->add_base_ctor_arg(std::move(arg));
+            }
+        }
 
         // Set the return type annotation from the captured type string
         // This preserves the original type annotation (e.g., "Option<u64>") for later phases
