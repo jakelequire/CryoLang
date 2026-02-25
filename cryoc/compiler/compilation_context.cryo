@@ -1,0 +1,194 @@
+///! Compilation Context
+///!
+///! Single shared state container for a compilation session.  Replaces both
+///! PassContext (11 raw pointers) and component ownership on CompilerInstance
+///! (17 unique_ptrs with implicit destruction ordering).
+///!
+///! Components are initialized lazily via init_*() methods called by passes
+///! at the appropriate pipeline stage, not all upfront in a constructor.
+
+namespace Compiler::CompilationContext;
+
+import Compiler::CompileMode;
+import Compiler::Diagnostics;
+import Compiler::Artifacts;
+import Compiler::PassID;
+import Compiler::ModuleGraph;
+
+
+// ============================================================================
+// CompilationContext
+// ============================================================================
+
+type struct CompilationContext {
+public:
+    // -- Configuration (set at creation, read-only thereafter) --
+    mode:              CompileMode;
+    source_file:       string;
+    include_paths:     string[];
+    debug_mode:        boolean;
+    current_namespace: string;
+
+    // -- Phase outputs (populated by passes) --
+    artifacts: PhaseArtifacts;
+
+    // -- Diagnostics --
+    diagnostics: DiagnosticSink;
+
+    // -- Pass tracking --
+    provisions: ProvisionSet;
+
+    // -- Multi-module state --
+    module_graph: ModuleGraph;
+
+private:
+    // Owned components (void* during bootstrap, typed structs later).
+    // Initialized lazily by passes that need them.
+    lexer:              void*;
+    parser:             void*;
+    ast_context:        void*;
+    symbol_table:       void*;
+    type_resolver:      void*;
+    type_checker:       void*;
+    generic_registry:   void*;
+    monomorphizer:      void*;
+    ast_specializer:    void*;
+    template_registry:  void*;
+    module_loader:      void*;
+    codegen:            void*;
+    linker:             void*;
+    directive_registry: void*;
+
+public:
+    /// Create a new compilation context for the given mode and source file.
+    static new(mode: CompileMode, source_file: string) -> CompilationContext {
+        return CompilationContext {
+            mode:              mode,
+            source_file:       source_file,
+            include_paths:     [],
+            debug_mode:        false,
+            current_namespace: "",
+
+            artifacts:    PhaseArtifacts::new(),
+            diagnostics:  DiagnosticSink::new(),
+            provisions:   ProvisionSet::empty(),
+            module_graph: ModuleGraph::new(),
+
+            lexer:              null,
+            parser:             null,
+            ast_context:        null,
+            symbol_table:       null,
+            type_resolver:      null,
+            type_checker:       null,
+            generic_registry:   null,
+            monomorphizer:      null,
+            ast_specializer:    null,
+            template_registry:  null,
+            module_loader:      null,
+            codegen:            null,
+            linker:             null,
+            directive_registry: null,
+        };
+    }
+
+    /// Create a debug context with verbose logging.
+    static debug(mode: CompileMode, source_file: string) -> CompilationContext {
+        mut ctx: CompilationContext = CompilationContext::new(mode, source_file);
+        ctx.debug_mode = true;
+        return ctx;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Lazy component initialization
+    // TODO:
+    // Remove later when all components are fully typed and can be initialized in the constructor
+    // ----------------------------------------------------------------
+
+    /// Initialize the type system components (type arena, symbol table, registries).
+    /// Called by the TypeDeclaration pass.
+    init_type_system(mut &this) -> void {
+        // Will create TypeArena, SymbolTable, TemplateRegistry, GenericRegistry
+        // when those types are defined in Cryo.
+    }
+
+    /// Initialize the module loader for import resolution.
+    /// Called by the ImportResolution pass.
+    init_module_loader(mut &this) -> void {
+        // Will create ModuleLoader with include_paths when defined.
+    }
+
+    /// Initialize the code generation backend.
+    /// Called by the TypeLowering pass.
+    init_codegen(mut &this) -> void {
+        // Will create LLVM context and module when @cImport is available.
+    }
+
+    /// Initialize the directive registry.
+    /// Called by the DirectiveProcessing pass.
+    init_directives(mut &this) -> void {
+        // Will create DirectiveRegistry when defined.
+    }
+
+
+    // ----------------------------------------------------------------
+    // Diagnostic convenience
+    // ----------------------------------------------------------------
+
+    /// Emit an error diagnostic.
+    emit_error(mut &this, code: u32, message: string) -> void {
+        this.diagnostics.emit(Diagnostic::error(code, message));
+    }
+
+    /// Emit a warning diagnostic.
+    emit_warning(mut &this, code: u32, message: string) -> void {
+        this.diagnostics.emit(Diagnostic::warning(code, message));
+    }
+
+    /// Emit an error with source location.
+    emit_error_at(mut &this, code: u32, message: string, span: SourceSpan) -> void {
+        mut diag: Diagnostic = Diagnostic::error(code, message);
+        diag = diag.at(span);
+        this.diagnostics.emit(diag);
+    }
+
+    /// Whether any errors have been emitted.
+    has_errors(&this) -> boolean {
+        return this.diagnostics.has_errors();
+    }
+
+
+    // ----------------------------------------------------------------
+    // Provision tracking
+    // ----------------------------------------------------------------
+
+    /// Mark a provision as satisfied.
+    mark_provided(mut &this, p: Provision) -> void {
+        this.provisions.mark(p);
+    }
+
+    /// Check whether a provision has been satisfied.
+    has_provided(&this, p: Provision) -> boolean {
+        return this.provisions.has(p);
+    }
+
+
+    // ----------------------------------------------------------------
+    // Module-level reset (stdlib batch mode)
+    // ----------------------------------------------------------------
+
+    /// Reset per-module state for the next module in a batch compilation.
+    /// Checks mode.preserve_asts() to decide whether to save the current AST.
+    reset_for_next_module(mut &this, next_source: string) -> void {
+        // Preserve ASTs if the mode requires it (StdlibBatch)
+        if (this.mode.preserve_asts()) {
+            this.artifacts.preserve_current_ast();
+        }
+
+        // Reset per-module data
+        this.artifacts.reset_for_next_module();
+        this.provisions.clear();
+        this.source_file = next_source;
+        this.current_namespace = "";
+    }
+}

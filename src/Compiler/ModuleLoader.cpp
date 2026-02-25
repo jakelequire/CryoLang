@@ -399,18 +399,72 @@ namespace Cryo
         _last_resolve_was_local = false;
 
         // Precompute case-insensitive variants for fallback on case-sensitive filesystems.
-        // We try two variants:
-        //   1. Fully lowercased path (e.g., CLI/Commands → cli/commands)
-        //   2. Only the last segment lowercased (e.g., CLI/Commands → CLI/commands)
-        // Variant 2 is critical on Linux where directory names preserve their original case
-        // but file names may differ (e.g., directory "CLI" with file "commands.cryo").
+        // We try these variants in order:
+        //   1. Exact case (e.g., Compiler/CompileMode)
+        //   2. Last segment lowercased (e.g., Compiler/compilemode)
+        //   3. Last segment as snake_case (e.g., Compiler/compile_mode)  ← NEW
+        //   4. Fully lowercased path (e.g., compiler/compilemode)
+        //   5. Fully snake_cased path (e.g., compiler/compile_mode)      ← NEW
         std::string lower_file_path = file_path;
         std::transform(lower_file_path.begin(), lower_file_path.end(), lower_file_path.begin(), ::tolower);
         bool has_lower_variant = (lower_file_path != file_path);
 
+        // Helper: convert a PascalCase or camelCase string to snake_case
+        auto to_snake_case = [](const std::string &s) -> std::string
+        {
+            std::string result;
+            for (size_t i = 0; i < s.size(); ++i)
+            {
+                char c = s[i];
+                if (std::isupper(c))
+                {
+                    // Insert underscore before uppercase if:
+                    //   - not at start
+                    //   - previous char is lowercase, OR
+                    //   - next char is lowercase (handles "XMLParser" → "xml_parser")
+                    if (i > 0 && (std::islower(s[i - 1]) ||
+                                  (i + 1 < s.size() && std::islower(s[i + 1]))))
+                    {
+                        result += '_';
+                    }
+                    result += static_cast<char>(std::tolower(c));
+                }
+                else
+                {
+                    result += c;
+                }
+            }
+            return result;
+        };
+
+        // Build a variant with each path segment converted to snake_case
+        auto snake_case_path = [&](const std::string &path) -> std::string
+        {
+            std::string result;
+            size_t start = 0;
+            while (start < path.size())
+            {
+                size_t slash = path.find('/', start);
+                if (slash == std::string::npos)
+                {
+                    result += to_snake_case(path.substr(start));
+                    break;
+                }
+                result += to_snake_case(path.substr(start, slash - start));
+                result += '/';
+                start = slash + 1;
+            }
+            return result;
+        };
+
+        std::string snake_file_path = snake_case_path(file_path);
+        bool has_snake_variant = (snake_file_path != file_path && snake_file_path != lower_file_path);
+
         // Build a variant with only the last path segment lowercased
         std::string last_seg_lower_path;
         bool has_last_seg_lower = false;
+        std::string last_seg_snake_path;
+        bool has_last_seg_snake = false;
         {
             size_t last_slash = file_path.rfind('/');
             if (last_slash != std::string::npos)
@@ -423,6 +477,15 @@ namespace Cryo
                 {
                     last_seg_lower_path = dir_part + lower_file_part;
                     has_last_seg_lower = (last_seg_lower_path != file_path && last_seg_lower_path != lower_file_path);
+                }
+
+                std::string snake_file_part = to_snake_case(file_part);
+                if (snake_file_part != file_part && snake_file_part != lower_file_part)
+                {
+                    last_seg_snake_path = dir_part + snake_file_part;
+                    has_last_seg_snake = (last_seg_snake_path != file_path &&
+                                         last_seg_snake_path != lower_file_path &&
+                                         last_seg_snake_path != last_seg_lower_path);
                 }
             }
         }
@@ -451,10 +514,34 @@ namespace Cryo
                 }
             }
 
+            // Last-segment snake_case (import Compiler::CompileMode → Compiler/compile_mode.cryo)
+            if (has_last_seg_snake)
+            {
+                project_resolved = os.join_path(_project_root, last_seg_snake_path);
+                result = resolve_module_file_path(project_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
+
             // Fully lowercase (import Compiler → compiler/_module.cryo)
             if (has_lower_variant)
             {
                 project_resolved = os.join_path(_project_root, lower_file_path);
+                result = resolve_module_file_path(project_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
+
+            // Fully snake_cased (import Compiler::CompileMode → compiler/compile_mode.cryo)
+            if (has_snake_variant)
+            {
+                project_resolved = os.join_path(_project_root, snake_file_path);
                 result = resolve_module_file_path(project_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
                 if (std::filesystem::exists(result))
                 {
@@ -488,10 +575,34 @@ namespace Cryo
                 }
             }
 
+            // Last-segment snake_case
+            if (has_last_seg_snake)
+            {
+                local_resolved = os.join_path(_current_file_dir, last_seg_snake_path);
+                result = resolve_module_file_path(local_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
+
             // Fully lowercase
             if (has_lower_variant)
             {
                 local_resolved = os.join_path(_current_file_dir, lower_file_path);
+                result = resolve_module_file_path(local_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
+
+            // Fully snake_cased
+            if (has_snake_variant)
+            {
+                local_resolved = os.join_path(_current_file_dir, snake_file_path);
                 result = resolve_module_file_path(local_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
                 if (std::filesystem::exists(result))
                 {
@@ -522,10 +633,34 @@ namespace Cryo
             }
         }
 
+        // Last-segment snake_case for stdlib
+        if (has_last_seg_snake)
+        {
+            stdlib_resolved = os.join_path(_stdlib_root, last_seg_snake_path);
+            result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+            if (std::filesystem::exists(result))
+            {
+                _last_resolve_was_local = false;
+                return result;
+            }
+        }
+
         // Fully lowercase for stdlib
         if (has_lower_variant)
         {
             stdlib_resolved = os.join_path(_stdlib_root, lower_file_path);
+            result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+            if (std::filesystem::exists(result))
+            {
+                _last_resolve_was_local = false;
+                return result;
+            }
+        }
+
+        // Fully snake_cased for stdlib
+        if (has_snake_variant)
+        {
+            stdlib_resolved = os.join_path(_stdlib_root, snake_file_path);
             result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
             if (std::filesystem::exists(result))
             {

@@ -1953,6 +1953,67 @@ namespace Cryo::Codegen
                     }
                 }
             }
+            else if (array_ptr->getType()->isStructTy())
+            {
+                // Handle Array<T> struct types: layout is { ptr, i64, i64 }
+                // We need to extract the data pointer (field 0) and GEP on that
+                llvm::StructType *st = llvm::cast<llvm::StructType>(array_ptr->getType());
+                std::string struct_name = st->hasName() ? st->getName().str() : "";
+
+                if (struct_name.find("Array<") != std::string::npos)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_array_access: Detected Array<T> struct '{}', extracting data pointer", struct_name);
+
+                    // Try to get element type from resolved Cryo type
+                    TypeRef cryo_array_type = node->array()->get_resolved_type();
+                    if (cryo_array_type.is_valid() && cryo_array_type->kind() == TypeKind::Array)
+                    {
+                        auto *arr = static_cast<const Cryo::ArrayType *>(cryo_array_type.get());
+                        element_type = get_llvm_type(arr->element());
+                    }
+
+                    // Fallback: resolve element type from struct name "Array<ElementName>"
+                    if (!element_type && struct_name.size() > 7)
+                    {
+                        std::string elem_name = struct_name.substr(6, struct_name.size() - 7);
+                        if (elem_name == "string")
+                            element_type = llvm::PointerType::get(llvm_ctx(), 0);
+                        else if (elem_name == "i32" || elem_name == "u32" || elem_name == "int")
+                            element_type = llvm::Type::getInt32Ty(llvm_ctx());
+                        else if (elem_name == "i64" || elem_name == "u64")
+                            element_type = llvm::Type::getInt64Ty(llvm_ctx());
+                        else if (elem_name == "i8" || elem_name == "u8")
+                            element_type = llvm::Type::getInt8Ty(llvm_ctx());
+                        else if (elem_name == "i16" || elem_name == "u16")
+                            element_type = llvm::Type::getInt16Ty(llvm_ctx());
+                        else if (elem_name == "f32" || elem_name == "float")
+                            element_type = llvm::Type::getFloatTy(llvm_ctx());
+                        else if (elem_name == "f64" || elem_name == "double")
+                            element_type = llvm::Type::getDoubleTy(llvm_ctx());
+                        else if (elem_name == "boolean" || elem_name == "bool")
+                            element_type = llvm::Type::getInt1Ty(llvm_ctx());
+                        else
+                        {
+                            // Try named struct first, then resolve_type_by_name
+                            llvm::StructType *named_st = llvm::StructType::getTypeByName(llvm_ctx(), elem_name);
+                            if (named_st)
+                                element_type = named_st;
+                            else
+                                element_type = resolve_type_by_name(elem_name);
+                        }
+                    }
+
+                    // Store the struct value to an alloca so we can GEP into it
+                    llvm::AllocaInst *arr_alloca = create_entry_alloca(st, "arr.idx.tmp");
+                    builder().CreateStore(array_ptr, arr_alloca);
+
+                    // Extract field 0 (data pointer)
+                    llvm::Value *data_field = builder().CreateStructGEP(st, arr_alloca, 0, "arr.data.field");
+                    llvm::Value *data_ptr = create_load(data_field, llvm::PointerType::get(llvm_ctx(), 0), "arr.data.ptr");
+                    array_ptr = data_ptr;
+                }
+            }
         }
 
         if (!element_type)
@@ -1996,7 +2057,7 @@ namespace Cryo::Codegen
         }
         else
         {
-            // For pointer arrays, use single index
+            // For pointer arrays (including extracted Array<T> data pointers), use single index
             element_ptr = create_array_gep(element_type, array_ptr, index_val, "elem.ptr");
         }
 
@@ -2875,8 +2936,6 @@ namespace Cryo::Codegen
 
             // Create blocks for this arm
             llvm::BasicBlock *arm_block = create_block("matchexpr.arm." + std::to_string(i), fn);
-            // For the last arm, create a separate "nomatch" block instead of using merge_block.
-            // This prevents merge_block from having a predecessor without a PHI entry.
             llvm::BasicBlock *next_test_block = is_last
                                                     ? create_block("matchexpr.nomatch", fn)
                                                     : create_block("matchexpr.test." + std::to_string(i + 1), fn);
@@ -2986,7 +3045,19 @@ namespace Cryo::Codegen
         if (current_test_block != merge_block && !current_test_block->getTerminator())
         {
             builder().SetInsertPoint(current_test_block);
-            builder().CreateUnreachable();
+            // If the nomatch block has no predecessors (e.g., a wildcard arm always matches),
+            // just remove it entirely to keep the CFG clean.
+            if (current_test_block->hasNPredecessorsOrMore(1))
+            {
+                // Has predecessors — some non-wildcard arm could fall through here.
+                // Branch to merge with an undef default to satisfy the PHI.
+                builder().CreateBr(merge_block);
+            }
+            else
+            {
+                // No predecessors — block is dead. Add unreachable and let it be removed.
+                builder().CreateUnreachable();
+            }
         }
 
         // Create PHI node to merge results
@@ -2999,12 +3070,28 @@ namespace Cryo::Codegen
 
         // Determine result type from first arm
         llvm::Type *result_type = arm_results[0].first->getType();
-        llvm::PHINode *phi = builder().CreatePHI(result_type, arm_results.size(), "matchexpr.result");
+
+        // Count total incoming edges: arm results + nomatch (if it branches to merge)
+        unsigned phi_count = arm_results.size();
+        bool nomatch_branches_to_merge = (current_test_block != merge_block &&
+                                          current_test_block->getTerminator() &&
+                                          !llvm::isa<llvm::UnreachableInst>(current_test_block->getTerminator()) &&
+                                          current_test_block->hasNPredecessorsOrMore(1));
+        if (nomatch_branches_to_merge)
+            phi_count++;
+
+        llvm::PHINode *phi = builder().CreatePHI(result_type, phi_count, "matchexpr.result");
 
         for (const auto &[value, block] : arm_results)
         {
             llvm::Value *casted_value = cast_if_needed(value, result_type);
             phi->addIncoming(casted_value, block);
+        }
+
+        // If the nomatch block branches to merge, add an undef value for it
+        if (nomatch_branches_to_merge)
+        {
+            phi->addIncoming(llvm::UndefValue::get(result_type), current_test_block);
         }
 
         return phi;
@@ -5112,6 +5199,74 @@ namespace Cryo::Codegen
                                        size);
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "Initialized struct array field '{}' via memcpy ({} bytes)", field_name, size);
+            }
+            else if (field_type->isStructTy() && llvm::isa<llvm::AllocaInst>(field_val))
+            {
+                // Check if this is a raw [N x T] array being stored to an Array<T> struct field.
+                // generate_array_literal may produce raw [N x T] allocas when the resolved type
+                // is missing. We need to wrap them into Array<T> { ptr, i64, i64 } structs.
+                llvm::StructType *field_st = llvm::cast<llvm::StructType>(field_type);
+                llvm::AllocaInst *alloca_val = llvm::cast<llvm::AllocaInst>(field_val);
+                std::string st_name = field_st->hasName() ? field_st->getName().str() : "";
+                bool is_array_struct = st_name.find("Array<") != std::string::npos;
+
+                if (is_array_struct && alloca_val->getAllocatedType()->isArrayTy())
+                {
+                    // Raw [N x T] → Array<T> struct wrapping with heap allocation
+                    llvm::ArrayType *arr_ty = llvm::cast<llvm::ArrayType>(alloca_val->getAllocatedType());
+                    uint64_t num_elems = arr_ty->getNumElements();
+                    auto &DL = module()->getDataLayout();
+                    uint64_t elem_size = DL.getTypeAllocSize(arr_ty->getElementType());
+                    uint64_t total_bytes = num_elems * elem_size;
+
+                    // Heap-allocate so data survives beyond the current stack frame
+                    llvm::Function *malloc_fn = module()->getFunction("malloc");
+                    if (!malloc_fn)
+                    {
+                        llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+                            llvm::PointerType::get(llvm_ctx(), 0),
+                            {llvm::Type::getInt64Ty(llvm_ctx())}, false);
+                        malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
+                                                           "malloc", module());
+                    }
+                    llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), total_bytes);
+                    llvm::Value *heap_ptr = builder().CreateCall(malloc_fn, {size_val}, "array.heap");
+                    builder().CreateMemCpy(heap_ptr, llvm::MaybeAlign(1),
+                                           alloca_val, llvm::MaybeAlign(1), size_val);
+
+                    // Build the Array<T> wrapper struct in-place at field_ptr
+                    llvm::Value *data_ptr = create_struct_gep(field_st, field_ptr, 0, field_name + ".data");
+                    builder().CreateStore(heap_ptr, data_ptr);
+                    llvm::Value *len_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), num_elems);
+                    llvm::Value *len_ptr = create_struct_gep(field_st, field_ptr, 1, field_name + ".len");
+                    builder().CreateStore(len_val, len_ptr);
+                    llvm::Value *cap_ptr = create_struct_gep(field_st, field_ptr, 2, field_name + ".cap");
+                    builder().CreateStore(len_val, cap_ptr);
+
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Wrapped raw [{}x T] array into Array<T> struct for field '{}' ({} bytes, {} elems)",
+                              num_elems, field_name, total_bytes, num_elems);
+                }
+                else if (llvm::isa<llvm::ConstantPointerNull>(field_val))
+                {
+                    // Empty array literal returns null pointer - zero-initialize the struct field
+                    const llvm::DataLayout &DL = module()->getDataLayout();
+                    uint64_t size = DL.getTypeAllocSize(field_type);
+                    builder().CreateMemSet(field_ptr, builder().getInt8(0), size, llvm::MaybeAlign());
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Zero-initialized struct field '{}' ({} bytes, was null pointer)",
+                              field_name, size);
+                }
+                else
+                {
+                    // Struct field with struct alloca value - memcpy
+                    const llvm::DataLayout &DL = module()->getDataLayout();
+                    uint64_t size = DL.getTypeAllocSize(field_type);
+                    builder().CreateMemCpy(field_ptr, llvm::MaybeAlign(),
+                                           field_val, llvm::MaybeAlign(), size);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Initialized struct field '{}' via memcpy ({} bytes)", field_name, size);
+                }
             }
             else if (llvm::isa<llvm::ConstantPointerNull>(field_val) && field_type->isStructTy())
             {

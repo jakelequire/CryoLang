@@ -1,0 +1,584 @@
+///! Pass Identity
+///!
+///! Type-safe pass identity system replacing string-typed PassProvides
+///! identifiers and the PassStage numeric enum.  Every pass has a PassID
+///! (enum variant), declares its requirements and provisions as Provision
+///! enum values, and is grouped into a PassStage.  ProvisionSet is a u32
+///! bitset for O(1) dependency checking.
+
+namespace Compiler::PassID;
+
+
+// ============================================================================
+// PassID — Unique identity for every compiler pass
+// ============================================================================
+
+type enum PassID {
+    // Stage 1: Frontend
+    Lexing;
+    Parsing;
+    ASTValidation;
+
+    // Stage 2: Module Resolution
+    AutoImport;
+    ImportResolution;
+
+    // Stage 3: Declaration Collection
+    TypeDeclaration;
+    FunctionSignature;
+    TemplateRegistration;
+
+    // Stage 4: Type Resolution
+    TypeResolution;
+    StructFieldTypeSync;
+
+    // Stage 5: Semantic Analysis
+    DirectiveProcessing;
+    FunctionBodyTypeCheck;
+
+    // Stage 6: Specialization
+    Monomorphization;
+    GenericExpressionResolution;
+
+    // Stage 7: Codegen Preparation
+    TypeLowering;
+    FunctionDeclaration;
+
+    // Stage 8: IR Generation
+    IRGeneration;
+
+    // Stage 9: Output
+    Optimization;
+    ObjectEmission;
+    Linking;
+}
+
+implement enum PassID {
+    /// Human-readable name for logging.
+    name(&this) -> string {
+        return match (this) {
+            PassID::Lexing                      => { "Lexing"                      }
+            PassID::Parsing                     => { "Parsing"                     }
+            PassID::ASTValidation               => { "ASTValidation"               }
+            PassID::AutoImport                  => { "AutoImport"                  }
+            PassID::ImportResolution            => { "ImportResolution"            }
+            PassID::TypeDeclaration             => { "TypeDeclaration"             }
+            PassID::FunctionSignature           => { "FunctionSignature"           }
+            PassID::TemplateRegistration        => { "TemplateRegistration"        }
+            PassID::TypeResolution              => { "TypeResolution"              }
+            PassID::StructFieldTypeSync         => { "StructFieldTypeSync"         }
+            PassID::DirectiveProcessing         => { "DirectiveProcessing"         }
+            PassID::FunctionBodyTypeCheck       => { "FunctionBodyTypeCheck"       }
+            PassID::Monomorphization            => { "Monomorphization"            }
+            PassID::GenericExpressionResolution => { "GenericExpressionResolution" }
+            PassID::TypeLowering                => { "TypeLowering"                }
+            PassID::FunctionDeclaration         => { "FunctionDeclaration"         }
+            PassID::IRGeneration                => { "IRGeneration"                }
+            PassID::Optimization                => { "Optimization"                }
+            PassID::ObjectEmission              => { "ObjectEmission"              }
+            PassID::Linking                     => { "Linking"                     }
+        };
+    }
+
+    /// Which pipeline stage this pass belongs to.
+    stage(&this) -> PassStage {
+        return match (this) {
+            PassID::Lexing                      => { PassStage::Frontend              }
+            PassID::Parsing                     => { PassStage::Frontend              }
+            PassID::ASTValidation               => { PassStage::Frontend              }
+            PassID::AutoImport                  => { PassStage::ModuleResolution      }
+            PassID::ImportResolution            => { PassStage::ModuleResolution      }
+            PassID::TypeDeclaration             => { PassStage::DeclarationCollection }
+            PassID::FunctionSignature           => { PassStage::DeclarationCollection }
+            PassID::TemplateRegistration        => { PassStage::DeclarationCollection }
+            PassID::TypeResolution              => { PassStage::TypeResolution        }
+            PassID::StructFieldTypeSync         => { PassStage::TypeResolution        }
+            PassID::DirectiveProcessing         => { PassStage::SemanticAnalysis      }
+            PassID::FunctionBodyTypeCheck       => { PassStage::SemanticAnalysis      }
+            PassID::Monomorphization            => { PassStage::Specialization        }
+            PassID::GenericExpressionResolution => { PassStage::Specialization        }
+            PassID::TypeLowering                => { PassStage::CodegenPreparation    }
+            PassID::FunctionDeclaration         => { PassStage::CodegenPreparation    }
+            PassID::IRGeneration                => { PassStage::IRGeneration          }
+            PassID::Optimization                => { PassStage::Output                }
+            PassID::ObjectEmission              => { PassStage::Output                }
+            PassID::Linking                     => { PassStage::Output                }
+        };
+    }
+
+    /// Execution order within the full pipeline (0-based).
+    order(&this) -> u32 {
+        return match (this) {
+            PassID::Lexing                      => { 0  }
+            PassID::Parsing                     => { 1  }
+            PassID::ASTValidation               => { 2  }
+            PassID::AutoImport                  => { 3  }
+            PassID::ImportResolution            => { 4  }
+            PassID::TypeDeclaration             => { 5  }
+            PassID::FunctionSignature           => { 6  }
+            PassID::TemplateRegistration        => { 7  }
+            PassID::TypeResolution              => { 8  }
+            PassID::StructFieldTypeSync         => { 9  }
+            PassID::DirectiveProcessing         => { 10 }
+            PassID::FunctionBodyTypeCheck       => { 11 }
+            PassID::Monomorphization            => { 12 }
+            PassID::GenericExpressionResolution => { 13 }
+            PassID::TypeLowering                => { 14 }
+            PassID::FunctionDeclaration         => { 15 }
+            PassID::IRGeneration                => { 16 }
+            PassID::Optimization                => { 17 }
+            PassID::ObjectEmission              => { 18 }
+            PassID::Linking                     => { 19 }
+        };
+    }
+
+    /// Whether failure in this pass should abort the pipeline.
+    fatal_on_failure(&this) -> boolean {
+        return match (this) {
+            PassID::Lexing            => { true  }
+            PassID::Parsing           => { true  }
+            PassID::ASTValidation     => { true  }
+            PassID::TypeResolution    => { true  }
+            PassID::IRGeneration      => { true  }
+            _                         => { false }
+        };
+    }
+}
+
+
+// ============================================================================
+// Provision — What a pass produces
+// ============================================================================
+
+/// Each provision represents a capability or data artifact that a pass makes
+/// available to downstream passes.  21 provisions fit in a u32 bitset.
+type enum Provision {
+    Tokens;
+    AST;
+    ASTValidated;
+    ImportsDiscovered;
+    ModulesLoaded;
+    ModuleOrder;
+    TypeDeclarations;
+    FunctionSignatures;
+    TemplatesRegistered;
+    TypesResolved;
+    StructFieldsSynced;
+    DirectivesProcessed;
+    BodiesTypeChecked;
+    MonomorphizationComplete;
+    GenericExpressionsResolved;
+    TypesLowered;
+    FunctionsDeclared;
+    IRGenerated;
+    Optimized;
+    ObjectsEmitted;
+    Linked;
+}
+
+implement enum Provision {
+    /// Bit index for the ProvisionSet bitset.
+    bit_index(&this) -> u32 {
+        return match (this) {
+            Provision::Tokens                     => { 0  }
+            Provision::AST                        => { 1  }
+            Provision::ASTValidated               => { 2  }
+            Provision::ImportsDiscovered          => { 3  }
+            Provision::ModulesLoaded              => { 4  }
+            Provision::ModuleOrder                => { 5  }
+            Provision::TypeDeclarations           => { 6  }
+            Provision::FunctionSignatures         => { 7  }
+            Provision::TemplatesRegistered        => { 8  }
+            Provision::TypesResolved              => { 9  }
+            Provision::StructFieldsSynced         => { 10 }
+            Provision::DirectivesProcessed        => { 11 }
+            Provision::BodiesTypeChecked          => { 12 }
+            Provision::MonomorphizationComplete   => { 13 }
+            Provision::GenericExpressionsResolved => { 14 }
+            Provision::TypesLowered               => { 15 }
+            Provision::FunctionsDeclared          => { 16 }
+            Provision::IRGenerated                => { 17 }
+            Provision::Optimized                  => { 18 }
+            Provision::ObjectsEmitted             => { 19 }
+            Provision::Linked                     => { 20 }
+        };
+    }
+
+    name(&this) -> string {
+        return match (this) {
+            Provision::Tokens                     => { "Tokens"                    }
+            Provision::AST                        => { "AST"                       }
+            Provision::ASTValidated               => { "ASTValidated"              }
+            Provision::ImportsDiscovered          => { "ImportsDiscovered"         }
+            Provision::ModulesLoaded              => { "ModulesLoaded"             }
+            Provision::ModuleOrder                => { "ModuleOrder"               }
+            Provision::TypeDeclarations           => { "TypeDeclarations"          }
+            Provision::FunctionSignatures         => { "FunctionSignatures"        }
+            Provision::TemplatesRegistered        => { "TemplatesRegistered"       }
+            Provision::TypesResolved              => { "TypesResolved"             }
+            Provision::StructFieldsSynced         => { "StructFieldsSynced"        }
+            Provision::DirectivesProcessed        => { "DirectivesProcessed"       }
+            Provision::BodiesTypeChecked          => { "BodiesTypeChecked"         }
+            Provision::MonomorphizationComplete   => { "MonomorphizationComplete"  }
+            Provision::GenericExpressionsResolved => { "GenericExpressionsResolved" }
+            Provision::TypesLowered               => { "TypesLowered"              }
+            Provision::FunctionsDeclared          => { "FunctionsDeclared"         }
+            Provision::IRGenerated                => { "IRGenerated"               }
+            Provision::Optimized                  => { "Optimized"                 }
+            Provision::ObjectsEmitted             => { "ObjectsEmitted"            }
+            Provision::Linked                     => { "Linked"                    }
+        };
+    }
+}
+
+
+// ============================================================================
+// PassStage — Pipeline stage grouping
+// ============================================================================
+
+type enum PassStage {
+    Frontend;
+    ModuleResolution;
+    DeclarationCollection;
+    TypeResolution;
+    SemanticAnalysis;
+    Specialization;
+    CodegenPreparation;
+    IRGeneration;
+    Output;
+}
+
+implement enum PassStage {
+    label(&this) -> string {
+        return match (this) {
+            PassStage::Frontend              => { "Frontend"              }
+            PassStage::ModuleResolution      => { "ModuleResolution"      }
+            PassStage::DeclarationCollection => { "DeclarationCollection" }
+            PassStage::TypeResolution        => { "TypeResolution"        }
+            PassStage::SemanticAnalysis      => { "SemanticAnalysis"      }
+            PassStage::Specialization        => { "Specialization"        }
+            PassStage::CodegenPreparation    => { "CodegenPreparation"    }
+            PassStage::IRGeneration          => { "IRGeneration"          }
+            PassStage::Output               => { "Output"               }
+        };
+    }
+
+    /// Numeric ordering for stage comparison.
+    to_int(&this) -> u32 {
+        return match (this) {
+            PassStage::Frontend              => { 0 }
+            PassStage::ModuleResolution      => { 1 }
+            PassStage::DeclarationCollection => { 2 }
+            PassStage::TypeResolution        => { 3 }
+            PassStage::SemanticAnalysis      => { 4 }
+            PassStage::Specialization        => { 5 }
+            PassStage::CodegenPreparation    => { 6 }
+            PassStage::IRGeneration          => { 7 }
+            PassStage::Output               => { 8 }
+        };
+    }
+}
+
+
+// ============================================================================
+// ProvisionSet — Bitset for O(1) provision tracking
+// ============================================================================
+
+type struct ProvisionSet {
+    bits: u32;
+
+    static empty() -> ProvisionSet {
+        return ProvisionSet {
+            bits: 0,
+        };
+    }
+
+    /// Mark a provision as satisfied.
+    mark(mut &this, p: Provision) -> void {
+        const shift: u32 = p.bit_index();
+        this.bits = this.bits | (1 << shift);
+    }
+
+    /// Check whether a provision has been satisfied.
+    has(&this, p: Provision) -> boolean {
+        const shift: u32 = p.bit_index();
+        return (this.bits & (1 << shift)) != 0;
+    }
+
+    /// Reset all provisions.
+    clear(mut &this) -> void {
+        this.bits = 0;
+    }
+}
+
+
+// ============================================================================
+// PassRequirement — Dependency declaration
+// ============================================================================
+
+type struct PassRequirement {
+    provision:   Provision;
+    is_required: boolean;
+
+    static required(p: Provision) -> PassRequirement {
+        return PassRequirement {
+            provision:   p,
+            is_required: true,
+        };
+    }
+
+    static optional(p: Provision) -> PassRequirement {
+        return PassRequirement {
+            provision:   p,
+            is_required: false,
+        };
+    }
+}
+
+
+// ============================================================================
+// PassMetadata — Static metadata for a pass
+// ============================================================================
+
+type struct PassMetadata {
+    id:               PassID;
+    name:             string;
+    stage:            PassStage;
+    order:            u32;
+    fatal_on_failure: boolean;
+    requirements:     PassRequirement[];
+    provisions:       Provision[];
+}
+
+
+// ============================================================================
+// get_pass_metadata — Pure function "vtable" for all passes
+// ============================================================================
+
+/// Returns the static metadata for a given pass.  This is the single source
+/// of truth for what each pass requires and provides.
+function get_pass_metadata(id: PassID) -> PassMetadata {
+    return match (id) {
+        PassID::Lexing => {
+            PassMetadata {
+                id:               PassID::Lexing,
+                name:             "Lexing",
+                stage:            PassStage::Frontend,
+                order:            0,
+                fatal_on_failure: true,
+                requirements:     [],
+                provisions:       [Provision::Tokens],
+            }
+        }
+        PassID::Parsing => {
+            PassMetadata {
+                id:               PassID::Parsing,
+                name:             "Parsing",
+                stage:            PassStage::Frontend,
+                order:            1,
+                fatal_on_failure: true,
+                requirements:     [PassRequirement::required(Provision::Tokens)],
+                provisions:       [Provision::AST],
+            }
+        }
+        PassID::ASTValidation => {
+            PassMetadata {
+                id:               PassID::ASTValidation,
+                name:             "ASTValidation",
+                stage:            PassStage::Frontend,
+                order:            2,
+                fatal_on_failure: true,
+                requirements:     [PassRequirement::required(Provision::AST)],
+                provisions:       [Provision::ASTValidated],
+            }
+        }
+        PassID::AutoImport => {
+            PassMetadata {
+                id:               PassID::AutoImport,
+                name:             "AutoImport",
+                stage:            PassStage::ModuleResolution,
+                order:            3,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::ASTValidated)],
+                provisions:       [Provision::ImportsDiscovered],
+            }
+        }
+        PassID::ImportResolution => {
+            PassMetadata {
+                id:               PassID::ImportResolution,
+                name:             "ImportResolution",
+                stage:            PassStage::ModuleResolution,
+                order:            4,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::ImportsDiscovered)],
+                provisions:       [Provision::ModulesLoaded, Provision::ModuleOrder],
+            }
+        }
+        PassID::TypeDeclaration => {
+            PassMetadata {
+                id:               PassID::TypeDeclaration,
+                name:             "TypeDeclaration",
+                stage:            PassStage::DeclarationCollection,
+                order:            5,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::ASTValidated)],
+                provisions:       [Provision::TypeDeclarations],
+            }
+        }
+        PassID::FunctionSignature => {
+            PassMetadata {
+                id:               PassID::FunctionSignature,
+                name:             "FunctionSignature",
+                stage:            PassStage::DeclarationCollection,
+                order:            6,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::TypeDeclarations)],
+                provisions:       [Provision::FunctionSignatures],
+            }
+        }
+        PassID::TemplateRegistration => {
+            PassMetadata {
+                id:               PassID::TemplateRegistration,
+                name:             "TemplateRegistration",
+                stage:            PassStage::DeclarationCollection,
+                order:            7,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::FunctionSignatures)],
+                provisions:       [Provision::TemplatesRegistered],
+            }
+        }
+        PassID::TypeResolution => {
+            PassMetadata {
+                id:               PassID::TypeResolution,
+                name:             "TypeResolution",
+                stage:            PassStage::TypeResolution,
+                order:            8,
+                fatal_on_failure: true,
+                requirements:     [PassRequirement::required(Provision::TemplatesRegistered)],
+                provisions:       [Provision::TypesResolved],
+            }
+        }
+        PassID::StructFieldTypeSync => {
+            PassMetadata {
+                id:               PassID::StructFieldTypeSync,
+                name:             "StructFieldTypeSync",
+                stage:            PassStage::TypeResolution,
+                order:            9,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::TypesResolved)],
+                provisions:       [Provision::StructFieldsSynced],
+            }
+        }
+        PassID::DirectiveProcessing => {
+            PassMetadata {
+                id:               PassID::DirectiveProcessing,
+                name:             "DirectiveProcessing",
+                stage:            PassStage::SemanticAnalysis,
+                order:            10,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::TypesResolved)],
+                provisions:       [Provision::DirectivesProcessed],
+            }
+        }
+        PassID::FunctionBodyTypeCheck => {
+            PassMetadata {
+                id:               PassID::FunctionBodyTypeCheck,
+                name:             "FunctionBodyTypeCheck",
+                stage:            PassStage::SemanticAnalysis,
+                order:            11,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::TypesResolved),
+                                   PassRequirement::optional(Provision::DirectivesProcessed)],
+                provisions:       [Provision::BodiesTypeChecked],
+            }
+        }
+        PassID::Monomorphization => {
+            PassMetadata {
+                id:               PassID::Monomorphization,
+                name:             "Monomorphization",
+                stage:            PassStage::Specialization,
+                order:            12,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::BodiesTypeChecked)],
+                provisions:       [Provision::MonomorphizationComplete],
+            }
+        }
+        PassID::GenericExpressionResolution => {
+            PassMetadata {
+                id:               PassID::GenericExpressionResolution,
+                name:             "GenericExpressionResolution",
+                stage:            PassStage::Specialization,
+                order:            13,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::MonomorphizationComplete)],
+                provisions:       [Provision::GenericExpressionsResolved],
+            }
+        }
+        PassID::TypeLowering => {
+            PassMetadata {
+                id:               PassID::TypeLowering,
+                name:             "TypeLowering",
+                stage:            PassStage::CodegenPreparation,
+                order:            14,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::GenericExpressionsResolved)],
+                provisions:       [Provision::TypesLowered],
+            }
+        }
+        PassID::FunctionDeclaration => {
+            PassMetadata {
+                id:               PassID::FunctionDeclaration,
+                name:             "FunctionDeclaration",
+                stage:            PassStage::CodegenPreparation,
+                order:            15,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::TypesLowered)],
+                provisions:       [Provision::FunctionsDeclared],
+            }
+        }
+        PassID::IRGeneration => {
+            PassMetadata {
+                id:               PassID::IRGeneration,
+                name:             "IRGeneration",
+                stage:            PassStage::IRGeneration,
+                order:            16,
+                fatal_on_failure: true,
+                requirements:     [PassRequirement::required(Provision::FunctionsDeclared)],
+                provisions:       [Provision::IRGenerated],
+            }
+        }
+        PassID::Optimization => {
+            PassMetadata {
+                id:               PassID::Optimization,
+                name:             "Optimization",
+                stage:            PassStage::Output,
+                order:            17,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::IRGenerated)],
+                provisions:       [Provision::Optimized],
+            }
+        }
+        PassID::ObjectEmission => {
+            PassMetadata {
+                id:               PassID::ObjectEmission,
+                name:             "ObjectEmission",
+                stage:            PassStage::Output,
+                order:            18,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::Optimized)],
+                provisions:       [Provision::ObjectsEmitted],
+            }
+        }
+        PassID::Linking => {
+            PassMetadata {
+                id:               PassID::Linking,
+                name:             "Linking",
+                stage:            PassStage::Output,
+                order:            19,
+                fatal_on_failure: false,
+                requirements:     [PassRequirement::required(Provision::ObjectsEmitted)],
+                provisions:       [Provision::Linked],
+            }
+        }
+    };
+}
