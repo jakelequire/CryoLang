@@ -258,6 +258,16 @@ namespace Cryo::Codegen
                             }
                         }
                     }
+                    else
+                    {
+                        // Fallback: generate_member_receiver_address returns nullptr for
+                        // non-struct types (e.g., enum fields accessed via nested member chains
+                        // like this.state.phase). Use generate_expression which handles all types.
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Nested member receiver address returned nullptr, falling back to generate_expression for: {}",
+                                  nested_member->member());
+                        receiver = generate_expression(member->object());
+                    }
                 }
                 else
                 {
@@ -3556,6 +3566,97 @@ namespace Cryo::Codegen
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                           "Nested member access: parent '{}' -> {}", parent_id->name(), parent_type_name);
                             }
+                        }
+                    }
+                    // Handle doubly-nested member access (e.g., this.state.phase in this.state.phase.label())
+                    // Walk the chain to resolve the intermediate type through TemplateRegistry field lookups
+                    else if (auto *parent_member = dynamic_cast<MemberAccessNode *>(member_access->object()))
+                    {
+                        // Collect the member chain from innermost to outermost
+                        std::vector<std::string> chain;
+                        chain.push_back(parent_member->member()); // e.g., "state"
+                        ASTNode *current = parent_member->object();
+
+                        // Walk up through any further nested MemberAccessNodes
+                        while (auto *next = dynamic_cast<MemberAccessNode *>(current))
+                        {
+                            chain.push_back(next->member());
+                            current = next->object();
+                        }
+
+                        // Resolve the root type
+                        std::string root_type;
+                        if (auto *root_id = dynamic_cast<IdentifierNode *>(current))
+                        {
+                            if (root_id->name() == "this")
+                            {
+                                root_type = ctx().current_type_name();
+                            }
+                            else
+                            {
+                                auto &var_types = ctx().variable_types_map();
+                                auto it = var_types.find(root_id->name());
+                                if (it != var_types.end() && it->second.is_valid())
+                                {
+                                    root_type = it->second->display_name();
+                                    if (!root_type.empty() && (root_type.back() == '*' || root_type.back() == '&'))
+                                        root_type.pop_back();
+                                }
+                            }
+                        }
+
+                        // Walk the chain in reverse (outermost to innermost), resolving field types
+                        if (!root_type.empty())
+                        {
+                            auto *template_reg = ctx().template_registry();
+                            std::string current_type = root_type;
+
+                            for (int ci = static_cast<int>(chain.size()) - 1; ci >= 0; --ci)
+                            {
+                                const std::string &field = chain[ci];
+                                bool found = false;
+
+                                if (template_reg)
+                                {
+                                    auto candidates = generate_lookup_candidates(current_type, Cryo::SymbolKind::Type);
+                                    for (const auto &cand : candidates)
+                                    {
+                                        const TemplateRegistry::StructFieldInfo *fi = template_reg->get_struct_field_types(cand);
+                                        if (fi)
+                                        {
+                                            for (size_t i = 0; i < fi->field_names.size(); ++i)
+                                            {
+                                                if (fi->field_names[i] == field && i < fi->field_types.size())
+                                                {
+                                                    TypeRef ft = fi->field_types[i];
+                                                    if (ft.is_valid())
+                                                    {
+                                                        current_type = ft->display_name();
+                                                        if (!current_type.empty() && (current_type.back() == '*' || current_type.back() == '&'))
+                                                            current_type.pop_back();
+                                                        found = true;
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (found) break;
+                                    }
+                                }
+
+                                if (!found)
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Doubly-nested member access: could not resolve field '{}' in type '{}'",
+                                              field, current_type);
+                                    current_type.clear();
+                                    break;
+                                }
+                            }
+
+                            parent_type_name = current_type;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Doubly-nested member access: resolved chain to parent type '{}'", parent_type_name);
                         }
                     }
 
