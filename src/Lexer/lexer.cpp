@@ -110,6 +110,8 @@ namespace Cryo
         {"public", TokenKind::TK_KW_PUBLIC},
         {"private", TokenKind::TK_KW_PRIVATE},
         {"protected", TokenKind::TK_KW_PROTECTED},
+        {"virtual", TokenKind::TK_KW_VIRTUAL},
+        {"override", TokenKind::TK_KW_OVERRIDE},
         {"mutable", TokenKind::TK_KW_MUTABLE},
         {"inline", TokenKind::TK_KW_INLINE},
         {"async", TokenKind::TK_KW_ASYNC},

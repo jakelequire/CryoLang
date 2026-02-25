@@ -5,6 +5,7 @@
 #include "Types/ErrorType.hpp"
 #include "Types/GenericTypes.hpp"
 #include "Types/GenericRegistry.hpp"
+#include "Types/UserDefinedTypes.hpp"
 #include "Utils/Logger.hpp"
 
 #include <llvm/IR/Intrinsics.h>
@@ -445,13 +446,67 @@ namespace Cryo::Codegen
             {
                 TypeRef ptype = param->get_resolved_type();
                 // Check for error types (unresolved function types, etc.)
-                // Error types map to void in LLVM, which is invalid as a parameter type
+                // Error types map to void in LLVM, which is invalid as a parameter type.
+                // Before skipping, try to resolve the type from the annotation — the type
+                // may have been unresolvable during type-checking due to forward references
+                // (e.g., accept(visitor: Visitor*) on ASTNode where Visitor is defined later)
+                // but is available now that all classes are registered.
                 if (ptype.is_error())
                 {
-                    LOG_WARN(Cryo::LogComponent::CODEGEN,
-                             "DeclarationCodegen: Skipping method '{}' - param '{}' has error type '{}'",
-                             node->name(), param->name(), ptype.get()->display_name());
-                    return nullptr;
+                    bool recovered = false;
+                    // Try resolving from annotation
+                    if (param->has_type_annotation())
+                    {
+                        TypeRef resolved = resolve_type_annotation(param->type_annotation());
+                        if (resolved.is_valid() && !resolved.is_error())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "DeclarationCodegen: Recovered error type for param '{}' via annotation: '{}'",
+                                      param->name(), resolved->display_name());
+                            param->set_resolved_type(resolved);
+                            recovered = true;
+                        }
+                    }
+                    // Fallback: check if the error description names a known class/struct type
+                    // (e.g., "<error: unresolved type: Visitor*>")
+                    if (!recovered)
+                    {
+                        std::string desc = ptype.get()->display_name();
+                        // Extract the type name from error description
+                        size_t colon_pos = desc.rfind(": ");
+                        if (colon_pos != std::string::npos)
+                        {
+                            std::string type_hint = desc.substr(colon_pos + 2);
+                            // Remove trailing '>'
+                            if (!type_hint.empty() && type_hint.back() == '>')
+                                type_hint.pop_back();
+                            // Check if it's a pointer type (ends with '*')
+                            bool is_ptr = !type_hint.empty() && type_hint.back() == '*';
+                            std::string base_name = is_ptr ? type_hint.substr(0, type_hint.size() - 1) : type_hint;
+                            // Try to look up as a class or struct type
+                            TypeRef found_type = ctx().symbols().lookup_class_type(base_name);
+                            if (!found_type.is_valid())
+                                found_type = ctx().symbols().lookup_struct_type(base_name);
+                            if (found_type.is_valid())
+                            {
+                                TypeRef final_type = found_type;
+                                if (is_ptr)
+                                    final_type = ctx().symbols().arena().get_pointer_to(found_type);
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "DeclarationCodegen: Recovered error type for param '{}' from error desc: '{}'",
+                                          param->name(), final_type->display_name());
+                                param->set_resolved_type(final_type);
+                                recovered = true;
+                            }
+                        }
+                    }
+                    if (!recovered)
+                    {
+                        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                 "DeclarationCodegen: Skipping method '{}' - param '{}' has error type '{}'",
+                                 node->name(), param->name(), ptype.get()->display_name());
+                        return nullptr;
+                    }
                 }
                 // Check for Generic type kind or undefined struct/class types
                 // First, try to substitute type parameters if we're in a generic instantiation scope
@@ -763,11 +818,27 @@ namespace Cryo::Codegen
                 ensure_arg_names(existing);
                 return existing;
             }
-            // Types differ and existing has a body (or different param count) - this is a true overload
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "DeclarationCodegen: Method '{}' exists with different types (overload), using '{}'",
-                      llvm_fn_name, overload_name);
-            llvm_fn_name = overload_name;
+            // If the existing function is a declaration-only stub (from pre-registration)
+            // with a DIFFERENT param count, the stub was generated with the wrong signature.
+            // Replace it with the correct definition instead of creating an overloaded name.
+            if (existing->isDeclaration() && fn_type && existing->use_empty())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Replacing pre-registered stub '{}' (param count {} -> {})",
+                          llvm_fn_name,
+                          existing->getFunctionType()->getNumParams(),
+                          fn_type->getNumParams());
+                existing->eraseFromParent();
+                // Fall through to create the function with the correct type
+            }
+            else
+            {
+                // Types differ and existing has a body (or different param count) - this is a true overload
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Method '{}' exists with different types (overload), using '{}'",
+                          llvm_fn_name, overload_name);
+                llvm_fn_name = overload_name;
+            }
         }
         else if (llvm::Function *existing = module()->getFunction(base_method_name))
         {
@@ -791,11 +862,27 @@ namespace Cryo::Codegen
                 ensure_arg_names(existing);
                 return existing;
             }
-            // Types differ - this is an overload, use overload_name
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "DeclarationCodegen: Method base '{}' exists with different types (overload), using '{}'",
-                      base_method_name, overload_name);
-            llvm_fn_name = overload_name;
+            // If the existing function is a declaration-only stub (from pre-registration)
+            // with a DIFFERENT param count, the stub was generated with the wrong signature.
+            // Replace it so callers find the correct definition under the base name.
+            if (existing->isDeclaration() && fn_type && existing->use_empty())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Replacing pre-registered stub (base='{}') (param count {} -> {})",
+                          base_method_name,
+                          existing->getFunctionType()->getNumParams(),
+                          fn_type->getNumParams());
+                existing->eraseFromParent();
+                llvm_fn_name = base_method_name;
+            }
+            else
+            {
+                // Types differ - this is an overload, use overload_name
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Method base '{}' exists with different types (overload), using '{}'",
+                          base_method_name, overload_name);
+                llvm_fn_name = overload_name;
+            }
         }
         if (!fn_type)
         {
@@ -1673,29 +1760,70 @@ namespace Cryo::Codegen
             class_type = llvm::StructType::create(llvm_ctx(), name);
         }
 
+        // Look up the ClassType from the type system for inheritance info
+        TypeRef cryo_type = ctx().symbols().lookup_class_type(name);
+        const Cryo::ClassType *cryo_class = nullptr;
+        bool needs_vtable = false;
+        if (cryo_type.is_valid())
+        {
+            cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
+            if (cryo_class)
+            {
+                needs_vtable = cryo_class->has_virtual_methods() || cryo_class->has_base_class();
+            }
+        }
+
         // Collect field types (including inherited fields if any)
         std::vector<llvm::Type *> field_types;
 
-        // Add vtable pointer if class has virtual methods
-        // (simplified - full implementation would check for virtual methods)
-        // field_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
-
-        for (const auto &field : node->fields())
+        // Add vtable pointer as first field if class uses virtual dispatch
+        if (needs_vtable)
         {
-            llvm::Type *field_type = get_llvm_type(field->get_resolved_type());
-            if (field_type)
+            field_types.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Added vtable pointer to class '{}'", name);
+        }
+
+        // If we have a ClassType with resolved fields, use those (they include inherited fields)
+        if (cryo_class && !cryo_class->fields().empty())
+        {
+            for (const auto &field : cryo_class->fields())
             {
-                field_types.push_back(field_type);
+                llvm::Type *ft = get_llvm_type(field.type);
+                if (ft)
+                {
+                    field_types.push_back(ft);
+                }
+                else
+                {
+                    field_types.push_back(llvm::PointerType::get(llvm_ctx(), 0)); // Fallback
+                }
+            }
+        }
+        else
+        {
+            // Fallback to AST node fields
+            for (const auto &field : node->fields())
+            {
+                llvm::Type *field_type = get_llvm_type(field->get_resolved_type());
+                if (field_type)
+                {
+                    field_types.push_back(field_type);
+                }
             }
         }
 
         // Set class body (this works even if class was previously opaque)
         class_type->setBody(field_types);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                  "DeclarationCodegen: Set class '{}' body with {} fields", name, field_types.size());
+                  "DeclarationCodegen: Set class '{}' body with {} fields (vtable={})",
+                  name, field_types.size(), needs_vtable);
 
         // Register type
         ctx().register_type(name, class_type);
+
+        // Note: vtable generation is deferred until after method declarations are emitted
+        // (handled in CodegenVisitor::visit(ClassDeclarationNode))
 
         // Register type's namespace for cross-module method resolution
         std::string ns_context = ctx().namespace_context();
@@ -1707,6 +1835,116 @@ namespace Cryo::Codegen
         }
 
         return class_type;
+    }
+
+    void DeclarationCodegen::generate_vtable(const std::string &class_name, const Cryo::ClassType *cryo_class)
+    {
+        auto vtable_entries = cryo_class->build_vtable();
+        if (vtable_entries.empty())
+            return;
+
+        std::string vtable_name = "vtable." + class_name;
+
+        // Build the vtable type: a struct of function pointers
+        std::vector<llvm::Type *> vtable_field_types;
+        std::vector<llvm::Constant *> vtable_values;
+        llvm::Type *ptr_ty = llvm::PointerType::get(llvm_ctx(), 0);
+
+        // Get the current namespace context for qualified lookups
+        std::string ns_context = ctx().namespace_context();
+
+        for (const auto &entry : vtable_entries)
+        {
+            vtable_field_types.push_back(ptr_ty);
+
+            // Look up the actual LLVM function for this method
+            // Try multiple name patterns: unqualified, namespace-qualified
+            llvm::Function *fn = nullptr;
+
+            // Pattern 1: ClassName::methodName
+            std::string fn_name = class_name + "::" + entry.name;
+            fn = module()->getFunction(fn_name);
+
+            // Pattern 2: Namespace::ClassName::methodName
+            if (!fn && !ns_context.empty())
+            {
+                std::string qualified_fn = ns_context + "::" + class_name + "::" + entry.name;
+                fn = module()->getFunction(qualified_fn);
+            }
+
+            // If not found with class name, walk the inheritance chain to find
+            // the most derived implementation (base class may define the method)
+            if (!fn && cryo_class->has_base_class())
+            {
+                auto *walk = dynamic_cast<const Cryo::ClassType *>(cryo_class->base_class().get());
+                while (walk && !fn)
+                {
+                    // Try unqualified base name
+                    std::string base_fn = walk->name() + "::" + entry.name;
+                    fn = module()->getFunction(base_fn);
+                    // Try namespace-qualified base name
+                    if (!fn && !ns_context.empty())
+                    {
+                        std::string qualified_base = ns_context + "::" + walk->name() + "::" + entry.name;
+                        fn = module()->getFunction(qualified_base);
+                    }
+                    walk = walk->has_base_class()
+                               ? dynamic_cast<const Cryo::ClassType *>(walk->base_class().get())
+                               : nullptr;
+                }
+            }
+
+            // A pure virtual method is one that is declared virtual but not override,
+            // and has no body (LLVM function is a declaration-only stub).
+            // Use null for these entries instead of the extern declaration.
+            bool is_pure_virtual = fn && fn->isDeclaration() && entry.is_virtual && !entry.is_override;
+
+            if (fn && !is_pure_virtual)
+            {
+                vtable_values.push_back(fn);
+            }
+            else
+            {
+                // Placeholder null for pure virtual methods (no body)
+                vtable_values.push_back(llvm::ConstantPointerNull::get(
+                    llvm::PointerType::get(llvm_ctx(), 0)));
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: VTable entry '{}' for class '{}' is null (pure virtual or not yet generated)",
+                          entry.name, class_name);
+            }
+        }
+
+        // If vtable already exists, replace its initializer with updated values
+        llvm::GlobalVariable *existing_vtable = module()->getGlobalVariable(vtable_name, /*AllowInternal=*/true);
+        if (existing_vtable)
+        {
+            // Reuse the existing vtable type (already named) and update the initializer
+            llvm::StructType *vtable_type = llvm::dyn_cast<llvm::StructType>(existing_vtable->getValueType());
+            if (vtable_type)
+            {
+                llvm::Constant *vtable_init = llvm::ConstantStruct::get(vtable_type, vtable_values);
+                existing_vtable->setInitializer(vtable_init);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Updated existing vtable '{}' with {} entries for class '{}'",
+                          vtable_name, vtable_entries.size(), class_name);
+                return;
+            }
+        }
+
+        // Create the vtable struct type
+        std::string vtable_type_name = "VTable." + class_name;
+        llvm::StructType *vtable_type = llvm::StructType::create(llvm_ctx(), vtable_field_types, vtable_type_name);
+
+        // Create the vtable global constant
+        llvm::Constant *vtable_init = llvm::ConstantStruct::get(vtable_type, vtable_values);
+        auto *vtable_global = new llvm::GlobalVariable(
+            *module(), vtable_type, true, // isConstant
+            llvm::GlobalValue::InternalLinkage,
+            vtable_init, vtable_name);
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "DeclarationCodegen: Generated vtable '{}' with {} entries for class '{}'",
+                  vtable_name, vtable_entries.size(), class_name);
     }
 
     llvm::Type *DeclarationCodegen::generate_enum_declaration(Cryo::EnumDeclarationNode *node)
@@ -3034,21 +3272,25 @@ namespace Cryo::Codegen
 
             // Register all parameter types in variable_types_map for Array<T> detection
             // StructMethodNode inherits from FunctionDeclarationNode so parameters() is available
-            // Note: AST params DO include 'this' for non-static methods, so LLVM args and AST params
-            // are aligned 1:1. We still skip 'this' since it's handled separately above.
+            // AST params may or may not include 'this':
+            //   - Explicit `&this` / `mut &this` syntax: parser adds it, AST params have it
+            //   - Implicit `this` (class methods): parser omits it, AST params don't have it
+            // Detect whether AST params include 'this' to align indices correctly.
             const auto &ast_params = node->parameters();
+            bool ast_has_this = !ast_params.empty() && ast_params[0]->name() == "this";
             size_t param_idx = 0;
             for (auto &arg : fn->args())
             {
-                // Skip 'this' as it's handled above (only for non-static methods)
+                // Skip 'this' as it's handled above.
+                // Only advance param_idx if the AST params also include 'this'.
                 if (arg.getName() == "this")
                 {
-                    param_idx++;
+                    if (ast_has_this)
+                        param_idx++;
                     continue;
                 }
 
-                // AST params and LLVM args are aligned 1:1 (both include 'this')
-                // So we use param_idx directly
+                // Map LLVM args to AST params by index
                 if (param_idx < ast_params.size())
                 {
                     TypeRef param_type = ast_params[param_idx]->get_resolved_type();
@@ -3095,6 +3337,79 @@ namespace Cryo::Codegen
                     }
                 }
                 param_idx++;
+            }
+
+            // Generate base constructor call if this is a constructor with a base init list
+            if (auto *struct_method = dynamic_cast<Cryo::StructMethodNode *>(node))
+            {
+                if (struct_method->is_constructor() && !struct_method->base_ctor_name().empty())
+                {
+                    std::string base_ctor_fn_name = struct_method->base_ctor_name() + "::" +
+                                                     struct_method->base_ctor_name();
+                    llvm::Function *base_ctor = module()->getFunction(base_ctor_fn_name);
+                    if (base_ctor)
+                    {
+                        // Get 'this' pointer
+                        llvm::AllocaInst *this_alloca = values().get_alloca("this");
+                        if (this_alloca)
+                        {
+                            llvm::Value *this_ptr = builder().CreateLoad(
+                                llvm::PointerType::get(llvm_ctx(), 0), this_alloca, "this.ptr");
+
+                            std::vector<llvm::Value *> base_args;
+                            base_args.push_back(this_ptr);
+
+                            // Generate base constructor argument expressions
+                            CodegenVisitor *visitor_tmp = ctx().visitor();
+                            for (const auto &arg : struct_method->base_ctor_args())
+                            {
+                                if (arg && visitor_tmp)
+                                {
+                                    ctx().set_result(nullptr);
+                                    arg->accept(*visitor_tmp);
+                                    llvm::Value *arg_val = ctx().get_result();
+                                    if (arg_val)
+                                        base_args.push_back(arg_val);
+                                }
+                            }
+
+                            builder().CreateCall(base_ctor, base_args);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Generated base constructor call to '{}' with {} args",
+                                      base_ctor_fn_name, base_args.size());
+
+                            // Re-initialize vtable pointer to the derived class's vtable
+                            // (base constructor set it to the base vtable, we need the derived one)
+                            TypeRef cryo_type = ctx().symbols().lookup_class_type(parent_type);
+                            if (cryo_type.is_valid())
+                            {
+                                auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
+                                if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
+                                {
+                                    std::string vtable_name = "vtable." + parent_type;
+                                    llvm::GlobalVariable *vtable_global = module()->getGlobalVariable(vtable_name, /*AllowInternal=*/true);
+                                    if (vtable_global)
+                                    {
+                                        llvm::StructType *class_llvm_type =
+                                            llvm::StructType::getTypeByName(llvm_ctx(), parent_type);
+                                        if (class_llvm_type)
+                                        {
+                                            llvm::Value *vptr_gep = builder().CreateStructGEP(
+                                                class_llvm_type, this_ptr, 0, "vptr.derived");
+                                            builder().CreateStore(vtable_global, vptr_gep);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                 "Base constructor '{}' not found for class '{}'",
+                                 base_ctor_fn_name, parent_type);
+                    }
+                }
             }
 
             // Generate body
@@ -3479,15 +3794,17 @@ namespace Cryo::Codegen
                     }
 
                     // Register all parameter types in variable_types_map
-                    // AST params and LLVM args are aligned 1:1 (both include 'this')
+                    // AST params may or may not include 'this' depending on syntax.
                     const auto &ast_params = fn_node->parameters();
+                    bool ast_has_this_param = !ast_params.empty() && ast_params[0]->name() == "this";
                     size_t param_idx = 0;
                     for (auto &arg : fn->args())
                     {
                         // Skip 'this' as it's handled above
                         if (arg.getName() == "this")
                         {
-                            param_idx++;
+                            if (ast_has_this_param)
+                                param_idx++;
                             continue;
                         }
 

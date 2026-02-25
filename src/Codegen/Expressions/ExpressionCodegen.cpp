@@ -5353,18 +5353,18 @@ namespace Cryo::Codegen
             // Calculate total allocation size
             llvm::Value *total_size = builder().CreateMul(count, elem_size_val, "array.total.size");
 
-            // Call cryo_alloc
-            llvm::Function *cryo_alloc_fn = module()->getFunction("std::Runtime::cryo_alloc");
-            if (!cryo_alloc_fn)
+            // Call malloc for heap allocation
+            llvm::Function *malloc_fn = module()->getFunction("malloc");
+            if (!malloc_fn)
             {
                 llvm::Type *i64_type = llvm::Type::getInt64Ty(llvm_ctx());
                 llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
-                llvm::FunctionType *cryo_alloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
-                cryo_alloc_fn = llvm::Function::Create(cryo_alloc_type, llvm::Function::ExternalLinkage,
-                                                       "std::Runtime::cryo_alloc", module());
+                llvm::FunctionType *malloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
+                malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
+                                                   "malloc", module());
             }
 
-            llvm::Value *ptr = builder().CreateCall(cryo_alloc_fn, {total_size}, "new.array." + node->type_name());
+            llvm::Value *ptr = builder().CreateCall(malloc_fn, {total_size}, "new.array." + node->type_name());
             return ptr;
         }
 
@@ -5455,6 +5455,22 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
+        // Check for abstract class instantiation
+        {
+            TypeRef cryo_type = symbols().lookup_class_type(node->type_name());
+            if (cryo_type.is_valid())
+            {
+                auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
+                if (cryo_class && cryo_class->is_abstract())
+                {
+                    report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
+                                 "Cannot instantiate abstract class '" + node->type_name() +
+                                 "' — it has pure virtual methods");
+                    return nullptr;
+                }
+            }
+        }
+
         // Calculate size (with safety check for unsized types)
         const llvm::DataLayout &dl = module()->getDataLayout();
         uint64_t size;
@@ -5470,19 +5486,40 @@ namespace Cryo::Codegen
             size = 8; // Default to pointer size for unsized types
         }
 
-        // Call cryo_alloc (runtime heap allocator)
-        llvm::Function *cryo_alloc_fn = module()->getFunction("std::Runtime::cryo_alloc");
-        if (!cryo_alloc_fn)
+        // Call malloc for heap allocation
+        llvm::Function *malloc_fn = module()->getFunction("malloc");
+        if (!malloc_fn)
         {
             llvm::Type *i64_type = llvm::Type::getInt64Ty(llvm_ctx());
             llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
-            llvm::FunctionType *cryo_alloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
-            cryo_alloc_fn = llvm::Function::Create(cryo_alloc_type, llvm::Function::ExternalLinkage,
-                                                   "std::Runtime::cryo_alloc", module());
+            llvm::FunctionType *malloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
+            malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
+                                               "malloc", module());
         }
 
         llvm::Value *size_val = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
-        llvm::Value *ptr = builder().CreateCall(cryo_alloc_fn, {size_val}, "new." + type_name_for_alloc);
+        llvm::Value *ptr = builder().CreateCall(malloc_fn, {size_val}, "new." + type_name_for_alloc);
+
+        // Initialize vtable pointer for classes with virtual methods
+        {
+            TypeRef cryo_type = symbols().lookup_class_type(node->type_name());
+            if (cryo_type.is_valid())
+            {
+                auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
+                if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
+                {
+                    std::string vtable_name = "vtable." + node->type_name();
+                    llvm::GlobalVariable *vtable_global = module()->getGlobalVariable(vtable_name, /*AllowInternal=*/true);
+                    if (vtable_global && alloc_type)
+                    {
+                        llvm::Value *vptr_gep = builder().CreateStructGEP(alloc_type, ptr, 0, "vptr");
+                        builder().CreateStore(vtable_global, vptr_gep);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Initialized vtable pointer for class '{}' (heap alloc)", node->type_name());
+                    }
+                }
+            }
+        }
 
         // If there are constructor arguments, call constructor
         if (!node->arguments().empty())

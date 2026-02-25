@@ -14,6 +14,7 @@
 #include "Codegen/Declarations/TypeCodegen.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Types/TypeChecker.hpp"
+#include "Types/UserDefinedTypes.hpp"
 
 #include "Utils/Logger.hpp"
 
@@ -978,6 +979,19 @@ namespace Cryo::Codegen
                 if (method)
                 {
                     _declarations->generate_method_declaration(method.get(), node.name());
+                }
+            }
+
+            // Generate vtable after method declarations are available
+            {
+                TypeRef cryo_type = _ctx->symbols().lookup_class_type(node.name());
+                if (cryo_type.is_valid())
+                {
+                    auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
+                    if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
+                    {
+                        _declarations->generate_vtable(node.name(), cryo_class);
+                    }
                 }
             }
 

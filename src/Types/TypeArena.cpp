@@ -1057,7 +1057,65 @@ namespace Cryo
             if (m.name == name)
                 return &m;
         }
+        // Walk inheritance chain — check base class(es)
+        if (_base_class.is_valid())
+        {
+            auto *base = dynamic_cast<const ClassType *>(_base_class.get());
+            if (base)
+                return base->get_method(name);
+        }
         return nullptr;
+    }
+
+    std::vector<MethodInfo> ClassType::build_vtable() const
+    {
+        std::vector<MethodInfo> vtable;
+
+        // Start with base class vtable entries
+        if (_base_class.is_valid())
+        {
+            auto *base = dynamic_cast<const ClassType *>(_base_class.get());
+            if (base)
+            {
+                vtable = base->build_vtable();
+            }
+        }
+
+        // Add or override with this class's virtual/override methods
+        for (const auto &method : _methods)
+        {
+            if (method.is_virtual || method.is_override)
+            {
+                // Check if this overrides an existing entry
+                bool found = false;
+                for (auto &entry : vtable)
+                {
+                    if (entry.name == method.name)
+                    {
+                        entry = method; // Override
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    vtable.push_back(method);
+                }
+            }
+        }
+
+        return vtable;
+    }
+
+    int ClassType::vtable_index(const std::string &method_name) const
+    {
+        auto vtable = build_vtable();
+        for (size_t i = 0; i < vtable.size(); ++i)
+        {
+            if (vtable[i].name == method_name)
+                return static_cast<int>(i);
+        }
+        return -1;
     }
 
     void ClassType::compute_layout()
