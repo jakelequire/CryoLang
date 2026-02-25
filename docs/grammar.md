@@ -1,4 +1,3 @@
-
 <program>        ::= { <statement> }
 <statement>      ::= <var-declaration> | <function-declaration> | <struct-declaration> | <class-declaration> | <enum-declaration> | <type-alias-declaration> | <implementation-block> | <expression-statement> | <if-statement> | <while-statement> | <for-statement> | <break-statement> | <continue-statement> | <return-statement>
 
@@ -14,7 +13,7 @@
 <class-declaration>     ::=  "class" <identifier> [<generic-params>] [":" <identifier>] "{" { <class-member> } "}"
 <enum-declaration>      ::=  ["type"] "enum" <identifier> [<generic-params>] "{" { <enum-variant> } "}"
 <type-alias-declaration>::=  "type" <identifier> "=" <type> ";"
-<implementation-block>  ::=  "implement" "struct" <identifier> "{" { <implementation-member> } "}"
+<implementation-block>  ::=  "implement" ("enum" | "struct" | "class") <identifier> "{" { <implementation-member> } "}"
 
 <generic-params>        ::=  "<" <generic-param> { "," <generic-param> } ">"
 <generic-param>         ::=  <identifier> [":" <type-constraint>]
