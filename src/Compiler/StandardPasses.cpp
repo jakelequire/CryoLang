@@ -1831,8 +1831,13 @@ namespace Cryo
                 }
                 else
                 {
+                    // Still add the field with an invalid type so it isn't dropped
+                    // from the field list. Codegen will use a fallback type (i64/ptr).
+                    // Dropping it would corrupt field indices for all subsequent fields.
+                    new_fields.emplace_back(field->name(), TypeRef{}, 0, true, field->is_mutable());
+                    has_changes = true;
                     LOG_WARN(LogComponent::GENERAL,
-                        "StructFieldTypeSyncPass: Field '{}::{}' still unresolved after TypeResolutionPass",
+                        "StructFieldTypeSyncPass: Field '{}::{}' still unresolved after TypeResolutionPass (kept with placeholder)",
                         struct_decl->name(), field->name());
                 }
             }
@@ -1931,8 +1936,13 @@ namespace Cryo
                 }
                 else
                 {
+                    // Still add the field with an invalid type so it isn't dropped
+                    // from the field list. Codegen will use a fallback type (i64/ptr).
+                    // Dropping it would corrupt field indices for all subsequent fields.
+                    new_fields.emplace_back(field->name(), TypeRef{}, 0, true, field->is_mutable());
+                    has_changes = true;
                     LOG_WARN(LogComponent::GENERAL,
-                        "StructFieldTypeSyncPass: Field '{}::{}' still unresolved after TypeResolutionPass",
+                        "StructFieldTypeSyncPass: Field '{}::{}' still unresolved after TypeResolutionPass (kept with placeholder)",
                         class_decl->name(), field->name());
                 }
             }

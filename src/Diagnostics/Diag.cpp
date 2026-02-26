@@ -340,6 +340,12 @@ namespace Cryo
                 << primary->file << ":" << primary->start_line << ":"
                 << primary->start_col << "\n";
 
+            // Try to load source file if not already cached
+            if (primary->start_line > 0 && !has_source(primary->file))
+            {
+                add_source_file(primary->file);
+            }
+
             // Try to show source code with syntax highlighting
             if (has_source(primary->file))
             {

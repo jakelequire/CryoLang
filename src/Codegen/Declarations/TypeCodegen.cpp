@@ -2,6 +2,7 @@
 #include "Codegen/CodegenVisitor.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Types/Types.hpp"
+#include "Types/TypeAnnotation.hpp"
 #include "Types/UserDefinedTypes.hpp"
 #include "Utils/Logger.hpp"
 #include "AST/TemplateRegistry.hpp"
@@ -109,6 +110,40 @@ namespace Cryo::Codegen
         }
         return type_args;
     }
+    // Helper: Create or look up a dynamic Array<T> LLVM struct type from a type annotation.
+    // Dynamic arrays are always { ptr, i64, i64 } (elements, length, capacity), regardless
+    // of element type. This allows generating the correct LLVM type even when the element
+    // type is a cross-module forward reference that hasn't been resolved yet.
+    static llvm::StructType *get_or_create_array_struct_from_annotation(
+        const Cryo::TypeAnnotation *annotation,
+        llvm::LLVMContext &llvm_ctx)
+    {
+        if (!annotation || annotation->kind != Cryo::TypeAnnotationKind::Array)
+            return nullptr;
+
+        // Only handle dynamic arrays (no fixed size)
+        if (annotation->array_size.has_value())
+            return nullptr;
+
+        // Get element type name from annotation for naming the struct
+        std::string elem_name = annotation->inner ? annotation->inner->to_string() : "unknown";
+        std::string array_name = "Array<" + elem_name + ">";
+
+        // Check if it already exists
+        llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx, array_name);
+        if (existing)
+            return existing;
+
+        // Create the struct: { ptr (elements), i64 (length), i64 (capacity) }
+        std::vector<llvm::Type *> fields = {
+            llvm::PointerType::get(llvm_ctx, 0),    // elements: T*
+            llvm::Type::getInt64Ty(llvm_ctx),        // length: u64
+            llvm::Type::getInt64Ty(llvm_ctx)         // capacity: u64
+        };
+
+        return llvm::StructType::create(llvm_ctx, fields, array_name);
+    }
+
     //===================================================================
     // Construction
     //===================================================================
@@ -832,6 +867,21 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Fallback: try creating Array<T> struct from array annotation
+            if (!field_llvm_type && field->has_type_annotation()
+                && field->type_annotation()->kind == Cryo::TypeAnnotationKind::Array)
+            {
+                llvm::StructType *array_struct = get_or_create_array_struct_from_annotation(
+                    field->type_annotation(), llvm_ctx());
+                if (array_struct)
+                {
+                    field_llvm_type = array_struct;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "=== STRUCT_GEN: Field '{}' resolved as dynamic array -> '{}' ===",
+                              field->name(), array_struct->getName().str());
+                }
+            }
+
             if (field_llvm_type)
             {
                 field_types.push_back(field_llvm_type);
@@ -1012,13 +1062,37 @@ namespace Cryo::Codegen
             cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type_ref.get());
         }
 
-        if (cryo_class && !cryo_class->fields().empty())
+        // Prefer ClassType fields (includes inherited fields from base classes),
+        // but fall back to AST node fields if ClassType has fewer fields than the AST
+        // (can happen when sync pass couldn't resolve all field types and the ClassType
+        // was initially populated with an incomplete set).
+        bool use_class_type_fields = cryo_class && !cryo_class->fields().empty()
+            && cryo_class->fields().size() >= node->fields().size();
+
+        if (use_class_type_fields)
         {
-            for (const auto &field : cryo_class->fields())
+            for (size_t fi = 0; fi < cryo_class->fields().size(); ++fi)
             {
+                const auto &field = cryo_class->fields()[fi];
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Class field '{}': type='{}'",
                           field.name, field.type.is_valid() ? field.type->display_name() : "NULL");
                 llvm::Type *field_type = field.type.is_valid() ? types().map(field.type) : nullptr;
+                if (!field_type)
+                {
+                    // Try to resolve array type from AST annotation when TypeRef is unavailable
+                    if (fi < node->fields().size() && node->fields()[fi]->has_type_annotation()
+                        && node->fields()[fi]->type_annotation()->kind == Cryo::TypeAnnotationKind::Array)
+                    {
+                        field_type = get_or_create_array_struct_from_annotation(
+                            node->fields()[fi]->type_annotation(), llvm_ctx());
+                        if (field_type)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Class field '{}' resolved as dynamic array from annotation -> '{}'",
+                                      field.name, llvm::cast<llvm::StructType>(field_type)->getName().str());
+                        }
+                    }
+                }
                 if (field_type)
                 {
                     field_types.push_back(field_type);
@@ -1033,20 +1107,35 @@ namespace Cryo::Codegen
         else
         {
             // Fallback to AST node fields (no inheritance info)
+            if (cryo_class && !cryo_class->fields().empty())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                    "TypeCodegen: ClassType '{}' has {} fields but AST has {} - using AST fields",
+                    name, cryo_class->fields().size(), node->fields().size());
+            }
             for (const auto &field : node->fields())
             {
                 TypeRef cryo_field_type = field->get_resolved_type();
+                llvm::Type *field_llvm_type = nullptr;
                 if (cryo_field_type)
                 {
-                    llvm::Type *field_type = types().map(cryo_field_type);
-                    if (field_type)
+                    field_llvm_type = types().map(cryo_field_type);
+                }
+                if (!field_llvm_type && field->has_type_annotation()
+                    && field->type_annotation()->kind == Cryo::TypeAnnotationKind::Array)
+                {
+                    field_llvm_type = get_or_create_array_struct_from_annotation(
+                        field->type_annotation(), llvm_ctx());
+                    if (field_llvm_type)
                     {
-                        field_types.push_back(field_type);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Class field '{}' resolved as dynamic array from annotation -> '{}'",
+                                  field->name(), llvm::cast<llvm::StructType>(field_llvm_type)->getName().str());
                     }
-                    else
-                    {
-                        field_types.push_back(llvm::Type::getInt64Ty(llvm_ctx()));
-                    }
+                }
+                if (field_llvm_type)
+                {
+                    field_types.push_back(field_llvm_type);
                 }
                 else
                 {
@@ -1084,12 +1173,21 @@ namespace Cryo::Codegen
         if (auto *template_reg = ctx().template_registry())
         {
             std::vector<TypeRef> cryo_field_type_refs;
+            std::vector<std::string> field_type_annotations;
             cryo_field_type_refs.reserve(field_names.size());
+            field_type_annotations.reserve(field_names.size());
+
             if (cryo_class && !cryo_class->fields().empty())
             {
-                for (const auto &field : cryo_class->fields())
+                for (size_t fi = 0; fi < cryo_class->fields().size(); ++fi)
                 {
+                    const auto &field = cryo_class->fields()[fi];
                     cryo_field_type_refs.push_back(field.type.is_valid() ? field.type : TypeRef{});
+                    // Get annotation string from AST node if available
+                    if (fi < node->fields().size() && node->fields()[fi]->has_type_annotation())
+                        field_type_annotations.push_back(node->fields()[fi]->type_annotation()->to_string());
+                    else
+                        field_type_annotations.push_back("");
                 }
             }
             else
@@ -1098,15 +1196,19 @@ namespace Cryo::Codegen
                 {
                     TypeRef ftype = field->get_resolved_type();
                     cryo_field_type_refs.push_back(ftype.is_valid() && !ftype.is_error() ? ftype : TypeRef{});
+                    if (field->has_type_annotation())
+                        field_type_annotations.push_back(field->type_annotation()->to_string());
+                    else
+                        field_type_annotations.push_back("");
                 }
             }
 
             std::string source_ns = ctx().namespace_context();
             std::string qualified_name = source_ns.empty() ? name : source_ns + "::" + name;
-            template_reg->register_struct_field_types(qualified_name, field_names, cryo_field_type_refs, source_ns);
+            template_reg->register_struct_field_types(qualified_name, field_names, cryo_field_type_refs, source_ns, field_type_annotations);
             if (qualified_name != name)
             {
-                template_reg->register_struct_field_types(name, field_names, cryo_field_type_refs, source_ns);
+                template_reg->register_struct_field_types(name, field_names, cryo_field_type_refs, source_ns, field_type_annotations);
             }
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered {} field types in TemplateRegistry for class {} (qualified: {})",
                       cryo_field_type_refs.size(), name, qualified_name);

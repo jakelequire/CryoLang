@@ -1,0 +1,586 @@
+///! AST Declaration Nodes
+///!
+///! DeclarationNode base and all 17 concrete declaration classes.
+
+namespace Compiler::AST::Declaration;
+
+import Compiler::Diagnostics;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+
+
+// ============================================================================
+// DeclarationNode — Base for all declarations
+// ==========================================================================
+
+type class DeclarationNode : ASTNode {
+public:
+    documentation: string;
+    source_module: string;
+    name_span:     SourceSpan;
+
+    DeclarationNode(kind: NodeKind, span: SourceSpan) : ASTNode(kind, span) {
+        this.documentation = "";
+        this.source_module = "";
+        this.name_span     = SourceSpan::none();
+    }
+
+    has_documentation() -> boolean { return this.documentation != ""; }
+    is_from_import() -> boolean    { return this.source_module != ""; }
+    has_name_span() -> boolean     { return this.name_span.has_location(); }
+
+    set_documentation(doc: string) -> void  { this.documentation = doc; }
+    set_source_module(mod: string) -> void  { this.source_module = mod; }
+    set_name_span(span: SourceSpan) -> void { this.name_span = span; }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+// ============================================================================
+// Concrete Declaration Nodes
+// ============================================================================
+
+type class VarDeclNode : DeclarationNode {
+public:
+    name:            string;
+    initializer:     ExpressionNode*;
+    is_mutable:      boolean;
+    is_auto:         boolean;
+    is_global:       boolean;
+    type_annotation: TypeAnnotation*;
+    resolved_type:   void*;
+
+    VarDeclNode(name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::VariableDeclaration, span) {
+        this.name            = name;
+        this.initializer     = null;
+        this.is_mutable      = false;
+        this.is_auto         = false;
+        this.is_global       = false;
+        this.type_annotation = null;
+        this.resolved_type   = null;
+    }
+
+    has_initializer() -> boolean     { return this.initializer != null; }
+    has_type_annotation() -> boolean { return this.type_annotation != null; }
+    has_resolved_type() -> boolean   { return this.resolved_type != null; }
+
+    set_initializer(expr: ExpressionNode*) -> void  { this.initializer = expr; }
+    set_mutable(v: boolean) -> void                 { this.is_mutable = v; }
+    set_auto(v: boolean) -> void                    { this.is_auto = v; }
+    set_global(v: boolean) -> void                  { this.is_global = v; }
+    set_type_annotation(a: TypeAnnotation*) -> void { this.type_annotation = a; }
+    set_resolved_type(t: void*) -> void             { this.resolved_type = t; }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class FunctionDeclNode : DeclarationNode {
+public:
+    name:                   string;
+    parameters:             VarDeclNode*[];
+    generic_params:         GenericParamNode*[];
+    trait_bounds:           TraitBound[];
+    body:                   BlockStmtNode*;
+    is_public:              boolean;
+    is_static:              boolean;
+    is_inline:              boolean;
+    is_variadic:            boolean;
+    return_type_annotation: TypeAnnotation*;
+    resolved_return_type:   void*;
+
+    FunctionDeclNode(name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::FunctionDeclaration, span) {
+        this.name                   = name;
+        this.parameters             = [];
+        this.generic_params         = [];
+        this.trait_bounds           = [];
+        this.body                   = null;
+        this.is_public              = false;
+        this.is_static              = false;
+        this.is_inline              = false;
+        this.is_variadic            = false;
+        this.return_type_annotation = null;
+        this.resolved_return_type   = null;
+    }
+
+    has_body() -> boolean                 { return this.body != null; }
+    is_generic() -> boolean               { return this.generic_params.length > 0; }
+    has_resolved_return_type() -> boolean { return this.resolved_return_type != null; }
+
+    add_parameter(param: VarDeclNode*) -> void {
+        this.parameters.push(param);
+    }
+
+    add_generic_param(param: GenericParamNode*) -> void {
+        this.generic_params.push(param);
+    }
+
+    add_trait_bound(bound: TraitBound) -> void {
+        this.trait_bounds.push(bound);
+    }
+
+    set_body(b: BlockStmtNode*) -> void                     { this.body = b; }
+    set_public(v: boolean) -> void                          { this.is_public = v; }
+    set_static(v: boolean) -> void                          { this.is_static = v; }
+    set_inline(v: boolean) -> void                          { this.is_inline = v; }
+    set_variadic(v: boolean) -> void                        { this.is_variadic = v; }
+    set_return_type_annotation(a: TypeAnnotation*) -> void  { this.return_type_annotation = a; }
+    set_resolved_return_type(t: void*) -> void              { this.resolved_return_type = t; }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+/// Method node uses composition: holds a FunctionDeclNode* for the function
+/// signature and body, plus method-specific flags.
+type class MethodNode : DeclarationNode {
+public:
+    func:                  FunctionDeclNode*;
+    visibility:            Visibility;
+    is_constructor:        boolean;
+    is_destructor:         boolean;
+    is_static:             boolean;
+    is_default_destructor: boolean;
+    is_virtual:            boolean;
+    is_override:           boolean;
+    base_ctor_name:        string;
+    base_ctor_args:        ExpressionNode*[];
+
+    MethodNode(func: FunctionDeclNode*, span: SourceSpan)
+        : DeclarationNode(NodeKind::FunctionDeclaration, span) {
+        this.func                  = func;
+        this.visibility            = Visibility::Public;
+        this.is_constructor        = false;
+        this.is_destructor         = false;
+        this.is_static             = false;
+        this.is_default_destructor = false;
+        this.is_virtual            = false;
+        this.is_override           = false;
+        this.base_ctor_name        = "";
+        this.base_ctor_args        = [];
+    }
+
+    has_base_ctor() -> boolean { return this.base_ctor_name != ""; }
+
+    set_visibility(v: Visibility) -> void       { this.visibility = v; }
+    set_constructor(v: boolean) -> void         { this.is_constructor = v; }
+    set_destructor(v: boolean) -> void          { this.is_destructor = v; }
+    set_static(v: boolean) -> void              { this.is_static = v; }
+    set_default_destructor(v: boolean) -> void  { this.is_default_destructor = v; }
+    set_virtual(v: boolean) -> void             { this.is_virtual = v; }
+    set_override(v: boolean) -> void            { this.is_override = v; }
+    set_base_ctor_name(name: string) -> void    { this.base_ctor_name = name; }
+
+    add_base_ctor_arg(arg: ExpressionNode*) -> void {
+        this.base_ctor_args.push(arg);
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class IntrinsicDeclNode : DeclarationNode {
+public:
+    name:                 string;
+    parameters:           VarDeclNode*[];
+    body:                 BlockStmtNode*;
+    resolved_return_type: void*;
+
+    IntrinsicDeclNode(name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::IntrinsicDeclaration, span) {
+        this.name                 = name;
+        this.parameters           = [];
+        this.body                 = null;
+        this.resolved_return_type = null;
+    }
+
+    has_body() -> boolean { return this.body != null; }
+
+    add_parameter(param: VarDeclNode*) -> void {
+        this.parameters.push(param);
+    }
+
+    set_body(b: BlockStmtNode*) -> void             { this.body = b; }
+    set_resolved_return_type(t: void*) -> void      { this.resolved_return_type = t; }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class IntrinsicConstDeclNode : DeclarationNode {
+public:
+    name:          string;
+    resolved_type: void*;
+
+    IntrinsicConstDeclNode(name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::IntrinsicConstDeclaration, span) {
+        this.name          = name;
+        this.resolved_type = null;
+    }
+
+    set_resolved_type(t: void*) -> void { this.resolved_type = t; }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class ImportDeclNode : DeclarationNode {
+public:
+    module_path:      string;
+    alias:            string;
+    specific_imports: string[];
+    style:            ImportStyle;
+
+    ImportDeclNode(module_path: string, style: ImportStyle, span: SourceSpan)
+        : DeclarationNode(NodeKind::ImportDeclaration, span) {
+        this.module_path      = module_path;
+        this.alias            = "";
+        this.specific_imports = [];
+        this.style            = style;
+    }
+
+    has_alias() -> boolean { return this.alias != ""; }
+
+    set_alias(a: string) -> void { this.alias = a; }
+
+    add_specific_import(name: string) -> void {
+        this.specific_imports.push(name);
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class ModuleDeclNode : DeclarationNode {
+public:
+    path:      string;
+    is_public: boolean;
+
+    ModuleDeclNode(path: string, is_public: boolean, span: SourceSpan)
+        : DeclarationNode(NodeKind::ModuleDeclaration, span) {
+        this.path      = path;
+        this.is_public = is_public;
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class StructDeclNode : DeclarationNode {
+public:
+    name:           string;
+    generic_params: GenericParamNode*[];
+    fields:         FieldDeclNode*[];
+    methods:        MethodNode*[];
+
+    StructDeclNode(name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::StructDeclaration, span) {
+        this.name           = name;
+        this.generic_params = [];
+        this.fields         = [];
+        this.methods        = [];
+    }
+
+    is_generic() -> boolean { return this.generic_params.length > 0; }
+
+    add_generic_param(param: GenericParamNode*) -> void {
+        this.generic_params.push(param);
+    }
+
+    add_field(field: FieldDeclNode*) -> void {
+        this.fields.push(field);
+    }
+
+    add_method(method: MethodNode*) -> void {
+        this.methods.push(method);
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class ClassDeclNode : DeclarationNode {
+public:
+    name:           string;
+    generic_params: GenericParamNode*[];
+    fields:         FieldDeclNode*[];
+    methods:        MethodNode*[];
+    base_class:     string;
+
+    ClassDeclNode(name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::ClassDeclaration, span) {
+        this.name           = name;
+        this.generic_params = [];
+        this.fields         = [];
+        this.methods        = [];
+        this.base_class     = "";
+    }
+
+    is_generic() -> boolean     { return this.generic_params.length > 0; }
+    has_base_class() -> boolean { return this.base_class != ""; }
+
+    add_generic_param(param: GenericParamNode*) -> void {
+        this.generic_params.push(param);
+    }
+
+    add_field(field: FieldDeclNode*) -> void {
+        this.fields.push(field);
+    }
+
+    add_method(method: MethodNode*) -> void {
+        this.methods.push(method);
+    }
+
+    set_base_class(name: string) -> void {
+        this.base_class = name;
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class TraitDeclNode : DeclarationNode {
+public:
+    name:           string;
+    generic_params: GenericParamNode*[];
+    methods:        FunctionDeclNode*[];
+    base_traits:    BaseTraitInfo[];
+
+    TraitDeclNode(name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::TraitDeclaration, span) {
+        this.name           = name;
+        this.generic_params = [];
+        this.methods        = [];
+        this.base_traits    = [];
+    }
+
+    is_generic() -> boolean { return this.generic_params.length > 0; }
+
+    add_generic_param(param: GenericParamNode*) -> void {
+        this.generic_params.push(param);
+    }
+
+    add_method(method: FunctionDeclNode*) -> void {
+        this.methods.push(method);
+    }
+
+    add_base_trait(info: BaseTraitInfo) -> void {
+        this.base_traits.push(info);
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class TypeAliasDeclNode : DeclarationNode {
+public:
+    alias_name:        string;
+    generic_params:    string[];
+    target_annotation: TypeAnnotation*;
+    resolved_target:   void*;
+
+    TypeAliasDeclNode(alias_name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::TypeAliasDeclaration, span) {
+        this.alias_name        = alias_name;
+        this.generic_params    = [];
+        this.target_annotation = null;
+        this.resolved_target   = null;
+    }
+
+    is_generic() -> boolean          { return this.generic_params.length > 0; }
+    has_resolved_target() -> boolean { return this.resolved_target != null; }
+
+    set_generic_params(params: string[]) -> void      { this.generic_params = params; }
+    set_target_annotation(a: TypeAnnotation*) -> void  { this.target_annotation = a; }
+    set_resolved_target(t: void*) -> void              { this.resolved_target = t; }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class EnumDeclNode : DeclarationNode {
+public:
+    name:           string;
+    generic_params: GenericParamNode*[];
+    variants:       EnumVariantNode*[];
+
+    EnumDeclNode(name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::EnumDeclaration, span) {
+        this.name           = name;
+        this.generic_params = [];
+        this.variants       = [];
+    }
+
+    is_generic() -> boolean { return this.generic_params.length > 0; }
+
+    add_generic_param(param: GenericParamNode*) -> void {
+        this.generic_params.push(param);
+    }
+
+    add_variant(variant: EnumVariantNode*) -> void {
+        this.variants.push(variant);
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class EnumVariantNode : DeclarationNode {
+public:
+    name:             string;
+    associated_types: string[];
+    explicit_value:   i64;
+    has_value:        boolean;
+
+    EnumVariantNode(name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::EnumDeclaration, span) {
+        this.name             = name;
+        this.associated_types = [];
+        this.explicit_value   = 0;
+        this.has_value        = false;
+    }
+
+    add_associated_type(t: string) -> void {
+        this.associated_types.push(t);
+    }
+
+    set_explicit_value(v: i64) -> void {
+        this.explicit_value = v;
+        this.has_value      = true;
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class ImplBlockNode : DeclarationNode {
+public:
+    target_type: string;
+    fields:      FieldDeclNode*[];
+    methods:     MethodNode*[];
+
+    ImplBlockNode(target_type: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::ImplementationBlock, span) {
+        this.target_type = target_type;
+        this.fields      = [];
+        this.methods     = [];
+    }
+
+    add_field(field: FieldDeclNode*) -> void {
+        this.fields.push(field);
+    }
+
+    add_method(method: MethodNode*) -> void {
+        this.methods.push(method);
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class ExternBlockNode : DeclarationNode {
+public:
+    linkage_type: string;
+    functions:    FunctionDeclNode*[];
+
+    ExternBlockNode(linkage_type: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::ExternBlock, span) {
+        this.linkage_type = linkage_type;
+        this.functions    = [];
+    }
+
+    add_function(func: FunctionDeclNode*) -> void {
+        this.functions.push(func);
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class FieldDeclNode : DeclarationNode {
+public:
+    name:            string;
+    visibility:      Visibility;
+    default_value:   ExpressionNode*;
+    type_annotation: TypeAnnotation*;
+    resolved_type:   void*;
+
+    FieldDeclNode(name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::VariableDeclaration, span) {
+        this.name            = name;
+        this.visibility      = Visibility::Public;
+        this.default_value   = null;
+        this.type_annotation = null;
+        this.resolved_type   = null;
+    }
+
+    has_default_value() -> boolean   { return this.default_value != null; }
+    has_type_annotation() -> boolean { return this.type_annotation != null; }
+    has_resolved_type() -> boolean   { return this.resolved_type != null; }
+
+    set_visibility(v: Visibility) -> void         { this.visibility = v; }
+    set_default_value(v: ExpressionNode*) -> void { this.default_value = v; }
+    set_type_annotation(a: TypeAnnotation*) -> void { this.type_annotation = a; }
+    set_resolved_type(t: void*) -> void           { this.resolved_type = t; }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
+type class GenericParamNode : DeclarationNode {
+public:
+    name:        string;
+    constraints: string[];
+
+    GenericParamNode(name: string, span: SourceSpan)
+        : DeclarationNode(NodeKind::Declaration, span) {
+        this.name        = name;
+        this.constraints = [];
+    }
+
+    add_constraint(c: string) -> void {
+        this.constraints = this.constraints + [c];
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
