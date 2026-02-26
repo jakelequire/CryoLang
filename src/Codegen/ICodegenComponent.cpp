@@ -1657,7 +1657,7 @@ namespace Cryo::Codegen
         return types().map_type(cryo_type);
     }
 
-    llvm::Value *ICodegenComponent::cast_if_needed(llvm::Value *value, llvm::Type *target_type)
+    llvm::Value *ICodegenComponent::cast_if_needed(llvm::Value *value, llvm::Type *target_type, bool is_unsigned)
     {
         if (!value || !target_type)
         {
@@ -1709,10 +1709,10 @@ namespace Cryo::Codegen
 
             if (source_bits < target_bits)
             {
-                // Extension - use sign-extend as the safe default because Cryo's default
-                // integer type is signed (int/i32/i64). This correctly preserves negative
-                // values (e.g., return -1 from i32 to i64). For positive values, sext and
-                // zext produce identical results so this is safe for unsigned types too.
+                if (is_unsigned)
+                {
+                    return b.CreateZExt(value, target_type, "zext");
+                }
                 return b.CreateSExt(value, target_type, "sext");
             }
             else if (source_bits > target_bits)

@@ -1,0 +1,215 @@
+///! TypeResolver
+///!
+///! Resolves unresolved TypeAnnotation nodes (from the parser) into concrete
+///! TypeRef handles by looking up types in the TypeArena.
+///!
+///! Design note: Reuses the existing TypeAnnotation enum from AST/_module.cryo
+///! directly, avoiding the C++ compiler's duplication.
+
+namespace Compiler::Types::Resolver;
+
+import Compiler::Diagnostics;
+import Compiler::AST;
+
+
+// ============================================================================
+// ResolutionContext — Context for type resolution
+// ============================================================================
+
+/// Ambient state needed while resolving type annotations.
+type struct ResolutionContext {
+    current_module:   string;
+    source_file:      string;
+    generic_bindings: string[];     // Parallel arrays: generic name → bound TypeRef
+    binding_refs:     TypeRef[];
+
+    static new(current_module: string, source_file: string) -> ResolutionContext {
+        return ResolutionContext {
+            current_module:   current_module,
+            source_file:      source_file,
+            generic_bindings: [],
+            binding_refs:     [],
+        };
+    }
+
+    /// Add a generic binding (e.g., T → i32).
+    add_binding(mut &this, name: string, bound_type: TypeRef) -> void {
+        this.generic_bindings = this.generic_bindings + [name];
+        this.binding_refs     = this.binding_refs + [bound_type];
+    }
+
+    /// Look up a generic binding by name.
+    lookup_binding(&this, name: string) -> TypeRef {
+        for (mut i: i64 = 0; i < this.generic_bindings.length; i = i + 1) {
+            if (this.generic_bindings[i] == name) {
+                return this.binding_refs[i];
+            }
+        }
+        return TypeRef::invalid();
+    }
+}
+
+
+// ============================================================================
+// TypeResolver
+// ============================================================================
+
+type struct TypeResolver {
+    arena: TypeArena*;
+
+    static new(arena: TypeArena*) -> TypeResolver {
+        return TypeResolver {
+            arena: arena,
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Main resolve entry point
+    // ----------------------------------------------------------------
+
+    /// Resolve a TypeAnnotation to a TypeRef.
+    resolve(&this, ann: TypeAnnotation*, ctx: ResolutionContext*) -> TypeRef {
+        if (ann == null) {
+            return TypeRef::invalid();
+        }
+
+        return match (*ann) {
+            TypeAnnotation::Primitive(p) => {
+                this.resolve_primitive(p.name)
+            }
+            TypeAnnotation::Named(n) => {
+                this.resolve_named(n.name, ctx)
+            }
+            TypeAnnotation::Pointer(p) => {
+                mut inner: TypeRef = this.resolve(p.inner, ctx);
+                this.arena.get_pointer_to(inner)
+            }
+            TypeAnnotation::Reference(r) => {
+                mut inner: TypeRef = this.resolve(r.inner, ctx);
+                mut mutability: RefMutability = RefMutability::Immutable;
+                if (r.is_mutable) {
+                    mutability = RefMutability::Mutable;
+                }
+                this.arena.get_reference_to(inner, mutability)
+            }
+            TypeAnnotation::Array(a) => {
+                mut elem: TypeRef = this.resolve(a.element, ctx);
+                this.arena.get_array_of(elem, a.size)
+            }
+            TypeAnnotation::Function(f) => {
+                this.resolve_function(f, ctx)
+            }
+            TypeAnnotation::Tuple(t) => {
+                this.resolve_tuple(t, ctx)
+            }
+            TypeAnnotation::Optional(o) => {
+                mut inner: TypeRef = this.resolve(o.inner, ctx);
+                this.arena.get_optional_of(inner)
+            }
+            TypeAnnotation::Generic(g) => {
+                this.resolve_generic(g, ctx)
+            }
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Dispatch helpers
+    // ----------------------------------------------------------------
+
+    /// Resolve a primitive type name to its arena singleton.
+    resolve_primitive(&this, name: string) -> TypeRef {
+        if (name == "void")    { return this.arena.get_void(); }
+        if (name == "boolean") { return this.arena.get_bool(); }
+        if (name == "bool")    { return this.arena.get_bool(); }
+        if (name == "char")    { return this.arena.get_char(); }
+        if (name == "string")  { return this.arena.get_string(); }
+        if (name == "never")   { return this.arena.get_never(); }
+
+        // Integer types
+        if (name == "i8")   { return this.arena.get_i8(); }
+        if (name == "i16")  { return this.arena.get_i16(); }
+        if (name == "i32")  { return this.arena.get_i32(); }
+        if (name == "i64")  { return this.arena.get_i64(); }
+        if (name == "i128") { return this.arena.get_i128(); }
+        if (name == "u8")   { return this.arena.get_u8(); }
+        if (name == "u16")  { return this.arena.get_u16(); }
+        if (name == "u32")  { return this.arena.get_u32(); }
+        if (name == "u64")  { return this.arena.get_u64(); }
+        if (name == "u128") { return this.arena.get_u128(); }
+
+        // Float types
+        if (name == "f32") { return this.arena.get_f32(); }
+        if (name == "f64") { return this.arena.get_f64(); }
+
+        // Common aliases
+        if (name == "int")    { return this.arena.get_i32(); }
+        if (name == "uint")   { return this.arena.get_u32(); }
+        if (name == "float")  { return this.arena.get_f64(); }
+        if (name == "double") { return this.arena.get_f64(); }
+        if (name == "byte")   { return this.arena.get_u8(); }
+
+        return TypeRef::invalid();
+    }
+
+    /// Resolve a named type (user-defined or generic binding).
+    resolve_named(&this, name: string, ctx: ResolutionContext*) -> TypeRef {
+        // Check generic bindings first
+        mut binding: TypeRef = ctx.lookup_binding(name);
+        if (binding.is_valid()) {
+            return binding;
+        }
+
+        // Look up in arena's user-defined caches
+        mut found: TypeRef = this.arena.lookup_by_name(name);
+        if (found.is_valid()) {
+            return found;
+        }
+
+        // Try qualified name with current module
+        if (ctx.current_module != "") {
+            mut qualified: string = sprintf("%s::%s", ctx.current_module, name);
+            found = this.arena.lookup_by_name(qualified);
+            if (found.is_valid()) {
+                return found;
+            }
+        }
+
+        // Not found — return invalid (caller should create error)
+        return TypeRef::invalid();
+    }
+
+    /// Resolve a function type annotation.
+    resolve_function(&this, f: FunctionAnnotation*, ctx: ResolutionContext*) -> TypeRef {
+        mut ret: TypeRef = this.resolve(f.return_type, ctx);
+
+        mut params: TypeRef[] = [];
+        for (mut i: i64 = 0; i < f.parameters.length; i = i + 1) {
+            params = params + [this.resolve(f.parameters[i], ctx)];
+        }
+
+        return this.arena.get_function(ret, params, false);
+    }
+
+    /// Resolve a tuple type annotation.
+    resolve_tuple(&this, t: TupleAnnotation*, ctx: ResolutionContext*) -> TypeRef {
+        mut elements: TypeRef[] = [];
+        for (mut i: i64 = 0; i < t.elements.length; i = i + 1) {
+            elements = elements + [this.resolve(t.elements[i], ctx)];
+        }
+        return this.arena.get_tuple(elements);
+    }
+
+    /// Resolve a generic type instantiation annotation.
+    resolve_generic(&this, g: GenericAnnotation*, ctx: ResolutionContext*) -> TypeRef {
+        mut base: TypeRef = this.resolve(g.base, ctx);
+
+        mut args: TypeRef[] = [];
+        for (mut i: i64 = 0; i < g.args.length; i = i + 1) {
+            args = args + [this.resolve(g.args[i], ctx)];
+        }
+
+        return this.arena.create_instantiation(base, args);
+    }
+}

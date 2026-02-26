@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace Cryo
 {
@@ -17,7 +19,7 @@ namespace Cryo
      *   1. Resolves include path relative to source directory
      *   2. Runs clang-20 -E -P to preprocess
      *   3. Parses preprocessed C with CParser
-     *   4. Maps C types to Cryo TypeRefs
+     *   4. Maps C types to Cryo TypeRefs (resolving typedefs and enum names)
      *   5. Creates FunctionDeclarationNode AST nodes
      */
     class CHeaderProcessor
@@ -52,8 +54,15 @@ namespace Cryo
 
         /**
          * @brief Map a C type string to a Cryo TypeRef.
+         * Resolves typedefs, recognizes enum types as i32,
+         * and handles struct types as opaque pointers.
          */
         TypeRef map_c_type(const std::string &c_type, TypeArena &arena);
+
+        /**
+         * @brief Resolve a typedef chain to its underlying type.
+         */
+        std::string resolve_typedef(const std::string &type_name) const;
 
         /**
          * @brief Create a FunctionDeclarationNode from a CFunctionDecl.
@@ -61,6 +70,11 @@ namespace Cryo
         std::unique_ptr<FunctionDeclarationNode> create_function_node(
             const CFunctionDecl &decl,
             TypeArena &arena);
+
+        // Type info from CParser (populated during process_header)
+        std::unordered_map<std::string, std::string> _typedefs;
+        std::unordered_set<std::string> _enum_names;
+        std::unordered_set<std::string> _struct_names;
     };
 
 } // namespace Cryo

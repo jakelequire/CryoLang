@@ -1,0 +1,249 @@
+///! ModuleTypeRegistry
+///!
+///! Cross-module type tracking with visibility control.  Each module registers
+///! its types here during declaration collection, and other modules look up
+///! types through their import lists.
+
+namespace Compiler::Types::Registry;
+
+
+// ============================================================================
+// TypeVisibility — Access control for registered types
+// ============================================================================
+
+type enum TypeVisibility {
+    Public;
+    Private;
+    Internal;
+}
+
+implement enum TypeVisibility {
+    to_string(&this) -> string {
+        return match (&this) {
+            TypeVisibility::Public   => { "Public" }
+            TypeVisibility::Private  => { "Private" }
+            TypeVisibility::Internal => { "Internal" }
+        };
+    }
+
+    is_public(&this) -> boolean {
+        return match (&this) {
+            TypeVisibility::Public => { true }
+            _                      => { false }
+        };
+    }
+}
+
+
+// ============================================================================
+// TypeRegistryEntry — A single type registration
+// ============================================================================
+
+type struct TypeRegistryEntry {
+    entry_type: TypeRef;
+    visibility: TypeVisibility;
+    local_name: string;
+
+    static new(entry_type: TypeRef, visibility: TypeVisibility, local_name: string) -> TypeRegistryEntry {
+        return TypeRegistryEntry {
+            entry_type: entry_type,
+            visibility: visibility,
+            local_name: local_name,
+        };
+    }
+}
+
+
+// ============================================================================
+// ModuleTypeRegistry
+// ============================================================================
+
+type struct ModuleTypeRegistry {
+    // module_name → list of TypeRegistryEntry (parallel arrays)
+    module_names:    string[];
+    module_entries:  TypeRegistryEntry[][];
+
+    // Type aliases: alias_name → target TypeRef (parallel arrays)
+    alias_names:    string[];
+    alias_targets:  TypeRef[];
+
+    // Alias base name tracking for chain resolution
+    alias_base_names: string[];
+    alias_base_refs:  string[];
+
+    static new() -> ModuleTypeRegistry {
+        return ModuleTypeRegistry {
+            module_names:     [],
+            module_entries:   [],
+            alias_names:      [],
+            alias_targets:    [],
+            alias_base_names: [],
+            alias_base_refs:  [],
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Type registration
+    // ----------------------------------------------------------------
+
+    /// Register a type in a module with the given visibility.
+    register_type(mut &this, module: string, name: string, ty: TypeRef, vis: TypeVisibility) -> void {
+        mut entry: TypeRegistryEntry = TypeRegistryEntry::new(ty, vis, name);
+
+        // Find or create module entry list
+        for (mut i: i64 = 0; i < this.module_names.length; i = i + 1) {
+            if (this.module_names[i] == module) {
+                this.module_entries[i].push(entry);
+                return;
+            }
+        }
+
+        // New module
+        this.module_names.push(module);
+        this.module_entries.push([entry]);
+    }
+
+
+    // ----------------------------------------------------------------
+    // Type lookup
+    // ----------------------------------------------------------------
+
+    /// Look up a type in a specific module by name.
+    lookup_type(&this, module: string, name: string) -> TypeRef {
+        for (mut i: i64 = 0; i < this.module_names.length; i = i + 1) {
+            if (this.module_names[i] == module) {
+                mut entries: TypeRegistryEntry[] = this.module_entries[i];
+                for (mut j: i64 = 0; j < entries.length; j = j + 1) {
+                    if (entries[j].local_name == name) {
+                        return entries[j].entry_type;
+                    }
+                }
+                return TypeRef::invalid();
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Look up a type across a list of imported modules (public types only).
+    lookup_type_in_imports(&this, name: string, imports: string[]) -> TypeRef {
+        for (mut i: i64 = 0; i < imports.length; i = i + 1) {
+            for (mut j: i64 = 0; j < this.module_names.length; j = j + 1) {
+                if (this.module_names[j] == imports[i]) {
+                    mut entries: TypeRegistryEntry[] = this.module_entries[j];
+                    for (mut k: i64 = 0; k < entries.length; k = k + 1) {
+                        if (entries[k].local_name == name && entries[k].visibility.is_public()) {
+                            return entries[k].entry_type;
+                        }
+                    }
+                }
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Get all types registered in a module.
+    get_module_types(&this, module: string) -> TypeRegistryEntry[] {
+        for (mut i: i64 = 0; i < this.module_names.length; i = i + 1) {
+            if (this.module_names[i] == module) {
+                return this.module_entries[i];
+            }
+        }
+        return [];
+    }
+
+    /// Get all public types registered in a module.
+    get_public_types(&this, module: string) -> TypeRegistryEntry[] {
+        mut result: TypeRegistryEntry[] = [];
+        for (mut i: i64 = 0; i < this.module_names.length; i = i + 1) {
+            if (this.module_names[i] == module) {
+                mut entries: TypeRegistryEntry[] = this.module_entries[i];
+                for (mut j: i64 = 0; j < entries.length; j = j + 1) {
+                    if (entries[j].visibility.is_public()) {
+                        result = result + [entries[j]];
+                    }
+                }
+                return result;
+            }
+        }
+        return result;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Type aliases
+    // ----------------------------------------------------------------
+
+    /// Register a type alias.
+    register_type_alias(mut &this, alias: string, target: TypeRef) -> void {
+        // Check for existing alias
+        for (mut i: i64 = 0; i < this.alias_names.length; i = i + 1) {
+            if (this.alias_names[i] == alias) {
+                this.alias_targets[i] = target;
+                return;
+            }
+        }
+        this.alias_names   = this.alias_names + [alias];
+        this.alias_targets = this.alias_targets + [target];
+    }
+
+    /// Look up a type alias.
+    lookup_alias(&this, name: string) -> TypeRef {
+        for (mut i: i64 = 0; i < this.alias_names.length; i = i + 1) {
+            if (this.alias_names[i] == name) {
+                return this.alias_targets[i];
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Resolve an alias chain (follow aliases until a non-alias is found).
+    /// Returns the original name if no alias exists.
+    resolve_alias(&this, name: string) -> string {
+        mut current: string = name;
+        mut max_depth: i64 = 32;  // Prevent infinite loops
+
+        for (mut depth: i64 = 0; depth < max_depth; depth = depth + 1) {
+            mut found: boolean = false;
+            for (mut i: i64 = 0; i < this.alias_base_names.length; i = i + 1) {
+                if (this.alias_base_names[i] == current) {
+                    current = this.alias_base_refs[i];
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                break;
+            }
+        }
+
+        return current;
+    }
+
+    /// Register an alias base name mapping (alias → base type name).
+    register_alias_base(mut &this, alias: string, base_name: string) -> void {
+        for (mut i: i64 = 0; i < this.alias_base_names.length; i = i + 1) {
+            if (this.alias_base_names[i] == alias) {
+                this.alias_base_refs[i] = base_name;
+                return;
+            }
+        }
+        this.alias_base_names = this.alias_base_names + [alias];
+        this.alias_base_refs  = this.alias_base_refs + [base_name];
+    }
+
+    /// Check whether a module has any registered types.
+    has_module(&this, module: string) -> boolean {
+        for (mut i: i64 = 0; i < this.module_names.length; i = i + 1) {
+            if (this.module_names[i] == module) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Total number of registered modules.
+    module_count(&this) -> i64 {
+        return this.module_names.length;
+    }
+}

@@ -1,0 +1,381 @@
+///! User-Defined Types
+///!
+///! Type classes and helper structs for struct, class, enum, trait, and type
+///! alias declarations.  Supports forward declaration (is_complete flag)
+///! and incremental population of fields/methods.
+
+namespace Compiler::Types::UserDefined;
+
+
+// ============================================================================
+// FieldInfo — Metadata for a struct/class field
+// ============================================================================
+
+type struct FieldInfo {
+    name:       string;
+    field_type: TypeRef;
+    offset:     u64;
+    is_public:  boolean;
+    is_mutable: boolean;
+
+    static new(name: string, field_type: TypeRef, is_public: boolean, is_mutable: boolean) -> FieldInfo {
+        return FieldInfo {
+            name:       name,
+            field_type: field_type,
+            offset:     0,
+            is_public:  is_public,
+            is_mutable: is_mutable,
+        };
+    }
+}
+
+
+// ============================================================================
+// MethodInfo — Metadata for a type method
+// ============================================================================
+
+type struct MethodInfo {
+    name:          string;
+    function_type: TypeRef;   // Points to a FunctionType in the arena
+    is_public:     boolean;
+    is_static:     boolean;
+    is_virtual:    boolean;
+    is_override:   boolean;
+
+    static new(name: string, function_type: TypeRef, is_public: boolean, is_static: boolean) -> MethodInfo {
+        return MethodInfo {
+            name:          name,
+            function_type: function_type,
+            is_public:     is_public,
+            is_static:     is_static,
+            is_virtual:    false,
+            is_override:   false,
+        };
+    }
+}
+
+
+// ============================================================================
+// EnumVariantInfo — Metadata for an enum variant
+// ============================================================================
+
+type struct EnumVariantInfo {
+    name:          string;
+    payload_types: TypeRef[];
+    tag_value:     u64;
+
+    static new(name: string, payload_types: TypeRef[], tag_value: u64) -> EnumVariantInfo {
+        return EnumVariantInfo {
+            name:          name,
+            payload_types: payload_types,
+            tag_value:     tag_value,
+        };
+    }
+
+    has_payload(&this) -> boolean {
+        return this.payload_types.length > 0;
+    }
+}
+
+
+// ============================================================================
+// StructType — Named struct with fields and methods
+// ============================================================================
+
+type class StructType : Type {
+public:
+    qualified_name: string;
+    module_name:    string;
+    fields:         FieldInfo[];
+    methods:        MethodInfo[];
+    is_complete:    boolean;
+
+    StructType(id: u64, qualified_name: string, module_name: string)
+        : Type(id, TypeKind::Struct) {
+        this.qualified_name = qualified_name;
+        this.module_name    = module_name;
+        this.fields         = [];
+        this.methods        = [];
+        this.is_complete    = false;
+    }
+
+    /// Populate fields for a previously forward-declared struct.
+    set_fields(fields: FieldInfo[]) -> void {
+        this.fields      = fields;
+        this.is_complete = true;
+    }
+
+    add_field(field: FieldInfo) -> void {
+        this.fields = this.fields + [field];
+    }
+
+    add_method(method: MethodInfo) -> void {
+        this.methods = this.methods + [method];
+    }
+
+    /// Returns -1 if not found.
+    field_index(name: string) -> i64 {
+        for (mut i: i64 = 0; i < this.fields.length; i = i + 1) {
+            if (this.fields[i].name == name) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    get_field(name: string) -> FieldInfo* {
+        for (mut i: i64 = 0; i < this.fields.length; i = i + 1) {
+            if (this.fields[i].name == name) {
+                return &this.fields[i];
+            }
+        }
+        return null;
+    }
+
+    get_method(name: string) -> MethodInfo* {
+        for (mut i: i64 = 0; i < this.methods.length; i = i + 1) {
+            if (this.methods[i].name == name) {
+                return &this.methods[i];
+            }
+        }
+        return null;
+    }
+
+    field_count(&this) -> i64   { return this.fields.length; }
+    method_count(&this) -> i64  { return this.methods.length; }
+
+    override display_name(&this) -> string { return this.qualified_name; }
+    override mangled_name(&this) -> string { return sprintf("_CS%s", this.qualified_name); }
+
+    override size_bytes(&this) -> u64 {
+        // Sum of field sizes (simplified; real layout needs alignment padding)
+        return 0;
+    }
+
+    override alignment(&this) -> u64 { return 8; }
+}
+
+
+// ============================================================================
+// ClassType — Class with inheritance support
+// ============================================================================
+
+type class ClassType : Type {
+public:
+    qualified_name:      string;
+    module_name:         string;
+    fields:              FieldInfo[];
+    methods:             MethodInfo[];
+    base_class:          TypeRef;
+    has_base:            boolean;
+    has_virtual_methods: boolean;
+    is_complete:         boolean;
+
+    ClassType(id: u64, qualified_name: string, module_name: string)
+        : Type(id, TypeKind::Class) {
+        this.qualified_name      = qualified_name;
+        this.module_name         = module_name;
+        this.fields              = [];
+        this.methods             = [];
+        this.base_class          = TypeRef::invalid();
+        this.has_base            = false;
+        this.has_virtual_methods = false;
+        this.is_complete         = false;
+    }
+
+    set_fields(fields: FieldInfo[]) -> void {
+        this.fields      = fields;
+        this.is_complete = true;
+    }
+
+    set_base_class(base: TypeRef) -> void {
+        this.base_class = base;
+        this.has_base   = true;
+    }
+
+    add_field(field: FieldInfo) -> void {
+        this.fields = this.fields + [field];
+    }
+
+    add_method(method: MethodInfo) -> void {
+        this.methods = this.methods + [method];
+        if (method.is_virtual || method.is_override) {
+            this.has_virtual_methods = true;
+        }
+    }
+
+    field_index(name: string) -> i64 {
+        for (mut i: i64 = 0; i < this.fields.length; i = i + 1) {
+            if (this.fields[i].name == name) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    get_field(name: string) -> FieldInfo* {
+        for (mut i: i64 = 0; i < this.fields.length; i = i + 1) {
+            if (this.fields[i].name == name) {
+                return &this.fields[i];
+            }
+        }
+        return null;
+    }
+
+    get_method(name: string) -> MethodInfo* {
+        for (mut i: i64 = 0; i < this.methods.length; i = i + 1) {
+            if (this.methods[i].name == name) {
+                return &this.methods[i];
+            }
+        }
+        return null;
+    }
+
+    override display_name(&this) -> string { return this.qualified_name; }
+    override mangled_name(&this) -> string { return sprintf("_CC%s", this.qualified_name); }
+    override size_bytes(&this) -> u64      { return 0; }
+    override alignment(&this) -> u64       { return 8; }
+}
+
+
+// ============================================================================
+// EnumType — Discriminated union with variants
+// ============================================================================
+
+type class EnumType : Type {
+public:
+    qualified_name: string;
+    module_name:    string;
+    variants:       EnumVariantInfo[];
+    methods:        MethodInfo[];
+
+    EnumType(id: u64, qualified_name: string, module_name: string)
+        : Type(id, TypeKind::Enum) {
+        this.qualified_name = qualified_name;
+        this.module_name    = module_name;
+        this.variants       = [];
+        this.methods        = [];
+    }
+
+    add_variant(variant: EnumVariantInfo) -> void {
+        this.variants = this.variants + [variant];
+    }
+
+    add_method(method: MethodInfo) -> void {
+        this.methods = this.methods + [method];
+    }
+
+    /// Whether all variants have no payload (simple C-style enum).
+    is_simple_enum(&this) -> boolean {
+        for (mut i: i64 = 0; i < this.variants.length; i = i + 1) {
+            if (this.variants[i].has_payload()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    get_variant(name: string) -> EnumVariantInfo* {
+        for (mut i: i64 = 0; i < this.variants.length; i = i + 1) {
+            if (this.variants[i].name == name) {
+                return &this.variants[i];
+            }
+        }
+        return null;
+    }
+
+    get_method(name: string) -> MethodInfo* {
+        for (mut i: i64 = 0; i < this.methods.length; i = i + 1) {
+            if (this.methods[i].name == name) {
+                return &this.methods[i];
+            }
+        }
+        return null;
+    }
+
+    variant_count(&this) -> i64 { return this.variants.length; }
+
+    override display_name(&this) -> string { return this.qualified_name; }
+    override mangled_name(&this) -> string { return sprintf("_CE%s", this.qualified_name); }
+    override size_bytes(&this) -> u64      { return 0; }  // Depends on largest variant
+    override alignment(&this) -> u64       { return 8; }
+}
+
+
+// ============================================================================
+// TraitType — Interface definition with required methods
+// ============================================================================
+
+type class TraitType : Type {
+public:
+    qualified_name:   string;
+    module_name:      string;
+    required_methods: MethodInfo[];
+    super_traits:     TypeRef[];
+
+    TraitType(id: u64, qualified_name: string, module_name: string)
+        : Type(id, TypeKind::Trait) {
+        this.qualified_name   = qualified_name;
+        this.module_name      = module_name;
+        this.required_methods = [];
+        this.super_traits     = [];
+    }
+
+    add_required_method(method: MethodInfo) -> void {
+        this.required_methods = this.required_methods + [method];
+    }
+
+    add_super_trait(trait_ref: TypeRef) -> void {
+        this.super_traits = this.super_traits + [trait_ref];
+    }
+
+    get_method(name: string) -> MethodInfo* {
+        for (mut i: i64 = 0; i < this.required_methods.length; i = i + 1) {
+            if (this.required_methods[i].name == name) {
+                return &this.required_methods[i];
+            }
+        }
+        return null;
+    }
+
+    override display_name(&this) -> string { return this.qualified_name; }
+    override mangled_name(&this) -> string { return sprintf("_CT%s", this.qualified_name); }
+    override size_bytes(&this) -> u64      { return 0; }  // Traits have no size
+    override alignment(&this) -> u64       { return 0; }
+}
+
+
+// ============================================================================
+// TypeAliasType — Named alias for another type
+// ============================================================================
+
+type class TypeAliasType : Type {
+public:
+    alias_name: string;
+    target:     TypeRef;
+
+    TypeAliasType(id: u64, alias_name: string, target: TypeRef)
+        : Type(id, TypeKind::TypeAlias) {
+        this.alias_name = alias_name;
+        this.target     = target;
+    }
+
+    has_target(&this) -> boolean {
+        return this.target.is_valid();
+    }
+
+    set_target(target: TypeRef) -> void {
+        this.target = target;
+    }
+
+    override display_name(&this) -> string { return this.alias_name; }
+    override mangled_name(&this) -> string { return sprintf("_CA%s", this.alias_name); }
+
+    override size_bytes(&this) -> u64 {
+        return 0;  // Delegates to target once resolved
+    }
+
+    override alignment(&this) -> u64 {
+        return 0;  // Delegates to target once resolved
+    }
+}

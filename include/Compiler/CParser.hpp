@@ -3,6 +3,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace Cryo
 {
@@ -10,8 +12,9 @@ namespace Cryo
      * @brief Lightweight C declaration parser for preprocessed C code.
      *
      * Parses preprocessed C (output of clang -E -P) and extracts function
-     * prototypes. Skips anything it can't handle (struct definitions,
-     * function pointers, etc.) by advancing to the next ';' or '}'.
+     * prototypes, typedef aliases, enum names, and struct names.
+     * Skips anything it can't handle (function pointers, complex declarators)
+     * by advancing to the next ';' or '}'.
      *
      * Inspired by Zig's Aro parser — minimal, resilient, and focused
      * on extracting just what Cryo needs for C interop.
@@ -29,6 +32,18 @@ namespace Cryo
         std::string return_type; // e.g., "void", "int", "const char *"
         std::vector<CParam> params;
         bool is_variadic = false;
+    };
+
+    struct CEnumConstant
+    {
+        std::string name;
+        int64_t value;
+    };
+
+    struct CEnumDecl
+    {
+        std::string name;                        // May be empty for anonymous enums
+        std::vector<CEnumConstant> constants;
     };
 
     class CParser
@@ -98,11 +113,27 @@ namespace Cryo
         };
 
         /**
-         * @brief Parse preprocessed C source and extract function declarations.
+         * @brief Parse preprocessed C source and extract declarations.
          * @param source Preprocessed C text (output of clang -E -P)
          * @return Vector of parsed function declarations
          */
         std::vector<CFunctionDecl> parse(const std::string &source);
+
+        // ====================================================================
+        // Post-parse accessors (available after parse() returns)
+        // ====================================================================
+
+        /// Typedef aliases: name -> resolved C type string (e.g., "FooRef" -> "struct Foo *")
+        const std::unordered_map<std::string, std::string> &typedefs() const { return _typedefs; }
+
+        /// Enum type names (both tagged and typedef'd)
+        const std::unordered_set<std::string> &enum_names() const { return _enum_names; }
+
+        /// Struct/union type names (both tagged and typedef'd)
+        const std::unordered_set<std::string> &struct_names() const { return _struct_names; }
+
+        /// Parsed enum declarations with their constants
+        const std::vector<CEnumDecl> &enum_decls() const { return _enum_decls; }
 
     private:
         // Lexer state
@@ -110,6 +141,12 @@ namespace Cryo
         size_t _pos = 0;
         std::vector<CToken> _tokens;
         size_t _tok_pos = 0;
+
+        // Type tracking (populated during parse)
+        std::unordered_map<std::string, std::string> _typedefs;
+        std::unordered_set<std::string> _enum_names;
+        std::unordered_set<std::string> _struct_names;
+        std::vector<CEnumDecl> _enum_decls;
 
         void tokenize();
         void skip_whitespace_and_comments();
@@ -129,6 +166,7 @@ namespace Cryo
         bool check(CTokKind kind) const;
         void skip_to_semicolon_or_brace();
         void skip_balanced_braces();
+        void skip_balanced_parens();
 
         // Parse a type specifier (qualifiers + base type + pointers)
         std::string parse_type_specifier();
@@ -142,9 +180,16 @@ namespace Cryo
         // Parse parameter list between ( and )
         bool parse_parameter_list(std::vector<CParam> &params, bool &is_variadic);
 
+        // Typedef, enum, struct parsing
+        void parse_typedef();
+        void parse_enum_body(CEnumDecl &out);
+
         // Check if a token kind is a type keyword
         bool is_type_keyword(CTokKind kind) const;
         bool is_type_qualifier(CTokKind kind) const;
+
+        // Check if an identifier is a known typedef name (acts as a type)
+        bool is_typedef_name(const std::string &name) const;
     };
 
 } // namespace Cryo
