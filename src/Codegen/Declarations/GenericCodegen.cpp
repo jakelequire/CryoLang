@@ -10,6 +10,7 @@
 #include "Utils/Logger.hpp"
 
 #include <llvm/IR/Verifier.h>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Cryo::Codegen
@@ -534,6 +535,15 @@ namespace Cryo::Codegen
             // reference each other regardless of source order, then generate bodies.
 
             // Pass 1: Generate all method declarations
+            // Detect overloaded method names so we can protect earlier declarations
+            // from being erased by generate_method_declaration's stub-replacement logic.
+            std::unordered_map<std::string, int> method_name_counts;
+            for (const auto &method : struct_decl->methods())
+            {
+                if (method)
+                    method_name_counts[method->name()]++;
+            }
+
             std::vector<std::pair<Cryo::FunctionDeclarationNode *, llvm::Function *>> method_decls;
             for (const auto &method : struct_decl->methods())
             {
@@ -545,7 +555,26 @@ namespace Cryo::Codegen
                 llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
                 if (fn && method->body() && fn->empty())
                 {
+                    // If this method name has overloads, add a placeholder entry block
+                    // to prevent subsequent overload declarations from erasing this function
+                    // (generate_method_declaration only erases declaration-only stubs).
+                    // The block will be removed and re-created during body generation.
+                    if (method_name_counts[method->name()] > 1)
+                    {
+                        llvm::BasicBlock::Create(llvm_ctx(), "placeholder", fn);
+                    }
                     method_decls.push_back({method.get(), fn});
+                }
+            }
+
+            // Remove placeholder blocks from overloaded methods so body generation
+            // sees them as empty (fn->empty()) and generates the real entry block.
+            for (auto &[method, fn] : method_decls)
+            {
+                if (method_name_counts[method->name()] > 1 && !fn->empty())
+                {
+                    // Remove the placeholder block (it has no instructions)
+                    fn->begin()->eraseFromParent();
                 }
             }
 
@@ -753,6 +782,14 @@ namespace Cryo::Codegen
                 // Two-pass method generation: declare all methods first, then generate bodies
 
                 // Pass 1: Declare all impl block methods
+                // Detect overloaded method names (same logic as inline methods above)
+                std::unordered_map<std::string, int> impl_method_counts;
+                for (const auto &method : impl_block->method_implementations())
+                {
+                    if (method)
+                        impl_method_counts[method->name()]++;
+                }
+
                 std::vector<std::pair<Cryo::FunctionDeclarationNode *, llvm::Function *>> impl_method_decls;
                 for (const auto &method : impl_block->method_implementations())
                 {
@@ -763,7 +800,20 @@ namespace Cryo::Codegen
                     llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
                     if (fn && method->body() && fn->empty())
                     {
+                        if (impl_method_counts[method->name()] > 1)
+                        {
+                            llvm::BasicBlock::Create(llvm_ctx(), "placeholder", fn);
+                        }
                         impl_method_decls.push_back({method.get(), fn});
+                    }
+                }
+
+                // Remove placeholder blocks before body generation
+                for (auto &[method, fn] : impl_method_decls)
+                {
+                    if (impl_method_counts[method->name()] > 1 && !fn->empty())
+                    {
+                        fn->begin()->eraseFromParent();
                     }
                 }
 

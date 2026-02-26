@@ -945,7 +945,7 @@ namespace Cryo::Codegen
 
                         // Check if this class has a vtable pointer (first LLVM element)
                         bool has_vtable = false;
-                        if (cls && (cls->has_virtual_methods() || cls->has_base_class()))
+                        if (cls && cls->needs_vtable_pointer())
                             has_vtable = true;
 
                         std::vector<std::string> field_names;
@@ -986,7 +986,7 @@ namespace Cryo::Codegen
             if (cryo_type.is_valid())
             {
                 auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
-                if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
+                if (cryo_class && cryo_class->needs_vtable_pointer())
                 {
                     needs_vtable = true;
                 }
@@ -1078,6 +1078,39 @@ namespace Cryo::Codegen
         ctx().register_struct_fields(name, field_names, field_offset);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered {} field names for class {} (vtable_offset={})",
                   field_names.size(), name, field_offset);
+
+        // Register field types in TemplateRegistry for nested member access resolution
+        // (e.g., obj.pointer_field.member requires knowing pointer_field's type)
+        if (auto *template_reg = ctx().template_registry())
+        {
+            std::vector<TypeRef> cryo_field_type_refs;
+            cryo_field_type_refs.reserve(field_names.size());
+            if (cryo_class && !cryo_class->fields().empty())
+            {
+                for (const auto &field : cryo_class->fields())
+                {
+                    cryo_field_type_refs.push_back(field.type.is_valid() ? field.type : TypeRef{});
+                }
+            }
+            else
+            {
+                for (const auto &field : node->fields())
+                {
+                    TypeRef ftype = field->get_resolved_type();
+                    cryo_field_type_refs.push_back(ftype.is_valid() && !ftype.is_error() ? ftype : TypeRef{});
+                }
+            }
+
+            std::string source_ns = ctx().namespace_context();
+            std::string qualified_name = source_ns.empty() ? name : source_ns + "::" + name;
+            template_reg->register_struct_field_types(qualified_name, field_names, cryo_field_type_refs, source_ns);
+            if (qualified_name != name)
+            {
+                template_reg->register_struct_field_types(name, field_names, cryo_field_type_refs, source_ns);
+            }
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Registered {} field types in TemplateRegistry for class {} (qualified: {})",
+                      cryo_field_type_refs.size(), name, qualified_name);
+        }
 
         return class_type;
     }
