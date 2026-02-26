@@ -1,0 +1,187 @@
+///! Generic Types & ErrorType
+///!
+///! Type classes for generic parameters, bounded parameters, instantiated
+///! (monomorphized) types, and the error sentinel type.
+
+namespace Compiler::Types::Generic;
+
+import Compiler::Diagnostics;
+
+
+// ============================================================================
+// GenericParamType — Unresolved generic type parameter (e.g., T)
+// ============================================================================
+
+/// Represents an unbound generic parameter.
+/// Identified by INDEX (not name) to prevent "T" collisions across scopes.
+type class GenericParamType : Type {
+public:
+    param_name:  string;
+    param_index: u64;
+
+    GenericParamType(id: u64, param_name: string, param_index: u64)
+        : Type(id, TypeKind::GenericParam) {
+        this.param_name  = param_name;
+        this.param_index = param_index;
+    }
+
+    override display_name(&this) -> string { return this.param_name; }
+
+    override mangled_name(&this) -> string {
+        return sprintf("_CG%s_%lu", this.param_name, this.param_index);
+    }
+
+    override size_bytes(&this) -> u64 { return 0; }
+    override alignment(&this) -> u64  { return 0; }
+
+    /// Generic parameters are NOT resolved until instantiation.
+    override is_resolved(&this) -> boolean { return false; }
+}
+
+
+// ============================================================================
+// BoundedParamType — Generic parameter with trait bounds (e.g., T: Clone + Debug)
+// ============================================================================
+
+type class BoundedParamType : Type {
+public:
+    param_name:  string;
+    param_index: u64;
+    bounds:      TypeRef[];   // Each points to a TraitType
+
+    BoundedParamType(id: u64, param_name: string, param_index: u64, bounds: TypeRef[])
+        : Type(id, TypeKind::BoundedParam) {
+        this.param_name  = param_name;
+        this.param_index = param_index;
+        this.bounds      = bounds;
+    }
+
+    bound_count(&this) -> i64 {
+        return this.bounds.length;
+    }
+
+    override display_name(&this) -> string {
+        if (this.bounds.length == 0) {
+            return this.param_name;
+        }
+        mut result: string = this.param_name + ": ";
+        for (mut i: i64 = 0; i < this.bounds.length; i = i + 1) {
+            if (i > 0) {
+                result = result + " + ";
+            }
+            result = sprintf("%s%lu", result, this.bounds[i].id);
+        }
+        return result;
+    }
+
+    override mangled_name(&this) -> string {
+        return sprintf("_CB%s_%lu", this.param_name, this.param_index);
+    }
+
+    override size_bytes(&this) -> u64 { return 0; }
+    override alignment(&this) -> u64  { return 0; }
+
+    /// Bounded parameters are NOT resolved until instantiation.
+    override is_resolved(&this) -> boolean { return false; }
+}
+
+
+// ============================================================================
+// InstantiatedType — Concrete instantiation of a generic type
+// ============================================================================
+
+/// Created when a generic type is instantiated with concrete type arguments.
+/// E.g., Array<i32> → InstantiatedType(base=Array, args=[i32]).
+/// After monomorphization, resolved_type points to the concrete StructType/etc.
+type class InstantiatedType : Type {
+public:
+    generic_base:  TypeRef;       // The uninstantiated generic type
+    type_args:     TypeRef[];     // Concrete type arguments
+    resolved_type: TypeRef;       // Filled after monomorphization
+
+    InstantiatedType(id: u64, generic_base: TypeRef, type_args: TypeRef[])
+        : Type(id, TypeKind::InstantiatedType) {
+        this.generic_base  = generic_base;
+        this.type_args     = type_args;
+        this.resolved_type = TypeRef::invalid();
+    }
+
+    has_resolved_type(&this) -> boolean {
+        return this.resolved_type.is_valid();
+    }
+
+    set_resolved_type(resolved: TypeRef) -> void {
+        this.resolved_type = resolved;
+    }
+
+    arg_count(&this) -> i64 {
+        return this.type_args.length;
+    }
+
+    override display_name(&this) -> string {
+        mut result: string = sprintf("%lu<", this.generic_base.id);
+        for (mut i: i64 = 0; i < this.type_args.length; i = i + 1) {
+            if (i > 0) {
+                result = result + ", ";
+            }
+            result = sprintf("%s%lu", result, this.type_args[i].id);
+        }
+        result = result + ">";
+        return result;
+    }
+
+    override mangled_name(&this) -> string {
+        mut result: string = sprintf("_CI%lu", this.generic_base.id);
+        for (mut i: i64 = 0; i < this.type_args.length; i = i + 1) {
+            result = sprintf("%s_%lu", result, this.type_args[i].id);
+        }
+        return result;
+    }
+
+    override size_bytes(&this) -> u64 {
+        // Delegates to resolved_type when available
+        return 0;
+    }
+
+    override alignment(&this) -> u64 { return 0; }
+
+    override is_resolved(&this) -> boolean {
+        return this.has_resolved_type();
+    }
+}
+
+
+// ============================================================================
+// ErrorType — Placeholder for type resolution failures
+// ============================================================================
+
+/// Captures type resolution failures explicitly so that downstream passes
+/// can report meaningful errors rather than crashing on null pointers.
+type class ErrorType : Type {
+public:
+    reason: string;
+    span:   SourceSpan;
+    notes:  string[];
+
+    ErrorType(id: u64, reason: string, span: SourceSpan)
+        : Type(id, TypeKind::Error) {
+        this.reason = reason;
+        this.span   = span;
+        this.notes  = [];
+    }
+
+    add_note(note: string) -> void {
+        this.notes = this.notes + [note];
+    }
+
+    override display_name(&this) -> string {
+        return sprintf("<error: %s>", this.reason);
+    }
+
+    override mangled_name(&this) -> string {
+        return "_Cerror";
+    }
+
+    override size_bytes(&this) -> u64 { return 0; }
+    override alignment(&this) -> u64  { return 0; }
+}

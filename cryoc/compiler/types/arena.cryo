@@ -1,0 +1,486 @@
+///! TypeArena
+///!
+///! The single owner of all Type objects.  Manages allocation, deduplication,
+///! and singleton primitives.  All types are created through the arena's factory
+///! methods, which return TypeRef handles.
+///!
+///! Design note: User-defined type caches are keyed by qualified name only
+///! (not module_id::name), fixing the C++ compiler's cross-module dedup issue.
+
+namespace Compiler::Types::Arena;
+
+import Compiler::Diagnostics;
+
+
+// ============================================================================
+// TypeArena
+// ============================================================================
+
+type struct TypeArena {
+    // -- Ownership --
+    types:   Type*[];           // All types (indexed by allocation order)
+    next_id: u64;               // Monotonic counter (starts at 1; 0 = invalid)
+
+    // -- Primitive singletons --
+    void_type:   TypeRef;
+    unit_type:   TypeRef;
+    bool_type:   TypeRef;
+    char_type:   TypeRef;
+    string_type: TypeRef;
+    never_type:  TypeRef;
+
+    i8_type:   TypeRef;
+    i16_type:  TypeRef;
+    i32_type:  TypeRef;
+    i64_type:  TypeRef;
+    i128_type: TypeRef;
+    u8_type:   TypeRef;
+    u16_type:  TypeRef;
+    u32_type:  TypeRef;
+    u64_type:  TypeRef;
+    u128_type: TypeRef;
+    f32_type:  TypeRef;
+    f64_type:  TypeRef;
+
+    // -- Compound type dedup caches --
+    // These use string keys derived from the constituent TypeRef IDs.
+    pointer_cache:  string[];   // Parallel arrays: key + TypeRef pairs
+    pointer_refs:   TypeRef[];
+    reference_cache: string[];
+    reference_refs:  TypeRef[];
+    array_cache:    string[];
+    array_refs:     TypeRef[];
+    optional_cache: string[];
+    optional_refs:  TypeRef[];
+    function_cache: string[];
+    function_refs:  TypeRef[];
+    tuple_cache:    string[];
+    tuple_refs:     TypeRef[];
+
+    // -- User-defined type caches (by qualified name) --
+    struct_names: string[];
+    struct_refs:  TypeRef[];
+    class_names:  string[];
+    class_refs:   TypeRef[];
+    enum_names:   string[];
+    enum_refs:    TypeRef[];
+    trait_names:  string[];
+    trait_refs:   TypeRef[];
+    alias_names:  string[];
+    alias_refs:   TypeRef[];
+
+
+    // ----------------------------------------------------------------
+    // Construction
+    // ----------------------------------------------------------------
+
+    /// Create a new TypeArena and initialize all 20 primitive singletons.
+    static new() -> TypeArena {
+        mut arena: TypeArena = TypeArena {
+            types:   [],
+            next_id: 1,
+
+            void_type:   TypeRef::invalid(),
+            unit_type:   TypeRef::invalid(),
+            bool_type:   TypeRef::invalid(),
+            char_type:   TypeRef::invalid(),
+            string_type: TypeRef::invalid(),
+            never_type:  TypeRef::invalid(),
+
+            i8_type:   TypeRef::invalid(),
+            i16_type:  TypeRef::invalid(),
+            i32_type:  TypeRef::invalid(),
+            i64_type:  TypeRef::invalid(),
+            i128_type: TypeRef::invalid(),
+            u8_type:   TypeRef::invalid(),
+            u16_type:  TypeRef::invalid(),
+            u32_type:  TypeRef::invalid(),
+            u64_type:  TypeRef::invalid(),
+            u128_type: TypeRef::invalid(),
+            f32_type:  TypeRef::invalid(),
+            f64_type:  TypeRef::invalid(),
+
+            pointer_cache:  [],
+            pointer_refs:   [],
+            reference_cache: [],
+            reference_refs:  [],
+            array_cache:    [],
+            array_refs:     [],
+            optional_cache: [],
+            optional_refs:  [],
+            function_cache: [],
+            function_refs:  [],
+            tuple_cache:    [],
+            tuple_refs:     [],
+
+            struct_names: [],
+            struct_refs:  [],
+            class_names:  [],
+            class_refs:   [],
+            enum_names:   [],
+            enum_refs:    [],
+            trait_names:  [],
+            trait_refs:   [],
+            alias_names:  [],
+            alias_refs:   [],
+        };
+
+        arena.init_primitives();
+        return arena;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Internal: primitive initialization
+    // ----------------------------------------------------------------
+
+    init_primitives(mut &this) -> void {
+        this.void_type   = this.alloc_type(new VoidType(this.next_id));
+        this.unit_type   = this.alloc_type(new UnitType(this.next_id));
+        this.bool_type   = this.alloc_type(new BoolType(this.next_id));
+        this.char_type   = this.alloc_type(new CharType(this.next_id));
+        this.string_type = this.alloc_type(new StringType(this.next_id));
+        this.never_type  = this.alloc_type(new NeverType(this.next_id));
+
+        this.i8_type   = this.alloc_type(new IntType(this.next_id, IntegerKind::I8));
+        this.i16_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::I16));
+        this.i32_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::I32));
+        this.i64_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::I64));
+        this.i128_type = this.alloc_type(new IntType(this.next_id, IntegerKind::I128));
+        this.u8_type   = this.alloc_type(new IntType(this.next_id, IntegerKind::U8));
+        this.u16_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::U16));
+        this.u32_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::U32));
+        this.u64_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::U64));
+        this.u128_type = this.alloc_type(new IntType(this.next_id, IntegerKind::U128));
+        this.f32_type  = this.alloc_type(new FloatType(this.next_id, FloatKind::F32));
+        this.f64_type  = this.alloc_type(new FloatType(this.next_id, FloatKind::F64));
+    }
+
+    /// Allocate a type, assign it an ID, store it, and return a TypeRef.
+    alloc_type(mut &this, ty: Type*) -> TypeRef {
+        mut id: u64 = this.next_id;
+        ty.id = id;
+        this.next_id = this.next_id + 1;
+        this.types = this.types + [ty];
+        return TypeRef::new(id, this);
+    }
+
+
+    // ----------------------------------------------------------------
+    // Primitive getters
+    // ----------------------------------------------------------------
+
+    get_void(&this) -> TypeRef   { return this.void_type; }
+    get_unit(&this) -> TypeRef   { return this.unit_type; }
+    get_bool(&this) -> TypeRef   { return this.bool_type; }
+    get_char(&this) -> TypeRef   { return this.char_type; }
+    get_string(&this) -> TypeRef { return this.string_type; }
+    get_never(&this) -> TypeRef  { return this.never_type; }
+
+    get_i8(&this) -> TypeRef   { return this.i8_type; }
+    get_i16(&this) -> TypeRef  { return this.i16_type; }
+    get_i32(&this) -> TypeRef  { return this.i32_type; }
+    get_i64(&this) -> TypeRef  { return this.i64_type; }
+    get_i128(&this) -> TypeRef { return this.i128_type; }
+    get_u8(&this) -> TypeRef   { return this.u8_type; }
+    get_u16(&this) -> TypeRef  { return this.u16_type; }
+    get_u32(&this) -> TypeRef  { return this.u32_type; }
+    get_u64(&this) -> TypeRef  { return this.u64_type; }
+    get_u128(&this) -> TypeRef { return this.u128_type; }
+    get_f32(&this) -> TypeRef  { return this.f32_type; }
+    get_f64(&this) -> TypeRef  { return this.f64_type; }
+
+    /// Look up an integer type by IntegerKind.
+    get_int(mut &this, int_kind: IntegerKind) -> TypeRef {
+        return match (int_kind) {
+            IntegerKind::I8   => { this.i8_type }
+            IntegerKind::I16  => { this.i16_type }
+            IntegerKind::I32  => { this.i32_type }
+            IntegerKind::I64  => { this.i64_type }
+            IntegerKind::I128 => { this.i128_type }
+            IntegerKind::U8   => { this.u8_type }
+            IntegerKind::U16  => { this.u16_type }
+            IntegerKind::U32  => { this.u32_type }
+            IntegerKind::U64  => { this.u64_type }
+            IntegerKind::U128 => { this.u128_type }
+        };
+    }
+
+    /// Look up a float type by FloatKind.
+    get_float(mut &this, float_kind: FloatKind) -> TypeRef {
+        return match (float_kind) {
+            FloatKind::F32 => { this.f32_type }
+            FloatKind::F64 => { this.f64_type }
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Compound type factories (deduplicated)
+    // ----------------------------------------------------------------
+
+    /// Get or create a pointer type to the given pointee.
+    get_pointer_to(mut &this, pointee: TypeRef) -> TypeRef {
+        mut key: string = sprintf("ptr_%lu", pointee.id);
+
+        // Check cache
+        for (mut i: i64 = 0; i < this.pointer_cache.length; i = i + 1) {
+            if (this.pointer_cache[i] == key) {
+                return this.pointer_refs[i];
+            }
+        }
+
+        // Create new
+        mut ref: TypeRef = this.alloc_type(new PointerType(this.next_id, pointee));
+        this.pointer_cache = this.pointer_cache + [key];
+        this.pointer_refs  = this.pointer_refs + [ref];
+        return ref;
+    }
+
+    /// Get or create a reference type to the given referent.
+    get_reference_to(mut &this, referent: TypeRef, mutability: RefMutability) -> TypeRef {
+        mut mut_tag: string = "imm";
+        if (mutability.is_mutable()) {
+            mut_tag = "mut";
+        }
+        mut key: string = sprintf("ref_%s_%lu", mut_tag, referent.id);
+
+        for (mut i: i64 = 0; i < this.reference_cache.length; i = i + 1) {
+            if (this.reference_cache[i] == key) {
+                return this.reference_refs[i];
+            }
+        }
+
+        mut ref: TypeRef = this.alloc_type(new ReferenceType(this.next_id, referent, mutability));
+        this.reference_cache = this.reference_cache + [key];
+        this.reference_refs  = this.reference_refs + [ref];
+        return ref;
+    }
+
+    /// Get or create an array type with the given element type and size.
+    get_array_of(mut &this, element: TypeRef, size: i64) -> TypeRef {
+        mut key: string = sprintf("array_%lu_%ld", element.id, size);
+
+        for (mut i: i64 = 0; i < this.array_cache.length; i = i + 1) {
+            if (this.array_cache[i] == key) {
+                return this.array_refs[i];
+            }
+        }
+
+        mut ref: TypeRef = this.alloc_type(new ArrayType(this.next_id, element, size));
+        this.array_cache = this.array_cache + [key];
+        this.array_refs  = this.array_refs + [ref];
+        return ref;
+    }
+
+    /// Get or create an optional type wrapping the given type.
+    get_optional_of(mut &this, wrapped: TypeRef) -> TypeRef {
+        mut key: string = sprintf("opt_%lu", wrapped.id);
+
+        for (mut i: i64 = 0; i < this.optional_cache.length; i = i + 1) {
+            if (this.optional_cache[i] == key) {
+                return this.optional_refs[i];
+            }
+        }
+
+        mut ref: TypeRef = this.alloc_type(new OptionalType(this.next_id, wrapped));
+        this.optional_cache = this.optional_cache + [key];
+        this.optional_refs  = this.optional_refs + [ref];
+        return ref;
+    }
+
+    /// Get or create a function type.
+    get_function(mut &this, ret: TypeRef, params: TypeRef[], is_variadic: boolean) -> TypeRef {
+        mut key: string = sprintf("fn_ret_%lu", ret.id);
+        for (mut i: i64 = 0; i < params.length; i = i + 1) {
+            key = sprintf("%s_%lu", key, params[i].id);
+        }
+        if (is_variadic) {
+            key = key + "_var";
+        }
+
+        for (mut i: i64 = 0; i < this.function_cache.length; i = i + 1) {
+            if (this.function_cache[i] == key) {
+                return this.function_refs[i];
+            }
+        }
+
+        mut ref: TypeRef = this.alloc_type(new FunctionType(this.next_id, ret, params, is_variadic));
+        this.function_cache = this.function_cache + [key];
+        this.function_refs  = this.function_refs + [ref];
+        return ref;
+    }
+
+    /// Get or create a tuple type.
+    get_tuple(mut &this, elements: TypeRef[]) -> TypeRef {
+        mut key: string = "tuple";
+        for (mut i: i64 = 0; i < elements.length; i = i + 1) {
+            key = sprintf("%s_%lu", key, elements[i].id);
+        }
+
+        for (mut i: i64 = 0; i < this.tuple_cache.length; i = i + 1) {
+            if (this.tuple_cache[i] == key) {
+                return this.tuple_refs[i];
+            }
+        }
+
+        mut ref: TypeRef = this.alloc_type(new TupleType(this.next_id, elements));
+        this.tuple_cache = this.tuple_cache + [key];
+        this.tuple_refs  = this.tuple_refs + [ref];
+        return ref;
+    }
+
+
+    // ----------------------------------------------------------------
+    // User-defined type factories (deduplicated by qualified name)
+    // ----------------------------------------------------------------
+
+    /// Create or retrieve a struct type by qualified name.
+    create_struct(mut &this, qualified_name: string, module_name: string) -> TypeRef {
+        // Check cache
+        for (mut i: i64 = 0; i < this.struct_names.length; i = i + 1) {
+            if (this.struct_names[i] == qualified_name) {
+                return this.struct_refs[i];
+            }
+        }
+
+        mut ref: TypeRef = this.alloc_type(new StructType(this.next_id, qualified_name, module_name));
+        this.struct_names = this.struct_names + [qualified_name];
+        this.struct_refs  = this.struct_refs + [ref];
+        return ref;
+    }
+
+    /// Create or retrieve a class type by qualified name.
+    create_class(mut &this, qualified_name: string, module_name: string) -> TypeRef {
+        for (mut i: i64 = 0; i < this.class_names.length; i = i + 1) {
+            if (this.class_names[i] == qualified_name) {
+                return this.class_refs[i];
+            }
+        }
+
+        mut ref: TypeRef = this.alloc_type(new ClassType(this.next_id, qualified_name, module_name));
+        this.class_names = this.class_names + [qualified_name];
+        this.class_refs  = this.class_refs + [ref];
+        return ref;
+    }
+
+    /// Create or retrieve an enum type by qualified name.
+    create_enum(mut &this, qualified_name: string, module_name: string) -> TypeRef {
+        for (mut i: i64 = 0; i < this.enum_names.length; i = i + 1) {
+            if (this.enum_names[i] == qualified_name) {
+                return this.enum_refs[i];
+            }
+        }
+
+        mut ref: TypeRef = this.alloc_type(new EnumType(this.next_id, qualified_name, module_name));
+        this.enum_names = this.enum_names + [qualified_name];
+        this.enum_refs  = this.enum_refs + [ref];
+        return ref;
+    }
+
+    /// Create or retrieve a trait type by qualified name.
+    create_trait(mut &this, qualified_name: string, module_name: string) -> TypeRef {
+        for (mut i: i64 = 0; i < this.trait_names.length; i = i + 1) {
+            if (this.trait_names[i] == qualified_name) {
+                return this.trait_refs[i];
+            }
+        }
+
+        mut ref: TypeRef = this.alloc_type(new TraitType(this.next_id, qualified_name, module_name));
+        this.trait_names = this.trait_names + [qualified_name];
+        this.trait_refs  = this.trait_refs + [ref];
+        return ref;
+    }
+
+    /// Create or retrieve a type alias.
+    create_type_alias(mut &this, alias_name: string, target: TypeRef) -> TypeRef {
+        for (mut i: i64 = 0; i < this.alias_names.length; i = i + 1) {
+            if (this.alias_names[i] == alias_name) {
+                return this.alias_refs[i];
+            }
+        }
+
+        mut ref: TypeRef = this.alloc_type(new TypeAliasType(this.next_id, alias_name, target));
+        this.alias_names = this.alias_names + [alias_name];
+        this.alias_refs  = this.alias_refs + [ref];
+        return ref;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Generic type factories (not deduplicated — each instantiation is unique)
+    // ----------------------------------------------------------------
+
+    /// Create a generic parameter type.
+    create_generic_param(mut &this, name: string, index: u64) -> TypeRef {
+        return this.alloc_type(new GenericParamType(this.next_id, name, index));
+    }
+
+    /// Create a bounded generic parameter type.
+    create_bounded_param(mut &this, name: string, index: u64, bounds: TypeRef[]) -> TypeRef {
+        return this.alloc_type(new BoundedParamType(this.next_id, name, index, bounds));
+    }
+
+    /// Create a generic type instantiation.
+    create_instantiation(mut &this, base: TypeRef, args: TypeRef[]) -> TypeRef {
+        return this.alloc_type(new InstantiatedType(this.next_id, base, args));
+    }
+
+    /// Create an error type for type resolution failures.
+    create_error(mut &this, reason: string, span: SourceSpan) -> TypeRef {
+        return this.alloc_type(new ErrorType(this.next_id, reason, span));
+    }
+
+
+    // ----------------------------------------------------------------
+    // Lookup
+    // ----------------------------------------------------------------
+
+    /// Look up a Type by its ID.  Returns null if the ID is invalid.
+    lookup(&this, id: u64) -> Type* {
+        if (id == 0) {
+            return null;
+        }
+        // IDs start at 1, array starts at 0
+        mut index: u64 = id - 1;
+        if (index >= this.types.length) {
+            return null;
+        }
+        return this.types[index];
+    }
+
+    /// Search all user-defined type caches by name.
+    lookup_by_name(&this, name: string) -> TypeRef {
+        for (mut i: i64 = 0; i < this.struct_names.length; i = i + 1) {
+            if (this.struct_names[i] == name) {
+                return this.struct_refs[i];
+            }
+        }
+        for (mut i: i64 = 0; i < this.class_names.length; i = i + 1) {
+            if (this.class_names[i] == name) {
+                return this.class_refs[i];
+            }
+        }
+        for (mut i: i64 = 0; i < this.enum_names.length; i = i + 1) {
+            if (this.enum_names[i] == name) {
+                return this.enum_refs[i];
+            }
+        }
+        for (mut i: i64 = 0; i < this.trait_names.length; i = i + 1) {
+            if (this.trait_names[i] == name) {
+                return this.trait_refs[i];
+            }
+        }
+        for (mut i: i64 = 0; i < this.alias_names.length; i = i + 1) {
+            if (this.alias_names[i] == name) {
+                return this.alias_refs[i];
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Total number of types allocated.
+    type_count(&this) -> i64 {
+        return this.types.length;
+    }
+}

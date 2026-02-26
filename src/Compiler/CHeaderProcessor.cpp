@@ -54,7 +54,13 @@ namespace Cryo
         CParser parser;
         auto c_decls = parser.parse(preprocessed);
 
-        LOG_DEBUG(LogComponent::GENERAL, "CHeaderProcessor: CParser found {} function declarations", c_decls.size());
+        // Capture type information for resolving typedefs and enum types
+        _typedefs = parser.typedefs();
+        _enum_names = parser.enum_names();
+        _struct_names = parser.struct_names();
+
+        LOG_DEBUG(LogComponent::GENERAL, "CHeaderProcessor: CParser found {} function declarations, {} typedefs, {} enum names, {} struct names",
+                  c_decls.size(), _typedefs.size(), _enum_names.size(), _struct_names.size());
 
         // 4. Create AST nodes
         std::vector<std::unique_ptr<FunctionDeclarationNode>> result;
@@ -126,6 +132,21 @@ namespace Cryo
     // C-to-Cryo Type Mapping
     // ========================================================================
 
+    std::string CHeaderProcessor::resolve_typedef(const std::string &type_name) const
+    {
+        std::string resolved = type_name;
+        int depth = 0;
+        while (depth < 10) // prevent infinite loops
+        {
+            auto it = _typedefs.find(resolved);
+            if (it == _typedefs.end())
+                break;
+            resolved = it->second;
+            depth++;
+        }
+        return resolved;
+    }
+
     TypeRef CHeaderProcessor::map_c_type(const std::string &c_type, TypeArena &arena)
     {
         // Normalize: strip leading/trailing whitespace
@@ -134,6 +155,21 @@ namespace Cryo
             type.erase(type.begin());
         while (!type.empty() && type.back() == ' ')
             type.pop_back();
+
+        // Resolve typedefs first (e.g., "FooRef" -> "struct Foo *")
+        std::string resolved = resolve_typedef(type);
+        if (resolved != type)
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "CHeaderProcessor: Resolved typedef '{}' -> '{}'", type, resolved);
+            return map_c_type(resolved, arena);
+        }
+
+        // Check if this is a known enum type name → map to i32
+        if (_enum_names.count(type))
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "CHeaderProcessor: Mapped enum type '{}' to i32", type);
+            return arena.get_i32();
+        }
 
         // Check for pointer types (ends with *)
         if (!type.empty() && type.back() == '*')
@@ -212,6 +248,20 @@ namespace Cryo
             return arena.get_u32();
         if (stripped == "uint64_t")
             return arena.get_u64();
+
+        // Check if this is an enum type by prefix (e.g., "enum Foo")
+        if (stripped.substr(0, 5) == "enum ")
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "CHeaderProcessor: Mapped enum type '{}' to i32", c_type);
+            return arena.get_i32();
+        }
+
+        // Check if this is a known struct name (without "struct " prefix)
+        if (_struct_names.count(stripped))
+        {
+            LOG_DEBUG(LogComponent::GENERAL, "CHeaderProcessor: Mapped struct type '{}' to opaque void*", c_type);
+            return arena.get_pointer_to(arena.get_void());
+        }
 
         // Unknown types — treat as opaque pointer (void *)
         LOG_DEBUG(LogComponent::GENERAL, "CHeaderProcessor: Unknown C type '{}', mapping to void*", c_type);

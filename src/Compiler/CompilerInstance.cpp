@@ -784,8 +784,9 @@ namespace Cryo
             // Compile discovered C source files (from CImport blocks) and add to linker
             for (const auto &c_file : _c_source_files)
             {
-                std::string obj_path = std::filesystem::temp_directory_path().string() +
-                                       "/cryo_cimport_" + std::filesystem::path(c_file).stem().string() + ".o";
+                // Place the .o next to the .c file to avoid collisions between parallel builds
+                std::filesystem::path c_path(c_file);
+                std::string obj_path = (c_path.parent_path() / (c_path.stem().string() + ".o")).string();
                 std::string cmd = "clang-20 -c \"" + c_file + "\" -o \"" + obj_path + "\" 2>&1";
                 int ret = system(cmd.c_str());
                 if (ret == 0 && std::filesystem::exists(obj_path))
@@ -1255,7 +1256,7 @@ namespace Cryo
             }
 
             // Create function type
-            TypeRef function_type = _ast_context->types().get_function(return_type, param_types);
+            TypeRef function_type = _ast_context->types().get_function(return_type, param_types, func_decl->is_variadic());
 
             // Build enhanced signature including generic parameters
             std::string enhanced_signature = build_function_signature(func_decl);
@@ -2045,7 +2046,7 @@ namespace Cryo
                         return_type = _ast_context->types().get_void();
                     }
 
-                    TypeRef function_type = _ast_context->types().get_function(return_type, param_types);
+                    TypeRef function_type = _ast_context->types().get_function(return_type, param_types, fn_decl->is_variadic());
                     _symbol_table->declare_function(qualified_name, function_type, fn_decl->location());
 
                     LOG_TRACE(Cryo::LogComponent::GENERAL,
