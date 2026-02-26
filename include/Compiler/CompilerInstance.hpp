@@ -95,6 +95,8 @@ namespace Cryo
         std::string _current_namespace;                 // Current namespace context
         std::vector<std::string> _imported_namespaces;  // Track imported namespaces for enhanced resolution
         std::vector<std::string> _local_import_modules; // Modules from local project files that need IR generation
+        std::vector<std::string> _c_source_files;       // C source files discovered by CHeaderImportPass for linking
+        std::vector<std::string> _extra_object_files;    // Extra object files from --link-object CLI flag
 
         // Results
         std::unique_ptr<ProgramNode> _ast_root;
@@ -240,6 +242,17 @@ namespace Cryo
         }
         bool dump_symbols_enabled() const { return _dump_symbols; }
         const std::string &dump_symbols_output_dir() const { return _dump_symbols_output_dir; }
+
+        // Source file access
+        const std::string &source_file() const { return _source_file; }
+
+        // C source files for auto-linking (discovered by CHeaderImportPass)
+        void add_c_source_file(const std::string &path) { _c_source_files.push_back(path); }
+        const std::vector<std::string> &c_source_files() const { return _c_source_files; }
+
+        // Extra object files from CLI
+        void add_extra_object_file(const std::string &path) { _extra_object_files.push_back(path); }
+        const std::vector<std::string> &extra_object_files() const { return _extra_object_files; }
 
         // Namespace context
         void set_namespace_context(const std::string &namespace_name);

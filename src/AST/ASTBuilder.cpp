@@ -433,9 +433,9 @@ namespace Cryo
         return node;
     }
 
-    std::unique_ptr<ExternBlockNode> ASTBuilder::create_extern_block(SourceLocation loc, std::string linkage_type)
+    std::unique_ptr<ExternBlockNode> ASTBuilder::create_extern_block(SourceLocation loc, std::string linkage_type, std::string namespace_alias)
     {
-        auto node = std::make_unique<ExternBlockNode>(loc, std::move(linkage_type));
+        auto node = std::make_unique<ExternBlockNode>(loc, std::move(linkage_type), std::move(namespace_alias));
         node->set_source_file(_source_file);
         return node;
     }

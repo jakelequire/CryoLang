@@ -326,10 +326,11 @@ namespace Cryo
             _current_token = token;
             _token_count++;
 
-            // IMPORTANT: When returning a peeked token, we need to advance
-            // the buffer position to match the token that was peeked
-            // We do this by re-lexing to the same position
-            lex_token(); // This will properly advance _current to the right position
+            // Restore buffer position to where the peeked lex_token() left off.
+            // This avoids re-lexing (which would duplicate string pool entries
+            // and corrupt string_view data for string literal tokens).
+            _current = _peek_saved_current;
+            _current_location = _peek_saved_location;
 
             return _current_token;
         }
@@ -347,14 +348,19 @@ namespace Cryo
             return *_peeked_token;
         }
 
-        // Save current state
+        // Save current state (pre-lex position)
         const char *saved_current = _current;
         SourceLocation saved_location = _current_location;
 
         // Lex the next token
         _peeked_token = lex_token();
 
-        // Restore state
+        // Save the post-lex position so next_token() can restore it
+        // without needing to re-lex (which would corrupt string pool entries)
+        _peek_saved_current = _current;
+        _peek_saved_location = _current_location;
+
+        // Restore state to pre-lex position (peek doesn't consume)
         _current = saved_current;
         _current_location = saved_location;
 
@@ -378,6 +384,7 @@ namespace Cryo
         _previous_token = Token(TokenKind::TK_ERROR);
         _token_count = 0;
         _peeked_token.reset();
+        _peek_saved_current = nullptr;
     }
 
     // ================================================================

@@ -102,7 +102,8 @@ namespace Cryo::CLI
                     }
                     // Handle special compilation flags that expect values
                     else if ((flag_name == "o" || flag_name == "output" ||
-                              flag_name == "log-file" || flag_name == "log-component") &&
+                              flag_name == "log-file" || flag_name == "log-component" ||
+                              flag_name == "link-object") &&
                              i + 1 < argc && !is_flag(argv[i + 1]))
                     {
                         args.set_arg(flag_name, argv[++i]);
@@ -475,6 +476,15 @@ namespace Cryo::CLI
         {
             compiler->set_raw_mode(true);
             std::cout << "[INFO] Raw mode enabled - no stdlib linking or main transform" << std::endl;
+        }
+
+        // Pass extra object files from --link-object flag
+        {
+            std::string link_obj = args.get_arg("link-object", "");
+            if (!link_obj.empty())
+            {
+                compiler->add_extra_object_file(link_obj);
+            }
         }
 
         bool compilation_success = compiler->compile_file(file_path);

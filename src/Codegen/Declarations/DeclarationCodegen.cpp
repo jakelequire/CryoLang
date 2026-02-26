@@ -3890,12 +3890,43 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating extern block with linkage: {}",
                   node->linkage_type());
 
+        std::string ns_alias = node->namespace_alias();
+        bool is_cimport = node->is_c_import();
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                  "DeclarationCodegen: extern block is_c_import={}, ns_alias='{}', function_count={}",
+                  is_cimport, ns_alias, node->function_declarations().size());
+
         // Generate each function declaration in the extern block
         for (const auto &fn_decl : node->function_declarations())
         {
             if (fn_decl)
             {
-                generate_extern_function(fn_decl.get());
+                llvm::Function *fn = generate_extern_function(fn_decl.get());
+
+                // For CImport blocks with a namespace alias, also register the
+                // function under the qualified name (e.g., "ex::greet" -> llvm "greet")
+                if (fn && node->is_c_import() && !ns_alias.empty())
+                {
+                    std::string qualified_name = ns_alias + "::" + fn_decl->name();
+
+                    // Pre-registration (Stage 7.2) may have created an LLVM function
+                    // with the qualified name (e.g., @"ex::greet") from the symbol table.
+                    // Replace it with the bare-named C function so the linker resolves correctly.
+                    if (llvm::Function *stale = module()->getFunction(qualified_name))
+                    {
+                        stale->replaceAllUsesWith(fn);
+                        stale->eraseFromParent();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Replaced pre-registered '{}' with bare C function '{}'",
+                                  qualified_name, fn_decl->name());
+                    }
+
+                    ctx().register_function(qualified_name, fn);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Registered CImport function alias: {} -> {}",
+                              qualified_name, fn_decl->name());
+                }
             }
         }
     }

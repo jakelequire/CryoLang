@@ -1847,19 +1847,30 @@ namespace Cryo
         void accept(ASTVisitor &visitor) override;
     };
 
-    // External linkage block (extern "C" { ... })
+    // External linkage block (extern "C" { ... } or extern "CImport" name { ... })
     class ExternBlockNode : public DeclarationNode
     {
     private:
-        std::string _linkage_type; // "C" or other linkage types
+        std::string _linkage_type;    // "C" or "CImport"
+        std::string _namespace_alias; // Optional namespace alias (e.g., "ex" in extern "CImport" ex { ... })
+        std::vector<std::string> _include_paths; // Include paths for CImport blocks
+        bool _is_c_import;            // true when linkage_type is "CImport"
         std::vector<std::unique_ptr<FunctionDeclarationNode>> _function_declarations;
 
     public:
-        ExternBlockNode(SourceLocation loc, std::string linkage_type)
-            : DeclarationNode(NodeKind::ExternBlock, loc), _linkage_type(std::move(linkage_type)) {}
+        ExternBlockNode(SourceLocation loc, std::string linkage_type, std::string namespace_alias = "")
+            : DeclarationNode(NodeKind::ExternBlock, loc),
+              _linkage_type(std::move(linkage_type)),
+              _namespace_alias(std::move(namespace_alias)),
+              _is_c_import(_linkage_type == "CImport") {}
 
         const std::string &linkage_type() const { return _linkage_type; }
+        const std::string &namespace_alias() const { return _namespace_alias; }
+        const std::vector<std::string> &include_paths() const { return _include_paths; }
+        bool is_c_import() const { return _is_c_import; }
         const std::vector<std::unique_ptr<FunctionDeclarationNode>> &function_declarations() const { return _function_declarations; }
+
+        void add_include_path(const std::string &path) { _include_paths.push_back(path); }
 
         void add_function_declaration(std::unique_ptr<FunctionDeclarationNode> func_decl)
         {
@@ -1868,7 +1879,19 @@ namespace Cryo
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "ExternBlock linkage=\"" << _linkage_type << "\"" << std::endl;
+            os << std::string(indent, ' ') << "ExternBlock linkage=\"" << _linkage_type << "\"";
+            if (!_namespace_alias.empty())
+                os << " alias=\"" << _namespace_alias << "\"";
+            os << std::endl;
+
+            if (!_include_paths.empty())
+            {
+                os << std::string(indent + 2, ' ') << "Include Paths:" << std::endl;
+                for (const auto &path : _include_paths)
+                {
+                    os << std::string(indent + 4, ' ') << path << std::endl;
+                }
+            }
 
             if (!_function_declarations.empty())
             {
