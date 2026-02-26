@@ -7,6 +7,7 @@
 #include <fstream>
 #include <unordered_map>
 #include <optional>
+#include <deque>
 #include <vector>
 #include <cstdint>
 
@@ -182,13 +183,18 @@ namespace Cryo
 
         // Peek token state
         std::optional<Token> _peeked_token;
+        // Saved buffer position after peeking (so next_token doesn't re-lex)
+        const char *_peek_saved_current = nullptr;
+        SourceLocation _peek_saved_location;
 
         // Diagnostic reporting
         DiagEmitter *_diagnostics;
         std::string _source_file;
 
         // String pool for processed string literals
-        std::vector<std::string> _string_pool;
+        // Uses deque instead of vector so that push_back never invalidates
+        // existing elements — string_views into pool entries remain valid.
+        std::deque<std::string> _string_pool;
 
         // Static keyword lookup table
         static const std::unordered_map<std::string_view, TokenKind> _keywords;

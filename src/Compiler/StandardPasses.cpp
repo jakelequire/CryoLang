@@ -1,6 +1,7 @@
 #include "Compiler/StandardPasses.hpp"
 #include "Compiler/CompilerInstance.hpp"
 #include "Compiler/ModuleLoader.hpp"
+#include "Compiler/CHeaderProcessor.hpp"
 #include "AST/ASTContext.hpp"
 #include "AST/ASTNode.hpp"
 #include "AST/TemplateRegistry.hpp"
@@ -21,6 +22,7 @@
 #include "Utils/Logger.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <sstream>
 
 namespace Cryo
@@ -101,6 +103,84 @@ namespace Cryo
                   program->statements().size());
 
         return PassResult::ok({PassProvides::AST_VALIDATED});
+    }
+
+    // Pass 1.4: C Header Import
+    CHeaderImportPass::CHeaderImportPass(CompilerInstance &compiler)
+        : _compiler(compiler)
+    {
+    }
+
+    PassResult CHeaderImportPass::run(PassContext &ctx)
+    {
+        auto *program = _compiler.ast_root();
+        if (!program)
+        {
+            return PassResult::ok({PassProvides::C_HEADERS_IMPORTED});
+        }
+
+        // Determine source directory for resolving relative include paths
+        std::string source_dir;
+        {
+            std::filesystem::path source_path(_compiler.source_file());
+            source_dir = source_path.parent_path().string();
+            if (source_dir.empty())
+                source_dir = ".";
+        }
+
+        CHeaderProcessor processor;
+
+        // Walk top-level statements looking for CImport extern blocks
+        for (const auto &stmt : program->statements())
+        {
+            auto *extern_block = dynamic_cast<ExternBlockNode *>(stmt.get());
+            if (!extern_block || !extern_block->is_c_import())
+                continue;
+
+            LOG_DEBUG(LogComponent::GENERAL, "CHeaderImportPass: Processing CImport block with {} include paths",
+                      extern_block->include_paths().size());
+
+            for (const auto &include_path : extern_block->include_paths())
+            {
+                LOG_DEBUG(LogComponent::GENERAL, "CHeaderImportPass: Processing #include \"{}\"", include_path);
+
+                auto func_nodes = processor.process_header(
+                    include_path,
+                    source_dir,
+                    _compiler.ast_context()->types());
+
+                LOG_DEBUG(LogComponent::GENERAL, "CHeaderImportPass: Got {} function declarations from {}",
+                          func_nodes.size(), include_path);
+
+                for (auto &func : func_nodes)
+                {
+                    extern_block->add_function_declaration(std::move(func));
+                }
+
+                // Check for matching .c file for auto-linking
+                std::filesystem::path resolved;
+                if (std::filesystem::path(include_path).is_absolute())
+                {
+                    resolved = include_path;
+                }
+                else
+                {
+                    resolved = std::filesystem::path(source_dir) / include_path;
+                }
+                if (std::filesystem::exists(resolved))
+                {
+                    resolved = std::filesystem::canonical(resolved);
+                    std::string c_file = CHeaderProcessor::find_matching_c_file(resolved.string());
+                    if (!c_file.empty())
+                    {
+                        LOG_DEBUG(LogComponent::GENERAL, "CHeaderImportPass: Found matching C file: {}", c_file);
+                        _compiler.add_c_source_file(c_file);
+                    }
+                }
+            }
+        }
+
+        return PassResult::ok({PassProvides::C_HEADERS_IMPORTED});
     }
 
     // ============================================================================
@@ -3970,6 +4050,7 @@ namespace Cryo
         manager->register_pass(std::make_unique<LexingPass>(compiler));
         manager->register_pass(std::make_unique<ParsingPass>(compiler));
         manager->register_pass(std::make_unique<ASTValidationPass>(compiler));
+        manager->register_pass(std::make_unique<CHeaderImportPass>(compiler));
 
         // Stage 2: Module Resolution
         manager->register_pass(std::make_unique<AutoImportPass>(compiler));
@@ -4010,6 +4091,7 @@ namespace Cryo
         manager->register_pass(std::make_unique<LexingPass>(compiler));
         manager->register_pass(std::make_unique<ParsingPass>(compiler));
         manager->register_pass(std::make_unique<ASTValidationPass>(compiler));
+        manager->register_pass(std::make_unique<CHeaderImportPass>(compiler));
 
         // Stage 2: Module Resolution
         manager->register_pass(std::make_unique<AutoImportPass>(compiler));
