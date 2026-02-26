@@ -1,0 +1,523 @@
+///! TypeChecker
+///!
+///! Determines type compatibility, validates operations, and provides
+///! numeric promotion rules.  Mirrors the C++ compiler's TypeChecker.
+
+namespace Compiler::Types::Checker;
+
+
+// ============================================================================
+// TypeCompatibility — Result of comparing two types
+// ============================================================================
+
+type enum TypeCompatibility {
+    /// Types are exactly the same.
+    Identical;
+    /// Types are structurally compatible (e.g., same layout).
+    Compatible;
+    /// Source can be implicitly converted to target (widening).
+    ImplicitConvert;
+    /// Source requires explicit cast to target (narrowing or lossy).
+    ExplicitCast;
+    /// Types are incompatible.
+    Incompatible;
+}
+
+implement enum TypeCompatibility {
+    to_string(&this) -> string {
+        return match (&this) {
+            TypeCompatibility::Identical       => { "Identical" }
+            TypeCompatibility::Compatible      => { "Compatible" }
+            TypeCompatibility::ImplicitConvert => { "ImplicitConvert" }
+            TypeCompatibility::ExplicitCast    => { "ExplicitCast" }
+            TypeCompatibility::Incompatible    => { "Incompatible" }
+        };
+    }
+
+    is_assignable(&this) -> boolean {
+        return match (&this) {
+            TypeCompatibility::Identical       => { true }
+            TypeCompatibility::Compatible      => { true }
+            TypeCompatibility::ImplicitConvert => { true }
+            _                                  => { false }
+        };
+    }
+}
+
+
+// ============================================================================
+// TypeCheckResult — Result of a type-checking operation
+// ============================================================================
+
+type struct TypeCheckResult {
+    result_type:   TypeRef;
+    success:       boolean;
+    error_message: string;
+
+    static ok(result_type: TypeRef) -> TypeCheckResult {
+        return TypeCheckResult {
+            result_type:   result_type,
+            success:       true,
+            error_message: "",
+        };
+    }
+
+    static fail(message: string) -> TypeCheckResult {
+        return TypeCheckResult {
+            result_type:   TypeRef::invalid(),
+            success:       false,
+            error_message: message,
+        };
+    }
+}
+
+
+// ============================================================================
+// ConversionInfo — Details about a type conversion
+// ============================================================================
+
+type struct ConversionInfo {
+    from_type:     TypeRef;
+    to_type:       TypeRef;
+    compatibility: TypeCompatibility;
+    is_narrowing:  boolean;
+
+    static new(from: TypeRef, to: TypeRef, compat: TypeCompatibility, narrowing: boolean) -> ConversionInfo {
+        return ConversionInfo {
+            from_type:     from,
+            to_type:       to,
+            compatibility: compat,
+            is_narrowing:  narrowing,
+        };
+    }
+}
+
+
+// ============================================================================
+// TypeChecker
+// ============================================================================
+
+type struct TypeChecker {
+    arena: TypeArena*;
+
+    static new(arena: TypeArena*) -> TypeChecker {
+        return TypeChecker {
+            arena: arena,
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Core compatibility checking
+    // ----------------------------------------------------------------
+
+    /// Check compatibility between two types.
+    check_compatibility(&this, from: TypeRef, to: TypeRef) -> TypeCompatibility {
+        // Same type ID → identical
+        if (from.equals(to)) {
+            return TypeCompatibility::Identical;
+        }
+
+        // Invalid types are incompatible
+        if (from.is_invalid() || to.is_invalid()) {
+            return TypeCompatibility::Incompatible;
+        }
+
+        mut from_type: Type* = this.arena.lookup(from.id);
+        mut to_type: Type*   = this.arena.lookup(to.id);
+
+        if (from_type == null || to_type == null) {
+            return TypeCompatibility::Incompatible;
+        }
+
+        // Error types are compatible with everything (prevents cascading errors)
+        if (from_type.is_error() || to_type.is_error()) {
+            return TypeCompatibility::Compatible;
+        }
+
+        // Never type is compatible with any type (it diverges)
+        if (from_type.kind == TypeKind::Never) {
+            return TypeCompatibility::Compatible;
+        }
+
+        // Numeric conversions
+        if (from_type.kind == TypeKind::Int && to_type.kind == TypeKind::Int) {
+            return this.check_int_compatibility(from_type, to_type);
+        }
+
+        if (from_type.kind == TypeKind::Float && to_type.kind == TypeKind::Float) {
+            return this.check_float_compatibility(from_type, to_type);
+        }
+
+        if (from_type.kind == TypeKind::Int && to_type.kind == TypeKind::Float) {
+            return TypeCompatibility::ImplicitConvert;
+        }
+
+        if (from_type.kind == TypeKind::Float && to_type.kind == TypeKind::Int) {
+            return TypeCompatibility::ExplicitCast;
+        }
+
+        // Pointer/reference conversions
+        if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::Pointer) {
+            return TypeCompatibility::ExplicitCast;
+        }
+
+        // Optional wrapping: T → T?
+        if (to_type.kind == TypeKind::Optional) {
+            mut opt: OptionalType* = to_type as OptionalType*;
+            mut inner_compat: TypeCompatibility = this.check_compatibility(from, opt.wrapped);
+            if (inner_compat.is_assignable()) {
+                return TypeCompatibility::ImplicitConvert;
+            }
+        }
+
+        // TypeAlias: resolve and check
+        if (from_type.kind == TypeKind::TypeAlias) {
+            mut alias: TypeAliasType* = from_type as TypeAliasType*;
+            if (alias.has_target()) {
+                return this.check_compatibility(alias.target, to);
+            }
+        }
+        if (to_type.kind == TypeKind::TypeAlias) {
+            mut alias: TypeAliasType* = to_type as TypeAliasType*;
+            if (alias.has_target()) {
+                return this.check_compatibility(from, alias.target);
+            }
+        }
+
+        return TypeCompatibility::Incompatible;
+    }
+
+    /// Whether from can be assigned to to (Identical, Compatible, or ImplicitConvert).
+    can_assign(&this, from: TypeRef, to: TypeRef) -> boolean {
+        return this.check_compatibility(from, to).is_assignable();
+    }
+
+    /// Whether from can be implicitly converted to to.
+    can_implicit_convert(&this, from: TypeRef, to: TypeRef) -> boolean {
+        mut compat: TypeCompatibility = this.check_compatibility(from, to);
+        return match (compat) {
+            TypeCompatibility::Identical       => { true }
+            TypeCompatibility::Compatible      => { true }
+            TypeCompatibility::ImplicitConvert => { true }
+            _                                  => { false }
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Numeric compatibility helpers
+    // ----------------------------------------------------------------
+
+    check_int_compatibility(&this, from: Type*, to: Type*) -> TypeCompatibility {
+        mut from_int: IntType* = from as IntType*;
+        mut to_int: IntType*   = to as IntType*;
+
+        mut from_width: u64 = from_int.bit_width();
+        mut to_width: u64   = to_int.bit_width();
+
+        mut from_signed: boolean = from_int.is_signed();
+        mut to_signed: boolean   = to_int.is_signed();
+
+        // Same signedness
+        if (from_signed == to_signed) {
+            if (from_width < to_width) {
+                return TypeCompatibility::ImplicitConvert;   // Widening
+            }
+            if (from_width > to_width) {
+                return TypeCompatibility::ExplicitCast;      // Narrowing
+            }
+            return TypeCompatibility::Identical;
+        }
+
+        // Different signedness, same width → explicit cast
+        if (from_width == to_width) {
+            return TypeCompatibility::ExplicitCast;
+        }
+
+        // Unsigned to signed with wider width → implicit
+        if (!from_signed && to_signed && from_width < to_width) {
+            return TypeCompatibility::ImplicitConvert;
+        }
+
+        // Otherwise → explicit cast
+        return TypeCompatibility::ExplicitCast;
+    }
+
+    check_float_compatibility(&this, from: Type*, to: Type*) -> TypeCompatibility {
+        mut from_float: FloatType* = from as FloatType*;
+        mut to_float: FloatType*   = to as FloatType*;
+
+        if (from_float.bit_width() < to_float.bit_width()) {
+            return TypeCompatibility::ImplicitConvert;   // f32 → f64
+        }
+        if (from_float.bit_width() > to_float.bit_width()) {
+            return TypeCompatibility::ExplicitCast;      // f64 → f32
+        }
+        return TypeCompatibility::Identical;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Operation type checking
+    // ----------------------------------------------------------------
+
+    /// Check a binary operation and return the result type.
+    check_binary_op(&this, op: string, lhs: TypeRef, rhs: TypeRef) -> TypeCheckResult {
+        if (lhs.is_invalid() || rhs.is_invalid()) {
+            return TypeCheckResult::fail("Cannot apply operator to invalid types");
+        }
+
+        mut lhs_type: Type* = this.arena.lookup(lhs.id);
+        mut rhs_type: Type* = this.arena.lookup(rhs.id);
+
+        if (lhs_type == null || rhs_type == null) {
+            return TypeCheckResult::fail("Type lookup failed");
+        }
+
+        // Arithmetic: + - * / %
+        if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") {
+            if (lhs_type.is_numeric() && rhs_type.is_numeric()) {
+                return TypeCheckResult::ok(this.get_common_numeric_type(lhs, rhs));
+            }
+            // String concatenation
+            if (op == "+" && lhs_type.kind == TypeKind::String && rhs_type.kind == TypeKind::String) {
+                return TypeCheckResult::ok(this.arena.get_string());
+            }
+            return TypeCheckResult::fail(sprintf("Cannot apply '%s' to %s and %s",
+                op, lhs_type.kind.to_string(), rhs_type.kind.to_string()));
+        }
+
+        // Comparison: == != < > <= >=
+        if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=") {
+            if (lhs_type.is_numeric() && rhs_type.is_numeric()) {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            if (lhs_type.kind == TypeKind::Bool && rhs_type.kind == TypeKind::Bool) {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            if (lhs_type.kind == TypeKind::String && rhs_type.kind == TypeKind::String) {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            if (lhs_type.kind == TypeKind::Char && rhs_type.kind == TypeKind::Char) {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            return TypeCheckResult::fail(sprintf("Cannot compare %s and %s",
+                lhs_type.kind.to_string(), rhs_type.kind.to_string()));
+        }
+
+        // Logical: && ||
+        if (op == "&&" || op == "||") {
+            if (lhs_type.kind == TypeKind::Bool && rhs_type.kind == TypeKind::Bool) {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            return TypeCheckResult::fail(sprintf("Logical '%s' requires boolean operands", op));
+        }
+
+        // Bitwise: & | ^ << >>
+        if (op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+            if (lhs_type.kind == TypeKind::Int && rhs_type.kind == TypeKind::Int) {
+                return TypeCheckResult::ok(this.get_common_numeric_type(lhs, rhs));
+            }
+            return TypeCheckResult::fail(sprintf("Bitwise '%s' requires integer operands", op));
+        }
+
+        return TypeCheckResult::fail(sprintf("Unknown binary operator '%s'", op));
+    }
+
+    /// Check a unary operation and return the result type.
+    check_unary_op(&this, op: string, operand: TypeRef) -> TypeCheckResult {
+        if (operand.is_invalid()) {
+            return TypeCheckResult::fail("Cannot apply unary operator to invalid type");
+        }
+
+        mut op_type: Type* = this.arena.lookup(operand.id);
+        if (op_type == null) {
+            return TypeCheckResult::fail("Type lookup failed");
+        }
+
+        // Negation: -
+        if (op == "-") {
+            if (op_type.is_numeric()) {
+                return TypeCheckResult::ok(operand);
+            }
+            return TypeCheckResult::fail("Negation requires numeric operand");
+        }
+
+        // Logical not: !
+        if (op == "!") {
+            if (op_type.kind == TypeKind::Bool) {
+                return TypeCheckResult::ok(operand);
+            }
+            return TypeCheckResult::fail("Logical NOT requires boolean operand");
+        }
+
+        // Bitwise not: ~
+        if (op == "~") {
+            if (op_type.kind == TypeKind::Int) {
+                return TypeCheckResult::ok(operand);
+            }
+            return TypeCheckResult::fail("Bitwise NOT requires integer operand");
+        }
+
+        // Dereference: *
+        if (op == "*") {
+            if (op_type.kind == TypeKind::Pointer) {
+                mut ptr: PointerType* = op_type as PointerType*;
+                return TypeCheckResult::ok(ptr.pointee);
+            }
+            return TypeCheckResult::fail("Dereference requires pointer operand");
+        }
+
+        // Address-of: &
+        if (op == "&") {
+            return TypeCheckResult::ok(this.arena.get_pointer_to(operand));
+        }
+
+        return TypeCheckResult::fail(sprintf("Unknown unary operator '%s'", op));
+    }
+
+    /// Check a function call with the given argument types.
+    check_function_call(&this, func: TypeRef, args: TypeRef[]) -> TypeCheckResult {
+        mut func_type: Type* = this.arena.lookup(func.id);
+        if (func_type == null || func_type.kind != TypeKind::Function) {
+            return TypeCheckResult::fail("Called expression is not a function type");
+        }
+
+        mut fn_type: FunctionType* = func_type as FunctionType*;
+
+        // Check arity
+        if (!fn_type.is_variadic && args.length != fn_type.param_types.length) {
+            return TypeCheckResult::fail(sprintf("Expected %ld arguments, got %ld",
+                fn_type.param_types.length, args.length));
+        }
+
+        if (fn_type.is_variadic && args.length < fn_type.param_types.length) {
+            return TypeCheckResult::fail(sprintf("Expected at least %ld arguments, got %ld",
+                fn_type.param_types.length, args.length));
+        }
+
+        // Check each argument type
+        for (mut i: i64 = 0; i < fn_type.param_types.length; i = i + 1) {
+            if (!this.can_assign(args[i], fn_type.param_types[i])) {
+                return TypeCheckResult::fail(sprintf("Argument %ld type mismatch", i + 1));
+            }
+        }
+
+        return TypeCheckResult::ok(fn_type.return_type);
+    }
+
+    /// Check field access on a type.
+    check_field_access(&this, base: TypeRef, field_name: string) -> TypeCheckResult {
+        mut base_type: Type* = this.arena.lookup(base.id);
+        if (base_type == null) {
+            return TypeCheckResult::fail("Type lookup failed for field access");
+        }
+
+        if (base_type.kind == TypeKind::Struct) {
+            mut st: StructType* = base_type as StructType*;
+            mut field: FieldInfo* = st.get_field(field_name);
+            if (field != null) {
+                return TypeCheckResult::ok(field.field_type);
+            }
+            return TypeCheckResult::fail(sprintf("Struct '%s' has no field '%s'",
+                st.qualified_name, field_name));
+        }
+
+        if (base_type.kind == TypeKind::Class) {
+            mut ct: ClassType* = base_type as ClassType*;
+            mut field: FieldInfo* = ct.get_field(field_name);
+            if (field != null) {
+                return TypeCheckResult::ok(field.field_type);
+            }
+            return TypeCheckResult::fail(sprintf("Class '%s' has no field '%s'",
+                ct.qualified_name, field_name));
+        }
+
+        // Tuple index access (0, 1, 2, ...)
+        if (base_type.kind == TypeKind::Tuple) {
+            return TypeCheckResult::fail("Tuple field access requires numeric index");
+        }
+
+        return TypeCheckResult::fail(sprintf("Cannot access field '%s' on type %s",
+            field_name, base_type.kind.to_string()));
+    }
+
+    /// Check index access (array[index]).
+    check_index_access(&this, base: TypeRef, index: TypeRef) -> TypeCheckResult {
+        mut base_type: Type* = this.arena.lookup(base.id);
+        if (base_type == null) {
+            return TypeCheckResult::fail("Type lookup failed for index access");
+        }
+
+        if (base_type.kind == TypeKind::Array) {
+            mut arr: ArrayType* = base_type as ArrayType*;
+            // Index must be integer
+            mut idx_type: Type* = this.arena.lookup(index.id);
+            if (idx_type != null && idx_type.kind == TypeKind::Int) {
+                return TypeCheckResult::ok(arr.element);
+            }
+            return TypeCheckResult::fail("Array index must be an integer");
+        }
+
+        return TypeCheckResult::fail(sprintf("Cannot index into type %s",
+            base_type.kind.to_string()));
+    }
+
+
+    // ----------------------------------------------------------------
+    // Numeric promotion
+    // ----------------------------------------------------------------
+
+    /// Get the common type for a numeric binary operation.
+    /// Promotes to the wider/higher-precision type.
+    get_common_numeric_type(&this, a: TypeRef, b: TypeRef) -> TypeRef {
+        if (a.equals(b)) {
+            return a;
+        }
+
+        mut a_type: Type* = this.arena.lookup(a.id);
+        mut b_type: Type* = this.arena.lookup(b.id);
+
+        if (a_type == null || b_type == null) {
+            return TypeRef::invalid();
+        }
+
+        // Float beats int
+        if (a_type.kind == TypeKind::Float && b_type.kind == TypeKind::Int) {
+            return a;
+        }
+        if (a_type.kind == TypeKind::Int && b_type.kind == TypeKind::Float) {
+            return b;
+        }
+
+        // Both float → wider wins
+        if (a_type.kind == TypeKind::Float && b_type.kind == TypeKind::Float) {
+            mut a_float: FloatType* = a_type as FloatType*;
+            mut b_float: FloatType* = b_type as FloatType*;
+            if (a_float.bit_width() >= b_float.bit_width()) {
+                return a;
+            }
+            return b;
+        }
+
+        // Both int → wider wins, prefer signed if same width
+        if (a_type.kind == TypeKind::Int && b_type.kind == TypeKind::Int) {
+            mut a_int: IntType* = a_type as IntType*;
+            mut b_int: IntType* = b_type as IntType*;
+            if (a_int.bit_width() > b_int.bit_width()) {
+                return a;
+            }
+            if (b_int.bit_width() > a_int.bit_width()) {
+                return b;
+            }
+            // Same width — prefer signed
+            if (a_int.is_signed()) {
+                return a;
+            }
+            return b;
+        }
+
+        return a;  // Fallback
+    }
+}

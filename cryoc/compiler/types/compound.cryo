@@ -1,0 +1,237 @@
+///! Compound Types
+///!
+///! Type classes for pointer, reference, array, function, tuple, and optional.
+///! These wrap other types (via TypeRef handles) and are deduplicated by the arena.
+
+namespace Compiler::Types::Compound;
+
+
+// ============================================================================
+// PointerType — Raw pointer to another type
+// ============================================================================
+
+type class PointerType : Type {
+public:
+    pointee: TypeRef;
+
+    PointerType(id: u64, pointee: TypeRef) : Type(id, TypeKind::Pointer) {
+        this.pointee = pointee;
+    }
+
+    override display_name(&this) -> string {
+        return sprintf("%s*", this.pointee.id);
+    }
+
+    override mangled_name(&this) -> string {
+        return sprintf("_Cptr_%lu", this.pointee.id);
+    }
+
+    override size_bytes(&this) -> u64 { return 8; }
+    override alignment(&this) -> u64  { return 8; }
+}
+
+
+// ============================================================================
+// ReferenceType — Borrowed reference (immutable or mutable)
+// ============================================================================
+
+type class ReferenceType : Type {
+public:
+    referent:   TypeRef;
+    mutability: RefMutability;
+
+    ReferenceType(id: u64, referent: TypeRef, mutability: RefMutability)
+        : Type(id, TypeKind::Reference) {
+        this.referent   = referent;
+        this.mutability = mutability;
+    }
+
+    is_mutable(&this) -> boolean {
+        return this.mutability.is_mutable();
+    }
+
+    override display_name(&this) -> string {
+        if (this.is_mutable()) {
+            return sprintf("&mut %lu", this.referent.id);
+        }
+        return sprintf("&%lu", this.referent.id);
+    }
+
+    override mangled_name(&this) -> string {
+        if (this.is_mutable()) {
+            return sprintf("_Cmutref_%lu", this.referent.id);
+        }
+        return sprintf("_Cref_%lu", this.referent.id);
+    }
+
+    override size_bytes(&this) -> u64 { return 8; }
+    override alignment(&this) -> u64  { return 8; }
+}
+
+
+// ============================================================================
+// ArrayType — Fixed-size or dynamic array
+// ============================================================================
+
+type class ArrayType : Type {
+public:
+    element: TypeRef;
+    size:    i64;       // -1 = dynamic/unsized
+
+    ArrayType(id: u64, element: TypeRef, size: i64) : Type(id, TypeKind::Array) {
+        this.element = element;
+        this.size    = size;
+    }
+
+    is_dynamic(&this) -> boolean { return this.size < 0; }
+    is_fixed(&this) -> boolean   { return this.size >= 0; }
+
+    override display_name(&this) -> string {
+        if (this.is_dynamic()) {
+            return sprintf("%lu[]", this.element.id);
+        }
+        return sprintf("%lu[%ld]", this.element.id, this.size);
+    }
+
+    override mangled_name(&this) -> string {
+        if (this.is_dynamic()) {
+            return sprintf("_Carray_%lu_dyn", this.element.id);
+        }
+        return sprintf("_Carray_%lu_%ld", this.element.id, this.size);
+    }
+
+    override size_bytes(&this) -> u64 {
+        if (this.is_dynamic()) {
+            return 16;  // ptr + len (fat pointer)
+        }
+        // Fixed-size: element_size * count
+        // Note: actual size requires arena lookup; return 0 as placeholder
+        return 0;
+    }
+
+    override alignment(&this) -> u64 {
+        if (this.is_dynamic()) {
+            return 8;
+        }
+        return 0;  // Depends on element type alignment
+    }
+}
+
+
+// ============================================================================
+// FunctionType — Function signature
+// ============================================================================
+
+type class FunctionType : Type {
+public:
+    return_type: TypeRef;
+    param_types: TypeRef[];
+    is_variadic: boolean;
+
+    FunctionType(id: u64, return_type: TypeRef, param_types: TypeRef[], is_variadic: boolean)
+        : Type(id, TypeKind::Function) {
+        this.return_type = return_type;
+        this.param_types = param_types;
+        this.is_variadic = is_variadic;
+    }
+
+    param_count(&this) -> i64 {
+        return this.param_types.length;
+    }
+
+    override display_name(&this) -> string {
+        mut result: string = "(";
+        for (mut i: i64 = 0; i < this.param_types.length; i = i + 1) {
+            if (i > 0) {
+                result = result + ", ";
+            }
+            result = sprintf("%s%lu", result, this.param_types[i].id);
+        }
+        if (this.is_variadic) {
+            if (this.param_types.length > 0) {
+                result = result + ", ";
+            }
+            result = result + "...";
+        }
+        result = sprintf("%s) -> %lu", result, this.return_type.id);
+        return result;
+    }
+
+    override mangled_name(&this) -> string {
+        mut result: string = "_Cfn";
+        for (mut i: i64 = 0; i < this.param_types.length; i = i + 1) {
+            result = sprintf("%s_%lu", result, this.param_types[i].id);
+        }
+        result = sprintf("%s_ret_%lu", result, this.return_type.id);
+        return result;
+    }
+
+    override size_bytes(&this) -> u64 { return 8; }  // Function pointer
+    override alignment(&this) -> u64  { return 8; }
+}
+
+
+// ============================================================================
+// TupleType — Heterogeneous fixed-size collection
+// ============================================================================
+
+type class TupleType : Type {
+public:
+    elements: TypeRef[];
+
+    TupleType(id: u64, elements: TypeRef[]) : Type(id, TypeKind::Tuple) {
+        this.elements = elements;
+    }
+
+    element_count(&this) -> i64 {
+        return this.elements.length;
+    }
+
+    override display_name(&this) -> string {
+        mut result: string = "(";
+        for (mut i: i64 = 0; i < this.elements.length; i = i + 1) {
+            if (i > 0) {
+                result = result + ", ";
+            }
+            result = sprintf("%s%lu", result, this.elements[i].id);
+        }
+        result = result + ")";
+        return result;
+    }
+
+    override mangled_name(&this) -> string {
+        mut result: string = "_Ctuple";
+        for (mut i: i64 = 0; i < this.elements.length; i = i + 1) {
+            result = sprintf("%s_%lu", result, this.elements[i].id);
+        }
+        return result;
+    }
+
+    override size_bytes(&this) -> u64 { return 0; }  // Depends on elements
+    override alignment(&this) -> u64  { return 0; }
+}
+
+
+// ============================================================================
+// OptionalType — Nullable wrapper (T?)
+// ============================================================================
+
+type class OptionalType : Type {
+public:
+    wrapped: TypeRef;
+
+    OptionalType(id: u64, wrapped: TypeRef) : Type(id, TypeKind::Optional) {
+        this.wrapped = wrapped;
+    }
+
+    override display_name(&this) -> string {
+        return sprintf("%lu?", this.wrapped.id);
+    }
+
+    override mangled_name(&this) -> string {
+        return sprintf("_Copt_%lu", this.wrapped.id);
+    }
+
+    override size_bytes(&this) -> u64 { return 0; }  // Depends on wrapped + tag
+    override alignment(&this) -> u64  { return 0; }
+}

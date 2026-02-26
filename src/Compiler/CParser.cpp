@@ -14,6 +14,10 @@ namespace Cryo
         _pos = 0;
         _tokens.clear();
         _tok_pos = 0;
+        _typedefs.clear();
+        _enum_names.clear();
+        _struct_names.clear();
+        _enum_decls.clear();
 
         tokenize();
 
@@ -21,6 +25,70 @@ namespace Cryo
 
         while (!check(CTokKind::Eof))
         {
+            // Handle typedef declarations first
+            if (check(CTokKind::Typedef))
+            {
+                parse_typedef();
+                continue;
+            }
+
+            // Handle standalone enum declarations: enum Name { ... };
+            if (check(CTokKind::Enum) && peek().kind != CTokKind::Eof)
+            {
+                // Could be a standalone enum decl OR a function returning enum type.
+                // Peek ahead: enum [Name] { → standalone decl
+                // enum [Name] Identifier ( → function returning enum type
+                size_t saved = _tok_pos;
+                advance(); // consume 'enum'
+                if (check(CTokKind::Identifier))
+                    advance(); // skip tag name
+                if (check(CTokKind::LBrace))
+                {
+                    // Standalone enum declaration — parse and track it
+                    _tok_pos = saved;
+                    advance(); // consume 'enum'
+                    std::string tag;
+                    if (check(CTokKind::Identifier))
+                    {
+                        tag = current().text;
+                        advance();
+                    }
+                    CEnumDecl edecl;
+                    edecl.name = tag;
+                    parse_enum_body(edecl);
+                    if (!tag.empty())
+                        _enum_names.insert(tag);
+                    _enum_decls.push_back(std::move(edecl));
+                    match(CTokKind::Semicolon);
+                    continue;
+                }
+                _tok_pos = saved; // restore — let try_parse_function_decl handle it
+            }
+
+            // Handle standalone struct/union declarations: struct Name { ... };
+            if ((check(CTokKind::Struct) || check(CTokKind::Union)) && peek().kind != CTokKind::Eof)
+            {
+                size_t saved = _tok_pos;
+                advance(); // consume 'struct'/'union'
+                if (check(CTokKind::Identifier))
+                    advance(); // skip tag name
+                if (check(CTokKind::LBrace))
+                {
+                    // Standalone struct/union declaration — track the name, skip the body
+                    _tok_pos = saved;
+                    advance(); // consume 'struct'/'union'
+                    if (check(CTokKind::Identifier))
+                    {
+                        _struct_names.insert(current().text);
+                        advance();
+                    }
+                    skip_balanced_braces();
+                    match(CTokKind::Semicolon);
+                    continue;
+                }
+                _tok_pos = saved;
+            }
+
             CFunctionDecl decl;
             if (try_parse_function_decl(decl))
             {
@@ -95,14 +163,12 @@ namespace Cryo
     {
         while (_pos < _source.size())
         {
-            // Skip whitespace
             if (std::isspace(static_cast<unsigned char>(_source[_pos])))
             {
                 _pos++;
                 continue;
             }
 
-            // Skip // line comments
             if (_pos + 1 < _source.size() && _source[_pos] == '/' && _source[_pos + 1] == '/')
             {
                 _pos += 2;
@@ -111,7 +177,6 @@ namespace Cryo
                 continue;
             }
 
-            // Skip /* block comments */
             if (_pos + 1 < _source.size() && _source[_pos] == '/' && _source[_pos + 1] == '*')
             {
                 _pos += 2;
@@ -133,40 +198,29 @@ namespace Cryo
 
         char c = _source[_pos];
 
-        // Identifiers and keywords
         if (std::isalpha(static_cast<unsigned char>(c)) || c == '_')
-        {
             return lex_identifier_or_keyword();
-        }
 
-        // Numbers
         if (std::isdigit(static_cast<unsigned char>(c)))
-        {
             return lex_number();
-        }
 
-        // String literals
         if (c == '"')
-        {
             return lex_string_literal();
-        }
 
-        // Character literals
         if (c == '\'')
         {
-            _pos++; // skip opening '
+            _pos++;
             while (_pos < _source.size() && _source[_pos] != '\'')
             {
                 if (_source[_pos] == '\\')
-                    _pos++; // skip escape
+                    _pos++;
                 _pos++;
             }
             if (_pos < _source.size())
-                _pos++; // skip closing '
-            return {CTokKind::NumericConstant, "0"}; // treat char literals as numeric
+                _pos++;
+            return {CTokKind::NumericConstant, "0"};
         }
 
-        // Punctuation
         _pos++;
         switch (c)
         {
@@ -191,7 +245,6 @@ namespace Cryo
         case '=':
             return {CTokKind::Equals, "="};
         case '.':
-            // Check for ellipsis
             if (_pos + 1 < _source.size() && _source[_pos] == '.' && _source[_pos + 1] == '.')
             {
                 _pos += 2;
@@ -208,18 +261,13 @@ namespace Cryo
         size_t start = _pos;
         while (_pos < _source.size() &&
                (std::isalnum(static_cast<unsigned char>(_source[_pos])) || _source[_pos] == '_'))
-        {
             _pos++;
-        }
 
         std::string text = _source.substr(start, _pos - start);
 
-        // Check for keywords
         auto it = keyword_map.find(text);
         if (it != keyword_map.end())
-        {
             return {it->second, text};
-        }
 
         return {CTokKind::Identifier, text};
     }
@@ -228,7 +276,6 @@ namespace Cryo
     {
         size_t start = _pos;
 
-        // Handle hex (0x...), octal (0...), or decimal
         if (_source[_pos] == '0' && _pos + 1 < _source.size())
         {
             char next = _source[_pos + 1];
@@ -253,15 +300,15 @@ namespace Cryo
     CParser::CToken CParser::lex_string_literal()
     {
         size_t start = _pos;
-        _pos++; // skip opening "
+        _pos++;
         while (_pos < _source.size() && _source[_pos] != '"')
         {
             if (_source[_pos] == '\\')
-                _pos++; // skip escape
+                _pos++;
             _pos++;
         }
         if (_pos < _source.size())
-            _pos++; // skip closing "
+            _pos++;
         return {CTokKind::StringLiteral, _source.substr(start, _pos - start)};
     }
 
@@ -307,6 +354,11 @@ namespace Cryo
         return current().kind == kind;
     }
 
+    bool CParser::is_typedef_name(const std::string &name) const
+    {
+        return _typedefs.find(name) != _typedefs.end();
+    }
+
     void CParser::skip_to_semicolon_or_brace()
     {
         while (!check(CTokKind::Eof))
@@ -319,7 +371,6 @@ namespace Cryo
             if (check(CTokKind::LBrace))
             {
                 skip_balanced_braces();
-                // After a closing brace, optionally consume a semicolon
                 match(CTokKind::Semicolon);
                 return;
             }
@@ -338,6 +389,22 @@ namespace Cryo
             if (check(CTokKind::LBrace))
                 depth++;
             else if (check(CTokKind::RBrace))
+                depth--;
+            advance();
+        }
+    }
+
+    void CParser::skip_balanced_parens()
+    {
+        if (!match(CTokKind::LParen))
+            return;
+
+        int depth = 1;
+        while (!check(CTokKind::Eof) && depth > 0)
+        {
+            if (check(CTokKind::LParen))
+                depth++;
+            else if (check(CTokKind::RParen))
                 depth--;
             advance();
         }
@@ -397,7 +464,6 @@ namespace Cryo
     {
         std::string type_str;
 
-        // Collect qualifiers and type keywords
         bool has_base_type = false;
         while (!check(CTokKind::Eof))
         {
@@ -416,7 +482,6 @@ namespace Cryo
             }
             else if (kind == CTokKind::Struct || kind == CTokKind::Union || kind == CTokKind::Enum)
             {
-                // struct/union/enum tag — skip the whole thing as an opaque type
                 if (!type_str.empty())
                     type_str += " ";
                 type_str += current().text;
@@ -428,10 +493,15 @@ namespace Cryo
                     advance();
                     has_base_type = true;
                 }
+                // If there's an inline enum/struct body in a param type, skip it
+                if (check(CTokKind::LBrace))
+                {
+                    skip_balanced_braces();
+                    has_base_type = true;
+                }
             }
             else if (kind == CTokKind::Identifier && !has_base_type)
             {
-                // Treat an unknown identifier as a type name (e.g., FILE, va_list, etc.)
                 if (!type_str.empty())
                     type_str += " ";
                 type_str += current().text;
@@ -449,11 +519,8 @@ namespace Cryo
         {
             type_str += " *";
             advance();
-            // Collect post-pointer qualifiers (const T * const)
             while (check(CTokKind::Const) || check(CTokKind::Volatile))
-            {
-                advance(); // skip post-pointer qualifiers
-            }
+                advance();
         }
 
         return type_str;
@@ -461,11 +528,6 @@ namespace Cryo
 
     std::string CParser::parse_declarator_name()
     {
-        // A declarator can have leading *'s (for function pointers we skip, but
-        // for normal declarators the *'s are part of the type), then an identifier.
-        // Since we already parsed pointer *'s in parse_type_specifier, here we
-        // just look for an identifier.
-
         if (check(CTokKind::Identifier))
         {
             std::string name = current().text;
@@ -476,19 +538,207 @@ namespace Cryo
     }
 
     // ========================================================================
+    // Parser: Typedef Declarations
+    // ========================================================================
+
+    void CParser::parse_typedef()
+    {
+        advance(); // consume 'typedef'
+
+        // --- typedef enum { ... } Name; ---
+        if (check(CTokKind::Enum))
+        {
+            advance(); // consume 'enum'
+
+            std::string tag;
+            if (check(CTokKind::Identifier))
+            {
+                tag = current().text;
+                advance();
+            }
+
+            CEnumDecl edecl;
+            edecl.name = tag;
+
+            if (check(CTokKind::LBrace))
+            {
+                parse_enum_body(edecl);
+            }
+
+            // The typedef name(s) follow
+            if (check(CTokKind::Identifier))
+            {
+                std::string alias = current().text;
+                advance();
+                _typedefs[alias] = "int"; // enums are ints in C ABI
+                _enum_names.insert(alias);
+                if (tag.empty())
+                    edecl.name = alias;
+            }
+            if (!tag.empty())
+                _enum_names.insert(tag);
+
+            _enum_decls.push_back(std::move(edecl));
+            match(CTokKind::Semicolon);
+            return;
+        }
+
+        // --- typedef struct/union [Name] [{...}] [*] Alias; ---
+        if (check(CTokKind::Struct) || check(CTokKind::Union))
+        {
+            std::string kind_str = current().text;
+            advance(); // consume 'struct'/'union'
+
+            std::string tag;
+            if (check(CTokKind::Identifier))
+            {
+                tag = current().text;
+                _struct_names.insert(tag);
+                advance();
+            }
+
+            if (check(CTokKind::LBrace))
+            {
+                skip_balanced_braces();
+            }
+
+            // Build the resolved type string
+            std::string resolved = kind_str;
+            if (!tag.empty())
+                resolved += " " + tag;
+
+            // Collect pointer stars
+            while (check(CTokKind::Star))
+            {
+                resolved += " *";
+                advance();
+                while (check(CTokKind::Const) || check(CTokKind::Volatile))
+                    advance();
+            }
+
+            // Typedef name
+            if (check(CTokKind::Identifier))
+            {
+                std::string alias = current().text;
+                advance();
+                _typedefs[alias] = resolved;
+                // If it's a pointer to a struct, also track the alias as a struct-related name
+            }
+
+            match(CTokKind::Semicolon);
+            return;
+        }
+
+        // --- General typedef: typedef TYPE NAME; ---
+        // e.g., typedef int myint; typedef unsigned long ulong_t;
+        std::string type_str = parse_type_specifier();
+
+        // Check for function pointer typedef: typedef RET (*NAME)(PARAMS);
+        if (check(CTokKind::LParen))
+        {
+            // Skip function pointer typedefs entirely
+            skip_to_semicolon_or_brace();
+            return;
+        }
+
+        if (check(CTokKind::Identifier))
+        {
+            std::string alias = current().text;
+            advance();
+            if (!type_str.empty())
+                _typedefs[alias] = type_str;
+        }
+
+        // Handle any trailing array or function declarator junk
+        skip_to_semicolon_or_brace();
+    }
+
+    // ========================================================================
+    // Parser: Enum Body
+    // ========================================================================
+
+    void CParser::parse_enum_body(CEnumDecl &out)
+    {
+        if (!match(CTokKind::LBrace))
+            return;
+
+        int64_t next_value = 0;
+
+        while (!check(CTokKind::RBrace) && !check(CTokKind::Eof))
+        {
+            if (!check(CTokKind::Identifier))
+            {
+                advance();
+                continue;
+            }
+
+            CEnumConstant constant;
+            constant.name = current().text;
+            advance();
+
+            // Optional: = value
+            if (match(CTokKind::Equals))
+            {
+                // Parse integer constant (possibly negative or hex)
+                bool negative = false;
+                if (check(CTokKind::Unknown) && current().text == "-")
+                {
+                    negative = true;
+                    advance();
+                }
+
+                if (check(CTokKind::NumericConstant))
+                {
+                    try
+                    {
+                        // Handle hex (0x...) and decimal
+                        std::string val_str = current().text;
+                        // Strip suffixes
+                        while (!val_str.empty() && std::isalpha(val_str.back()))
+                            val_str.pop_back();
+                        if (val_str.size() > 2 && val_str[0] == '0' && (val_str[1] == 'x' || val_str[1] == 'X'))
+                            next_value = std::stoll(val_str, nullptr, 16);
+                        else
+                            next_value = std::stoll(val_str, nullptr, 10);
+                        if (negative)
+                            next_value = -next_value;
+                    }
+                    catch (...)
+                    {
+                        // If parsing fails, just continue with auto-increment
+                    }
+                    advance();
+                }
+                else
+                {
+                    // Complex expression (e.g., 1 << 3) — skip to comma or brace
+                    while (!check(CTokKind::Comma) && !check(CTokKind::RBrace) && !check(CTokKind::Eof))
+                        advance();
+                }
+            }
+
+            constant.value = next_value;
+            out.constants.push_back(std::move(constant));
+            next_value++;
+
+            // Consume comma between enumerators
+            match(CTokKind::Comma);
+        }
+
+        match(CTokKind::RBrace);
+    }
+
+    // ========================================================================
     // Parser: Function Declarations
     // ========================================================================
 
     bool CParser::try_parse_function_decl(CFunctionDecl &out)
     {
-        // Save position for backtracking
         size_t saved_pos = _tok_pos;
 
-        // Skip typedef — we don't produce function decls from typedefs
+        // Skip typedef — handled separately
         if (check(CTokKind::Typedef))
-        {
             return false;
-        }
 
         // Parse return type
         std::string return_type = parse_type_specifier();
@@ -534,16 +784,14 @@ namespace Cryo
         // Expect ';' for a prototype, or '{' for a definition
         if (check(CTokKind::Semicolon))
         {
-            advance(); // consume ';'
+            advance();
         }
         else if (check(CTokKind::LBrace))
         {
-            // Function definition — skip the body, still capture the declaration
             skip_balanced_braces();
         }
         else
         {
-            // Could be something like __attribute__ — skip
             _tok_pos = saved_pos;
             return false;
         }
@@ -559,22 +807,17 @@ namespace Cryo
     {
         is_variadic = false;
 
-        // Check for void parameter (void as sole parameter means no params)
         if (check(CTokKind::Void) && peek().kind == CTokKind::RParen)
         {
-            advance(); // consume 'void'
+            advance();
             return true;
         }
 
-        // Empty parameter list
         if (check(CTokKind::RParen))
-        {
             return true;
-        }
 
         while (!check(CTokKind::RParen) && !check(CTokKind::Eof))
         {
-            // Check for variadic
             if (check(CTokKind::Ellipsis))
             {
                 is_variadic = true;
@@ -582,12 +825,10 @@ namespace Cryo
                 break;
             }
 
-            // Parse parameter type
             std::string param_type = parse_type_specifier();
             if (param_type.empty())
                 return false;
 
-            // Parse optional parameter name
             std::string param_name;
             if (check(CTokKind::Identifier) && peek().kind != CTokKind::LParen)
             {
@@ -598,25 +839,19 @@ namespace Cryo
             // Skip array declarators like [N] or []
             while (check(CTokKind::LBracket))
             {
-                advance(); // '['
+                advance();
                 while (!check(CTokKind::RBracket) && !check(CTokKind::Eof))
                     advance();
                 match(CTokKind::RBracket);
-                // Array parameters decay to pointers in C
                 param_type += " *";
             }
 
             params.push_back({param_name, param_type});
 
-            // Expect ',' or ')'
             if (check(CTokKind::Comma))
-            {
                 advance();
-            }
             else
-            {
                 break;
-            }
         }
 
         return true;

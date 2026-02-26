@@ -83,9 +83,8 @@ class CompilerDriver:
     def compile_project(self, test: TestCase) -> CompilationResult:
         """Build a project-mode test.
 
-        Uses `cryo build` with cwd=project_dir.  For no_std projects, falls
-        back to direct `cryo <entry> --raw -o <output>` because the build
-        command does not yet support --raw mode.
+        Uses `cryo build` with cwd=project_dir.  The build command reads
+        cryoconfig and handles no_std mode internally.
         """
         project_dir = test.project_dir
         if project_dir is None:
@@ -97,31 +96,13 @@ class CompilerDriver:
             )
 
         config = parse_cryoconfig(project_dir / "cryoconfig")
-        no_std = config.get("no_std", "false") == "true"
         output_dir_name = config.get("output_dir", "build")
         project_name = config.get("project_name", "app")
-        entry_point = config.get("entry_point", "src/main.cryo")
 
-        if no_std:
-            # cryo build doesn't support --raw; use direct compilation
-            out_dir = project_dir / output_dir_name
-            out_dir.mkdir(parents=True, exist_ok=True)
-            output_path = out_dir / project_name
-            if sys.platform == "win32":
-                output_path = output_path.with_suffix(".exe")
-
-            cmd = [
-                str(self.cryo_binary),
-                str(project_dir / entry_point),
-                "--raw",
-                "--emit-llvm",
-                "-o", str(output_path),
-            ]
-            if test.metadata.compiler_args:
-                cmd.extend(shlex.split(test.metadata.compiler_args))
-        else:
-            cmd = [str(self.cryo_binary), "build"]
-            output_path = project_dir / output_dir_name / project_name
+        cmd = [str(self.cryo_binary), "build"]
+        if test.metadata.compiler_args:
+            cmd.extend(shlex.split(test.metadata.compiler_args))
+        output_path = project_dir / output_dir_name / project_name
 
         start = time.monotonic()
         try:

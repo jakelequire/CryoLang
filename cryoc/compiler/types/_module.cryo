@@ -1,1 +1,295 @@
+///! Types Module
+///!
+///! Core type system for the Cryo self-hosted compiler.
+///! Mirrors the C++ compiler's type architecture: TypeArena owns all Type
+///! objects, TypeRef provides lightweight handles, and deduplication ensures
+///! identity-based equality.
+
 namespace Compiler::Types;
+
+public module Type;
+public module Compound;
+public module UserDefined;
+public module Generic;
+public module Arena;
+public module Checker;
+public module Resolver;
+public module SymbolTable;
+public module Registry;
+
+import Compiler::Diagnostics;
+
+
+// ============================================================================
+// TypeKind — Discriminator for all type categories
+// ============================================================================
+
+/// Mirrors C++ TypeKind exactly (26 variants).
+type enum TypeKind {
+    // Primitives
+    Void; Unit; Bool; Int; Float; Char; String; Never;
+
+    // Compound
+    Pointer; Reference; Array; Function; Tuple; Optional;
+
+    // User-defined
+    Struct; Class; Enum; Trait; TypeAlias;
+
+    // Generics
+    GenericParam; BoundedParam; InstantiatedType;
+
+    // Error
+    Error;
+}
+
+implement enum TypeKind {
+    to_string(&this) -> string {
+        return match (&this) {
+            TypeKind::Void             => { "Void" }
+            TypeKind::Unit             => { "Unit" }
+            TypeKind::Bool             => { "Bool" }
+            TypeKind::Int              => { "Int" }
+            TypeKind::Float            => { "Float" }
+            TypeKind::Char             => { "Char" }
+            TypeKind::String           => { "String" }
+            TypeKind::Never            => { "Never" }
+            TypeKind::Pointer          => { "Pointer" }
+            TypeKind::Reference        => { "Reference" }
+            TypeKind::Array            => { "Array" }
+            TypeKind::Function         => { "Function" }
+            TypeKind::Tuple            => { "Tuple" }
+            TypeKind::Optional         => { "Optional" }
+            TypeKind::Struct           => { "Struct" }
+            TypeKind::Class            => { "Class" }
+            TypeKind::Enum             => { "Enum" }
+            TypeKind::Trait            => { "Trait" }
+            TypeKind::TypeAlias        => { "TypeAlias" }
+            TypeKind::GenericParam     => { "GenericParam" }
+            TypeKind::BoundedParam     => { "BoundedParam" }
+            TypeKind::InstantiatedType => { "InstantiatedType" }
+            TypeKind::Error            => { "Error" }
+        };
+    }
+
+    is_primitive(&this) -> boolean {
+        return match (&this) {
+            TypeKind::Void   => { true }
+            TypeKind::Unit   => { true }
+            TypeKind::Bool   => { true }
+            TypeKind::Int    => { true }
+            TypeKind::Float  => { true }
+            TypeKind::Char   => { true }
+            TypeKind::String => { true }
+            TypeKind::Never  => { true }
+            _                => { false }
+        };
+    }
+
+    is_compound(&this) -> boolean {
+        return match (&this) {
+            TypeKind::Pointer   => { true }
+            TypeKind::Reference => { true }
+            TypeKind::Array     => { true }
+            TypeKind::Function  => { true }
+            TypeKind::Tuple     => { true }
+            TypeKind::Optional  => { true }
+            _                   => { false }
+        };
+    }
+
+    is_user_defined(&this) -> boolean {
+        return match (&this) {
+            TypeKind::Struct    => { true }
+            TypeKind::Class     => { true }
+            TypeKind::Enum      => { true }
+            TypeKind::Trait     => { true }
+            TypeKind::TypeAlias => { true }
+            _                   => { false }
+        };
+    }
+
+    is_generic(&this) -> boolean {
+        return match (&this) {
+            TypeKind::GenericParam     => { true }
+            TypeKind::BoundedParam     => { true }
+            TypeKind::InstantiatedType => { true }
+            _                          => { false }
+        };
+    }
+
+    is_numeric(&this) -> boolean {
+        return match (&this) {
+            TypeKind::Int   => { true }
+            TypeKind::Float => { true }
+            _               => { false }
+        };
+    }
+
+    is_error(&this) -> boolean {
+        return match (&this) {
+            TypeKind::Error => { true }
+            _               => { false }
+        };
+    }
+}
+
+
+// ============================================================================
+// IntegerKind — Width and signedness of integer types
+// ============================================================================
+
+type enum IntegerKind {
+    I8; I16; I32; I64; I128;
+    U8; U16; U32; U64; U128;
+}
+
+implement enum IntegerKind {
+    to_string(&this) -> string {
+        return match (&this) {
+            IntegerKind::I8   => { "i8" }
+            IntegerKind::I16  => { "i16" }
+            IntegerKind::I32  => { "i32" }
+            IntegerKind::I64  => { "i64" }
+            IntegerKind::I128 => { "i128" }
+            IntegerKind::U8   => { "u8" }
+            IntegerKind::U16  => { "u16" }
+            IntegerKind::U32  => { "u32" }
+            IntegerKind::U64  => { "u64" }
+            IntegerKind::U128 => { "u128" }
+        };
+    }
+
+    bit_width(&this) -> u64 {
+        return match (&this) {
+            IntegerKind::I8   => { 8 }
+            IntegerKind::I16  => { 16 }
+            IntegerKind::I32  => { 32 }
+            IntegerKind::I64  => { 64 }
+            IntegerKind::I128 => { 128 }
+            IntegerKind::U8   => { 8 }
+            IntegerKind::U16  => { 16 }
+            IntegerKind::U32  => { 32 }
+            IntegerKind::U64  => { 64 }
+            IntegerKind::U128 => { 128 }
+        };
+    }
+
+    is_signed(&this) -> boolean {
+        return match (&this) {
+            IntegerKind::I8   => { true }
+            IntegerKind::I16  => { true }
+            IntegerKind::I32  => { true }
+            IntegerKind::I64  => { true }
+            IntegerKind::I128 => { true }
+            _                 => { false }
+        };
+    }
+
+    is_unsigned(&this) -> boolean {
+        return !this.is_signed();
+    }
+
+    byte_size(&this) -> u64 {
+        return this.bit_width() / 8;
+    }
+}
+
+
+// ============================================================================
+// FloatKind — Width of floating-point types
+// ============================================================================
+
+type enum FloatKind {
+    F32;
+    F64;
+}
+
+implement enum FloatKind {
+    to_string(&this) -> string {
+        return match (&this) {
+            FloatKind::F32 => { "f32" }
+            FloatKind::F64 => { "f64" }
+        };
+    }
+
+    bit_width(&this) -> u64 {
+        return match (&this) {
+            FloatKind::F32 => { 32 }
+            FloatKind::F64 => { 64 }
+        };
+    }
+
+    byte_size(&this) -> u64 {
+        return this.bit_width() / 8;
+    }
+}
+
+
+// ============================================================================
+// RefMutability — Reference mutability qualifier
+// ============================================================================
+
+type enum RefMutability {
+    Immutable;
+    Mutable;
+}
+
+implement enum RefMutability {
+    to_string(&this) -> string {
+        return match (&this) {
+            RefMutability::Immutable => { "immutable" }
+            RefMutability::Mutable   => { "mutable" }
+        };
+    }
+
+    is_mutable(&this) -> boolean {
+        return match (&this) {
+            RefMutability::Mutable => { true }
+            _                      => { false }
+        };
+    }
+}
+
+
+// ============================================================================
+// TypeRef — Lightweight handle to a Type in the TypeArena
+// ============================================================================
+
+/// A lightweight handle to a type in the TypeArena.
+/// Equality is determined by comparing type IDs.
+/// ID 0 is reserved as the invalid/unresolved sentinel.
+type struct TypeRef {
+    id:    u64;
+    arena: void*;   // TypeArena* — void* to break circular dependency
+
+    /// Create an invalid/unresolved type reference (id = 0).
+    static invalid() -> TypeRef {
+        return TypeRef {
+            id:    0,
+            arena: null,
+        };
+    }
+
+    /// Create a new type reference with the given ID and arena.
+    static new(id: u64, arena: void*) -> TypeRef {
+        return TypeRef {
+            id:    id,
+            arena: arena,
+        };
+    }
+
+    /// Whether this refers to a valid type (id != 0 and arena != null).
+    is_valid(&this) -> boolean {
+        return this.id != 0 && this.arena != null;
+    }
+
+    /// Whether this is the invalid sentinel.
+    is_invalid(&this) -> boolean {
+        return this.id == 0;
+    }
+
+    /// Check equality by type ID.
+    equals(&this, other: TypeRef) -> boolean {
+        return this.id == other.id;
+    }
+}

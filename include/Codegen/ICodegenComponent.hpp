@@ -260,7 +260,7 @@ namespace Cryo::Codegen
          * @param target_type Target LLVM type
          * @return Cast value, or original if no cast needed
          */
-        llvm::Value *cast_if_needed(llvm::Value *value, llvm::Type *target_type);
+        llvm::Value *cast_if_needed(llvm::Value *value, llvm::Type *target_type, bool is_unsigned = false);
 
         /**
          * @brief Check if a value is an alloca instruction
