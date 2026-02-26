@@ -1769,7 +1769,7 @@ namespace Cryo::Codegen
             cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
             if (cryo_class)
             {
-                needs_vtable = cryo_class->has_virtual_methods() || cryo_class->has_base_class();
+                needs_vtable = cryo_class->needs_vtable_pointer();
             }
         }
 
@@ -3384,7 +3384,7 @@ namespace Cryo::Codegen
                             if (cryo_type.is_valid())
                             {
                                 auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
-                                if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
+                                if (cryo_class && cryo_class->needs_vtable_pointer())
                                 {
                                     std::string vtable_name = "vtable." + parent_type;
                                     llvm::GlobalVariable *vtable_global = module()->getGlobalVariable(vtable_name, /*AllowInternal=*/true);
