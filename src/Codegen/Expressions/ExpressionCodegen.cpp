@@ -3569,13 +3569,29 @@ namespace Cryo::Codegen
                             for (const auto &candidate : candidates)
                             {
                                 const auto *field_info = template_reg->get_struct_field_types(candidate);
-                                if (field_info && outer_field_idx < field_info->field_types.size())
+                                if (field_info)
                                 {
-                                    obj_type = field_info->field_types[outer_field_idx];
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                              "resolve_member_info: Resolved nested member '{}' type to '{}' via TemplateRegistry",
-                                              member_access->member(), obj_type ? obj_type->display_name() : "<null>");
-                                    break;
+                                    // outer_field_idx is the LLVM struct index (includes vtable pointer).
+                                    // TemplateRegistry stores logical fields only (no vtable).
+                                    // Adjust by checking if the outer type has a vtable offset.
+                                    unsigned logical_idx = outer_field_idx;
+                                    // Check for vtable offset: if outer_struct's element 0 is a pointer
+                                    // and field_info has fewer entries than outer_struct elements
+                                    if (outer_struct && outer_field_idx > 0 &&
+                                        outer_struct->getNumElements() > field_info->field_types.size())
+                                    {
+                                        logical_idx = outer_field_idx - (outer_struct->getNumElements() - field_info->field_types.size());
+                                    }
+
+                                    if (logical_idx < field_info->field_types.size())
+                                    {
+                                        obj_type = field_info->field_types[logical_idx];
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "resolve_member_info: Resolved nested member '{}' type to '{}' via TemplateRegistry (llvm_idx={}, logical_idx={})",
+                                                  member_access->member(), obj_type ? obj_type->display_name() : "<null>",
+                                                  outer_field_idx, logical_idx);
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -5506,7 +5522,7 @@ namespace Cryo::Codegen
             if (cryo_type.is_valid())
             {
                 auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
-                if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
+                if (cryo_class && cryo_class->needs_vtable_pointer())
                 {
                     std::string vtable_name = "vtable." + node->type_name();
                     llvm::GlobalVariable *vtable_global = module()->getGlobalVariable(vtable_name, /*AllowInternal=*/true);
@@ -5521,8 +5537,9 @@ namespace Cryo::Codegen
             }
         }
 
-        // If there are constructor arguments, call constructor
-        if (!node->arguments().empty())
+        // Call the constructor — always for classes (even with zero args),
+        // only when args are present for structs (which use static factories)
+        if (!node->arguments().empty() || symbols().lookup_class_type(node->type_name()).is_valid())
         {
             // Look up the constructor using multiple patterns (consistent with CallCodegen)
             llvm::Function *ctor_fn = nullptr;

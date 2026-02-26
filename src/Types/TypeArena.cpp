@@ -1050,6 +1050,20 @@ namespace Cryo
         return nullptr;
     }
 
+    bool ClassType::needs_vtable_pointer() const
+    {
+        if (_has_virtual_methods)
+            return true;
+        // Walk the inheritance chain — if any ancestor has virtual methods, we need a vtable
+        if (_base_class.is_valid())
+        {
+            auto *base = dynamic_cast<const ClassType *>(_base_class.get());
+            if (base)
+                return base->needs_vtable_pointer();
+        }
+        return false;
+    }
+
     const MethodInfo *ClassType::get_method(const std::string &name) const
     {
         for (const auto &m : _methods)
@@ -1123,8 +1137,8 @@ namespace Cryo
         size_t offset = 0;
         size_t max_align = sizeof(void *); // At least pointer alignment
 
-        // If has virtual methods, account for vtable pointer
-        if (_has_virtual_methods || _base_class.is_valid())
+        // If this class needs a vtable pointer (has virtual methods in hierarchy)
+        if (needs_vtable_pointer())
         {
             offset = sizeof(void *);
         }

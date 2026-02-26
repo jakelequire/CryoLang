@@ -305,7 +305,7 @@ namespace Cryo::Codegen
                                     {
                                         // Account for vtable pointer offset (field 0 is vptr for classes with vtable)
                                         size_t llvm_idx = *field_idx;
-                                        if (cls && (cls->has_virtual_methods() || cls->has_base_class()))
+                                        if (cls && cls->needs_vtable_pointer())
                                             llvm_idx += 1; // vtable pointer is at index 0
 
                                         if (llvm_idx < parent_llvm_type->getNumElements())
@@ -2088,7 +2088,7 @@ namespace Cryo::Codegen
             if (cryo_type.is_valid())
             {
                 auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
-                if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
+                if (cryo_class && cryo_class->needs_vtable_pointer())
                 {
                     std::string vtable_name = "vtable." + effective_type_name;
                     llvm::GlobalVariable *vtable_global = module()->getGlobalVariable(vtable_name, /*AllowInternal=*/true);
@@ -4732,10 +4732,17 @@ namespace Cryo::Codegen
         // call indirectly through the vtable instead of directly
         {
             TypeRef cryo_type = ctx().symbols().lookup_class_type(type_name);
+            // Try unqualified name if qualified lookup fails (e.g., "Namespace::Class" -> "Class")
+            if (!cryo_type.is_valid())
+            {
+                auto last_sep = type_name.rfind("::");
+                if (last_sep != std::string::npos)
+                    cryo_type = ctx().symbols().lookup_class_type(type_name.substr(last_sep + 2));
+            }
             if (cryo_type.is_valid())
             {
                 auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
-                if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
+                if (cryo_class && cryo_class->needs_vtable_pointer())
                 {
                     int vtable_idx = cryo_class->vtable_index(method_name);
                     if (vtable_idx >= 0)
@@ -4781,7 +4788,13 @@ namespace Cryo::Codegen
                             llvm::StructType *vtable_type =
                                 llvm::StructType::getTypeByName(llvm_ctx(), vtable_type_name);
 
-                            // If vtable type not found with this class name, walk up hierarchy
+                            // If vtable type not found with qualified name, try simple class name
+                            if (!vtable_type)
+                            {
+                                vtable_type = llvm::StructType::getTypeByName(
+                                    llvm_ctx(), "VTable." + cryo_class->name());
+                            }
+                            // If still not found, walk up hierarchy
                             if (!vtable_type && cryo_class->has_base_class())
                             {
                                 auto *walk = cryo_class;

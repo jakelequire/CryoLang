@@ -204,6 +204,9 @@ namespace Cryo
         const std::vector<MethodInfo> &methods() const { return _methods; }
         const MethodInfo *get_method(const std::string &name) const;
         bool has_virtual_methods() const { return _has_virtual_methods; }
+        /// Returns true if this class needs a vtable pointer in its struct layout.
+        /// This is true when this class or any ancestor class has virtual methods.
+        bool needs_vtable_pointer() const;
         bool is_abstract() const { return _is_abstract; }
         void set_abstract(bool v) { _is_abstract = v; }
 

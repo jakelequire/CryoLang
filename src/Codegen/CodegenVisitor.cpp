@@ -988,7 +988,7 @@ namespace Cryo::Codegen
                 if (cryo_type.is_valid())
                 {
                     auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
-                    if (cryo_class && (cryo_class->has_virtual_methods() || cryo_class->has_base_class()))
+                    if (cryo_class && cryo_class->needs_vtable_pointer())
                     {
                         _declarations->generate_vtable(node.name(), cryo_class);
                     }
@@ -1008,6 +1008,20 @@ namespace Cryo::Codegen
                     {
                         // Generate the method body (declaration already exists)
                         _declarations->generate_method(method.get());
+                    }
+                }
+
+                // Re-generate vtable now that method bodies exist
+                // (the earlier vtable generation may have seen only declarations)
+                {
+                    TypeRef cryo_type2 = _ctx->symbols().lookup_class_type(node.name());
+                    if (cryo_type2.is_valid())
+                    {
+                        auto *cryo_class2 = dynamic_cast<const Cryo::ClassType *>(cryo_type2.get());
+                        if (cryo_class2 && cryo_class2->needs_vtable_pointer())
+                        {
+                            _declarations->generate_vtable(node.name(), cryo_class2);
+                        }
                     }
                 }
             }

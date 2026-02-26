@@ -871,7 +871,7 @@ namespace Cryo
             bool has_invalid_field = false;
 
             // Add vtable pointer as first field if class has virtual methods or a base class
-            if (type->has_virtual_methods() || type->has_base_class())
+            if (type->needs_vtable_pointer())
             {
                 llvm_fields.push_back(llvm::PointerType::get(_llvm_ctx, 0));
             }
