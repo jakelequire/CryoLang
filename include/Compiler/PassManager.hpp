@@ -534,6 +534,7 @@ namespace Cryo
         constexpr const char *TOKENS = "tokens";
         constexpr const char *AST = "ast";
         constexpr const char *AST_VALIDATED = "ast_validated";
+        constexpr const char *C_HEADERS_IMPORTED = "c_headers_imported";
 
         // Stage 2: Module Resolution
         constexpr const char *IMPORTS_DISCOVERED = "imports_discovered";

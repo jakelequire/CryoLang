@@ -6142,41 +6142,114 @@ namespace Cryo
 
         consume(TokenKind::TK_KW_EXTERN, "Expected 'extern'");
 
-        // Parse linkage specifier (e.g., "C")
-        Token linkage_token = consume(TokenKind::TK_STRING_LITERAL, "Expected linkage specifier (e.g., \"C\")");
-        std::string linkage_type = std::string(linkage_token.text());
+        // Parse linkage specifier (e.g., "C" or "CImport")
+        // NOTE: Must capture text BEFORE advance() — Token holds a string_view
+        // into lexer memory that advance() can invalidate.
+        if (!_current_token.is(TokenKind::TK_STRING_LITERAL))
+        {
+            error("Expected linkage specifier (e.g., \"C\")");
+            return nullptr;
+        }
+        std::string linkage_type = std::string(_current_token.text());
+        advance(); // consume the string literal
 
-        // Remove quotes from linkage type
+        // Remove quotes from linkage type (lexer strips quotes, but be safe)
         if (linkage_type.length() >= 2 && linkage_type.front() == '"' && linkage_type.back() == '"')
         {
             linkage_type = linkage_type.substr(1, linkage_type.length() - 2);
         }
 
-        auto extern_block = _builder.create_extern_block(start_loc, linkage_type);
+        // Parse optional namespace alias (e.g., "ex" in extern "CImport" ex { ... })
+        // Same pattern: capture text before advance.
+        std::string namespace_alias;
+        if (_current_token.is(TokenKind::TK_IDENTIFIER))
+        {
+            namespace_alias = std::string(_current_token.text());
+            advance();
+        }
+
+        auto extern_block = _builder.create_extern_block(start_loc, linkage_type, namespace_alias);
 
         consume(TokenKind::TK_L_BRACE, "Expected '{' after extern linkage");
 
-        // Parse function declarations within the extern block
-        while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
+        if (linkage_type == "CImport")
         {
-            try
+            // Parse #include directives within the CImport block
+            while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
             {
-                // Parse function declaration (should be function signatures only)
-                if (_current_token.is(TokenKind::TK_KW_FUNCTION))
+                try
                 {
-                    auto func_decl = parse_extern_function_declaration();
-                    extern_block->add_function_declaration(std::move(func_decl));
+                    // Expect: # include "path"
+                    if (_current_token.is(TokenKind::TK_HASH))
+                    {
+                        advance(); // consume '#'
+
+                        // Expect 'include' identifier
+                        if (!_current_token.is(TokenKind::TK_IDENTIFIER) ||
+                            std::string(_current_token.text()) != "include")
+                        {
+                            error("Expected 'include' after '#' in CImport block");
+                            synchronize();
+                            continue;
+                        }
+                        advance(); // consume 'include'
+
+                        // Parse the include path string
+                        // Capture text before advance to avoid dangling string_view
+                        if (!_current_token.is(TokenKind::TK_STRING_LITERAL))
+                        {
+                            error("Expected string path after #include");
+                            synchronize();
+                            continue;
+                        }
+                        std::string include_path = std::string(_current_token.text());
+                        advance(); // consume the string literal
+
+                        // Remove quotes from include path (lexer strips quotes, but be safe)
+                        if (include_path.length() >= 2 && include_path.front() == '"' && include_path.back() == '"')
+                        {
+                            include_path = include_path.substr(1, include_path.length() - 2);
+                        }
+
+                        extern_block->add_include_path(include_path);
+                    }
+                    else
+                    {
+                        error("Expected '#include' directive in CImport block");
+                        synchronize();
+                    }
                 }
-                else
+                catch (const ParseError &e)
                 {
-                    error("Expected function declaration in extern block");
+                    _errors.push_back(e);
                     synchronize();
                 }
             }
-            catch (const ParseError &e)
+        }
+        else
+        {
+            // Parse function declarations within the extern block (existing behavior)
+            while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
             {
-                _errors.push_back(e);
-                synchronize();
+                try
+                {
+                    // Parse function declaration (should be function signatures only)
+                    if (_current_token.is(TokenKind::TK_KW_FUNCTION))
+                    {
+                        auto func_decl = parse_extern_function_declaration();
+                        extern_block->add_function_declaration(std::move(func_decl));
+                    }
+                    else
+                    {
+                        error("Expected function declaration in extern block");
+                        synchronize();
+                    }
+                }
+                catch (const ParseError &e)
+                {
+                    _errors.push_back(e);
+                    synchronize();
+                }
             }
         }
 

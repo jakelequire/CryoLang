@@ -126,6 +126,45 @@ namespace Cryo
         CompilerInstance &_compiler;
     };
 
+    /**
+     * @brief Pass 1.4: C Header Import
+     *
+     * Processes extern "CImport" blocks by running clang-20 -E on
+     * referenced headers, parsing the preprocessed C with a custom
+     * minimal C parser, and injecting the resulting function declarations
+     * into the ExternBlockNode.
+     */
+    class CHeaderImportPass : public CompilerPass
+    {
+    public:
+        explicit CHeaderImportPass(CompilerInstance &compiler);
+
+        std::string name() const override { return "CHeaderImport"; }
+        PassStage stage() const override { return PassStage::Frontend; }
+        int order() const override { return 4; }
+        PassScope scope() const override { return PassScope::PerFile; }
+
+        std::vector<PassDependency> dependencies() const override
+        {
+            return {PassDependency::required(PassProvides::AST_VALIDATED)};
+        }
+
+        std::vector<std::string> provides() const override
+        {
+            return {PassProvides::C_HEADERS_IMPORTED};
+        }
+
+        std::string description() const override
+        {
+            return "Import C header declarations via CImport blocks";
+        }
+
+        PassResult run(PassContext &ctx) override;
+
+    private:
+        CompilerInstance &_compiler;
+    };
+
     // ============================================================================
     // Stage 2: Module Resolution Passes
     // ============================================================================
@@ -147,7 +186,7 @@ namespace Cryo
 
         std::vector<PassDependency> dependencies() const override
         {
-            return {PassDependency::required(PassProvides::AST_VALIDATED)};
+            return {PassDependency::required(PassProvides::C_HEADERS_IMPORTED)};
         }
 
         std::vector<std::string> provides() const override

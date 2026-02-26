@@ -781,6 +781,38 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Standard library linking disabled by --no-std flag");
             }
 
+            // Compile discovered C source files (from CImport blocks) and add to linker
+            for (const auto &c_file : _c_source_files)
+            {
+                std::string obj_path = std::filesystem::temp_directory_path().string() +
+                                       "/cryo_cimport_" + std::filesystem::path(c_file).stem().string() + ".o";
+                std::string cmd = "clang-20 -c \"" + c_file + "\" -o \"" + obj_path + "\" 2>&1";
+                int ret = system(cmd.c_str());
+                if (ret == 0 && std::filesystem::exists(obj_path))
+                {
+                    _linker->add_object_file(obj_path);
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Compiled and added C source for linking: {} -> {}", c_file, obj_path);
+                }
+                else
+                {
+                    LOG_WARN(Cryo::LogComponent::GENERAL, "Failed to compile C source file: {}", c_file);
+                }
+            }
+
+            // Add extra object files from --link-object CLI flag
+            for (const auto &obj_file : _extra_object_files)
+            {
+                if (std::filesystem::exists(obj_file))
+                {
+                    _linker->add_object_file(obj_file);
+                    LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added extra object file for linking: {}", obj_file);
+                }
+                else
+                {
+                    LOG_WARN(Cryo::LogComponent::GENERAL, "Extra object file not found: {}", obj_file);
+                }
+            }
+
             // Get generated module and link
             llvm::Module *module = _codegen->get_module();
             if (!module)
@@ -1982,6 +2014,45 @@ namespace Cryo
                 _symbol_table->declare_variable(var_decl->name(), var_decl->get_resolved_type(), var_decl->location(), false);
             }
             // Skip other variable declarations - they will be properly handled by TypeChecker
+        }
+        // Handle extern blocks — register contained function declarations
+        else if (auto extern_block = dynamic_cast<ExternBlockNode *>(node))
+        {
+            std::string ns_alias = extern_block->namespace_alias();
+            for (const auto &fn_decl : extern_block->function_declarations())
+            {
+                if (!fn_decl)
+                    continue;
+
+                // Register the function with its bare C name
+                collect_declarations_pass(fn_decl.get(), current_scope, scope_name);
+
+                // For CImport blocks with a namespace alias, also register under
+                // the qualified name (e.g., "ex::greet") so ScopeResolutionNode resolves it
+                if (extern_block->is_c_import() && !ns_alias.empty())
+                {
+                    std::string qualified_name = ns_alias + "::" + fn_decl->name();
+
+                    std::vector<TypeRef> param_types;
+                    for (const auto &param : fn_decl->parameters())
+                    {
+                        param_types.push_back(param->get_resolved_type());
+                    }
+
+                    TypeRef return_type = fn_decl->get_resolved_return_type();
+                    if (!return_type.is_valid())
+                    {
+                        return_type = _ast_context->types().get_void();
+                    }
+
+                    TypeRef function_type = _ast_context->types().get_function(return_type, param_types);
+                    _symbol_table->declare_function(qualified_name, function_type, fn_decl->location());
+
+                    LOG_TRACE(Cryo::LogComponent::GENERAL,
+                              "Pass 1: Registered CImport function: {} (C name: {})",
+                              qualified_name, fn_decl->name());
+                }
+            }
         }
         // Handle declaration statements (our wrapper)
         else if (auto decl_stmt = dynamic_cast<DeclarationStatementNode *>(node))
