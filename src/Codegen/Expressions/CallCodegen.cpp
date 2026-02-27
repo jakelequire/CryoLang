@@ -39,7 +39,7 @@ namespace Cryo::Codegen
         "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat",
         "strchr", "strrchr", "strstr", "strdup", "substr",
         // I/O operations
-        "printf", "snprintf", "sprintf", "fprintf", "sscanf", "getchar", "putchar", "puts",
+        "printf", "println", "snprintf", "sprintf", "fprintf", "sscanf", "getchar", "putchar", "puts",
         // File I/O
         "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush", "feof", "ferror",
         "fgets", "fputs", "fgetc", "fputc", "fileno", "fdopen",
@@ -48,7 +48,7 @@ namespace Cryo::Codegen
         // Filesystem operations
         "stat", "fstat", "lstat", "access", "mkdir", "rmdir", "unlink", "rename",
         "symlink", "readlink", "truncate", "ftruncate", "chmod", "chown",
-        "getcwd", "chdir", "opendir", "readdir", "closedir",
+        "getcwd", "chdir", "opendir", "readdir", "closedir", "dirent_name", "dirent_type",
         // Process management
         "exit", "abort", "fork", "execvp", "wait", "waitpid",
         "getpid", "getppid", "getuid", "getgid", "geteuid", "getegid",

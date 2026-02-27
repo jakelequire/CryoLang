@@ -13,7 +13,7 @@
 namespace HelloWorld;
 
 function main() -> int {
-    printf("Hello, world!\n");
+    println("Hello, world!\n");
     return 0;
 }
 ```
@@ -84,7 +84,7 @@ Create `hello.cryo`:
 namespace Hello;
 
 function main() -> int {
-    printf("Hello, world!\n");
+    println("Hello, world!");
     return 0;
 }
 ```
@@ -139,7 +139,7 @@ function add(a: int, b: int) -> int {
 }
 
 function greet(name: string) -> void {
-    printf("Hello, %s!\n", name);
+    println("Hello, %s!\n", name);
 }
 ```
 
@@ -148,19 +148,19 @@ function greet(name: string) -> void {
 ```cryo
 // if / else
 if (x > 0) {
-    printf("positive\n");
+    println("positive");
 } else if (x < 0) {
-    printf("negative\n");
+    println("negative");
 } else {
-    printf("zero\n");
+    println("zero");
 }
 
-// If expressions can return values
+// if expressions can return values
 const is_even: boolean = if (n % 2 == 0) { true } else { false };
 
 // for loop
 for (mut i: int = 0; i < 10; i++) {
-    printf("%d\n", i);
+    println("%d", i);
 }
 
 // while loop
@@ -175,12 +175,12 @@ loop {
 
 // match (integers, enums)
 match (n) {
-    1 => { printf("one\n"); }
-    2 => { printf("two\n"); }
-    _ => { printf("other\n"); }
+    1 => { println("one"); }
+    2 => { println("two"); }
+    _ => { println("other"); }
 }
 
-// Match expressions can return values
+// match expressions can return values
 const parity: string = match (n % 2) {
     0 => { "even" }
     1 => { "odd" }
@@ -213,9 +213,9 @@ type struct Rect {
 
 function main() -> int {
     mut r: Rect = Rect::new(5, 10);
-    printf("Area: %d\n", r.area());    // 50
+    println("Area: %d", r.area());    // 50
     r.scale(2);
-    printf("Area: %d\n", r.area());    // 200
+    println("Area: %d", r.area());    // 200
     return 0;
 }
 ```
@@ -235,8 +235,8 @@ public:
         this.kind = _kind;
     }
 
-    describe() -> void {
-        printf("Animal: %s\n", this.kind);
+    describe(&this) -> void {
+        println("Animal: %s", this.kind);
     }
 }
 
@@ -260,8 +260,8 @@ public:
         this.name = _name;
     }
 
-    bark() -> void {
-        printf("%s says: Woof!\n", this.name);
+    bark(&this) -> void {
+        println("%s says: Woof!", this.name);
     }
 }
 
@@ -290,8 +290,8 @@ type class Dog : Animal {
 public:
     Dog() : Animal("Dog") {}
 
-    override speak() -> void {
-        printf("%s speaks: Woof!\n", this.name);
+    override speak(&this) -> void {
+        println("%s speaks: Woof!", this.name);
     }
 }
 
@@ -299,8 +299,8 @@ type class Cat : Animal {
 public:
     Cat() : Animal("Cat") {}
 
-    override speak() -> void {
-        printf("%s speaks: Meow!\n", this.name);
+    override speak(&this) -> void {
+        println("%s speaks: Meow!", this.name);
     }
 }
 
@@ -340,8 +340,8 @@ public:
     name: string;
     GoldenRetriever(_name: string) : Dog("GoldenRetriever") { this.name = _name; }
 
-    introduce() -> void {
-        printf("%s: %s (%s, %s)\n", this.breed, this.name, this.breed, this.species);
+    introduce(&this) -> void {
+        println("%s: %s (%s, %s)", this.breed, this.name, this.breed, this.species);
     }
 }
 ```
@@ -353,7 +353,7 @@ public:
 | **Allocation** | Stack (value type) | Heap via `new` (reference type) |
 | **Inheritance** | No | Single inheritance |
 | **Virtual dispatch** | No | `virtual` / `override` |
-| **Receivers** | `&this` / `mut &this` ( ** ) |
+| **Receivers** | `&this` / `mut &this` ( ** ) | `&this` / `mut &this` ( ** ) |
 | **Use when** | Plain data, small types, generics | Polymorphism, object hierarchies |
 
 ** Non-static methods on any object *(struct or class)* by default receive an immutable reference `&this`. Use `mut &this` if mutation is needed.
@@ -372,13 +372,13 @@ type enum Shape {
 function describe(s: Shape) -> void {
     match (s) {
         Shape::Circle(r) => {
-            printf("Circle with radius %f\n", r);
+            println("Circle with radius %f\n", r);
         }
         Shape::Rectangle(w, h) => {
-            printf("Rectangle %f x %f\n", w, h);
+            println("Rectangle %f x %f\n", w, h);
         }
         Shape::Point => {
-            printf("A point\n");
+            println("A point\n");
         }
     }
 }
@@ -529,7 +529,7 @@ Cryo provides explicit pointer operations for systems-level control.
 function example() -> void {
     mut x: int = 42;
     const ptr: int* = &x;          // address-of
-    printf("%d\n", *ptr);          // dereference
+    println("%d\n", *ptr);          // dereference
 
     // Heap allocation
     const buf: int* = malloc(sizeof(int) * 10);
