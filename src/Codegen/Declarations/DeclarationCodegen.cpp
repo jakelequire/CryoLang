@@ -3441,6 +3441,28 @@ namespace Cryo::Codegen
             ctx().clear_current_function();
             ctx().set_result(nullptr);
         }
+        else if (fn && !node->body() && fn->empty() && node->is_virtual())
+        {
+            // Bodyless virtual method (pure virtual / abstract) — generate an empty
+            // default body so the linker can resolve direct calls.  Without vtable
+            // dispatch, calls through a base-class pointer are emitted as direct calls
+            // to this function, so it must have a definition.
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Generating empty body for abstract virtual method: {}",
+                      fn->getName().str());
+
+            llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", fn);
+            builder().SetInsertPoint(entry);
+
+            if (fn->getReturnType()->isVoidTy())
+            {
+                builder().CreateRetVoid();
+            }
+            else
+            {
+                builder().CreateRet(llvm::Constant::getNullValue(fn->getReturnType()));
+            }
+        }
     }
 
     void DeclarationCodegen::generate_impl_block(Cryo::ImplementationBlockNode *node)
