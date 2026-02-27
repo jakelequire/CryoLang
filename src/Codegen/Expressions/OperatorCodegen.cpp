@@ -116,25 +116,101 @@ namespace Cryo::Codegen
             TypeRef lhs_type = node->left()->get_resolved_type();
             TypeRef rhs_type = node->right()->get_resolved_type();
 
-            // Fallback: if AST types are unresolved, try variable_types_map for identifiers
+            // Fallback: resolve expression types from variable_types_map, TemplateRegistry, etc.
+            // Handles identifiers, array access (arr[i]), and member access (this.field).
+            std::function<TypeRef(Cryo::ExpressionNode *)> resolve_expr_type =
+                [this, &resolve_expr_type](Cryo::ExpressionNode *expr) -> TypeRef
+            {
+                if (!expr)
+                    return TypeRef();
+
+                // 1. Identifier — look up in variable_types_map
+                if (auto *ident = dynamic_cast<Cryo::IdentifierNode *>(expr))
+                {
+                    auto it = ctx().variable_types_map().find(ident->name());
+                    if (it != ctx().variable_types_map().end())
+                        return it->second;
+                    return TypeRef();
+                }
+
+                // 2. ArrayAccessNode — resolve array type, return element type
+                if (auto *arr_acc = dynamic_cast<Cryo::ArrayAccessNode *>(expr))
+                {
+                    // Try resolved type on the array expression first
+                    TypeRef arr_type = arr_acc->array()->get_resolved_type();
+                    if (!arr_type)
+                    {
+                        // Recurse to resolve the array expression type
+                        arr_type = resolve_expr_type(arr_acc->array());
+                    }
+                    if (arr_type && arr_type->kind() == Cryo::TypeKind::Array)
+                    {
+                        auto *at = dynamic_cast<const Cryo::ArrayType *>(arr_type.get());
+                        if (at)
+                            return at->element();
+                    }
+                    return TypeRef();
+                }
+
+                // 3. MemberAccessNode — look up field type from TemplateRegistry
+                if (auto *mem = dynamic_cast<Cryo::MemberAccessNode *>(expr))
+                {
+                    std::string base_type_name;
+                    if (auto *base_ident = dynamic_cast<Cryo::IdentifierNode *>(mem->object()))
+                    {
+                        if (base_ident->name() == "this")
+                        {
+                            base_type_name = ctx().current_type_name();
+                        }
+                        else
+                        {
+                            auto it = ctx().variable_types_map().find(base_ident->name());
+                            if (it != ctx().variable_types_map().end() && it->second.is_valid())
+                            {
+                                TypeRef bt = it->second;
+                                if (bt->kind() == Cryo::TypeKind::Pointer)
+                                {
+                                    auto *ptr = dynamic_cast<const Cryo::PointerType *>(bt.get());
+                                    if (ptr && ptr->pointee())
+                                        base_type_name = ptr->pointee()->display_name();
+                                }
+                                else
+                                    base_type_name = bt->display_name();
+                            }
+                        }
+                    }
+                    if (!base_type_name.empty())
+                    {
+                        if (auto *template_reg = ctx().template_registry())
+                        {
+                            std::vector<std::string> candidates = {base_type_name};
+                            if (!ctx().namespace_context().empty())
+                                candidates.push_back(ctx().namespace_context() + "::" + base_type_name);
+                            for (const auto &cand : candidates)
+                            {
+                                const auto *fi = template_reg->get_struct_field_types(cand);
+                                if (fi)
+                                {
+                                    for (size_t i = 0; i < fi->field_names.size(); ++i)
+                                    {
+                                        if (fi->field_names[i] == mem->member() &&
+                                            i < fi->field_types.size())
+                                            return fi->field_types[i];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return TypeRef();
+                }
+
+                return TypeRef();
+            };
+
             if (!lhs_type)
-            {
-                if (auto *ident = dynamic_cast<Cryo::IdentifierNode *>(node->left()))
-                {
-                    auto it = ctx().variable_types_map().find(ident->name());
-                    if (it != ctx().variable_types_map().end())
-                        lhs_type = it->second;
-                }
-            }
+                lhs_type = resolve_expr_type(node->left());
             if (!rhs_type)
-            {
-                if (auto *ident = dynamic_cast<Cryo::IdentifierNode *>(node->right()))
-                {
-                    auto it = ctx().variable_types_map().find(ident->name());
-                    if (it != ctx().variable_types_map().end())
-                        rhs_type = it->second;
-                }
-            }
+                rhs_type = resolve_expr_type(node->right());
 
             bool lhs_is_string = is_string_type(lhs_type);
             bool rhs_is_string = is_string_type(rhs_type);
@@ -213,6 +289,37 @@ namespace Cryo::Codegen
 
             if (lhs_is_array && rhs_is_array)
             {
+                // If values are pointers (not structs), load them as the Array<T> struct type
+                // so generate_array_concat can extract fields correctly.
+                if (lhs->getType()->isPointerTy() || rhs->getType()->isPointerTy())
+                {
+                    llvm::StructType *arr_st = nullptr;
+                    // Try to find the struct type from whichever side is already a struct
+                    if (lhs->getType()->isStructTy())
+                        arr_st = llvm::cast<llvm::StructType>(lhs->getType());
+                    else if (rhs->getType()->isStructTy())
+                        arr_st = llvm::cast<llvm::StructType>(rhs->getType());
+                    // Fallback: map from Cryo TypeRef
+                    if (!arr_st && lhs_type)
+                    {
+                        llvm::Type *mapped = get_llvm_type(lhs_type);
+                        if (mapped && mapped->isStructTy())
+                            arr_st = llvm::cast<llvm::StructType>(mapped);
+                    }
+                    if (!arr_st && rhs_type)
+                    {
+                        llvm::Type *mapped = get_llvm_type(rhs_type);
+                        if (mapped && mapped->isStructTy())
+                            arr_st = llvm::cast<llvm::StructType>(mapped);
+                    }
+                    if (arr_st)
+                    {
+                        if (lhs->getType()->isPointerTy())
+                            lhs = create_load(lhs, arr_st, "arr.concat.lhs");
+                        if (rhs->getType()->isPointerTy())
+                            rhs = create_load(rhs, arr_st, "arr.concat.rhs");
+                    }
+                }
                 return generate_array_concat(lhs, rhs, lhs_type);
             }
 
@@ -309,14 +416,27 @@ namespace Cryo::Codegen
                 any_arr_st = check_struct_name(lhs);
                 if (!any_arr_st) any_arr_st = check_struct_name(rhs);
             }
-            if (any_arr_st && lhs->getType()->isStructTy() && rhs->getType()->isStructTy())
+            if (any_arr_st)
             {
-                TypeRef best_type = node->get_resolved_type();
-                if (!best_type || best_type->kind() != Cryo::TypeKind::Array)
-                    best_type = lhs_type;
-                if (!best_type || best_type->kind() != Cryo::TypeKind::Array)
-                    best_type = rhs_type;
-                return generate_array_concat(lhs, rhs, best_type);
+                // If one side is a pointer, load it as the array struct type
+                if (lhs->getType()->isPointerTy() && !lhs->getType()->isStructTy())
+                {
+                    lhs = create_load(lhs, any_arr_st, "arr.load.lhs");
+                }
+                if (rhs->getType()->isPointerTy() && !rhs->getType()->isStructTy())
+                {
+                    rhs = create_load(rhs, any_arr_st, "arr.load.rhs");
+                }
+
+                if (lhs->getType()->isStructTy() && rhs->getType()->isStructTy())
+                {
+                    TypeRef best_type = node->get_resolved_type();
+                    if (!best_type || best_type->kind() != Cryo::TypeKind::Array)
+                        best_type = lhs_type;
+                    if (!best_type || best_type->kind() != Cryo::TypeKind::Array)
+                        best_type = rhs_type;
+                    return generate_array_concat(lhs, rhs, best_type);
+                }
             }
         }
 
@@ -1459,6 +1579,56 @@ namespace Cryo::Codegen
             }
         }
 
+        // Check for array struct before ensure_compatible_types (which asserts on struct vs int)
+        if (op == TokenKind::TK_PLUS)
+        {
+            auto is_array_struct = [](llvm::Type *ty) -> bool
+            {
+                if (!ty->isStructTy()) return false;
+                auto *st = llvm::cast<llvm::StructType>(ty);
+                if (!st->isLiteral() && st->hasName() && st->getName().starts_with("Array<"))
+                    return true;
+                if (!st->isOpaque() && st->getNumElements() == 3 &&
+                    st->getElementType(0)->isPointerTy() &&
+                    st->getElementType(1)->isIntegerTy(64) &&
+                    st->getElementType(2)->isIntegerTy(64))
+                    return true;
+                return false;
+            };
+
+            bool lhs_is_arr = is_array_struct(lhs->getType());
+            bool rhs_is_arr = is_array_struct(rhs->getType());
+
+            if (lhs_is_arr && rhs_is_arr)
+            {
+                return generate_array_concat(lhs, rhs, result_type);
+            }
+            if (lhs_is_arr || rhs_is_arr)
+            {
+                // One side is array struct, other is not — can't do arithmetic
+                std::string type_name = lhs_is_arr
+                    ? llvm::cast<llvm::StructType>(lhs->getType())->getName().str()
+                    : llvm::cast<llvm::StructType>(rhs->getType())->getName().str();
+                report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
+                             "Arithmetic operations not supported for type: " + type_name);
+                return nullptr;
+            }
+        }
+
+        // Guard: don't call ensure_compatible_types if types are fundamentally incompatible
+        // (e.g., struct vs integer) — this would cause an assertion failure
+        bool lhs_is_int_or_float = lhs->getType()->isIntegerTy() || lhs->getType()->isFloatingPointTy();
+        bool rhs_is_int_or_float = rhs->getType()->isIntegerTy() || rhs->getType()->isFloatingPointTy();
+        if (!lhs_is_int_or_float || !rhs_is_int_or_float)
+        {
+            std::string type_name = lhs->getType()->isStructTy()
+                ? lhs->getType()->getStructName().str()
+                : (rhs->getType()->isStructTy() ? rhs->getType()->getStructName().str() : "<unknown>");
+            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
+                         "Arithmetic operations not supported for type: " + type_name);
+            return nullptr;
+        }
+
         // Ensure compatible types for non-pointer arithmetic
         ensure_compatible_types(lhs, rhs);
 
@@ -1473,54 +1643,6 @@ namespace Cryo::Codegen
         if (type->isFloatingPointTy())
         {
             return generate_float_arithmetic(op, lhs, rhs);
-        }
-
-        // Last resort: if PLUS and either side looks like an Array struct, do array concat
-        if (op == TokenKind::TK_PLUS)
-        {
-            auto is_array_struct = [](llvm::Type *ty) -> bool
-            {
-                if (!ty->isStructTy()) return false;
-                auto *st = llvm::cast<llvm::StructType>(ty);
-                // Named Array<T> struct
-                if (!st->isLiteral() && st->hasName() && st->getName().starts_with("Array<"))
-                    return true;
-                // Anonymous { ptr, i64, i64 } layout (dynamic array pattern)
-                if (!st->isOpaque() && st->getNumElements() == 3 &&
-                    st->getElementType(0)->isPointerTy() &&
-                    st->getElementType(1)->isIntegerTy(64) &&
-                    st->getElementType(2)->isIntegerTy(64))
-                    return true;
-                return false;
-            };
-
-            bool lhs_is_arr = is_array_struct(lhs->getType());
-            bool rhs_is_arr = is_array_struct(rhs->getType());
-
-            if (lhs_is_arr || rhs_is_arr)
-            {
-                // Ensure both sides are the same struct type for concat
-                llvm::StructType *arr_st = nullptr;
-                if (lhs->getType()->isStructTy())
-                    arr_st = llvm::cast<llvm::StructType>(lhs->getType());
-                else if (rhs->getType()->isStructTy())
-                    arr_st = llvm::cast<llvm::StructType>(rhs->getType());
-
-                if (arr_st)
-                {
-                    // If one side is a pointer, load it as the array struct type
-                    if (lhs->getType()->isPointerTy() && !lhs->getType()->isStructTy())
-                    {
-                        lhs = create_load(lhs, arr_st, "arr.load.lhs");
-                    }
-                    if (rhs->getType()->isPointerTy() && !rhs->getType()->isStructTy())
-                    {
-                        rhs = create_load(rhs, arr_st, "arr.load.rhs");
-                    }
-
-                    return generate_array_concat(lhs, rhs, result_type);
-                }
-            }
         }
 
         std::string type_name = type->isStructTy() ? type->getStructName().str() : "<unknown>";
