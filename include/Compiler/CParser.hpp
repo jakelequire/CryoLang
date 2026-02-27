@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <cstdint>
 
 namespace Cryo
 {
@@ -42,7 +43,7 @@ namespace Cryo
 
     struct CEnumDecl
     {
-        std::string name;                        // May be empty for anonymous enums
+        std::string name; // May be empty for anonymous enums
         std::vector<CEnumConstant> constants;
     };
 
@@ -74,9 +75,9 @@ namespace Cryo
             Union,
             Enum,
             Typedef,
-            Bool,     // _Bool
-            SizeT,    // size_t
-            Int8T,    // int8_t, uint8_t, etc.
+            Bool,  // _Bool
+            SizeT, // size_t
+            Int8T, // int8_t, uint8_t, etc.
             Int16T,
             Int32T,
             Int64T,
@@ -86,17 +87,17 @@ namespace Cryo
             UInt64T,
 
             // Punctuation
-            Star,        // *
-            LParen,      // (
-            RParen,      // )
-            LBrace,      // {
-            RBrace,      // }
-            LBracket,    // [
-            RBracket,    // ]
-            Comma,        // ,
-            Semicolon,   // ;
-            Ellipsis,    // ...
-            Equals,      // =
+            Star,      // *
+            LParen,    // (
+            RParen,    // )
+            LBrace,    // {
+            RBrace,    // }
+            LBracket,  // [
+            RBracket,  // ]
+            Comma,     // ,
+            Semicolon, // ;
+            Ellipsis,  // ...
+            Equals,    // =
 
             // Other
             Identifier,

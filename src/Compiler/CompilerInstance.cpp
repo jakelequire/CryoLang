@@ -786,8 +786,13 @@ namespace Cryo
             {
                 // Place the .o next to the .c file to avoid collisions between parallel builds
                 std::filesystem::path c_path(c_file);
-                std::string obj_path = (c_path.parent_path() / (c_path.stem().string() + ".o")).string();
-                std::string cmd = "clang-20 -c \"" + c_file + "\" -o \"" + obj_path + "\" 2>&1";
+                std::string obj_path = (c_path.parent_path() / (c_path.stem().string() + ".o")).generic_string();
+                std::string c_file_normalized = std::filesystem::path(c_file).generic_string();
+#if defined(_WIN32) || defined(_WIN64)
+                std::string cmd = "C:/msys64/mingw64/bin/clang -c \"" + c_file_normalized + "\" -o \"" + obj_path + "\" 2>&1";
+#else
+                std::string cmd = "clang-20 -c \"" + c_file_normalized + "\" -o \"" + obj_path + "\" 2>&1";
+#endif
                 int ret = system(cmd.c_str());
                 if (ret == 0 && std::filesystem::exists(obj_path))
                 {
@@ -4288,6 +4293,20 @@ namespace Cryo
                 LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Module order after dependency sort:");
                 for (size_t i = 0; i < modules_to_generate.size(); ++i)
                     LOG_DEBUG(LogComponent::GENERAL, "  [{}] {}", i, modules_to_generate[i]);
+
+                // Pre-registration pass: create LLVM struct/class/enum types for ALL modules
+                // before any module generates method bodies. This ensures cross-module type
+                // references (e.g., Checker using Type*) can find the LLVM struct type.
+                LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Pre-registering type declarations for all modules");
+                for (const auto &module_name : modules_to_generate)
+                {
+                    auto it = imported_asts.find(module_name);
+                    if (it != imported_asts.end() && it->second)
+                    {
+                        _codegen->generate_imported_type_declarations(it->second.get(), module_name);
+                    }
+                }
+                LOG_DEBUG(LogComponent::GENERAL, "IR generation phase: Type pre-registration complete");
 
                 for (const auto &module_name : modules_to_generate)
                 {
