@@ -1890,9 +1890,9 @@ namespace Cryo::Codegen
 
     llvm::Value *Intrinsics::generate_sprintf(const std::vector<llvm::Value *> &args)
     {
-        if (args.size() < 2)
+        if (args.size() < 1)
         {
-            report_error("__sprintf__ requires at least 2 arguments (buffer, format, ...)");
+            report_error("__sprintf__ requires at least 1 argument (format, ...)");
             return nullptr;
         }
 
@@ -1908,7 +1908,61 @@ namespace Cryo::Codegen
         // Get or create sprintf function
         llvm::Function *sprintf_func = get_or_create_libc_function("sprintf", sprintf_type);
 
-        // Ensure first two arguments are pointers
+        // Detect calling convention:
+        // - CryoLang style: sprintf(format, args...) — args[0] is format (pointer), args[1] may not be pointer
+        // - C style: sprintf(buffer, format, args...) — args[0] and args[1] are both pointers
+        bool cryo_style = (args.size() == 1) ||
+                          (!args[0]->getType()->isPointerTy()) ||
+                          (args.size() >= 2 && !args[1]->getType()->isPointerTy());
+
+        if (cryo_style)
+        {
+            // CryoLang convention: sprintf(format, args...) → auto-allocate buffer
+            if (!args[0]->getType()->isPointerTy())
+            {
+                report_error("__sprintf__ format argument must be a string (pointer)");
+                return nullptr;
+            }
+
+            // Allocate a stack buffer for the result
+            llvm::Value *buffer = builder.CreateAlloca(
+                llvm::Type::getInt8Ty(context),
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 4096),
+                "sprintf.buf");
+
+            // Build args: buffer, format, variadic args...
+            std::vector<llvm::Value *> converted_args;
+            converted_args.reserve(args.size() + 1);
+            converted_args.push_back(buffer);
+
+            for (size_t i = 0; i < args.size(); ++i)
+            {
+                llvm::Value *arg = args[i];
+                llvm::Type *arg_type = arg->getType();
+
+                if (arg_type->isIntegerTy())
+                {
+                    unsigned bit_width = arg_type->getIntegerBitWidth();
+                    if (bit_width < 32)
+                    {
+                        arg = builder.CreateZExt(arg, llvm::Type::getInt32Ty(context), "sprintf.arg.promote");
+                    }
+                }
+                else if (arg_type->isFloatTy())
+                {
+                    arg = builder.CreateFPExt(arg, llvm::Type::getDoubleTy(context), "sprintf.arg.fpext");
+                }
+
+                converted_args.push_back(arg);
+            }
+
+            builder.CreateCall(sprintf_func, converted_args, "sprintf.result");
+
+            // Return the buffer pointer (the formatted string)
+            return buffer;
+        }
+
+        // C-style convention: sprintf(buffer, format, args...)
         if (!args[0]->getType()->isPointerTy() || !args[1]->getType()->isPointerTy())
         {
             report_error("__sprintf__ buffer and format arguments must be pointers");

@@ -2,17 +2,12 @@
   <img src="./assets/cryo-logo.svg" alt="Cryo" width="180"/>
 
   <h1>The Cryo Programming Language</h1>
+  <h4><i>Under Development</i></h4>
 
-  <p>A statically-typed, compiled systems language with monomorphic generics, class inheritance, algebraic data types, and an LLVM backend.</p>
-
-  [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-  [![LLVM](https://img.shields.io/badge/LLVM-20-orange.svg)](https://llvm.org/)
-  [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20WASM-lightgrey.svg)]()
+  <p>A statically-typed, compiled systems language with monomorphic generics, class inheritance, pattern matching, algebraic data types, and an LLVM backend.</p>
 </div>
 
 ---
-
-Cryo is a systems programming language designed for performance, clarity, and zero-cost abstractions. It combines a familiar C-style syntax with modern language features — class inheritance with virtual dispatch, pattern matching, generic types, a module system, and a comprehensive standard library — all compiled through LLVM 20 to produce efficient native code.
 
 ```cryo
 namespace HelloWorld;
@@ -55,8 +50,8 @@ function main() -> int {
 | **Algebraic data types** | Enums with payloads and exhaustive pattern matching |
 | **Module system** | Hierarchical namespaces with visibility control and a prelude |
 | **LLVM 20 backend** | Optimizing compilation to native x86-64, ARM64, and WebAssembly |
-| **Rich standard library** | `Option<T>`, `Result<T, E>`, `Array<T>`, `String`, allocators, I/O, and more — written entirely in Cryo |
-| **Self-hosting** | The compiler orchestration layer is being rewritten in Cryo itself |
+| **Rich standard library** | `Option<T>`, `Result<T, E>`, `Array<T>`, `String`, allocators, I/O, and more |
+| **Self-hosting** | *(In development)* The compiler is written in Cryo itself, bootstrapped from C++ |
 | **Integrated tooling** | LSP server, VS Code extension, code formatter, and a tiered test suite |
 
 ## Getting Started
@@ -160,6 +155,9 @@ if (x > 0) {
     printf("zero\n");
 }
 
+// If expressions can return values
+const is_even: boolean = if (n % 2 == 0) { true } else { false };
+
 // for loop
 for (mut i: int = 0; i < 10; i++) {
     printf("%d\n", i);
@@ -177,10 +175,17 @@ loop {
 
 // match (integers, enums)
 match (n) {
-    1 => { printf("one\n"); },
-    2 => { printf("two\n"); },
-    _ => { printf("other\n"); },
+    1 => { printf("one\n"); }
+    2 => { printf("two\n"); }
+    _ => { printf("other\n"); }
 }
+
+// Match expressions can return values
+const parity: string = match (n % 2) {
+    0 => { "even" }
+    1 => { "odd" }
+    _ => { "unknown" }
+};
 ```
 
 ### Structs
@@ -348,15 +353,17 @@ public:
 | **Allocation** | Stack (value type) | Heap via `new` (reference type) |
 | **Inheritance** | No | Single inheritance |
 | **Virtual dispatch** | No | `virtual` / `override` |
-| **Receivers** | `&this` / `mut &this` | `this` (implicit pointer) |
+| **Receivers** | `&this` / `mut &this` ( ** ) |
 | **Use when** | Plain data, small types, generics | Polymorphism, object hierarchies |
+
+** Non-static methods on any object *(struct or class)* by default receive an immutable reference `&this`. Use `mut &this` if mutation is needed.
 
 ### Enums & Pattern Matching
 
 Enums support unit variants and variants with payloads. Pattern matching is exhaustive.
 
 ```cryo
-enum Shape {
+type enum Shape {
     Circle(f64);
     Rectangle(f64, f64);
     Point;
@@ -453,17 +460,17 @@ function min<T>(a: T, b: T) -> T {
 ```cryo
 implement enum Option<T> {
     is_some(&this) -> boolean {
-        match (&this) {
-            Option::Some(_) => { return true; }
-            Option::None =>    { return false; }
-        }
+        return match (this) {
+            Option::Some(_) => { true }
+            Option::None =>    { false }
+        };
     }
 
     unwrap_or(&this, default_value: T) -> T {
-        match (&this) {
-            Option::Some(value) => { return value; }
-            Option::None =>        { return default_value; }
-        }
+        return match (this) {
+            Option::Some(value) => { value }
+            Option::None =>        { default_value }
+        };
     }
 }
 ```
@@ -490,7 +497,7 @@ public module matrix;
 // math/vector.cryo
 namespace Math::Vector;
 
-public type struct Vec2 {
+type struct Vec2 {
     x: f64;
     y: f64;
 
@@ -504,10 +511,10 @@ public type struct Vec2 {
 // main.cryo
 namespace Main;
 
-import Math;
+import Math::Vector;
 
 function main() -> int {
-    const v: Math::Vector::Vec2 = Math::Vector::Vec2::new(1.0, 2.0);
+    const v: Vec2 = Vec2::new(1.0, 2.0);
     return 0;
 }
 ```
@@ -545,6 +552,7 @@ function example() -> void {
 | `char` | 8-bit character |
 | `string` | Null-terminated string (`char*`) |
 | `void` | No value |
+| `()` | Unit type |
 
 ### Type Casting
 
@@ -571,50 +579,22 @@ The standard library is written entirely in Cryo and compiled as a static librar
 
 The prelude provides `Option<T>`, `Result<T, E>`, `Array<T>`, `String`, `print`, `println`, `assert`, `assert_eq`, `panic`, `min`, `max`, `clamp`, `swap`, `identity`, and more.
 
-### Module Overview
 
-| Module | Contents |
-|---|---|
-| `core::option` | `Option<T>` — `Some(T)` / `None` with `unwrap`, `map`, `and_then`, `unwrap_or` |
-| `core::result` | `Result<T, E>` — `Ok(T)` / `Err(E)` with `unwrap`, `map`, `and_then`, `is_ok` |
-| `core::primitives` | Methods on built-in types: `to_i64()`, `abs()`, `min_value()`, `max_value()` |
-| `core::intrinsics` | `malloc`, `free`, `memcpy`, `memset`, `printf`, `sizeof` |
-| `core::mem` | `sizeof<T>()`, `default<T>()`, `take`, `replace` |
-| `collections::array` | `Array<T>` — growable array with `push`, `pop`, `len`, `capacity`, `filled` |
-| `collections::string` | `String` — heap-allocated UTF-8 string with `from_cstr`, `push_char`, `len` |
-| `collections::hashmap` | `HashMap<K, V>` — hash table |
-| `collections::deque` | `Deque<T>` — double-ended queue |
-| `collections::btree` | `BTreeMap<K, V>` — ordered map |
-| `alloc` | Arena, heap, stack, and pool allocators |
-| `io::stdio` | `print`, `println`, `printf` |
-| `io::file` | File reading and writing |
-| `thread` | Threads, mutexes, condition variables |
-| `sync` | Atomics, channels, semaphores |
-| `fs` | File system operations, paths |
-| `time` | Instant, Duration, Timer |
-| `math` | Mathematical functions |
+### Core Modules
+- `/stdlib/alloc` — Arena, heap, stack, pool allocators
+- `/stdlib/collections` — Array, String, HashMap, Deque, BTreeMap
+- `/stdlib/core` — Option, Result, primitives, intrinsics
+- `/stdlib/env` — Environment variables, args
+- `/stdlib/ffi` — Foreign function interface (C interop)
+- `/stdlib/fmt` — Formatting
+- `/stdlib/fs` — File system, paths
+- `/stdlib/io` — stdio, file, reader, writer
+- `/stdlib/math` — math functions and constants
+- `/stdlib/os` — OS abstractions, threads, synchronization
+- `/stdlib/process` — Process spawning, exit codes
+- `/stdlib/time` — Time, duration, sleep
 
-### Example: Option and Result
 
-```cryo
-function find(arr: Array<int>, target: int) -> Option<u64> {
-    mut i: u64 = 0;
-    while (i < arr.len()) {
-        if (arr[i] == target) {
-            return Option::Some(i);
-        }
-        i = i + 1;
-    }
-    return Option::None;
-}
-
-function divide(a: f64, b: f64) -> Result<f64, string> {
-    if (b == 0.0) {
-        return Result::Err("division by zero");
-    }
-    return Result::Ok(a / b);
-}
-```
 
 ## Tooling
 
@@ -764,15 +744,6 @@ Source → Frontend → Module Resolution → Declaration Collection → Type Re
 | **IR Generation** | Emit LLVM IR via the LLVM 20 C++ API |
 | **Optimization** | LLVM optimization passes and linking |
 
-## Contributing
-
-Cryo is under active development. Contributions are welcome across all areas:
-
-- **Language design** — syntax, semantics, new features
-- **Compiler** — passes, optimizations, diagnostics
-- **Standard library** — new modules, more methods on existing types
-- **Tooling** — LSP improvements, formatter, debugger integration
-- **Documentation** — guides, examples, specification
 
 ## License
 

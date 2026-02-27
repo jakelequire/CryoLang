@@ -3940,6 +3940,94 @@ namespace Cryo::Codegen
                         }
                     }
 
+                    // Handle array-indexed parent (e.g., entries[k].visibility in entries[k].visibility.is_public())
+                    else if (auto *parent_arr = dynamic_cast<ArrayAccessNode *>(member_access->object()))
+                    {
+                        ExpressionNode *arr_expr = parent_arr->array();
+                        if (auto *arr_id = dynamic_cast<IdentifierNode *>(arr_expr))
+                        {
+                            auto &var_types = ctx().variable_types_map();
+                            auto it = var_types.find(arr_id->name());
+                            if (it != var_types.end() && it->second.is_valid())
+                            {
+                                TypeRef var_type = it->second;
+                                if (var_type->kind() == Cryo::TypeKind::Array)
+                                {
+                                    auto *arr_type = dynamic_cast<const Cryo::ArrayType *>(var_type.get());
+                                    if (arr_type && arr_type->element().is_valid())
+                                    {
+                                        parent_type_name = arr_type->element()->display_name();
+                                        if (!parent_type_name.empty() && parent_type_name.back() == '*')
+                                            parent_type_name.pop_back();
+                                    }
+                                }
+                            }
+                        }
+                        else if (auto *arr_member = dynamic_cast<MemberAccessNode *>(arr_expr))
+                        {
+                            // e.g., this.module_entries[j] — resolve field type's element type
+                            std::string arr_field_name = arr_member->member();
+                            std::string arr_parent_type;
+
+                            if (auto *arr_parent_id = dynamic_cast<IdentifierNode *>(arr_member->object()))
+                            {
+                                if (arr_parent_id->name() == "this")
+                                    arr_parent_type = ctx().current_type_name();
+                                else
+                                {
+                                    auto &var_types = ctx().variable_types_map();
+                                    auto vit = var_types.find(arr_parent_id->name());
+                                    if (vit != var_types.end() && vit->second.is_valid())
+                                    {
+                                        arr_parent_type = vit->second->display_name();
+                                        if (!arr_parent_type.empty() && (arr_parent_type.back() == '*' || arr_parent_type.back() == '&'))
+                                            arr_parent_type.pop_back();
+                                    }
+                                }
+                            }
+
+                            if (!arr_parent_type.empty())
+                            {
+                                auto cands = generate_lookup_candidates(arr_parent_type, Cryo::SymbolKind::Type);
+                                if (auto *template_reg = ctx().template_registry())
+                                {
+                                    for (const auto &cand : cands)
+                                    {
+                                        const TemplateRegistry::StructFieldInfo *fi = template_reg->get_struct_field_types(cand);
+                                        if (fi)
+                                        {
+                                            for (size_t i = 0; i < fi->field_names.size(); ++i)
+                                            {
+                                                if (fi->field_names[i] == arr_field_name && i < fi->field_types.size())
+                                                {
+                                                    TypeRef ft = fi->field_types[i];
+                                                    if (ft.is_valid() && ft->kind() == Cryo::TypeKind::Array)
+                                                    {
+                                                        auto *arr_t = dynamic_cast<const Cryo::ArrayType *>(ft.get());
+                                                        if (arr_t && arr_t->element().is_valid())
+                                                        {
+                                                            parent_type_name = arr_t->element()->display_name();
+                                                            if (!parent_type_name.empty() && parent_type_name.back() == '*')
+                                                                parent_type_name.pop_back();
+                                                        }
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                            if (!parent_type_name.empty()) break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!parent_type_name.empty())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Array-indexed parent: resolved element type to '{}'", parent_type_name);
+                        }
+                    }
+
                     // Now look up the field type using TemplateRegistry
                     if (!parent_type_name.empty())
                     {
@@ -4210,6 +4298,162 @@ namespace Cryo::Codegen
                         }
                     }
                 }
+                // Fallback for array-indexed receiver (e.g., this.scopes[idx].find(name))
+                // When the object is an ArrayAccessNode, resolve the array's element type
+                else if (auto *array_access = dynamic_cast<ArrayAccessNode *>(callee->object()))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Attempting type resolution for array-indexed receiver");
+
+                    // The array sub-expression can be:
+                    //   - MemberAccessNode (e.g., this.scopes)
+                    //   - IdentifierNode (e.g., entries)
+                    ExpressionNode *array_expr = array_access->array();
+                    std::string array_type_name;
+
+                    if (auto *arr_member = dynamic_cast<MemberAccessNode *>(array_expr))
+                    {
+                        // e.g., this.scopes[idx] -> resolve "scopes" field type on parent
+                        std::string arr_field_name = arr_member->member();
+                        std::string arr_parent_type;
+
+                        if (auto *arr_parent_id = dynamic_cast<IdentifierNode *>(arr_member->object()))
+                        {
+                            if (arr_parent_id->name() == "this")
+                            {
+                                arr_parent_type = ctx().current_type_name();
+                            }
+                            else
+                            {
+                                auto &var_types = ctx().variable_types_map();
+                                auto it = var_types.find(arr_parent_id->name());
+                                if (it != var_types.end() && it->second.is_valid())
+                                {
+                                    arr_parent_type = it->second->display_name();
+                                    if (!arr_parent_type.empty() && (arr_parent_type.back() == '*' || arr_parent_type.back() == '&'))
+                                        arr_parent_type.pop_back();
+                                }
+                            }
+                        }
+
+                        if (!arr_parent_type.empty())
+                        {
+                            auto type_candidates = generate_lookup_candidates(arr_parent_type, Cryo::SymbolKind::Type);
+                            if (auto *template_reg = ctx().template_registry())
+                            {
+                                for (const auto &candidate : type_candidates)
+                                {
+                                    const TemplateRegistry::StructFieldInfo *field_info = template_reg->get_struct_field_types(candidate);
+                                    if (field_info)
+                                    {
+                                        for (size_t i = 0; i < field_info->field_names.size(); ++i)
+                                        {
+                                            if (field_info->field_names[i] == arr_field_name && i < field_info->field_types.size())
+                                            {
+                                                TypeRef field_type = field_info->field_types[i];
+                                                if (field_type.is_valid())
+                                                {
+                                                    // Field is an array type — get element type
+                                                    if (field_type->kind() == Cryo::TypeKind::Array)
+                                                    {
+                                                        auto *arr_type = dynamic_cast<const Cryo::ArrayType *>(field_type.get());
+                                                        if (arr_type && arr_type->element().is_valid())
+                                                        {
+                                                            TypeRef elem_type = arr_type->element();
+                                                            array_type_name = elem_type->display_name();
+                                                            // Strip pointer suffix
+                                                            if (!array_type_name.empty() && array_type_name.back() == '*')
+                                                                array_type_name.pop_back();
+                                                            // If element is itself an array (e.g., Symbol[][]),
+                                                            // the receiver is the inner array — use T[] naming
+                                                            // so the built-in array method detector matches
+                                                            if (elem_type->kind() == Cryo::TypeKind::Array)
+                                                            {
+                                                                auto *inner_arr = dynamic_cast<const Cryo::ArrayType *>(elem_type.get());
+                                                                if (inner_arr && inner_arr->element().is_valid())
+                                                                {
+                                                                    array_type_name = inner_arr->element()->display_name() + "[]";
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        // Not an array — use field type directly (shouldn't normally reach here)
+                                                        array_type_name = field_type->display_name();
+                                                        if (!array_type_name.empty() && array_type_name.back() == '*')
+                                                            array_type_name.pop_back();
+                                                    }
+                                                }
+                                                else if (i < field_info->field_type_annotations.size())
+                                                {
+                                                    // TypeRef invalid — use annotation string
+                                                    std::string annotation = field_info->field_type_annotations[i];
+                                                    // Strip [] suffix to get element type name
+                                                    if (annotation.size() > 2 && annotation.compare(annotation.size() - 2, 2, "[]") == 0)
+                                                    {
+                                                        array_type_name = annotation.substr(0, annotation.size() - 2);
+                                                        // Strip pointer suffix if present
+                                                        if (!array_type_name.empty() && array_type_name.back() == '*')
+                                                            array_type_name.pop_back();
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        if (!array_type_name.empty()) break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else if (auto *arr_id = dynamic_cast<IdentifierNode *>(array_expr))
+                    {
+                        // e.g., entries[k] -> resolve "entries" type from variable_types_map
+                        auto &var_types = ctx().variable_types_map();
+                        auto it = var_types.find(arr_id->name());
+                        if (it != var_types.end() && it->second.is_valid())
+                        {
+                            TypeRef var_type = it->second;
+                            if (var_type->kind() == Cryo::TypeKind::Array)
+                            {
+                                auto *arr_type = dynamic_cast<const Cryo::ArrayType *>(var_type.get());
+                                if (arr_type && arr_type->element().is_valid())
+                                {
+                                    array_type_name = arr_type->element()->display_name();
+                                    if (!array_type_name.empty() && array_type_name.back() == '*')
+                                        array_type_name.pop_back();
+                                }
+                            }
+                        }
+                    }
+
+                    if (!array_type_name.empty())
+                    {
+                        type_name = array_type_name;
+
+                        // Qualify with source namespace if unqualified
+                        if (type_name.find("::") == std::string::npos)
+                        {
+                            if (auto *template_reg = ctx().template_registry())
+                            {
+                                auto candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
+                                for (const auto &cand : candidates)
+                                {
+                                    const TemplateRegistry::StructFieldInfo *fi = template_reg->get_struct_field_types(cand);
+                                    if (fi && !fi->source_namespace.empty())
+                                    {
+                                        type_name = fi->source_namespace + "::" + type_name;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Resolved array-indexed receiver type: {}", type_name);
+                    }
+                }
                 // Additional fallback for chained method calls (e.g., this.next().is_some())
                 // When the object is a CallExpressionNode, try to get the return type from the call
                 else if (auto *call_expr = dynamic_cast<CallExpressionNode *>(callee->object()))
@@ -4251,14 +4495,21 @@ namespace Cryo::Codegen
                             {
                                 if (auto *inner_id = dynamic_cast<IdentifierNode *>(inner_callee->object()))
                                 {
-                                    auto &var_types = ctx().variable_types_map();
-                                    auto it = var_types.find(inner_id->name());
-                                    if (it != var_types.end() && it->second.is_valid())
+                                    if (inner_id->name() == "this")
                                     {
-                                        inner_receiver_type = it->second->display_name();
-                                        if (!inner_receiver_type.empty() && inner_receiver_type.back() == '*')
+                                        inner_receiver_type = ctx().current_type_name();
+                                    }
+                                    else
+                                    {
+                                        auto &var_types = ctx().variable_types_map();
+                                        auto it = var_types.find(inner_id->name());
+                                        if (it != var_types.end() && it->second.is_valid())
                                         {
-                                            inner_receiver_type.pop_back();
+                                            inner_receiver_type = it->second->display_name();
+                                            if (!inner_receiver_type.empty() && inner_receiver_type.back() == '*')
+                                            {
+                                                inner_receiver_type.pop_back();
+                                            }
                                         }
                                     }
                                 }
@@ -4391,12 +4642,81 @@ namespace Cryo::Codegen
                                                       "Chained call returns pointer type");
                                         }
                                     }
+
+                                    // If LLVM type didn't give us a name (e.g., enums are i32),
+                                    // try TemplateRegistry method return type annotation
+                                    if (type_name.empty())
+                                    {
+                                        if (auto *template_reg = ctx().template_registry())
+                                        {
+                                            auto type_candidates = generate_lookup_candidates(inner_receiver_type, Cryo::SymbolKind::Type);
+                                            for (const auto &cand : type_candidates)
+                                            {
+                                                std::string qualified = cand + "::" + inner_method_name;
+                                                std::string ret_annotation = template_reg->get_method_return_type_annotation(qualified);
+                                                if (!ret_annotation.empty())
+                                                {
+                                                    type_name = ret_annotation;
+                                                    if (!type_name.empty() && type_name.back() == '*')
+                                                        type_name.pop_back();
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                              "Inferred chained call return type from annotation: {}", type_name);
+                                                    break;
+                                                }
+
+                                                // Also try find_template_method
+                                                const TemplateRegistry::MethodMetadata *meta =
+                                                    template_reg->find_template_method(cand, inner_method_name);
+                                                if (meta && !meta->return_type_annotation.empty())
+                                                {
+                                                    type_name = meta->return_type_annotation;
+                                                    if (!type_name.empty() && type_name.back() == '*')
+                                                        type_name.pop_back();
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                              "Inferred chained call return type from template method: {}", type_name);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 else
                                 {
                                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                               "Chained call fallback: Could not find inner method '{}.{}'",
                                               inner_receiver_type, inner_method_name);
+
+                                    // Even without LLVM function, try TemplateRegistry
+                                    if (auto *template_reg = ctx().template_registry())
+                                    {
+                                        auto type_candidates = generate_lookup_candidates(inner_receiver_type, Cryo::SymbolKind::Type);
+                                        for (const auto &cand : type_candidates)
+                                        {
+                                            std::string qualified = cand + "::" + inner_method_name;
+                                            std::string ret_annotation = template_reg->get_method_return_type_annotation(qualified);
+                                            if (!ret_annotation.empty())
+                                            {
+                                                type_name = ret_annotation;
+                                                if (!type_name.empty() && type_name.back() == '*')
+                                                    type_name.pop_back();
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "Inferred chained call return type from annotation (no LLVM fn): {}", type_name);
+                                                break;
+                                            }
+
+                                            const TemplateRegistry::MethodMetadata *meta =
+                                                template_reg->find_template_method(cand, inner_method_name);
+                                            if (meta && !meta->return_type_annotation.empty())
+                                            {
+                                                type_name = meta->return_type_annotation;
+                                                if (!type_name.empty() && type_name.back() == '*')
+                                                    type_name.pop_back();
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "Inferred chained call return type from template method (no LLVM fn): {}", type_name);
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4670,6 +4990,11 @@ namespace Cryo::Codegen
                     else if (elem_name == "boolean" || elem_name == "bool") elem_type = types().bool_type();
                     else if (elem_name == "string") elem_type = types().ptr_type();
                     else if (elem_name == "char") elem_type = types().i8_type();
+                    else if (elem_name.size() > 1 && elem_name.back() == '*')
+                    {
+                        // Pointer element type (e.g., "GenericParamNode*") — all pointers are opaque ptr
+                        elem_type = types().ptr_type();
+                    }
                     else
                     {
                         // Try looking up as a struct type in the LLVM module
@@ -4702,6 +5027,18 @@ namespace Cryo::Codegen
                         else if (normalized == "boolean") normalized = "bool";
                         array_struct = llvm::dyn_cast_or_null<llvm::StructType>(
                             llvm::StructType::getTypeByName(llvm_ctx(), "Array<" + normalized + ">"));
+                    }
+                    // For pointer element types or missing array structs, create on demand.
+                    // All dynamic arrays have the same layout: { ptr, i64, i64 }
+                    if (!array_struct && elem_type)
+                    {
+                        std::string array_name = "Array<" + elem_name + ">";
+                        std::vector<llvm::Type *> fields = {
+                            llvm::PointerType::get(llvm_ctx(), 0),  // elements: T*
+                            llvm::Type::getInt64Ty(llvm_ctx()),      // length
+                            llvm::Type::getInt64Ty(llvm_ctx())       // capacity
+                        };
+                        array_struct = llvm::StructType::create(llvm_ctx(), fields, array_name);
                     }
 
                     if (elem_type && array_struct)
