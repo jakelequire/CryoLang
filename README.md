@@ -1,563 +1,95 @@
-# CryoLang
-
 <div align="center">
-  <img src="./assets/cryo-logo.svg" alt="CryoLang Logo" width="200"/>
-  
-  **A Modern Systems Programming Language**
-  
-  Fast • Safe • Expressive
+  <img src="./assets/cryo-logo.svg" alt="Cryo" width="180"/>
+
+  <h1>The Cryo Programming Language</h1>
+
+  <p>A statically-typed, compiled systems language with monomorphic generics, class inheritance, algebraic data types, and an LLVM backend.</p>
+
+  [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+  [![LLVM](https://img.shields.io/badge/LLVM-20-orange.svg)](https://llvm.org/)
+  [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20WASM-lightgrey.svg)]()
 </div>
 
 ---
 
-## Overview
-
-CryoLang is a statically-typed, compiled systems programming language designed for performance, safety, and developer productivity. With a modern syntax, comprehensive type system, and zero-cost abstractions, CryoLang enables developers to write efficient, maintainable code for system-level applications.
-
-## Key Features
-
-**Memory Safety**: References, pointers, and automatic memory management with compile-time safety guarantees.
-
-**Generic Programming**: Template-like generics for code reuse without runtime overhead.
-
-**Pattern Matching**: Advanced pattern matching with destructuring for expressive control flow.
-
-**Trait System**: Interface-based programming with polymorphic behavior and composition.
-
-**LLVM Backend**: Optimizing compiler backend producing efficient native code.
-
-**Rich Type System**: Strong static typing with type inference, algebraic data types, and comprehensive error handling.
-
-## Language Syntax
-
-### Variable Declarations
-
-CryoLang supports both mutable and immutable variable declarations with explicit type annotations:
+Cryo is a systems programming language designed for performance, clarity, and zero-cost abstractions. It combines a familiar C-style syntax with modern language features — class inheritance with virtual dispatch, pattern matching, generic types, a module system, and a comprehensive standard library — all compiled through LLVM 20 to produce efficient native code.
 
 ```cryo
-const name: string = "CryoLang";        // Immutable variable
-mut counter: int = 0;                   // Mutable variable
-const pi: float = 3.14159;              // Floating point
-const is_ready: boolean = true;         // Boolean type
-const letter: char = 'A';               // Character type
-```
+namespace HelloWorld;
 
-### Functions
-
-Functions are first-class citizens with support for multiple parameters, return types, and generic programming:
-
-```cryo
-// Simple function
-function add(a: int, b: int) -> int {
-    return a + b;
-}
-
-// Function with multiple parameter types
-function process_data(id: int, name: string, active: boolean) -> void {
-    std::IO::println("Processing user data");
-    std::IO::print_int(id);
-    std::IO::println(name);
-    std::IO::print_bool(active);
-}
-
-// Generic function
-function swap<T>(a: T, b: T) -> void {
-    // Implementation details
+function main() -> int {
+    printf("Hello, world!\n");
+    return 0;
 }
 ```
 
-### Control Flow
-
-CryoLang provides comprehensive control flow constructs including loops, conditionals, and pattern matching:
-
-```cryo
-// Conditional statements
-const value: int = 42;
-if (value > 0) {
-    std::IO::println("Positive number");
-} else if (value < 0) {
-    std::IO::println("Negative number");
-} else {
-    std::IO::println("Zero");
-}
-
-// Loops
-for (mut i: int = 0; i < 10; i++) {
-    if (i == 5) {
-        continue;
-    }
-    if (i == 8) {
-        break;
-    }
-    std::IO::print_int(i);
-}
-
-mut counter: int = 0;
-while (counter < 5) {
-    std::IO::print_int(counter);
-    counter++;
-}
-
-// Ternary operator
-const result: int = value > 10 ? value : 10;
-```
-
-### Data Structures
-
-#### Structs
-
-Define custom data types with methods and constructors:
-
-```cryo
-type struct Point {
-    x: int;
-    y: int;
-    
-    Point(x: int, y: int);
-    distance_from_origin() -> float;
-    move(dx: int, dy: int) -> void;
-}
-
-implement struct Point {
-    Point(_x: int, _y: int) {
-        this.x = _x;
-        this.y = _y;
-    }
-    
-    distance_from_origin() -> float {
-        const dx: float = this.x as float;
-        const dy: float = this.y as float;
-        return std::Math::sqrt(dx * dx + dy * dy);
-    }
-    
-    move(dx: int, dy: int) -> void {
-        this.x = this.x + dx;
-        this.y = this.y + dy;
-    }
-}
-
-// Usage
-const point: Point = new Point(10, 20);
-point.move(5, -3);
-```
-
-#### Classes
-
-Object-oriented programming with encapsulation and inheritance:
-
-```cryo
-type class Circle {
-public:
-    center: Point;
-    radius: float;
-
-    Circle(center: Point, radius: float);
-    area() -> float;
-    circumference() -> float;
-
-private:
-    validate_radius() -> boolean;
-}
-
-implement class Circle {
-    Circle(_center: Point, _radius: float) {
-        this.center = _center;
-        this.radius = _radius;
-    }
-    
-    area() -> float {
-        return 3.14159 * this.radius * this.radius;
-    }
-    
-    circumference() -> float {
-        return 2.0 * 3.14159 * this.radius;
-    }
-}
-```
-
-#### Enums
-
-Support for both simple and complex algebraic data types:
-
-```cryo
-// Simple enum
-enum Status {
-    PENDING,
-    PROCESSING,
-    COMPLETED,
-    FAILED
-}
-
-// Complex enum with associated data
-enum Shape {
-    Circle(float),
-    Rectangle(float, float),
-    Triangle(float, float, float)
-}
-
-// Pattern matching with enums
-const shape: Shape = Shape::Circle(5.0);
-match shape {
-    Shape::Circle(radius) => {
-        const area: float = 3.14159 * radius * radius;
-        std::IO::print_float(area);
-    },
-    Shape::Rectangle(width, height) => {
-        const area: float = width * height;
-        std::IO::print_float(area);
-    },
-    Shape::Triangle(a, b, c) => {
-        const s: float = (a + b + c) / 2.0;
-        std::IO::print_float(s);
-    }
-}
-```
-
-### Arrays and Collections
-
-```cryo
-// Array declarations
-const numbers: int[] = [1, 2, 3, 4, 5];
-const names: string[] = ["Alice", "Bob", "Charlie"];
-const matrix: int[][] = [[1, 2], [3, 4], [5, 6]];
-
-// Array access
-const first: int = numbers[0];
-const element: int = matrix[1][0];  // Access 2D array
-
-// Iteration
-for (mut i: int = 0; i < 5; i++) {
-    std::IO::print_int(numbers[i]);
-}
-```
-
-### Memory Management
-
-CryoLang provides both references and pointers for fine-grained memory control:
-
-```cryo
-function memory_example() -> void {
-    mut x: int = 42;
-    mut y: int = 24;
-    
-    // References (safe, automatic dereferencing)
-    mut ref_x: &int = &x;
-    mut ref_y: &int = &y;
-    
-    // Pointers (explicit dereferencing required)
-    mut ptr_x: int* = &x;
-    mut ptr_y: int* = &y;
-    
-    // Modify through pointer
-    *ptr_x = *ptr_x + 10;  // x is now 52
-    
-    // Safe reference usage
-    x = *ref_x + 5;        // x is now 57
-}
-```
-
-### Generic Programming
-
-Write reusable code with type parameters:
-
-```cryo
-type struct Container<T> {
-    value: T;
-    
-    Container(val: T) {
-        this.value = val;
-    }
-    
-    get() -> T {
-        return this.value;
-    }
-    
-    set(new_value: T) -> void {
-        this.value = new_value;
-    }
-}
-
-// Multiple type parameters
-type struct Pair<T, U> {
-    first: T;
-    second: U;
-}
-
-// Usage
-const int_container: Container<int> = new Container<int>(42);
-const pair: Pair<int, string> = Pair<int, string>({first: 1, second: "one"});
-```
-
-### Trait System
-
-Define interfaces and implement them for different types:
-
-```cryo
-trait Drawable {
-    draw(self: &Drawable) -> void;
-    area(self: &Drawable) -> float;
-}
-
-trait Printable {
-    print(self: &Printable) -> void;
-}
-
-// Trait inheritance
-trait UIComponent : Drawable, Printable {
-    handle_click(self: &UIComponent) -> void;
-}
-```
-
-### Error Handling
-
-CryoLang includes comprehensive error handling with Result and Option types:
-
-```cryo
-enum Result<T, E> {
-    Ok(T),
-    Err(E)
-}
-
-enum Option<T> {
-    Some(T),
-    None
-}
-
-// Functions can return Results for error handling
-function divide(a: int, b: int) -> Result<float, string> {
-    if (b == 0) {
-        return Result::Err("Division by zero");
-    }
-    return Result::Ok(a as float / b as float);
-}
-```
-
-## Type System
-
-### Primitive Types
-
-| Type | Description | Size |
-|------|-------------|------|
-| `i8`, `i16`, `i32`, `i64` | Signed integers | 1, 2, 4, 8 bytes |
-| `u8`, `u16`, `u32`, `u64` | Unsigned integers | 1, 2, 4, 8 bytes |
-| `int` | Default integer (i64) | 8 bytes |
-| `uint` | Default unsigned integer (u64) | 8 bytes |
-| `f32`, `f64` | Floating point | 4, 8 bytes |
-| `float` | Default float (f32) | 4 bytes |
-| `double` | Double precision float (f64) | 8 bytes |
-| `boolean` | Boolean value | 1 byte |
-| `char` | Unicode character | 4 bytes |
-| `string` | UTF-8 string | Variable |
-
-### Type Aliases
-
-Create custom type names for better code clarity:
-
-```cryo
-type UserId = u64;
-type Temperature = f32;
-type ptr<T> = T*;
-type const_ptr<T> = const T*;
-```
-
-## Standard Library
-
-### Core Utilities (`std::core::Types`)
-
-```cryo
-import <core/types>;
-
-// Option type for nullable values
-const maybe_value: Option<int> = Option::Some(42);
-
-// Result type for error handling
-const operation_result: Result<int, string> = Result::Ok(100);
-
-// Error types
-const error: Error = Error(404, "Not Found");
-```
-
-### Input/Output (`std::IO`)
-
-```cryo
-import <io/stdio>;
-
-// Print functions
-std::IO::println("Hello, World!");
-std::IO::print_int(42);
-std::IO::print_float(3.14);
-std::IO::print_bool(true);
-```
-
-### String Operations (`std::String`)
-
-```cryo
-import <strings/strings>;
-
-const text: string = "Hello";
-const length: u64 = std::String::_strlen(text);
-const number_str: string = std::String::_int_to_string(42);
-const float_str: string = std::String::_float_to_string(3.14);
-```
-
-### System Calls (`std::Syscall`)
-
-```cryo
-import <core/syscall>;
-
-// File operations
-const fd: int = std::Syscall::IO::open("file.txt", 0, 0644);
-const bytes_written: i64 = std::Syscall::IO::write(fd, "Hello", 5);
-std::Syscall::IO::close(fd);
-```
-
-### Intrinsic Functions (`std::Intrinsics`)
-
-Low-level system operations and compiler intrinsics:
-
-```cryo
-import <core/intrinsics>;
-
-// Memory management
-const ptr: void* = std::Intrinsics::__malloc__(1024);
-std::Intrinsics::__free__(ptr);
-
-// Math functions
-const sqrt_value: f64 = std::Intrinsics::__sqrt__(25.0);
-const power: f64 = std::Intrinsics::__pow__(2.0, 8.0);
-
-// String operations
-const str_len: u64 = std::Intrinsics::__strlen__("Hello");
-```
-
-## Operators
-
-### Arithmetic Operators
-```cryo
-const a: int = 10 + 5;      // Addition
-const b: int = 10 - 5;      // Subtraction  
-const c: int = 10 * 5;      // Multiplication
-const d: int = 10 / 5;      // Division
-const e: int = 10 % 3;      // Modulus
-```
-
-### Comparison Operators
-```cryo
-const equal: boolean = a == b;      // Equality
-const not_equal: boolean = a != b;  // Inequality
-const less: boolean = a < b;        // Less than
-const greater: boolean = a > b;     // Greater than
-const less_eq: boolean = a <= b;    // Less than or equal
-const greater_eq: boolean = a >= b; // Greater than or equal
-```
-
-### Logical Operators
-```cryo
-const and_result: boolean = true && false;  // Logical AND
-const or_result: boolean = true || false;   // Logical OR
-const not_result: boolean = !true;          // Logical NOT
-```
-
-### Bitwise Operators
-```cryo
-const and_bits: int = 5 & 3;    // Bitwise AND
-const or_bits: int = 5 | 3;     // Bitwise OR
-const xor_bits: int = 5 ^ 3;    // Bitwise XOR
-const shift_left: int = 5 << 2; // Left shift
-const shift_right: int = 5 >> 1; // Right shift
-```
-
-### Assignment Operators
-```cryo
-mut value: int = 10;
-value += 5;     // Add and assign
-value -= 3;     // Subtract and assign
-value *= 2;     // Multiply and assign
-value /= 4;     // Divide and assign
-value++;        // Increment
-value--;        // Decrement
-```
-
-## Keywords
-
-### Declarations
-`const` `mut` `function` `type` `struct` `class` `enum` `trait` `implement` `namespace` `import` `export`
-
-### Control Flow
-`if` `else` `while` `for` `do` `break` `continue` `return` `match` `switch` `case` `default`
-
-### Types
-`int` `i8` `i16` `i32` `i64` `uint` `u8` `u16` `u32` `u64` `float` `f32` `f64` `double` `boolean` `char` `string` `void`
-
-### Modifiers
-`public` `private` `protected` `static` `extern` `inline` `virtual` `override` `abstract` `final`
-
-### Special
-`this` `true` `false` `null` `sizeof` `new` `intrinsic`
-
-## Development Tools
-
-### Compiler Usage
-
-```bash
-# Compile source file to executable
-cryo source.cryo -o output
-
-# Compile only (no linking)
-cryo source.cryo -c
-
-# Show AST
-cryo source.cryo --ast
-
-# Show LLVM IR
-cryo source.cryo --ir
-
-# Display help
-cryo --help
-```
-
-### Language Server
-
-CryoLang includes a full Language Server Protocol (LSP) implementation providing:
-- Syntax highlighting
-- Error diagnostics  
-- Code completion
-- Go to definition
-- Symbol search
-- Real-time compilation feedback
-
-### VS Code Extension
-
-The official VS Code extension (`cryo-language-support`) provides comprehensive IDE support with syntax highlighting, error reporting, and integrated development features.
+## Table of Contents
+
+- [Features](#features)
+- [Getting Started](#getting-started)
+- [Language Overview](#language-overview)
+  - [Variables](#variables)
+  - [Functions](#functions)
+  - [Control Flow](#control-flow)
+  - [Structs](#structs)
+  - [Classes & Inheritance](#classes--inheritance)
+  - [Enums & Pattern Matching](#enums--pattern-matching)
+  - [Generics](#generics)
+  - [Modules](#modules)
+  - [Pointers & Memory](#pointers--memory)
+- [Type System](#type-system)
+- [Standard Library](#standard-library)
+- [Tooling](#tooling)
+- [Building from Source](#building-from-source)
+- [Architecture](#architecture)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Features
+
+| | |
+|---|---|
+| **Strong static typing** | Explicit type annotations with no implicit conversions |
+| **Monomorphic generics** | Compile-time specialization with zero runtime overhead |
+| **Class inheritance** | Single inheritance, virtual methods, and polymorphic dispatch |
+| **Algebraic data types** | Enums with payloads and exhaustive pattern matching |
+| **Module system** | Hierarchical namespaces with visibility control and a prelude |
+| **LLVM 20 backend** | Optimizing compilation to native x86-64, ARM64, and WebAssembly |
+| **Rich standard library** | `Option<T>`, `Result<T, E>`, `Array<T>`, `String`, allocators, I/O, and more — written entirely in Cryo |
+| **Self-hosting** | The compiler orchestration layer is being rewritten in Cryo itself |
+| **Integrated tooling** | LSP server, VS Code extension, code formatter, and a tiered test suite |
 
 ## Getting Started
 
 ### Prerequisites
 
-- LLVM 14+ development libraries
-- C++23 compatible compiler (GCC 11+, Clang 14+)
-- CMake 3.20+
+| Dependency | Version |
+|---|---|
+| LLVM | 20 |
+| Clang | 20 |
+| GNU Make | 4.0+ |
+| C++ compiler | C++23 support required |
+| Python | 3.x (for test runner) |
 
-### Building from Source
+### Install
 
 ```bash
 git clone https://github.com/jakelequire/CryoLang.git
 cd CryoLang
-make clean
 make all
 ```
 
+The compiler binary is placed at `./bin/cryo`.
+
 ### Hello World
 
-Create a file named `hello.cryo`:
+Create `hello.cryo`:
 
 ```cryo
-namespace Main;
-
-import <io/stdio>;
+namespace Hello;
 
 function main() -> int {
-    std::IO::println("Hello, CryoLang!");
+    printf("Hello, world!\n");
     return 0;
 }
 ```
@@ -569,12 +101,681 @@ Compile and run:
 ./hello
 ```
 
+### Project-Based Builds
+
+For multi-file projects, create a `cryoconfig` file:
+
+```toml
+[project]
+project_name = "myapp"
+output_dir = "build"
+target_type = "executable"
+entry_point = "main.cryo"
+
+[compiler]
+debug = false
+optimize = true
+```
+
+Then build and run:
+
+```bash
+cryo build
+cryo run
+```
+
+## Language Overview
+
+### Variables
+
+All variables require explicit type annotations. Bindings are immutable by default.
+
+```cryo
+const name: string = "Cryo";       // immutable
+mut counter: int = 0;              // mutable
+counter = counter + 1;
+```
+
+### Functions
+
+```cryo
+function add(a: int, b: int) -> int {
+    return a + b;
+}
+
+function greet(name: string) -> void {
+    printf("Hello, %s!\n", name);
+}
+```
+
+### Control Flow
+
+```cryo
+// if / else
+if (x > 0) {
+    printf("positive\n");
+} else if (x < 0) {
+    printf("negative\n");
+} else {
+    printf("zero\n");
+}
+
+// for loop
+for (mut i: int = 0; i < 10; i++) {
+    printf("%d\n", i);
+}
+
+// while loop
+while (condition) {
+    // ...
+}
+
+// infinite loop
+loop {
+    if (done) { break; }
+}
+
+// match (integers, enums)
+match (n) {
+    1 => { printf("one\n"); },
+    2 => { printf("two\n"); },
+    _ => { printf("other\n"); },
+}
+```
+
+### Structs
+
+Structs define value types with fields and methods. Methods use `&this` for immutable access and `mut &this` for mutation.
+
+```cryo
+type struct Rect {
+    width: int;
+    height: int;
+
+    static new(w: int, h: int) -> Rect {
+        return Rect { width: w, height: h };
+    }
+
+    area(&this) -> int {
+        return this.width * this.height;
+    }
+
+    scale(mut &this, factor: int) -> void {
+        this.width = this.width * factor;
+        this.height = this.height * factor;
+    }
+}
+
+function main() -> int {
+    mut r: Rect = Rect::new(5, 10);
+    printf("Area: %d\n", r.area());    // 50
+    r.scale(2);
+    printf("Area: %d\n", r.area());    // 200
+    return 0;
+}
+```
+
+### Classes & Inheritance
+
+Classes are heap-allocated reference types that support single inheritance, constructor chaining, virtual methods, and polymorphic dispatch.
+
+#### Defining a Class
+
+```cryo
+type class Animal {
+public:
+    kind: string;
+
+    Animal(_kind: string) {
+        this.kind = _kind;
+    }
+
+    describe() -> void {
+        printf("Animal: %s\n", this.kind);
+    }
+}
+
+function main() -> i32 {
+    const a: Animal* = new Animal("Cat");
+    a.describe();   // Animal: Cat
+    return 0;
+}
+```
+
+#### Inheritance & Constructor Chaining
+
+Derived classes use `: BaseClass(args)` syntax to chain constructors. Fields and methods from the base class are inherited automatically.
+
+```cryo
+type class Dog : Animal {
+public:
+    name: string;
+
+    Dog(_name: string) : Animal("Dog") {
+        this.name = _name;
+    }
+
+    bark() -> void {
+        printf("%s says: Woof!\n", this.name);
+    }
+}
+
+const buddy: Dog* = new Dog("Buddy");
+buddy.describe();   // Animal: Dog       (inherited from Animal)
+buddy.bark();       // Buddy says: Woof!
+```
+
+#### Virtual Methods & Polymorphism
+
+Mark base class methods as `virtual` and override them in derived classes with `override`. Calls through a base class pointer dispatch to the correct implementation at runtime.
+
+```cryo
+type class Animal {
+public:
+    name: string;
+
+    Animal(_name: string) {
+        this.name = _name;
+    }
+
+    virtual speak() -> void;
+}
+
+type class Dog : Animal {
+public:
+    Dog() : Animal("Dog") {}
+
+    override speak() -> void {
+        printf("%s speaks: Woof!\n", this.name);
+    }
+}
+
+type class Cat : Animal {
+public:
+    Cat() : Animal("Cat") {}
+
+    override speak() -> void {
+        printf("%s speaks: Meow!\n", this.name);
+    }
+}
+
+// Polymorphic dispatch through a base class pointer
+function make_speak(animal: Animal*) -> void {
+    animal.speak();
+}
+
+function main() -> i32 {
+    const dog: Dog* = new Dog();
+    const cat: Cat* = new Cat();
+    make_speak(dog);    // Dog speaks: Woof!
+    make_speak(cat);    // Cat speaks: Meow!
+    return 0;
+}
+```
+
+#### Deep Inheritance
+
+Inheritance chains can extend to any depth. Each level chains to its parent's constructor.
+
+```cryo
+type class Animal {
+public:
+    species: string;
+    Animal(_species: string) { this.species = _species; }
+}
+
+type class Dog : Animal {
+public:
+    breed: string;
+    Dog(_breed: string) : Animal("Dog") { this.breed = _breed; }
+}
+
+type class GoldenRetriever : Dog {
+public:
+    name: string;
+    GoldenRetriever(_name: string) : Dog("GoldenRetriever") { this.name = _name; }
+
+    introduce() -> void {
+        printf("%s: %s (%s, %s)\n", this.breed, this.name, this.breed, this.species);
+    }
+}
+```
+
+#### Structs vs. Classes
+
+| | Struct | Class |
+|---|---|---|
+| **Allocation** | Stack (value type) | Heap via `new` (reference type) |
+| **Inheritance** | No | Single inheritance |
+| **Virtual dispatch** | No | `virtual` / `override` |
+| **Receivers** | `&this` / `mut &this` | `this` (implicit pointer) |
+| **Use when** | Plain data, small types, generics | Polymorphism, object hierarchies |
+
+### Enums & Pattern Matching
+
+Enums support unit variants and variants with payloads. Pattern matching is exhaustive.
+
+```cryo
+enum Shape {
+    Circle(f64);
+    Rectangle(f64, f64);
+    Point;
+}
+
+function describe(s: Shape) -> void {
+    match (s) {
+        Shape::Circle(r) => {
+            printf("Circle with radius %f\n", r);
+        }
+        Shape::Rectangle(w, h) => {
+            printf("Rectangle %f x %f\n", w, h);
+        }
+        Shape::Point => {
+            printf("A point\n");
+        }
+    }
+}
+```
+
+Enums can be extended with methods via `implement` blocks:
+
+```cryo
+implement enum Shape {
+    is_circle(&this) -> boolean {
+        return match (&this) {
+            Shape::Circle(_) => { true }
+            _ =>                { false }
+        }
+    }
+}
+```
+
+### Generics
+
+Cryo uses monomorphization — generic code is specialized at compile time for each concrete type used, producing zero-overhead abstractions.
+
+#### Generic Structs
+
+```cryo
+type struct Pair<T> {
+    first: T;
+    second: T;
+
+    static new(a: T, b: T) -> Pair<T> {
+        return Pair { first: a, second: b };
+    }
+
+    swap(mut &this) -> void {
+        const temp: T = this.first;
+        this.first = this.second;
+        this.second = temp;
+    }
+}
+
+// Each instantiation generates specialized code
+const ints: Pair<int> = Pair<int>::new(1, 2);
+const strs: Pair<string> = Pair<string>::new("hello", "world");
+```
+
+#### Generic Enums
+
+Generic enums power the standard library's core types:
+
+```cryo
+type enum Option<T> {
+    Some(T);
+    None;
+}
+
+type enum Result<T, E> {
+    Ok(T);
+    Err(E);
+}
+```
+
+#### Generic Functions
+
+```cryo
+function identity<T>(x: T) -> T {
+    return x;
+}
+
+function min<T>(a: T, b: T) -> T {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+```
+
+#### Generic Implement Blocks
+
+```cryo
+implement enum Option<T> {
+    is_some(&this) -> boolean {
+        match (&this) {
+            Option::Some(_) => { return true; }
+            Option::None =>    { return false; }
+        }
+    }
+
+    unwrap_or(&this, default_value: T) -> T {
+        match (&this) {
+            Option::Some(value) => { return value; }
+            Option::None =>        { return default_value; }
+        }
+    }
+}
+```
+
+#### Type Aliases
+
+```cryo
+type StringResult<T> = Result<T, string>;
+```
+
+### Modules
+
+Every file declares a namespace. Modules are organized using `_module.cryo` files that re-export submodules — similar to Rust's `mod.rs`.
+
+```cryo
+// math/_module.cryo
+namespace Math;
+
+public module vector;
+public module matrix;
+```
+
+```cryo
+// math/vector.cryo
+namespace Math::Vector;
+
+public type struct Vec2 {
+    x: f64;
+    y: f64;
+
+    static new(x: f64, y: f64) -> Vec2 {
+        return Vec2 { x: x, y: y };
+    }
+}
+```
+
+```cryo
+// main.cryo
+namespace Main;
+
+import Math;
+
+function main() -> int {
+    const v: Math::Vector::Vec2 = Math::Vector::Vec2::new(1.0, 2.0);
+    return 0;
+}
+```
+
+Items are private by default. Use `public` to export them.
+
+### Pointers & Memory
+
+Cryo provides explicit pointer operations for systems-level control.
+
+```cryo
+function example() -> void {
+    mut x: int = 42;
+    const ptr: int* = &x;          // address-of
+    printf("%d\n", *ptr);          // dereference
+
+    // Heap allocation
+    const buf: int* = malloc(sizeof(int) * 10);
+    buf[0] = 100;
+    free(buf);
+}
+```
+
+## Type System
+
+### Primitive Types
+
+| Type | Description |
+|---|---|
+| `i8` `i16` `i32` `i64` | Signed integers |
+| `u8` `u16` `u32` `u64` | Unsigned integers |
+| `int` | Platform integer (i32) |
+| `f32` `f64` | Floating-point numbers |
+| `boolean` | `true` or `false` |
+| `char` | 8-bit character |
+| `string` | Null-terminated string (`char*`) |
+| `void` | No value |
+
+### Type Casting
+
+```cryo
+const a: i64 = 42;
+const b: i32 = a as i32;
+```
+
+### Operators
+
+| Category | Operators |
+|---|---|
+| Arithmetic | `+` `-` `*` `/` `%` |
+| Comparison | `==` `!=` `<` `<=` `>` `>=` |
+| Logical | `&&` `\|\|` `!` |
+| Bitwise | `&` `\|` `^` `<<` `>>` |
+| Assignment | `=` `+=` `-=` `*=` `/=` `++` `--` |
+
+## Standard Library
+
+The standard library is written entirely in Cryo and compiled as a static library. A **prelude** automatically imports the most common types and functions into every file.
+
+### Prelude (auto-imported)
+
+The prelude provides `Option<T>`, `Result<T, E>`, `Array<T>`, `String`, `print`, `println`, `assert`, `assert_eq`, `panic`, `min`, `max`, `clamp`, `swap`, `identity`, and more.
+
+### Module Overview
+
+| Module | Contents |
+|---|---|
+| `core::option` | `Option<T>` — `Some(T)` / `None` with `unwrap`, `map`, `and_then`, `unwrap_or` |
+| `core::result` | `Result<T, E>` — `Ok(T)` / `Err(E)` with `unwrap`, `map`, `and_then`, `is_ok` |
+| `core::primitives` | Methods on built-in types: `to_i64()`, `abs()`, `min_value()`, `max_value()` |
+| `core::intrinsics` | `malloc`, `free`, `memcpy`, `memset`, `printf`, `sizeof` |
+| `core::mem` | `sizeof<T>()`, `default<T>()`, `take`, `replace` |
+| `collections::array` | `Array<T>` — growable array with `push`, `pop`, `len`, `capacity`, `filled` |
+| `collections::string` | `String` — heap-allocated UTF-8 string with `from_cstr`, `push_char`, `len` |
+| `collections::hashmap` | `HashMap<K, V>` — hash table |
+| `collections::deque` | `Deque<T>` — double-ended queue |
+| `collections::btree` | `BTreeMap<K, V>` — ordered map |
+| `alloc` | Arena, heap, stack, and pool allocators |
+| `io::stdio` | `print`, `println`, `printf` |
+| `io::file` | File reading and writing |
+| `thread` | Threads, mutexes, condition variables |
+| `sync` | Atomics, channels, semaphores |
+| `fs` | File system operations, paths |
+| `time` | Instant, Duration, Timer |
+| `math` | Mathematical functions |
+
+### Example: Option and Result
+
+```cryo
+function find(arr: Array<int>, target: int) -> Option<u64> {
+    mut i: u64 = 0;
+    while (i < arr.len()) {
+        if (arr[i] == target) {
+            return Option::Some(i);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+function divide(a: f64, b: f64) -> Result<f64, string> {
+    if (b == 0.0) {
+        return Result::Err("division by zero");
+    }
+    return Result::Ok(a / b);
+}
+```
+
+## Tooling
+
+### Compiler CLI
+
+```
+Usage: cryo <command> [options]
+
+Commands:
+  compile <file>     Compile a source file (default)
+  build              Build project from cryoconfig
+  run                Build and execute
+  check              Type-check without compiling
+  init               Initialize a new project
+  ast                Display the AST
+  tokens             Display lexer output
+  symbols            Display symbol table
+  info               Show compiler information
+  version            Show version
+
+Options:
+  -o, --output       Output file name
+  -c, --compile-only Compile only (no linking)
+  -d, --debug        Enable debug output
+  -v, --verbose      Verbose output
+  --emit-llvm        Emit LLVM bitcode
+  --emit-wasm        Compile to WebAssembly (experimental)
+  --ir               Display LLVM IR
+  --ast              Display AST
+  --no-std           Compile without standard library
+  --log-component    Filter logs (CODEGEN, PARSER, LEXER, etc.)
+```
+
+### Language Server (LSP)
+
+A full LSP implementation provides real-time feedback in your editor:
+
+- Syntax highlighting and diagnostics
+- Code completion
+- Go to definition
+- Hover documentation
+- Symbol search
+
+Build the LSP server:
+
+```bash
+make lsp
+```
+
+### VS Code Extension
+
+The official extension **cryo-language-support** integrates the LSP server with VS Code for a complete development experience.
+
+### Test Suite
+
+The E2E test suite is organized into tiers:
+
+```bash
+make test            # Run all tests
+make test-tier1      # Core language (variables, control flow, functions)
+make test-tier2      # Type system (structs, enums, pointers, match)
+make test-tier3      # Generics (structs, enums, cross-module)
+make test-tier4      # Modules (imports, submodules, visibility)
+make test-tier5      # Classes (inheritance, virtual dispatch, polymorphism)
+make test-negative   # Expected compilation failures
+```
+
+## Building from Source
+
+### Quick Build
+
+```bash
+make all        # Build compiler, stdlib, and run tests
+```
+
+### Individual Targets
+
+```bash
+make build      # Compiler only
+make stdlib     # Standard library
+make lsp        # Language Server
+make rebuild    # Clean rebuild
+make clean      # Remove all build artifacts
+```
+
+### Platform Notes
+
+| Platform | Toolchain | Notes |
+|---|---|---|
+| **Windows** | MSYS2 MinGW64 + Clang 20 | Primary development platform |
+| **Linux** | Clang 20 | x86-64 and ARM64 |
+| **macOS** | Clang (Xcode) | x86-64 and ARM64 |
+| **WebAssembly** | Emscripten | Experimental; uses `--emit-wasm` flag |
+
+### Project Structure
+
+```
+CryoLang/
+├── src/                    # Compiler implementation (C++23)
+│   ├── CLI/                #   Command-line interface
+│   ├── Compiler/           #   Multi-pass compilation pipeline
+│   ├── Codegen/            #   LLVM IR generation
+│   ├── Lexer/              #   Tokenization
+│   ├── Parser/             #   Syntax analysis
+│   ├── AST/                #   Abstract syntax tree
+│   ├── Types/              #   Type system (TypeID, TypeRef, TypeArena)
+│   ├── Linker/             #   Object linking
+│   └── Utils/              #   Platform abstractions, logging
+├── include/                # C++ headers
+├── stdlib/                 # Standard library (written in Cryo)
+│   ├── prelude.cryo        #   Auto-imported essentials
+│   ├── core/               #   Option, Result, primitives, intrinsics
+│   ├── collections/        #   Array, String, HashMap, Deque, BTreeMap
+│   ├── alloc/              #   Arena, heap, stack, pool allocators
+│   ├── io/                 #   stdio, file, reader, writer
+│   ├── net/                #   TCP, HTTP, sockets
+│   ├── fs/                 #   File system, paths
+│   └── ...
+├── cryoc/                  # Self-hosted compiler (in Cryo)
+├── tests/                  # E2E test suite (tiered)
+├── tools/
+│   ├── CryoLSP/           #   Language Server Protocol server
+│   ├── CryoFormat/        #   Code formatter
+│   └── CryoAnalyzer/      #   VS Code extension
+└── makefile                # Build system
+```
+
+## Architecture
+
+The compiler uses a 9-stage multi-pass pipeline:
+
+```
+Source → Frontend → Module Resolution → Declaration Collection → Type Resolution
+     → Semantic Analysis → Specialization → Codegen Preparation → IR Generation
+     → Optimization → Native Binary
+```
+
+| Stage | Purpose |
+|---|---|
+| **Frontend** | Lexing and parsing into AST |
+| **Module Resolution** | Resolve imports and module dependencies |
+| **Declaration Collection** | Gather all type and function declarations |
+| **Type Resolution** | Resolve all type references and annotations |
+| **Semantic Analysis** | Validate correctness and scope checking |
+| **Specialization** | Monomorphize generic instantiations |
+| **Codegen Preparation** | Multi-pass type and declaration ordering |
+| **IR Generation** | Emit LLVM IR via the LLVM 20 C++ API |
+| **Optimization** | LLVM optimization passes and linking |
+
 ## Contributing
 
-CryoLang is actively developed and welcomes contributions. Whether you're interested in language design, compiler implementation, standard library development, or tooling improvements, there are opportunities to get involved.
+Cryo is under active development. Contributions are welcome across all areas:
+
+- **Language design** — syntax, semantics, new features
+- **Compiler** — passes, optimizations, diagnostics
+- **Standard library** — new modules, more methods on existing types
+- **Tooling** — LSP improvements, formatter, debugger integration
+- **Documentation** — guides, examples, specification
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+Licensed under the [Apache License 2.0](LICENSE).
 
----
+Copyright 2025 Jacob LeQuire.
