@@ -414,7 +414,8 @@ namespace Cryo::Codegen
                     return static_cast<llvm::StructType *>(nullptr);
                 };
                 any_arr_st = check_struct_name(lhs);
-                if (!any_arr_st) any_arr_st = check_struct_name(rhs);
+                if (!any_arr_st)
+                    any_arr_st = check_struct_name(rhs);
             }
             if (any_arr_st)
             {
@@ -1584,7 +1585,8 @@ namespace Cryo::Codegen
         {
             auto is_array_struct = [](llvm::Type *ty) -> bool
             {
-                if (!ty->isStructTy()) return false;
+                if (!ty->isStructTy())
+                    return false;
                 auto *st = llvm::cast<llvm::StructType>(ty);
                 if (!st->isLiteral() && st->hasName() && st->getName().starts_with("Array<"))
                     return true;
@@ -1607,8 +1609,8 @@ namespace Cryo::Codegen
             {
                 // One side is array struct, other is not — can't do arithmetic
                 std::string type_name = lhs_is_arr
-                    ? llvm::cast<llvm::StructType>(lhs->getType())->getName().str()
-                    : llvm::cast<llvm::StructType>(rhs->getType())->getName().str();
+                                            ? llvm::cast<llvm::StructType>(lhs->getType())->getName().str()
+                                            : llvm::cast<llvm::StructType>(rhs->getType())->getName().str();
                 report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
                              "Arithmetic operations not supported for type: " + type_name);
                 return nullptr;
@@ -1622,8 +1624,8 @@ namespace Cryo::Codegen
         if (!lhs_is_int_or_float || !rhs_is_int_or_float)
         {
             std::string type_name = lhs->getType()->isStructTy()
-                ? lhs->getType()->getStructName().str()
-                : (rhs->getType()->isStructTy() ? rhs->getType()->getStructName().str() : "<unknown>");
+                                        ? lhs->getType()->getStructName().str()
+                                        : (rhs->getType()->isStructTy() ? rhs->getType()->getStructName().str() : "<unknown>");
             report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
                          "Arithmetic operations not supported for type: " + type_name);
             return nullptr;
@@ -1834,7 +1836,8 @@ namespace Cryo::Codegen
         {
             if (auto *st = llvm::dyn_cast<llvm::StructType>(lhs->getType()))
             {
-                if (st->hasName()) lhs_type_name = st->getName().str();
+                if (st->hasName())
+                    lhs_type_name = st->getName().str();
             }
             else if (!ctx().current_type_display_name().empty())
                 lhs_type_name = ctx().current_type_display_name();
@@ -1843,7 +1846,8 @@ namespace Cryo::Codegen
         {
             if (auto *st = llvm::dyn_cast<llvm::StructType>(rhs->getType()))
             {
-                if (st->hasName()) rhs_type_name = st->getName().str();
+                if (st->hasName())
+                    rhs_type_name = st->getName().str();
             }
         }
 
@@ -1882,18 +1886,73 @@ namespace Cryo::Codegen
             return generate_pointer_comparison(op, lhs, rhs, node);
         }
 
-        // Handle struct comparison using memcmp
-        // This is needed for generic types where T is a struct (e.g., Option<String>::contains)
+        // Handle struct comparison
         if (type->isStructTy() && rhs->getType()->isStructTy())
         {
-            // Only support equality/inequality for structs
+            // Convention-based ordering: if the struct defines a `compare` method
+            // returning i32 (negative/zero/positive), use it for all comparison operators.
+            // This allows any struct to opt into ordering by defining:
+            //   compare(&this, other: T) -> i32
+            std::string struct_name;
+            if (auto *st = llvm::dyn_cast<llvm::StructType>(type))
+            {
+                if (st->hasName())
+                    struct_name = st->getName().str();
+            }
+
+            llvm::Function *compare_method = nullptr;
+            if (!struct_name.empty() && _calls)
+                compare_method = _calls->resolve_method(struct_name, "compare");
+
+            if (compare_method)
+            {
+                llvm::IRBuilder<> &b = builder();
+
+                // Store lhs to memory to get a pointer for the &this parameter
+                llvm::AllocaInst *lhs_alloca = b.CreateAlloca(type, nullptr, "cmp.lhs");
+                b.CreateStore(lhs, lhs_alloca);
+
+                // Build call args: compare(&this, other)
+                // Check what the method expects for the second parameter
+                llvm::FunctionType *fn_type = compare_method->getFunctionType();
+                llvm::Value *rhs_arg = rhs;
+                if (fn_type->getNumParams() >= 2 && fn_type->getParamType(1)->isPointerTy() &&
+                    rhs->getType()->isStructTy())
+                {
+                    // Method expects pointer — store rhs and pass address
+                    llvm::AllocaInst *rhs_alloca = b.CreateAlloca(rhs->getType(), nullptr, "cmp.rhs");
+                    b.CreateStore(rhs, rhs_alloca);
+                    rhs_arg = rhs_alloca;
+                }
+
+                llvm::Value *cmp = b.CreateCall(compare_method, {lhs_alloca, rhs_arg}, "cmp.result");
+                llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0);
+
+                switch (op)
+                {
+                case TokenKind::TK_EQUALEQUAL:    return b.CreateICmpEQ(cmp, zero, "cmp.eq");
+                case TokenKind::TK_EXCLAIMEQUAL:  return b.CreateICmpNE(cmp, zero, "cmp.ne");
+                case TokenKind::TK_L_ANGLE:       return b.CreateICmpSLT(cmp, zero, "cmp.lt");
+                case TokenKind::TK_LESSEQUAL:     return b.CreateICmpSLE(cmp, zero, "cmp.le");
+                case TokenKind::TK_R_ANGLE:       return b.CreateICmpSGT(cmp, zero, "cmp.gt");
+                case TokenKind::TK_GREATEREQUAL:  return b.CreateICmpSGE(cmp, zero, "cmp.ge");
+                default:
+                    report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
+                                 "unsupported comparison operator for type '" + struct_name + "'");
+                    return nullptr;
+                }
+            }
+
+            // No compare method — only support equality/inequality via memcmp
             if (op != TokenKind::TK_EQUALEQUAL && op != TokenKind::TK_EXCLAIMEQUAL)
             {
                 {
                     auto diag = Diag::error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
                                             "binary operation cannot be applied to type '" + lhs_type_name + "'");
-                    if (node) diag.at(node);
-                    diag.with_note("struct types do not support ordering comparisons (<, >, <=, >=)");
+                    if (node)
+                        diag.at(node);
+                    diag.with_note("struct types do not support ordering comparisons (<, >, <=, >=) — "
+                                   "define a `compare(&this, other: " + lhs_type_name + ") -> i32` method to enable them");
                     emit_diagnostic(std::move(diag));
                 }
                 return nullptr;
