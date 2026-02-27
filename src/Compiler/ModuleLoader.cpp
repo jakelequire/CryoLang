@@ -2640,6 +2640,20 @@ namespace Cryo
             return TypeRef{};
         }
 
+        // Handle dynamic array types (e.g., "i32[]", "string[]", "GenericParamNode*[]")
+        if (type_str.size() > 2 && type_str.compare(type_str.size() - 2, 2, "[]") == 0)
+        {
+            std::string elem_str = type_str.substr(0, type_str.size() - 2);
+            TypeRef elem_type = resolve_primitive_type(elem_str, arena);
+            if (!elem_type.is_valid())
+                elem_type = arena.lookup_type_by_name(elem_str);
+            if (elem_type.is_valid())
+            {
+                return arena.get_array_of(elem_type); // dynamic (no size)
+            }
+            return TypeRef{};
+        }
+
         // Handle primitive types
         if (type_str == "boolean" || type_str == "bool")
             return arena.get_bool();
