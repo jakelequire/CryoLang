@@ -132,6 +132,27 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Instantiating struct {} -> {}",
                   generic_name, mangled);
 
+        // Helper: ensure field indices are registered.
+        // Called at early-return points where the full instantiation path is skipped.
+        // TypeMapper creates LLVM structs for monomorphized generics but doesn't register
+        // field names in CodegenContext — recover from the Cryo type in TypeArena.
+        auto ensure_fields_registered = [&](const std::string &name) {
+            auto &arena = ctx().symbols().arena();
+            TypeRef cryo_type = arena.lookup_type_by_name(name);
+            if (cryo_type.is_valid() && cryo_type->kind() == Cryo::TypeKind::Struct)
+            {
+                auto *struct_info = static_cast<const Cryo::StructType *>(cryo_type.get());
+                if (struct_info->field_count() > 0)
+                {
+                    std::vector<std::string> names;
+                    names.reserve(struct_info->field_count());
+                    for (const auto &f : struct_info->fields())
+                        names.push_back(f.name);
+                    ctx().register_struct_fields(name, names);
+                }
+            }
+        };
+
         // Check if methods have already been generated for this instantiation
         // We track this separately from type caching because the LLVM type may exist
         // (created by Monomorphizer) but methods may not be generated yet
@@ -145,6 +166,7 @@ namespace Cryo::Codegen
                 {
                     if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(cached))
                     {
+                        ensure_fields_registered(mangled);
                         return struct_type;
                     }
                 }
@@ -153,6 +175,9 @@ namespace Cryo::Codegen
             if (llvm::StructType *existing = llvm::StructType::getTypeByName(llvm_ctx(), mangled))
             {
                 _type_cache[mangled] = existing;
+                ctx().register_type(mangled, existing);
+                types().register_struct(mangled, existing);
+                ensure_fields_registered(mangled);
                 return existing;
             }
         }
@@ -382,12 +407,14 @@ namespace Cryo::Codegen
                 }
             }
 
-            // Cache and register in multiple places for consistency BEFORE generating methods
-            // This ensures the struct type is available for self-referential types
-            _type_cache[mangled] = struct_type;
-            ctx().register_type(mangled, struct_type);
-            types().register_struct(mangled, struct_type);
         }
+
+        // Always register in all caches, even when reusing existing type.
+        // The Monomorphizer may create the LLVM struct type, but only CodegenContext._types
+        // and TypeMapper._struct_cache make it visible to ExpressionCodegen lookups.
+        _type_cache[mangled] = struct_type;
+        ctx().register_type(mangled, struct_type);
+        types().register_struct(mangled, struct_type);
 
         // Register type's namespace for cross-module method resolution
         // First check TemplateRegistry (for cross-module structs), then fall back to local context
@@ -1115,6 +1142,26 @@ namespace Cryo::Codegen
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "GenericCodegen: Instantiating class {} -> {}",
                   generic_name, mangled);
 
+        // Helper: ensure field indices are registered.
+        // TypeMapper creates LLVM structs but doesn't register field names — recover from TypeArena.
+        auto ensure_class_fields_registered = [&](const std::string &name) {
+            auto &arena = ctx().symbols().arena();
+            TypeRef cryo_type = arena.lookup_type_by_name(name);
+            if (cryo_type.is_valid() &&
+                (cryo_type->kind() == Cryo::TypeKind::Struct || cryo_type->kind() == Cryo::TypeKind::Class))
+            {
+                auto *struct_info = static_cast<const Cryo::StructType *>(cryo_type.get());
+                if (struct_info->field_count() > 0)
+                {
+                    std::vector<std::string> names;
+                    names.reserve(struct_info->field_count());
+                    for (const auto &f : struct_info->fields())
+                        names.push_back(f.name);
+                    ctx().register_struct_fields(name, names);
+                }
+            }
+        };
+
         // Check cache
         if (has_type_instantiation(mangled))
         {
@@ -1124,6 +1171,7 @@ namespace Cryo::Codegen
             {
                 if (auto *struct_type = llvm::dyn_cast<llvm::StructType>(cached))
                 {
+                    ensure_class_fields_registered(mangled);
                     return struct_type;
                 }
             }
@@ -1136,6 +1184,9 @@ namespace Cryo::Codegen
             if (!existing->isOpaque())
             {
                 _type_cache[mangled] = existing;
+                ctx().register_type(mangled, existing);
+                types().register_struct(mangled, existing);
+                ensure_class_fields_registered(mangled);
                 return existing;
             }
             else

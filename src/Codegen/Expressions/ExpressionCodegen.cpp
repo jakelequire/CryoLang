@@ -5169,6 +5169,27 @@ namespace Cryo::Codegen
             int field_idx = ctx().get_struct_field_index(type_name, field_name);
             if (field_idx < 0)
             {
+                // Fallback: look up the Cryo StructType from TypeArena.
+                // TypeMapper creates LLVM structs for monomorphized generics but doesn't
+                // register field names in CodegenContext. Recover field info from the arena.
+                auto &arena = ctx().symbols().arena();
+                TypeRef cryo_type = arena.lookup_type_by_name(type_name);
+                if (cryo_type.is_valid() && cryo_type->kind() == Cryo::TypeKind::Struct)
+                {
+                    auto *struct_info = static_cast<const Cryo::StructType *>(cryo_type.get());
+                    if (struct_info->field_count() > 0)
+                    {
+                        std::vector<std::string> names;
+                        names.reserve(struct_info->field_count());
+                        for (const auto &f : struct_info->fields())
+                            names.push_back(f.name);
+                        ctx().register_struct_fields(type_name, names);
+                        field_idx = ctx().get_struct_field_index(type_name, field_name);
+                    }
+                }
+            }
+            if (field_idx < 0)
+            {
                 LOG_WARN(Cryo::LogComponent::CODEGEN,
                          "Field '{}' not found in struct '{}', skipping", field_name, type_name);
                 report_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION, node,
