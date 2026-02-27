@@ -1833,13 +1833,19 @@ namespace Cryo::Codegen
         // Evaluate LHS
         llvm::Value *lhs = generate_operand(node->left());
         if (!lhs)
+        {
+            rhs_block->eraseFromParent();
+            merge_block->eraseFromParent();
             return nullptr;
+        }
 
         // Convert to bool if needed — guard against struct types which can't be compared with ICmp
         if (!lhs->getType()->isIntegerTy(1))
         {
             if (!lhs->getType()->isIntegerTy() && !lhs->getType()->isPointerTy() && !lhs->getType()->isFloatingPointTy())
             {
+                rhs_block->eraseFromParent();
+                merge_block->eraseFromParent();
                 report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
                              "Cannot convert struct/aggregate type to boolean for logical AND");
                 return nullptr;
@@ -1856,12 +1862,24 @@ namespace Cryo::Codegen
         b.SetInsertPoint(rhs_block);
         llvm::Value *rhs = generate_operand(node->right());
         if (!rhs)
+        {
+            // rhs_block and merge_block are branch targets, terminate them
+            if (!b.GetInsertBlock()->getTerminator())
+                b.CreateUnreachable();
+            b.SetInsertPoint(merge_block);
+            b.CreateUnreachable();
             return nullptr;
+        }
 
         if (!rhs->getType()->isIntegerTy(1))
         {
             if (!rhs->getType()->isIntegerTy() && !rhs->getType()->isPointerTy() && !rhs->getType()->isFloatingPointTy())
             {
+                // rhs_block and merge_block are branch targets, terminate them
+                if (!b.GetInsertBlock()->getTerminator())
+                    b.CreateUnreachable();
+                b.SetInsertPoint(merge_block);
+                b.CreateUnreachable();
                 report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
                              "Cannot convert struct/aggregate type to boolean for logical AND");
                 return nullptr;
@@ -1909,13 +1927,19 @@ namespace Cryo::Codegen
         // Evaluate LHS
         llvm::Value *lhs = generate_operand(node->left());
         if (!lhs)
+        {
+            rhs_block->eraseFromParent();
+            merge_block->eraseFromParent();
             return nullptr;
+        }
 
         // Convert to bool if needed — guard against struct types which can't be compared with ICmp
         if (!lhs->getType()->isIntegerTy(1))
         {
             if (!lhs->getType()->isIntegerTy() && !lhs->getType()->isPointerTy() && !lhs->getType()->isFloatingPointTy())
             {
+                rhs_block->eraseFromParent();
+                merge_block->eraseFromParent();
                 report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
                              "Cannot convert struct/aggregate type to boolean for logical OR");
                 return nullptr;
@@ -1932,12 +1956,24 @@ namespace Cryo::Codegen
         b.SetInsertPoint(rhs_block);
         llvm::Value *rhs = generate_operand(node->right());
         if (!rhs)
+        {
+            // rhs_block and merge_block are branch targets, terminate them
+            if (!b.GetInsertBlock()->getTerminator())
+                b.CreateUnreachable();
+            b.SetInsertPoint(merge_block);
+            b.CreateUnreachable();
             return nullptr;
+        }
 
         if (!rhs->getType()->isIntegerTy(1))
         {
             if (!rhs->getType()->isIntegerTy() && !rhs->getType()->isPointerTy() && !rhs->getType()->isFloatingPointTy())
             {
+                // rhs_block and merge_block are branch targets, terminate them
+                if (!b.GetInsertBlock()->getTerminator())
+                    b.CreateUnreachable();
+                b.SetInsertPoint(merge_block);
+                b.CreateUnreachable();
                 report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
                              "Cannot convert struct/aggregate type to boolean for logical OR");
                 return nullptr;

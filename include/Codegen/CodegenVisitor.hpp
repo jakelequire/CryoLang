@@ -191,6 +191,10 @@ namespace Cryo::Codegen
         void generate_global_constructors();
         void set_pre_registration_mode(bool enabled);
 
+        /// Run only Pass 0 (enums) + Pass 1 (struct/class type declarations) for a program.
+        /// Used to pre-register all LLVM struct types across modules before generating bodies.
+        void generate_type_declarations(Cryo::ProgramNode &node);
+
         TypeMapper *get_type_mapper() const;
         Cryo::ASTNode *get_current_node() const;
         Cryo::SRM::SymbolResolutionManager *get_srm_manager() const;

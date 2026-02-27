@@ -114,6 +114,13 @@ namespace Cryo::Codegen
         bool generate_imported_ir(Cryo::ProgramNode *program_node, const std::string &module_namespace = "");
 
         /**
+         * @brief Pre-register type declarations (enums + struct/class types) from an imported module.
+         * Runs only Pass 0 + Pass 1 without generating method bodies or functions.
+         * Call this for ALL modules before calling generate_imported_ir on any module.
+         */
+        void generate_imported_type_declarations(Cryo::ProgramNode *program_node, const std::string &module_namespace);
+
+        /**
          * @brief Generate optimized LLVM IR
          * @param optimization_level Optimization level (0-3)
          * @return Success status
