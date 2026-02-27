@@ -2954,8 +2954,24 @@ namespace Cryo::Codegen
             {
                 auto *inst_type = static_cast<const Cryo::InstantiatedType *>(call_resolved_type.get());
 
-                // Check if the InstantiatedType has a resolved concrete type
-                if (inst_type->has_resolved_type())
+                // Only use the resolved type to redirect type_name when the generic base
+                // matches the call's receiver type. The resolved type is the *return type*,
+                // which may be a completely different generic (e.g., File::open returns
+                // IoResult<File> — we must not redirect "File" to "IoResult_File").
+                std::string base_name;
+                if (inst_type->generic_base().is_valid())
+                    base_name = inst_type->generic_base()->display_name();
+
+                // Extract base from type_name (e.g., "Stack" from "Stack<int>")
+                std::string receiver_base = type_name;
+                size_t angle = receiver_base.find('<');
+                if (angle != std::string::npos)
+                    receiver_base = receiver_base.substr(0, angle);
+
+                bool base_matches = !base_name.empty() &&
+                    (base_name == type_name || base_name == receiver_base);
+
+                if (base_matches && inst_type->has_resolved_type())
                 {
                     TypeRef concrete_type = inst_type->resolved_type();
                     if (concrete_type.is_valid())
@@ -2966,7 +2982,7 @@ namespace Cryo::Codegen
                                   resolved_type_name);
                     }
                 }
-                else if (generics && generics->in_type_param_scope())
+                else if (base_matches && generics && generics->in_type_param_scope())
                 {
                     // Try to substitute type parameters
                     std::string resolved_display = call_resolved_type->display_name();
@@ -2982,11 +2998,23 @@ namespace Cryo::Codegen
             }
             else if (call_resolved_type->kind() == Cryo::TypeKind::Struct)
             {
-                // Already a concrete struct type
-                resolved_type_name = call_resolved_type->display_name();
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "generate_static_method: Using concrete resolved type: {}",
-                          resolved_type_name);
+                // Only override if the resolved struct type name relates to the receiver.
+                // The resolved type is the return type, which may differ from the receiver
+                // (e.g., File::open returns IoResult<File>, not File).
+                std::string concrete_name = call_resolved_type->display_name();
+                // Extract base name from type_name (e.g., "Stack" from "Stack<int>")
+                std::string base = type_name;
+                size_t angle = base.find('<');
+                if (angle != std::string::npos)
+                    base = base.substr(0, angle);
+                if (concrete_name == type_name || concrete_name == base ||
+                    concrete_name.find(base + "_") == 0)
+                {
+                    resolved_type_name = concrete_name;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_static_method: Using concrete resolved type: {}",
+                              resolved_type_name);
+                }
             }
         }
 
