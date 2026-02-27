@@ -1557,6 +1557,14 @@ namespace Cryo
                                             if (it != symbol_map.end() && it->second.type.is_valid())
                                                 payload_type = it->second.type;
                                         }
+                                        // Handle pointer types to module-local types (e.g., "SomeStruct*")
+                                        if (!payload_type.is_valid() && type_str.size() > 1 && type_str.back() == '*')
+                                        {
+                                            std::string base_name = type_str.substr(0, type_str.size() - 1);
+                                            auto it = symbol_map.find(base_name);
+                                            if (it != symbol_map.end() && it->second.type.is_valid())
+                                                payload_type = type_arena.get_pointer_to(it->second.type);
+                                        }
 
                                         payload_types.push_back(payload_type.is_valid() ? payload_type : TypeRef{});
                                     }
@@ -1604,6 +1612,19 @@ namespace Cryo
                                     if (it != symbol_map.end() && it->second.type.is_valid())
                                     {
                                         payload_type = it->second.type;
+                                    }
+                                }
+
+                                // Handle pointer types to user-defined types (e.g., "PrimitiveAnnotation*")
+                                // resolve_primitive_type handles primitive pointers and arena-registered types,
+                                // but we also need to check symbol_map for types defined in this module
+                                if (!payload_type.is_valid() && type_str.size() > 1 && type_str.back() == '*')
+                                {
+                                    std::string base_name = type_str.substr(0, type_str.size() - 1);
+                                    auto it = symbol_map.find(base_name);
+                                    if (it != symbol_map.end() && it->second.type.is_valid())
+                                    {
+                                        payload_type = type_arena.get_pointer_to(it->second.type);
                                     }
                                 }
 
@@ -2608,8 +2629,15 @@ namespace Cryo
             {
                 return arena.get_pointer_to(base_type);
             }
-            // If base type not found, still return a generic pointer type
-            return arena.get_pointer_to(arena.get_void());
+            // If base type is not a primitive, try user-defined types via arena lookup
+            base_type = arena.lookup_type_by_name(base_type_str);
+            if (base_type.is_valid())
+            {
+                return arena.get_pointer_to(base_type);
+            }
+
+            // Base type not found — return invalid so callers can try other resolution
+            return TypeRef{};
         }
 
         // Handle primitive types
