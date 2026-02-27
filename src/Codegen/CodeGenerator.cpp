@@ -162,6 +162,22 @@ namespace Cryo::Codegen
         }
     }
 
+    void CodeGenerator::generate_imported_type_declarations(ProgramNode *program, const std::string &module_namespace)
+    {
+        if (!program || !_visitor)
+            return;
+
+        std::string saved_source_file = _pending_source_file;
+        std::string saved_namespace = _pending_namespace_context;
+
+        if (!module_namespace.empty())
+            _visitor->set_source_info(_pending_source_file, module_namespace);
+
+        _visitor->generate_type_declarations(*program);
+
+        _visitor->set_source_info(saved_source_file, saved_namespace);
+    }
+
     llvm::Module *CodeGenerator::get_module() const
     {
         return _context_manager ? _context_manager->get_module() : nullptr;

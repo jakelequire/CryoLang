@@ -84,7 +84,7 @@ namespace Cryo
 
         if (std::filesystem::exists(c_path))
         {
-            return c_path.string();
+            return c_path.generic_string();
         }
         return "";
     }
@@ -95,10 +95,19 @@ namespace Cryo
 
     std::string CHeaderProcessor::run_preprocessor(const std::string &resolved_path)
     {
-        // Build command: clang-20 -E -P <path>
+        // Build command: clang -E -P <path>
         // -E: preprocess only
         // -P: omit #line directives
-        std::string cmd = "clang-20 -E -P \"" + resolved_path + "\" 2>/dev/null";
+
+        // Use generic_string() to normalize backslashes to forward slashes,
+        // avoiding shell escape-sequence corruption on Windows.
+        std::string normalized = std::filesystem::path(resolved_path).generic_string();
+
+#if defined(_WIN32) || defined(_WIN64)
+        std::string cmd = "C:/msys64/mingw64/bin/clang -E -P \"" + normalized + "\" 2>NUL";
+#else
+        std::string cmd = "clang-20 -E -P \"" + normalized + "\" 2>/dev/null";
+#endif
 
         LOG_DEBUG(LogComponent::GENERAL, "CHeaderProcessor: Running preprocessor: {}", cmd);
 

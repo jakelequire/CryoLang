@@ -1693,6 +1693,77 @@ namespace Cryo::Codegen
         _declarations->set_pre_registration_mode(enabled);
     }
 
+    void CodegenVisitor::generate_type_declarations(Cryo::ProgramNode &node)
+    {
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_type_declarations: Pre-registering enums + struct/class types");
+
+        // Pre-pass: Register import declarations with SRM
+        for (const auto &stmt : node.statements())
+        {
+            if (!stmt)
+                continue;
+            auto *import_decl = dynamic_cast<Cryo::ImportDeclarationNode *>(stmt.get());
+            if (!import_decl)
+            {
+                if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+                {
+                    if (decl_stmt->declaration())
+                        import_decl = dynamic_cast<Cryo::ImportDeclarationNode *>(decl_stmt->declaration());
+                }
+            }
+            if (import_decl)
+            {
+                std::string import_path = import_decl->path();
+                if (!import_path.empty())
+                    _ctx->srm_context().add_imported_namespace(import_path);
+            }
+        }
+
+        // Pass 0: Enum declarations
+        for (const auto &stmt : node.statements())
+        {
+            if (!stmt)
+                continue;
+            if (dynamic_cast<Cryo::EnumDeclarationNode *>(stmt.get()))
+            {
+                stmt->accept(*this);
+            }
+            else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+            {
+                if (decl_stmt->declaration() &&
+                    dynamic_cast<Cryo::EnumDeclarationNode *>(decl_stmt->declaration()))
+                {
+                    stmt->accept(*this);
+                }
+            }
+        }
+
+        // Pass 1: Struct/class type declarations only (no method bodies)
+        _defer_method_generation = true;
+        for (const auto &stmt : node.statements())
+        {
+            if (!stmt)
+                continue;
+            if (dynamic_cast<Cryo::StructDeclarationNode *>(stmt.get()) ||
+                dynamic_cast<Cryo::ClassDeclarationNode *>(stmt.get()))
+            {
+                stmt->accept(*this);
+            }
+            else if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+            {
+                if (decl_stmt->declaration() &&
+                    (dynamic_cast<Cryo::StructDeclarationNode *>(decl_stmt->declaration()) ||
+                     dynamic_cast<Cryo::ClassDeclarationNode *>(decl_stmt->declaration())))
+                {
+                    stmt->accept(*this);
+                }
+            }
+        }
+        _defer_method_generation = false;
+
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_type_declarations: Done");
+    }
+
     TypeMapper *CodegenVisitor::get_type_mapper() const
     {
         return &_ctx->types();
