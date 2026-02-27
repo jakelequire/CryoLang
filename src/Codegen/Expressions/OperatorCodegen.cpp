@@ -277,6 +277,47 @@ namespace Cryo::Codegen
                     best_type = lhs_type;
                 return generate_array_concat(lhs, rhs_struct, best_type);
             }
+
+            // Case 3: Last resort — if either side has an Array<...> struct type,
+            // treat as array concatenation. This catches cases where one side is a
+            // nested-array element (e.g., this.overload_lists[i]) whose type wasn't
+            // detected earlier due to cross-module type resolution.
+            llvm::StructType *any_arr_st = lhs_arr_st ? lhs_arr_st : rhs_arr_st;
+            if (!any_arr_st)
+            {
+                // Also try to detect Array structs by checking the struct name pattern
+                // on values that might not have been caught by get_array_struct_type
+                // (e.g., if the value is a struct but without "Array<" prefix)
+                auto check_struct_name = [](llvm::Value *val) -> llvm::StructType *
+                {
+                    llvm::Type *ty = val->getType();
+                    if (ty->isStructTy())
+                    {
+                        auto *st = llvm::cast<llvm::StructType>(ty);
+                        // Match Array<T> pattern or any { ptr, i64, i64 } layout
+                        if (!st->isLiteral() && st->hasName() && st->getName().starts_with("Array<"))
+                            return st;
+                        // Check layout: { ptr, i64, i64 } is the array struct pattern
+                        if (!st->isOpaque() && st->getNumElements() == 3 &&
+                            st->getElementType(0)->isPointerTy() &&
+                            st->getElementType(1)->isIntegerTy(64) &&
+                            st->getElementType(2)->isIntegerTy(64))
+                            return st;
+                    }
+                    return static_cast<llvm::StructType *>(nullptr);
+                };
+                any_arr_st = check_struct_name(lhs);
+                if (!any_arr_st) any_arr_st = check_struct_name(rhs);
+            }
+            if (any_arr_st && lhs->getType()->isStructTy() && rhs->getType()->isStructTy())
+            {
+                TypeRef best_type = node->get_resolved_type();
+                if (!best_type || best_type->kind() != Cryo::TypeKind::Array)
+                    best_type = lhs_type;
+                if (!best_type || best_type->kind() != Cryo::TypeKind::Array)
+                    best_type = rhs_type;
+                return generate_array_concat(lhs, rhs, best_type);
+            }
         }
 
         // Classify and dispatch
@@ -1434,9 +1475,57 @@ namespace Cryo::Codegen
             return generate_float_arithmetic(op, lhs, rhs);
         }
 
+        // Last resort: if PLUS and either side looks like an Array struct, do array concat
+        if (op == TokenKind::TK_PLUS)
+        {
+            auto is_array_struct = [](llvm::Type *ty) -> bool
+            {
+                if (!ty->isStructTy()) return false;
+                auto *st = llvm::cast<llvm::StructType>(ty);
+                // Named Array<T> struct
+                if (!st->isLiteral() && st->hasName() && st->getName().starts_with("Array<"))
+                    return true;
+                // Anonymous { ptr, i64, i64 } layout (dynamic array pattern)
+                if (!st->isOpaque() && st->getNumElements() == 3 &&
+                    st->getElementType(0)->isPointerTy() &&
+                    st->getElementType(1)->isIntegerTy(64) &&
+                    st->getElementType(2)->isIntegerTy(64))
+                    return true;
+                return false;
+            };
+
+            bool lhs_is_arr = is_array_struct(lhs->getType());
+            bool rhs_is_arr = is_array_struct(rhs->getType());
+
+            if (lhs_is_arr || rhs_is_arr)
+            {
+                // Ensure both sides are the same struct type for concat
+                llvm::StructType *arr_st = nullptr;
+                if (lhs->getType()->isStructTy())
+                    arr_st = llvm::cast<llvm::StructType>(lhs->getType());
+                else if (rhs->getType()->isStructTy())
+                    arr_st = llvm::cast<llvm::StructType>(rhs->getType());
+
+                if (arr_st)
+                {
+                    // If one side is a pointer, load it as the array struct type
+                    if (lhs->getType()->isPointerTy() && !lhs->getType()->isStructTy())
+                    {
+                        lhs = create_load(lhs, arr_st, "arr.load.lhs");
+                    }
+                    if (rhs->getType()->isPointerTy() && !rhs->getType()->isStructTy())
+                    {
+                        rhs = create_load(rhs, arr_st, "arr.load.rhs");
+                    }
+
+                    return generate_array_concat(lhs, rhs, result_type);
+                }
+            }
+        }
+
         std::string type_name = type->isStructTy() ? type->getStructName().str() : "<unknown>";
 
-        report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, 
+        report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR,
                      "Arithmetic operations not supported for type: " + type_name);
         return nullptr;
     }
