@@ -116,10 +116,56 @@ namespace Cryo::Codegen
             TypeRef lhs_type = node->left()->get_resolved_type();
             TypeRef rhs_type = node->right()->get_resolved_type();
 
+            // Fallback: if AST types are unresolved, try variable_types_map for identifiers
+            if (!lhs_type)
+            {
+                if (auto *ident = dynamic_cast<Cryo::IdentifierNode *>(node->left()))
+                {
+                    auto it = ctx().variable_types_map().find(ident->name());
+                    if (it != ctx().variable_types_map().end())
+                        lhs_type = it->second;
+                }
+            }
+            if (!rhs_type)
+            {
+                if (auto *ident = dynamic_cast<Cryo::IdentifierNode *>(node->right()))
+                {
+                    auto it = ctx().variable_types_map().find(ident->name());
+                    if (it != ctx().variable_types_map().end())
+                        rhs_type = it->second;
+                }
+            }
+
             bool lhs_is_string = is_string_type(lhs_type);
             bool rhs_is_string = is_string_type(rhs_type);
             bool lhs_is_char = is_char_type(lhs_type);
             bool rhs_is_char = is_char_type(rhs_type);
+
+            // Fallback: if one side is string and the other is an unresolved pointer type,
+            // treat it as string concatenation (common in cross-module method bodies where
+            // local variable types aren't propagated through AST resolution)
+            if ((!lhs_is_string || !rhs_is_string) &&
+                lhs->getType()->isPointerTy() && rhs->getType()->isPointerTy())
+            {
+                if (lhs_is_string && !rhs_type)
+                {
+                    return generate_string_concat(lhs, rhs);
+                }
+                if (rhs_is_string && !lhs_type)
+                {
+                    return generate_string_concat(lhs, rhs);
+                }
+                // Both types unknown but both are pointers — check if either is a string literal
+                if (!lhs_type && !rhs_type)
+                {
+                    bool lhs_is_literal = dynamic_cast<Cryo::LiteralNode *>(node->left()) != nullptr;
+                    bool rhs_is_literal = dynamic_cast<Cryo::LiteralNode *>(node->right()) != nullptr;
+                    if (lhs_is_literal || rhs_is_literal)
+                    {
+                        return generate_string_concat(lhs, rhs);
+                    }
+                }
+            }
 
             // string + string
             if (lhs_is_string && rhs_is_string)
