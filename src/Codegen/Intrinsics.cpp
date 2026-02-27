@@ -90,6 +90,8 @@ namespace Cryo::Codegen
         // I/O intrinsics
         else if (intrinsic_name == "printf")
             return generate_printf(args);
+        else if (intrinsic_name == "println")
+            return generate_println(args);
         else if (intrinsic_name == "sprintf")
             return generate_sprintf(args);
         else if (intrinsic_name == "snprintf")
@@ -208,6 +210,10 @@ namespace Cryo::Codegen
             return generate_readdir(args);
         else if (intrinsic_name == "closedir")
             return generate_closedir(args);
+        else if (intrinsic_name == "dirent_name")
+            return generate_dirent_name(args);
+        else if (intrinsic_name == "dirent_type")
+            return generate_dirent_type(args);
 
         // Process intrinsics
         else if (intrinsic_name == "exit")
@@ -1886,6 +1892,64 @@ namespace Cryo::Codegen
         llvm::CallInst *call = builder.CreateCall(printf_func, converted_args, "printf.result");
 
         return call;
+    }
+
+    llvm::Value *Intrinsics::generate_println(const std::vector<llvm::Value *> &args)
+    {
+        if (args.empty())
+        {
+            report_error("println requires at least 1 argument (format)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Get or create printf: int printf(const char*, ...)
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *printf_type = llvm::FunctionType::get(
+            int_type, {char_ptr_type}, true);
+        llvm::Function *printf_func = get_or_create_libc_function("printf", printf_type);
+
+        if (!args[0]->getType()->isPointerTy())
+        {
+            report_error("println format argument must be a pointer");
+            return nullptr;
+        }
+
+        // Promote variadic args (same as printf)
+        std::vector<llvm::Value *> converted_args;
+        converted_args.reserve(args.size());
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            llvm::Value *arg = args[i];
+            llvm::Type *arg_type = arg->getType();
+            if (arg_type->isIntegerTy())
+            {
+                unsigned bit_width = arg_type->getIntegerBitWidth();
+                if (bit_width < 32)
+                {
+                    arg = builder.CreateZExt(arg, llvm::Type::getInt32Ty(context), "println.arg.promote");
+                }
+            }
+            else if (arg_type->isFloatTy())
+            {
+                arg = builder.CreateFPExt(arg, llvm::Type::getDoubleTy(context), "println.arg.fpext");
+            }
+            converted_args.push_back(arg);
+        }
+
+        // Call printf with the format + args
+        builder.CreateCall(printf_func, converted_args, "println.printf");
+
+        // Get or create putchar: int putchar(int)
+        llvm::FunctionType *putchar_type = llvm::FunctionType::get(int_type, {int_type}, false);
+        llvm::Function *putchar_func = get_or_create_libc_function("putchar", putchar_type);
+
+        // Emit putchar('\n')
+        llvm::Value *newline = llvm::ConstantInt::get(int_type, '\n');
+        return builder.CreateCall(putchar_func, {newline}, "println.newline");
     }
 
     llvm::Value *Intrinsics::generate_sprintf(const std::vector<llvm::Value *> &args)
@@ -4452,6 +4516,165 @@ namespace Cryo::Codegen
 
         llvm::Function *closedir_func = get_or_create_libc_function("closedir", closedir_type);
         return builder.CreateCall(closedir_func, {args[0]}, "closedir.result");
+    }
+
+    llvm::Value *Intrinsics::generate_dirent_name(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("dirent_name requires exactly 1 argument (entry)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        auto *module = builder.GetInsertBlock()->getParent()->getParent();
+
+        // Create or get the helper: char* __cryo_dirent_name(void* entry) { return ((struct dirent*)entry)->d_name; }
+        // We generate a small wrapper that calls through a C-level helper to avoid hard-coding struct layout.
+        const std::string helper_name = "__cryo_dirent_name";
+        llvm::Function *helper = module->getFunction(helper_name);
+        if (!helper)
+        {
+            // Define struct dirent layout for the target platform.
+            // Linux x86_64: { i64 d_ino, i64 d_off, i16 d_reclen, i8 d_type, [256 x i8] d_name }
+            // Windows (MSVC UCRT / MinGW): varies, but we use the POSIX layout.
+            llvm::Type *i8Ty = llvm::Type::getInt8Ty(context);
+            llvm::Type *i16Ty = llvm::Type::getInt16Ty(context);
+            llvm::Type *i64Ty = llvm::Type::getInt64Ty(context);
+            llvm::ArrayType *nameTy = llvm::ArrayType::get(i8Ty, 256);
+
+            // struct dirent { i64, i64, i16, i8, [256 x i8] }
+            llvm::StructType *direntTy = llvm::StructType::getTypeByName(context, "struct.dirent");
+            if (!direntTy)
+            {
+                direntTy = llvm::StructType::create(context, {i64Ty, i64Ty, i16Ty, i8Ty, nameTy}, "struct.dirent");
+            }
+
+            llvm::Type *void_ptr = llvm::PointerType::get(context, 0);
+            llvm::FunctionType *helperTy = llvm::FunctionType::get(void_ptr, {void_ptr}, false);
+            helper = llvm::Function::Create(helperTy, llvm::Function::InternalLinkage, helper_name, module);
+            helper->addFnAttr(llvm::Attribute::AlwaysInline);
+
+            llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", helper);
+            llvm::IRBuilder<> helperBuilder(entry);
+
+            llvm::Value *dirent_ptr = helper->getArg(0);
+            // GEP to d_name field (index 4 in our struct layout)
+            llvm::Value *name_ptr = helperBuilder.CreateStructGEP(direntTy, dirent_ptr, 4, "d_name");
+            helperBuilder.CreateRet(name_ptr);
+        }
+
+        return builder.CreateCall(helper, {args[0]}, "dirent_name.result");
+    }
+
+    llvm::Value *Intrinsics::generate_dirent_type(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("dirent_type requires exactly 1 argument (entry)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        auto *module = builder.GetInsertBlock()->getParent()->getParent();
+
+        // Create or get the helper: i32 __cryo_dirent_type(void* entry)
+        // Maps POSIX d_type values to FileType enum ordinals:
+        //   DT_REG(8)  -> FileType::File(0)
+        //   DT_DIR(4)  -> FileType::Directory(1)
+        //   DT_LNK(10) -> FileType::Symlink(2)
+        //   DT_BLK(6)  -> FileType::BlockDevice(3)
+        //   DT_CHR(2)  -> FileType::CharDevice(4)
+        //   DT_FIFO(1) -> FileType::Fifo(5)
+        //   DT_SOCK(12) -> FileType::Socket(6)
+        //   otherwise   -> FileType::Unknown(7)
+        const std::string helper_name = "__cryo_dirent_type";
+        llvm::Function *helper = module->getFunction(helper_name);
+        if (!helper)
+        {
+            llvm::IntegerType *i8Ty = llvm::Type::getInt8Ty(context);
+            llvm::IntegerType *i16Ty = llvm::Type::getInt16Ty(context);
+            llvm::IntegerType *i32Ty = llvm::Type::getInt32Ty(context);
+            llvm::IntegerType *i64Ty = llvm::Type::getInt64Ty(context);
+            llvm::ArrayType *nameTy = llvm::ArrayType::get(i8Ty, 256);
+
+            llvm::StructType *direntTy = llvm::StructType::getTypeByName(context, "struct.dirent");
+            if (!direntTy)
+            {
+                direntTy = llvm::StructType::create(context, {i64Ty, i64Ty, i16Ty, i8Ty, nameTy}, "struct.dirent");
+            }
+
+            llvm::Type *void_ptr = llvm::PointerType::get(context, 0);
+            llvm::FunctionType *helperTy = llvm::FunctionType::get(i32Ty, {void_ptr}, false);
+            helper = llvm::Function::Create(helperTy, llvm::Function::InternalLinkage, helper_name, module);
+            helper->addFnAttr(llvm::Attribute::AlwaysInline);
+
+            llvm::BasicBlock *entry_bb = llvm::BasicBlock::Create(context, "entry", helper);
+            llvm::IRBuilder<> b(entry_bb);
+
+            llvm::Value *dirent_ptr = helper->getArg(0);
+            // GEP to d_type field (index 3)
+            llvm::Value *d_type_ptr = b.CreateStructGEP(direntTy, dirent_ptr, 3, "d_type_ptr");
+            llvm::Value *d_type = b.CreateLoad(i8Ty, d_type_ptr, "d_type");
+            llvm::Value *d_type_i32 = b.CreateZExt(d_type, i32Ty, "d_type_i32");
+
+            // POSIX DT_* constants
+            const int DT_FIFO = 1, DT_CHR = 2, DT_DIR = 4, DT_BLK = 6, DT_REG = 8, DT_LNK = 10, DT_SOCK = 12;
+            // FileType enum ordinals
+            const int FT_File = 0, FT_Dir = 1, FT_Symlink = 2, FT_Block = 3, FT_Char = 4, FT_Fifo = 5, FT_Socket = 6, FT_Unknown = 7;
+
+            llvm::BasicBlock *default_bb = llvm::BasicBlock::Create(context, "dt_unknown", helper);
+            llvm::BasicBlock *merge_bb = llvm::BasicBlock::Create(context, "merge", helper);
+
+            llvm::SwitchInst *sw = b.CreateSwitch(d_type_i32, default_bb, 7);
+
+            // Helper lambda to add a switch case
+            auto addCase = [&](int dt_val, int ft_val, const char *label) {
+                llvm::BasicBlock *bb = llvm::BasicBlock::Create(context, label, helper);
+                sw->addCase(llvm::ConstantInt::get(i32Ty, dt_val), bb);
+                llvm::IRBuilder<> cb(bb);
+                cb.CreateBr(merge_bb);
+            };
+
+            addCase(DT_REG, FT_File, "dt_reg");
+            addCase(DT_DIR, FT_Dir, "dt_dir");
+            addCase(DT_LNK, FT_Symlink, "dt_lnk");
+            addCase(DT_BLK, FT_Block, "dt_blk");
+            addCase(DT_CHR, FT_Char, "dt_chr");
+            addCase(DT_FIFO, FT_Fifo, "dt_fifo");
+            addCase(DT_SOCK, FT_Socket, "dt_sock");
+
+            // Default case
+            llvm::IRBuilder<> db(default_bb);
+            db.CreateBr(merge_bb);
+
+            // Merge with PHI
+            llvm::IRBuilder<> mb(merge_bb);
+            llvm::PHINode *phi = mb.CreatePHI(i32Ty, 8, "file_type");
+
+            // Get the basic blocks in order from the switch
+            for (auto caseIt = sw->case_begin(); caseIt != sw->case_end(); ++caseIt)
+            {
+                int dt_val = (int)caseIt->getCaseValue()->getSExtValue();
+                int ft_val;
+                if (dt_val == DT_REG) ft_val = FT_File;
+                else if (dt_val == DT_DIR) ft_val = FT_Dir;
+                else if (dt_val == DT_LNK) ft_val = FT_Symlink;
+                else if (dt_val == DT_BLK) ft_val = FT_Block;
+                else if (dt_val == DT_CHR) ft_val = FT_Char;
+                else if (dt_val == DT_FIFO) ft_val = FT_Fifo;
+                else if (dt_val == DT_SOCK) ft_val = FT_Socket;
+                else ft_val = FT_Unknown;
+                phi->addIncoming(llvm::ConstantInt::get(i32Ty, ft_val), caseIt->getCaseSuccessor());
+            }
+            phi->addIncoming(llvm::ConstantInt::get(i32Ty, FT_Unknown), default_bb);
+
+            mb.CreateRet(phi);
+        }
+
+        return builder.CreateCall(helper, {args[0]}, "dirent_type.result");
     }
 
     // ========================================

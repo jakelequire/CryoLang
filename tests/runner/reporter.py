@@ -136,7 +136,7 @@ class ConsoleReporter:
 
         for category in sorted(by_category.keys()):
             cat_results = by_category[category]
-            print(f"\n{self._bold(f'[{category}]')}")
+            print(f"\n{self._bold(f'[{category}]')} ({len(cat_results)} tests)")
             for r in cat_results:
                 name = r.test.metadata.name
                 verdict = self._verdict_str(r.verdict)

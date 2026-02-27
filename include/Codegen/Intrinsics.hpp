@@ -64,6 +64,7 @@ namespace Cryo::Codegen
 
         // I/O intrinsics
         llvm::Value *generate_printf(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_println(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_snprintf(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_getchar(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_putchar(const std::vector<llvm::Value *> &args);
@@ -119,6 +120,8 @@ namespace Cryo::Codegen
         llvm::Value *generate_opendir(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_readdir(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_closedir(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_dirent_name(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_dirent_type(const std::vector<llvm::Value *> &args);
 
         // Process intrinsics
         llvm::Value *generate_exit(const std::vector<llvm::Value *> &args);
