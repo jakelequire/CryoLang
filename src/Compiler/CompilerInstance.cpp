@@ -3702,8 +3702,33 @@ namespace Cryo
         LOG_INFO(LogComponent::GENERAL, "Generated {} object files ({} total)",
                  generated_object_files.size(), format_bytes(total_bytes));
 
-        // TODO: Combine object files into final library (.a file) if desired
-        // For now, individual object files are sufficient for testing
+        // Combine object files into final static library archive
+        if (!generated_object_files.empty() && _linker)
+        {
+            std::string archive_path = output_dir + "/stdlib.a";
+            std::cout << "  Bundling " << generated_object_files.size()
+                      << " object files into " << archive_path << "..." << std::endl;
+
+            if (_linker->create_static_archive(generated_object_files, archive_path))
+            {
+                try
+                {
+                    if (std::filesystem::exists(archive_path))
+                        std::cout << "  ✓ Created stdlib archive: " << archive_path
+                                  << " (" << format_bytes(std::filesystem::file_size(archive_path)) << ")"
+                                  << std::endl;
+                }
+                catch (...)
+                {
+                }
+            }
+            else
+            {
+                std::cout << "  ✗ Failed to create stdlib archive: "
+                          << _linker->get_last_error() << std::endl;
+                overall_success = false;
+            }
+        }
 
         return overall_success;
     }
