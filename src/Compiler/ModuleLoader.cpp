@@ -383,6 +383,73 @@ namespace Cryo
         return result;
     }
 
+    // Case-insensitive path resolution: walks directory segments of `relative_path`
+    // against actual filesystem entries under `root`, matching case-insensitively.
+    // Resolves all segments EXCEPT the last one (which is the module/file name handled
+    // by resolve_module_file_path). Returns the resolved base path with the original
+    // last segment appended, or empty string if any directory segment can't be found.
+    // For single-segment paths, returns root + segment unchanged.
+    static std::string resolve_path_case_insensitive(const std::string &root, const std::string &relative_path)
+    {
+        namespace fs = std::filesystem;
+
+        // Split relative_path by '/'
+        std::vector<std::string> segments;
+        size_t start = 0;
+        while (start < relative_path.size())
+        {
+            size_t slash = relative_path.find('/', start);
+            if (slash == std::string::npos)
+            {
+                segments.push_back(relative_path.substr(start));
+                break;
+            }
+            segments.push_back(relative_path.substr(start, slash - start));
+            start = slash + 1;
+        }
+        if (segments.empty())
+            return "";
+
+        // Single segment — nothing to resolve case-insensitively
+        if (segments.size() == 1)
+            return "";
+
+        // Walk directory segments (all except the last), matching case-insensitively
+        fs::path current = root;
+        for (size_t i = 0; i < segments.size() - 1; ++i)
+        {
+            if (!fs::is_directory(current))
+                return "";
+
+            std::string target_lower = segments[i];
+            std::transform(target_lower.begin(), target_lower.end(), target_lower.begin(), ::tolower);
+
+            bool found = false;
+            for (const auto &entry : fs::directory_iterator(current))
+            {
+                if (!entry.is_directory())
+                    continue;
+                std::string entry_name = entry.path().filename().string();
+                std::string entry_lower = entry_name;
+                std::transform(entry_lower.begin(), entry_lower.end(), entry_lower.begin(), ::tolower);
+
+                if (entry_lower == target_lower)
+                {
+                    current = entry.path();
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+                return "";
+        }
+
+        // Append the last segment (lowercased) — resolve_module_file_path will add .cryo
+        std::string last_seg = segments.back();
+        std::transform(last_seg.begin(), last_seg.end(), last_seg.begin(), ::tolower);
+        return (current / last_seg).string();
+    }
+
     std::string ModuleLoader::resolve_import_path(const std::string &import_path)
     {
         // Convert module path (core::option) to file path (core/option)
@@ -547,6 +614,21 @@ namespace Cryo
                 {
                     _last_resolve_was_local = true;
                     return result;
+                }
+            }
+
+            // Case-insensitive filesystem walk: handles mixed-case directories
+            // (e.g., import Compiler::AST::Node → compiler/AST/node.cryo)
+            {
+                std::string ci_path = resolve_path_case_insensitive(_project_root, file_path);
+                if (!ci_path.empty())
+                {
+                    result = resolve_module_file_path(ci_path, ImportDeclarationNode::ImportStyle::WildcardImport);
+                    if (std::filesystem::exists(result))
+                    {
+                        _last_resolve_was_local = true;
+                        return result;
+                    }
                 }
             }
         }
