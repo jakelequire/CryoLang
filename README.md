@@ -13,7 +13,7 @@
 namespace HelloWorld;
 
 function main() -> int {
-    println("Hello, world!\n");
+    println("Hello, world!");
     return 0;
 }
 ```
@@ -139,7 +139,7 @@ function add(a: int, b: int) -> int {
 }
 
 function greet(name: string) -> void {
-    println("Hello, %s!\n", name);
+    println("Hello, %s!", name);
 }
 ```
 
@@ -372,13 +372,13 @@ type enum Shape {
 function describe(s: Shape) -> void {
     match (s) {
         Shape::Circle(r) => {
-            println("Circle with radius %f\n", r);
+            println("Circle with radius %f", r);
         }
         Shape::Rectangle(w, h) => {
-            println("Rectangle %f x %f\n", w, h);
+            println("Rectangle %f x %f", w, h);
         }
         Shape::Point => {
-            println("A point\n");
+            println("A point");
         }
     }
 }
@@ -529,7 +529,7 @@ Cryo provides explicit pointer operations for systems-level control.
 function example() -> void {
     mut x: int = 42;
     const ptr: int* = &x;          // address-of
-    println("%d\n", *ptr);          // dereference
+    println("%d", *ptr);          // dereference
 
     // Heap allocation
     const buf: int* = malloc(sizeof(int) * 10);
@@ -659,6 +659,7 @@ make test-tier2      # Type system (structs, enums, pointers, match)
 make test-tier3      # Generics (structs, enums, cross-module)
 make test-tier4      # Modules (imports, submodules, visibility)
 make test-tier5      # Classes (inheritance, virtual dispatch, polymorphism)
+make test-tier6      # FFI (C interop, unsafe code)
 make test-negative   # Expected compilation failures
 ```
 
