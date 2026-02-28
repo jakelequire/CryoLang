@@ -3322,9 +3322,27 @@ namespace Cryo
 
         for (const auto &[fn_name, entry] : _cross_module_functions)
         {
-            // Skip if already declared in current module
-            if (current_module->getFunction(fn_name))
-                continue;
+            // Check if already declared in current module
+            if (llvm::Function *existing = current_module->getFunction(fn_name))
+            {
+                // If the existing declaration has a different signature than the cross-module
+                // definition (e.g., pre_register_functions created it with wrong arg count),
+                // remove the incorrect declaration and let us create the correct one.
+                llvm::FunctionType *existing_ft = existing->getFunctionType();
+                if (existing->isDeclaration() &&
+                    existing_ft->getNumParams() != entry.param_types.size())
+                {
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "Cross-module: replacing mismatched declaration '{}' "
+                              "(had {} params, need {})",
+                              fn_name, existing_ft->getNumParams(), entry.param_types.size());
+                    existing->eraseFromParent();
+                }
+                else
+                {
+                    continue;
+                }
+            }
 
             // Reconstruct return type
             llvm::Type *ret_type = desc_to_llvm_type(entry.return_type, ctx);

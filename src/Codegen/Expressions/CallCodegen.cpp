@@ -2464,12 +2464,16 @@ namespace Cryo::Codegen
         auto args = generate_arguments(node->arguments());
 
         // Look for variant constructor function (for complex variants with payloads)
-        // Try instantiated name first (e.g., Option_string::Some)
+        // Only accept functions with a DEFINITION (not mere declarations), because
+        // cross-module stubs or previous invocations may have created a `declare`
+        // that will never be defined in the final binary.
         llvm::Function *ctor = module()->getFunction(qualified_variant);
+        if (ctor && ctor->isDeclaration()) ctor = nullptr;
         if (!ctor && instantiated_enum_name != resolved_enum_name)
         {
             // Fallback to base name (e.g., Option::Some)
             ctor = module()->getFunction(base_qualified_variant);
+            if (ctor && ctor->isDeclaration()) ctor = nullptr;
         }
         if (!ctor)
         {
@@ -2479,6 +2483,7 @@ namespace Cryo::Codegen
             {
                 std::string short_name = resolved_enum_name.substr(last_sep + 2) + "::" + variant_name;
                 ctor = module()->getFunction(short_name);
+                if (ctor && ctor->isDeclaration()) ctor = nullptr;
             }
         }
         if (!ctor)
@@ -2489,6 +2494,7 @@ namespace Cryo::Codegen
             std::string suffix = "::" + qualified_variant;
             for (auto &fn : module()->functions())
             {
+                if (fn.isDeclaration()) continue;
                 std::string fn_name = fn.getName().str();
                 if (fn_name.size() > suffix.size() &&
                     fn_name.compare(fn_name.size() - suffix.size(), suffix.size(), suffix) == 0)
@@ -2679,10 +2685,76 @@ namespace Cryo::Codegen
                   "generate_enum_variant: Enum type lookup for '{}': {}",
                   instantiated_enum_name, enum_type ? "found" : "not found");
 
-        // For cross-module enum variant calls with payloads, create an extern declaration
-        // This handles cases where the enum is defined in another module
+        // For enum variant calls with payloads where the constructor function and
+        // discriminant weren't found, try inline-constructing with a computed index.
         if (!args.empty())
         {
+            // Determine the discriminant by looking up the variant name in the
+            // generic enum template.  For Result<T,E>: Ok=0, Err=1.
+            int32_t computed_disc = -1;
+            if (auto *template_reg = ctx().template_registry())
+            {
+                // Try the resolved (base) enum name first
+                auto *tmpl_info = template_reg->find_template(resolved_enum_name);
+                if (!tmpl_info)
+                {
+                    // Try stripping namespace prefix
+                    size_t sep = resolved_enum_name.rfind("::");
+                    if (sep != std::string::npos)
+                        tmpl_info = template_reg->find_template(resolved_enum_name.substr(sep + 2));
+                }
+                if (tmpl_info && tmpl_info->enum_template)
+                {
+                    int32_t idx = 0;
+                    for (const auto &v : tmpl_info->enum_template->variants())
+                    {
+                        if (v->name() == variant_name)
+                        {
+                            computed_disc = idx;
+                            break;
+                        }
+                        idx++;
+                    }
+                }
+            }
+
+            // If we have the enum type and discriminant, inline-construct
+            if (computed_disc >= 0 && enum_type && enum_type->isStructTy())
+            {
+                auto *struct_ty = llvm::cast<llvm::StructType>(enum_type);
+                llvm::Value *enum_alloca = create_entry_alloca(struct_ty, variant_name + ".ctor");
+
+                // Store discriminant
+                llvm::Value *disc_ptr = builder().CreateStructGEP(struct_ty, enum_alloca, 0, "disc_ptr");
+                llvm::Value *disc_val = llvm::ConstantInt::get(struct_ty->getElementType(0), computed_disc);
+                builder().CreateStore(disc_val, disc_ptr);
+
+                // Store payload fields
+                if (struct_ty->getNumElements() > 1)
+                {
+                    llvm::Value *payload_ptr = builder().CreateStructGEP(struct_ty, enum_alloca, 1, "payload_ptr");
+                    size_t byte_offset = 0;
+                    for (size_t i = 0; i < args.size(); ++i)
+                    {
+                        if (!args[i]) continue;
+                        llvm::Value *field_ptr = builder().CreateConstGEP1_32(
+                            llvm::Type::getInt8Ty(llvm_ctx()), payload_ptr, byte_offset, "field_ptr");
+                        builder().CreateStore(args[i], field_ptr);
+                        llvm::Type *arg_type = args[i]->getType();
+                        if (arg_type->isSized())
+                            byte_offset += module()->getDataLayout().getTypeAllocSize(arg_type);
+                        else
+                            byte_offset += 8;
+                    }
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_enum_variant: Inline-constructed '{}' via template lookup (disc={})",
+                          qualified_variant, computed_disc);
+
+                return builder().CreateLoad(struct_ty, enum_alloca, variant_name + ".val");
+            }
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "generate_enum_variant: Creating extern declaration for '{}' with {} args",
                       qualified_variant, args.size());
@@ -2704,10 +2776,87 @@ namespace Cryo::Codegen
                 return nullptr;
             }
 
-            // Create function type: (...payload_types) -> enum_type
-            llvm::FunctionType *ctor_type = llvm::FunctionType::get(enum_type, param_types, false);
+            // Determine the variant's discriminant index.  We try to look it
+            // up from the generic (non-instantiated) enum variant registry first,
+            // then from the generic enum declaration's variant ordering.
+            int32_t disc_index = -1;
+            {
+                // Try looking up the discriminant from registered variants using
+                // various name patterns
+                auto &ev = ctx().enum_variants_map();
+                std::vector<std::string> disc_keys = {
+                    qualified_variant,
+                    base_qualified_variant,
+                    resolved_enum_name + "::" + variant_name,
+                };
+                for (const auto &key : disc_keys)
+                {
+                    auto disc_it = ev.find(key);
+                    if (disc_it != ev.end())
+                    {
+                        if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(disc_it->second))
+                            disc_index = static_cast<int32_t>(ci->getZExtValue());
+                        break;
+                    }
+                }
+                // Fallback: search for any key ending with "::<variant_name>"
+                // in the same base enum
+                if (disc_index < 0)
+                {
+                    std::string suffix = "::" + variant_name;
+                    for (auto &[k, v] : ev)
+                    {
+                        if (k.size() > suffix.size() && k.ends_with(suffix))
+                        {
+                            if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(v))
+                                disc_index = static_cast<int32_t>(ci->getZExtValue());
+                            break;
+                        }
+                    }
+                }
+            }
 
-            // Create extern declaration
+            if (disc_index >= 0 && enum_type->isStructTy())
+            {
+                // Inline-construct the enum value directly at the call site.
+                // This avoids needing a separate constructor function that may
+                // not be generated in the stdlib.
+                auto *struct_ty = llvm::cast<llvm::StructType>(enum_type);
+                llvm::Value *enum_alloca = create_entry_alloca(struct_ty, variant_name + ".ctor");
+
+                // Store discriminant
+                llvm::Value *disc_ptr = builder().CreateStructGEP(struct_ty, enum_alloca, 0, "disc_ptr");
+                llvm::Value *disc_val = llvm::ConstantInt::get(struct_ty->getElementType(0), disc_index);
+                builder().CreateStore(disc_val, disc_ptr);
+
+                // Store payload fields
+                if (struct_ty->getNumElements() > 1)
+                {
+                    llvm::Value *payload_ptr = builder().CreateStructGEP(struct_ty, enum_alloca, 1, "payload_ptr");
+                    size_t byte_offset = 0;
+                    for (size_t i = 0; i < args.size(); ++i)
+                    {
+                        if (!args[i]) continue;
+                        llvm::Value *field_ptr = builder().CreateConstGEP1_32(
+                            llvm::Type::getInt8Ty(llvm_ctx()), payload_ptr, byte_offset, "field_ptr");
+                        builder().CreateStore(args[i], field_ptr);
+                        llvm::Type *arg_type = args[i]->getType();
+                        if (arg_type->isSized())
+                            byte_offset += module()->getDataLayout().getTypeAllocSize(arg_type);
+                        else
+                            byte_offset += 8;
+                    }
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "generate_enum_variant: Inline-constructed '{}' (disc={})",
+                          qualified_variant, disc_index);
+
+                return builder().CreateLoad(struct_ty, enum_alloca, variant_name + ".val");
+            }
+
+            // Last resort: create extern declaration and hope it's defined elsewhere
+            llvm::FunctionType *ctor_type = llvm::FunctionType::get(enum_type, param_types, false);
             llvm::Function *extern_ctor = llvm::Function::Create(
                 ctor_type, llvm::Function::ExternalLinkage, qualified_variant, module());
 
@@ -3209,6 +3358,10 @@ namespace Cryo::Codegen
             {
                 for (const auto &type_candidate : type_candidates)
                 {
+                    // Skip "Global::" candidates — these are synthetic scope names
+                    // from inject_parent_module_import, not real namespaces.
+                    if (type_candidate.substr(0, 8) == "Global::")
+                        continue;
                     std::string base_qualified = type_candidate + "::" + method_name;
                     if (llvm::Function *fn = module()->getFunction(base_qualified))
                     {
@@ -3241,6 +3394,9 @@ namespace Cryo::Codegen
                     for (auto &fn : module()->functions())
                     {
                         std::string fn_name = fn.getName().str();
+                        // Skip "Global::" prefixed functions — synthetic scope, not real namespace
+                        if (fn_name.substr(0, 8) == "Global::")
+                            continue;
                         // Match functions ending with "Type::method" (no overload suffix)
                         if ((fn_name == target_suffix || fn_name.ends_with("::" + target_suffix)) &&
                             fn_name.find('(') == std::string::npos &&
@@ -3812,6 +3968,54 @@ namespace Cryo::Codegen
                         type_name = ref_type->referent()->display_name();
                     }
                 }
+                // If we're inside a monomorphized method body, the AST types
+                // may still contain unresolved generic parameters (e.g.,
+                // "Array<T>" instead of "Array<u8>").  The codegen context's
+                // current_type_name is set correctly by
+                // GenericCodegen::instantiate_method_for_type to the mangled
+                // concrete name (e.g., "Array_u8").  Prefer it when available
+                // and the AST-derived name still looks generic.
+                {
+                    std::string ctx_type = ctx().current_type_name();
+                    if (!ctx_type.empty() && ctx_type != type_name)
+                    {
+                        // Check if type_name contains single-letter type params
+                        // that suggest it hasn't been fully monomorphized
+                        bool looks_generic = false;
+                        // Generic params: <T>, <T, E>, <K, V> etc.
+                        if (type_name.find('<') != std::string::npos)
+                        {
+                            // Has angle brackets - check if the args are single uppercase letters
+                            size_t open = type_name.find('<');
+                            size_t close = type_name.find('>');
+                            if (open != std::string::npos && close != std::string::npos)
+                            {
+                                std::string params = type_name.substr(open + 1, close - open - 1);
+                                // If params section contains single uppercase letters (T, E, K, V)
+                                // surrounded by delimiters, it's still generic
+                                for (size_t i = 0; i < params.size(); ++i)
+                                {
+                                    char c = params[i];
+                                    if (std::isupper(c) && (i == 0 || params[i-1] == ' ' || params[i-1] == ',') &&
+                                        (i+1 >= params.size() || params[i+1] == ',' || params[i+1] == '>'))
+                                    {
+                                        looks_generic = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (looks_generic)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Instance method: type '{}' has unsubstituted params, "
+                                      "using context type '{}' instead",
+                                      type_name, ctx_type);
+                            type_name = ctx_type;
+                        }
+                    }
+                }
+
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "Instance method receiver type: {}", type_name);
             }
@@ -3860,6 +4064,26 @@ namespace Cryo::Codegen
                         {
                             type_name = var_type->display_name();
                         }
+                        // If the type name still has unsubstituted generic params (e.g.,
+                        // "Array<T>"), use GenericCodegen to substitute them into the
+                        // concrete mangled name (e.g., "Array_String").
+                        if (type_name.find('<') != std::string::npos)
+                        {
+                            CodegenVisitor *visitor = ctx().visitor();
+                            GenericCodegen *generics = visitor ? visitor->get_generics() : nullptr;
+                            if (generics && generics->in_type_param_scope())
+                            {
+                                std::string substituted = generics->substitute_type_annotation(type_name);
+                                if (!substituted.empty())
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Instance method: substituted variable map type '{}' -> '{}'",
+                                              type_name, substituted);
+                                    type_name = substituted;
+                                }
+                            }
+                        }
+
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                   "Instance method receiver type from variable map: {}", type_name);
                     }

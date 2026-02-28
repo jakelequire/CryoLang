@@ -1423,6 +1423,15 @@ namespace Cryo::Codegen
                     existing->setInitializer(initializer);
                     existing->setConstant(!node->is_mutable());
 
+                    // Update linkage: the pre-registered placeholder used ExternalLinkage,
+                    // but now that we have the full declaration we can apply the proper linkage.
+                    llvm::GlobalValue::LinkageTypes linkage = get_linkage(node);
+                    existing->setLinkage(linkage);
+                    if (linkage == llvm::GlobalValue::LinkOnceODRLinkage)
+                    {
+                        existing->setComdat(module()->getOrInsertComdat(name));
+                    }
+
                     // Register constant in TemplateRegistry for cross-module generic method access
                     // (mirrors the logic at line ~1415 for the non-pre-registered path)
                     if (!node->is_mutable())

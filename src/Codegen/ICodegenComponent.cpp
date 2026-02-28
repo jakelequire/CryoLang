@@ -167,8 +167,11 @@ namespace Cryo::Codegen
                               type_name, method_name, qualified_method);
                     return fn;
                 }
-                // Remember declaration as fallback but keep looking for a definition
-                if (!declaration_fallback)
+                // Remember declaration as fallback but keep looking for a definition.
+                // Skip "Global::" prefixed names — they come from inject_parent_module_import
+                // and are not real namespaces; a properly-namespaced version will be found
+                // by the pattern-based scan below.
+                if (!declaration_fallback && qualified_method.substr(0, 8) != "Global::")
                     declaration_fallback = fn;
             }
 
@@ -189,7 +192,7 @@ namespace Cryo::Codegen
                                       type_name, method_name, fn_name);
                             return &fn;
                         }
-                        if (!declaration_fallback)
+                        if (!declaration_fallback && qualified_method.substr(0, 8) != "Global::")
                             declaration_fallback = &fn;
                     }
                 }
@@ -205,7 +208,7 @@ namespace Cryo::Codegen
                               type_name, method_name, qualified_method);
                     return fn;
                 }
-                if (!declaration_fallback)
+                if (!declaration_fallback && qualified_method.substr(0, 8) != "Global::")
                     declaration_fallback = fn;
             }
         }
