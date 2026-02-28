@@ -92,6 +92,22 @@ namespace Cryo::Linker
         _object_files.push_back(object_path);
     }
 
+    bool CryoLinker::create_static_archive(
+        const std::vector<std::string> &object_files,
+        const std::string &output_path)
+    {
+        if (object_files.empty())
+            return false;
+
+        std::vector<std::string> ar_args;
+        ar_args.push_back("rcs");
+        ar_args.push_back(output_path);
+        for (const auto &obj : object_files)
+            ar_args.push_back(obj);
+
+        return execute_ar_command(ar_args);
+    }
+
     void CryoLinker::add_library(const std::string &library_name, bool is_static)
     {
         _libraries.emplace_back(library_name, is_static);
