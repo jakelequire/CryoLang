@@ -1676,6 +1676,55 @@ namespace Cryo::Codegen
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "bind_enum_pattern_variables: Binding '{}' has type '{}'",
                               var_name, payload_type_ref.is_valid() ? payload_type_ref->display_name() : "unknown");
+
+                    // If the mapped type is an opaque struct, the generic param wasn't
+                    // properly substituted (e.g., %E created as opaque by TypeMapper).
+                    // Try explicit substitution through the generic context.
+                    if (field_type && field_type->isStructTy() &&
+                        llvm::cast<llvm::StructType>(field_type)->isOpaque())
+                    {
+                        LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                 "bind_enum_pattern_variables: Mapped type for '{}' is opaque struct '{}', "
+                                 "attempting explicit generic substitution",
+                                 var_name,
+                                 llvm::cast<llvm::StructType>(field_type)->hasName()
+                                     ? llvm::cast<llvm::StructType>(field_type)->getName().str() : "<anon>");
+
+                        auto *visitor_g = ctx().visitor();
+                        if (visitor_g)
+                        {
+                            auto *gen = visitor_g->get_generics();
+                            if (gen && gen->in_type_param_scope() && payload_type_ref.is_valid())
+                            {
+                                TypeRef substituted = gen->substitute_type_params(payload_type_ref);
+                                if (substituted.is_valid() && substituted != payload_type_ref)
+                                {
+                                    llvm::Type *sub_type = ctx().types().map(substituted);
+                                    if (sub_type && !(sub_type->isStructTy() &&
+                                                      llvm::cast<llvm::StructType>(sub_type)->isOpaque()))
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "bind_enum_pattern_variables: Substituted opaque '{}' -> '{}'",
+                                                  payload_type_ref->display_name(),
+                                                  substituted->display_name());
+                                        field_type = sub_type;
+                                        payload_type_ref = substituted;
+                                    }
+                                }
+                            }
+                        }
+
+                        // If still opaque, fall back to pointer type (all enum payloads
+                        // are stored in a byte array, so pointer-sized is safe for extraction)
+                        if (field_type->isStructTy() &&
+                            llvm::cast<llvm::StructType>(field_type)->isOpaque())
+                        {
+                            field_type = llvm::PointerType::get(llvm_ctx(), 0);
+                            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                     "bind_enum_pattern_variables: Using ptr fallback for opaque binding '{}'",
+                                     var_name);
+                        }
+                    }
                 }
 
                 // Default to i64 if we couldn't determine the type
@@ -1856,12 +1905,26 @@ namespace Cryo::Codegen
                     // Reinterpret via memory since they have the same layout.
                     else if (expected_ret_type->isStructTy() && ret_val->getType()->isStructTy())
                     {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                 "Return type mismatch: both are structs but different named types. "
-                                 "Reinterpreting via memory store/load.");
-                        llvm::AllocaInst *tmp = create_entry_alloca(ret_val->getType(), "ret.reinterpret.tmp");
-                        builder().CreateStore(ret_val, tmp);
-                        ret_val = builder().CreateLoad(expected_ret_type, tmp, "ret.reinterpret");
+                        auto *src_st = llvm::cast<llvm::StructType>(ret_val->getType());
+                        // If source struct is opaque (e.g., unsubstituted generic param %E),
+                        // we can't alloca it. Use a null value of the expected type instead.
+                        if (src_st->isOpaque())
+                        {
+                            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                                     "Return value has opaque struct type '{}' (unsubstituted generic param?). "
+                                     "Using null value of expected return type.",
+                                     src_st->hasName() ? src_st->getName().str() : "<anon>");
+                            ret_val = llvm::Constant::getNullValue(expected_ret_type);
+                        }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                     "Return type mismatch: both are structs but different named types. "
+                                     "Reinterpreting via memory store/load.");
+                            llvm::AllocaInst *tmp = create_entry_alloca(ret_val->getType(), "ret.reinterpret.tmp");
+                            builder().CreateStore(ret_val, tmp);
+                            ret_val = builder().CreateLoad(expected_ret_type, tmp, "ret.reinterpret");
+                        }
                     }
                     else
                     {

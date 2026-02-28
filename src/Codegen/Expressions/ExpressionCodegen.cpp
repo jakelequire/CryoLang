@@ -3811,6 +3811,29 @@ namespace Cryo::Codegen
                         }
                     }
                 }
+
+                // If the extracted element type still contains unsubstituted generic params
+                // (e.g., HashSetEntry<T> from the AST), apply type parameter substitution
+                // through the current generic instantiation context.
+                if (obj_type.is_valid())
+                {
+                    auto *visitor_g = ctx().visitor();
+                    if (visitor_g)
+                    {
+                        auto *gen = visitor_g->get_generics();
+                        if (gen && gen->in_type_param_scope())
+                        {
+                            Cryo::TypeRef substituted = gen->substitute_type_params(obj_type);
+                            if (substituted.is_valid() && substituted != obj_type)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_member_info: Substituted ArrayAccessNode element type {} -> {}",
+                                          obj_type->display_name(), substituted->display_name());
+                                obj_type = substituted;
+                            }
+                        }
+                    }
+                }
             }
             // Fallback: If object is a CallExpressionNode (e.g., this.peek().ty), resolve the return type
             else if (auto *call_expr = dynamic_cast<Cryo::CallExpressionNode *>(object))
@@ -3891,6 +3914,113 @@ namespace Cryo::Codegen
                                               "resolve_member_info: Resolved method '{}' return type to '{}'",
                                               candidate, obj_type->display_name());
                                     break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!obj_type)
+            {
+                // Last-resort fallback for ArrayAccessNode: resolve element type via
+                // TemplateRegistry using current_type_name. This handles cases like
+                // this.entries[i].value where the existing ArrayAccessNode branch above
+                // failed to determine array_type (e.g., because field types from
+                // get_resolved_type() were null).
+                if (auto *array_access_fixup = dynamic_cast<Cryo::ArrayAccessNode *>(object))
+                {
+                    if (auto *arr_member = dynamic_cast<Cryo::MemberAccessNode *>(array_access_fixup->array()))
+                    {
+                        llvm::StructType *parent_struct = nullptr;
+                        unsigned field_idx_tmp = 0;
+                        if (resolve_member_info(arr_member->object(), arr_member->member(), parent_struct, field_idx_tmp))
+                        {
+                            // Use current_type_name (always set during method codegen)
+                            std::string parent_type_name = ctx().current_type_name();
+
+                            // Also try variable_types_map
+                            if (parent_type_name.empty())
+                            {
+                                if (auto *arr_id = dynamic_cast<Cryo::IdentifierNode *>(arr_member->object()))
+                                {
+                                    auto &var_types = ctx().variable_types_map();
+                                    auto it = var_types.find(arr_id->name());
+                                    if (it != var_types.end() && it->second.is_valid())
+                                    {
+                                        TypeRef vt = it->second;
+                                        if (vt->kind() == Cryo::TypeKind::Pointer)
+                                        {
+                                            auto *ptr = dynamic_cast<const Cryo::PointerType *>(vt.get());
+                                            if (ptr && ptr->pointee())
+                                                parent_type_name = ptr->pointee()->display_name();
+                                        }
+                                        else if (vt->kind() == Cryo::TypeKind::Reference)
+                                        {
+                                            auto *ref = dynamic_cast<const Cryo::ReferenceType *>(vt.get());
+                                            if (ref && ref->referent())
+                                                parent_type_name = ref->referent()->display_name();
+                                        }
+                                        else
+                                            parent_type_name = vt->display_name();
+                                    }
+                                }
+                            }
+
+                            if (!parent_type_name.empty())
+                            {
+                                if (auto *template_reg = ctx().template_registry())
+                                {
+                                    std::vector<std::string> candidates = {parent_type_name};
+                                    if (!ctx().namespace_context().empty())
+                                        candidates.push_back(ctx().namespace_context() + "::" + parent_type_name);
+
+                                    for (const auto &candidate : candidates)
+                                    {
+                                        const auto *field_info = template_reg->get_struct_field_types(candidate);
+                                        if (field_info && field_idx_tmp < field_info->field_types.size())
+                                        {
+                                            TypeRef field_type = field_info->field_types[field_idx_tmp];
+                                            if (field_type.is_valid())
+                                            {
+                                                TypeRef element_type;
+                                                if (field_type->kind() == Cryo::TypeKind::Pointer)
+                                                {
+                                                    auto *ptr = dynamic_cast<const Cryo::PointerType *>(field_type.get());
+                                                    if (ptr && ptr->pointee())
+                                                        element_type = ptr->pointee();
+                                                }
+                                                else if (field_type->kind() == Cryo::TypeKind::Array)
+                                                {
+                                                    auto *arr = dynamic_cast<const Cryo::ArrayType *>(field_type.get());
+                                                    if (arr && arr->element())
+                                                        element_type = arr->element();
+                                                }
+
+                                                if (element_type.is_valid())
+                                                {
+                                                    auto *visitor_g = ctx().visitor();
+                                                    if (visitor_g)
+                                                    {
+                                                        auto *gen = visitor_g->get_generics();
+                                                        if (gen && gen->in_type_param_scope())
+                                                        {
+                                                            TypeRef sub = gen->substitute_type_params(element_type);
+                                                            if (sub.is_valid() && sub != element_type)
+                                                                element_type = sub;
+                                                        }
+                                                    }
+
+                                                    obj_type = element_type;
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                              "resolve_member_info: ArrayAccessNode last-resort fixup - "
+                                                              "resolved element type to '{}' from parent '{}' field index {}",
+                                                              obj_type->display_name(), candidate, field_idx_tmp);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
