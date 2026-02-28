@@ -6129,6 +6129,34 @@ namespace Cryo::Codegen
             }
         }
 
+        // Last resort: if the scope name is a generic enum template and we're NOT in a type param
+        // scope (e.g., RangeIter::last() references Option::None), search for any instantiated
+        // variant matching the pattern "{mangled}::{member}".
+        if (auto *template_reg = ctx().template_registry())
+        {
+            const auto *tmpl_info = template_reg->find_template(node->scope_name());
+            if (tmpl_info && tmpl_info->enum_template)
+            {
+                std::string member = node->member_name();
+                std::string suffix = "::" + member;
+                auto &ev_map = ctx().enum_variants_map();
+                for (const auto &[vname, vval] : ev_map)
+                {
+                    // Match pattern: scope_name followed by mangled suffix, then ::member
+                    // e.g., "Option_i64::None" starts with "Option" and ends with "::None"
+                    if (vname.size() > suffix.size() &&
+                        vname.compare(0, node->scope_name().size(), node->scope_name()) == 0 &&
+                        vname.compare(vname.size() - suffix.size(), suffix.size(), suffix) == 0)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "ExpressionCodegen: Resolved generic enum variant '{}' via pattern match to '{}'",
+                                  qualified_name, vname);
+                        return vval;
+                    }
+                }
+            }
+        }
+
         // Log failure for debugging
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ExpressionCodegen: Failed to find '{}'", qualified_name);
         auto &enum_variants = ctx().enum_variants_map();
