@@ -1906,12 +1906,29 @@ namespace Cryo::Codegen
         // %"IoResult<u32>" created by GenericCodegen and TypeMapper respectively).
         if (source_type->isStructTy() && target_type->isStructTy())
         {
+            auto *src_st = llvm::cast<llvm::StructType>(source_type);
+            auto *tgt_st = llvm::cast<llvm::StructType>(target_type);
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                      "cast_if_needed: Reinterpreting struct '{}' as '{}' via memory",
-                     llvm::cast<llvm::StructType>(source_type)->hasName()
-                         ? llvm::cast<llvm::StructType>(source_type)->getName().str() : "<anon>",
-                     llvm::cast<llvm::StructType>(target_type)->hasName()
-                         ? llvm::cast<llvm::StructType>(target_type)->getName().str() : "<anon>");
+                     src_st->hasName() ? src_st->getName().str() : "<anon>",
+                     tgt_st->hasName() ? tgt_st->getName().str() : "<anon>");
+
+            // If source struct is opaque (unsized), we can't alloca/store it.
+            // This can happen when an unsubstituted generic param type (e.g., %E)
+            // was created as an opaque struct by TypeMapper. If the target type is
+            // concrete, just return a null value of the target type since the
+            // original value can't be used as-is.
+            if (src_st->isOpaque())
+            {
+                LOG_WARN(Cryo::LogComponent::CODEGEN,
+                         "cast_if_needed: Source struct '{}' is opaque (unsubstituted generic param?), "
+                         "cannot reinterpret as '{}' - returning null",
+                         src_st->hasName() ? src_st->getName().str() : "<anon>",
+                         tgt_st->hasName() ? tgt_st->getName().str() : "<anon>");
+                return llvm::Constant::getNullValue(target_type);
+            }
+
             llvm::AllocaInst *tmp = b.CreateAlloca(source_type, nullptr, "struct.cast.tmp");
             b.CreateStore(value, tmp);
             return b.CreateLoad(target_type, tmp, "struct.cast.val");

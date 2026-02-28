@@ -811,12 +811,36 @@ namespace Cryo::Codegen
             if (existing->isDeclaration() && fn_type &&
                 existing->getFunctionType()->getNumParams() == fn_type->getNumParams())
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Reusing extern declaration '{}' despite type mismatch "
-                          "(definition will use extern's signature)",
-                          llvm_fn_name);
-                ensure_arg_names(existing);
-                return existing;
+                // Only reuse if parameter types are compatible (all pointers in opaque ptr mode).
+                // If any parameter differs in kind (e.g., i32 vs struct), this is a genuine
+                // overload with the same arity, not a type mismatch we can paper over.
+                bool params_compatible = true;
+                for (unsigned pi = 0; pi < fn_type->getNumParams(); ++pi)
+                {
+                    llvm::Type *existing_pt = existing->getFunctionType()->getParamType(pi);
+                    llvm::Type *new_pt = fn_type->getParamType(pi);
+                    if (existing_pt != new_pt)
+                    {
+                        // In opaque pointer mode, all pointers are `ptr` so they match.
+                        // Only allow reuse if both are the same type class (both ptr, both same int width, etc.)
+                        bool both_ptrs = existing_pt->isPointerTy() && new_pt->isPointerTy();
+                        if (!both_ptrs)
+                        {
+                            params_compatible = false;
+                            break;
+                        }
+                    }
+                }
+                if (params_compatible)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Reusing extern declaration '{}' despite type mismatch "
+                              "(definition will use extern's signature)",
+                              llvm_fn_name);
+                    ensure_arg_names(existing);
+                    return existing;
+                }
+                // Parameters are genuinely different types — fall through to create overloaded function
             }
             // If the existing function is a declaration-only stub (from pre-registration)
             // with a DIFFERENT param count, the stub was generated with the wrong signature.
