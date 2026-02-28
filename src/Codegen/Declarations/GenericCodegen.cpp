@@ -2007,6 +2007,45 @@ namespace Cryo::Codegen
                         {
                             param_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
                         }
+                        // Fallback: try primitive type mapping for basic types like
+                        // i8, i16, i32, i64, u8, u16, u32, u64, boolean, etc.
+                        if (!param_type)
+                        {
+                            if (type_name == "i8" || type_name == "u8")
+                                param_type = llvm::Type::getInt8Ty(llvm_ctx());
+                            else if (type_name == "i16" || type_name == "u16")
+                                param_type = llvm::Type::getInt16Ty(llvm_ctx());
+                            else if (type_name == "i32" || type_name == "u32" || type_name == "int")
+                                param_type = llvm::Type::getInt32Ty(llvm_ctx());
+                            else if (type_name == "i64" || type_name == "u64")
+                                param_type = llvm::Type::getInt64Ty(llvm_ctx());
+                            else if (type_name == "f32")
+                                param_type = llvm::Type::getFloatTy(llvm_ctx());
+                            else if (type_name == "f64")
+                                param_type = llvm::Type::getDoubleTy(llvm_ctx());
+                            else if (type_name == "boolean" || type_name == "bool")
+                                param_type = llvm::Type::getInt1Ty(llvm_ctx());
+                            else if (type_name == "string" || type_name == "void*" ||
+                                     type_name.back() == '*')
+                                param_type = llvm::PointerType::get(llvm_ctx(), 0);
+                        }
+                        // Fallback: search all struct types in the module for a
+                        // name that ends with "::type_name" (namespace-qualified).
+                        if (!param_type)
+                        {
+                            for (auto *st : module()->getIdentifiedStructTypes())
+                            {
+                                llvm::StringRef sn = st->getName();
+                                if (sn == type_name ||
+                                    (sn.size() > type_name.size() + 2 &&
+                                     sn.ends_with(type_name) &&
+                                     sn[sn.size() - type_name.size() - 2] == ':'))
+                                {
+                                    param_type = st;
+                                    break;
+                                }
+                            }
+                        }
                         if (!param_type)
                         {
                             LOG_WARN(Cryo::LogComponent::CODEGEN,
