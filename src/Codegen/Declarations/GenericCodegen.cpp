@@ -591,6 +591,11 @@ namespace Cryo::Codegen
                 // Track the method node so TypeMapper callbacks get the method location
                 NodeTracker method_tracker(ctx(), method.get());
                 llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
+                if (fn)
+                {
+                    fn->setLinkage(llvm::Function::LinkOnceODRLinkage);
+                    fn->setComdat(module()->getOrInsertComdat(fn->getName().str()));
+                }
                 if (fn && method->body() && fn->empty())
                 {
                     // If this method name has overloads, add a placeholder entry block
@@ -840,6 +845,11 @@ namespace Cryo::Codegen
 
                     NodeTracker method_tracker(ctx(), method.get());
                     llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
+                    if (fn)
+                    {
+                        fn->setLinkage(llvm::Function::LinkOnceODRLinkage);
+                        fn->setComdat(module()->getOrInsertComdat(fn->getName().str()));
+                    }
                     if (fn && method->body() && fn->empty())
                     {
                         if (impl_method_counts[method->name()] > 1)
@@ -1488,6 +1498,11 @@ namespace Cryo::Codegen
 
                 // Generate method with the mangled class name as parent type
                 llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
+                if (fn)
+                {
+                    fn->setLinkage(llvm::Function::LinkOnceODRLinkage);
+                    fn->setComdat(module()->getOrInsertComdat(fn->getName().str()));
+                }
                 if (fn && method->body() && fn->empty())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -2007,7 +2022,8 @@ namespace Cryo::Codegen
                         // Create function type: (...fields) -> EnumType
                         llvm::FunctionType *ctor_type = llvm::FunctionType::get(enum_type, param_types, false);
                         llvm::Function *ctor = llvm::Function::Create(
-                            ctor_type, llvm::Function::ExternalLinkage, ctor_name, module());
+                            ctor_type, llvm::Function::LinkOnceODRLinkage, ctor_name, module());
+                        ctor->setComdat(module()->getOrInsertComdat(ctor_name));
 
                         // Create entry block
                         llvm::BasicBlock *entry = llvm::BasicBlock::Create(llvm_ctx(), "entry", ctor);
@@ -2232,6 +2248,11 @@ namespace Cryo::Codegen
 
                     // Generate method declaration with the mangled enum name as parent type
                     llvm::Function *fn = _declarations->generate_method_declaration(method.get(), mangled);
+                    if (fn)
+                    {
+                        fn->setLinkage(llvm::Function::LinkOnceODRLinkage);
+                        fn->setComdat(module()->getOrInsertComdat(fn->getName().str()));
+                    }
                     if (fn && method->body() && fn->empty())
                     {
                         enum_method_decls.push_back({method.get(), fn});
@@ -2660,12 +2681,15 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Create function
+        // Create function — use LinkOnceODR so multiple TUs can each instantiate
+        // the same generic specialization without causing duplicate-symbol linker errors.
         llvm::Function *fn = llvm::Function::Create(
             fn_type,
-            llvm::Function::ExternalLinkage,
+            llvm::Function::LinkOnceODRLinkage,
             mangled,
             module());
+        // On Windows COFF, LinkOnceODR requires a comdat group.
+        fn->setComdat(module()->getOrInsertComdat(mangled));
 
         // Set parameter names from AST
         {
@@ -2915,6 +2939,11 @@ namespace Cryo::Codegen
 
         // Generate method declaration (force_allow_generic = true to bypass generic skip)
         llvm::Function *fn = _declarations->generate_method_declaration(method, mangled_type, /*force_allow_generic=*/true);
+        if (fn)
+        {
+            fn->setLinkage(llvm::Function::LinkOnceODRLinkage);
+            fn->setComdat(module()->getOrInsertComdat(fn->getName().str()));
+        }
         if (fn && method->body() && fn->empty())
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,

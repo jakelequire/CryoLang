@@ -864,6 +864,88 @@ namespace Cryo::Codegen
         else if (intrinsic_name == "va_arg_ptr")
             return generate_va_arg_ptr(args);
 
+        // Memory mapping
+        else if (intrinsic_name == "mmap")
+            return generate_mmap(args);
+        else if (intrinsic_name == "munmap")
+            return generate_munmap(args);
+
+        // Float-to-string conversions
+        else if (intrinsic_name == "float32_to_string")
+            return generate_float32_to_string(args);
+        else if (intrinsic_name == "float64_to_string")
+            return generate_float64_to_string(args);
+
+        // Float classification
+        else if (intrinsic_name == "isinf")
+            return generate_isinf(args);
+        else if (intrinsic_name == "isfinite")
+            return generate_isfinite(args);
+        else if (intrinsic_name == "isnan")
+            return generate_isnan(args);
+        else if (intrinsic_name == "isnormal")
+            return generate_isnormal(args);
+        else if (intrinsic_name == "signbit")
+            return generate_signbit(args);
+
+        // Additional math (libc)
+        else if (intrinsic_name == "tgamma")
+            return generate_tgamma(args);
+        else if (intrinsic_name == "lgamma")
+            return generate_lgamma(args);
+
+        // Bit manipulation (LLVM intrinsics)
+        else if (intrinsic_name == "clz")
+            return generate_clz(args);
+        else if (intrinsic_name == "clz32")
+            return generate_clz32(args);
+        else if (intrinsic_name == "clz64")
+            return generate_clz64(args);
+        else if (intrinsic_name == "ctz")
+            return generate_ctz(args);
+        else if (intrinsic_name == "ctz32")
+            return generate_ctz32(args);
+        else if (intrinsic_name == "ctz64")
+            return generate_ctz64(args);
+        else if (intrinsic_name == "popcount32")
+            return generate_popcount32(args);
+        else if (intrinsic_name == "popcount64")
+            return generate_popcount64(args);
+        else if (intrinsic_name == "rotl32")
+            return generate_rotl32(args);
+        else if (intrinsic_name == "rotl64")
+            return generate_rotl64(args);
+        else if (intrinsic_name == "rotr32")
+            return generate_rotr32(args);
+        else if (intrinsic_name == "rotr64")
+            return generate_rotr64(args);
+        else if (intrinsic_name == "bswap16")
+            return generate_bswap16(args);
+        else if (intrinsic_name == "bswap32")
+            return generate_bswap32(args);
+        else if (intrinsic_name == "bswap64")
+            return generate_bswap64(args);
+
+        // Memory protection
+        else if (intrinsic_name == "mprotect")
+            return generate_mprotect(args);
+        else if (intrinsic_name == "mlock")
+            return generate_mlock(args);
+        else if (intrinsic_name == "munlock")
+            return generate_munlock(args);
+        else if (intrinsic_name == "madvise")
+            return generate_madvise(args);
+
+        // Dynamic loading
+        else if (intrinsic_name == "dlopen")
+            return generate_dlopen(args);
+        else if (intrinsic_name == "dlsym")
+            return generate_dlsym(args);
+        else if (intrinsic_name == "dlclose")
+            return generate_dlclose(args);
+        else if (intrinsic_name == "dlerror")
+            return generate_dlerror(args);
+
         else
         {
             report_unimplemented_intrinsic(intrinsic_name, node);
@@ -1002,30 +1084,35 @@ namespace Cryo::Codegen
 
     llvm::Value *Intrinsics::generate_mmap(const std::vector<llvm::Value *> &args)
     {
-        if (args.size() != 1)
+        if (args.size() != 6)
         {
-            report_error("__mmap__ requires exactly 1 argument (size)");
+            report_error("mmap requires exactly 6 arguments (addr, length, prot, flags, fd, offset)");
             return nullptr;
         }
 
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        // For simplicity, we'll implement mmap as a malloc call
-        // In a real implementation, you'd want actual mmap system call
-        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        // void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
         llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
-        llvm::FunctionType *malloc_type = llvm::FunctionType::get(
-            void_ptr_type, {size_t_type}, false);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *off_t_type = llvm::Type::getInt64Ty(context);
 
-        // Get or create malloc function
-        llvm::Function *malloc_func = get_or_create_libc_function("malloc", malloc_type);
+        llvm::FunctionType *mmap_type = llvm::FunctionType::get(
+            void_ptr_type, {void_ptr_type, size_t_type, int_type, int_type, int_type, off_t_type}, false);
 
-        // Ensure size argument is size_t (i64)
-        llvm::Value *size_arg = ensure_type(args[0], size_t_type, "mmap.size");
+        llvm::Function *mmap_func = get_or_create_libc_function("mmap", mmap_type);
 
-        // Call malloc (simplified mmap implementation)
-        return builder.CreateCall(malloc_func, {size_arg}, "mmap.result");
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], void_ptr_type, "mmap.addr"),
+            ensure_type(args[1], size_t_type, "mmap.length"),
+            ensure_type(args[2], int_type, "mmap.prot"),
+            ensure_type(args[3], int_type, "mmap.flags"),
+            ensure_type(args[4], int_type, "mmap.fd"),
+            ensure_type(args[5], off_t_type, "mmap.offset")};
+
+        return builder.CreateCall(mmap_func, call_args, "mmap.result");
     }
 
     llvm::Value *Intrinsics::generate_munmap(const std::vector<llvm::Value *> &args)
@@ -1400,6 +1487,654 @@ namespace Cryo::Codegen
 
         llvm::Value *arg = ensure_type(args[0], f32_type, "log2f.arg");
         return builder.CreateCall(fn, {arg}, "log2f.result");
+    }
+
+    // ========================================
+    // Float Classification Intrinsics
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_isinf(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("isinf requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *f64_type = llvm::Type::getDoubleTy(context);
+        llvm::Value *arg = ensure_type(args[0], f64_type, "isinf.arg");
+
+        // isinf: compare to +inf and -inf
+        llvm::Value *pos_inf = llvm::ConstantFP::getInfinity(f64_type, false);
+        llvm::Value *neg_inf = llvm::ConstantFP::getInfinity(f64_type, true);
+        llvm::Value *is_pos_inf = builder.CreateFCmpOEQ(arg, pos_inf, "isinf.pos");
+        llvm::Value *is_neg_inf = builder.CreateFCmpOEQ(arg, neg_inf, "isinf.neg");
+        llvm::Value *result = builder.CreateOr(is_pos_inf, is_neg_inf, "isinf.result");
+
+        // Convert i1 to i8 (boolean)
+        return builder.CreateZExt(result, llvm::Type::getInt8Ty(context), "isinf.bool");
+    }
+
+    llvm::Value *Intrinsics::generate_isnan(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("isnan requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *f64_type = llvm::Type::getDoubleTy(context);
+        llvm::Value *arg = ensure_type(args[0], f64_type, "isnan.arg");
+
+        // NaN is unordered with itself: fcmp uno %x, %x
+        llvm::Value *result = builder.CreateFCmpUNO(arg, arg, "isnan.result");
+
+        // Convert i1 to i8 (boolean)
+        return builder.CreateZExt(result, llvm::Type::getInt8Ty(context), "isnan.bool");
+    }
+
+    llvm::Value *Intrinsics::generate_isfinite(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("isfinite requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *f64_type = llvm::Type::getDoubleTy(context);
+        llvm::Value *arg = ensure_type(args[0], f64_type, "isfinite.arg");
+
+        // isfinite = !isinf && !isnan
+        // Check not NaN: fcmp ord %x, 0.0
+        llvm::Value *zero = llvm::ConstantFP::get(f64_type, 0.0);
+        llvm::Value *is_ordered = builder.CreateFCmpORD(arg, zero, "isfinite.ord");
+
+        // Check not inf
+        llvm::Value *pos_inf = llvm::ConstantFP::getInfinity(f64_type, false);
+        llvm::Value *neg_inf = llvm::ConstantFP::getInfinity(f64_type, true);
+        llvm::Value *not_pos_inf = builder.CreateFCmpONE(arg, pos_inf, "isfinite.notposinf");
+        llvm::Value *not_neg_inf = builder.CreateFCmpONE(arg, neg_inf, "isfinite.notneginf");
+
+        llvm::Value *not_inf = builder.CreateAnd(not_pos_inf, not_neg_inf, "isfinite.notinf");
+        llvm::Value *result = builder.CreateAnd(is_ordered, not_inf, "isfinite.result");
+
+        // Convert i1 to i8 (boolean)
+        return builder.CreateZExt(result, llvm::Type::getInt8Ty(context), "isfinite.bool");
+    }
+
+    // ========================================
+    // Additional Float Classification
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_isnormal(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("isnormal requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *f64_type = llvm::Type::getDoubleTy(context);
+        llvm::Value *arg = ensure_type(args[0], f64_type, "isnormal.arg");
+
+        // isnormal = !isnan && !isinf && !iszero && !issubnormal
+        // Use fabs to check magnitude
+        llvm::Function *fabs_fn = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::fabs, {f64_type});
+        llvm::Value *abs_val = builder.CreateCall(fabs_fn, {arg}, "isnormal.abs");
+
+        // Not NaN: ordered comparison with self
+        llvm::Value *not_nan = builder.CreateFCmpORD(arg, arg, "isnormal.notnan");
+        // Not zero: abs > 0
+        llvm::Value *zero = llvm::ConstantFP::get(f64_type, 0.0);
+        llvm::Value *not_zero = builder.CreateFCmpOGT(abs_val, zero, "isnormal.notzero");
+        // Not inf
+        llvm::Value *pos_inf = llvm::ConstantFP::getInfinity(f64_type, false);
+        llvm::Value *not_inf = builder.CreateFCmpONE(abs_val, pos_inf, "isnormal.notinf");
+        // Not subnormal: abs >= DBL_MIN (2.2250738585072014e-308)
+        llvm::Value *dbl_min = llvm::ConstantFP::get(f64_type, 2.2250738585072014e-308);
+        llvm::Value *not_subnormal = builder.CreateFCmpOGE(abs_val, dbl_min, "isnormal.notsub");
+
+        llvm::Value *result = builder.CreateAnd(not_nan, not_zero, "isnormal.t1");
+        result = builder.CreateAnd(result, not_inf, "isnormal.t2");
+        result = builder.CreateAnd(result, not_subnormal, "isnormal.result");
+
+        return builder.CreateZExt(result, llvm::Type::getInt8Ty(context), "isnormal.bool");
+    }
+
+    llvm::Value *Intrinsics::generate_signbit(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("signbit requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *f64_type = llvm::Type::getDoubleTy(context);
+        llvm::Value *arg = ensure_type(args[0], f64_type, "signbit.arg");
+
+        // Bitcast to i64, check high bit
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *as_int = builder.CreateBitCast(arg, i64_type, "signbit.bits");
+        llvm::Value *shifted = builder.CreateLShr(as_int, llvm::ConstantInt::get(i64_type, 63), "signbit.shift");
+        llvm::Value *result = builder.CreateTrunc(shifted, llvm::Type::getInt8Ty(context), "signbit.trunc");
+
+        return result;
+    }
+
+    // ========================================
+    // Math Functions (libc): tgamma, lgamma
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_tgamma(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("tgamma requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *f64_type = llvm::Type::getDoubleTy(context);
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(f64_type, {f64_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("tgamma", fn_type);
+
+        llvm::Value *x = ensure_type(args[0], f64_type, "tgamma.x");
+        return builder.CreateCall(fn, {x}, "tgamma.result");
+    }
+
+    llvm::Value *Intrinsics::generate_lgamma(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("lgamma requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *f64_type = llvm::Type::getDoubleTy(context);
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(f64_type, {f64_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("lgamma", fn_type);
+
+        llvm::Value *x = ensure_type(args[0], f64_type, "lgamma.x");
+        return builder.CreateCall(fn, {x}, "lgamma.result");
+    }
+
+    // ========================================
+    // Bit Manipulation Intrinsics (LLVM)
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_clz(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("clz requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *arg = ensure_type(args[0], i64_type, "clz.arg");
+
+        // llvm.ctlz.i64(val, is_poison_if_zero=false)
+        llvm::Function *ctlz = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::ctlz, {i64_type});
+        llvm::Value *is_poison = builder.getFalse();
+        llvm::Value *result = builder.CreateCall(ctlz, {arg, is_poison}, "clz.result");
+
+        // Truncate i64 result to i32 (u32)
+        return builder.CreateTrunc(result, llvm::Type::getInt32Ty(context), "clz.trunc");
+    }
+
+    llvm::Value *Intrinsics::generate_ctz(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("ctz requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *arg = ensure_type(args[0], i64_type, "ctz.arg");
+
+        // llvm.cttz.i64(val, is_poison_if_zero=false)
+        llvm::Function *cttz = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::cttz, {i64_type});
+        llvm::Value *is_poison = builder.getFalse();
+        llvm::Value *result = builder.CreateCall(cttz, {arg, is_poison}, "ctz.result");
+
+        return builder.CreateTrunc(result, llvm::Type::getInt32Ty(context), "ctz.trunc");
+    }
+
+    llvm::Value *Intrinsics::generate_popcount64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("popcount64 requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *arg = ensure_type(args[0], i64_type, "popcount64.arg");
+
+        // llvm.ctpop.i64
+        llvm::Function *ctpop = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::ctpop, {i64_type});
+        llvm::Value *result = builder.CreateCall(ctpop, {arg}, "popcount64.result");
+
+        return builder.CreateTrunc(result, llvm::Type::getInt32Ty(context), "popcount64.trunc");
+    }
+
+    llvm::Value *Intrinsics::generate_rotl64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("rotl64 requires exactly 2 arguments (value, shift)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *val = ensure_type(args[0], i64_type, "rotl64.val");
+        llvm::Value *shift = ensure_type(args[1], i64_type, "rotl64.shift");
+
+        // llvm.fshl.i64(a, a, shift) = rotate left
+        llvm::Function *fshl = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::fshl, {i64_type});
+        return builder.CreateCall(fshl, {val, val, shift}, "rotl64.result");
+    }
+
+    llvm::Value *Intrinsics::generate_rotr64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("rotr64 requires exactly 2 arguments (value, shift)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *val = ensure_type(args[0], i64_type, "rotr64.val");
+        llvm::Value *shift = ensure_type(args[1], i64_type, "rotr64.shift");
+
+        // llvm.fshr.i64(a, a, shift) = rotate right
+        llvm::Function *fshr = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::fshr, {i64_type});
+        return builder.CreateCall(fshr, {val, val, shift}, "rotr64.result");
+    }
+
+    llvm::Value *Intrinsics::generate_bswap64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("bswap64 requires exactly 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *arg = ensure_type(args[0], i64_type, "bswap64.arg");
+
+        // llvm.bswap.i64
+        llvm::Function *bswap = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::bswap, {i64_type});
+        return builder.CreateCall(bswap, {arg}, "bswap64.result");
+    }
+
+    // ========================================
+    // 32-bit and 16-bit Bit Manipulation Variants
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_clz32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1) { report_error("clz32 requires exactly 1 argument"); return nullptr; }
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *arg = ensure_type(args[0], i32_type, "clz32.arg");
+        llvm::Function *ctlz = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::ctlz, {i32_type});
+        return builder.CreateCall(ctlz, {arg, builder.getFalse()}, "clz32.result");
+    }
+
+    llvm::Value *Intrinsics::generate_clz64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1) { report_error("clz64 requires exactly 1 argument"); return nullptr; }
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *arg = ensure_type(args[0], i64_type, "clz64.arg");
+        llvm::Function *ctlz = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::ctlz, {i64_type});
+        llvm::Value *result = builder.CreateCall(ctlz, {arg, builder.getFalse()}, "clz64.result");
+        return builder.CreateTrunc(result, llvm::Type::getInt32Ty(context), "clz64.trunc");
+    }
+
+    llvm::Value *Intrinsics::generate_ctz32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1) { report_error("ctz32 requires exactly 1 argument"); return nullptr; }
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *arg = ensure_type(args[0], i32_type, "ctz32.arg");
+        llvm::Function *cttz = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::cttz, {i32_type});
+        return builder.CreateCall(cttz, {arg, builder.getFalse()}, "ctz32.result");
+    }
+
+    llvm::Value *Intrinsics::generate_ctz64(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1) { report_error("ctz64 requires exactly 1 argument"); return nullptr; }
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+        llvm::Value *arg = ensure_type(args[0], i64_type, "ctz64.arg");
+        llvm::Function *cttz = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::cttz, {i64_type});
+        llvm::Value *result = builder.CreateCall(cttz, {arg, builder.getFalse()}, "ctz64.result");
+        return builder.CreateTrunc(result, llvm::Type::getInt32Ty(context), "ctz64.trunc");
+    }
+
+    llvm::Value *Intrinsics::generate_popcount32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1) { report_error("popcount32 requires exactly 1 argument"); return nullptr; }
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *arg = ensure_type(args[0], i32_type, "popcount32.arg");
+        llvm::Function *ctpop = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::ctpop, {i32_type});
+        return builder.CreateCall(ctpop, {arg}, "popcount32.result");
+    }
+
+    llvm::Value *Intrinsics::generate_rotl32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2) { report_error("rotl32 requires exactly 2 arguments"); return nullptr; }
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *val = ensure_type(args[0], i32_type, "rotl32.val");
+        llvm::Value *shift = ensure_type(args[1], i32_type, "rotl32.shift");
+        llvm::Function *fshl = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::fshl, {i32_type});
+        return builder.CreateCall(fshl, {val, val, shift}, "rotl32.result");
+    }
+
+    llvm::Value *Intrinsics::generate_rotr32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2) { report_error("rotr32 requires exactly 2 arguments"); return nullptr; }
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *val = ensure_type(args[0], i32_type, "rotr32.val");
+        llvm::Value *shift = ensure_type(args[1], i32_type, "rotr32.shift");
+        llvm::Function *fshr = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::fshr, {i32_type});
+        return builder.CreateCall(fshr, {val, val, shift}, "rotr32.result");
+    }
+
+    llvm::Value *Intrinsics::generate_bswap16(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1) { report_error("bswap16 requires exactly 1 argument"); return nullptr; }
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Type *i16_type = llvm::Type::getInt16Ty(context);
+        llvm::Value *arg = ensure_type(args[0], i16_type, "bswap16.arg");
+        llvm::Function *bswap = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::bswap, {i16_type});
+        return builder.CreateCall(bswap, {arg}, "bswap16.result");
+    }
+
+    llvm::Value *Intrinsics::generate_bswap32(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1) { report_error("bswap32 requires exactly 1 argument"); return nullptr; }
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::Value *arg = ensure_type(args[0], i32_type, "bswap32.arg");
+        llvm::Function *bswap = llvm::Intrinsic::getDeclaration(
+            _context_manager.get_module(), llvm::Intrinsic::bswap, {i32_type});
+        return builder.CreateCall(bswap, {arg}, "bswap32.result");
+    }
+
+    // ========================================
+    // Memory Protection Intrinsics (libc)
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_mprotect(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("mprotect requires exactly 3 arguments (addr, length, prot)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(
+            int_type, {void_ptr_type, size_t_type, int_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("mprotect", fn_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], void_ptr_type, "mprotect.addr"),
+            ensure_type(args[1], size_t_type, "mprotect.length"),
+            ensure_type(args[2], int_type, "mprotect.prot")};
+
+        return builder.CreateCall(fn, call_args, "mprotect.result");
+    }
+
+    llvm::Value *Intrinsics::generate_mlock(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("mlock requires exactly 2 arguments (addr, length)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(
+            int_type, {void_ptr_type, size_t_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("mlock", fn_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], void_ptr_type, "mlock.addr"),
+            ensure_type(args[1], size_t_type, "mlock.length")};
+
+        return builder.CreateCall(fn, call_args, "mlock.result");
+    }
+
+    llvm::Value *Intrinsics::generate_munlock(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("munlock requires exactly 2 arguments (addr, length)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(
+            int_type, {void_ptr_type, size_t_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("munlock", fn_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], void_ptr_type, "munlock.addr"),
+            ensure_type(args[1], size_t_type, "munlock.length")};
+
+        return builder.CreateCall(fn, call_args, "munlock.result");
+    }
+
+    llvm::Value *Intrinsics::generate_madvise(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 3)
+        {
+            report_error("madvise requires exactly 3 arguments (addr, length, advice)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(
+            int_type, {void_ptr_type, size_t_type, int_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("madvise", fn_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], void_ptr_type, "madvise.addr"),
+            ensure_type(args[1], size_t_type, "madvise.length"),
+            ensure_type(args[2], int_type, "madvise.advice")};
+
+        return builder.CreateCall(fn, call_args, "madvise.result");
+    }
+
+    // ========================================
+    // Dynamic Loading Intrinsics (libc)
+    // ========================================
+
+    llvm::Value *Intrinsics::generate_dlopen(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("dlopen requires exactly 2 arguments (filename, flags)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(
+            void_ptr_type, {void_ptr_type, int_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("dlopen", fn_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], void_ptr_type, "dlopen.filename"),
+            ensure_type(args[1], int_type, "dlopen.flags")};
+
+        return builder.CreateCall(fn, call_args, "dlopen.result");
+    }
+
+    llvm::Value *Intrinsics::generate_dlsym(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("dlsym requires exactly 2 arguments (handle, symbol)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(
+            void_ptr_type, {void_ptr_type, void_ptr_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("dlsym", fn_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], void_ptr_type, "dlsym.handle"),
+            ensure_type(args[1], void_ptr_type, "dlsym.symbol")};
+
+        return builder.CreateCall(fn, call_args, "dlsym.result");
+    }
+
+    llvm::Value *Intrinsics::generate_dlclose(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("dlclose requires exactly 1 argument (handle)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(
+            int_type, {void_ptr_type}, false);
+        llvm::Function *fn = get_or_create_libc_function("dlclose", fn_type);
+
+        std::vector<llvm::Value *> call_args = {
+            ensure_type(args[0], void_ptr_type, "dlclose.handle")};
+
+        return builder.CreateCall(fn, call_args, "dlclose.result");
+    }
+
+    llvm::Value *Intrinsics::generate_dlerror(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 0)
+        {
+            report_error("dlerror takes no arguments");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+
+        llvm::FunctionType *fn_type = llvm::FunctionType::get(
+            char_ptr_type, {}, false);
+        llvm::Function *fn = get_or_create_libc_function("dlerror", fn_type);
+
+        return builder.CreateCall(fn, {}, "dlerror.result");
     }
 
     // ========================================
@@ -2602,6 +3337,22 @@ namespace Cryo::Codegen
             }
         }
 
+        // Handle floating-point type conversions (e.g., double <-> float)
+        if (current_type->isFloatingPointTy() && target_type->isFloatingPointTy())
+        {
+            unsigned current_width = current_type->getPrimitiveSizeInBits();
+            unsigned target_width = target_type->getPrimitiveSizeInBits();
+
+            if (current_width > target_width)
+            {
+                return builder.CreateFPTrunc(value, target_type, name + ".fptrunc");
+            }
+            else if (current_width < target_width)
+            {
+                return builder.CreateFPExt(value, target_type, name + ".fpext");
+            }
+        }
+
         // Handle pointer to integer conversion
         if (current_type->isPointerTy() && target_type->isIntegerTy())
         {
@@ -3769,19 +4520,20 @@ namespace Cryo::Codegen
         auto &builder = _context_manager.get_builder();
         auto &context = _context_manager.get_context();
 
-        // Create read function type: int read(int fd, void* buffer, int count)
-        // Using i32 for count to match common user declarations
+        // Create read function type: ssize_t read(int fd, void* buffer, size_t count)
         llvm::Type *int_type = llvm::Type::getInt32Ty(context);
         llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *size_t_type = llvm::Type::getInt64Ty(context);
+        llvm::Type *ssize_t_type = llvm::Type::getInt64Ty(context);
         llvm::FunctionType *read_type = llvm::FunctionType::get(
-            int_type, {int_type, void_ptr_type, int_type}, false);
+            ssize_t_type, {int_type, void_ptr_type, size_t_type}, false);
 
         llvm::Function *read_func = get_or_create_libc_function("read", read_type);
 
         std::vector<llvm::Value *> call_args = {
             ensure_type(args[0], int_type, "read.fd"),
             args[1], // buffer
-            ensure_type(args[2], int_type, "read.count")};
+            ensure_type(args[2], size_t_type, "read.count")};
 
         return builder.CreateCall(read_func, call_args, "read.result");
     }
@@ -4696,11 +5448,11 @@ namespace Cryo::Codegen
         llvm::FunctionType *abort_type = llvm::FunctionType::get(void_type, {}, false);
 
         llvm::Function *abort_func = get_or_create_libc_function("abort", abort_type);
-        llvm::Value *call_result = builder.CreateCall(abort_func, {}, "abort");
+        builder.CreateCall(abort_func, {});
 
         // abort() never returns, add unreachable
         builder.CreateUnreachable();
-        return call_result;
+        return llvm::Constant::getNullValue(llvm::Type::getInt32Ty(context));
     }
 
     llvm::Value *Intrinsics::generate_execvp(const std::vector<llvm::Value *> &args)

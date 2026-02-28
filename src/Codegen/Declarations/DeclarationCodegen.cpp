@@ -1608,6 +1608,12 @@ namespace Cryo::Codegen
             initializer,
             name);
 
+        // On Windows COFF, LinkOnceODR requires a comdat group.
+        if (linkage == llvm::GlobalValue::LinkOnceODRLinkage)
+        {
+            global->setComdat(module()->getOrInsertComdat(name));
+        }
+
         // Register in value context for later lookup
         // Register with simple name
         values().set_global_value(name, global);
@@ -2848,8 +2854,16 @@ namespace Cryo::Codegen
 
     llvm::GlobalValue::LinkageTypes DeclarationCodegen::get_linkage(Cryo::ASTNode *node) const
     {
-        // Check for public/private visibility
-        // For now, default to external linkage
+        // Constants with initializers may appear in multiple compilation units
+        // (e.g., BUCKET_EMPTY in both hashmap.o and hashset.o). Use LinkOnceODR
+        // so the linker deduplicates identical definitions instead of erroring.
+        if (auto *var_node = dynamic_cast<Cryo::VariableDeclarationNode *>(node))
+        {
+            if (!var_node->is_mutable() && var_node->initializer() != nullptr)
+            {
+                return llvm::GlobalValue::LinkOnceODRLinkage;
+            }
+        }
         return llvm::GlobalValue::ExternalLinkage;
     }
 
