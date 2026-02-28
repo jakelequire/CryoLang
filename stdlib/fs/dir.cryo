@@ -19,16 +19,25 @@ import fs::metadata;
 // ============================================================================
 
 const F_OK: i32 = 0;
-const S_IFMT: u32 = 0o170000;
-const S_IFDIR: u32 = 0o040000;
-const S_IFREG: u32 = 0o100000;
 
 // ============================================================================
 // Syscall Wrappers
 // ============================================================================
 
 type DirentPtr = void*;
-type StatBuf = void*;
+
+/// Converts a dirent type ordinal (i32) to a FileType enum value.
+/// The intrinsic dirent_type returns i32 mapped to FileType ordinals.
+function file_type_from_ordinal(ordinal: i32) -> FileType {
+    if (ordinal == 0) { return FileType::File; }
+    if (ordinal == 1) { return FileType::Directory; }
+    if (ordinal == 2) { return FileType::Symlink; }
+    if (ordinal == 3) { return FileType::BlockDevice; }
+    if (ordinal == 4) { return FileType::CharDevice; }
+    if (ordinal == 5) { return FileType::Fifo; }
+    if (ordinal == 6) { return FileType::Socket; }
+    return FileType::Unknown;
+}
 
 // ============================================================================
 // Directory Entry
@@ -135,7 +144,7 @@ type struct ReadDir {
             }
 
             const entry_path: PathBuf = this.base_path.join(name);
-            const file_type: FileType = intrinsics::dirent_type(entry);
+            const file_type: FileType = file_type_from_ordinal(intrinsics::dirent_type(entry));
 
             return Option::Some(IoResult::Ok(DirEntry {
                 name: String::from_cstr(name),
@@ -254,9 +263,8 @@ function remove_dir_all(path: string) -> IoResult<()> {
                             IoResult::Ok(e) => {
                                 const entry_path: string = e.path().as_str();
                                 if (e.is_dir()) {
-                                    const sub_result: IoResult<()> = remove_dir_all(entry_path);
                                     e.drop();
-                                    match (sub_result) {
+                                    match (remove_dir_all(entry_path)) {
                                         IoResult::Err(err) => {
                                             d.drop();
                                             return IoResult::Err(err);
@@ -264,9 +272,8 @@ function remove_dir_all(path: string) -> IoResult<()> {
                                         IoResult::Ok(_) => {}
                                     }
                                 } else {
-                                    const remove_result: IoResult<()> = remove_file(entry_path);
                                     e.drop();
-                                    match (remove_result) {
+                                    match (remove_file(entry_path)) {
                                         IoResult::Err(err) => {
                                             d.drop();
                                             return IoResult::Err(err);
@@ -292,22 +299,22 @@ function exists(path: string) -> boolean {
 
 /// Returns true if a path is a directory.
 function is_dir(path: string) -> boolean {
-    const stat: StatBuf = StatBuf::new();
-    const result: i32 = intrinsics::stat(path, &stat);
-    if (result < 0) {
+    // Try to open as directory — if it succeeds, it's a directory
+    const dir: void* = intrinsics::opendir(path);
+    if (dir == null) {
         return false;
     }
-    return (stat.mode & S_IFMT) == S_IFDIR;
+    intrinsics::closedir(dir);
+    return true;
 }
 
 /// Returns true if a path is a file.
 function is_file(path: string) -> boolean {
-    const stat: StatBuf = StatBuf::new();
-    const result: i32 = intrinsics::stat(path, &stat);
-    if (result < 0) {
+    // A path is a file if it exists but is not a directory
+    if (!exists(path)) {
         return false;
     }
-    return (stat.mode & S_IFMT) == S_IFREG;
+    return !is_dir(path);
 }
 
 /// Removes a file.
@@ -346,8 +353,7 @@ function copy(_from: string, to: string) -> IoResult<u64> {
                     mut total: u64 = 0;
 
                     loop {
-                        const read_result: IoResult<u64> = s.read(&buf[0], BUF_SIZE);
-                        match (read_result) {
+                        match (s.read(&buf[0], BUF_SIZE)) {
                             IoResult::Err(e) => {
                                 s.drop();
                                 d.drop();
@@ -359,8 +365,7 @@ function copy(_from: string, to: string) -> IoResult<u64> {
                                 return IoResult::Ok(total);
                             }
                             IoResult::Ok(n) => {
-                                const write_result: IoResult<()> = d.write_all(&buf[0], n);
-                                match (write_result) {
+                                match (d.write_all(&buf[0], n)) {
                                     IoResult::Err(e) => {
                                         s.drop();
                                         d.drop();
