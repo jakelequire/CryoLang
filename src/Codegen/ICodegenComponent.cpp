@@ -1113,13 +1113,42 @@ namespace Cryo::Codegen
                               "resolve_method_by_name: Skipping 'this' parameter for static method '{}'", full_method_name);
                 }
 
-                // Add explicit parameter types from the impl block AST.
+                // Add explicit parameter types from the method AST.
                 // The 'this' parameter was handled above; now we need the remaining
                 // explicit parameters (e.g., 'threshold: LogLevel' in meets_threshold(&this, threshold: LogLevel)).
                 // Without this, the extern declaration would only have 'this' and miss all explicit args.
+                // We search: enum impl blocks, struct impl blocks, and struct template methods.
                 if (template_registry)
                 {
-                    // Try enum impl block first (most common case for this path)
+                    // Lambda to extract non-this params from an AST method and add to param_types
+                    auto extract_params_from_method = [&](Cryo::FunctionDeclarationNode *method) -> bool {
+                        if (!method || method->name() != method_name)
+                            return false;
+                        bool found_any = false;
+                        for (const auto &param : method->parameters())
+                        {
+                            if (param->name() == "this")
+                                continue;
+                            TypeRef param_type = param->get_resolved_type();
+                            if (param_type.is_valid())
+                            {
+                                llvm::Type *pt = types().map(param_type);
+                                if (pt)
+                                {
+                                    param_types.push_back(pt);
+                                    found_any = true;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_method_by_name: Added explicit param '{}' type for '{}'",
+                                              param->name(), full_method_name);
+                                }
+                            }
+                        }
+                        return true; // method name matched
+                    };
+
+                    bool params_found = false;
+
+                    // 1. Try enum impl block
                     Cryo::ImplementationBlockNode *impl_block = template_registry->get_enum_impl_block(base_type);
                     if (!impl_block)
                         impl_block = template_registry->get_enum_impl_block(simple_type_name);
@@ -1127,27 +1156,48 @@ namespace Cryo::Codegen
                     {
                         for (const auto &method_impl : impl_block->method_implementations())
                         {
-                            if (method_impl->name() == method_name)
+                            if (extract_params_from_method(method_impl.get()))
                             {
-                                // Iterate the AST parameters, skipping 'this'
-                                for (const auto &param : method_impl->parameters())
-                                {
-                                    if (param->name() == "this")
-                                        continue;
-                                    TypeRef param_type = param->get_resolved_type();
-                                    if (param_type.is_valid())
-                                    {
-                                        llvm::Type *pt = types().map(param_type);
-                                        if (pt)
-                                        {
-                                            param_types.push_back(pt);
-                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                      "resolve_method_by_name: Added explicit param '{}' type for '{}'",
-                                                      param->name(), full_method_name);
-                                        }
-                                    }
-                                }
+                                params_found = true;
                                 break;
+                            }
+                        }
+                    }
+
+                    // 2. Try struct impl block
+                    if (!params_found)
+                    {
+                        Cryo::ImplementationBlockNode *struct_impl = template_registry->get_struct_impl_block(base_type);
+                        if (!struct_impl)
+                            struct_impl = template_registry->get_struct_impl_block(simple_type_name);
+                        if (struct_impl)
+                        {
+                            for (const auto &method_impl : struct_impl->method_implementations())
+                            {
+                                if (extract_params_from_method(method_impl.get()))
+                                {
+                                    params_found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. Try struct template methods (methods defined inline in the struct)
+                    if (!params_found)
+                    {
+                        const auto *tmpl_info = template_registry->find_template(base_type);
+                        if (!tmpl_info)
+                            tmpl_info = template_registry->find_template(simple_type_name);
+                        if (tmpl_info && tmpl_info->struct_template)
+                        {
+                            for (const auto &method : tmpl_info->struct_template->methods())
+                            {
+                                if (extract_params_from_method(method.get()))
+                                {
+                                    params_found = true;
+                                    break;
+                                }
                             }
                         }
                     }

@@ -1796,23 +1796,30 @@ namespace Cryo::Codegen
 
         // Extract enum discriminants from tagged union structs ({ i32, [N x i8] })
         // so that enum values can be compared by their discriminant integer.
-        // This mirrors the approach used in pattern matching (ControlFlowCodegen.cpp).
-        if (lhs->getType()->isStructTy())
+        // Only do this when the Cryo type confirms it's an enum — the caller
+        // (generate_binary) already handles typed enum extraction, but this catches
+        // cases where operand_type is unavailable. We must NOT blindly extract field 0
+        // from every struct with an integer first field, as that would corrupt data
+        // structs like String ({ ptr, i64, i64 }) or any struct starting with an int.
+        if (operand_type && operand_type->is_enum())
         {
-            auto *st = llvm::cast<llvm::StructType>(lhs->getType());
-            if (!st->isOpaque() && st->getNumElements() >= 1 &&
-                st->getElementType(0)->isIntegerTy())
+            if (lhs->getType()->isStructTy())
             {
-                lhs = builder().CreateExtractValue(lhs, 0, "enum.disc");
+                auto *st = llvm::cast<llvm::StructType>(lhs->getType());
+                if (!st->isOpaque() && st->getNumElements() >= 1 &&
+                    st->getElementType(0)->isIntegerTy())
+                {
+                    lhs = builder().CreateExtractValue(lhs, 0, "enum.disc");
+                }
             }
-        }
-        if (rhs->getType()->isStructTy())
-        {
-            auto *st = llvm::cast<llvm::StructType>(rhs->getType());
-            if (!st->isOpaque() && st->getNumElements() >= 1 &&
-                st->getElementType(0)->isIntegerTy())
+            if (rhs->getType()->isStructTy())
             {
-                rhs = builder().CreateExtractValue(rhs, 0, "enum.disc");
+                auto *st = llvm::cast<llvm::StructType>(rhs->getType());
+                if (!st->isOpaque() && st->getNumElements() >= 1 &&
+                    st->getElementType(0)->isIntegerTy())
+                {
+                    rhs = builder().CreateExtractValue(rhs, 0, "enum.disc");
+                }
             }
         }
 
@@ -1901,8 +1908,61 @@ namespace Cryo::Codegen
             }
 
             llvm::Function *compare_method = nullptr;
+            bool compare_needs_type_fix = false; // true if declaration has wrong nparams
             if (!struct_name.empty() && _calls)
+            {
                 compare_method = _calls->resolve_method(struct_name, "compare");
+                // Validate: compare method must take exactly 2 params (&this, other)
+                if (compare_method && compare_method->getFunctionType()->getNumParams() != 2)
+                    compare_method = nullptr;
+
+                // Fallback: scan the LLVM module for a function matching *::StructName::compare.
+                // In multi-module compilation, resolve_method may fail when generic instantiation
+                // happens in a module context that hasn't imported the type's namespace, but the
+                // function may already exist as a declaration.
+                if (!compare_method && module())
+                {
+                    std::string suffix = "::" + struct_name + "::compare";
+                    llvm::Function *wrong_params_candidate = nullptr;
+                    for (auto &fn : module()->functions())
+                    {
+                        llvm::StringRef fn_name = fn.getName();
+                        if (fn_name.size() > suffix.size() &&
+                            fn_name.ends_with(suffix) &&
+                            fn.getFunctionType())
+                        {
+                            if (fn.getFunctionType()->getNumParams() == 2)
+                            {
+                                compare_method = &fn;
+                                break;
+                            }
+                            else if (fn.getFunctionType()->getNumParams() == 1 &&
+                                     fn.getFunctionType()->getReturnType()->isIntegerTy(32))
+                            {
+                                // Cross-module declaration with wrong param count (missing explicit params).
+                                // We'll accept it but call through the correct FunctionType.
+                                wrong_params_candidate = &fn;
+                            }
+                        }
+                    }
+                    if (!compare_method && wrong_params_candidate)
+                    {
+                        compare_method = wrong_params_candidate;
+                        compare_needs_type_fix = true;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "compare dispatch: accepting nparams={} candidate '{}', will call with correct type",
+                                  wrong_params_candidate->getFunctionType()->getNumParams(),
+                                  wrong_params_candidate->getName().str());
+                    }
+                }
+
+                if (compare_method)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "compare dispatch: using '{}' for struct '{}'",
+                              compare_method->getName().str(), struct_name);
+                }
+            }
 
             if (compare_method)
             {
@@ -1913,10 +1973,25 @@ namespace Cryo::Codegen
                 b.CreateStore(lhs, lhs_alloca);
 
                 // Build call args: compare(&this, other)
-                // Check what the method expects for the second parameter
+                // Determine rhs argument: pass by pointer if the method expects ptr
                 llvm::FunctionType *fn_type = compare_method->getFunctionType();
                 llvm::Value *rhs_arg = rhs;
-                if (fn_type->getNumParams() >= 2 && fn_type->getParamType(1)->isPointerTy() &&
+
+                // Build the correct function type for the call.
+                // compare(&this, other: T) -> i32 always takes (ptr, ptr) in the ABI.
+                llvm::FunctionType *call_type = fn_type;
+                if (compare_needs_type_fix)
+                {
+                    // The declaration has wrong param count; construct the correct type:
+                    // (ptr, ptr) -> i32  (both &this and &other are passed by pointer)
+                    call_type = llvm::FunctionType::get(
+                        llvm::Type::getInt32Ty(llvm_ctx()),
+                        {llvm::PointerType::get(llvm_ctx(), 0),
+                         llvm::PointerType::get(llvm_ctx(), 0)},
+                        false);
+                }
+
+                if ((compare_needs_type_fix || (fn_type->getNumParams() >= 2 && fn_type->getParamType(1)->isPointerTy())) &&
                     rhs->getType()->isStructTy())
                 {
                     // Method expects pointer — store rhs and pass address
@@ -1925,7 +2000,8 @@ namespace Cryo::Codegen
                     rhs_arg = rhs_alloca;
                 }
 
-                llvm::Value *cmp = b.CreateCall(compare_method, {lhs_alloca, rhs_arg}, "cmp.result");
+                // Use CreateCall with explicit FunctionType to handle mismatched declarations
+                llvm::Value *cmp = b.CreateCall(call_type, compare_method, {lhs_alloca, rhs_arg}, "cmp.result");
                 llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0);
 
                 switch (op)
