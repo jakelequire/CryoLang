@@ -747,8 +747,21 @@ namespace Cryo
                 std::string bin_dir = find_bin_directory();
 
                 // Add runtime first (contains true main function)
-                std::string runtime_path = bin_dir + "/stdlib/runtime.o";
-                if (std::filesystem::exists(runtime_path))
+                std::string runtime_path;
+                std::vector<std::string> runtime_candidates = {
+                    bin_dir + "/stdlib/runtime.o",
+                    Cryo::ModuleLoader::find_stdlib_directory() + "/.bin/runtime.o",
+                };
+                for (const auto &candidate : runtime_candidates)
+                {
+                    if (!candidate.empty() && std::filesystem::exists(candidate))
+                    {
+                        runtime_path = candidate;
+                        break;
+                    }
+                }
+
+                if (!runtime_path.empty())
                 {
                     _linker->add_object_file(runtime_path);
                     if (_debug_mode)
@@ -756,14 +769,24 @@ namespace Cryo
                         LOG_DEBUG(Cryo::LogComponent::GENERAL, "Added runtime.o for runtime linking: {}", runtime_path);
                     }
                 }
-                else
-                {
-                    LOG_WARN(Cryo::LogComponent::GENERAL, "runtime.o not found at {}, runtime functions may not link properly", runtime_path);
-                }
 
                 // Add libcryo.a to the linker
-                std::string libcryo_path = bin_dir + "/stdlib/libcryo.a";
-                if (std::filesystem::exists(libcryo_path))
+                // Check multiple possible locations for the pre-built stdlib archive
+                std::string libcryo_path;
+                std::vector<std::string> libcryo_candidates = {
+                    bin_dir + "/stdlib/libcryo.a",
+                    Cryo::ModuleLoader::find_stdlib_directory() + "/.bin/libcryo.a",
+                };
+                for (const auto &candidate : libcryo_candidates)
+                {
+                    if (!candidate.empty() && std::filesystem::exists(candidate))
+                    {
+                        libcryo_path = candidate;
+                        break;
+                    }
+                }
+
+                if (!libcryo_path.empty())
                 {
                     _linker->add_object_file(libcryo_path);
                     if (_debug_mode)
@@ -773,7 +796,7 @@ namespace Cryo
                 }
                 else
                 {
-                    LOG_WARN(Cryo::LogComponent::GENERAL, "libcryo.a not found at {}, stdlib functions may not link properly", libcryo_path);
+                    LOG_WARN(Cryo::LogComponent::GENERAL, "libcryo.a not found, stdlib functions may not link properly. Searched: {}", libcryo_candidates[0]);
                 }
             }
             else if (_debug_mode)
@@ -3705,7 +3728,7 @@ namespace Cryo
         // Combine object files into final static library archive
         if (!generated_object_files.empty() && _linker)
         {
-            std::string archive_path = output_dir + "/stdlib.a";
+            std::string archive_path = output_dir + "/libcryo.a";
             std::cout << "  Bundling " << generated_object_files.size()
                       << " object files into " << archive_path << "..." << std::endl;
 
@@ -4181,7 +4204,7 @@ namespace Cryo
                 std::unordered_map<std::string, int> in_degree;
                 for (const auto &mod : all_local_modules)
                 {
-                    deps[mod];     // ensure entry exists
+                    deps[mod]; // ensure entry exists
                     if (in_degree.find(mod) == in_degree.end())
                         in_degree[mod] = 0;
                 }

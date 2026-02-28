@@ -207,6 +207,46 @@ namespace Cryo::Codegen
         llvm::Value *generate_log10f(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_log2f(const std::vector<llvm::Value *> &args);
 
+        // Float classification intrinsics
+        llvm::Value *generate_isinf(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_isnan(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_isfinite(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_isnormal(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_signbit(const std::vector<llvm::Value *> &args);
+
+        // Additional math intrinsics (libc)
+        llvm::Value *generate_tgamma(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_lgamma(const std::vector<llvm::Value *> &args);
+
+        // Bit manipulation intrinsics (LLVM)
+        llvm::Value *generate_clz(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_clz32(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_clz64(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_ctz(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_ctz32(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_ctz64(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_popcount32(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_popcount64(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_rotl32(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_rotl64(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_rotr32(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_rotr64(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_bswap16(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_bswap32(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_bswap64(const std::vector<llvm::Value *> &args);
+
+        // Memory protection intrinsics
+        llvm::Value *generate_mprotect(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_mlock(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_munlock(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_madvise(const std::vector<llvm::Value *> &args);
+
+        // Dynamic loading intrinsics
+        llvm::Value *generate_dlopen(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_dlsym(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_dlclose(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_dlerror(const std::vector<llvm::Value *> &args);
+
         // Float conversion intrinsics
         llvm::Value *generate_float_conversion(const std::vector<llvm::Value *> &args, bool f32_to_f64);
         llvm::Value *generate_int_to_float(const std::vector<llvm::Value *> &args, int from_bits, bool is_signed, bool to_f32);

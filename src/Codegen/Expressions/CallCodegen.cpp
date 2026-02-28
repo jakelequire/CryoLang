@@ -118,6 +118,41 @@ namespace Cryo::Codegen
         "syscall_open", "syscall_close", "syscall_lseek",
         // Environment
         "getenv", "setenv", "unsetenv", "clearenv", "environ",
+        // Integer type conversions (signed)
+        "i8_to_i16", "i8_to_i32", "i8_to_i64", "i16_to_i32", "i16_to_i64", "i32_to_i64",
+        "i64_to_i32", "i64_to_i16", "i64_to_i8", "i32_to_i16", "i32_to_i8", "i16_to_i8",
+        // Integer type conversions (unsigned)
+        "u8_to_u16", "u8_to_u32", "u8_to_u64", "u16_to_u32", "u16_to_u64", "u32_to_u64",
+        "u64_to_u32", "u64_to_u16", "u64_to_u8", "u32_to_u16", "u32_to_u8", "u16_to_u8",
+        // Sign conversions
+        "i32_to_u32", "u32_to_i32", "i64_to_u64", "u64_to_i64", "u8_to_i8", "i8_to_u8",
+        // Float conversions
+        "f32_to_f64", "f64_to_f32",
+        // Int to float conversions
+        "i32_to_f32", "i32_to_f64", "i64_to_f64", "u32_to_f32", "u32_to_f64", "u64_to_f64",
+        // Float to int conversions
+        "f32_to_i32", "f64_to_i32", "f64_to_i64", "f32_to_u32", "f64_to_u32", "f64_to_u64",
+        // Additional float math
+        "truncf", "log10f", "log2f",
+        // Float classification
+        "isinf", "isfinite", "isnan", "isnormal", "signbit",
+        // Special math
+        "tgamma", "lgamma",
+        // Bit manipulation
+        "clz", "clz32", "clz64", "ctz", "ctz32", "ctz64",
+        "popcount32", "popcount64",
+        "rotl32", "rotl64", "rotr32", "rotr64",
+        "bswap16", "bswap32", "bswap64",
+        // Variadic argument intrinsics
+        "va_arg_i32", "va_arg_i64", "va_arg_u64", "va_arg_f64", "va_arg_ptr",
+        // Additional filesystem
+        "pread", "pwrite", "fsync", "fdatasync", "link", "realpath",
+        // Memory mapping
+        "mmap", "munmap",
+        // Memory protection
+        "mprotect", "mlock", "munlock", "madvise",
+        // Dynamic loading
+        "dlopen", "dlsym", "dlclose", "dlerror",
         // Misc
         "panic", "todo", "float32_to_string", "float64_to_string", "sizeof"};
 
@@ -1449,10 +1484,11 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "classify_call: Object identifier is '{}'", obj_name);
 
-                // ONLY classify as intrinsic if the object is the 'intrinsics' namespace
-                // This prevents method calls like this.read(buf, len) from being
-                // misclassified as intrinsic calls like intrinsics::read(fd, buf, len)
-                if (obj_name == "intrinsics" && is_intrinsic(method_name))
+                // If the object is the 'intrinsics' namespace, always treat as intrinsic call.
+                // This avoids needing to keep _intrinsic_functions perfectly in sync with
+                // Intrinsics.cpp. Unimplemented intrinsics get a clear error from
+                // report_unimplemented_intrinsic instead of confusing "Unknown function".
+                if (obj_name == "intrinsics")
                 {
                     return CallKind::Intrinsic;
                 }
@@ -1567,6 +1603,12 @@ namespace Cryo::Codegen
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "classify_call: ScopeResolution '{}::{}' has_generic_args={}",
                       scope_name, member_name, scope->has_generic_args());
+
+            // If the scope is the 'intrinsics' namespace, always treat as intrinsic call.
+            if (scope_name == "intrinsics")
+            {
+                return CallKind::Intrinsic;
+            }
 
             // Check if it's an enum variant
             if (is_enum_type(scope_name))
@@ -2437,6 +2479,25 @@ namespace Cryo::Codegen
             {
                 std::string short_name = resolved_enum_name.substr(last_sep + 2) + "::" + variant_name;
                 ctor = module()->getFunction(short_name);
+            }
+        }
+        if (!ctor)
+        {
+            // Fallback: the constructor may exist with a fully-qualified namespace prefix
+            // (e.g., "std::core::result::Result_i8_ConversionError::Ok" when we searched
+            // for "Result_i8_ConversionError::Ok"). Search all functions for a matching suffix.
+            std::string suffix = "::" + qualified_variant;
+            for (auto &fn : module()->functions())
+            {
+                std::string fn_name = fn.getName().str();
+                if (fn_name.size() > suffix.size() &&
+                    fn_name.compare(fn_name.size() - suffix.size(), suffix.size(), suffix) == 0)
+                {
+                    ctor = &fn;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_enum_variant: Found constructor via suffix match: {}", fn_name);
+                    break;
+                }
             }
         }
         if (ctor)

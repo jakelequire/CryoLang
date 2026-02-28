@@ -1572,13 +1572,14 @@ namespace Cryo
             is_in_std_namespace = _current_namespace.find("std::") != std::string::npos;
         }
 
-        if (func_name == "main")
-        {
-            if (!is_in_std_namespace && !_raw_mode)
-            {
-                func_name = "_user_main_";
-            }
-        }
+        // Runtime function name transformation: main -> _user_main_
+        // Currently disabled — Cryo Runtime is not yet implemented.
+        // When the runtime is ready, re-enable this so the runtime's main()
+        // can call _user_main_() after initialization.
+        // if (func_name == "main" && !is_in_std_namespace && !_raw_mode)
+        // {
+        //     func_name = "_user_main_";
+        // }
 
         // Create function declaration early so we can add generic parameters
         TypeRef void_type = resolve_type_from_string("void");
