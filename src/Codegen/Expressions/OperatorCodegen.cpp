@@ -2006,12 +2006,18 @@ namespace Cryo::Codegen
 
                 switch (op)
                 {
-                case TokenKind::TK_EQUALEQUAL:    return b.CreateICmpEQ(cmp, zero, "cmp.eq");
-                case TokenKind::TK_EXCLAIMEQUAL:  return b.CreateICmpNE(cmp, zero, "cmp.ne");
-                case TokenKind::TK_L_ANGLE:       return b.CreateICmpSLT(cmp, zero, "cmp.lt");
-                case TokenKind::TK_LESSEQUAL:     return b.CreateICmpSLE(cmp, zero, "cmp.le");
-                case TokenKind::TK_R_ANGLE:       return b.CreateICmpSGT(cmp, zero, "cmp.gt");
-                case TokenKind::TK_GREATEREQUAL:  return b.CreateICmpSGE(cmp, zero, "cmp.ge");
+                case TokenKind::TK_EQUALEQUAL:
+                    return b.CreateICmpEQ(cmp, zero, "cmp.eq");
+                case TokenKind::TK_EXCLAIMEQUAL:
+                    return b.CreateICmpNE(cmp, zero, "cmp.ne");
+                case TokenKind::TK_L_ANGLE:
+                    return b.CreateICmpSLT(cmp, zero, "cmp.lt");
+                case TokenKind::TK_LESSEQUAL:
+                    return b.CreateICmpSLE(cmp, zero, "cmp.le");
+                case TokenKind::TK_R_ANGLE:
+                    return b.CreateICmpSGT(cmp, zero, "cmp.gt");
+                case TokenKind::TK_GREATEREQUAL:
+                    return b.CreateICmpSGE(cmp, zero, "cmp.ge");
                 default:
                     report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
                                  "unsupported comparison operator for type '" + struct_name + "'");
@@ -2028,7 +2034,8 @@ namespace Cryo::Codegen
                     if (node)
                         diag.at(node);
                     diag.with_note("struct types do not support ordering comparisons (<, >, <=, >=) — "
-                                   "define a `compare(&this, other: " + lhs_type_name + ") -> i32` method to enable them");
+                                   "define a `compare(&this, other: " +
+                                   lhs_type_name + ") -> i32` method to enable them");
                     emit_diagnostic(std::move(diag));
                 }
                 return nullptr;

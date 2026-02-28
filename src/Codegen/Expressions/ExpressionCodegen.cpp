@@ -4988,6 +4988,18 @@ namespace Cryo::Codegen
                 if (i > 0)
                     mangled += "_";
                 std::string arg_name = node->generic_args()[i];
+                // Substitute type parameters in generic context (e.g., "T" -> "string")
+                auto *visitor2 = ctx().visitor();
+                if (visitor2)
+                {
+                    auto *gen = visitor2->get_generics();
+                    if (gen && gen->in_type_param_scope())
+                    {
+                        std::string substituted_arg = gen->substitute_type_annotation(arg_name);
+                        if (!substituted_arg.empty() && substituted_arg != arg_name)
+                            arg_name = substituted_arg;
+                    }
+                }
                 // Resolve common type aliases (parser stores "int" but LLVM uses "i32")
                 auto &arena = ctx().symbols().arena();
                 TypeRef arg_type = arena.lookup_type_by_name(arg_name);
@@ -5008,6 +5020,45 @@ namespace Cryo::Codegen
             struct_type = ctx().get_type(mangled);
             if (!struct_type)
                 struct_type = llvm::StructType::getTypeByName(llvm_ctx(), mangled);
+            // Try on-demand instantiation if not found
+            if (!struct_type || !struct_type->isStructTy())
+            {
+                auto *visitor3 = ctx().visitor();
+                if (visitor3)
+                {
+                    auto *gen = visitor3->get_generics();
+                    if (gen)
+                    {
+                        // Build type args for instantiation
+                        std::vector<TypeRef> resolved_type_args;
+                        auto &arena = ctx().symbols().arena();
+                        for (size_t gi = 0; gi < node->generic_args().size(); ++gi)
+                        {
+                            std::string ga = node->generic_args()[gi];
+                            // Substitute type params first
+                            if (gen->in_type_param_scope())
+                            {
+                                std::string sub = gen->substitute_type_annotation(ga);
+                                if (!sub.empty() && sub != ga)
+                                    ga = sub;
+                            }
+                            TypeRef ta = arena.lookup_type_by_name(ga);
+                            if (ta.is_valid())
+                                resolved_type_args.push_back(ta);
+                        }
+                        if (resolved_type_args.size() == node->generic_args().size())
+                        {
+                            llvm::Type *inst = gen->get_instantiated_type(
+                                node->struct_type(), resolved_type_args);
+                            if (inst && inst->isStructTy())
+                            {
+                                struct_type = inst;
+                                type_name = mangled;
+                            }
+                        }
+                    }
+                }
+            }
             if (struct_type && struct_type->isStructTy())
                 type_name = mangled;
         }
@@ -5185,6 +5236,38 @@ namespace Cryo::Codegen
                             names.push_back(f.name);
                         ctx().register_struct_fields(type_name, names);
                         field_idx = ctx().get_struct_field_index(type_name, field_name);
+                    }
+                }
+            }
+            if (field_idx < 0)
+            {
+                // Fallback: try TemplateRegistry for generic struct field lookup
+                if (auto *template_reg = ctx().template_registry())
+                {
+                    std::vector<std::string> candidates = {type_name};
+                    std::string type_ns = ctx().get_type_namespace(type_name);
+                    if (!type_ns.empty())
+                        candidates.push_back(type_ns + "::" + type_name);
+
+                    for (const auto &candidate : candidates)
+                    {
+                        const auto *field_info = template_reg->get_struct_field_types(candidate);
+                        if (field_info && !field_info->field_names.empty())
+                        {
+                            for (size_t fi = 0; fi < field_info->field_names.size(); ++fi)
+                            {
+                                if (field_info->field_names[fi] == field_name)
+                                {
+                                    field_idx = static_cast<int>(fi);
+                                    break;
+                                }
+                            }
+                            if (field_idx >= 0)
+                            {
+                                ctx().register_struct_fields(type_name, field_info->field_names);
+                                break;
+                            }
+                        }
                     }
                 }
             }
