@@ -103,6 +103,16 @@ namespace Cryo::Linker
         void add_object_file(const std::string &object_path);
 
         /**
+         * @brief Create a static library archive from multiple object files
+         * @param object_files Vector of object file paths to archive
+         * @param output_path Output archive path (.a)
+         * @return Success status
+         */
+        bool create_static_archive(
+            const std::vector<std::string> &object_files,
+            const std::string &output_path);
+
+        /**
          * @brief Add library to link against
          * @param library_name Library name (without lib prefix or extension)
          * @param is_static Whether to link statically
