@@ -107,23 +107,36 @@ type struct Reader {
 
     /// Reads all bytes into a String until EOF.
     read_to_string(&this, s: &mut String) -> IoResult<u64> {
-        const buf: Array<u8> = Array<u8>::new();
-        const result: IoResult<u64> = this.read_to_end(&buf);
+        // Read directly into string using chunks, avoiding method dispatch issues
+        // with read_to_end on Array<u8>
+        const CHUNK_SIZE: u64 = 8192;
+        mut total_read: u64 = 0;
 
-        match (result) {
-            IoResult::Err(e) => { return IoResult::Err(e); }
-            IoResult::Ok(n) => {
-                // Append bytes to string
-                mut i: u64 = 0;
-                while (i < buf.len()) {
-                    s.push_byte(buf.get_ref(i).*);
-                    i = i + 1;
+        loop {
+            mut chunk: u8[8192];
+            const result: IoResult<u64> = this.read(&chunk[0], CHUNK_SIZE);
+
+            match (result) {
+                IoResult::Err(e) => {
+                    if (e.kind() == IoErrorKind::Interrupted) {
+                        continue;
+                    }
+                    return IoResult::Err(e);
                 }
-                buf.drop();
-                return IoResult::Ok(n);
+                IoResult::Ok(0) => {
+                    return IoResult::Ok(total_read);
+                }
+                IoResult::Ok(n) => {
+                    mut i: u64 = 0;
+                    while (i < n) {
+                        s.push_byte(chunk[i]);
+                        i = i + 1;
+                    }
+                    total_read = total_read + n;
+                }
             }
         }
-        return IoResult::Err(IoError::new(IoErrorKind::InvalidData, "failed to read string"));
+        return IoResult::Ok(total_read);
     }
 
     /// Closes the reader.

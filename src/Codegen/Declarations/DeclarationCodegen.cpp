@@ -3237,6 +3237,8 @@ namespace Cryo::Codegen
                             this_type = arena.get_bool();
                         else if (parent_type == "char")
                             this_type = arena.get_char();
+                        else if (parent_type == "string")
+                            this_type = arena.get_string();
                     }
                     if (this_type.is_valid())
                     {
@@ -3819,6 +3821,7 @@ namespace Cryo::Codegen
                     // AST params may or may not include 'this' depending on syntax.
                     const auto &ast_params = fn_node->parameters();
                     bool ast_has_this_param = !ast_params.empty() && ast_params[0]->name() == "this";
+                    bool is_static_method = fn_node->is_static();
                     size_t param_idx = 0;
                     for (auto &arg : fn->args())
                     {
@@ -3830,9 +3833,18 @@ namespace Cryo::Codegen
                             continue;
                         }
 
-                        if (param_idx < ast_params.size())
+                        // For static methods, param_idx maps directly to AST params.
+                        // For instance methods without explicit 'this', LLVM params are
+                        // offset by 1 (implicit 'this'), so we adjust.
+                        size_t ast_idx;
+                        if (ast_has_this_param || is_static_method)
+                            ast_idx = param_idx;
+                        else
+                            ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
+
+                        if (ast_idx < ast_params.size())
                         {
-                            TypeRef param_type = ast_params[param_idx]->get_resolved_type();
+                            TypeRef param_type = ast_params[ast_idx]->get_resolved_type();
                             // Apply type substitution if we're in a generic instantiation scope
                             if (param_type.is_valid() && _generics)
                             {
@@ -3850,10 +3862,10 @@ namespace Cryo::Codegen
                                           "Registered impl method parameter type: {} -> {}",
                                           param_name, param_type->display_name());
                             }
-                            else if (ast_params[param_idx]->has_type_annotation())
+                            else if (ast_params[ast_idx]->has_type_annotation())
                             {
                                 // Fallback: resolve from type annotation (cross-module params may lack resolved types)
-                                TypeRef resolved = resolve_type_annotation(ast_params[param_idx]->type_annotation());
+                                TypeRef resolved = resolve_type_annotation(ast_params[ast_idx]->type_annotation());
                                 if (resolved.is_valid())
                                 {
                                     std::string param_name = arg.getName().str();

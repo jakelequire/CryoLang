@@ -32,12 +32,12 @@ function main() -> int {
   - [Generics](#generics)
   - [Modules](#modules)
   - [Pointers & Memory](#pointers--memory)
+- [FFI (Foreign Function Interface)](#ffi-foreign-function-interface)
 - [Type System](#type-system)
 - [Standard Library](#standard-library)
 - [Tooling](#tooling)
 - [Building from Source](#building-from-source)
 - [Architecture](#architecture)
-- [Contributing](#contributing)
 - [License](#license)
 
 ## Features
@@ -186,6 +186,9 @@ const parity: string = match (n % 2) {
     1 => { "odd" }
     _ => { "unknown" }
 };
+
+// ternary operators
+const abs: int = x >= 0 ? x : -x;
 ```
 
 ### Structs
@@ -537,6 +540,36 @@ function example() -> void {
     free(buf);
 }
 ```
+
+## FFI (Foreign Function Interface)
+Cryo can call C functions and be called from C. Use `extern "C"` blocks to declare foreign functions. Or, using `extern "CImport" [identifier] { ... }` to import C header files directly, which generates bindings automatically.
+
+```cryo
+namespace FFI;
+
+// Declare an external C function, using Cryo syntax.
+extern "C" {
+    function puts(s: string) -> int;
+}
+
+// Import C functions from a header file. 
+// The `c` namespace (any identifier) is used to access imported C functions.
+extern "CImport" c {
+    #include <stdio.h>
+    #include "./my_header.h" // void foo(int);
+}
+
+function main() -> int {
+    const message: string = "Hello from C!";
+    puts(message);  // Calls the C function `puts`
+
+    c::foo(42);    // Calls the C function `foo` imported from my_header.h
+    c::printf("Value: %d\n", 123); // Calls C's printf via the c namespace
+
+    return 0;
+}
+```
+
 
 ## Type System
 
