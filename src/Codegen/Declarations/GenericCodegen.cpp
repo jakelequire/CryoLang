@@ -137,6 +137,7 @@ namespace Cryo::Codegen
         // TypeMapper creates LLVM structs for monomorphized generics but doesn't register
         // field names in CodegenContext — recover from the Cryo type in TypeArena.
         auto ensure_fields_registered = [&](const std::string &name) {
+            // Try TypeArena first
             auto &arena = ctx().symbols().arena();
             TypeRef cryo_type = arena.lookup_type_by_name(name);
             if (cryo_type.is_valid() && cryo_type->kind() == Cryo::TypeKind::Struct)
@@ -149,6 +150,16 @@ namespace Cryo::Codegen
                     for (const auto &f : struct_info->fields())
                         names.push_back(f.name);
                     ctx().register_struct_fields(name, names);
+                    return;
+                }
+            }
+            // Fallback: try TemplateRegistry
+            if (auto *template_reg = ctx().template_registry())
+            {
+                const auto *field_info = template_reg->get_struct_field_types(name);
+                if (field_info && !field_info->field_names.empty())
+                {
+                    ctx().register_struct_fields(name, field_info->field_names);
                 }
             }
         };
@@ -2966,7 +2977,12 @@ namespace Cryo::Codegen
                 {
                     bool ast_has_explicit_this = !ast_params.empty() &&
                                                  ast_params[0]->name() == "this";
-                    size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
+                    bool is_static = method->is_static();
+                    size_t ast_idx;
+                    if (ast_has_explicit_this || is_static)
+                        ast_idx = param_idx;
+                    else
+                        ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
                     if (ast_idx < ast_params.size())
                     {
                         TypeRef substituted = resolve_param_type(ast_params[ast_idx].get());
