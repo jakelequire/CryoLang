@@ -657,12 +657,16 @@ namespace Cryo::Codegen
                     }
                     else if (param_idx < ast_params.size() + 1)
                     {
-                        // Get AST parameter - check if AST has explicit 'this' parameter
-                        // If AST includes 'this' explicitly, use param_idx directly
-                        // Otherwise, subtract 1 to account for implicit 'this' added by codegen
+                        // For static methods, there's no implicit 'this', so param_idx maps directly
+                        // For instance methods, subtract 1 to account for implicit 'this' added by codegen
+                        bool is_static = method->is_static();
                         bool ast_has_explicit_this = !ast_params.empty() &&
                                                      ast_params[0]->name() == "this";
-                        size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
+                        size_t ast_idx;
+                        if (ast_has_explicit_this || is_static)
+                            ast_idx = param_idx;
+                        else
+                            ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
                         if (ast_idx < ast_params.size())
                         {
                             TypeRef substituted = resolve_param_type(ast_params[ast_idx].get());
@@ -893,9 +897,16 @@ namespace Cryo::Codegen
                         }
                         else if (param_idx < ast_params.size() + 1)
                         {
+                            // For static methods, there's no implicit 'this', so param_idx maps directly
+                            // For instance methods, subtract 1 to account for implicit 'this' added by codegen
+                            bool is_static = method->is_static();
                             bool ast_has_explicit_this = !ast_params.empty() &&
                                                          ast_params[0]->name() == "this";
-                            size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
+                            size_t ast_idx;
+                            if (ast_has_explicit_this || is_static)
+                                ast_idx = param_idx;
+                            else
+                                ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
                             if (ast_idx < ast_params.size())
                             {
                                 TypeRef substituted = resolve_param_type(ast_params[ast_idx].get());
@@ -1513,10 +1524,16 @@ namespace Cryo::Codegen
                         }
                         else if (param_idx < ast_params.size() + 1)
                         {
-                            // Check if AST has explicit 'this' parameter
+                            // For static methods, there's no implicit 'this', so param_idx maps directly
+                            // For instance methods, subtract 1 to account for implicit 'this' added by codegen
+                            bool is_static = method->is_static();
                             bool ast_has_explicit_this = !ast_params.empty() &&
                                                          ast_params[0]->name() == "this";
-                            size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
+                            size_t ast_idx;
+                            if (ast_has_explicit_this || is_static)
+                                ast_idx = param_idx;
+                            else
+                                ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
                             if (ast_idx < ast_params.size())
                             {
                                 TypeRef substituted = resolve_param_type(ast_params[ast_idx].get());
@@ -2301,10 +2318,16 @@ namespace Cryo::Codegen
                         {
                             // Get AST parameter - check if AST has explicit 'this' parameter
                             // If AST includes 'this' explicitly, use param_idx directly
-                            // Otherwise, subtract 1 to account for implicit 'this' added by codegen
+                            // For static methods, there's no implicit 'this', so param_idx maps directly
+                            // For instance methods, subtract 1 to account for implicit 'this' added by codegen
+                            bool is_static = method->is_static();
                             bool ast_has_explicit_this = !ast_params.empty() &&
                                                          ast_params[0]->name() == "this";
-                            size_t ast_idx = ast_has_explicit_this ? param_idx : (param_idx > 0 ? param_idx - 1 : param_idx);
+                            size_t ast_idx;
+                            if (ast_has_explicit_this || is_static)
+                                ast_idx = param_idx;
+                            else
+                                ast_idx = param_idx > 0 ? param_idx - 1 : param_idx;
                             if (ast_idx < ast_params.size())
                             {
                                 TypeRef substituted = resolve_param_type(ast_params[ast_idx].get());
