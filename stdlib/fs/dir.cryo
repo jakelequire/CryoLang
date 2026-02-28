@@ -246,50 +246,51 @@ function remove_dir(path: string) -> IoResult<()> {
 
 /// Removes a directory and all its contents.
 function remove_dir_all(path: string) -> IoResult<()> {
-    const dir: IoResult<ReadDir> = read_dir(path);
-    match (dir) {
-        IoResult::Err(e) => { return IoResult::Err(e); }
-        IoResult::Ok(d) => {
-            loop {
-                const entry: Option<IoResult<DirEntry>> = d.next();
-                match (entry) {
-                    Option::None => { break; }
-                    Option::Some(result) => {
-                        match (result) {
-                            IoResult::Err(e) => {
-                                d.drop();
-                                return IoResult::Err(e);
-                            }
-                            IoResult::Ok(e) => {
-                                const entry_path: string = e.path().as_str();
-                                if (e.is_dir()) {
-                                    e.drop();
-                                    match (remove_dir_all(entry_path)) {
-                                        IoResult::Err(err) => {
-                                            d.drop();
-                                            return IoResult::Err(err);
-                                        }
-                                        IoResult::Ok(_) => {}
-                                    }
-                                } else {
-                                    e.drop();
-                                    match (remove_file(entry_path)) {
-                                        IoResult::Err(err) => {
-                                            d.drop();
-                                            return IoResult::Err(err);
-                                        }
-                                        IoResult::Ok(_) => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            d.drop();
-            return remove_dir(path);
-        }
+    // Simplified: use intrinsics directly to avoid deeply nested match
+    const dir_ptr: void* = intrinsics::opendir(path);
+    if (dir_ptr == null) {
+        return IoResult::Err(IoError::from_raw_os_error(errno()));
     }
+
+    loop {
+        const entry: void* = intrinsics::readdir(dir_ptr);
+        if (entry == null) {
+            break;
+        }
+
+        const name: string = intrinsics::dirent_name(entry);
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+
+        const entry_path: PathBuf = PathBuf::from_str(path);
+        entry_path.push(name);
+        const entry_path_str: string = entry_path.as_str();
+
+        if (is_dir(entry_path_str)) {
+            match (remove_dir_all(entry_path_str)) {
+                IoResult::Err(e) => {
+                    intrinsics::closedir(dir_ptr);
+                    entry_path.drop();
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(_) => {}
+            }
+        } else {
+            match (remove_file(entry_path_str)) {
+                IoResult::Err(e) => {
+                    intrinsics::closedir(dir_ptr);
+                    entry_path.drop();
+                    return IoResult::Err(e);
+                }
+                IoResult::Ok(_) => {}
+            }
+        }
+        entry_path.drop();
+    }
+
+    intrinsics::closedir(dir_ptr);
+    return remove_dir(path);
 }
 
 /// Returns true if a path exists.
@@ -337,52 +338,45 @@ function rename(_from: string, to: string) -> IoResult<()> {
 
 /// Copies a file.
 function copy(_from: string, to: string) -> IoResult<u64> {
-    const src: IoResult<File> = File::open(_from);
-    match (src) {
-        IoResult::Err(e) => { return IoResult::Err(e); }
-        IoResult::Ok(s) => {
-            const dst: IoResult<File> = File::create(to);
-            match (dst) {
-                IoResult::Err(e) => {
-                    s.drop();
-                    return IoResult::Err(e);
-                }
-                IoResult::Ok(d) => {
-                    const BUF_SIZE: u64 = 8192;
-                    mut buf: u8[8192];
-                    mut total: u64 = 0;
-
-                    loop {
-                        match (s.read(&buf[0], BUF_SIZE)) {
-                            IoResult::Err(e) => {
-                                s.drop();
-                                d.drop();
-                                return IoResult::Err(e);
-                            }
-                            IoResult::Ok(0) => {
-                                s.drop();
-                                d.drop();
-                                return IoResult::Ok(total);
-                            }
-                            IoResult::Ok(n) => {
-                                match (d.write_all(&buf[0], n)) {
-                                    IoResult::Err(e) => {
-                                        s.drop();
-                                        d.drop();
-                                        return IoResult::Err(e);
-                                    }
-                                    IoResult::Ok(_) => {
-                                        total = total + n;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // Use raw fd operations to avoid deeply nested match codegen issues
+    const src_fd: i32 = intrinsics::open(_from, 0, 0); // O_RDONLY = 0
+    if (src_fd < 0) {
+        return IoResult::Err(IoError::from_raw_os_error(-src_fd));
     }
-    return IoResult::Ok(0); // Unreachable, but required for type checking
+
+    // O_WRONLY | O_CREAT | O_TRUNC = 1 | 64 | 512 = 577
+    const dst_fd: i32 = intrinsics::open(to, 577, 0o644);
+    if (dst_fd < 0) {
+        intrinsics::close(src_fd);
+        return IoResult::Err(IoError::from_raw_os_error(-dst_fd));
+    }
+
+    mut buf: u8[8192];
+    mut total: u64 = 0;
+
+    loop {
+        const n: i64 = intrinsics::read(src_fd, &buf[0], 8192);
+        if (n < 0) {
+            intrinsics::close(src_fd);
+            intrinsics::close(dst_fd);
+            return IoResult::Err(IoError::from_raw_os_error(-n));
+        }
+        if (n == 0) {
+            break;
+        }
+
+        const written: i64 = intrinsics::write(dst_fd, &buf[0], n);
+        if (written < 0) {
+            intrinsics::close(src_fd);
+            intrinsics::close(dst_fd);
+            return IoResult::Err(IoError::from_raw_os_error(-written));
+        }
+        total = total + n;
+    }
+
+    intrinsics::close(src_fd);
+    intrinsics::close(dst_fd);
+    return IoResult::Ok(total);
 }
 
 /// Creates a hard link.
