@@ -1,0 +1,145 @@
+///! Generic Registry
+///!
+///! Type-level instantiation cache and monomorphization tracker.  Sits between
+///! TypeResolver (which creates InstantiatedType objects) and the Monomorphizer
+///! (which processes them).
+///!
+///! When the type resolver encounters `Array<i32>`, it calls
+///! `generic_registry.instantiate(array_base, [i32_ref])` which deduplicates
+///! and returns a stable TypeRef.  Later, the Monomorphizer queries
+///! `collect_unmonomorphized()` to find all instantiations that still need
+///! specialization.
+
+namespace Compiler::Types::GenericRegistry;
+
+
+// ============================================================================
+// GenericRegistry — Instantiation cache + monomorphization tracker
+// ============================================================================
+
+type struct GenericRegistry {
+    arena: TypeArena*;
+
+    // Instantiation cache: key_string → InstantiatedType TypeRef
+    cache_keys: string[];
+    cache_refs: TypeRef[];
+
+    // Monomorphization tracking: set of keys already processed
+    mono_keys: string[];
+
+
+    // ----------------------------------------------------------------
+    // Construction
+    // ----------------------------------------------------------------
+
+    static new(arena: TypeArena*) -> GenericRegistry {
+        return GenericRegistry {
+            arena:      arena,
+            cache_keys: [],
+            cache_refs: [],
+            mono_keys:  [],
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Instantiation
+    // ----------------------------------------------------------------
+
+    /// Get or create an InstantiatedType for the given base + type args.
+    /// Deduplicates via string key so the same instantiation always returns
+    /// the same TypeRef.
+    instantiate(mut &this, base: TypeRef, args: TypeRef[]) -> TypeRef {
+        const key: string = make_cache_key(base, args);
+
+        // Check cache
+        for (mut i: i64 = 0; i < this.cache_keys.length; i++) {
+            if (this.cache_keys[i] == key) {
+                return this.cache_refs[i];
+            }
+        }
+
+        // Cache miss — create new InstantiatedType
+        const inst: TypeRef = this.arena.create_instantiation(base, args);
+        this.cache_keys = this.cache_keys + [key];
+        this.cache_refs = this.cache_refs + [inst];
+        return inst;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Monomorphization tracking
+    // ----------------------------------------------------------------
+
+    /// Check if an instantiation has already been monomorphized.
+    is_monomorphized(&this, base: TypeRef, args: TypeRef[]) -> boolean {
+        const key: string = make_cache_key(base, args);
+        for (mut i: i64 = 0; i < this.mono_keys.length; i++) {
+            if (this.mono_keys[i] == key) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Mark an instantiation as monomorphized (specialization completed).
+    mark_monomorphized(mut &this, base: TypeRef, args: TypeRef[]) -> void {
+        const key: string = make_cache_key(base, args);
+        // Check for duplicate
+        for (mut i: i64 = 0; i < this.mono_keys.length; i++) {
+            if (this.mono_keys[i] == key) {
+                return;
+            }
+        }
+        this.mono_keys = this.mono_keys + [key];
+    }
+
+    /// Collect all cached instantiations that have not yet been monomorphized.
+    /// Returns the TypeRefs of unprocessed InstantiatedTypes.
+    collect_unmonomorphized(&this) -> TypeRef[] {
+        mut result: TypeRef[] = [];
+        for (mut i: i64 = 0; i < this.cache_keys.length; i++) {
+            const key: string = this.cache_keys[i];
+            mut found: boolean = false;
+            for (mut j: i64 = 0; j < this.mono_keys.length; j++) {
+                if (this.mono_keys[j] == key) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                result = result + [this.cache_refs[i]];
+            }
+        }
+        return result;
+    }
+
+    /// Number of cached instantiations.
+    cache_count(&this) -> i64 {
+        return this.cache_keys.length;
+    }
+
+    /// Number of monomorphized instantiations.
+    mono_count(&this) -> i64 {
+        return this.mono_keys.length;
+    }
+}
+
+
+// ============================================================================
+// Cache key construction
+// ============================================================================
+
+/// Build a cache key string from a base TypeRef and type args.
+/// Format: "{base_id}<{arg_id_1},{arg_id_2}>"
+function make_cache_key(base: TypeRef, args: TypeRef[]) -> string {
+    mut key: string = sprintf("%llu<", base.id);
+    for (mut i: i64 = 0; i < args.length; i++) {
+        if (i > 0) {
+            key = key + ",";
+        }
+        key = key + sprintf("%llu", args[i].id);
+    }
+    key = key + ">";
+    return key;
+}

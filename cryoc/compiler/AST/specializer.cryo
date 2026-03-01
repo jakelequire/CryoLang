@@ -1,0 +1,134 @@
+///! AST Specializer
+///!
+///! Thin orchestrator for generic AST specialization: clone → substitute → return.
+///! Used by the Monomorphizer to produce concrete AST declarations from generic
+///! template entries.
+
+namespace Compiler::AST::Specializer;
+
+import Compiler::Diag;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::AST::Cloner;
+import Compiler::AST::TypeSubstituter;
+import Compiler::Types;
+import Compiler::Types::Substitution;
+import Compiler::Types::TemplateRegistry;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::MangledName;
+
+
+// ============================================================================
+// SpecializationResult — Output of a single specialization
+// ============================================================================
+
+type struct SpecializationResult {
+    specialized_ast: ASTNode*;
+    impl_asts:       ASTNode*[];
+    spec_name:       string;
+    success:         boolean;
+    error_message:   string;
+
+    static ok(ast: ASTNode*, impls: ASTNode*[], name: string) -> SpecializationResult {
+        return SpecializationResult {
+            specialized_ast: ast,
+            impl_asts:       impls,
+            spec_name:       name,
+            success:         true,
+            error_message:   "",
+        };
+    }
+
+    static fail(message: string) -> SpecializationResult {
+        return SpecializationResult {
+            specialized_ast: null,
+            impl_asts:       [],
+            spec_name:       "",
+            success:         false,
+            error_message:   message,
+        };
+    }
+}
+
+
+// ============================================================================
+// ASTSpecializer — Clone + substitute orchestrator
+// ============================================================================
+
+type struct ASTSpecializer {
+    arena:        TypeArena*;
+    intern_table: InternTable*;
+
+
+    static new(arena: TypeArena*, intern_table: InternTable*) -> ASTSpecializer {
+        return ASTSpecializer {
+            arena:        arena,
+            intern_table: intern_table,
+        };
+    }
+
+
+    /// Specialize a generic template entry with the given concrete type arguments.
+    ///
+    /// Steps:
+    ///   1. Build TypeSubstitution from entry's param IDs → concrete type args
+    ///   2. Generate specialized name via MangledName
+    ///   3. Clone the generic AST
+    ///   4. Run ASTTypeSubstituter on the clone
+    ///   5. Clone + substitute each impl block
+    ///   6. Return result
+    specialize(&this, entry: TemplateEntry*, type_args: TypeRef[],
+               type_arg_displays: string[]) -> SpecializationResult {
+        // Validate
+        if (entry == null) {
+            return SpecializationResult::fail("null template entry");
+        }
+        if (type_args.length != entry.param_count) {
+            return SpecializationResult::fail(
+                sprintf("type argument count mismatch: expected %lld, got %lld",
+                        entry.param_count, type_args.length)
+            );
+        }
+
+        // 1. Build substitution
+        const subst: TypeSubstitution = TypeSubstitution::from_params(
+            entry.param_type_ids, type_args
+        );
+        const subst_ptr: TypeSubstitution* = malloc(sizeof(TypeSubstitution));
+        *subst_ptr = subst;
+
+        // 2. Generate specialized name
+        const mangled: MangledName = MangledName::from_generic(
+            this.intern_table, entry.name, type_arg_displays
+        );
+        const spec_name: string = this.intern_table.resolve(mangled.value);
+
+        // 3. Clone AST
+        mut cloner: ASTCloner = new ASTCloner();
+        const cloned_ast: ASTNode* = cloner.clone_node(entry.ast_node);
+        if (cloned_ast == null) {
+            return SpecializationResult::fail("AST clone returned null");
+        }
+
+        // 4. Substitute on clone
+        mut substituter: ASTTypeSubstituter = new ASTTypeSubstituter(
+            subst_ptr, this.arena, this.intern_table,
+            entry.name, spec_name,
+            entry.param_names, type_arg_displays
+        );
+        cloned_ast.accept(&substituter);
+
+        // 5. Clone + substitute each impl block
+        mut impl_asts: ASTNode*[] = [];
+        for (mut i: i64 = 0; i < entry.impl_blocks.length; i++) {
+            const cloned_impl: ASTNode* = cloner.clone_node(entry.impl_blocks[i]);
+            if (cloned_impl != null) {
+                cloned_impl.accept(&substituter);
+                impl_asts = impl_asts + [cloned_impl];
+            }
+        }
+
+        // 6. Return
+        return SpecializationResult::ok(cloned_ast, impl_asts, spec_name);
+    }
+}
