@@ -1154,31 +1154,94 @@ namespace Cryo
                     symbol_map[var_decl->name()] = symbol;
 
                     // Register module-level constants in TemplateRegistry for cross-module
-                    // generic instantiation. Constants with simple integer literal initializers
+                    // generic instantiation. Constants with simple literal initializers
                     // are registered so that generic methods can reference them when instantiated
                     // in other modules (before the defining module's IR is generated).
                     if (!var_decl->is_mutable() && var_decl->initializer())
                     {
+                        std::string type_ann;
+                        if (var_decl->type_annotation())
+                            type_ann = var_decl->type_annotation()->to_string();
+
+                        bool registered = false;
                         auto *literal = dynamic_cast<LiteralNode *>(var_decl->initializer());
                         if (literal && (literal->literal_kind() == TokenKind::TK_NUMERIC_CONSTANT ||
                                         literal->literal_kind() == TokenKind::TK_BOOLEAN_LITERAL))
                         {
-                            std::string type_ann;
-                            if (var_decl->type_annotation())
-                                type_ann = var_decl->type_annotation()->to_string();
-
-                            uint64_t int_value = 0;
-                            if (literal->literal_kind() == TokenKind::TK_BOOLEAN_LITERAL)
-                                int_value = (literal->value() == "true") ? 1 : 0;
+                            // Check if this is a float constant based on type annotation
+                            bool is_float = (type_ann == "f32" || type_ann == "f64");
+                            if (is_float)
+                            {
+                                double float_value = std::stod(literal->value());
+                                _template_registry.register_module_constant_float(
+                                    module_name, var_decl->name(), type_ann, float_value);
+                            }
                             else
-                                int_value = std::stoull(literal->value());
+                            {
+                                uint64_t int_value = 0;
+                                if (literal->literal_kind() == TokenKind::TK_BOOLEAN_LITERAL)
+                                    int_value = (literal->value() == "true") ? 1 : 0;
+                                else
+                                    int_value = std::stoull(literal->value());
 
-                            _template_registry.register_module_constant(
-                                module_name, var_decl->name(), type_ann, int_value);
+                                _template_registry.register_module_constant(
+                                    module_name, var_decl->name(), type_ann, int_value);
+                            }
+                            registered = true;
+                        }
 
+                        // Handle computed float constants like 1.0 / 0.0 (INFINITY) or 0.0 / 0.0 (NAN)
+                        if (!registered && (type_ann == "f32" || type_ann == "f64"))
+                        {
+                            auto *binary = dynamic_cast<BinaryExpressionNode *>(var_decl->initializer());
+                            if (binary && binary->operator_token().kind() == TokenKind::TK_SLASH)
+                            {
+                                // Try to extract literal values from both sides
+                                // Handle both plain literals and unary negation (e.g., -1.0)
+                                auto extract_float = [](ExpressionNode *expr, double &out) -> bool
+                                {
+                                    if (auto *lit = dynamic_cast<LiteralNode *>(expr))
+                                    {
+                                        if (lit->literal_kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                                        {
+                                            out = std::stod(lit->value());
+                                            return true;
+                                        }
+                                    }
+                                    if (auto *unary = dynamic_cast<UnaryExpressionNode *>(expr))
+                                    {
+                                        if (unary->operator_token().kind() == TokenKind::TK_MINUS)
+                                        {
+                                            if (auto *lit = dynamic_cast<LiteralNode *>(unary->operand()))
+                                            {
+                                                if (lit->literal_kind() == TokenKind::TK_NUMERIC_CONSTANT)
+                                                {
+                                                    out = -std::stod(lit->value());
+                                                    return true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    return false;
+                                };
+
+                                double lhs_val, rhs_val;
+                                if (extract_float(binary->left(), lhs_val) &&
+                                    extract_float(binary->right(), rhs_val))
+                                {
+                                    double result = lhs_val / rhs_val;
+                                    _template_registry.register_module_constant_float(
+                                        module_name, var_decl->name(), type_ann, result);
+                                    registered = true;
+                                }
+                            }
+                        }
+
+                        if (registered)
+                        {
                             LOG_DEBUG(LogComponent::GENERAL,
-                                      "ModuleLoader: Registered constant '{}::{}' = {} (type: {}) in TemplateRegistry",
-                                      module_name, var_decl->name(), int_value, type_ann);
+                                      "ModuleLoader: Registered constant '{}::{}' (type: {}) in TemplateRegistry",
+                                      module_name, var_decl->name(), type_ann);
                         }
                     }
                 }
@@ -1348,7 +1411,12 @@ namespace Cryo
                     symbol_map[struct_decl->name()] = symbol;
 
                     // Also register struct methods with qualified names (TypeName::methodName)
-                    // Use arity-disambiguated keys to support overloads in the flat symbol_map
+                    // Use type-disambiguated keys to support overloads in the flat symbol_map.
+                    // Skip overload disambiguation for generic struct templates — their param
+                    // TypeRefs may contain dangling arena pointers for unresolved generic types.
+                    // Generic methods are monomorphized at use-site and don't need LLVM forward
+                    // declarations via pre_register_functions.
+                    bool is_generic_struct = !struct_decl->generic_parameters().empty();
                     for (const auto &method : struct_decl->methods())
                     {
                         if (method)
@@ -1359,22 +1427,89 @@ namespace Cryo
                             {
                                 Symbol method_symbol(qualified_method_name, SymbolKind::Function, method_type, module_id, method->location());
                                 method_symbol.scope = module_name;
+
                                 std::string map_key = qualified_method_name;
-                                auto existing_it = symbol_map.find(map_key);
-                                if (existing_it != symbol_map.end())
+
+                                if (!is_generic_struct)
                                 {
-                                    // Only disambiguate if arities differ (genuine overload)
-                                    auto *new_func = static_cast<const FunctionType *>(method_type.get());
-                                    bool same_arity = false;
-                                    if (existing_it->second.type.is_valid() && existing_it->second.type->kind() == TypeKind::Function)
+                                    auto existing_it = symbol_map.find(map_key);
+                                    if (existing_it != symbol_map.end())
                                     {
-                                        auto *old_func = static_cast<const FunctionType *>(existing_it->second.type.get());
-                                        same_arity = (old_func->param_count() == new_func->param_count());
+                                        auto *new_func = static_cast<const FunctionType *>(method_type.get());
+                                        bool needs_disambig = true;
+                                        if (existing_it->second.type.is_valid() && existing_it->second.type->kind() == TypeKind::Function)
+                                        {
+                                            auto *old_func = static_cast<const FunctionType *>(existing_it->second.type.get());
+                                            if (old_func->param_count() == new_func->param_count())
+                                            {
+                                                // Same arity: check if parameter types actually differ
+                                                bool types_match = true;
+                                                for (size_t pi = 0; pi < old_func->param_count(); ++pi)
+                                                {
+                                                    auto &old_p = old_func->param_types()[pi];
+                                                    auto &new_p = new_func->param_types()[pi];
+                                                    if (old_p.is_valid() && new_p.is_valid() &&
+                                                        old_p->display_name() != new_p->display_name())
+                                                    {
+                                                        types_match = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if (types_match)
+                                                    needs_disambig = false; // Identical signature, safe to overwrite
+                                            }
+                                        }
+                                        if (needs_disambig)
+                                        {
+                                            // Build overload suffix from param types for the NEW entry
+                                            std::string new_suffix;
+                                            if (new_func->param_count() > 0)
+                                            {
+                                                new_suffix = "(";
+                                                for (size_t pi = 0; pi < new_func->param_count(); ++pi)
+                                                {
+                                                    if (pi > 0) new_suffix += ",";
+                                                    auto &p = new_func->param_types()[pi];
+                                                    new_suffix += p.is_valid() ? p->display_name() : "?";
+                                                }
+                                                new_suffix += ")";
+                                            }
+
+                                            map_key += "#" + (new_suffix.empty() ? "()" : new_suffix);
+
+                                            // Set qualified_name on the NEW entry so pre_register_functions
+                                            // uses the correct LLVM name with overload suffix.
+                                            if (!new_suffix.empty())
+                                            {
+                                                method_symbol.qualified_name = module_name + "::" +
+                                                    qualified_method_name + new_suffix;
+                                            }
+
+                                            // Also fix the EXISTING entry: give it a qualified_name
+                                            // with its own overload suffix so pre_register_functions
+                                            // creates a correctly-named LLVM declaration for it too.
+                                            if (existing_it->second.qualified_name.empty())
+                                            {
+                                                auto *old_func_type = static_cast<const FunctionType *>(
+                                                    existing_it->second.type.get());
+                                                if (old_func_type && old_func_type->param_count() > 0)
+                                                {
+                                                    std::string old_suffix = "(";
+                                                    for (size_t pi = 0; pi < old_func_type->param_count(); ++pi)
+                                                    {
+                                                        if (pi > 0) old_suffix += ",";
+                                                        auto &p = old_func_type->param_types()[pi];
+                                                        old_suffix += p.is_valid() ? p->display_name() : "?";
+                                                    }
+                                                    old_suffix += ")";
+                                                    existing_it->second.qualified_name = module_name + "::" +
+                                                        qualified_method_name + old_suffix;
+                                                }
+                                            }
+                                        }
                                     }
-                                    if (!same_arity)
-                                        map_key += "#" + std::to_string(new_func->param_count());
-                                    // If same arity, overwrite (original behavior)
                                 }
+
                                 symbol_map[map_key] = method_symbol;
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added struct method '{}' to symbol map (key='{}')", qualified_method_name, map_key);
                             }
@@ -1488,10 +1623,52 @@ namespace Cryo
                         QualifiedTypeName class_qname{module_id, class_decl->name()};
                         class_type = type_arena.create_class(class_qname);
 
+                        // Resolve base class if specified
+                        if (class_type.is_valid() && !class_decl->base_class().empty())
+                        {
+                            auto *class_ptr = const_cast<ClassType *>(dynamic_cast<const ClassType *>(class_type.get()));
+                            if (class_ptr && !class_ptr->has_base_class())
+                            {
+                                TypeRef base_type = _symbol_table.lookup_class_type(class_decl->base_class());
+                                if (!base_type.is_valid())
+                                {
+                                    base_type = type_arena.lookup_type_by_name(class_decl->base_class());
+                                }
+                                if (base_type.is_valid())
+                                {
+                                    class_ptr->set_base_class(base_type);
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Set base class '{}' for class '{}'",
+                                              class_decl->base_class(), class_decl->name());
+                                }
+                                else
+                                {
+                                    LOG_WARN(LogComponent::GENERAL, "ModuleLoader: Base class '{}' not found for class '{}'",
+                                             class_decl->base_class(), class_decl->name());
+                                }
+                            }
+                        }
+
                         // Build field information from the class declaration
                         if (class_type.is_valid() && !class_decl->fields().empty())
                         {
                             std::vector<FieldInfo> fields;
+
+                            // Prepend inherited base class fields
+                            auto *class_ptr = const_cast<ClassType *>(dynamic_cast<const ClassType *>(class_type.get()));
+                            if (class_ptr && class_ptr->has_base_class())
+                            {
+                                auto *base_class = dynamic_cast<const ClassType *>(class_ptr->base_class().get());
+                                if (base_class)
+                                {
+                                    for (const auto &base_field : base_class->fields())
+                                    {
+                                        fields.push_back(base_field);
+                                    }
+                                    LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Prepended {} inherited fields from '{}' to class '{}'",
+                                              base_class->fields().size(), class_decl->base_class(), class_decl->name());
+                                }
+                            }
+
                             for (const auto &field : class_decl->fields())
                             {
                                 if (field)
@@ -1536,6 +1713,49 @@ namespace Cryo
                                               class_decl->name(), class_decl->fields().size());
                                 }
                             }
+
+                            // Also register class field types in TemplateRegistry for cross-module
+                            // method resolution (same as non-generic structs).
+                            {
+                                std::string qualified_name = module_name.empty()
+                                    ? class_decl->name()
+                                    : module_name + "::" + class_decl->name();
+                                std::vector<std::string> field_names;
+                                std::vector<TypeRef> field_types;
+                                std::vector<std::string> field_annotations;
+
+                                for (const auto &field : class_decl->fields())
+                                {
+                                    if (field)
+                                    {
+                                        field_names.push_back(field->name());
+                                        std::string annotation = field->has_type_annotation()
+                                            ? field->type_annotation()->to_string() : "";
+                                        field_annotations.push_back(annotation);
+                                        TypeRef field_type = field->get_resolved_type();
+                                        if (!field_type.is_valid() && field->has_type_annotation())
+                                        {
+                                            field_type = resolve_primitive_type(
+                                                field->type_annotation()->to_string(), type_arena);
+                                        }
+                                        field_types.push_back(field_type); // May be invalid for complex types
+                                    }
+                                }
+
+                                if (!field_names.empty())
+                                {
+                                    _template_registry.register_struct_field_types(
+                                        qualified_name, field_names, field_types, module_name, field_annotations);
+                                    if (qualified_name != class_decl->name())
+                                    {
+                                        _template_registry.register_struct_field_types(
+                                            class_decl->name(), field_names, field_types, module_name, field_annotations);
+                                    }
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                              "ModuleLoader: Registered class field types in TemplateRegistry: {} with {} fields",
+                                              qualified_name, field_names.size());
+                                }
+                            }
                         }
                     }
 
@@ -1545,7 +1765,9 @@ namespace Cryo
                     symbol_map[class_decl->name()] = symbol;
 
                     // Also register class methods with qualified names (TypeName::methodName)
-                    // Use arity-disambiguated keys to support overloads in the flat symbol_map
+                    // Use type-disambiguated keys to support overloads in the flat symbol_map.
+                    // Skip overload disambiguation for generic class templates (same as structs).
+                    bool is_generic_class = !class_decl->generic_parameters().empty();
                     for (const auto &method : class_decl->methods())
                     {
                         if (method)
@@ -1557,19 +1779,24 @@ namespace Cryo
                                 Symbol method_symbol(qualified_method_name, SymbolKind::Function, method_type, module_id, method->location());
                                 method_symbol.scope = module_name;
                                 std::string map_key = qualified_method_name;
-                                auto existing_it = symbol_map.find(map_key);
-                                if (existing_it != symbol_map.end())
+
+                                if (!is_generic_class)
                                 {
-                                    auto *new_func = static_cast<const FunctionType *>(method_type.get());
-                                    bool same_arity = false;
-                                    if (existing_it->second.type.is_valid() && existing_it->second.type->kind() == TypeKind::Function)
+                                    auto existing_it = symbol_map.find(map_key);
+                                    if (existing_it != symbol_map.end())
                                     {
-                                        auto *old_func = static_cast<const FunctionType *>(existing_it->second.type.get());
-                                        same_arity = (old_func->param_count() == new_func->param_count());
+                                        auto *new_func = static_cast<const FunctionType *>(method_type.get());
+                                        bool same_arity = false;
+                                        if (existing_it->second.type.is_valid() && existing_it->second.type->kind() == TypeKind::Function)
+                                        {
+                                            auto *old_func = static_cast<const FunctionType *>(existing_it->second.type.get());
+                                            same_arity = (old_func->param_count() == new_func->param_count());
+                                        }
+                                        if (!same_arity)
+                                            map_key += "#" + std::to_string(new_func->param_count());
                                     }
-                                    if (!same_arity)
-                                        map_key += "#" + std::to_string(new_func->param_count());
                                 }
+
                                 symbol_map[map_key] = method_symbol;
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added class method '{}' to symbol map (key='{}')", qualified_method_name, map_key);
                             }
@@ -1891,17 +2118,52 @@ namespace Cryo
                                 auto existing_it = symbol_map.find(map_key);
                                 if (existing_it != symbol_map.end())
                                 {
-                                    // Only disambiguate if arities differ (genuine overload)
                                     auto *new_func = static_cast<const FunctionType *>(method_type.get());
-                                    bool same_arity = false;
+                                    bool needs_disambig = true;
                                     if (existing_it->second.type.is_valid() && existing_it->second.type->kind() == TypeKind::Function)
                                     {
                                         auto *old_func = static_cast<const FunctionType *>(existing_it->second.type.get());
-                                        same_arity = (old_func->param_count() == new_func->param_count());
+                                        if (old_func->param_count() == new_func->param_count())
+                                        {
+                                            // Same arity: check if parameter types actually differ
+                                            bool types_match = true;
+                                            for (size_t pi = 0; pi < old_func->param_count(); ++pi)
+                                            {
+                                                auto &old_p = old_func->param_types()[pi];
+                                                auto &new_p = new_func->param_types()[pi];
+                                                if (old_p.is_valid() && new_p.is_valid() &&
+                                                    old_p->display_name() != new_p->display_name())
+                                                {
+                                                    types_match = false;
+                                                    break;
+                                                }
+                                            }
+                                            if (types_match)
+                                                needs_disambig = false; // Identical signature, safe to overwrite
+                                        }
                                     }
-                                    if (!same_arity)
-                                        map_key += "#" + std::to_string(new_func->param_count());
-                                    // If same arity, overwrite (original behavior)
+                                    if (needs_disambig)
+                                    {
+                                        // Build type-based suffix for disambiguation
+                                        std::string suffix;
+                                        for (size_t pi = 0; pi < new_func->param_count(); ++pi)
+                                        {
+                                            if (pi > 0) suffix += ",";
+                                            auto &p = new_func->param_types()[pi];
+                                            suffix += p.is_valid() ? p->display_name() : "?";
+                                        }
+                                        map_key += "#(" + suffix + ")";
+                                        // Set qualified_name with LLVM-style overload suffix so that
+                                        // pre_register_functions creates the correct LLVM function name
+                                        // matching the stdlib definition (e.g., String::new(u64)).
+                                        // Only add suffix for methods with params — 0-arg methods don't
+                                        // have a suffix in the LLVM function name.
+                                        if (new_func->param_count() > 0)
+                                        {
+                                            method_symbol.qualified_name = module_name + "::" +
+                                                qualified_method_name + "(" + suffix + ")";
+                                        }
+                                    }
                                 }
                                 symbol_map[map_key] = method_symbol;
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Added impl method '{}' to symbol map (key='{}')", qualified_method_name, map_key);

@@ -65,6 +65,9 @@ namespace Cryo::Codegen
         // I/O intrinsics
         llvm::Value *generate_printf(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_println(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_print(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_eprintln(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_eprint(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_snprintf(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_getchar(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_putchar(const std::vector<llvm::Value *> &args);

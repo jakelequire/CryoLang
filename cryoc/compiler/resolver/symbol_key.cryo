@@ -1,0 +1,360 @@
+///! SymbolKey
+///!
+///! The universal lookup key for symbol registries.  Every table that maps
+///! names to symbols, types, or LLVM values uses SymbolKey as its key type,
+///! eliminating the format mismatches that caused cascading fallback lookups
+///! in the C++ compiler.
+///!
+///! Five variants cover every lookup pattern:
+///!
+///!   Simple(name)                   — local variable, bare function
+///!   Qualified(path)                — module-qualified: std::io::println
+///!   Method(type_path, method)      — method on a type: Array::push
+///!   Overload(type_path, method, params) — overloaded: Array::push(i32)
+///!   Mangled(mangled)               — LLVM IR lookup by mangled name
+///!
+///! Construction uses factory methods that build the right variant:
+///!   SymbolKey::simple(sym)
+///!   SymbolKey::qualified(qname)
+///!   SymbolKey::method(type_qname, method_sym)
+///!   SymbolKey::overload(type_qname, method_sym, param_syms)
+///!   SymbolKey::mangled(mangled_name)
+///!
+///! Equality is structural — two keys are equal iff they are the same
+///! variant with the same interned content.  Since all components are
+///! SymbolStr-based, comparison is fast (O(1) per part).
+
+namespace Compiler::Resolver::SymbolKey;
+
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::QualifiedName;
+import Compiler::Resolver::MangledName;
+
+
+// ============================================================================
+// SymbolKeyKind — Discriminator for SymbolKey variants
+// ============================================================================
+
+type enum SymbolKeyKind {
+    Simple;
+    Qualified;
+    Method;
+    Overload;
+    Mangled;
+}
+
+implement enum SymbolKeyKind {
+    to_string(&this) -> string {
+        return match (&this) {
+            SymbolKeyKind::Simple    => { "Simple" }
+            SymbolKeyKind::Qualified => { "Qualified" }
+            SymbolKeyKind::Method    => { "Method" }
+            SymbolKeyKind::Overload  => { "Overload" }
+            SymbolKeyKind::Mangled   => { "Mangled" }
+        };
+    }
+
+    equals(&this, other: SymbolKeyKind) -> boolean {
+        return match (&this) {
+            SymbolKeyKind::Simple    => { match (other) { SymbolKeyKind::Simple    => { true } _ => { false } } }
+            SymbolKeyKind::Qualified => { match (other) { SymbolKeyKind::Qualified => { true } _ => { false } } }
+            SymbolKeyKind::Method    => { match (other) { SymbolKeyKind::Method    => { true } _ => { false } } }
+            SymbolKeyKind::Overload  => { match (other) { SymbolKeyKind::Overload  => { true } _ => { false } } }
+            SymbolKeyKind::Mangled   => { match (other) { SymbolKeyKind::Mangled   => { true } _ => { false } } }
+        };
+    }
+}
+
+
+// ============================================================================
+// SymbolKey — Universal registry lookup key
+// ============================================================================
+
+/// A universal key for looking up symbols in any registry.
+///
+/// Implemented as a struct with a kind discriminator rather than an enum
+/// with associated data, so that all fields are directly accessible
+/// without pattern matching for the common operations (equals, display).
+/// Unused fields are set to their empty/invalid sentinels per variant.
+type struct SymbolKey {
+    kind:       SymbolKeyKind;
+
+    // -- Simple / Qualified / Method / Overload --
+    name:       SymbolStr;      // Simple: the name.  Others: empty.
+    path:       QualifiedName;  // Qualified/Method/Overload: the path. Simple: empty.
+    method:     SymbolStr;      // Method/Overload: the method name.  Others: empty.
+    params:     SymbolStr[];    // Overload: interned param type display names.  Others: [].
+
+    // -- Mangled --
+    mangled:    MangledName;    // Mangled: the opaque name.  Others: empty.
+
+
+    // ----------------------------------------------------------------
+    // Factory methods
+    // ----------------------------------------------------------------
+
+    /// A bare unqualified name: variable, parameter, local function.
+    ///   SymbolKey::simple(intern.intern("x"))
+    static simple(name: SymbolStr) -> SymbolKey {
+        return SymbolKey {
+            kind:    SymbolKeyKind::Simple,
+            name:    name,
+            path:    QualifiedName::empty(),
+            method:  SymbolStr::empty(),
+            params:  [],
+            mangled: MangledName::empty(),
+        };
+    }
+
+    /// A module-qualified name: std::io::println, core::Option.
+    ///   SymbolKey::qualified(qname)
+    static qualified(path: QualifiedName) -> SymbolKey {
+        return SymbolKey {
+            kind:    SymbolKeyKind::Qualified,
+            name:    SymbolStr::empty(),
+            path:    path,
+            method:  SymbolStr::empty(),
+            params:  [],
+            mangled: MangledName::empty(),
+        };
+    }
+
+    /// A method on a type (no overload disambiguation).
+    ///   SymbolKey::method(type_qname, intern.intern("push"))
+    static method(type_path: QualifiedName, method_name: SymbolStr) -> SymbolKey {
+        return SymbolKey {
+            kind:    SymbolKeyKind::Method,
+            name:    SymbolStr::empty(),
+            path:    type_path,
+            method:  method_name,
+            params:  [],
+            mangled: MangledName::empty(),
+        };
+    }
+
+    /// An overloaded method, disambiguated by parameter type names.
+    /// The param_types should be the display names of each parameter's
+    /// type, interned into SymbolStr.  e.g. for push(i32):
+    ///   SymbolKey::overload(type_qname, intern.intern("push"), [intern.intern("i32")])
+    static overload(type_path: QualifiedName, method_name: SymbolStr,
+                    param_types: SymbolStr[]) -> SymbolKey {
+        return SymbolKey {
+            kind:    SymbolKeyKind::Overload,
+            name:    SymbolStr::empty(),
+            path:    type_path,
+            method:  method_name,
+            params:  param_types,
+            mangled: MangledName::empty(),
+        };
+    }
+
+    /// A mangled name for direct LLVM IR lookup.
+    ///   SymbolKey::from_mangled(mangled_name)
+    static from_mangled(mangled: MangledName) -> SymbolKey {
+        return SymbolKey {
+            kind:    SymbolKeyKind::Mangled,
+            name:    SymbolStr::empty(),
+            path:    QualifiedName::empty(),
+            method:  SymbolStr::empty(),
+            params:  [],
+            mangled: mangled,
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Convenience factories (intern + construct in one call)
+    // ----------------------------------------------------------------
+
+    /// Build a Simple key from a raw string.
+    static simple_from(table: InternTable*, text: string) -> SymbolKey {
+        return SymbolKey::simple(table.intern(text));
+    }
+
+    /// Build a Qualified key by parsing a "::" delimited string.
+    static qualified_from(table: InternTable*, text: string) -> SymbolKey {
+        return SymbolKey::qualified(QualifiedName::parse(table, text));
+    }
+
+    /// Build a Method key from a type QualifiedName and raw method name.
+    static method_from(table: InternTable*, type_path: QualifiedName,
+                       method_name: string) -> SymbolKey {
+        return SymbolKey::method(type_path, table.intern(method_name));
+    }
+
+
+    // ----------------------------------------------------------------
+    // Equality
+    // ----------------------------------------------------------------
+
+    /// Structural equality.  Two keys match iff same variant, same content.
+    equals(&this, other: SymbolKey) -> boolean {
+        if (!this.kind.equals(other.kind)) {
+            return false;
+        }
+
+        return match (this.kind) {
+            SymbolKeyKind::Simple => {
+                this.name.equals(other.name)
+            }
+            SymbolKeyKind::Qualified => {
+                this.path.equals(other.path)
+            }
+            SymbolKeyKind::Method => {
+                this.path.equals(other.path) && this.method.equals(other.method)
+            }
+            SymbolKeyKind::Overload => {
+                this.path.equals(other.path)
+                    && this.method.equals(other.method)
+                    && symbol_str_array_equals(this.params, other.params)
+            }
+            SymbolKeyKind::Mangled => {
+                this.mangled.equals(other.mangled)
+            }
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Accessors
+    // ----------------------------------------------------------------
+
+    /// Get the "leaf" name — the most specific identifier in the key.
+    /// Simple => the name.  Qualified => path leaf.  Method/Overload => method name.
+    /// Mangled => empty (opaque).
+    leaf(&this) -> SymbolStr {
+        return match (this.kind) {
+            SymbolKeyKind::Simple    => { this.name }
+            SymbolKeyKind::Qualified => { this.path.leaf() }
+            SymbolKeyKind::Method    => { this.method }
+            SymbolKeyKind::Overload  => { this.method }
+            SymbolKeyKind::Mangled   => { SymbolStr::empty() }
+        };
+    }
+
+    /// Whether this key would match a simple name lookup.
+    /// True for Simple keys and single-segment Qualified keys.
+    is_simple(&this) -> boolean {
+        return match (this.kind) {
+            SymbolKeyKind::Simple    => { true }
+            SymbolKeyKind::Qualified => { this.path.is_simple() }
+            _                        => { false }
+        };
+    }
+
+    /// Whether this key involves a type (Method or Overload).
+    is_method(&this) -> boolean {
+        return match (this.kind) {
+            SymbolKeyKind::Method   => { true }
+            SymbolKeyKind::Overload => { true }
+            _                       => { false }
+        };
+    }
+
+    /// Whether this key carries overload disambiguation.
+    is_overloaded(&this) -> boolean {
+        return match (this.kind) {
+            SymbolKeyKind::Overload => { true }
+            _                       => { false }
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Widening — convert a narrow key to a broader one for fallback
+    // ----------------------------------------------------------------
+
+    /// Widen an Overload key to a Method key (drop param types).
+    /// Returns the key unchanged if it's not an Overload.
+    widen_to_method(&this) -> SymbolKey {
+        if (!this.kind.equals(SymbolKeyKind::Overload)) {
+            return this;
+        }
+        return SymbolKey::method(this.path, this.method);
+    }
+
+    /// Widen a Method key to a Qualified key (drop method name, keep type path).
+    /// Returns the key unchanged if it's not a Method or Overload.
+    widen_to_qualified(&this) -> SymbolKey {
+        return match (this.kind) {
+            SymbolKeyKind::Method   => { SymbolKey::qualified(this.path) }
+            SymbolKeyKind::Overload => { SymbolKey::qualified(this.path) }
+            _                       => { this }
+        };
+    }
+
+    /// Widen a Qualified key to a Simple key (keep only the leaf).
+    /// Returns the key unchanged if it's already Simple.
+    widen_to_simple(&this) -> SymbolKey {
+        return match (this.kind) {
+            SymbolKeyKind::Simple    => { this }
+            SymbolKeyKind::Qualified => { SymbolKey::simple(this.path.leaf()) }
+            SymbolKeyKind::Method    => { SymbolKey::simple(this.method) }
+            SymbolKeyKind::Overload  => { SymbolKey::simple(this.method) }
+            SymbolKeyKind::Mangled   => { this }
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Display
+    // ----------------------------------------------------------------
+
+    /// Produce a human-readable string for diagnostics.
+    ///   Simple("x")                         => "x"
+    ///   Qualified(std::io::println)          => "std::io::println"
+    ///   Method(Array, push)                  => "Array::push"
+    ///   Overload(Array, push, [i32])         => "Array::push(i32)"
+    ///   Mangled(cryo_std_io_println)         => "<mangled:cryo_std_io_println>"
+    display(&this, table: InternTable*) -> string {
+        return match (this.kind) {
+            SymbolKeyKind::Simple => {
+                table.resolve(this.name)
+            }
+            SymbolKeyKind::Qualified => {
+                this.path.display(table)
+            }
+            SymbolKeyKind::Method => {
+                const resolved_method: string = table.resolve(this.method);
+                const path_display: string = this.path.display(table);
+                path_display + "::" + resolved_method
+            }
+            SymbolKeyKind::Overload => {
+                const resolved_method: string = table.resolve(this.method);
+                const path_display: string = this.path.display(table);
+                mut result: string = path_display + "::" + resolved_method;
+                result = result + "(";
+                for (mut i: i64 = 0; i < this.params.length; i++) {
+                    if (i > 0) {
+                        result = result + ", ";
+                    }
+                    result = result + table.resolve(this.params[i]);
+                }
+                result = result + ")";
+                result
+            }
+            SymbolKeyKind::Mangled => {
+                "<mangled:" + this.mangled.resolve(table) + ">"
+            }
+        };
+    }
+}
+
+
+// ============================================================================
+// Free functions
+// ============================================================================
+
+/// Compare two SymbolStr arrays for element-wise equality.
+function symbol_str_array_equals(a: SymbolStr[], b: SymbolStr[]) -> boolean {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (mut i: i64 = 0; i < a.length; i++) {
+        if (!a[i].equals(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}

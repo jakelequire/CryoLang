@@ -3060,7 +3060,7 @@ namespace Cryo::Codegen
             }
         }
 
-        // Create PHI node to merge results
+        // Merge results from all arms
         builder().SetInsertPoint(merge_block);
 
         if (arm_results.empty())
@@ -3071,7 +3071,34 @@ namespace Cryo::Codegen
         // Determine result type from first arm
         llvm::Type *result_type = arm_results[0].first->getType();
 
-        // Count total incoming edges: arm results + nomatch (if it branches to merge)
+        // For aggregate/struct types, use a result alloca instead of a PHI node.
+        // PHI nodes require that all incoming values dominate the PHI, but struct
+        // loads inside individual arm blocks don't dominate the merge block.
+        // Storing to an alloca in each arm and loading in the merge block avoids this.
+        if (result_type->isAggregateType())
+        {
+            // Create the alloca in the function's entry block for proper dominance
+            llvm::Function *current_fn = merge_block->getParent();
+            llvm::IRBuilder<> entry_builder(&current_fn->getEntryBlock(),
+                                             current_fn->getEntryBlock().begin());
+            llvm::AllocaInst *result_alloca = entry_builder.CreateAlloca(
+                result_type, nullptr, "matchexpr.result.addr");
+
+            // Insert stores in each arm block (before the terminator branch)
+            for (const auto &[value, block] : arm_results)
+            {
+                // Insert before the block's terminator
+                builder().SetInsertPoint(block->getTerminator());
+                llvm::Value *casted_value = cast_if_needed(value, result_type);
+                builder().CreateStore(casted_value, result_alloca);
+            }
+
+            // Load the result in the merge block
+            builder().SetInsertPoint(merge_block);
+            return builder().CreateLoad(result_type, result_alloca, "matchexpr.result");
+        }
+
+        // For scalar types, use a PHI node (standard and efficient)
         unsigned phi_count = arm_results.size();
         bool nomatch_branches_to_merge = (current_test_block != merge_block &&
                                           current_test_block->getTerminator() &&
@@ -5958,6 +5985,57 @@ namespace Cryo::Codegen
                                 }
                             }
 
+                            // Fallback: if direct name resolution failed (e.g., Option's "T" not found
+                            // in HashMap's scope which has "K","V"), try to infer from the current
+                            // function's return type. If the return type is an InstantiatedType whose
+                            // base matches the enum we're resolving, use its type args (after
+                            // substituting any remaining generic params using the current scope).
+                            if (!all_resolved && ctx().current_function() && ctx().current_function()->ast_node)
+                            {
+                                TypeRef ret_type = ctx().current_function()->ast_node->get_resolved_return_type();
+                                if (ret_type.is_valid() && ret_type->kind() == Cryo::TypeKind::InstantiatedType)
+                                {
+                                    auto *inst = dynamic_cast<const Cryo::InstantiatedType *>(ret_type.get());
+                                    if (inst && inst->generic_base().is_valid())
+                                    {
+                                        std::string base_name = inst->generic_base()->display_name();
+                                        if (base_name == effective_scope_name && inst->type_args().size() == generic_params.size())
+                                        {
+                                            resolved_args.clear();
+                                            all_resolved = true;
+                                            for (const auto &arg : inst->type_args())
+                                            {
+                                                if (arg.is_valid() && arg->is_generic_param())
+                                                {
+                                                    // This type arg is still a generic param (e.g., V);
+                                                    // resolve it using the current scope bindings
+                                                    TypeRef concrete = generics->resolve_type_param(arg->display_name());
+                                                    if (concrete.is_valid())
+                                                    {
+                                                        resolved_args.push_back(concrete);
+                                                    }
+                                                    else
+                                                    {
+                                                        all_resolved = false;
+                                                        break;
+                                                    }
+                                                }
+                                                else if (arg.is_valid())
+                                                {
+                                                    // Already a concrete type
+                                                    resolved_args.push_back(arg);
+                                                }
+                                                else
+                                                {
+                                                    all_resolved = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             if (all_resolved && !resolved_args.empty())
                             {
                                 // Build display name and mangle it (e.g., "Option<void*>" -> "Option_voidp")
@@ -6097,31 +6175,47 @@ namespace Cryo::Codegen
                         {
                             // Create the global variable on-the-fly from the registered constant
                             llvm::Type *const_type = nullptr;
-                            if (c.type_annotation == "u8" || c.type_annotation == "i8")
-                                const_type = llvm::Type::getInt8Ty(llvm_ctx());
-                            else if (c.type_annotation == "u16" || c.type_annotation == "i16")
-                                const_type = llvm::Type::getInt16Ty(llvm_ctx());
-                            else if (c.type_annotation == "u32" || c.type_annotation == "i32")
-                                const_type = llvm::Type::getInt32Ty(llvm_ctx());
-                            else if (c.type_annotation == "u64" || c.type_annotation == "i64")
-                                const_type = llvm::Type::getInt64Ty(llvm_ctx());
-                            else if (c.type_annotation == "int")
-                                const_type = llvm::Type::getInt32Ty(llvm_ctx());
-                            else if (c.type_annotation == "boolean")
-                                const_type = llvm::Type::getInt1Ty(llvm_ctx());
+                            llvm::Constant *const_init = nullptr;
+
+                            if (c.type_annotation == "f32")
+                            {
+                                const_type = llvm::Type::getFloatTy(llvm_ctx());
+                                const_init = llvm::ConstantFP::get(const_type, c.float_value);
+                            }
+                            else if (c.type_annotation == "f64")
+                            {
+                                const_type = llvm::Type::getDoubleTy(llvm_ctx());
+                                const_init = llvm::ConstantFP::get(const_type, c.float_value);
+                            }
                             else
-                                const_type = llvm::Type::getInt64Ty(llvm_ctx());
+                            {
+                                if (c.type_annotation == "u8" || c.type_annotation == "i8")
+                                    const_type = llvm::Type::getInt8Ty(llvm_ctx());
+                                else if (c.type_annotation == "u16" || c.type_annotation == "i16")
+                                    const_type = llvm::Type::getInt16Ty(llvm_ctx());
+                                else if (c.type_annotation == "u32" || c.type_annotation == "i32")
+                                    const_type = llvm::Type::getInt32Ty(llvm_ctx());
+                                else if (c.type_annotation == "u64" || c.type_annotation == "i64")
+                                    const_type = llvm::Type::getInt64Ty(llvm_ctx());
+                                else if (c.type_annotation == "int")
+                                    const_type = llvm::Type::getInt32Ty(llvm_ctx());
+                                else if (c.type_annotation == "boolean")
+                                    const_type = llvm::Type::getInt1Ty(llvm_ctx());
+                                else
+                                    const_type = llvm::Type::getInt64Ty(llvm_ctx());
+                                const_init = llvm::ConstantInt::get(const_type, c.int_value);
+                            }
 
                             auto *gv = new llvm::GlobalVariable(
                                 *module(), const_type, true,
                                 llvm::GlobalValue::PrivateLinkage,
-                                llvm::ConstantInt::get(const_type, c.int_value),
+                                const_init,
                                 c.name);
                             values().set_global_value(c.name, gv);
                             values().set_global_value(qualified_name, gv);
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "ExpressionCodegen: Created constant '{}' = {} from TemplateRegistry",
-                                      qualified_name, c.int_value);
+                                      "ExpressionCodegen: Created constant '{}' from TemplateRegistry",
+                                      qualified_name);
                             return builder().CreateLoad(const_type, gv, qualified_name + ".val");
                         }
                     }
