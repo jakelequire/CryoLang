@@ -1,0 +1,273 @@
+///! Symbol
+///!
+///! Symbol struct and related enums for the Resolver.  Each Symbol represents
+///! a declared name (variable, function, type, etc.) with its metadata.
+///! TypeRef is stored as void* and filled by the TypeResolution pass.
+///!
+///! The `name` field is a SymbolStr (interned) so that scope lookups
+///! compare integer IDs rather than character data.
+
+namespace Compiler::Resolver::Symbol;
+
+import Compiler::Resolver::SymbolID;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::Scope;
+import Compiler::Diag;
+
+
+// ============================================================================
+// SymbolKind — Classification of declared symbols
+// ============================================================================
+
+type enum SymbolKind {
+    Variable;
+    Parameter;
+    Function;
+    Method;
+    Type;
+    TypeAlias;
+    Constant;
+    Field;
+    EnumVariant;
+    GenericParam;
+    Namespace;
+    Import;
+    Intrinsic;
+}
+
+implement enum SymbolKind {
+    to_string(&this) -> string {
+        return match (&this) {
+            SymbolKind::Variable     => { "Variable" }
+            SymbolKind::Parameter    => { "Parameter" }
+            SymbolKind::Function     => { "Function" }
+            SymbolKind::Method       => { "Method" }
+            SymbolKind::Type         => { "Type" }
+            SymbolKind::TypeAlias    => { "TypeAlias" }
+            SymbolKind::Constant     => { "Constant" }
+            SymbolKind::Field        => { "Field" }
+            SymbolKind::EnumVariant  => { "EnumVariant" }
+            SymbolKind::GenericParam => { "GenericParam" }
+            SymbolKind::Namespace    => { "Namespace" }
+            SymbolKind::Import       => { "Import" }
+            SymbolKind::Intrinsic    => { "Intrinsic" }
+        };
+    }
+
+    /// Whether this symbol kind supports function-style overloading.
+    allows_overload(&this) -> boolean {
+        return match (&this) {
+            SymbolKind::Function => { true }
+            SymbolKind::Method   => { true }
+            _                    => { false }
+        };
+    }
+}
+
+
+// ============================================================================
+// SymbolVisibility — Access control for symbols
+// ============================================================================
+
+type enum SymbolVisibility {
+    Private;
+    Internal;
+    Public;
+}
+
+implement enum SymbolVisibility {
+    is_public(&this) -> boolean {
+        return match (&this) {
+            SymbolVisibility::Public => { true }
+            _                       => { false }
+        };
+    }
+
+    to_string(&this) -> string {
+        return match (&this) {
+            SymbolVisibility::Private  => { "private" }
+            SymbolVisibility::Internal => { "internal" }
+            SymbolVisibility::Public   => { "public" }
+        };
+    }
+}
+
+
+// ============================================================================
+// Symbol — A declared name in the program
+// ============================================================================
+
+type struct Symbol {
+    id:             SymbolID;
+    name:           SymbolStr;
+    kind:           SymbolKind;
+    visibility:     SymbolVisibility;
+    scope_id:       ScopeID;
+    type_ref:       void*; // TODO: use a proper TypeRef struct instead of void*
+    declaring_span: SourceSpan;
+    source_module:  string;    // module path metadata — stays string for now
+    is_mutable:     boolean;
+    is_generic:     boolean;
+
+    // -- Factory methods --
+
+    static variable(id: SymbolID, name: SymbolStr, scope: ScopeID,
+                    span: SourceSpan, module: string, is_mutable: boolean) -> Symbol {
+        return Symbol {
+            id:             id,
+            name:           name,
+            kind:           SymbolKind::Variable,
+            visibility:     SymbolVisibility::Private,
+            scope_id:       scope,
+            type_ref:       null,
+            declaring_span: span,
+            source_module:  module,
+            is_mutable:     is_mutable,
+            is_generic:     false,
+        };
+    }
+
+    static function(id: SymbolID, name: SymbolStr, scope: ScopeID,
+                    span: SourceSpan, module: string, is_public: boolean) -> Symbol {
+        return Symbol {
+            id:             id,
+            name:           name,
+            kind:           SymbolKind::Function,
+            visibility:     is_public ? SymbolVisibility::Public : SymbolVisibility::Private,
+            scope_id:       scope,
+            type_ref:       null,
+            declaring_span: span,
+            source_module:  module,
+            is_mutable:     false,
+            is_generic:     false,
+        };
+    }
+
+    static type_sym(id: SymbolID, name: SymbolStr, scope: ScopeID,
+                    span: SourceSpan, module: string, is_public: boolean) -> Symbol {
+        return Symbol {
+            id:             id,
+            name:           name,
+            kind:           SymbolKind::Type,
+            visibility:     is_public ? SymbolVisibility::Public : SymbolVisibility::Private,
+            scope_id:       scope,
+            type_ref:       null,
+            declaring_span: span,
+            source_module:  module,
+            is_mutable:     false,
+            is_generic:     false,
+        };
+    }
+
+    static parameter(id: SymbolID, name: SymbolStr, scope: ScopeID,
+                     span: SourceSpan, module: string) -> Symbol {
+        return Symbol {
+            id:             id,
+            name:           name,
+            kind:           SymbolKind::Parameter,
+            visibility:     SymbolVisibility::Private,
+            scope_id:       scope,
+            type_ref:       null,
+            declaring_span: span,
+            source_module:  module,
+            is_mutable:     false,
+            is_generic:     false,
+        };
+    }
+
+    static field(id: SymbolID, name: SymbolStr, scope: ScopeID,
+                 span: SourceSpan, module: string) -> Symbol {
+        return Symbol {
+            id:             id,
+            name:           name,
+            kind:           SymbolKind::Field,
+            visibility:     SymbolVisibility::Public,
+            scope_id:       scope,
+            type_ref:       null,
+            declaring_span: span,
+            source_module:  module,
+            is_mutable:     false,
+            is_generic:     false,
+        };
+    }
+
+    static enum_variant(id: SymbolID, name: SymbolStr, scope: ScopeID,
+                        span: SourceSpan, module: string) -> Symbol {
+        return Symbol {
+            id:             id,
+            name:           name,
+            kind:           SymbolKind::EnumVariant,
+            visibility:     SymbolVisibility::Public,
+            scope_id:       scope,
+            type_ref:       null,
+            declaring_span: span,
+            source_module:  module,
+            is_mutable:     false,
+            is_generic:     false,
+        };
+    }
+
+    static method(id: SymbolID, name: SymbolStr, scope: ScopeID,
+                  span: SourceSpan, module: string, is_public: boolean) -> Symbol {
+        return Symbol {
+            id:             id,
+            name:           name,
+            kind:           SymbolKind::Method,
+            visibility:     is_public ? SymbolVisibility::Public : SymbolVisibility::Private,
+            scope_id:       scope,
+            type_ref:       null,
+            declaring_span: span,
+            source_module:  module,
+            is_mutable:     false,
+            is_generic:     false,
+        };
+    }
+
+    static import_sym(id: SymbolID, name: SymbolStr, scope: ScopeID,
+                      span: SourceSpan, module: string) -> Symbol {
+        return Symbol {
+            id:             id,
+            name:           name,
+            kind:           SymbolKind::Import,
+            visibility:     SymbolVisibility::Private,
+            scope_id:       scope,
+            type_ref:       null,
+            declaring_span: span,
+            source_module:  module,
+            is_mutable:     false,
+            is_generic:     false,
+        };
+    }
+
+    static generic_param(id: SymbolID, name: SymbolStr, scope: ScopeID,
+                         span: SourceSpan, module: string) -> Symbol {
+        return Symbol {
+            id:             id,
+            name:           name,
+            kind:           SymbolKind::GenericParam,
+            visibility:     SymbolVisibility::Private,
+            scope_id:       scope,
+            type_ref:       null,
+            declaring_span: span,
+            source_module:  module,
+            is_mutable:     false,
+            is_generic:     true,
+        };
+    }
+
+    static intrinsic(id: SymbolID, name: SymbolStr, scope: ScopeID,
+                     span: SourceSpan) -> Symbol {
+        return Symbol {
+            id:             id,
+            name:           name,
+            kind:           SymbolKind::Intrinsic,
+            visibility:     SymbolVisibility::Public,
+            scope_id:       scope,
+            type_ref:       null,
+            declaring_span: span,
+            source_module:  "<intrinsic>",
+            is_mutable:     false,
+            is_generic:     false,
+        };
+    }
+}

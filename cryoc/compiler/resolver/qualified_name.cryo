@@ -1,0 +1,314 @@
+///! QualifiedName
+///!
+///! A structured multi-part name such as `std::collections::Array`.
+///! Stored as an array of interned SymbolStr parts — never as a flat
+///! "::" delimited string.  This eliminates the 40+ rfind("::") parse
+///! sites found in the C++ compiler.
+///!
+///! Construction patterns:
+///!   QualifiedName::single(intern, "println")       => println
+///!   QualifiedName::from_parts(intern, parts)       => std::io::println
+///!   QualifiedName::parse(intern, "std::io::println") => std::io::println
+///!   name.child(intern, "method")                   => std::io::IO::method
+///!
+///! Every method that needs to intern new strings takes an InternTable*
+///! parameter.  Methods that only read (leaf, parent, equals, display)
+///! do not.
+
+namespace Compiler::Resolver::QualifiedName;
+
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+
+
+// ============================================================================
+// QualifiedName — Structured multi-part symbol name
+// ============================================================================
+
+type struct QualifiedName {
+    /// The interned segments, e.g. ["std", "collections", "Array"].
+    /// Always has at least one part (leaf).  An empty QualifiedName uses
+    /// a single SymbolStr::empty() part.
+    parts: SymbolStr[];
+
+
+    // ----------------------------------------------------------------
+    // Construction
+    // ----------------------------------------------------------------
+
+    /// An empty / invalid qualified name.
+    static empty() -> QualifiedName {
+        return QualifiedName { parts: [] };
+    }
+
+    /// A single-segment name (e.g. a local variable or bare type name).
+    static single(table: InternTable*, text: string) -> QualifiedName {
+        mut qn: QualifiedName = QualifiedName { parts: [] };
+        qn.parts.push(table.intern(text));
+        return qn;
+    }
+
+    /// A single-segment name from an already-interned SymbolStr.
+    static from_symbol(sym: SymbolStr) -> QualifiedName {
+        mut qn: QualifiedName = QualifiedName { parts: [] };
+        qn.parts.push(sym);
+        return qn;
+    }
+
+    /// Build from pre-interned parts.
+    static from_parts(parts: SymbolStr[]) -> QualifiedName {
+        return QualifiedName { parts: parts };
+    }
+
+    /// Build from raw string segments, interning each one.
+    static from_strings(table: InternTable*, segments: string[]) -> QualifiedName {
+        mut qn: QualifiedName = QualifiedName { parts: [] };
+        for (mut i: i64 = 0; i < segments.length; i++) {
+            qn.parts.push(table.intern(segments[i]));
+        }
+        return qn;
+    }
+
+    /// Parse a "::" delimited string into a QualifiedName.
+    /// Use this at boundaries where raw strings enter the compiler
+    /// (e.g. parsing module paths from source text).  Avoid in hot
+    /// paths — prefer building incrementally with child() / push().
+    static parse(table: InternTable*, text: string) -> QualifiedName {
+        mut qn: QualifiedName = QualifiedName { parts: [] };
+
+        if (text == "") {
+            return qn;
+        }
+
+        // Walk the string, splitting on "::"
+        mut start: i64 = 0;
+        mut i: i64 = 0;
+        mut len: i64 = text.length();
+
+        while (i < len) {
+            // Check for "::" at position i
+            if (i + 1 < len && text[i] == ':' && text[i + 1] == ':') {
+                if (i > start) {
+                    qn.parts.push(table.intern(text.substring(start, i - start)));
+                }
+                i = i + 2;
+                start = i;
+            } else {
+                i++;
+            }
+        }
+
+        // Final segment after last "::" (or the whole string if no "::")
+        if (start < len) {
+            qn.parts.push(table.intern(text.substring(start, len - start)));
+        }
+
+        return qn;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Accessors
+    // ----------------------------------------------------------------
+
+    /// Number of parts (e.g. "std::io::println" has depth 3).
+    depth(&this) -> i64 {
+        return this.parts.length;
+    }
+
+    /// Whether this name has no parts.
+    is_empty(&this) -> boolean {
+        return this.parts.length == 0;
+    }
+
+    /// The final segment (the "symbol name" itself).
+    /// e.g. "std::io::println" => "println"
+    /// Returns SymbolStr::empty() if the name is empty.
+    leaf(&this) -> SymbolStr {
+        if (this.parts.length == 0) {
+            return SymbolStr::empty();
+        }
+        return this.parts[this.parts.length - 1];
+    }
+
+    /// Everything except the last segment (the "namespace path").
+    /// e.g. "std::io::println" => "std::io"
+    /// Returns an empty QualifiedName for single-segment names.
+    parent(&this) -> QualifiedName {
+        if (this.parts.length <= 1) {
+            return QualifiedName::empty();
+        }
+        mut parent_parts: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < this.parts.length - 1; i++) {
+            parent_parts.push(this.parts[i]);
+        }
+        return QualifiedName::from_parts(parent_parts);
+    }
+
+    /// Get a specific segment by index.
+    /// Returns SymbolStr::empty() for out-of-range indices.
+    part_at(&this, index: i64) -> SymbolStr {
+        if (index < 0 || index >= this.parts.length) {
+            return SymbolStr::empty();
+        }
+        return this.parts[index];
+    }
+
+    /// Whether this is a single unqualified name (no "::" in it).
+    is_simple(&this) -> boolean {
+        return this.parts.length == 1;
+    }
+
+    /// Whether this is a multi-part qualified name.
+    is_qualified(&this) -> boolean {
+        return this.parts.length > 1;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Building / extending
+    // ----------------------------------------------------------------
+
+    /// Return a new QualifiedName with an additional segment appended.
+    /// e.g. "std::io".child(intern, "println") => "std::io::println"
+    child(&this, table: InternTable*, text: string) -> QualifiedName {
+        mut new_parts: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < this.parts.length; i++) {
+            new_parts.push(this.parts[i]);
+        }
+        new_parts.push(table.intern(text));
+        return QualifiedName::from_parts(new_parts);
+    }
+
+    /// Return a new QualifiedName with an already-interned segment appended.
+    child_sym(&this, sym: SymbolStr) -> QualifiedName {
+        mut new_parts: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < this.parts.length; i++) {
+            new_parts.push(this.parts[i]);
+        }
+        new_parts.push(sym);
+        return QualifiedName::from_parts(new_parts);
+    }
+
+    /// Append a segment in place (mutating).
+    push(mut &this, table: InternTable*, text: string) -> void {
+        this.parts.push(table.intern(text));
+    }
+
+    /// Append an already-interned segment in place.
+    push_sym(mut &this, sym: SymbolStr) -> void {
+        this.parts.push(sym);
+    }
+
+    /// Concatenate another QualifiedName onto this one.
+    /// e.g. "std::io".join("IO::println") => "std::io::IO::println"
+    join(&this, other: QualifiedName) -> QualifiedName {
+        mut new_parts: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < this.parts.length; i++) {
+            new_parts.push(this.parts[i]);
+        }
+        for (mut i: i64 = 0; i < other.parts.length; i++) {
+            new_parts.push(other.parts[i]);
+        }
+        return QualifiedName::from_parts(new_parts);
+    }
+
+
+    // ----------------------------------------------------------------
+    // Comparison
+    // ----------------------------------------------------------------
+
+    /// O(n) equality where n = number of parts.
+    /// Since each part is a SymbolStr, individual comparisons are O(1).
+    equals(&this, other: QualifiedName) -> boolean {
+        if (this.parts.length != other.parts.length) {
+            return false;
+        }
+        for (mut i: i64 = 0; i < this.parts.length; i++) {
+            if (!this.parts[i].equals(other.parts[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether this name starts with the given prefix.
+    /// e.g. "std::io::println".starts_with("std::io") => true
+    starts_with(&this, prefix: QualifiedName) -> boolean {
+        if (prefix.parts.length > this.parts.length) {
+            return false;
+        }
+        for (mut i: i64 = 0; i < prefix.parts.length; i++) {
+            if (!this.parts[i].equals(prefix.parts[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether this name ends with the given suffix.
+    /// e.g. "std::io::println".ends_with("println") => true
+    /// e.g. "std::io::IO::println".ends_with("IO::println") => true
+    ends_with(&this, suffix: QualifiedName) -> boolean {
+        if (suffix.parts.length > this.parts.length) {
+            return false;
+        }
+        mut offset: i64 = this.parts.length - suffix.parts.length;
+        for (mut i: i64 = 0; i < suffix.parts.length; i++) {
+            if (!this.parts[offset + i].equals(suffix.parts[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether the leaf (last part) matches the given symbol.
+    leaf_equals(&this, sym: SymbolStr) -> boolean {
+        if (this.parts.length == 0) {
+            return sym.is_empty();
+        }
+        return this.parts[this.parts.length - 1].equals(sym);
+    }
+
+
+    // ----------------------------------------------------------------
+    // Display
+    // ----------------------------------------------------------------
+
+    /// Produce the "::" separated display string.
+    /// e.g. ["std", "io", "println"] => "std::io::println"
+    /// This allocates a new string — use only for diagnostics, error
+    /// messages, and LLVM name emission, not for equality checks.
+    display(&this, table: InternTable*) -> string {
+        if (this.parts.length == 0) {
+            return "";
+        }
+
+        mut result: string = table.resolve(this.parts[0]);
+        for (mut i: i64 = 1; i < this.parts.length; i++) {
+            result.append("::");
+            result.append(table.resolve(this.parts[i]));
+        }
+        return result;
+    }
+
+    /// Produce the display string for just the parent (namespace) portion.
+    /// e.g. "std::io::println" => "std::io"
+    display_parent(&this, table: InternTable*) -> string {
+        if (this.parts.length <= 1) {
+            return "";
+        }
+
+        mut result: string = table.resolve(this.parts[0]);
+        for (mut i: i64 = 1; i < this.parts.length - 1; i++) {
+            result.append("::");
+            result.append(table.resolve(this.parts[i]));
+        }
+        return result;
+    }
+
+    /// Resolve just the leaf segment to a string.
+    display_leaf(&this, table: InternTable*) -> string {
+        return table.resolve(this.leaf());
+    }
+}

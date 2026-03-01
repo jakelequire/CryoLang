@@ -1,0 +1,381 @@
+///! Resolver
+///!
+///! The core Resolver struct.  Owns all symbols and scopes, builds the
+///! scope tree, and holds the resolution map.  Used during the NameResolution
+///! pass to declare symbols and resolve names, then queried by downstream
+///! passes via SymbolID lookups.
+
+namespace Compiler::Resolver::Resolver;
+
+import Compiler::Resolver::SymbolID;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::Symbol;
+import Compiler::Resolver::Scope;
+import Compiler::Resolver::ResolutionMap;
+import Compiler::Diag;
+
+
+// ============================================================================
+// Resolver — Central name resolution context
+// ============================================================================
+
+type struct Resolver {
+    // Intern table — borrowed pointer, owned by CompilationContext
+    intern_table:       InternTable*;
+
+    // Symbol arena
+    symbols:            Symbol[];
+    next_symbol_id:     u64;
+
+    // Scope tree
+    scopes:             Scope[];
+    next_scope_id:      u64;
+    global_scope:       ScopeID;
+    current_scope:      ScopeID;
+
+    // Resolution map
+    resolution_map:     ResolutionMap;
+
+    // Cross-module state (parallel arrays)
+    export_module_names:  string[];
+    export_symbol_lists:  SymbolID[][];
+    import_alias_names:   SymbolStr[];
+    import_alias_ids:     SymbolID[];
+
+    // Current context
+    current_module:     string;
+
+
+    // ----------------------------------------------------------------
+    // Construction
+    // ----------------------------------------------------------------
+
+    /// Create a new Resolver with a global scope.
+    /// The InternTable pointer must outlive the Resolver (owned by CompilationContext).
+    static new(table: InternTable*) -> Resolver {
+        const global_id: ScopeID = ScopeID::new(1);
+        const global: Scope = Scope::new(
+            global_id, ScopeKind::Global, ScopeID::invalid(),
+            "", "<global>", SourceSpan::none()
+        );
+
+        return Resolver {
+            intern_table:         table,
+            symbols:              [],
+            next_symbol_id:       1,
+            scopes:               [global],
+            next_scope_id:        2,
+            global_scope:         global_id,
+            current_scope:        global_id,
+            resolution_map:       ResolutionMap::new(),
+            export_module_names:  [],
+            export_symbol_lists:  [],
+            import_alias_names:   [],
+            import_alias_ids:     [],
+            current_module:       "",
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Scope management
+    // ----------------------------------------------------------------
+
+    /// Allocate and register a new scope as a child of the given parent.
+    create_scope(mut &this, kind: ScopeKind, parent: ScopeID, module: string,
+                 owner: string, span: SourceSpan) -> ScopeID {
+        const id: ScopeID = ScopeID::new(this.next_scope_id);
+        this.next_scope_id = this.next_scope_id + 1;
+
+        const scope: Scope = Scope::new(id, kind, parent, module, owner, span);
+        this.scopes.push(scope);
+
+        // Register as child of parent
+        if (parent.is_valid()) {
+            for (mut i: i64 = 0; i < this.scopes.length; i++) {
+                if (this.scopes[i].id.equals(parent)) {
+                    this.scopes[i].add_child(id);
+                    break;
+                }
+            }
+        }
+
+        return id;
+    }
+
+    /// Create a child scope of the current scope and move the cursor into it.
+    enter_scope(mut &this, kind: ScopeKind, owner: string, span: SourceSpan) -> ScopeID {
+        const id: ScopeID = this.create_scope(kind, this.current_scope,
+                                               this.current_module, owner, span);
+        this.current_scope = id;
+        return id;
+    }
+
+    /// Move the cursor back to the parent scope.  Never exits past global.
+    exit_scope(mut &this) -> void {
+        const scope: Scope = this.get_scope(this.current_scope);
+        if (scope.parent_id.is_valid()) {
+            this.current_scope = scope.parent_id;
+        }
+    }
+
+    /// Set the current module name.
+    set_module(mut &this, module: string) -> void {
+        this.current_module = module;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Symbol declaration
+    // ----------------------------------------------------------------
+
+    /// Allocate the next monotonic SymbolID.
+    alloc_symbol_id(mut &this) -> SymbolID {
+        const id: SymbolID = SymbolID::new(this.next_symbol_id);
+        this.next_symbol_id = this.next_symbol_id + 1;
+        return id;
+    }
+
+    /// Insert a symbol into the arena and current scope.
+    declare(mut &this, sym: Symbol) -> SymbolID {
+        const id: SymbolID = sym.id;
+        this.symbols.push(sym);
+
+        // Insert into current scope
+        const allows_overload: boolean = sym.kind.allows_overload();
+        for (mut i: i64 = 0; i < this.scopes.length; i++) {
+            if (this.scopes[i].id.equals(this.current_scope)) {
+                this.scopes[i].insert(sym.name, id, allows_overload);
+                break;
+            }
+        }
+
+        return id;
+    }
+
+    declare_variable(mut &this, name: string, span: SourceSpan, is_mutable: boolean) -> SymbolID {
+        const id: SymbolID = this.alloc_symbol_id();
+        const sym_name: SymbolStr = this.intern_table.intern(name);
+        const sym: Symbol = Symbol::variable(id, sym_name, this.current_scope, span,
+                                              this.current_module, is_mutable);
+        return this.declare(sym);
+    }
+
+    declare_function(mut &this, name: string, span: SourceSpan, is_public: boolean) -> SymbolID {
+        const id: SymbolID = this.alloc_symbol_id();
+        const sym_name: SymbolStr = this.intern_table.intern(name);
+        const sym: Symbol = Symbol::function(id, sym_name, this.current_scope, span,
+                                              this.current_module, is_public);
+        return this.declare(sym);
+    }
+
+    declare_type(mut &this, name: string, span: SourceSpan, is_public: boolean) -> SymbolID {
+        const id: SymbolID = this.alloc_symbol_id();
+        const sym_name: SymbolStr = this.intern_table.intern(name);
+        const sym: Symbol = Symbol::type_sym(id, sym_name, this.current_scope, span,
+                                              this.current_module, is_public);
+        return this.declare(sym);
+    }
+
+    declare_parameter(mut &this, name: string, span: SourceSpan) -> SymbolID {
+        const id: SymbolID = this.alloc_symbol_id();
+        const sym_name: SymbolStr = this.intern_table.intern(name);
+        const sym: Symbol = Symbol::parameter(id, sym_name, this.current_scope, span,
+                                               this.current_module);
+        return this.declare(sym);
+    }
+
+    declare_field(mut &this, name: string, span: SourceSpan) -> SymbolID {
+        const id: SymbolID = this.alloc_symbol_id();
+        const sym_name: SymbolStr = this.intern_table.intern(name);
+        const sym: Symbol = Symbol::field(id, sym_name, this.current_scope, span,
+                                           this.current_module);
+        return this.declare(sym);
+    }
+
+    declare_enum_variant(mut &this, name: string, span: SourceSpan) -> SymbolID {
+        const id: SymbolID = this.alloc_symbol_id();
+        const sym_name: SymbolStr = this.intern_table.intern(name);
+        const sym: Symbol = Symbol::enum_variant(id, sym_name, this.current_scope, span,
+                                                  this.current_module);
+        return this.declare(sym);
+    }
+
+    declare_method(mut &this, name: string, span: SourceSpan, is_public: boolean) -> SymbolID {
+        const id: SymbolID = this.alloc_symbol_id();
+        const sym_name: SymbolStr = this.intern_table.intern(name);
+        const sym: Symbol = Symbol::method(id, sym_name, this.current_scope, span,
+                                            this.current_module, is_public);
+        return this.declare(sym);
+    }
+
+
+    // ----------------------------------------------------------------
+    // Name lookup
+    // ----------------------------------------------------------------
+
+    /// Walk the scope chain from `start` upward, looking for `name`.
+    /// The name string is interned for O(1) comparison during scope walks.
+    lookup(&this, name: string, start: ScopeID) -> SymbolID {
+        const sym_name: SymbolStr = this.intern_table.intern(name);
+        mut scope_id: ScopeID = start;
+        while (scope_id.is_valid()) {
+            const scope: Scope = this.get_scope(scope_id);
+            const found: SymbolID = scope.find(sym_name);
+            if (found.is_valid()) {
+                return found;
+            }
+            scope_id = scope.parent_id;
+        }
+        return SymbolID::invalid();
+    }
+
+    /// Look up a name in the current scope only.
+    lookup_local(&this, name: string) -> SymbolID {
+        const sym_name: SymbolStr = this.intern_table.intern(name);
+        const scope: Scope = this.get_scope(this.current_scope);
+        return scope.find(sym_name);
+    }
+
+    /// Collect all overloads for a name across the scope chain.
+    lookup_overloads(&this, name: string, start: ScopeID) -> SymbolID[] {
+        const sym_name: SymbolStr = this.intern_table.intern(name);
+        mut result: SymbolID[] = [];
+        mut scope_id: ScopeID = start;
+        while (scope_id.is_valid()) {
+            const scope: Scope = this.get_scope(scope_id);
+            const overloads: SymbolID[] = scope.get_overloads(sym_name);
+            result = result + overloads;
+            scope_id = scope.parent_id;
+        }
+        return result;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Resolution map access
+    // ----------------------------------------------------------------
+
+    /// Record that a span resolved to a specific symbol.
+    record_resolution(mut &this, span: SourceSpan, sym_id: SymbolID) -> void {
+        this.resolution_map.record(span, sym_id);
+    }
+
+    /// Resolve a span to a symbol.
+    resolve(&this, span: SourceSpan) -> SymbolID {
+        return this.resolution_map.resolve(span);
+    }
+
+    /// Record an overload set for a span.
+    record_overloads(mut &this, span: SourceSpan, sym_ids: SymbolID[]) -> void {
+        this.resolution_map.record_overloads(span, sym_ids);
+    }
+
+    /// Get overload candidates for a span.
+    get_overload_candidates(&this, span: SourceSpan) -> SymbolID[] {
+        return this.resolution_map.resolve_overloads(span);
+    }
+
+
+    // ----------------------------------------------------------------
+    // Cross-module
+    // ----------------------------------------------------------------
+
+    /// Register a symbol as exported from the current module.
+    export_symbol(mut &this, sym_id: SymbolID) -> void {
+        const module: string = this.current_module;
+
+        // Find existing export list for this module
+        for (mut i: i64 = 0; i < this.export_module_names.length; i++) {
+            if (this.export_module_names[i] == module) {
+                this.export_symbol_lists[i].push(sym_id);
+                return;
+            }
+        }
+
+        // Create new export list
+        this.export_module_names.push(module);
+        this.export_symbol_lists.push([sym_id]);
+    }
+
+    /// Get all exported symbols from a module.
+    get_exports(&this, module: string) -> SymbolID[] {
+        for (mut i: i64 = 0; i < this.export_module_names.length; i++) {
+            if (this.export_module_names[i] == module) {
+                return this.export_symbol_lists[i];
+            }
+        }
+        return [];
+    }
+
+    /// Look up a specific name in a module's exports.
+    lookup_in_module(&this, module: string, name: string) -> SymbolID {
+        const sym_name: SymbolStr = this.intern_table.intern(name);
+        const exports: SymbolID[] = this.get_exports(module);
+        for (mut i: i64 = 0; i < exports.length; i++) {
+            const sym: Symbol = this.get_symbol(exports[i]);
+            if (sym.name.equals(sym_name) && sym.visibility.is_public()) {
+                return exports[i];
+            }
+        }
+        return SymbolID::invalid();
+    }
+
+    /// Register an import alias (e.g., `import Foo as Bar` maps "Bar" → sym_id).
+    register_import_alias(mut &this, alias: string, sym_id: SymbolID) -> void {
+        const sym_alias: SymbolStr = this.intern_table.intern(alias);
+        this.import_alias_names.push(sym_alias);
+        this.import_alias_ids.push(sym_id);
+    }
+
+    /// Look up an import alias.
+    lookup_import_alias(&this, alias: string) -> SymbolID {
+        const sym_alias: SymbolStr = this.intern_table.intern(alias);
+        for (mut i: i64 = 0; i < this.import_alias_names.length; i++) {
+            if (this.import_alias_names[i].equals(sym_alias)) {
+                return this.import_alias_ids[i];
+            }
+        }
+        return SymbolID::invalid();
+    }
+
+
+    // ----------------------------------------------------------------
+    // Accessors
+    // ----------------------------------------------------------------
+
+    /// Get a symbol by its SymbolID.  Indexes by id-1 (IDs start at 1).
+    get_symbol(&this, id: SymbolID) -> Symbol {
+        return this.symbols[id.id - 1];
+    }
+
+    /// Get a scope by its ScopeID.  Indexes by id-1 (IDs start at 1).
+    get_scope(&this, id: ScopeID) -> Scope {
+        return this.scopes[id.id - 1];
+    }
+
+    /// Total number of symbols declared.
+    symbol_count(&this) -> i64 {
+        return this.symbols.length;
+    }
+
+    /// Total number of scopes created.
+    scope_count(&this) -> i64 {
+        return this.scopes.length;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Module-level reset (batch mode)
+    // ----------------------------------------------------------------
+
+    /// Reset per-module state for the next module.  Preserves accumulated
+    /// symbols/scopes/exports but resets the scope cursor to global.
+    reset_for_next_module(mut &this) -> void {
+        this.current_scope = this.global_scope;
+        this.current_module = "";
+        this.import_alias_names = [];
+        this.import_alias_ids = [];
+    }
+}

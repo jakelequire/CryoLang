@@ -721,6 +721,27 @@ namespace Cryo
                   module_namespace, name, type_annotation, value);
     }
 
+    void TemplateRegistry::register_module_constant_float(const std::string &module_namespace,
+                                                           const std::string &name,
+                                                           const std::string &type_annotation,
+                                                           double value)
+    {
+        if (module_namespace.empty() || name.empty())
+            return;
+
+        auto &constants = _module_constants[module_namespace];
+        for (const auto &c : constants)
+        {
+            if (c.name == name)
+                return;
+        }
+
+        constants.emplace_back(name, type_annotation, value);
+        LOG_DEBUG(Cryo::LogComponent::AST,
+                  "Registered module float constant: {}::{} (type: {}, value: {})",
+                  module_namespace, name, type_annotation, value);
+    }
+
     const std::vector<TemplateRegistry::ModuleConstant> *TemplateRegistry::get_module_constants(
         const std::string &module_namespace) const
     {

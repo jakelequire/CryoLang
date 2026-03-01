@@ -39,7 +39,8 @@ namespace Cryo::Codegen
         "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat",
         "strchr", "strrchr", "strstr", "strdup", "substr",
         // I/O operations
-        "printf", "println", "snprintf", "sprintf", "fprintf", "sscanf", "getchar", "putchar", "puts",
+        "printf", "println", "print", "eprintln", "eprint",
+        "snprintf", "sprintf", "fprintf", "sscanf", "getchar", "putchar", "puts",
         // File I/O
         "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush", "feof", "ferror",
         "fgets", "fputs", "fgetc", "fputc", "fileno", "fdopen",
@@ -3298,54 +3299,107 @@ namespace Cryo::Codegen
                       method->getFunctionType()->getNumParams(), args.size(),
                       resolved_type_name, method_name);
 
-            // Build overloaded name with argument types
-            std::string overload_suffix = "(";
+            // Build overloaded name with argument types.
+            // LLVM doesn't distinguish signed/unsigned integers, so we build
+            // multiple suffix variants: one with signed names (i8/i16/i32/i64)
+            // and one with unsigned names (u8/u16/u32/u64), since Cryo's
+            // overloaded method names use the Cryo type system names.
+            struct ArgTypeNames { std::string signed_name; std::string unsigned_name; };
+            std::vector<ArgTypeNames> arg_type_names;
             for (size_t i = 0; i < args.size(); ++i)
             {
-                if (i > 0)
-                    overload_suffix += ",";
+                ArgTypeNames names;
                 if (args[i])
                 {
                     llvm::Type *arg_type = args[i]->getType();
-                    if (arg_type->isIntegerTy(8))
-                        overload_suffix += "i8";
+                    if (arg_type->isIntegerTy(1))
+                    {
+                        names.signed_name = "bool";
+                        names.unsigned_name = "boolean";
+                    }
+                    else if (arg_type->isIntegerTy(8))
+                    {
+                        names.signed_name = "i8";
+                        names.unsigned_name = "u8";
+                    }
                     else if (arg_type->isIntegerTy(16))
-                        overload_suffix += "i16";
+                    {
+                        names.signed_name = "i16";
+                        names.unsigned_name = "u16";
+                    }
                     else if (arg_type->isIntegerTy(32))
-                        overload_suffix += "i32";
+                    {
+                        names.signed_name = "i32";
+                        names.unsigned_name = "u32";
+                    }
                     else if (arg_type->isIntegerTy(64))
-                        overload_suffix += "i64";
+                    {
+                        names.signed_name = "i64";
+                        names.unsigned_name = "u64";
+                    }
                     else if (arg_type->isFloatTy())
-                        overload_suffix += "f32";
+                    {
+                        names.signed_name = "f32";
+                        names.unsigned_name = "f32";
+                    }
                     else if (arg_type->isDoubleTy())
-                        overload_suffix += "f64";
+                    {
+                        names.signed_name = "f64";
+                        names.unsigned_name = "f64";
+                    }
                     else if (arg_type->isPointerTy())
-                        overload_suffix += "ptr";
-                    else if (arg_type->isIntegerTy(1))
-                        overload_suffix += "bool";
+                    {
+                        names.signed_name = "ptr";
+                        names.unsigned_name = "ptr";
+                    }
                     else
                     {
                         std::string type_str;
                         llvm::raw_string_ostream rso(type_str);
                         arg_type->print(rso);
-                        overload_suffix += type_str;
+                        names.signed_name = type_str;
+                        names.unsigned_name = type_str;
                     }
                 }
+                arg_type_names.push_back(names);
             }
-            overload_suffix += ")";
 
-            // Try finding the overloaded function with various qualified names
-            auto type_candidates = generate_lookup_candidates(resolved_type_name, Cryo::SymbolKind::Type);
-            for (const auto &type_candidate : type_candidates)
+            // Generate all suffix permutations (signed/unsigned for each arg).
+            // For a single arg, try both "(i64)" and "(u64)".
+            // For multiple args, generate all 2^N combinations.
+            std::vector<std::string> overload_suffixes;
+            overload_suffixes.push_back(""); // seed with empty string
+            for (size_t i = 0; i < arg_type_names.size(); ++i)
             {
-                std::string overloaded_name = type_candidate + "::" + method_name + overload_suffix;
-                if (llvm::Function *overloaded_fn = module()->getFunction(overloaded_name))
+                std::vector<std::string> new_suffixes;
+                for (const auto &prev : overload_suffixes)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "generate_static_method: Found overloaded method: {}", overloaded_name);
-                    method = overloaded_fn;
-                    break;
+                    std::string sep = prev.empty() ? "" : ",";
+                    new_suffixes.push_back(prev + sep + arg_type_names[i].signed_name);
+                    if (arg_type_names[i].unsigned_name != arg_type_names[i].signed_name)
+                        new_suffixes.push_back(prev + sep + arg_type_names[i].unsigned_name);
                 }
+                overload_suffixes = std::move(new_suffixes);
+            }
+
+            // Try finding the overloaded function with various qualified names and suffix variants
+            auto type_candidates = generate_lookup_candidates(resolved_type_name, Cryo::SymbolKind::Type);
+            for (const auto &suffix : overload_suffixes)
+            {
+                std::string overload_suffix = "(" + suffix + ")";
+                for (const auto &type_candidate : type_candidates)
+                {
+                    std::string overloaded_name = type_candidate + "::" + method_name + overload_suffix;
+                    if (llvm::Function *overloaded_fn = module()->getFunction(overloaded_name))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_static_method: Found overloaded method: {}", overloaded_name);
+                        method = overloaded_fn;
+                        break;
+                    }
+                }
+                if (method->getFunctionType()->getNumParams() == args.size())
+                    break;
             }
 
             // Broader fallback: scan module for functions matching Type::method(...)
@@ -3418,9 +3472,14 @@ namespace Cryo::Codegen
                         // Skip "Global::" prefixed functions — synthetic scope, not real namespace
                         if (fn_name.substr(0, 8) == "Global::")
                             continue;
-                        // Match functions ending with "Type::method" (no overload suffix)
-                        if ((fn_name == target_suffix || fn_name.ends_with("::" + target_suffix)) &&
-                            fn_name.find('(') == std::string::npos &&
+                        // Match functions containing "Type::method" either exactly or
+                        // with an overload suffix like "(u64)".
+                        // Strip any overload suffix from fn_name for comparison.
+                        std::string fn_base = fn_name;
+                        size_t paren_pos = fn_name.find('(');
+                        if (paren_pos != std::string::npos)
+                            fn_base = fn_name.substr(0, paren_pos);
+                        if ((fn_base == target_suffix || fn_base.ends_with("::" + target_suffix)) &&
                             fn.getFunctionType()->getNumParams() == args.size())
                         {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -4592,6 +4651,36 @@ namespace Cryo::Codegen
                                         field_type_opt = class_ty->field_type(member_name);
                                     }
                                 }
+
+                                // If TypeRef is invalid but we found the owning type, get
+                                // the annotation string from the TemplateRegistry entry
+                                if ((!field_type_opt.has_value() || !field_type_opt->is_valid()) && type_ref.is_valid())
+                                {
+                                    if (auto *template_reg = ctx().template_registry())
+                                    {
+                                        const TemplateRegistry::StructFieldInfo *fi = template_reg->get_struct_field_types(candidate);
+                                        if (fi)
+                                        {
+                                            for (size_t i = 0; i < fi->field_names.size(); ++i)
+                                            {
+                                                if (fi->field_names[i] == member_name && i < fi->field_type_annotations.size())
+                                                {
+                                                    std::string ann = fi->field_type_annotations[i];
+                                                    if (!ann.empty())
+                                                    {
+                                                        type_name = ann;
+                                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                                  "Resolved field type from annotation: {}.{} -> {}",
+                                                                  candidate, member_name, type_name);
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (!type_name.empty()) break;
+                                }
+
                                 if (field_type_opt.has_value() && field_type_opt->is_valid())
                                     {
                                         type_name = field_type_opt->get()->display_name();

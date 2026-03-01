@@ -15,6 +15,9 @@ import Compiler::Artifacts;
 import Compiler::PassID;
 import Compiler::ModuleGraph;
 import Compiler::Types;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::Resolver;
 
 
 // ============================================================================
@@ -42,13 +45,16 @@ public:
     // -- Multi-module state --
     module_graph: ModuleGraph;
 
+    // -- Interned strings (lives for the entire compilation) --
+    intern_table: InternTable;
+
 private:
     // Owned components (void* during bootstrap, typed structs later).
     // Initialized lazily by passes that need them.
     lexer:              void*;
     parser:             void*;
     ast_context:        void*;
-    symbol_table:       SymbolTable*;
+    resolver:           Resolver*;
     type_resolver:      TypeResolver*;
     type_checker:       TypeChecker*;
     generic_registry:   void*;
@@ -70,15 +76,16 @@ public:
             debug_mode:        false,
             current_namespace: "",
 
-            artifacts:    PhaseArtifacts::new(),
-            diagnostics:  DiagnosticSink::new(),
-            provisions:   ProvisionSet::empty(),
-            module_graph: ModuleGraph::new(),
+            artifacts:     PhaseArtifacts::new(),
+            diagnostics:   DiagnosticSink::new(),
+            provisions:    ProvisionSet::empty(),
+            module_graph:  ModuleGraph::new(),
+            intern_table:  InternTable::new(),
 
             lexer:              null,
             parser:             null,
             ast_context:        null,
-            symbol_table:       null,
+            resolver:           null,
             type_resolver:      null,
             type_checker:       null,
             generic_registry:   null,
@@ -101,20 +108,44 @@ public:
 
 
     // ----------------------------------------------------------------
+    // String interning convenience
+    // ----------------------------------------------------------------
+
+    /// Intern a string, returning a SymbolStr handle.
+    /// Shorthand for this.intern_table.intern(text).
+    intern(mut &this, text: string) -> SymbolStr {
+        return this.intern_table.intern(text);
+    }
+
+    /// Resolve a SymbolStr back to its string data.
+    /// Shorthand for this.intern_table.resolve(sym).
+    resolve_str(&this, sym: SymbolStr) -> string {
+        return this.intern_table.resolve(sym);
+    }
+
+
+    // ----------------------------------------------------------------
     // Lazy component initialization
     // TODO:
     // Remove later when all components are fully typed and can be initialized in the constructor
     // ----------------------------------------------------------------
 
-    /// Initialize the type system components (type arena, symbol table, registries).
+    /// Initialize the type system components (type arena, registries).
     /// Called by the TypeDeclaration pass.
     init_type_system(mut &this) -> void {
-        if (this.symbol_table == null) {
-            this.symbol_table = new SymbolTable::new();
-        }
+        // Ensure resolver is initialized (symbols live there now)
+        this.init_resolver();
         if (this.type_checker == null) {
             // TypeArena is created and stored in the TypedAST artifact
             // TypeChecker and TypeResolver are created on demand by passes
+        }
+    }
+
+    /// Initialize the Resolver for name resolution.
+    /// Called by the NameResolution pass.
+    init_resolver(mut &this) -> void {
+        if (this.resolver == null) {
+            this.resolver = new Resolver::new(&this.intern_table);
         }
     }
 
@@ -196,5 +227,10 @@ public:
         this.provisions.clear();
         this.source_file = next_source;
         this.current_namespace = "";
+
+        // Reset resolver cursor (preserves cross-module state)
+        if (this.resolver != null) {
+            this.resolver.reset_for_next_module();
+        }
     }
 }

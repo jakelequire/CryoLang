@@ -92,6 +92,12 @@ namespace Cryo::Codegen
             return generate_printf(args);
         else if (intrinsic_name == "println")
             return generate_println(args);
+        else if (intrinsic_name == "print")
+            return generate_print(args);
+        else if (intrinsic_name == "eprintln")
+            return generate_eprintln(args);
+        else if (intrinsic_name == "eprint")
+            return generate_eprint(args);
         else if (intrinsic_name == "sprintf")
             return generate_sprintf(args);
         else if (intrinsic_name == "snprintf")
@@ -2685,6 +2691,94 @@ namespace Cryo::Codegen
         // Emit putchar('\n')
         llvm::Value *newline = llvm::ConstantInt::get(int_type, '\n');
         return builder.CreateCall(putchar_func, {newline}, "println.newline");
+    }
+
+    llvm::Value *Intrinsics::generate_print(const std::vector<llvm::Value *> &args)
+    {
+        // print(s) — write string to stdout without newline
+        if (args.empty())
+        {
+            report_error("print requires at least 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *printf_type = llvm::FunctionType::get(
+            int_type, {char_ptr_type}, true);
+        llvm::Function *printf_func = get_or_create_libc_function("printf", printf_type);
+
+        // Format: "%s" to print the string as-is
+        llvm::Module *module = _context_manager.get_module();
+        llvm::Constant *fmt = builder.CreateGlobalStringPtr("%s", "print.fmt", 0, module);
+        return builder.CreateCall(printf_func, {fmt, args[0]}, "print.result");
+    }
+
+    llvm::Value *Intrinsics::generate_eprintln(const std::vector<llvm::Value *> &args)
+    {
+        // eprintln(s) — write string + newline to stderr
+        if (args.empty())
+        {
+            report_error("eprintln requires at least 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+
+        // strlen returns i64 (size_t on 64-bit)
+        llvm::FunctionType *strlen_type = llvm::FunctionType::get(i64_type, {char_ptr_type}, false);
+        llvm::Function *strlen_func = get_or_create_libc_function("strlen", strlen_type);
+        llvm::Value *len = builder.CreateCall(strlen_func, {args[0]}, "eprintln.len");
+
+        // write(int fd, const void *buf, size_t count) -> ssize_t
+        // On 64-bit: ssize_t=i64, size_t=i64
+        llvm::FunctionType *write_type = llvm::FunctionType::get(
+            i64_type, {int_type, char_ptr_type, i64_type}, false);
+        llvm::Function *write_func = get_or_create_libc_function("write", write_type);
+        llvm::Value *fd_stderr = llvm::ConstantInt::get(int_type, 2);
+        builder.CreateCall(write_func, {fd_stderr, args[0], len});
+
+        // Write newline
+        llvm::Module *module = _context_manager.get_module();
+        llvm::Constant *newline = builder.CreateGlobalStringPtr("\n", "eprintln.nl", 0, module);
+        return builder.CreateCall(write_func,
+                                  {fd_stderr, newline, llvm::ConstantInt::get(i64_type, 1)},
+                                  "eprintln.nl.write");
+    }
+
+    llvm::Value *Intrinsics::generate_eprint(const std::vector<llvm::Value *> &args)
+    {
+        // eprint(s) — write string to stderr without newline
+        if (args.empty())
+        {
+            report_error("eprint requires at least 1 argument");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::Type *i64_type = llvm::Type::getInt64Ty(context);
+
+        llvm::FunctionType *strlen_type = llvm::FunctionType::get(i64_type, {char_ptr_type}, false);
+        llvm::Function *strlen_func = get_or_create_libc_function("strlen", strlen_type);
+        llvm::Value *len = builder.CreateCall(strlen_func, {args[0]}, "eprint.len");
+
+        llvm::FunctionType *write_type = llvm::FunctionType::get(
+            i64_type, {int_type, char_ptr_type, i64_type}, false);
+        llvm::Function *write_func = get_or_create_libc_function("write", write_type);
+        llvm::Value *fd_stderr = llvm::ConstantInt::get(int_type, 2);
+        return builder.CreateCall(write_func, {fd_stderr, args[0], len}, "eprint.write");
     }
 
     llvm::Value *Intrinsics::generate_sprintf(const std::vector<llvm::Value *> &args)

@@ -1079,17 +1079,24 @@ namespace Cryo::Codegen
                 llvm::Type *field_type = field.type.is_valid() ? types().map(field.type) : nullptr;
                 if (!field_type)
                 {
-                    // Try to resolve array type from AST annotation when TypeRef is unavailable
-                    if (fi < node->fields().size() && node->fields()[fi]->has_type_annotation()
-                        && node->fields()[fi]->type_annotation()->kind == Cryo::TypeAnnotationKind::Array)
+                    // Try to resolve array type from AST annotation when TypeRef is unavailable.
+                    // Match by name (not index) because cryo_class->fields() includes inherited
+                    // fields while node->fields() does not.
+                    for (const auto &ast_field : node->fields())
                     {
-                        field_type = get_or_create_array_struct_from_annotation(
-                            node->fields()[fi]->type_annotation(), llvm_ctx());
-                        if (field_type)
+                        if (ast_field && ast_field->name() == field.name
+                            && ast_field->has_type_annotation()
+                            && ast_field->type_annotation()->kind == Cryo::TypeAnnotationKind::Array)
                         {
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "Class field '{}' resolved as dynamic array from annotation -> '{}'",
-                                      field.name, llvm::cast<llvm::StructType>(field_type)->getName().str());
+                            field_type = get_or_create_array_struct_from_annotation(
+                                ast_field->type_annotation(), llvm_ctx());
+                            if (field_type)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "Class field '{}' resolved as dynamic array from annotation -> '{}'",
+                                          field.name, llvm::cast<llvm::StructType>(field_type)->getName().str());
+                            }
+                            break;
                         }
                     }
                 }
@@ -1183,11 +1190,19 @@ namespace Cryo::Codegen
                 {
                     const auto &field = cryo_class->fields()[fi];
                     cryo_field_type_refs.push_back(field.type.is_valid() ? field.type : TypeRef{});
-                    // Get annotation string from AST node if available
-                    if (fi < node->fields().size() && node->fields()[fi]->has_type_annotation())
-                        field_type_annotations.push_back(node->fields()[fi]->type_annotation()->to_string());
-                    else
-                        field_type_annotations.push_back("");
+                    // Get annotation string from the AST node field with matching name.
+                    // Cannot use index-based access because cryo_class->fields() includes
+                    // inherited base-class fields while node->fields() does not.
+                    std::string ann;
+                    for (const auto &ast_field : node->fields())
+                    {
+                        if (ast_field && ast_field->name() == field.name && ast_field->has_type_annotation())
+                        {
+                            ann = ast_field->type_annotation()->to_string();
+                            break;
+                        }
+                    }
+                    field_type_annotations.push_back(ann);
                 }
             }
             else

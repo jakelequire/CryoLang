@@ -97,14 +97,18 @@ namespace Cryo
         struct ModuleConstant
         {
             std::string name;
-            std::string type_annotation; // e.g., "u8", "u64"
+            std::string type_annotation; // e.g., "u8", "u64", "f64"
             uint64_t int_value;
+            double float_value;
             bool is_integer;
 
-            ModuleConstant() : int_value(0), is_integer(false) {}
+            ModuleConstant() : int_value(0), float_value(0.0), is_integer(false) {}
             ModuleConstant(const std::string &n, const std::string &type_ann,
                            uint64_t val, bool is_int = true)
-                : name(n), type_annotation(type_ann), int_value(val), is_integer(is_int) {}
+                : name(n), type_annotation(type_ann), int_value(val), float_value(0.0), is_integer(is_int) {}
+            ModuleConstant(const std::string &n, const std::string &type_ann,
+                           double val)
+                : name(n), type_annotation(type_ann), int_value(0), float_value(val), is_integer(false) {}
         };
 
         //===================================================================
@@ -122,6 +126,12 @@ namespace Cryo
                                       const std::string &name,
                                       const std::string &type_annotation,
                                       uint64_t value);
+
+        /** @brief Register a floating-point module constant */
+        void register_module_constant_float(const std::string &module_namespace,
+                                            const std::string &name,
+                                            const std::string &type_annotation,
+                                            double value);
 
         /**
          * @brief Get all constants for a given module namespace
