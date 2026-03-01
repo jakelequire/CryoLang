@@ -10,6 +10,8 @@ namespace Compiler::Types::Resolver;
 
 import Compiler::Diag;
 import Compiler::AST;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
 
 
 // ============================================================================
@@ -20,6 +22,8 @@ import Compiler::AST;
 type struct ResolutionContext {
     current_module:   string;
     source_file:      string;
+    // TODO: Using a string array + parallel TypeRef array for generic bindings is a bit clunky;
+    // consider a more structured approach.
     generic_bindings: string[];     // Parallel arrays: generic name → bound TypeRef
     binding_refs:     TypeRef[];
 
@@ -55,11 +59,13 @@ type struct ResolutionContext {
 // ============================================================================
 
 type struct TypeResolver {
-    arena: TypeArena*;
+    arena:        TypeArena*;
+    intern_table: InternTable*;
 
-    static new(arena: TypeArena*) -> TypeResolver {
+    static new(arena: TypeArena*, intern_table: InternTable*) -> TypeResolver {
         return TypeResolver {
-            arena: arena,
+            arena:        arena,
+            intern_table: intern_table,
         };
     }
 
@@ -119,57 +125,62 @@ type struct TypeResolver {
     // ----------------------------------------------------------------
 
     /// Resolve a primitive type name to its arena singleton.
-    resolve_primitive(&this, name: string) -> TypeRef {
-        if (name == "void")    { return this.arena.get_void(); }
-        if (name == "boolean") { return this.arena.get_bool(); }
-        if (name == "bool")    { return this.arena.get_bool(); }
-        if (name == "char")    { return this.arena.get_char(); }
-        if (name == "string")  { return this.arena.get_string(); }
-        if (name == "never")   { return this.arena.get_never(); }
+    /// Accepts a SymbolStr, resolves to string internally for dispatch.
+    resolve_primitive(&this, name: SymbolStr) -> TypeRef {
+        const s: string = this.intern_table.resolve(name);
+        if (s == "void")    { return this.arena.get_void(); }
+        if (s == "boolean") { return this.arena.get_bool(); }
+        if (s == "bool")    { return this.arena.get_bool(); }
+        if (s == "char")    { return this.arena.get_char(); }
+        if (s == "string")  { return this.arena.get_string(); }
+        if (s == "never")   { return this.arena.get_never(); }
 
         // Integer types
-        if (name == "i8")   { return this.arena.get_i8(); }
-        if (name == "i16")  { return this.arena.get_i16(); }
-        if (name == "i32")  { return this.arena.get_i32(); }
-        if (name == "i64")  { return this.arena.get_i64(); }
-        if (name == "i128") { return this.arena.get_i128(); }
-        if (name == "u8")   { return this.arena.get_u8(); }
-        if (name == "u16")  { return this.arena.get_u16(); }
-        if (name == "u32")  { return this.arena.get_u32(); }
-        if (name == "u64")  { return this.arena.get_u64(); }
-        if (name == "u128") { return this.arena.get_u128(); }
+        if (s == "i8")   { return this.arena.get_i8(); }
+        if (s == "i16")  { return this.arena.get_i16(); }
+        if (s == "i32")  { return this.arena.get_i32(); }
+        if (s == "i64")  { return this.arena.get_i64(); }
+        if (s == "i128") { return this.arena.get_i128(); }
+        if (s == "u8")   { return this.arena.get_u8(); }
+        if (s == "u16")  { return this.arena.get_u16(); }
+        if (s == "u32")  { return this.arena.get_u32(); }
+        if (s == "u64")  { return this.arena.get_u64(); }
+        if (s == "u128") { return this.arena.get_u128(); }
 
         // Float types
-        if (name == "f32") { return this.arena.get_f32(); }
-        if (name == "f64") { return this.arena.get_f64(); }
+        if (s == "f32") { return this.arena.get_f32(); }
+        if (s == "f64") { return this.arena.get_f64(); }
 
         // Common aliases
-        if (name == "int")    { return this.arena.get_i32(); }
-        if (name == "uint")   { return this.arena.get_u32(); }
-        if (name == "float")  { return this.arena.get_f64(); }
-        if (name == "double") { return this.arena.get_f64(); }
-        if (name == "byte")   { return this.arena.get_u8(); }
+        if (s == "int")    { return this.arena.get_i32(); }
+        if (s == "uint")   { return this.arena.get_u32(); }
+        if (s == "float")  { return this.arena.get_f64(); }
+        if (s == "double") { return this.arena.get_f64(); }
+        if (s == "byte")   { return this.arena.get_u8(); }
 
         return TypeRef::invalid();
     }
 
     /// Resolve a named type (user-defined or generic binding).
-    resolve_named(&this, name: string, ctx: ResolutionContext*) -> TypeRef {
+    /// Accepts a SymbolStr, resolves to string for arena lookup.
+    resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*) -> TypeRef {
+        const name_str: string = this.intern_table.resolve(name);
+
         // Check generic bindings first
-        mut binding: TypeRef = ctx.lookup_binding(name);
+        mut binding: TypeRef = ctx.lookup_binding(name_str);
         if (binding.is_valid()) {
             return binding;
         }
 
         // Look up in arena's user-defined caches
-        mut found: TypeRef = this.arena.lookup_by_name(name);
+        mut found: TypeRef = this.arena.lookup_by_name(name_str);
         if (found.is_valid()) {
             return found;
         }
 
         // Try qualified name with current module
         if (ctx.current_module != "") {
-            mut qualified: string = sprintf("%s::%s", ctx.current_module, name);
+            mut qualified: string = sprintf("%s::%s", ctx.current_module, name_str);
             found = this.arena.lookup_by_name(qualified);
             if (found.is_valid()) {
                 return found;
