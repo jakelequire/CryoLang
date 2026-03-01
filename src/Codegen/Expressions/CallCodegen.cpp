@@ -1384,9 +1384,30 @@ namespace Cryo::Codegen
                 return CallKind::Intrinsic;
             }
 
-            // Check for intrinsics
+            // Check for intrinsics — but prefer stdlib versions when available.
+            // When the stdlib is linked, functions like println/print/eprintln exist
+            // as cross-module declarations in the LLVM module. We prefer those over
+            // the compiler-intrinsic versions so that user code goes through the
+            // stdlib's richer implementations (e.g., IoResult return types).
+            // The stdlib itself still uses intrinsics via the `intrinsics::` namespace.
             if (is_intrinsic(name))
             {
+                // These intrinsics have proper stdlib replacements in io::stdio.
+                // When stdlib is linked, prefer the stdlib version.
+                static const std::unordered_set<std::string> stdlib_overrides = {
+                    "println", "print", "eprintln", "eprint",
+                };
+                if (stdlib_overrides.count(name))
+                {
+                    llvm::Function *stdlib_fn = resolve_function_by_name(name);
+                    if (stdlib_fn)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "classify_call: '{}' is intrinsic but stdlib version exists, preferring FreeFunction",
+                                  name);
+                        return CallKind::FreeFunction;
+                    }
+                }
                 return CallKind::Intrinsic;
             }
 

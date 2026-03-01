@@ -2881,10 +2881,17 @@ namespace Cryo::Codegen
         }
 
         // Exit with status code 1 (indicating error)
-        llvm::Value *exit_code = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1);
-        std::vector<llvm::Value *> exit_args = {exit_code};
+        // Use libc exit() instead of raw syscall — syscall is Linux-only.
+        llvm::Type *i32_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *exit_type = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(context), {i32_type}, false);
+        llvm::Function *exit_func = get_or_create_libc_function("exit", exit_type);
 
-        return generate_syscall_exit(exit_args);
+        llvm::Value *exit_code = llvm::ConstantInt::get(i32_type, 1);
+        // Don't add unreachable here — callers (e.g., inside if/while) may
+        // continue emitting IR into this block. The exit() will terminate
+        // the process at runtime regardless.
+        return builder.CreateCall(exit_func, {exit_code});
     }
 
     llvm::Value *Intrinsics::generate_todo(const std::vector<llvm::Value *> &args)
