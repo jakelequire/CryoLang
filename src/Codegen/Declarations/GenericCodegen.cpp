@@ -528,7 +528,7 @@ namespace Cryo::Codegen
                     {
                         for (const auto &c : *constants)
                         {
-                            if (!module()->getGlobalVariable(c.name))
+                            if (!module()->getGlobalVariable(c.name, /*AllowInternal=*/true))
                             {
                                 // Map type annotation to LLVM type
                                 llvm::Type *const_type = nullptr;
@@ -547,9 +547,11 @@ namespace Cryo::Codegen
 
                                 auto *gv = new llvm::GlobalVariable(
                                     *module(), const_type, true,
-                                    llvm::GlobalValue::PrivateLinkage,
+                                    llvm::GlobalValue::LinkOnceODRLinkage,
                                     llvm::ConstantInt::get(const_type, c.int_value),
                                     c.name);
+                                // On Windows COFF, LinkOnceODR requires a comdat group.
+                                gv->setComdat(module()->getOrInsertComdat(c.name));
                                 values().set_global_value(c.name, gv);
                                 // Also register with qualified name for SRM lookups
                                 std::string qualified = base_namespace + "::" + c.name;
@@ -789,7 +791,7 @@ namespace Cryo::Codegen
                         {
                             for (const auto &c : *constants)
                             {
-                                if (!module()->getGlobalVariable(c.name))
+                                if (!module()->getGlobalVariable(c.name, /*AllowInternal=*/true))
                                 {
                                     llvm::Type *const_type = nullptr;
                                     if (c.type_annotation == "u8" || c.type_annotation == "i8")
@@ -807,9 +809,11 @@ namespace Cryo::Codegen
 
                                     auto *gv = new llvm::GlobalVariable(
                                         *module(), const_type, true,
-                                        llvm::GlobalValue::PrivateLinkage,
+                                        llvm::GlobalValue::LinkOnceODRLinkage,
                                         llvm::ConstantInt::get(const_type, c.int_value),
                                         c.name);
+                                    // On Windows COFF, LinkOnceODR requires a comdat group.
+                                    gv->setComdat(module()->getOrInsertComdat(c.name));
                                     values().set_global_value(c.name, gv);
                                     std::string qualified = base_namespace + "::" + c.name;
                                     values().set_global_value(qualified, gv);
@@ -1450,7 +1454,7 @@ namespace Cryo::Codegen
                     {
                         for (const auto &c : *constants)
                         {
-                            if (!module()->getGlobalVariable(c.name))
+                            if (!module()->getGlobalVariable(c.name, /*AllowInternal=*/true))
                             {
                                 llvm::Type *const_type = nullptr;
                                 if (c.type_annotation == "u8" || c.type_annotation == "i8")
@@ -1468,9 +1472,11 @@ namespace Cryo::Codegen
 
                                 auto *gv = new llvm::GlobalVariable(
                                     *module(), const_type, true,
-                                    llvm::GlobalValue::PrivateLinkage,
+                                    llvm::GlobalValue::LinkOnceODRLinkage,
                                     llvm::ConstantInt::get(const_type, c.int_value),
                                     c.name);
+                                // On Windows COFF, LinkOnceODR requires a comdat group.
+                                gv->setComdat(module()->getOrInsertComdat(c.name));
                                 values().set_global_value(c.name, gv);
                                 std::string qualified = base_namespace + "::" + c.name;
                                 values().set_global_value(qualified, gv);
