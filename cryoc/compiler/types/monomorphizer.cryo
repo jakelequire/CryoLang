@@ -1,0 +1,423 @@
+///! Monomorphizer
+///!
+///! Worklist-driven engine that processes all generic instantiations to completion.
+///! Repeatedly dequeues InstantiatedTypes, specializes them via ASTSpecializer,
+///! creates concrete types in the TypeArena, and discovers transitive dependencies.
+///!
+///! After process_all() completes, every InstantiatedType has a resolved_type
+///! pointing to a concrete Struct/Enum/Class, and get_all_specialized_asts()
+///! returns the full set of specialized declarations ready for injection into
+///! the program AST.
+
+namespace Compiler::Types::Monomorphizer;
+
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::AST::Specializer;
+import Compiler::Types::Substitution;
+import Compiler::Types::TemplateRegistry;
+import Compiler::Types::GenericRegistry;
+import Compiler::Resolver::InternTable;
+
+
+// ============================================================================
+// MonomorphRequest — A pending instantiation to specialize
+// ============================================================================
+
+type struct MonomorphRequest {
+    generic_type: TypeRef;          // The InstantiatedType
+    type_args:    TypeRef[];        // Concrete type arguments
+    base_type:    TypeRef;          // The generic base type
+    span:         SourceSpan;
+}
+
+
+// ============================================================================
+// SpecializationEntry — A completed specialization
+// ============================================================================
+
+type struct SpecializationEntry {
+    specialized_type: TypeRef;
+    specialized_name: string;
+    ast_node:         ASTNode*;
+    impl_nodes:       ASTNode*[];
+}
+
+
+// ============================================================================
+// Monomorphizer — Worklist engine
+// ============================================================================
+
+type struct Monomorphizer {
+    arena:             TypeArena*;
+    template_registry: TemplateRegistry*;
+    generic_registry:  GenericRegistry*;
+    intern_table:      InternTable*;
+    specializer:       ASTSpecializer;
+
+    // Worklist
+    pending:           MonomorphRequest[];
+    pending_cursor:    i64;                  // Index cursor (avoids O(n) erase-from-front)
+
+    // Cache (parallel arrays)
+    spec_keys:         string[];
+    spec_entries:      SpecializationEntry[];
+
+    // Cycle detection
+    in_progress:       string[];
+
+    // Error tracking
+    error_count:       i64;
+
+
+    // ----------------------------------------------------------------
+    // Construction
+    // ----------------------------------------------------------------
+
+    static new(arena: TypeArena*, template_registry: TemplateRegistry*,
+               generic_registry: GenericRegistry*,
+               intern_table: InternTable*) -> Monomorphizer {
+        return Monomorphizer {
+            arena:             arena,
+            template_registry: template_registry,
+            generic_registry:  generic_registry,
+            intern_table:      intern_table,
+            specializer:       ASTSpecializer::new(arena, intern_table),
+            pending:           [],
+            pending_cursor:    0,
+            spec_keys:         [],
+            spec_entries:      [],
+            in_progress:       [],
+            error_count:       0,
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Main worklist loop
+    // ----------------------------------------------------------------
+
+    /// Process all pending monomorphization requests.
+    /// Returns true if all succeeded, false if any errors occurred.
+    process_all(mut &this) -> boolean {
+        // Import all unmonomorphized instantiations from the generic registry
+        const unprocessed: TypeRef[] = this.generic_registry.collect_unmonomorphized();
+        for (mut i: i64 = 0; i < unprocessed.length; i++) {
+            this.enqueue_from_type_ref(unprocessed[i]);
+        }
+
+        // Process worklist until empty
+        while (this.pending_cursor < this.pending.length) {
+            const request: MonomorphRequest = this.pending[this.pending_cursor];
+            this.pending_cursor = this.pending_cursor + 1;
+
+            const key: string = this.make_key(request);
+
+            // Already cached — skip
+            if (this.is_cached(key)) {
+                continue;
+            }
+
+            // Cycle detection
+            if (this.is_in_progress(key)) {
+                printf("[Monomorphizer] Error: cycle detected for %s\n", key);
+                this.error_count = this.error_count + 1;
+                continue;
+            }
+
+            // Mark as in-progress
+            this.in_progress = this.in_progress + [key];
+
+            // Specialize
+            const success: boolean = this.specialize_request(request, key);
+
+            // Remove from in-progress
+            this.remove_in_progress(key);
+
+            if (!success) {
+                this.error_count = this.error_count + 1;
+            }
+        }
+
+        return this.error_count == 0;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Single request specialization
+    // ----------------------------------------------------------------
+
+    specialize_request(mut &this, request: MonomorphRequest, key: string) -> boolean {
+        // Look up template
+        const entry: TemplateEntry* = this.template_registry.get_by_type_id(request.base_type.id);
+        if (entry == null) {
+            // Also try by looking up the base type's display name
+            const base_t: Type* = this.arena.lookup(request.base_type.id);
+            if (base_t != null) {
+                const by_name: TemplateEntry* = this.template_registry.get_by_short_name(base_t.display_name());
+                if (by_name != null) {
+                    return this.specialize_with_entry(request, key, by_name);
+                }
+            }
+            printf("[Monomorphizer] Error: no template found for type ID %llu\n", request.base_type.id);
+            return false;
+        }
+
+        return this.specialize_with_entry(request, key, entry);
+    }
+
+    specialize_with_entry(mut &this, request: MonomorphRequest, key: string,
+                          entry: TemplateEntry*) -> boolean {
+        // Validate arg count
+        if (request.type_args.length != entry.param_count) {
+            printf("[Monomorphizer] Error: arg count mismatch for %s: expected %lld, got %lld\n",
+                   entry.qualified_name, entry.param_count, request.type_args.length);
+            return false;
+        }
+
+        // Build display names for type args
+        mut type_arg_displays: string[] = [];
+        for (mut i: i64 = 0; i < request.type_args.length; i++) {
+            const arg_t: Type* = this.arena.lookup(request.type_args[i].id);
+            if (arg_t != null) {
+                type_arg_displays = type_arg_displays + [arg_t.display_name()];
+            } else {
+                type_arg_displays = type_arg_displays + [sprintf("unknown_%llu", request.type_args[i].id)];
+            }
+        }
+
+        // Call AST specializer
+        const result: SpecializationResult = this.specializer.specialize(
+            entry, request.type_args, type_arg_displays
+        );
+        if (!result.success) {
+            printf("[Monomorphizer] Error: specialization failed for %s: %s\n",
+                   entry.qualified_name, result.error_message);
+            return false;
+        }
+
+        // Create concrete type in arena based on node kind
+        const subst: TypeSubstitution = TypeSubstitution::from_params(
+            entry.param_type_ids, request.type_args
+        );
+        const concrete_type: TypeRef = this.create_concrete_type(entry, result.spec_name, &subst);
+
+        // Set resolved_type on the InstantiatedType
+        const inst_t: Type* = this.arena.lookup(request.generic_type.id);
+        if (inst_t != null) {
+            const inst: InstantiatedType* = inst_t as InstantiatedType*;
+            inst.set_resolved_type(concrete_type);
+        }
+
+        // Mark as monomorphized
+        this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
+
+        // Cache the result
+        const spec_entry: SpecializationEntry = SpecializationEntry {
+            specialized_type: concrete_type,
+            specialized_name: result.spec_name,
+            ast_node:         result.specialized_ast,
+            impl_nodes:       result.impl_asts,
+        };
+        this.spec_keys    = this.spec_keys + [key];
+        this.spec_entries = this.spec_entries + [spec_entry];
+
+        // Discover nested instantiations
+        this.request_nested_instantiations(concrete_type);
+
+        return true;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Concrete type creation
+    // ----------------------------------------------------------------
+
+    create_concrete_type(mut &this, entry: TemplateEntry*, spec_name: string,
+                         subst: TypeSubstitution*) -> TypeRef {
+        return match (entry.node_kind) {
+            NodeKind::StructDeclaration => {
+                this.arena.create_struct(spec_name, entry.module_name)
+            }
+            NodeKind::EnumDeclaration => {
+                this.arena.create_enum(spec_name, entry.module_name)
+            }
+            NodeKind::ClassDeclaration => {
+                this.arena.create_class(spec_name, entry.module_name)
+            }
+            _ => {
+                // Fallback to struct for unknown kinds
+                this.arena.create_struct(spec_name, entry.module_name)
+            }
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Nested instantiation discovery
+    // ----------------------------------------------------------------
+
+    /// Walk a type recursively, enqueuing any unmonomorphized InstantiatedTypes.
+    request_nested_instantiations(mut &this, ty: TypeRef) -> void {
+        if (ty.is_invalid()) { return; }
+
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return; }
+
+        match (t.kind) {
+            TypeKind::InstantiatedType => {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                if (!inst.has_resolved_type()) {
+                    this.enqueue_from_inst(ty, inst);
+                }
+                // Also recurse into type args
+                for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                    this.request_nested_instantiations(inst.type_args[i]);
+                }
+            }
+            TypeKind::Pointer => {
+                const ptr: PointerType* = t as PointerType*;
+                this.request_nested_instantiations(ptr.pointee);
+            }
+            TypeKind::Reference => {
+                const ref: ReferenceType* = t as ReferenceType*;
+                this.request_nested_instantiations(ref.referent);
+            }
+            TypeKind::Array => {
+                const arr: ArrayType* = t as ArrayType*;
+                this.request_nested_instantiations(arr.element);
+            }
+            TypeKind::Optional => {
+                const opt: OptionalType* = t as OptionalType*;
+                this.request_nested_instantiations(opt.wrapped);
+            }
+            TypeKind::Function => {
+                const func: FunctionType* = t as FunctionType*;
+                this.request_nested_instantiations(func.return_type);
+                for (mut i: i64 = 0; i < func.param_types.length; i++) {
+                    this.request_nested_instantiations(func.param_types[i]);
+                }
+            }
+            TypeKind::Tuple => {
+                const tup: TupleType* = t as TupleType*;
+                for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                    this.request_nested_instantiations(tup.elements[i]);
+                }
+            }
+            TypeKind::Struct => {
+                const st: StructType* = t as StructType*;
+                for (mut i: i64 = 0; i < st.fields.length; i++) {
+                    this.request_nested_instantiations(st.fields[i].field_type);
+                }
+            }
+            TypeKind::Class => {
+                const cl: ClassType* = t as ClassType*;
+                for (mut i: i64 = 0; i < cl.fields.length; i++) {
+                    this.request_nested_instantiations(cl.fields[i].field_type);
+                }
+            }
+            TypeKind::Enum => {
+                const en: EnumType* = t as EnumType*;
+                for (mut i: i64 = 0; i < en.variants.length; i++) {
+                    for (mut j: i64 = 0; j < en.variants[i].payload_types.length; j++) {
+                        const payload_ty: TypeRef = en.variants[i].payload_types[j];
+                        this.request_nested_instantiations(payload_ty);
+                    }
+                }
+            }
+            _ => {
+                // No nested types to discover
+            }
+        }
+    }
+
+
+    // ----------------------------------------------------------------
+    // Result access
+    // ----------------------------------------------------------------
+
+    /// Get all specialized AST declarations for injection into the program.
+    get_all_specialized_asts(&this) -> ASTNode*[] {
+        mut result: ASTNode*[] = [];
+        for (mut i: i64 = 0; i < this.spec_entries.length; i++) {
+            if (this.spec_entries[i].ast_node != null) {
+                result.push(this.spec_entries[i].ast_node);
+            }
+            // Also include impl block ASTs
+            for (mut j: i64 = 0; j < this.spec_entries[i].impl_nodes.length; j++) {
+                result.push(this.spec_entries[i].impl_nodes[j]);
+            }
+        }
+        return result;
+    }
+
+    /// Number of specializations completed.
+    specialization_count(&this) -> i64 {
+        return this.spec_entries.length;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Internal helpers
+    // ----------------------------------------------------------------
+
+    /// Enqueue a monomorphization request from a TypeRef that is an InstantiatedType.
+    enqueue_from_type_ref(mut &this, ty: TypeRef) -> void {
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null || t.kind != TypeKind::InstantiatedType) { return; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        this.enqueue_from_inst(ty, inst);
+    }
+
+    enqueue_from_inst(mut &this, ty: TypeRef, inst: InstantiatedType*) -> void {
+        const request: MonomorphRequest = MonomorphRequest {
+            generic_type: ty,
+            type_args:    inst.type_args,
+            base_type:    inst.generic_base,
+            span:         SourceSpan::none(),
+        };
+        this.pending = this.pending + [request];
+    }
+
+    /// Build a cache key from a request.
+    make_key(&this, request: MonomorphRequest) -> string {
+        mut key: string = sprintf("%llu<", request.base_type.id);
+        for (mut i: i64 = 0; i < request.type_args.length; i++) {
+            if (i > 0) { key = key + ","; }
+            key = key + sprintf("%llu", request.type_args[i].id);
+        }
+        key = key + ">";
+        return key;
+    }
+
+    /// Check if a key is already in the specialization cache.
+    is_cached(&this, key: string) -> boolean {
+        for (mut i: i64 = 0; i < this.spec_keys.length; i++) {
+            if (this.spec_keys[i] == key) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Check if a key is currently being processed (cycle detection).
+    is_in_progress(&this, key: string) -> boolean {
+        for (mut i: i64 = 0; i < this.in_progress.length; i++) {
+            if (this.in_progress[i] == key) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Remove a key from the in-progress set.
+    remove_in_progress(mut &this, key: string) -> void {
+        mut new_list: string[] = [];
+        for (mut i: i64 = 0; i < this.in_progress.length; i++) {
+            if (this.in_progress[i] != key) {
+                new_list.push(this.in_progress[i]);
+            }
+        }
+        this.in_progress = new_list;
+    }
+}

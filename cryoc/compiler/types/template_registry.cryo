@@ -1,0 +1,198 @@
+///! Template Registry
+///!
+///! Stores generic AST declarations with extracted metadata.  Consolidates
+///! the C++ compiler's 8+ separate maps into one TemplateEntry struct.
+///! Acts as the "source of truth" for generic definitions — the Monomorphizer
+///! queries this to find the AST and type parameters for each generic type.
+
+namespace Compiler::Types::TemplateRegistry;
+
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+
+
+// ============================================================================
+// TemplateEntry — Metadata for a single generic declaration
+// ============================================================================
+
+/// All information needed to specialize a single generic type or function.
+type struct TemplateEntry {
+    name:           string;              // Unqualified: "Array"
+    qualified_name: string;              // "std::collections::Array"
+    module_name:    string;
+    param_names:    string[];            // ["T", "E"]
+    param_type_ids: u64[];              // TypeIDs of GenericParamType objects
+    param_count:    i64;
+    ast_node:       ASTNode*;           // Original generic declaration
+    node_kind:      NodeKind;
+    base_type:      TypeRef;            // The uninstantiated generic type in arena
+    impl_blocks:    ImplBlockNode*[];   // Associated impl blocks
+
+    /// Create a new template entry.
+    static new(name: string, qualified_name: string, module_name: string,
+               param_names: string[], param_type_ids: u64[],
+               ast_node: ASTNode*, node_kind: NodeKind,
+               base_type: TypeRef) -> TemplateEntry {
+        return TemplateEntry {
+            name:           name,
+            qualified_name: qualified_name,
+            module_name:    module_name,
+            param_names:    param_names,
+            param_type_ids: param_type_ids,
+            param_count:    param_names.length,
+            ast_node:       ast_node,
+            node_kind:      node_kind,
+            base_type:      base_type,
+            impl_blocks:    [],
+        };
+    }
+}
+
+
+// ============================================================================
+// TemplateRegistry — Collection of all generic declarations
+// ============================================================================
+
+/// Registry of all generic (template) declarations in the program.
+/// Uses parallel arrays for name-based and TypeID-based lookup.
+type struct TemplateRegistry {
+    // Primary index: qualified_name → entry
+    entry_names: string[];              // Parallel arrays keyed by qualified_name
+    entries:     TemplateEntry[];
+
+    // Secondary index: TypeID → index into entries
+    type_ids:    u64[];
+    type_indices: i64[];
+
+
+    // ----------------------------------------------------------------
+    // Construction
+    // ----------------------------------------------------------------
+
+    static new() -> TemplateRegistry {
+        return TemplateRegistry {
+            entry_names:  [],
+            entries:      [],
+            type_ids:     [],
+            type_indices: [],
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Registration
+    // ----------------------------------------------------------------
+
+    /// Register a template entry.  Deduplicates by qualified_name —
+    /// if an entry with the same name exists, it is overwritten.
+    register(mut &this, entry: TemplateEntry) -> void {
+        // Check for existing entry with same qualified_name
+        for (mut i: i64 = 0; i < this.entry_names.length; i++) {
+            if (this.entry_names[i] == entry.qualified_name) {
+                // Overwrite existing
+                this.entries[i] = entry;
+                // Update secondary index
+                if (entry.base_type.is_valid()) {
+                    this.update_type_index(entry.base_type.id, i);
+                }
+                return;
+            }
+        }
+
+        // New entry
+        const idx: i64 = this.entry_names.length;
+        this.entry_names = this.entry_names + [entry.qualified_name];
+        this.entries      = this.entries + [entry];
+
+        // Add secondary index entry
+        if (entry.base_type.is_valid()) {
+            this.type_ids     = this.type_ids + [entry.base_type.id];
+            this.type_indices = this.type_indices + [idx];
+        }
+    }
+
+    /// Associate an impl block with a registered template.
+    /// The target_name should match a registered template's qualified_name
+    /// or unqualified name.
+    register_impl_block(mut &this, target_name: string, block: ImplBlockNode*) -> void {
+        for (mut i: i64 = 0; i < this.entry_names.length; i++) {
+            if (this.entry_names[i] == target_name || this.entries[i].name == target_name) {
+                this.entries[i].impl_blocks.push(block);
+                return;
+            }
+        }
+    }
+
+
+    // ----------------------------------------------------------------
+    // Lookup
+    // ----------------------------------------------------------------
+
+    /// Look up a template entry by qualified name.
+    /// Returns null if not found.
+    get_by_name(&this, qualified_name: string) -> TemplateEntry* {
+        for (mut i: i64 = 0; i < this.entry_names.length; i++) {
+            if (this.entry_names[i] == qualified_name) {
+                return &this.entries[i];
+            }
+        }
+        return null;
+    }
+
+    /// Look up a template entry by the unqualified name.
+    /// Returns null if not found.  If multiple entries share the
+    /// same unqualified name, returns the first match.
+    get_by_short_name(&this, name: string) -> TemplateEntry* {
+        for (mut i: i64 = 0; i < this.entries.length; i++) {
+            if (this.entries[i].name == name) {
+                return &this.entries[i];
+            }
+        }
+        return null;
+    }
+
+    /// Look up a template entry by its base TypeID.
+    /// Returns null if not found.
+    get_by_type_id(&this, type_id: u64) -> TemplateEntry* {
+        for (mut i: i64 = 0; i < this.type_ids.length; i++) {
+            if (this.type_ids[i] == type_id) {
+                const idx: i64 = this.type_indices[i];
+                return &this.entries[idx];
+            }
+        }
+        return null;
+    }
+
+    /// Check whether a TypeID corresponds to a registered template.
+    is_template(&this, type_id: u64) -> boolean {
+        for (mut i: i64 = 0; i < this.type_ids.length; i++) {
+            if (this.type_ids[i] == type_id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Number of registered templates.
+    count(&this) -> i64 {
+        return this.entries.length;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Internal helpers
+    // ----------------------------------------------------------------
+
+    /// Update the secondary TypeID index for an existing entry.
+    update_type_index(mut &this, type_id: u64, entry_idx: i64) -> void {
+        for (mut i: i64 = 0; i < this.type_ids.length; i++) {
+            if (this.type_ids[i] == type_id) {
+                this.type_indices[i] = entry_idx;
+                return;
+            }
+        }
+        // Not found — add new mapping
+        this.type_ids.push(type_id);
+        this.type_indices.push(entry_idx);
+    }
+}

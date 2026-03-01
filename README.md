@@ -98,7 +98,11 @@ Compile and run:
 
 ### Project-Based Builds
 
-For multi-file projects, create a `cryoconfig` file:
+For multi-file projects, create a `cryoconfig` file by running `cryo init`:
+
+```bash
+cryo init <project_name>
+```
 
 ```toml
 [project]
@@ -115,6 +119,7 @@ optimize = true
 Then build and run:
 
 ```bash
+cd myapp
 cryo build
 cryo run
 ```

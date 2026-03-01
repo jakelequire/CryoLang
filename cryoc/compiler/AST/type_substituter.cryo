@@ -1,0 +1,605 @@
+///! AST Type Substituter
+///!
+///! Walks a cloned AST and rewrites type annotations and generic name references
+///! to reflect concrete type arguments.  Used after ASTCloner to transform a
+///! generic declaration clone into a concrete specialization.
+///!
+///! Example: For `Array<T>` specialized with T=i32:
+///!   - Named("T") annotations → Named("i32") or Primitive("i32")
+///!   - StructDeclNode.name "Array" → "Array_i32"
+///!   - generic_args ["T"] → ["i32"]
+///!   - generic_params cleared (the specialization is concrete)
+
+namespace Compiler::AST::TypeSubstituter;
+
+import Compiler::Diag;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::AST::Visitor;
+import Compiler::Types;
+import Compiler::Types::Substitution;
+import Compiler::Resolver::InternTable;
+
+
+// ============================================================================
+// ASTTypeSubstituter — Rewrites type annotations and names on a cloned AST
+// ============================================================================
+
+type class ASTTypeSubstituter : BaseASTVisitor {
+public:
+    subst:             TypeSubstitution*;
+    arena:             TypeArena*;
+    intern_table:      InternTable*;
+    base_name:         string;            // "Array"
+    spec_name:         string;            // "Array_i32"
+    param_names:       string[];          // ["T"]
+    type_arg_displays: string[];          // ["i32"]
+
+    ASTTypeSubstituter(subst: TypeSubstitution*, arena: TypeArena*,
+                       intern_table: InternTable*,
+                       base_name: string, spec_name: string,
+                       param_names: string[], type_arg_displays: string[])
+        : BaseASTVisitor() {
+        this.subst             = subst;
+        this.arena             = arena;
+        this.intern_table      = intern_table;
+        this.base_name         = base_name;
+        this.spec_name         = spec_name;
+        this.param_names       = param_names;
+        this.type_arg_displays = type_arg_displays;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Type annotation substitution
+    // ----------------------------------------------------------------
+
+    /// Substitute type parameters in a type annotation.
+    /// Returns a new annotation if changes were made, or the original if not.
+    substitute_annotation(ann: TypeAnnotation*) -> TypeAnnotation* {
+        if (ann == null) { return null; }
+
+        match (*ann) {
+            TypeAnnotation::Named(named) => {
+                return this.substitute_named_annotation(ann, named);
+            }
+            TypeAnnotation::Primitive(prim) => {
+                // Primitives never contain generic params
+                return ann;
+            }
+            TypeAnnotation::Pointer(ptr) => {
+                const new_inner: TypeAnnotation* = this.substitute_annotation(ptr.inner);
+                if (new_inner == ptr.inner) { return ann; }
+                const new_ptr: PointerAnnotation* = malloc(sizeof(PointerAnnotation));
+                *new_ptr = PointerAnnotation { inner: new_inner, span: ptr.span };
+                const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+                *result = TypeAnnotation::Pointer(new_ptr);
+                return result;
+            }
+            TypeAnnotation::Reference(ref) => {
+                const new_inner: TypeAnnotation* = this.substitute_annotation(ref.inner);
+                if (new_inner == ref.inner) { return ann; }
+                const new_ref: ReferenceAnnotation* = malloc(sizeof(ReferenceAnnotation));
+                *new_ref = ReferenceAnnotation {
+                    inner: new_inner, is_mutable: ref.is_mutable, span: ref.span
+                };
+                const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+                *result = TypeAnnotation::Reference(new_ref);
+                return result;
+            }
+            TypeAnnotation::Array(arr) => {
+                const new_elem: TypeAnnotation* = this.substitute_annotation(arr.element);
+                if (new_elem == arr.element) { return ann; }
+                const new_arr: ArrayAnnotation* = malloc(sizeof(ArrayAnnotation));
+                *new_arr = ArrayAnnotation {
+                    element: new_elem, size: arr.size, span: arr.span
+                };
+                const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+                *result = TypeAnnotation::Array(new_arr);
+                return result;
+            }
+            TypeAnnotation::Optional(opt) => {
+                const new_inner: TypeAnnotation* = this.substitute_annotation(opt.inner);
+                if (new_inner == opt.inner) { return ann; }
+                const new_opt: OptionalAnnotation* = malloc(sizeof(OptionalAnnotation));
+                *new_opt = OptionalAnnotation { inner: new_inner, span: opt.span };
+                const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+                *result = TypeAnnotation::Optional(new_opt);
+                return result;
+            }
+            TypeAnnotation::Function(func) => {
+                return this.substitute_function_annotation(ann, func);
+            }
+            TypeAnnotation::Tuple(tup) => {
+                return this.substitute_tuple_annotation(ann, tup);
+            }
+            TypeAnnotation::Generic(gen) => {
+                return this.substitute_generic_annotation(ann, gen);
+            }
+        }
+
+        return ann;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Annotation substitution helpers
+    // ----------------------------------------------------------------
+
+    substitute_named_annotation(ann: TypeAnnotation*, named: NamedAnnotation*) -> TypeAnnotation* {
+        // Check if this named annotation is one of our generic params
+        for (mut i: i64 = 0; i < this.param_names.length; i++) {
+            if (named.name == this.param_names[i]) {
+                // Replace with the concrete type display name
+                const concrete_name: string = this.type_arg_displays[i];
+                // Create a new Named annotation with the concrete type name
+                const new_named: NamedAnnotation* = malloc(sizeof(NamedAnnotation));
+                *new_named = NamedAnnotation { name: concrete_name, span: named.span };
+                const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+                *result = TypeAnnotation::Named(new_named);
+                return result;
+            }
+        }
+        return ann;
+    }
+
+    substitute_function_annotation(ann: TypeAnnotation*, func: FunctionAnnotation*) -> TypeAnnotation* {
+        mut changed: boolean = false;
+        mut new_params: TypeAnnotation*[] = [];
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const new_p: TypeAnnotation* = this.substitute_annotation(func.parameters[i]);
+            new_params = new_params + [new_p];
+            if (new_p != func.parameters[i]) { changed = true; }
+        }
+        const new_ret: TypeAnnotation* = this.substitute_annotation(func.return_type);
+        if (new_ret != func.return_type) { changed = true; }
+        if (!changed) { return ann; }
+        const new_func: FunctionAnnotation* = malloc(sizeof(FunctionAnnotation));
+        *new_func = FunctionAnnotation {
+            parameters: new_params, return_type: new_ret, span: func.span
+        };
+        const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+        *result = TypeAnnotation::Function(new_func);
+        return result;
+    }
+
+    substitute_tuple_annotation(ann: TypeAnnotation*, tup: TupleAnnotation*) -> TypeAnnotation* {
+        mut changed: boolean = false;
+        mut new_elems: TypeAnnotation*[] = [];
+        for (mut i: i64 = 0; i < tup.elements.length; i++) {
+            const new_e: TypeAnnotation* = this.substitute_annotation(tup.elements[i]);
+            new_elems = new_elems + [new_e];
+            if (new_e != tup.elements[i]) { changed = true; }
+        }
+        if (!changed) { return ann; }
+        const new_tup: TupleAnnotation* = malloc(sizeof(TupleAnnotation));
+        *new_tup = TupleAnnotation { elements: new_elems, span: tup.span };
+        const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+        *result = TypeAnnotation::Tuple(new_tup);
+        return result;
+    }
+
+    substitute_generic_annotation(ann: TypeAnnotation*, gen: GenericAnnotation*) -> TypeAnnotation* {
+        const new_base: TypeAnnotation* = this.substitute_annotation(gen.base);
+        mut new_args: TypeAnnotation*[] = [];
+        for (mut i: i64 = 0; i < gen.args.length; i++) {
+            new_args = new_args + [this.substitute_annotation(gen.args[i])];
+        }
+        const new_gen: GenericAnnotation* = malloc(sizeof(GenericAnnotation));
+        *new_gen = GenericAnnotation { base: new_base, args: new_args, span: gen.span };
+        const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+        *result = TypeAnnotation::Generic(new_gen);
+        return result;
+    }
+
+
+    // ----------------------------------------------------------------
+    // String-level generic_args substitution
+    // ----------------------------------------------------------------
+
+    /// Substitute generic arg strings: replaces param names with concrete display names.
+    substitute_generic_args(args: string[]) -> string[] {
+        mut result: string[] = [];
+        for (mut i: i64 = 0; i < args.length; i++) {
+            mut replaced: boolean = false;
+            for (mut j: i64 = 0; j < this.param_names.length; j++) {
+                if (args[i] == this.param_names[j]) {
+                    result = result + [this.type_arg_displays[j]];
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                result = result + [args[i]];
+            }
+        }
+        return result;
+    }
+
+
+    // ================================================================
+    // Declaration visitors — rename + substitute annotations
+    // ================================================================
+
+    override visit(node: StructDeclNode*) -> void {
+        // Rename to specialized name
+        if (node.name == this.base_name) {
+            node.name = this.spec_name;
+        }
+        // Clear generic params — this is now a concrete type
+        node.generic_params = [];
+        // Substitute field type annotations
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            this.visit_field_decl(node.fields[i]);
+        }
+        // Substitute method annotations
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            node.methods[i].accept(this);
+        }
+    }
+
+    override visit(node: ClassDeclNode*) -> void {
+        if (node.name == this.base_name) {
+            node.name = this.spec_name;
+        }
+        node.generic_params = [];
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            this.visit_field_decl(node.fields[i]);
+        }
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            node.methods[i].accept(this);
+        }
+    }
+
+    override visit(node: EnumDeclNode*) -> void {
+        if (node.name == this.base_name) {
+            node.name = this.spec_name;
+        }
+        node.generic_params = [];
+        for (mut i: i64 = 0; i < node.variants.length; i++) {
+            node.variants[i].accept(this);
+        }
+    }
+
+    override visit(node: EnumVariantNode*) -> void {
+        // Substitute associated type strings
+        mut new_types: string[] = [];
+        for (mut i: i64 = 0; i < node.associated_types.length; i++) {
+            mut replaced: boolean = false;
+            for (mut j: i64 = 0; j < this.param_names.length; j++) {
+                if (node.associated_types[i] == this.param_names[j]) {
+                    new_types = new_types + [this.type_arg_displays[j]];
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                new_types = new_types + [node.associated_types[i]];
+            }
+        }
+        node.associated_types = new_types;
+    }
+
+    override visit(node: FunctionDeclNode*) -> void {
+        // Substitute parameter type annotations
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            this.visit_var_decl(node.parameters[i]);
+        }
+        // Substitute return type annotation
+        if (node.return_type_annotation != null) {
+            node.return_type_annotation = this.substitute_annotation(node.return_type_annotation);
+        }
+        // Clear generic params if this function's generics match the type's
+        // (leave function-level generics that are separate from the type's)
+        // Recurse into body
+        if (node.has_body()) {
+            node.body.accept(this);
+        }
+    }
+
+    override visit(node: MethodNode*) -> void {
+        // Delegate to function
+        node.func.accept(this);
+        // Substitute base_ctor_args expressions
+        for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
+            node.base_ctor_args[i].accept(this);
+        }
+    }
+
+    override visit(node: VarDeclNode*) -> void {
+        this.visit_var_decl(node);
+    }
+
+    override visit(node: FieldDeclNode*) -> void {
+        this.visit_field_decl(node);
+    }
+
+    override visit(node: ImplBlockNode*) -> void {
+        // Rename target_type if it matches
+        if (node.target_type == this.base_name) {
+            node.target_type = this.spec_name;
+        }
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            this.visit_field_decl(node.fields[i]);
+        }
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            node.methods[i].accept(this);
+        }
+    }
+
+    override visit(node: TypeAliasDeclNode*) -> void {
+        if (node.target_annotation != null) {
+            node.target_annotation = this.substitute_annotation(node.target_annotation);
+        }
+        node.generic_params = [];
+    }
+
+    override visit(node: TraitDeclNode*) -> void {
+        node.generic_params = [];
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            node.methods[i].accept(this);
+        }
+    }
+
+    override visit(node: CastExprNode*) -> void {
+        node.expression.accept(this);
+        if (node.target_annotation != null) {
+            node.target_annotation = this.substitute_annotation(node.target_annotation);
+        }
+    }
+
+
+    // ================================================================
+    // Expression visitors — rewrite generic_args
+    // ================================================================
+
+    override visit(node: CallExprNode*) -> void {
+        node.callee.accept(this);
+        for (mut i: i64 = 0; i < node.arguments.length; i++) {
+            node.arguments[i].accept(this);
+        }
+        if (node.generic_args.length > 0) {
+            node.generic_args = this.substitute_generic_args(node.generic_args);
+        }
+    }
+
+    override visit(node: NewExprNode*) -> void {
+        if (node.type_name == this.base_name) {
+            node.type_name = this.spec_name;
+        }
+        for (mut i: i64 = 0; i < node.arguments.length; i++) {
+            node.arguments[i].accept(this);
+        }
+        if (node.generic_args.length > 0) {
+            node.generic_args = this.substitute_generic_args(node.generic_args);
+        }
+        if (node.array_size != null) {
+            node.array_size.accept(this);
+        }
+    }
+
+    override visit(node: StructLiteralNode*) -> void {
+        if (node.struct_type == this.base_name) {
+            node.struct_type = this.spec_name;
+        }
+        if (node.generic_args.length > 0) {
+            node.generic_args = this.substitute_generic_args(node.generic_args);
+        }
+        for (mut i: i64 = 0; i < node.field_inits.length; i++) {
+            const val: ExpressionNode* = node.field_inits[i].value as ExpressionNode*;
+            if (val != null) {
+                val.accept(this);
+            }
+        }
+    }
+
+    override visit(node: ScopeResolutionNode*) -> void {
+        if (node.scope_name == this.base_name) {
+            node.scope_name = this.spec_name;
+        }
+        if (node.generic_args.length > 0) {
+            node.generic_args = this.substitute_generic_args(node.generic_args);
+        }
+    }
+
+    override visit(node: SizeofExprNode*) -> void {
+        for (mut i: i64 = 0; i < this.param_names.length; i++) {
+            if (node.type_name == this.param_names[i]) {
+                node.type_name = this.type_arg_displays[i];
+                break;
+            }
+        }
+        if (node.type_name == this.base_name) {
+            node.type_name = this.spec_name;
+        }
+    }
+
+    override visit(node: AlignofExprNode*) -> void {
+        for (mut i: i64 = 0; i < this.param_names.length; i++) {
+            if (node.type_name == this.param_names[i]) {
+                node.type_name = this.type_arg_displays[i];
+                break;
+            }
+        }
+        if (node.type_name == this.base_name) {
+            node.type_name = this.spec_name;
+        }
+    }
+
+
+    // ================================================================
+    // Statement visitors — recurse into children
+    // ================================================================
+
+    override visit(node: BlockStmtNode*) -> void {
+        for (mut i: i64 = 0; i < node.statements.length; i++) {
+            node.statements[i].accept(this);
+        }
+    }
+
+    override visit(node: UnsafeBlockStmtNode*) -> void {
+        node.block.accept(this);
+    }
+
+    override visit(node: ReturnStmtNode*) -> void {
+        if (node.expression != null) {
+            node.expression.accept(this);
+        }
+    }
+
+    override visit(node: IfStmtNode*) -> void {
+        node.condition.accept(this);
+        node.then_stmt.accept(this);
+        if (node.else_stmt != null) {
+            node.else_stmt.accept(this);
+        }
+    }
+
+    override visit(node: WhileStmtNode*) -> void {
+        node.condition.accept(this);
+        node.body.accept(this);
+    }
+
+    override visit(node: DoWhileStmtNode*) -> void {
+        node.body.accept(this);
+        node.condition.accept(this);
+    }
+
+    override visit(node: ForStmtNode*) -> void {
+        if (node.init != null) { node.init.accept(this); }
+        if (node.condition != null) { node.condition.accept(this); }
+        if (node.update != null) { node.update.accept(this); }
+        node.body.accept(this);
+    }
+
+    override visit(node: MatchStmtNode*) -> void {
+        node.subject.accept(this);
+        for (mut i: i64 = 0; i < node.arms.length; i++) {
+            node.arms[i].accept(this);
+        }
+    }
+
+    override visit(node: SwitchStmtNode*) -> void {
+        node.expression.accept(this);
+        for (mut i: i64 = 0; i < node.cases.length; i++) {
+            node.cases[i].accept(this);
+        }
+    }
+
+    override visit(node: CaseStmtNode*) -> void {
+        if (node.value != null) { node.value.accept(this); }
+        node.body.accept(this);
+    }
+
+    override visit(node: ExprStmtNode*) -> void {
+        node.expression.accept(this);
+    }
+
+    override visit(node: DeclStmtNode*) -> void {
+        node.declaration.accept(this);
+    }
+
+    // Remaining expression visitors — recurse into children
+
+    override visit(node: BinaryExprNode*) -> void {
+        node.left.accept(this);
+        node.right.accept(this);
+    }
+
+    override visit(node: UnaryExprNode*) -> void {
+        node.operand.accept(this);
+    }
+
+    override visit(node: TernaryExprNode*) -> void {
+        node.condition.accept(this);
+        node.true_expr.accept(this);
+        node.false_expr.accept(this);
+    }
+
+    override visit(node: IfExprNode*) -> void {
+        node.condition.accept(this);
+        node.then_expr.accept(this);
+        if (node.else_expr != null) {
+            node.else_expr.accept(this);
+        }
+    }
+
+    override visit(node: MatchExprNode*) -> void {
+        node.subject.accept(this);
+        for (mut i: i64 = 0; i < node.arms.length; i++) {
+            node.arms[i].accept(this);
+        }
+    }
+
+    override visit(node: ArrayLiteralNode*) -> void {
+        for (mut i: i64 = 0; i < node.elements.length; i++) {
+            node.elements[i].accept(this);
+        }
+        // Substitute element_type string
+        for (mut i: i64 = 0; i < this.param_names.length; i++) {
+            if (node.element_type == this.param_names[i]) {
+                node.element_type = this.type_arg_displays[i];
+                break;
+            }
+        }
+        if (node.repeat_count_expr != null) {
+            node.repeat_count_expr.accept(this);
+        }
+    }
+
+    override visit(node: TupleLiteralNode*) -> void {
+        for (mut i: i64 = 0; i < node.elements.length; i++) {
+            node.elements[i].accept(this);
+        }
+    }
+
+    override visit(node: LambdaExprNode*) -> void {
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            this.visit_var_decl(node.parameters[i]);
+        }
+        if (node.body != null) {
+            node.body.accept(this);
+        }
+    }
+
+    override visit(node: ArrayAccessNode*) -> void {
+        node.array.accept(this);
+        node.index.accept(this);
+    }
+
+    override visit(node: MemberAccessNode*) -> void {
+        node.object.accept(this);
+    }
+
+    override visit(node: MatchArmNode*) -> void {
+        if (node.body != null) {
+            node.body.accept(this);
+        }
+    }
+
+
+    // ================================================================
+    // Internal helpers
+    // ================================================================
+
+    visit_var_decl(node: VarDeclNode*) -> void {
+        if (node.type_annotation != null) {
+            node.type_annotation = this.substitute_annotation(node.type_annotation);
+        }
+        if (node.initializer != null) {
+            node.initializer.accept(this);
+        }
+    }
+
+    visit_field_decl(node: FieldDeclNode*) -> void {
+        if (node.type_annotation != null) {
+            node.type_annotation = this.substitute_annotation(node.type_annotation);
+        }
+        if (node.default_value != null) {
+            node.default_value.accept(this);
+        }
+    }
+}

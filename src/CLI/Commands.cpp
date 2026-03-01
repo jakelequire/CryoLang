@@ -824,10 +824,9 @@ namespace Cryo::CLI::Commands
             }
 
             main_file << "namespace Main;\n\n";
-            main_file << "import IO from <io/stdio>\n\n";
             main_file << "\n";
             main_file << "function main() -> int {\n";
-            main_file << "    IO::println(\"Hello, world!\");\n";
+            main_file << "    println(\"Hello, world!\");\n";
             main_file << "    return 0;\n";
             main_file << "}\n";
 
