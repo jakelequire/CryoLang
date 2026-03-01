@@ -1406,8 +1406,9 @@ namespace Cryo::Codegen
         std::string name = node->name();
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "DeclarationCodegen: Generating global variable: {}", name);
 
-        // Check if already exists
-        if (llvm::GlobalVariable *existing = module()->getGlobalVariable(name))
+        // Check if already exists (AllowInternal=true to also find private/internal globals
+        // that may have been created by GenericCodegen for forwarded constants)
+        if (llvm::GlobalVariable *existing = module()->getGlobalVariable(name, /*AllowInternal=*/true))
         {
             // If it exists but is just an external declaration (no initializer),
             // we should update it with the actual initializer
