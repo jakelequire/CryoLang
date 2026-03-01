@@ -4608,6 +4608,10 @@ namespace Cryo::Codegen
                                                     else
                                                     {
                                                         type_name = annotation;
+                                                        // Strip pointer/reference suffix for method resolution
+                                                        // (e.g., "DiagRenderer*" -> "DiagRenderer")
+                                                        if (!type_name.empty() && (type_name.back() == '*' || type_name.back() == '&'))
+                                                            type_name.pop_back();
                                                     }
                                                 }
 
@@ -4669,6 +4673,9 @@ namespace Cryo::Codegen
                                                     if (!ann.empty())
                                                     {
                                                         type_name = ann;
+                                                        // Strip pointer/reference suffix for method resolution
+                                                        if (!type_name.empty() && (type_name.back() == '*' || type_name.back() == '&'))
+                                                            type_name.pop_back();
                                                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                                                   "Resolved field type from annotation: {}.{} -> {}",
                                                                   candidate, member_name, type_name);

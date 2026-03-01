@@ -37,7 +37,9 @@ public:
     artifacts: PhaseArtifacts;
 
     // -- Diagnostics --
-    diagnostics: DiagnosticSink;
+    diagnostics:    DiagnosticSink;
+    diag_renderer:  DiagRenderer*;
+    diag_config:    DiagConfig;
 
     // -- Pass tracking --
     provisions: ProvisionSet;
@@ -69,18 +71,24 @@ private:
 public:
     /// Create a new compilation context for the given mode and source file.
     static new(mode: CompileMode, source_file: string) -> CompilationContext {
-        return CompilationContext {
+        // Create the diagnostic renderer on the heap so it outlives this scope.
+        const renderer: DiagRenderer* = malloc(sizeof(DiagRenderer));
+        *renderer = DiagRenderer::new(RenderConfig::default());
+
+        mut ctx: CompilationContext = CompilationContext {
             mode:              mode,
             source_file:       source_file,
             include_paths:     [],
             debug_mode:        false,
             current_namespace: "",
 
-            artifacts:     PhaseArtifacts::new(),
-            diagnostics:   DiagnosticSink::new(),
-            provisions:    ProvisionSet::empty(),
-            module_graph:  ModuleGraph::new(),
-            intern_table:  InternTable::new(),
+            artifacts:      PhaseArtifacts::new(),
+            diagnostics:    DiagnosticSink::new(),
+            diag_renderer:  renderer,
+            diag_config:    DiagConfig::default(),
+            provisions:     ProvisionSet::empty(),
+            module_graph:   ModuleGraph::new(),
+            intern_table:   InternTable::new(),
 
             lexer:              null,
             parser:             null,
@@ -97,6 +105,11 @@ public:
             linker:             null,
             directive_registry: null,
         };
+
+        // Wire the renderer and config into the sink
+        ctx.diagnostics.set_renderer(renderer);
+        ctx.diagnostics.set_config(ctx.diag_config);
+        return ctx;
     }
 
     /// Create a debug context with verbose logging.
@@ -173,20 +186,48 @@ public:
     // ----------------------------------------------------------------
 
     /// Emit an error diagnostic.
-    emit_error(mut &this, code: u32, message: string) -> void {
+    emit_error(mut &this, code: ErrorCode, message: string) -> void {
         this.diagnostics.emit(Diagnostic::error(code, message));
     }
 
     /// Emit a warning diagnostic.
-    emit_warning(mut &this, code: u32, message: string) -> void {
+    emit_warning(mut &this, code: ErrorCode, message: string) -> void {
         this.diagnostics.emit(Diagnostic::warning(code, message));
     }
 
     /// Emit an error with source location.
-    emit_error_at(mut &this, code: u32, message: string, span: SourceSpan) -> void {
+    emit_error_at(mut &this, code: ErrorCode, message: string, span: SourceSpan) -> void {
         mut diag: Diagnostic = Diagnostic::error(code, message);
         diag = diag.at(span);
         this.diagnostics.emit(diag);
+    }
+
+    /// Emit a note diagnostic.
+    emit_note(mut &this, code: ErrorCode, message: string) -> void {
+        this.diagnostics.emit(Diagnostic::note(code, message));
+    }
+
+    /// Emit a help message (code E0000, severity Help).
+    emit_help(mut &this, message: string) -> void {
+        const diag: Diagnostic = Diagnostic {
+            severity:    Severity::Help,
+            code:        ErrorCode::E0000_UNKNOWN,
+            message:     message,
+            span:        SourceSpan::none(),
+            labels:      [],
+            children:    [],
+            suggestions: [],
+        };
+        this.diagnostics.emit(diag);
+    }
+
+    /// Internal compiler error: emit, print help, and abort.
+    ice(mut &this, message: string) -> void {
+        const ice_msg: string = sprintf("internal compiler error: %s", message);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR, ice_msg);
+        diag = diag.help("please report this bug");
+        this.diagnostics.emit(diag);
+        exit(1);
     }
 
     /// Whether any errors have been emitted.

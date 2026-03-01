@@ -1,0 +1,128 @@
+///! LSP Diagnostics
+///!
+///! Structured diagnostic output for language server integration.
+///! Maps internal Diagnostic structs to the LSP Diagnostic protocol types.
+
+namespace Compiler::Diag::Lsp;
+
+
+/// A range in a document (0-indexed, matching LSP spec).
+type struct LspRange {
+    start_line:   u32;
+    start_char:   u32;
+    end_line:     u32;
+    end_char:     u32;
+
+    /// Create from a SourceSpan (converts 1-indexed to 0-indexed).
+    static from_span(span: SourceSpan) -> LspRange {
+        mut sl: u32 = 0;
+        mut sc: u32 = 0;
+        mut el: u32 = 0;
+        mut ec: u32 = 0;
+        if (span.start_line > 0) { sl = span.start_line - 1; }
+        if (span.start_col > 0)  { sc = span.start_col - 1;  }
+        if (span.end_line > 0)   { el = span.end_line - 1;   }
+        if (span.end_col > 0)    { ec = span.end_col - 1;    }
+        return LspRange {
+            start_line: sl,
+            start_char: sc,
+            end_line:   el,
+            end_char:   ec,
+        };
+    }
+}
+
+
+/// Related information attached to an LSP diagnostic.
+type struct LspRelatedInfo {
+    uri:     string;
+    range:   LspRange;
+    message: string;
+
+    static new(uri: string, range: LspRange, message: string) -> LspRelatedInfo {
+        return LspRelatedInfo {
+            uri:     uri,
+            range:   range,
+            message: message,
+        };
+    }
+}
+
+
+/// An LSP-compatible diagnostic.
+type struct LspDiagnostic {
+    uri:       string;
+    range:     LspRange;
+    severity:  string;
+    code:      string;
+    message:   string;
+    related:   LspRelatedInfo[];
+
+    static new(uri: string, range: LspRange, severity: string,
+               code: string, message: string) -> LspDiagnostic {
+        return LspDiagnostic {
+            uri:      uri,
+            range:    range,
+            severity: severity,
+            code:     code,
+            message:  message,
+            related:  [],
+        };
+    }
+}
+
+
+/// Convert a Severity to LSP severity string.
+function severity_to_lsp(sev: Severity) -> string {
+    return match (sev) {
+        Severity::Error   => { "error"       }
+        Severity::Warning => { "warning"     }
+        Severity::Note    => { "information" }
+        Severity::Help    => { "hint"        }
+    };
+}
+
+
+/// Convert a single Diagnostic to an LspDiagnostic.
+function diagnostic_to_lsp(diag: Diagnostic) -> LspDiagnostic {
+    const range: LspRange = LspRange::from_span(diag.span);
+    const sev_str: string = severity_to_lsp(diag.severity);
+    const code_str: string = diag.code.format();
+
+    mut lsp_diag: LspDiagnostic = LspDiagnostic::new(
+        diag.span.file, range, sev_str, code_str, diag.message);
+
+    // Convert secondary labels to related info
+    for (mut i: int = 0; i < diag.labels.length; i++) {
+        const label: SpanLabel = diag.labels[i];
+        if (!label.is_primary && label.span.has_location()) {
+            const rel_range: LspRange = LspRange::from_span(label.span);
+            const rel: LspRelatedInfo = LspRelatedInfo::new(
+                label.span.file, rel_range, label.message);
+            lsp_diag.related = lsp_diag.related + [rel];
+        }
+    }
+
+    // Convert children to related info
+    for (mut i: int = 0; i < diag.children.length; i++) {
+        const child: Diagnostic = diag.children[i];
+        if (child.span.has_location()) {
+            const child_range: LspRange = LspRange::from_span(child.span);
+            const rel: LspRelatedInfo = LspRelatedInfo::new(
+                child.span.file, child_range, child.message);
+            lsp_diag.related = lsp_diag.related + [rel];
+        }
+    }
+
+    return lsp_diag;
+}
+
+
+/// Convert an array of Diagnostics to LSP diagnostics.
+function diagnostics_to_lsp(diagnostics: Diagnostic[]) -> LspDiagnostic[] {
+    mut result: LspDiagnostic[] = [];
+    for (mut i: int = 0; i < diagnostics.length; i++) {
+        result = result + [diagnostic_to_lsp(diagnostics[i])];
+    }
+    return result;
+}

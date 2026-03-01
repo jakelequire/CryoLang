@@ -1,0 +1,542 @@
+///! DiagRenderer
+///!
+///! Rich diagnostic renderer that produces rustc-style terminal output with
+///! ANSI colors, source snippets, caret underlines, secondary spans, child
+///! diagnostics, and suggestions.
+///!
+///! All output goes to stderr via fprintf(g_stderr, ...) to keep stdout
+///! clean for LSP/JSON-RPC.
+
+namespace Compiler::Diag::Renderer;
+
+import Utils;
+import Utils::File;
+
+
+// ============================================================================
+// ANSI Color Codes
+// ============================================================================
+
+const ANSI_RESET:   string = "\033[0m";
+const ANSI_BOLD:    string = "\033[1m";
+const ANSI_RED:     string = "\033[91m";
+const ANSI_YELLOW:  string = "\033[93m";
+const ANSI_CYAN:    string = "\033[96m";
+const ANSI_BLUE:    string = "\033[94m";
+const ANSI_GREEN:   string = "\033[92m";
+const ANSI_WHITE:   string = "\033[97m";
+const ANSI_GREY:    string = "\033[90m";
+
+
+// ============================================================================
+// RenderConfig
+// ============================================================================
+
+/// Configuration for the diagnostic renderer.
+type struct RenderConfig {
+    colors:             boolean;
+    context_lines:      u32;
+    max_errors:         u32;
+    warnings_as_errors: boolean;
+
+    /// Default config: colors on, 2 context lines, 50 max errors.
+    static default() -> RenderConfig {
+        return RenderConfig {
+            colors:             true,
+            context_lines:      2,
+            max_errors:         50,
+            warnings_as_errors: false,
+        };
+    }
+
+    /// Plain config: no colors, for redirected output or tests.
+    static plain() -> RenderConfig {
+        return RenderConfig {
+            colors:             false,
+            context_lines:      2,
+            max_errors:         50,
+            warnings_as_errors: false,
+        };
+    }
+}
+
+
+// ============================================================================
+// DiagRenderer
+// ============================================================================
+
+/// Renders diagnostics to stderr with source snippets and ANSI colors.
+type struct DiagRenderer {
+    config:          RenderConfig;
+    cached_files:    string[];
+    cached_contents: string[];
+
+    static new(config: RenderConfig) -> DiagRenderer {
+        return DiagRenderer {
+            config:          config,
+            cached_files:    [],
+            cached_contents: [],
+        };
+    }
+
+    /// Load a source file into the cache.  Returns true if the file was
+    /// loaded (or was already cached).
+    load_source(mut &this, filepath: string) -> boolean {
+        if (this.has_source(filepath)) {
+            return true;
+        }
+
+        if (!File::exists(filepath)) {
+            return false;
+        }
+
+        const file: File = File::new(filepath);
+        
+        // TODO: Linker error, cannot find `is_err` method on `Result` in this context.  Need to investigate.
+        // const result: Result<boolean, string> = file.load(&file);
+        // if (result.is_err()) {
+        //     return false;
+        // }
+
+        this.cached_files    = this.cached_files + [filepath];
+        this.cached_contents = this.cached_contents + [file.content];
+        return true;
+    }
+
+    /// Check whether a file is already in the source cache.
+    has_source(&this, filepath: string) -> boolean {
+        for (mut i: int = 0; i < this.cached_files.length; i++) {
+            if (this.cached_files[i] == filepath) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Get the content of a cached source file, or "" if not cached.
+    get_content(&this, filepath: string) -> string {
+        for (mut i: int = 0; i < this.cached_files.length; i++) {
+            if (this.cached_files[i] == filepath) {
+                return this.cached_contents[i];
+            }
+        }
+        return "";
+    }
+
+    /// Extract a single line (1-indexed) from a cached source file.
+    /// Returns "" if the file is not cached or the line doesn't exist.
+    get_line(&this, filepath: string, line_num: u32) -> string {
+        const content: string = this.get_content(filepath);
+        if (content == "") {
+            return "";
+        }
+
+        const content_len: i64 = strlen(content) as i64;
+
+        // Walk through the content counting newlines to find the target line.
+        // Lines are 1-indexed.
+        mut current_line: u32 = 1;
+        mut line_start: i64 = 0;
+
+        // If the target is line 1, line_start is already 0.
+        // Otherwise, advance past newlines until we reach the target line.
+        if (line_num > 1) {
+            for (mut pos: i64 = 0; pos < content_len; pos++) {
+                const ch: i8* = ptr_add(content as void*, pos) as i8*;
+                if (*ch == 10) {  // '\n' = ASCII 10
+                    current_line = current_line + 1;
+                    if (current_line == line_num) {
+                        line_start = pos + 1;
+                        break;
+                    }
+                }
+            }
+            // If we didn't reach the target line, it doesn't exist.
+            if (current_line < line_num) {
+                return "";
+            }
+        }
+
+        // Find the end of this line (next newline or end of content).
+        mut line_end: i64 = content_len;
+        for (mut pos: i64 = line_start; pos < content_len; pos++) {
+            const ch: i8* = ptr_add(content as void*, pos) as i8*;
+            if (*ch == 10) {  // '\n'
+                line_end = pos;
+                break;
+            }
+        }
+
+        // Handle trailing '\r' for CRLF line endings.
+        if (line_end > line_start) {
+            const prev: i8* = ptr_add(content as void*, line_end - 1) as i8*;
+            if (*prev == 13) {  // '\r' = ASCII 13
+                line_end = line_end - 1;
+            }
+        }
+
+        const line_len: i64 = line_end - line_start;
+        if (line_len <= 0) {
+            return "";
+        }
+
+        // Copy the line into a new buffer.
+        const buf: i8* = malloc(line_len + 1);
+        if (buf == null) {
+            return "";
+        }
+        const src: i8* = ptr_add(content as void*, line_start) as i8*;
+        memcpy(buf as void*, src as void*, line_len as u64);
+        const term: i8* = ptr_add(buf as void*, line_len) as i8*;
+        memset(term as void*, 0, 1);
+
+        return buf as string;
+    }
+
+
+    // ================================================================
+    // Color helpers
+    // ================================================================
+
+    color_reset(&this) -> string {
+        return if (this.config.colors) { ANSI_RESET } else { "" };
+    }
+
+    color_bold(&this) -> string {
+        return if (this.config.colors) { ANSI_BOLD } else { "" };
+    }
+
+    color_red(&this) -> string {
+        return if (this.config.colors) { ANSI_RED } else { "" };
+    }
+
+    color_yellow(&this) -> string {
+        return if (this.config.colors) { ANSI_YELLOW } else { "" };
+    }
+
+    color_cyan(&this) -> string {
+        return if (this.config.colors) { ANSI_CYAN } else { "" };
+    }
+
+    color_blue(&this) -> string {
+        return if (this.config.colors) { ANSI_BLUE } else { "" };
+    }
+
+    color_green(&this) -> string {
+        return if (this.config.colors) { ANSI_GREEN } else { "" };
+    }
+
+    color_white(&this) -> string {
+        return if (this.config.colors) { ANSI_WHITE } else { "" };
+    }
+
+    color_grey(&this) -> string {
+        return if (this.config.colors) { ANSI_GREY } else { "" };
+    }
+
+    /// Return the ANSI color code for a given severity level.
+    severity_color(&this, sev: Severity) -> string {
+        return match (sev) {
+            Severity::Error   => { this.color_red()    }
+            Severity::Warning => { this.color_yellow() }
+            Severity::Note    => { this.color_cyan()   }
+            Severity::Help    => { this.color_green()  }
+        };
+    }
+
+
+    // ================================================================
+    // Rendering
+    // ================================================================
+
+    /// Render a diagnostic to stderr.
+    render(mut &this, diag: Diagnostic) -> void {
+        // 1. Header line:  error[E0200]: message
+        this.render_header(diag);
+
+        // 2. Primary span snippet (if present)
+        if (diag.span.has_location()) {
+            this.load_source(diag.span.file);
+            this.render_snippet(diag.span, diag.severity, diag.message);
+        }
+
+        // 3. Secondary span labels
+        for (mut i: int = 0; i < diag.labels.length; i++) {
+            const label: SpanLabel = diag.labels[i];
+            if (!label.is_primary && label.span.has_location()) {
+                this.load_source(label.span.file);
+                this.render_secondary_span(label);
+            }
+        }
+
+        // 4. Children (notes, helps)
+        for (mut i: int = 0; i < diag.children.length; i++) {
+            const child: Diagnostic = diag.children[i];
+            this.render_child(child);
+        }
+
+        // 5. Suggestions
+        for (mut i: int = 0; i < diag.suggestions.length; i++) {
+            const sug: Suggestion = diag.suggestions[i];
+            this.render_suggestion(sug);
+        }
+
+        // Trailing blank line for separation
+        fprintf(g_stderr, "\n");
+    }
+
+    /// Render the header line:  error[E0200]: message
+    render_header(&this, diag: Diagnostic) -> void {
+        const sev_color: string = this.severity_color(diag.severity);
+        const bold: string = this.color_bold();
+        const reset: string = this.color_reset();
+        const white: string = this.color_white();
+
+        fprintf(g_stderr, "%s%s%s%s[%s]%s: %s%s%s\n",
+            bold, sev_color,
+            diag.severity.label(),
+            reset,
+            diag.code.format(),
+            reset,
+            bold, white,
+            diag.message);
+        // Final reset after message
+        fprintf(g_stderr, "%s", reset);
+    }
+
+    /// Render a source snippet with caret underline for the primary span.
+    render_snippet(mut &this, span: SourceSpan, severity: Severity, message: string) -> void {
+        const blue: string  = this.color_blue();
+        const reset: string = this.color_reset();
+        const bold: string  = this.color_bold();
+        const grey: string  = this.color_grey();
+
+        // Arrow line:  --> file:line:col
+        fprintf(g_stderr, " %s%s-->%s %s:%u:%u\n",
+            bold, blue, reset,
+            span.file, span.start_line, span.start_col);
+
+        // Calculate line number width (minimum 3)
+        mut line_width: u32 = 3;
+        if (span.start_line > 999) {
+            line_width = 4;
+        }
+        if (span.start_line > 9999) {
+            line_width = 5;
+        }
+
+        // Top margin
+        this.render_margin(line_width);
+
+        // Context lines before
+        const ctx: u32 = this.config.context_lines;
+        mut first_line: u32 = span.start_line;
+        if (first_line > ctx) {
+            first_line = first_line - ctx;
+        } else {
+            first_line = 1;
+        }
+
+        // Render context lines before the error
+        for (mut ln: u32 = first_line; ln < span.start_line; ln++) {
+            const line_text: string = this.get_line(span.file, ln);
+            fprintf(g_stderr, " %s%*u%s %s|%s %s\n",
+                grey, line_width, ln, reset,
+                blue, reset,
+                line_text);
+        }
+
+        // Render the error line
+        const error_line: string = this.get_line(span.file, span.start_line);
+        fprintf(g_stderr, " %s%s%*u%s %s|%s %s\n",
+            bold, blue, line_width, span.start_line, reset,
+            blue, reset,
+            error_line);
+
+        // Render the caret underline
+        this.render_underline(span, severity, message, line_width);
+
+        // Context lines after
+        const last_ctx: u32 = span.start_line + ctx;
+        for (mut ln: u32 = span.start_line + 1; ln <= last_ctx; ln++) {
+            const line_text: string = this.get_line(span.file, ln);
+            if (line_text == "" && ln > span.start_line + 1) {
+                break;  // Stop at empty lines past the first one
+            }
+            fprintf(g_stderr, " %s%*u%s %s|%s %s\n",
+                grey, line_width, ln, reset,
+                blue, reset,
+                line_text);
+        }
+
+        // Bottom margin
+        this.render_margin(line_width);
+    }
+
+    /// Render a margin-only line:  "   |"
+    render_margin(&this, line_width: u32) -> void {
+        const blue: string  = this.color_blue();
+        const reset: string = this.color_reset();
+        fprintf(g_stderr, " %*s %s|%s\n", line_width, "", blue, reset);
+    }
+
+    /// Render the caret underline below a source line.
+    render_underline(&this, span: SourceSpan, severity: Severity, message: string,
+                     line_width: u32) -> void {
+        const blue: string      = this.color_blue();
+        const reset: string     = this.color_reset();
+        const bold: string      = this.color_bold();
+        const sev_color: string = this.severity_color(severity);
+
+        // Calculate underline position (1-indexed → 0-indexed)
+        mut ul_start: u32 = 0;
+        if (span.start_col > 0) {
+            ul_start = span.start_col - 1;
+        }
+
+        mut ul_len: u32 = 1;
+        if (span.end_col > span.start_col) {
+            ul_len = span.end_col - span.start_col;
+        }
+
+        // Build the underline string: spaces + ^ + ~~~
+        // Leading spaces for margin + pipe + gap
+        fprintf(g_stderr, " %*s %s|%s ", line_width, "", blue, reset);
+
+        // Spaces to reach the underline start
+        for (mut s: u32 = 0; s < ul_start; s++) {
+            fprintf(g_stderr, " ");
+        }
+
+        // The caret and tildes
+        fprintf(g_stderr, "%s%s^", bold, sev_color);
+        for (mut t: u32 = 1; t < ul_len; t++) {
+            fprintf(g_stderr, "~");
+        }
+
+        // Inline label
+        if (message != "") {
+            fprintf(g_stderr, " %s", message);
+        }
+
+        fprintf(g_stderr, "%s\n", reset);
+    }
+
+    /// Render a secondary span:  :: file:line:col  with cyan underline.
+    render_secondary_span(mut &this, label: SpanLabel) -> void {
+        const blue: string  = this.color_blue();
+        const cyan: string  = this.color_cyan();
+        const bold: string  = this.color_bold();
+        const reset: string = this.color_reset();
+        const grey: string  = this.color_grey();
+
+        // Secondary arrow:  :: file:line:col
+        fprintf(g_stderr, " %s%s::%s %s:%u:%u\n",
+            bold, blue, reset,
+            label.span.file, label.span.start_line, label.span.start_col);
+
+        mut line_width: u32 = 3;
+        if (label.span.start_line > 999) {
+            line_width = 4;
+        }
+
+        this.render_margin(line_width);
+
+        // Render the source line
+        const line_text: string = this.get_line(label.span.file, label.span.start_line);
+        fprintf(g_stderr, " %s%*u%s %s|%s %s\n",
+            grey, line_width, label.span.start_line, reset,
+            blue, reset,
+            line_text);
+
+        // Cyan underline
+        mut ul_start: u32 = 0;
+        if (label.span.start_col > 0) {
+            ul_start = label.span.start_col - 1;
+        }
+        mut ul_len: u32 = 1;
+        if (label.span.end_col > label.span.start_col) {
+            ul_len = label.span.end_col - label.span.start_col;
+        }
+
+        fprintf(g_stderr, " %*s %s|%s ", line_width, "", blue, reset);
+        for (mut s: u32 = 0; s < ul_start; s++) {
+            fprintf(g_stderr, " ");
+        }
+        fprintf(g_stderr, "%s%s^", bold, cyan);
+        for (mut t: u32 = 1; t < ul_len; t++) {
+            fprintf(g_stderr, "~");
+        }
+        if (label.message != "") {
+            fprintf(g_stderr, " %s", label.message);
+        }
+        fprintf(g_stderr, "%s\n", reset);
+
+        this.render_margin(line_width);
+    }
+
+    /// Render a child diagnostic (note or help) without source context.
+    render_child(mut &this, child: Diagnostic) -> void {
+        const bold: string  = this.color_bold();
+        const reset: string = this.color_reset();
+        const sev_color: string = this.severity_color(child.severity);
+
+        if (child.span.has_location()) {
+            // Child with source location — show a mini snippet
+            fprintf(g_stderr, " %s%s%s%s: %s\n",
+                bold, sev_color, child.severity.label(), reset,
+                child.message);
+
+            this.load_source(child.span.file);
+            this.render_snippet(child.span, child.severity, child.message);
+        } else {
+            // Child without location — just the message
+            fprintf(g_stderr, " %s%s%s%s: %s\n",
+                bold, sev_color, child.severity.label(), reset,
+                child.message);
+        }
+    }
+
+    /// Render a suggestion with the replacement code in green.
+    render_suggestion(&this, sug: Suggestion) -> void {
+        const bold: string  = this.color_bold();
+        const green: string = this.color_green();
+        const blue: string  = this.color_blue();
+        const reset: string = this.color_reset();
+
+        fprintf(g_stderr, " %s%ssuggestion%s: %s\n",
+            bold, green, reset, sug.message);
+
+        if (sug.replacement != "") {
+            fprintf(g_stderr, "    %s|%s %s%s%s\n",
+                blue, reset,
+                bold, green, sug.replacement);
+            fprintf(g_stderr, "%s", reset);
+        }
+    }
+
+    /// Print a summary line:  "aborting due to N errors; M warnings emitted"
+    print_summary(&this, error_count: u32, warning_count: u32) -> void {
+        const bold: string  = this.color_bold();
+        const red: string   = this.color_red();
+        const reset: string = this.color_reset();
+
+        if (error_count > 0) {
+            fprintf(g_stderr, "%s%saborting due to %u error%s",
+                bold, red, error_count,
+                if (error_count == 1) { "" } else { "s" });
+            if (warning_count > 0) {
+                fprintf(g_stderr, "; %u warning%s emitted",
+                    warning_count,
+                    if (warning_count == 1) { "" } else { "s" });
+            }
+            fprintf(g_stderr, "%s\n", reset);
+        } else if (warning_count > 0) {
+            const yellow: string = this.color_yellow();
+            fprintf(g_stderr, "%s%s%u warning%s emitted%s\n",
+                bold, yellow, warning_count,
+                if (warning_count == 1) { "" } else { "s" },
+                reset);
+        }
+    }
+}
