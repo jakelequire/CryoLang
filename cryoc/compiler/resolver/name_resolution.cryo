@@ -1,0 +1,782 @@
+///! Name Resolution Pass
+///!
+///! Two-pass AST walk that populates the Resolver's symbol table and
+///! resolution map.  Pass 1 forward-declares all top-level names.
+///! Pass 2 walks the full AST, opening scopes, resolving identifiers,
+///! and recording (span → SymbolID) entries in the resolution map.
+///!
+///! After this pass, downstream consumers look up results by SymbolID —
+///! no more string-based name lookups.
+
+namespace Compiler::Resolver::NameResolution;
+
+import Compiler::Resolver::SymbolID;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::Symbol;
+import Compiler::Resolver::Scope;
+import Compiler::Resolver::Resolver;
+import Compiler::Diag;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::AST::Visitor;
+import Compiler::PassID;
+import Compiler::CompilationContext;
+
+
+
+// ============================================================================
+// NameResolver — AST visitor for name resolution
+// ============================================================================
+
+type class NameResolver : BaseASTVisitor {
+public:
+    resolver: Resolver*;
+    ctx:      CompilationContext*;
+
+    NameResolver(resolver: Resolver*, ctx: CompilationContext*)
+        : BaseASTVisitor() {
+        this.resolver = resolver;
+        this.ctx      = ctx;
+    }
+
+
+    // ================================================================
+    // Pass 1: Forward declaration collection (top-level only)
+    // ================================================================
+
+    /// Walk top-level statements and forward-declare all names.
+    forward_declare(program: ProgramNode*) -> void {
+        for (mut i: int = 0; i < program.statements.length; i++) {
+            const stmt: ASTNode* = program.statements[i];
+            this.forward_declare_node(stmt);
+        }
+    }
+
+    forward_declare_node(node: ASTNode*) -> void {
+        match (node.kind) {
+            NodeKind::FunctionDeclaration => {
+                const fn_node: FunctionDeclNode* = node as FunctionDeclNode*;
+                const sym_id: SymbolID = this.resolver.declare_function(
+                    fn_node.name, fn_node.span, fn_node.is_public);
+                if (fn_node.is_public) {
+                    this.resolver.export_symbol(sym_id);
+                }
+            }
+            NodeKind::StructDeclaration => {
+                const struct_node: StructDeclNode* = node as StructDeclNode*;
+                const sym_id: SymbolID = this.resolver.declare_type(
+                    struct_node.name, struct_node.span, true);
+                this.resolver.export_symbol(sym_id);
+            }
+            NodeKind::EnumDeclaration => {
+                const enum_node: EnumDeclNode* = node as EnumDeclNode*;
+                const sym_id: SymbolID = this.resolver.declare_type(
+                    enum_node.name, enum_node.span, true);
+                this.resolver.export_symbol(sym_id);
+            }
+            NodeKind::ClassDeclaration => {
+                const class_node: ClassDeclNode* = node as ClassDeclNode*;
+                const sym_id: SymbolID = this.resolver.declare_type(
+                    class_node.name, class_node.span, true);
+                this.resolver.export_symbol(sym_id);
+            }
+            NodeKind::TraitDeclaration => {
+                const trait_node: TraitDeclNode* = node as TraitDeclNode*;
+                const sym_id: SymbolID = this.resolver.declare_type(
+                    trait_node.name, trait_node.span, true);
+                this.resolver.export_symbol(sym_id);
+            }
+            NodeKind::TypeAliasDeclaration => {
+                const alias_node: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
+                const sym_id: SymbolID = this.resolver.declare_type(
+                    alias_node.alias_name, alias_node.span, true);
+                this.resolver.export_symbol(sym_id);
+            }
+            NodeKind::VariableDeclaration => {
+                const var_node: VarDeclNode* = node as VarDeclNode*;
+                if (var_node.is_global) {
+                    const sym_id: SymbolID = this.resolver.declare_variable(
+                        var_node.name, var_node.span, var_node.is_mutable);
+                    // Global variables are not exported by default
+                }
+            }
+            NodeKind::ImportDeclaration => {
+                this.process_import(node as ImportDeclNode*);
+            }
+            NodeKind::IntrinsicDeclaration => {
+                const intr_node: IntrinsicDeclNode* = node as IntrinsicDeclNode*;
+                const id: SymbolID = this.resolver.alloc_symbol_id();
+                const sym_name: SymbolStr = this.resolver.intern_table.intern(intr_node.name);
+                const sym: Symbol = Symbol::intrinsic(id, sym_name,
+                    this.resolver.current_scope, intr_node.span);
+                this.resolver.declare(sym);
+            }
+            NodeKind::ExternBlock => {
+                const extern_node: ExternBlockNode* = node as ExternBlockNode*;
+                for (mut j: int = 0; j < extern_node.functions.length; j++) {
+                    const fn_node: FunctionDeclNode* = extern_node.functions[j];
+                    const sym_id: SymbolID = this.resolver.declare_function(
+                        fn_node.name, fn_node.span, fn_node.is_public);
+                    if (fn_node.is_public) {
+                        this.resolver.export_symbol(sym_id);
+                    }
+                }
+            }
+            NodeKind::DeclarationStatement => {
+                const decl_stmt: DeclStmtNode* = node as DeclStmtNode*;
+                if (decl_stmt.declaration != null) {
+                    this.forward_declare_node(decl_stmt.declaration as ASTNode*);
+                }
+            }
+            _ => {
+                // Other nodes don't introduce module-level names, skip
+            }
+        }
+    }
+
+
+    // ================================================================
+    // Pass 2: Full resolution walk
+    // ================================================================
+
+    // -- ProgramNode --
+    override visit(node: ProgramNode*) -> void {
+        // Set module name
+        if (node.namespace_name != "") {
+            this.resolver.set_module(node.namespace_name);
+        }
+
+        // Pass 1: forward declarations
+        this.forward_declare(node);
+
+        // Pass 2: full resolution walk
+        for (mut i: int = 0; i < node.statements.length; i++) {
+            node.statements[i].accept(this);
+        }
+    }
+
+
+    // -- Declarations --
+
+    override visit(node: FunctionDeclNode*) -> void {
+        // Enter function scope
+        this.resolver.enter_scope(ScopeKind::Function, node.name, node.span);
+
+        // Declare generic params
+        for (mut i: int = 0; i < node.generic_params.length; i++) {
+            const gp: GenericParamNode* = node.generic_params[i];
+            const id: SymbolID = this.resolver.alloc_symbol_id();
+            const sym_name: SymbolStr = this.resolver.intern_table.intern(gp.name);
+            const sym: Symbol = Symbol::generic_param(id, sym_name,
+                this.resolver.current_scope, gp.span,
+                this.resolver.current_module);
+            this.resolver.declare(sym);
+        }
+
+        // Declare parameters
+        for (mut i: int = 0; i < node.parameters.length; i++) {
+            const param: VarDeclNode* = node.parameters[i];
+            this.resolver.declare_parameter(param.name, param.span);
+        }
+
+        // Visit body
+        if (node.has_body()) {
+            this.visit_block_contents(node.body);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    override visit(node: MethodNode*) -> void {
+        if (node.func != null) {
+            node.func.accept(this);
+        }
+    }
+
+    override visit(node: StructDeclNode*) -> void {
+        // Enter type body scope
+        this.resolver.enter_scope(ScopeKind::TypeBody, node.name, node.span);
+
+        // Declare generic params
+        for (mut i: int = 0; i < node.generic_params.length; i++) {
+            const gp: GenericParamNode* = node.generic_params[i];
+            const id: SymbolID = this.resolver.alloc_symbol_id();
+            const sym_name: SymbolStr = this.resolver.intern_table.intern(gp.name);
+            const sym: Symbol = Symbol::generic_param(id, sym_name,
+                this.resolver.current_scope, gp.span,
+                this.resolver.current_module);
+            this.resolver.declare(sym);
+        }
+
+        // Declare fields
+        for (mut i: int = 0; i < node.fields.length; i++) {
+            const field: FieldDeclNode* = node.fields[i];
+            this.resolver.declare_field(field.name, field.span);
+        }
+
+        // Visit methods
+        for (mut i: int = 0; i < node.methods.length; i++) {
+            node.methods[i].accept(this);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    override visit(node: ClassDeclNode*) -> void {
+        this.resolver.enter_scope(ScopeKind::TypeBody, node.name, node.span);
+
+        // Declare generic params
+        for (mut i: int = 0; i < node.generic_params.length; i++) {
+            const gp: GenericParamNode* = node.generic_params[i];
+            const id: SymbolID = this.resolver.alloc_symbol_id();
+            const sym_name: SymbolStr = this.resolver.intern_table.intern(gp.name);
+            const sym: Symbol = Symbol::generic_param(id, sym_name,
+                this.resolver.current_scope, gp.span,
+                this.resolver.current_module);
+            this.resolver.declare(sym);
+        }
+
+        // Declare fields
+        for (mut i: int = 0; i < node.fields.length; i++) {
+            const field: FieldDeclNode* = node.fields[i];
+            this.resolver.declare_field(field.name, field.span);
+        }
+
+        // Visit methods
+        for (mut i: int = 0; i < node.methods.length; i++) {
+            node.methods[i].accept(this);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    override visit(node: EnumDeclNode*) -> void {
+        this.resolver.enter_scope(ScopeKind::TypeBody, node.name, node.span);
+
+        // Declare generic params
+        for (mut i: int = 0; i < node.generic_params.length; i++) {
+            const gp: GenericParamNode* = node.generic_params[i];
+            const id: SymbolID = this.resolver.alloc_symbol_id();
+            const sym_name: SymbolStr = this.resolver.intern_table.intern(gp.name);
+            const sym: Symbol = Symbol::generic_param(id, sym_name,
+                this.resolver.current_scope, gp.span,
+                this.resolver.current_module);
+            this.resolver.declare(sym);
+        }
+
+        // Declare variants
+        for (mut i: int = 0; i < node.variants.length; i++) {
+            const variant: EnumVariantNode* = node.variants[i];
+            this.resolver.declare_enum_variant(variant.name, variant.span);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    override visit(node: TraitDeclNode*) -> void {
+        this.resolver.enter_scope(ScopeKind::Trait, node.name, node.span);
+
+        // Declare generic params
+        for (mut i: int = 0; i < node.generic_params.length; i++) {
+            const gp: GenericParamNode* = node.generic_params[i];
+            const id: SymbolID = this.resolver.alloc_symbol_id();
+            const sym_name: SymbolStr = this.resolver.intern_table.intern(gp.name);
+            const sym: Symbol = Symbol::generic_param(id, sym_name,
+                this.resolver.current_scope, gp.span,
+                this.resolver.current_module);
+            this.resolver.declare(sym);
+        }
+
+        // Declare methods (as signatures only)
+        for (mut i: int = 0; i < node.methods.length; i++) {
+            const method: FunctionDeclNode* = node.methods[i];
+            this.resolver.declare_method(method.name, method.span, true);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    override visit(node: ImplBlockNode*) -> void {
+        this.resolver.enter_scope(ScopeKind::Impl, node.target_type, node.span);
+
+        // Resolve the target type name
+        const target_id: SymbolID = this.resolver.lookup(
+            node.target_type, this.resolver.current_scope);
+        if (target_id.is_valid()) {
+            this.resolver.record_resolution(node.span, target_id);
+        }
+
+        // Declare and visit methods
+        for (mut i: int = 0; i < node.methods.length; i++) {
+            const method: MethodNode* = node.methods[i];
+            if (method.func != null) {
+                const is_public: boolean =
+                    method.visibility == Visibility::Public;
+                this.resolver.declare_method(
+                    method.func.name, method.func.span, is_public);
+            }
+            method.accept(this);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    override visit(node: VarDeclNode*) -> void {
+        // Local variable declarations (globals handled in forward_declare)
+        if (!node.is_global) {
+            this.resolver.declare_variable(node.name, node.span, node.is_mutable);
+        }
+
+        // Visit initializer expression
+        if (node.has_initializer()) {
+            node.initializer.accept(this);
+        }
+    }
+
+    override visit(node: TypeAliasDeclNode*) -> void {
+        // Already forward-declared; nothing more to resolve here.
+        // Target type resolution is deferred to the TypeResolution pass.
+    }
+
+    override visit(node: ImportDeclNode*) -> void {
+        // Already processed in forward_declare; skip in pass 2.
+    }
+
+    override visit(node: ExternBlockNode*) -> void {
+        // Already forward-declared functions; visit bodies if any.
+        for (mut i: int = 0; i < node.functions.length; i++) {
+            node.functions[i].accept(this);
+        }
+    }
+
+    override visit(node: IntrinsicDeclNode*) -> void {
+        // Already forward-declared; visit parameters/body if needed.
+        if (node.has_body()) {
+            this.resolver.enter_scope(ScopeKind::Function, node.name, node.span);
+            for (mut i: int = 0; i < node.parameters.length; i++) {
+                const param: VarDeclNode* = node.parameters[i];
+                this.resolver.declare_parameter(param.name, param.span);
+            }
+            this.visit_block_contents(node.body);
+            this.resolver.exit_scope();
+        }
+    }
+
+    override visit(node: FieldDeclNode*) -> void {
+        // Fields already declared by parent struct/class visitor.
+        // Visit default value expression if present.
+        if (node.has_default_value()) {
+            node.default_value.accept(this);
+        }
+    }
+
+    override visit(node: GenericParamNode*) -> void {
+        // Already declared by parent function/struct visitor.
+    }
+
+
+    // -- Expressions --
+
+    override visit(node: IdentifierNode*) -> void {
+        const sym_id: SymbolID = this.resolver.lookup(
+            node.name, this.resolver.current_scope);
+        if (sym_id.is_valid()) {
+            this.resolver.record_resolution(node.span, sym_id);
+        } else {
+            // Check import aliases
+            const alias_id: SymbolID = this.resolver.lookup_import_alias(node.name);
+            if (alias_id.is_valid()) {
+                this.resolver.record_resolution(node.span, alias_id);
+            }
+            // No error here — could be a built-in type or forward reference
+            // that will be resolved by TypeResolution
+        }
+    }
+
+    override visit(node: ScopeResolutionNode*) -> void {
+        // Look up the scope name (e.g., "Foo" in "Foo::Bar")
+        const scope_sym: SymbolID = this.resolver.lookup(
+            node.scope_name, this.resolver.current_scope);
+        if (scope_sym.is_valid()) {
+            this.resolver.record_resolution(node.span, scope_sym);
+        }
+        // Member resolution within the type's scope is deferred to
+        // TypeResolution (needs type info to find the TypeBody scope).
+    }
+
+    override visit(node: CallExprNode*) -> void {
+        // Visit the callee expression (resolves the function name)
+        node.callee.accept(this);
+
+        // If callee is an identifier, also collect overloads
+        if (node.callee.kind == NodeKind::Identifier) {
+            const id_node: IdentifierNode* = node.callee as IdentifierNode*;
+            const overloads: SymbolID[] = this.resolver.lookup_overloads(
+                id_node.name, this.resolver.current_scope);
+            if (overloads.length > 1) {
+                this.resolver.record_overloads(node.span, overloads);
+            }
+        }
+
+        // Visit arguments
+        for (mut i: int = 0; i < node.arguments.length; i++) {
+            node.arguments[i].accept(this);
+        }
+    }
+
+    override visit(node: MemberAccessNode*) -> void {
+        // Visit the object expression; member resolution deferred to TypeResolution
+        node.object.accept(this);
+    }
+
+    override visit(node: BinaryExprNode*) -> void {
+        node.left.accept(this);
+        node.right.accept(this);
+    }
+
+    override visit(node: UnaryExprNode*) -> void {
+        node.operand.accept(this);
+    }
+
+    override visit(node: TernaryExprNode*) -> void {
+        node.condition.accept(this);
+        node.true_expr.accept(this);
+        node.false_expr.accept(this);
+    }
+
+    override visit(node: IfExprNode*) -> void {
+        node.condition.accept(this);
+        node.then_expr.accept(this);
+        if (node.else_expr != null) {
+            node.else_expr.accept(this);
+        }
+    }
+
+    override visit(node: MatchExprNode*) -> void {
+        node.subject.accept(this);
+        for (mut i: int = 0; i < node.arms.length; i++) {
+            node.arms[i].accept(this);
+        }
+    }
+
+    override visit(node: NewExprNode*) -> void {
+        // Resolve type name
+        const type_sym: SymbolID = this.resolver.lookup(
+            node.type_name, this.resolver.current_scope);
+        if (type_sym.is_valid()) {
+            this.resolver.record_resolution(node.span, type_sym);
+        }
+
+        for (mut i: int = 0; i < node.arguments.length; i++) {
+            node.arguments[i].accept(this);
+        }
+
+        if (node.has_array_size()) {
+            node.array_size.accept(this);
+        }
+    }
+
+    override visit(node: CastExprNode*) -> void {
+        node.expression.accept(this);
+    }
+
+    override visit(node: StructLiteralNode*) -> void {
+        // Resolve struct type name
+        const type_sym: SymbolID = this.resolver.lookup(
+            node.struct_type, this.resolver.current_scope);
+        if (type_sym.is_valid()) {
+            this.resolver.record_resolution(node.span, type_sym);
+        }
+
+        // Visit field initializer expressions
+        for (mut i: int = 0; i < node.field_inits.length; i++) {
+            const init_value: ExpressionNode* = node.field_inits[i].value as ExpressionNode*;
+            if (init_value != null) {
+                init_value.accept(this);
+            }
+        }
+    }
+
+    override visit(node: ArrayLiteralNode*) -> void {
+        for (mut i: int = 0; i < node.elements.length; i++) {
+            node.elements[i].accept(this);
+        }
+        if (node.repeat_count_expr != null) {
+            node.repeat_count_expr.accept(this);
+        }
+    }
+
+    override visit(node: TupleLiteralNode*) -> void {
+        for (mut i: int = 0; i < node.elements.length; i++) {
+            node.elements[i].accept(this);
+        }
+    }
+
+    override visit(node: ArrayAccessNode*) -> void {
+        node.array.accept(this);
+        node.index.accept(this);
+    }
+
+    override visit(node: LambdaExprNode*) -> void {
+        this.resolver.enter_scope(ScopeKind::Lambda, "<lambda>", node.span);
+
+        // Declare parameters
+        for (mut i: int = 0; i < node.parameters.length; i++) {
+            const param: VarDeclNode* = node.parameters[i];
+            this.resolver.declare_parameter(param.name, param.span);
+        }
+
+        // Visit body
+        if (node.body != null) {
+            node.body.accept(this);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    // Leaf expressions — no name resolution needed
+    override visit(node: LiteralNode*) -> void {}
+    override visit(node: SizeofExprNode*) -> void {}
+    override visit(node: AlignofExprNode*) -> void {}
+
+
+    // -- Statements --
+
+    override visit(node: BlockStmtNode*) -> void {
+        this.resolver.enter_scope(ScopeKind::Block, "<block>", node.span);
+        this.visit_block_contents(node);
+        this.resolver.exit_scope();
+    }
+
+    override visit(node: ReturnStmtNode*) -> void {
+        if (node.has_expression()) {
+            node.expression.accept(this);
+        }
+    }
+
+    override visit(node: IfStmtNode*) -> void {
+        node.condition.accept(this);
+        node.then_stmt.accept(this);
+        if (node.has_else()) {
+            node.else_stmt.accept(this);
+        }
+    }
+
+    override visit(node: WhileStmtNode*) -> void {
+        node.condition.accept(this);
+        node.body.accept(this);
+    }
+
+    override visit(node: DoWhileStmtNode*) -> void {
+        node.body.accept(this);
+        node.condition.accept(this);
+    }
+
+    override visit(node: ForStmtNode*) -> void {
+        // For loops create a scope for the loop variable
+        this.resolver.enter_scope(ScopeKind::Block, "<for>", node.span);
+
+        if (node.init != null) {
+            node.init.accept(this);
+        }
+        if (node.condition != null) {
+            node.condition.accept(this);
+        }
+        if (node.update != null) {
+            node.update.accept(this);
+        }
+        if (node.body != null) {
+            node.body.accept(this);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    override visit(node: MatchStmtNode*) -> void {
+        node.subject.accept(this);
+        for (mut i: int = 0; i < node.arms.length; i++) {
+            node.arms[i].accept(this);
+        }
+    }
+
+    override visit(node: MatchArmNode*) -> void {
+        // Each arm gets its own scope for pattern bindings
+        this.resolver.enter_scope(ScopeKind::Block, "<match-arm>", node.span);
+
+        // Visit patterns (may introduce bindings)
+        for (mut i: int = 0; i < node.patterns.length; i++) {
+            node.patterns[i].accept(this);
+        }
+
+        // Visit body
+        if (node.body != null) {
+            node.body.accept(this);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    override visit(node: PatternNode*) -> void {
+        // Identifier patterns introduce a binding
+        if (node.pattern_kind == PatternKind::Identifier && node.binding_name != "") {
+            this.resolver.declare_variable(node.binding_name, node.span, false);
+        }
+    }
+
+    override visit(node: EnumPatternNode*) -> void {
+        // Resolve enum name
+        const enum_sym: SymbolID = this.resolver.lookup(
+            node.enum_name, this.resolver.current_scope);
+        if (enum_sym.is_valid()) {
+            this.resolver.record_resolution(node.span, enum_sym);
+        }
+
+        // Process pattern elements — bindings introduce variables
+        for (mut i: int = 0; i < node.elements.length; i++) {
+            // Pattern bindings are handled by the match arm scope
+            // We would process them here if PatternElement had accept()
+        }
+    }
+
+    override visit(node: ExprStmtNode*) -> void {
+        node.expression.accept(this);
+    }
+
+    override visit(node: DeclStmtNode*) -> void {
+        if (node.declaration != null) {
+            node.declaration.accept(this);
+        }
+    }
+
+    override visit(node: SwitchStmtNode*) -> void {
+        node.expression.accept(this);
+        for (mut i: int = 0; i < node.cases.length; i++) {
+            node.cases[i].accept(this);
+        }
+    }
+
+    override visit(node: CaseStmtNode*) -> void {
+        if (node.value != null) {
+            node.value.accept(this);
+        }
+        if (node.body != null) {
+            node.body.accept(this);
+        }
+    }
+
+    override visit(node: UnsafeBlockStmtNode*) -> void {
+        if (node.block != null) {
+            node.block.accept(this);
+        }
+    }
+
+
+    // ================================================================
+    // Helpers
+    // ================================================================
+
+    /// Visit block contents without creating a new scope (caller manages scope).
+    visit_block_contents(block: BlockStmtNode*) -> void {
+        if (block == null) { return; }
+        for (mut i: int = 0; i < block.statements.length; i++) {
+            block.statements[i].accept(this);
+        }
+    }
+
+    /// Process an import declaration: bring imported names into current scope.
+    process_import(node: ImportDeclNode*) -> void {
+        const module_path: string = node.module_path;
+        const exports: SymbolID[] = this.resolver.get_exports(module_path);
+
+        if (node.style == ImportStyle::Wildcard) {
+            // Bring all public exports into scope as Import-kind symbols
+            for (mut i: i64 = 0; i < exports.length; i++) {
+                const export_sym: Symbol = this.resolver.get_symbol(exports[i]);
+                if (export_sym.visibility.is_public()) {
+                    const id: SymbolID = this.resolver.alloc_symbol_id();
+                    const import_sym: Symbol = Symbol::import_sym(
+                        id, export_sym.name, this.resolver.current_scope,
+                        node.span, module_path);
+                    this.resolver.declare(import_sym);
+                }
+            }
+        } else {
+            // ImportStyle::Specific — bring only named symbols
+            for (mut i: int = 0; i < node.specific_imports.length; i++) {
+                const name: string = node.specific_imports[i];
+                const found: SymbolID = this.resolver.lookup_in_module(module_path, name);
+                if (found.is_valid()) {
+                    const id: SymbolID = this.resolver.alloc_symbol_id();
+                    const sym_name: SymbolStr = this.resolver.intern_table.intern(name);
+                    const import_sym: Symbol = Symbol::import_sym(
+                        id, sym_name, this.resolver.current_scope,
+                        node.span, module_path);
+                    this.resolver.declare(import_sym);
+                }
+            }
+        }
+
+        // Handle aliased imports
+        if (node.has_alias()) {
+            // If the module was imported with an alias, register the alias
+            // so "Alias::member" can be resolved later
+            const alias_id: SymbolID = this.resolver.alloc_symbol_id();
+            const sym_alias: SymbolStr = this.resolver.intern_table.intern(node.alias);
+            const alias_sym: Symbol = Symbol::import_sym(
+                alias_id, sym_alias, this.resolver.current_scope,
+                node.span, module_path);
+            this.resolver.declare(alias_sym);
+            this.resolver.register_import_alias(node.alias, alias_id);
+        }
+    }
+}
+
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+/// Run the name resolution pass on the compilation context.
+function run_name_resolution_pass(ctx: CompilationContext*) -> PassResult {
+    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+    // Initialize the resolver if needed
+    ctx.init_resolver();
+
+    if (ctx.resolver == null) {
+        ctx.emit_error(2001, "Failed to initialize Resolver");
+        return PassResult::failure(1);
+    }
+
+    // Set current module
+    if (ctx.current_namespace != "") {
+        ctx.resolver.set_module(ctx.current_namespace);
+    }
+
+    // Get AST root from artifacts
+    const root: ProgramNode* = ctx.artifacts.ast.root as ProgramNode*;
+    if (root == null) {
+        // No AST available yet — this is OK for stub passes
+        if (ctx.debug_mode) {
+            printf("[NameResolution] No AST root available, skipping\n");
+        }
+        return PassResult::ok([Provision::NamesResolved]);
+    }
+
+    // Create and run the visitor
+    const visitor: NameResolver = NameResolver(ctx.resolver, ctx);
+    root.accept(&visitor as ASTVisitor*);
+
+    if (ctx.debug_mode) {
+        printf("[NameResolution] Resolved %lld symbols in %lld scopes, %lld map entries\n",
+            ctx.resolver.symbol_count(),
+            ctx.resolver.scope_count(),
+            ctx.resolver.resolution_map.count());
+    }
+
+    return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::NamesResolved]);
+}

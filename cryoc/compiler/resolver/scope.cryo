@@ -1,0 +1,192 @@
+///! Scope
+///!
+///! Scope tree nodes for the Resolver.  Each Scope is a tree node with a
+///! parent pointer (ScopeID) and child list.  Symbols within a scope are
+///! stored in parallel arrays for name → SymbolID lookup.
+
+namespace Compiler::Resolver::Scope;
+
+import Compiler::Resolver::SymbolID;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Diag;
+
+
+// ============================================================================
+// ScopeID — Unique identity for a scope in the Resolver's arena
+// ============================================================================
+
+type struct ScopeID {
+    id: u64;
+
+    /// Create an invalid scope ID (id = 0).
+    static invalid() -> ScopeID {
+        return ScopeID { id: 0 };
+    }
+
+    /// Create a new scope ID with the given value.
+    static new(id: u64) -> ScopeID {
+        return ScopeID { id: id };
+    }
+
+    /// Whether this refers to a valid scope (id != 0).
+    is_valid(&this) -> boolean {
+        return this.id != 0;
+    }
+
+    /// Check equality by ID.
+    equals(&this, other: ScopeID) -> boolean {
+        return this.id == other.id;
+    }
+}
+
+
+// ============================================================================
+// ScopeKind — Classification of lexical scopes
+// ============================================================================
+
+type enum ScopeKind {
+    Global;
+    Module;
+    Function;
+    Block;
+    TypeBody;
+    Impl;
+    Trait;
+    Lambda;
+}
+
+implement enum ScopeKind {
+    to_string(&this) -> string {
+        return match (&this) {
+            ScopeKind::Global   => { "Global" }
+            ScopeKind::Module   => { "Module" }
+            ScopeKind::Function => { "Function" }
+            ScopeKind::Block    => { "Block" }
+            ScopeKind::TypeBody => { "TypeBody" }
+            ScopeKind::Impl     => { "Impl" }
+            ScopeKind::Trait    => { "Trait" }
+            ScopeKind::Lambda   => { "Lambda" }
+        };
+    }
+
+    /// Whether this scope kind allows shadowing of names from parent scopes.
+    allows_shadowing(&this) -> boolean {
+        return match (&this) {
+            ScopeKind::Function => { true }
+            ScopeKind::Block    => { true }
+            ScopeKind::Lambda   => { true }
+            _                   => { false }
+        };
+    }
+}
+
+
+// ============================================================================
+// Scope — A single node in the scope tree
+// ============================================================================
+
+type struct Scope {
+    id:              ScopeID;
+    kind:            ScopeKind;
+    parent_id:       ScopeID;
+    module_name:     string;
+    owner_name:      string;
+    span:            SourceSpan;
+
+    // Symbols declared in this scope (parallel arrays)
+    symbol_names:    SymbolStr[];
+    symbol_ids:      SymbolID[];
+
+    // Overloaded names (parallel arrays)
+    overload_names:  SymbolStr[];
+    overload_lists:  SymbolID[][];
+
+    // Child scopes
+    child_scope_ids: ScopeID[];
+
+    static new(id: ScopeID, kind: ScopeKind, parent: ScopeID,
+               module: string, owner: string, span: SourceSpan) -> Scope {
+        return Scope {
+            id:              id,
+            kind:            kind,
+            parent_id:       parent,
+            module_name:     module,
+            owner_name:      owner,
+            span:            span,
+            symbol_names:    [],
+            symbol_ids:      [],
+            overload_names:  [],
+            overload_lists:  [],
+            child_scope_ids: [],
+        };
+    }
+
+    /// Look up a symbol in this scope only.  Returns invalid SymbolID if not found.
+    find(&this, name: SymbolStr) -> SymbolID {
+        for (mut i: i64 = 0; i < this.symbol_names.length; i++) {
+            if (this.symbol_names[i].equals(name)) {
+                return this.symbol_ids[i];
+            }
+        }
+        return SymbolID::invalid();
+    }
+
+    /// Insert a symbol into this scope.  If the name already exists and
+    /// allows_overload is true, adds to the overload set instead.
+    /// Returns false if the name is a duplicate and overloading is not allowed.
+    insert(mut &this, name: SymbolStr, sym_id: SymbolID, allows_overload: boolean) -> boolean {
+        // Check for existing symbol with the same name
+        for (mut i: i64 = 0; i < this.symbol_names.length; i++) {
+            if (this.symbol_names[i].equals(name)) {
+                if (allows_overload) {
+                    this.add_overload(name, sym_id);
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        this.symbol_names.push(name);
+        this.symbol_ids.push(sym_id);
+        return true;
+    }
+
+    /// Add a symbol to the overload set for the given name.
+    add_overload(mut &this, name: SymbolStr, sym_id: SymbolID) -> void {
+        for (mut i: i64 = 0; i < this.overload_names.length; i++) {
+            if (this.overload_names[i].equals(name)) {
+                this.overload_lists[i].push(sym_id);
+                return;
+            }
+        }
+        // Create new overload list
+        this.overload_names.push(name);
+        this.overload_lists.push([sym_id]);
+    }
+
+    /// Get all overloads for a name (including the primary symbol).
+    get_overloads(&this, name: SymbolStr) -> SymbolID[] {
+        mut result: SymbolID[] = [];
+
+        // Primary symbol
+        for (mut i: i64 = 0; i < this.symbol_names.length; i++) {
+            if (this.symbol_names[i].equals(name)) {
+                result.push(this.symbol_ids[i]);
+            }
+        }
+
+        // Overflow overloads
+        for (mut i: i64 = 0; i < this.overload_names.length; i++) {
+            if (this.overload_names[i].equals(name)) {
+                result = result + this.overload_lists[i];
+            }
+        }
+
+        return result;
+    }
+
+    /// Register a child scope.
+    add_child(mut &this, child: ScopeID) -> void {
+        this.child_scope_ids.push(child);
+    }
+}

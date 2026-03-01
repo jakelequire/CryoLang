@@ -744,7 +744,6 @@ CryoLang/
 │   ├── collections/        #   Array, String, HashMap, Deque, BTreeMap
 │   ├── alloc/              #   Arena, heap, stack, pool allocators
 │   ├── io/                 #   stdio, file, reader, writer
-│   ├── net/                #   TCP, HTTP, sockets
 │   ├── fs/                 #   File system, paths
 │   └── ...
 ├── cryoc/                  # Self-hosted compiler (in Cryo)

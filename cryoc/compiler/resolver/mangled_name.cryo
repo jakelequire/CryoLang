@@ -1,0 +1,268 @@
+///! MangledName
+///!
+///! An opaque, LLVM-safe symbol name.  Can only be created through the
+///! canonical mangling functions defined here — never from a raw string.
+///! This makes it impossible to accidentally use a display name where a
+///! mangled name is expected (and vice versa).
+///!
+///! Replaces the 6 inconsistent mangling implementations in the C++
+///! compiler with a single set of rules:
+///!
+///!   Character escaping (mangle_char):
+///!     '<'  →  '_'          '>'  →  '_'
+///!     ','  →  '_'          ' '  →  '_'
+///!     '*'  →  'p'          ':'  →  '_'
+///!     '&'  →  'r'          '?'  →  'q'
+///!   Trailing underscores are stripped after escaping.
+///!
+///!   Generic specialization:
+///!     mangle_generic("Array", ["Token"])         => "Array_Token"
+///!     mangle_generic("Result", ["i32", "string"]) => "Result_i32_string"
+///!     mangle_generic("Option", ["void*"])         => "Option_voidp"
+///!
+///!   LLVM IR names:
+///!     for_function(name)  => escaped(name)
+///!     for_struct(name)    => "struct." + escaped(name)
+
+namespace Compiler::Resolver::MangledName;
+
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::QualifiedName;
+
+
+// ============================================================================
+// MangledName — Opaque mangled-string handle
+// ============================================================================
+
+type struct MangledName {
+    /// The interned mangled string.  Treat as opaque — only resolve
+    /// through the InternTable when emitting to LLVM IR or diagnostics.
+    value: SymbolStr;
+
+
+    // ----------------------------------------------------------------
+    // Construction — the ONLY way to create a MangledName
+    // ----------------------------------------------------------------
+
+    /// An empty / invalid mangled name.
+    static empty() -> MangledName {
+        return MangledName { value: SymbolStr::empty() };
+    }
+
+    /// Mangle a simple name (no generics, no qualification).
+    /// Escapes any unsafe characters in the input.
+    ///   "println"   => "println"
+    ///   "void*"     => "voidp"
+    static from_simple(table: InternTable*, text: string) -> MangledName {
+        mut escaped: string = escape_name(text);
+        return MangledName { value: table.intern(escaped) };
+    }
+
+    /// Mangle a QualifiedName by joining parts with "_".
+    ///   std::io::println  => "std_io_println"
+    static from_qualified(table: InternTable*, name: QualifiedName) -> MangledName {
+        if (name.is_empty()) {
+            return MangledName::empty();
+        }
+
+        mut result: string = escape_name(table.resolve(name.part_at(0)));
+        for (mut i: i64 = 1; i < name.depth(); i++) {
+            result.append("_");
+            result.append(escape_name(table.resolve(name.part_at(i))));
+        }
+        result = strip_trailing_underscores(result);
+        return MangledName { value: table.intern(result) };
+    }
+
+    /// The canonical generic specialization mangling.  Takes a base type
+    /// name and the display names of the type arguments.
+    ///   ("Array",  ["Token"])          => "Array_Token"
+    ///   ("Result", ["i32", "string"])  => "Result_i32_string"
+    ///   ("Option", ["void*"])          => "Option_voidp"
+    ///   ("HashMap", ["string", "Array<i32>"]) => "HashMap_string_Array_i32"
+    static from_generic(table: InternTable*, base: string, type_args: string[]) -> MangledName {
+        if (type_args.length == 0) {
+            return MangledName::from_simple(table, base);
+        }
+
+        mut result: string = escape_name(base) + "_";
+        for (mut i: i64 = 0; i < type_args.length; i++) {
+            if (i > 0) {
+                result.append("_");
+            }
+            result.append(escape_name(type_args[i]));
+        }
+        result = strip_trailing_underscores(result);
+        return MangledName { value: table.intern(result) };
+    }
+
+    /// Generic mangling from a QualifiedName base and display-name args.
+    ///   (std::core::option::Option, ["i32"]) => "std_core_option_Option_i32"
+    static from_generic_qualified(table: InternTable*, base: QualifiedName,
+                                  type_args: string[]) -> MangledName {
+        mut base_str: string = "";
+        for (mut i: i64 = 0; i < base.depth(); i++) {
+            if (i > 0) {
+                base_str = base_str + "_";
+            }
+            base_str = base_str + escape_name(table.resolve(base.part_at(i)));
+        }
+
+        if (type_args.length == 0) {
+            base_str = strip_trailing_underscores(base_str);
+            return MangledName { value: table.intern(base_str) };
+        }
+
+        mut result: string = base_str + "_";
+        for (mut i: i64 = 0; i < type_args.length; i++) {
+            if (i > 0) {
+                result = result + "_";
+            }
+            result = result + escape_name(type_args[i]);
+        }
+        result = strip_trailing_underscores(result);
+        return MangledName { value: table.intern(result) };
+    }
+
+
+    // ----------------------------------------------------------------
+    // LLVM IR name factories
+    // ----------------------------------------------------------------
+
+    /// Mangle a QualifiedName for use as an LLVM function name.
+    ///   std::io::println  => "std_io_println"
+    static for_function(table: InternTable*, name: QualifiedName) -> MangledName {
+        mut inner: MangledName = MangledName::from_qualified(table, name);
+        mut result: string = table.resolve(inner.value);
+        return MangledName { value: table.intern(result) };
+    }
+
+    /// Mangle a QualifiedName for use as an LLVM struct type name.
+    ///   std::collections::Array  => "struct.std_collections_Array"
+    static for_struct(table: InternTable*, name: QualifiedName) -> MangledName {
+        mut inner: MangledName = MangledName::from_qualified(table, name);
+        mut result: string = "struct." + table.resolve(inner.value);
+        return MangledName { value: table.intern(result) };
+    }
+
+    /// Mangle a QualifiedName for use as an LLVM global variable name.
+    ///   std::config::VERSION  => "global_std_config_VERSION"
+    static for_global(table: InternTable*, name: QualifiedName) -> MangledName {
+        mut inner: MangledName = MangledName::from_qualified(table, name);
+        mut result: string = "global_" + table.resolve(inner.value);
+        return MangledName { value: table.intern(result) };
+    }
+
+    /// Mangle a QualifiedName for use as an LLVM vtable name.
+    ///   MyClass  => "vtable.MyClass"
+    static for_vtable(table: InternTable*, name: QualifiedName) -> MangledName {
+        mut inner: MangledName = MangledName::from_qualified(table, name);
+        mut result: string = "vtable." + table.resolve(inner.value);
+        return MangledName { value: table.intern(result) };
+    }
+
+    /// Build a mangled method name: type + method, optionally with
+    /// an overload suffix from parameter type display names.
+    ///   for_method(table, "Array_i32", "push", ["i32"])
+    ///     => "Array_i32_push_i32"
+    static for_method(table: InternTable*, type_mangled: MangledName,
+                      method: string, param_displays: string[]) -> MangledName {
+        mut result: string = table.resolve(type_mangled.value);
+        result.append("_");
+        result.append(escape_name(method));
+        if (param_displays.length > 0) {
+            for (mut i: i64 = 0; i < param_displays.length; i++) {
+                result.append("_");
+                result.append(escape_name(param_displays[i]));
+            }
+        }
+        result = strip_trailing_underscores(result);
+        return MangledName { value: table.intern(result) };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Accessors
+    // ----------------------------------------------------------------
+
+    /// Whether this is the empty sentinel.
+    is_empty(&this) -> boolean {
+        return this.value.is_empty();
+    }
+
+    /// Whether this holds a valid mangled name.
+    is_valid(&this) -> boolean {
+        return this.value.is_valid();
+    }
+
+    /// O(1) equality.
+    equals(&this, other: MangledName) -> boolean {
+        return this.value.equals(other.value);
+    }
+
+    /// Resolve to the mangled string (for LLVM IR emission).
+    resolve(&this, table: InternTable*) -> string {
+        return table.resolve(this.value);
+    }
+}
+
+
+// ============================================================================
+// Free functions — canonical escaping rules
+// ============================================================================
+
+/// Escape a single character according to the canonical mangling rules.
+/// Returns the replacement character, or the original if no escaping needed.
+function mangle_char(c: char) -> char {
+    match (c) {
+        '<' => { '_' }
+        '>' => { '_' }
+        ',' => { '_' }
+        ' ' => { '_' }
+        ':' => { '_' }
+        '*' => { 'p' }
+        '&' => { 'r' }
+        '?' => { 'q' }
+    }
+    return c;
+}
+
+/// Whether a character is safe in a mangled name (alphanumeric or underscore).
+function is_safe_char(c: char) -> boolean {
+    return (c >= 'a' && c <= 'z')
+        || (c >= 'A' && c <= 'Z')
+        || (c >= '0' && c <= '9')
+        || c == '_';
+}
+
+/// Escape a full string using the canonical mangling rules.
+/// Characters that aren't alphanumeric or underscore after mangling
+/// are dropped (defensive — should not happen with well-formed names).
+function escape_name(text: string) -> string {
+    mut result: string = "";
+    for (mut i: i64 = 0; i < text.length(); i++) {
+        mut c: char = mangle_char(text[i]);
+        if (is_safe_char(c)) {
+            result.append(c as string);
+        }
+        // else: drop the character (shouldn't happen for valid names)
+    }
+    return result;
+}
+
+/// Strip trailing underscores from a mangled name.
+/// Prevents artifacts like "Option_" from trailing ">" replacement.
+function strip_trailing_underscores(text: string) -> string {
+    mut len: i64 = text.length();
+    while (len > 0 && text[len - 1] == '_') {
+        len = len - 1;
+    }
+    if (len == text.length()) {
+        return text;
+    }
+    if (len == 0) {
+        return "";
+    }
+    return text.substring(0, len);
+}

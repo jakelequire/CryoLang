@@ -1450,6 +1450,14 @@ namespace Cryo::Codegen
                                     template_reg->register_module_constant(
                                         ns_context, name, type_ann, const_int->getZExtValue());
                                 }
+                                else if (auto *const_fp = llvm::dyn_cast<llvm::ConstantFP>(initializer))
+                                {
+                                    std::string type_ann;
+                                    if (node->type_annotation())
+                                        type_ann = node->type_annotation()->to_string();
+                                    template_reg->register_module_constant_float(
+                                        ns_context, name, type_ann, const_fp->getValueAPF().convertToDouble());
+                                }
                             }
                         }
                     }
@@ -1654,6 +1662,14 @@ namespace Cryo::Codegen
                         type_ann = node->type_annotation()->to_string();
                     template_reg->register_module_constant(
                         ns_context, name, type_ann, const_int->getZExtValue());
+                }
+                else if (auto *const_fp = llvm::dyn_cast<llvm::ConstantFP>(initializer))
+                {
+                    std::string type_ann;
+                    if (node->type_annotation())
+                        type_ann = node->type_annotation()->to_string();
+                    template_reg->register_module_constant_float(
+                        ns_context, name, type_ann, const_fp->getValueAPF().convertToDouble());
                 }
             }
         }
