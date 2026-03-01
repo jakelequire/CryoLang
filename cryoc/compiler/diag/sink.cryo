@@ -1,35 +1,107 @@
 ///! DiagnosticSink
 ///!
 ///! Collects all diagnostics emitted during compilation.
+///! Supports deduplication, max-errors cutoff, warnings-as-errors promotion,
+///! and per-code suppression via DiagConfig.
 
 namespace Compiler::Diag::Sink;
 
 
 /// Collects all diagnostics emitted during compilation.
 type struct DiagnosticSink {
-    diagnostics:   Diagnostic[];
-    error_count:   u32;
-    warning_count: u32;
+    diagnostics:       Diagnostic[];
+    error_count:       u32;
+    warning_count:     u32;
+    renderer:          DiagRenderer*;
+    config:            DiagConfig;
+    reached_max_errors: boolean;
 
     static new() -> DiagnosticSink {
         return DiagnosticSink {
-            diagnostics:   [],
-            error_count:   0,
-            warning_count: 0,
+            diagnostics:       [],
+            error_count:       0,
+            warning_count:     0,
+            renderer:          null,
+            config:            DiagConfig::default(),
+            reached_max_errors: false,
         };
     }
 
-    /// Emit a diagnostic, updating counters.
+    /// Attach a renderer for rich diagnostic output.
+    set_renderer(mut &this, renderer: DiagRenderer*) -> void {
+        this.renderer = renderer;
+    }
+
+    /// Set the diagnostic configuration.
+    set_config(mut &this, config: DiagConfig) -> void {
+        this.config = config;
+    }
+
+    /// Emit a diagnostic, applying filtering, dedup, and rendering.
     emit(mut &this, diag: Diagnostic) -> void {
-        if (diag.severity.is_error()) {
+        // 1. Max-errors cutoff — stop emitting after the limit
+        if (this.reached_max_errors) {
+            return;
+        }
+
+        // 2. Per-code suppression
+        if (this.config.is_suppressed(diag.code.to_u32())) {
+            return;
+        }
+
+        // 3. Warnings-as-errors promotion
+        mut effective_diag: Diagnostic = diag;
+        if (this.config.warnings_as_errors && diag.severity.is_warning()) {
+            effective_diag = Diagnostic {
+                severity:    Severity::Error,
+                code:        diag.code,
+                message:     diag.message,
+                span:        diag.span,
+                labels:      diag.labels,
+                children:    diag.children,
+                suggestions: diag.suggestions,
+            };
+        }
+
+        // 4. Deduplication: skip if same (code, file, start_line, start_col)
+        const code_val: u32 = effective_diag.code.to_u32();
+        for (mut i: int = 0; i < this.diagnostics.length; i++) {
+            const existing: Diagnostic = this.diagnostics[i];
+            if (existing.code.to_u32() == code_val &&
+                existing.span.file == effective_diag.span.file &&
+                existing.span.start_line == effective_diag.span.start_line &&
+                existing.span.start_col == effective_diag.span.start_col) {
+                return;  // Duplicate — skip
+            }
+        }
+
+        // 5. Update counters
+        if (effective_diag.severity.is_error()) {
             this.error_count = this.error_count + 1;
         }
-        if (diag.severity.is_warning()) {
+        if (effective_diag.severity.is_warning()) {
             this.warning_count = this.warning_count + 1;
         }
-        // Print immediately for now (can be made configurable later)
-        printf("%s\n", diag.to_string());
-        this.diagnostics = this.diagnostics + [diag];
+
+        // 6. Render
+        if (this.renderer != null) {
+            this.renderer.render(effective_diag);
+        } else {
+            printf("%s\n", effective_diag.to_string());
+        }
+
+        // 7. Store
+        this.diagnostics = this.diagnostics + [effective_diag];
+
+        // 8. Check max-errors limit
+        if (this.config.max_errors > 0 && this.error_count >= this.config.max_errors) {
+            this.reached_max_errors = true;
+            if (this.renderer != null) {
+                this.renderer.print_summary(this.error_count, this.warning_count);
+            } else {
+                printf("aborting due to %u errors\n", this.error_count);
+            }
+        }
     }
 
     /// Take a snapshot of current counters.
@@ -56,4 +128,5 @@ type struct DiagnosticSink {
     count(&this) -> u32 {
         return this.diagnostics.length;
     }
+
 }

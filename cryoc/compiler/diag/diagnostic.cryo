@@ -1,70 +1,178 @@
 ///! Diagnostic
 ///!
 ///! A single compiler diagnostic (error, warning, note, or help).
+///! Supports multi-span labels, child diagnostics, and suggestions.
 
 namespace Compiler::Diag::Diagnostic;
 
 
 /// A single compiler diagnostic (error, warning, note, or help).
 type struct Diagnostic {
-    severity: Severity;
-    code:     u32;
-    message:  string;
-    span:     SourceSpan;
+    severity:    Severity;
+    code:        ErrorCode;
+    message:     string;
+    span:        SourceSpan;
+    labels:      SpanLabel[];
+    children:    Diagnostic[];
+    suggestions: Suggestion[];
 
     /// Create an error diagnostic (no location yet — attach with at()).
-    static error(code: u32, message: string) -> Diagnostic {
+    static error(code: ErrorCode, message: string) -> Diagnostic {
         return Diagnostic {
-            severity: Severity::Error,
-            code:     code,
-            message:  message,
-            span:     SourceSpan::none(),
+            severity:    Severity::Error,
+            code:        code,
+            message:     message,
+            span:        SourceSpan::none(),
+            labels:      [],
+            children:    [],
+            suggestions: [],
         };
     }
 
     /// Create a warning diagnostic.
-    static warning(code: u32, message: string) -> Diagnostic {
+    static warning(code: ErrorCode, message: string) -> Diagnostic {
         return Diagnostic {
-            severity: Severity::Warning,
-            code:     code,
-            message:  message,
-            span:     SourceSpan::none(),
+            severity:    Severity::Warning,
+            code:        code,
+            message:     message,
+            span:        SourceSpan::none(),
+            labels:      [],
+            children:    [],
+            suggestions: [],
         };
     }
 
     /// Create a note diagnostic.
-    static note(code: u32, message: string) -> Diagnostic {
+    static note(code: ErrorCode, message: string) -> Diagnostic {
         return Diagnostic {
-            severity: Severity::Note,
-            code:     code,
-            message:  message,
-            span:     SourceSpan::none(),
+            severity:    Severity::Note,
+            code:        code,
+            message:     message,
+            span:        SourceSpan::none(),
+            labels:      [],
+            children:    [],
+            suggestions: [],
         };
     }
 
-    /// Attach a source span and return this diagnostic (builder pattern).
+    /// Attach a source span and return a new diagnostic (builder pattern).
     at(mut &this, span: SourceSpan) -> Diagnostic {
         this.span = span;
         return Diagnostic {
-            severity: this.severity,
-            code:     this.code,
-            message:  this.message,
-            span:     span,
+            severity:    this.severity,
+            code:        this.code,
+            message:     this.message,
+            span:        span,
+            labels:      this.labels + [SpanLabel::primary(span, this.message)],
+            children:    this.children,
+            suggestions: this.suggestions,
         };
     }
 
-    /// Format for display.
+    /// Append a note child diagnostic.
+    with_note(&this, message: string) -> Diagnostic {
+        const child: Diagnostic = Diagnostic {
+            severity:    Severity::Note,
+            code:        ErrorCode::E0000_UNKNOWN,
+            message:     message,
+            span:        SourceSpan::none(),
+            labels:      [],
+            children:    [],
+            suggestions: [],
+        };
+        return Diagnostic {
+            severity:    this.severity,
+            code:        this.code,
+            message:     this.message,
+            span:        this.span,
+            labels:      this.labels,
+            children:    this.children + [child],
+            suggestions: this.suggestions,
+        };
+    }
+
+    /// Append a note child diagnostic with a source location.
+    with_note_at(&this, message: string, span: SourceSpan) -> Diagnostic {
+        const child: Diagnostic = Diagnostic {
+            severity:    Severity::Note,
+            code:        ErrorCode::E0000_UNKNOWN,
+            message:     message,
+            span:        span,
+            labels:      [SpanLabel::primary(span, message)],
+            children:    [],
+            suggestions: [],
+        };
+        return Diagnostic {
+            severity:    this.severity,
+            code:        this.code,
+            message:     this.message,
+            span:        this.span,
+            labels:      this.labels,
+            children:    this.children + [child],
+            suggestions: this.suggestions,
+        };
+    }
+
+    /// Append a help child diagnostic.
+    help(&this, message: string) -> Diagnostic {
+        const child: Diagnostic = Diagnostic {
+            severity:    Severity::Help,
+            code:        ErrorCode::E0000_UNKNOWN,
+            message:     message,
+            span:        SourceSpan::none(),
+            labels:      [],
+            children:    [],
+            suggestions: [],
+        };
+        return Diagnostic {
+            severity:    this.severity,
+            code:        this.code,
+            message:     this.message,
+            span:        this.span,
+            labels:      this.labels,
+            children:    this.children + [child],
+            suggestions: this.suggestions,
+        };
+    }
+
+    /// Append a secondary span label (e.g. "also defined here").
+    also_at(&this, span: SourceSpan, message: string) -> Diagnostic {
+        return Diagnostic {
+            severity:    this.severity,
+            code:        this.code,
+            message:     this.message,
+            span:        this.span,
+            labels:      this.labels + [SpanLabel::secondary(span, message)],
+            children:    this.children,
+            suggestions: this.suggestions,
+        };
+    }
+
+    /// Append a suggestion.
+    suggest(&this, suggestion: Suggestion) -> Diagnostic {
+        return Diagnostic {
+            severity:    this.severity,
+            code:        this.code,
+            message:     this.message,
+            span:        this.span,
+            labels:      this.labels,
+            children:    this.children,
+            suggestions: this.suggestions + [suggestion],
+        };
+    }
+
+    /// Format for display (simple, non-rendered format).
     to_string(&this) -> string {
         if (this.span.has_location()) {
-            return sprintf("%s: %s[E%04u]: %s",
+            return sprintf("%s: %s[%s]: %s",
                 this.span.to_string(),
                 this.severity.label(),
-                this.code,
+                this.code.format(),
                 this.message);
         }
-        return sprintf("%s[E%04u]: %s",
+        return sprintf("%s[%s]: %s",
             this.severity.label(),
-            this.code,
+            this.code.format(),
             this.message);
     }
 }

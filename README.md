@@ -693,6 +693,7 @@ make test-tier3      # Generics (structs, enums, cross-module)
 make test-tier4      # Modules (imports, submodules, visibility)
 make test-tier5      # Classes (inheritance, virtual dispatch, polymorphism)
 make test-tier6      # FFI (C interop, unsafe code)
+make test-tier7      # Standard library (collections, allocators, I/O)
 make test-negative   # Expected compilation failures
 ```
 

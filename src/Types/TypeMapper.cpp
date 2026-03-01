@@ -779,6 +779,26 @@ namespace Cryo
             return st;
         }
 
+        // Cycle detection: if we're already in the process of mapping this
+        // struct, return the opaque struct to break the recursion.  This
+        // handles self-referential types like `children: Diagnostic[]` where
+        // mapping the struct's fields would recursively try to map the same
+        // struct, causing infinite recursion.  The opaque struct is safe to
+        // use here because LLVM struct fields that reference the same struct
+        // go through an Array or Pointer indirection (both use ptr in LLVM's
+        // opaque-pointer model), so the struct body doesn't need the
+        // recursive type to be fully resolved.
+        if (_structs_in_progress.count(name))
+        {
+            LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
+                      "TypeMapper::map_struct: Breaking recursive cycle for '{}', returning opaque struct",
+                      name);
+            return st;
+        }
+
+        // Mark this struct as in-progress before mapping its fields
+        _structs_in_progress.insert(name);
+
         // Try to complete with field information from the Cryo type
         // Note: For locally-defined structs, fields() may be empty because set_fields
         // is only called for imported modules. In that case, the struct was completed
@@ -819,6 +839,9 @@ namespace Cryo
                 st->setBody(llvm_fields);
             }
         }
+
+        // Done mapping this struct — remove from in-progress set
+        _structs_in_progress.erase(name);
 
         return st;
     }
@@ -861,6 +884,17 @@ namespace Cryo
         {
             return st;
         }
+
+        // Cycle detection: break infinite recursion from self-referential class types
+        if (_structs_in_progress.count(name))
+        {
+            LOG_DEBUG(Cryo::LogComponent::TYPECHECKER,
+                      "TypeMapper::map_class: Breaking recursive cycle for '{}', returning opaque struct",
+                      name);
+            return st;
+        }
+
+        _structs_in_progress.insert(name);
 
         // Try to complete with field information from the Cryo type
         const auto &fields = type->fields();
@@ -905,6 +939,8 @@ namespace Cryo
                 st->setBody(llvm_fields);
             }
         }
+
+        _structs_in_progress.erase(name);
 
         return st;
     }
