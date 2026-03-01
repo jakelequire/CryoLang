@@ -392,7 +392,7 @@ Enums can be extended with methods via `implement` blocks:
 ```cryo
 implement enum Shape {
     is_circle(&this) -> boolean {
-        return match (&this) {
+        return match (this) {
             Shape::Circle(_) => { true }
             _ =>                { false }
         }
