@@ -32,6 +32,7 @@
 #include <llvm/IR/Constants.h>
 
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 #include <optional>
@@ -97,6 +98,10 @@ namespace Cryo
         // Type alias resolution map: alias name -> resolved target TypeRef
         // This is used to redirect placeholder structs to their actual types
         std::unordered_map<std::string, TypeRef> _type_alias_targets;
+
+        // Cycle detection: tracks structs currently being mapped to break
+        // infinite recursion from self-referential types (e.g. children: Diagnostic[])
+        std::unordered_set<std::string> _structs_in_progress;
 
         // Error state
         bool _has_error = false;
