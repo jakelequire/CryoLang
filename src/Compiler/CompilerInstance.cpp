@@ -1234,7 +1234,7 @@ namespace Cryo
                 _codegen->get_visitor()->pre_register_functions_from_symbol_table();
 
                 // Declare functions from previously compiled modules (cross-module resolution)
-                if (_stdlib_compilation_mode && !_cross_module_functions.empty())
+                if (!_cross_module_functions.empty())
                 {
                     declare_cross_module_functions();
                 }
@@ -4108,7 +4108,7 @@ namespace Cryo
             _codegen->get_visitor()->pre_register_functions_from_symbol_table();
 
             // Declare functions from previously compiled modules (cross-module resolution)
-            if (_stdlib_compilation_mode && !_cross_module_functions.empty())
+            if (!_cross_module_functions.empty())
             {
                 declare_cross_module_functions();
             }

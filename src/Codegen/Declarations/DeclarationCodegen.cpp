@@ -4184,6 +4184,10 @@ namespace Cryo::Codegen
             llvm::Type *ret = types().map(func_type->return_type());
             if (!ret)
             {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "pre_register_functions: Skipping '{}' — failed to map return type '{}'",
+                          llvm_name,
+                          func_type->return_type() ? func_type->return_type()->display_name() : "<null>");
                 skipped_map_fail++;
                 return;
             }
@@ -4267,6 +4271,7 @@ namespace Cryo::Codegen
             }
             bool all_mapped = true;
             bool is_first_param = true;
+            size_t param_idx = 0;
             for (const auto &p : func_type->param_types())
             {
                 // For simple enum methods, the first parameter (&this) is a reference
@@ -4284,6 +4289,10 @@ namespace Cryo::Codegen
                 llvm::Type *pt = types().map(p);
                 if (!pt)
                 {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "pre_register_functions: Skipping '{}' — failed to map param {} type '{}'",
+                              llvm_name, param_idx,
+                              p ? p->display_name() : "<null>");
                     all_mapped = false;
                     break;
                 }
@@ -4297,6 +4306,7 @@ namespace Cryo::Codegen
                     break;
                 }
                 params.push_back(pt);
+                param_idx++;
             }
             if (!all_mapped)
             {

@@ -8,6 +8,8 @@ import Compiler::Diag;
 import Compiler::AST::Node;
 import Compiler::AST::Expression;
 import Compiler::AST::Statement;
+import Compiler::Types;
+import Compiler::Resolver::SymbolStr;
 
 
 // ============================================================================
@@ -46,15 +48,15 @@ public:
 
 type class VarDeclNode : DeclarationNode {
 public:
-    name:            string;
+    name:            SymbolStr;
     initializer:     ExpressionNode*;
     is_mutable:      boolean;
     is_auto:         boolean;
     is_global:       boolean;
     type_annotation: TypeAnnotation*;
-    resolved_type:   void*;
+    resolved_type:   TypeRef;
 
-    VarDeclNode(name: string, span: SourceSpan)
+    VarDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::VariableDeclaration, span) {
         this.name            = name;
         this.initializer     = null;
@@ -62,19 +64,19 @@ public:
         this.is_auto         = false;
         this.is_global       = false;
         this.type_annotation = null;
-        this.resolved_type   = null;
+        this.resolved_type   = TypeRef::invalid();
     }
 
     has_initializer() -> boolean     { return this.initializer != null; }
     has_type_annotation() -> boolean { return this.type_annotation != null; }
-    has_resolved_type() -> boolean   { return this.resolved_type != null; }
+    has_resolved_type() -> boolean   { return this.resolved_type.is_valid(); }
 
     set_initializer(expr: ExpressionNode*) -> void  { this.initializer = expr; }
     set_mutable(v: boolean) -> void                 { this.is_mutable = v; }
     set_auto(v: boolean) -> void                    { this.is_auto = v; }
     set_global(v: boolean) -> void                  { this.is_global = v; }
     set_type_annotation(a: TypeAnnotation*) -> void { this.type_annotation = a; }
-    set_resolved_type(t: void*) -> void             { this.resolved_type = t; }
+    set_resolved_type(t: TypeRef) -> void           { this.resolved_type = t; }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -84,7 +86,7 @@ public:
 
 type class FunctionDeclNode : DeclarationNode {
 public:
-    name:                   string;
+    name:                   SymbolStr;
     parameters:             VarDeclNode*[];
     generic_params:         GenericParamNode*[];
     trait_bounds:           TraitBound[];
@@ -94,9 +96,9 @@ public:
     is_inline:              boolean;
     is_variadic:            boolean;
     return_type_annotation: TypeAnnotation*;
-    resolved_return_type:   void*;
+    resolved_return_type:   TypeRef;
 
-    FunctionDeclNode(name: string, span: SourceSpan)
+    FunctionDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::FunctionDeclaration, span) {
         this.name                   = name;
         this.parameters             = [];
@@ -108,12 +110,12 @@ public:
         this.is_inline              = false;
         this.is_variadic            = false;
         this.return_type_annotation = null;
-        this.resolved_return_type   = null;
+        this.resolved_return_type   = TypeRef::invalid();
     }
 
     has_body() -> boolean                 { return this.body != null; }
     is_generic() -> boolean               { return this.generic_params.length > 0; }
-    has_resolved_return_type() -> boolean { return this.resolved_return_type != null; }
+    has_resolved_return_type() -> boolean { return this.resolved_return_type.is_valid(); }
 
     add_parameter(param: VarDeclNode*) -> void {
         this.parameters.push(param);
@@ -133,7 +135,7 @@ public:
     set_inline(v: boolean) -> void                          { this.is_inline = v; }
     set_variadic(v: boolean) -> void                        { this.is_variadic = v; }
     set_return_type_annotation(a: TypeAnnotation*) -> void  { this.return_type_annotation = a; }
-    set_resolved_return_type(t: void*) -> void              { this.resolved_return_type = t; }
+    set_resolved_return_type(t: TypeRef) -> void             { this.resolved_return_type = t; }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -153,7 +155,7 @@ public:
     is_default_destructor: boolean;
     is_virtual:            boolean;
     is_override:           boolean;
-    base_ctor_name:        string;
+    base_ctor_name:        SymbolStr;
     base_ctor_args:        ExpressionNode*[];
 
     MethodNode(func: FunctionDeclNode*, span: SourceSpan)
@@ -166,11 +168,11 @@ public:
         this.is_default_destructor = false;
         this.is_virtual            = false;
         this.is_override           = false;
-        this.base_ctor_name        = "";
+        this.base_ctor_name        = SymbolStr::empty();
         this.base_ctor_args        = [];
     }
 
-    has_base_ctor() -> boolean { return this.base_ctor_name != ""; }
+    has_base_ctor() -> boolean { return this.base_ctor_name.is_valid(); }
 
     set_visibility(v: Visibility) -> void       { this.visibility = v; }
     set_constructor(v: boolean) -> void         { this.is_constructor = v; }
@@ -179,7 +181,7 @@ public:
     set_default_destructor(v: boolean) -> void  { this.is_default_destructor = v; }
     set_virtual(v: boolean) -> void             { this.is_virtual = v; }
     set_override(v: boolean) -> void            { this.is_override = v; }
-    set_base_ctor_name(name: string) -> void    { this.base_ctor_name = name; }
+    set_base_ctor_name(name: SymbolStr) -> void  { this.base_ctor_name = name; }
 
     add_base_ctor_arg(arg: ExpressionNode*) -> void {
         this.base_ctor_args.push(arg);
@@ -193,27 +195,28 @@ public:
 
 type class IntrinsicDeclNode : DeclarationNode {
 public:
-    name:                 string;
+    name:                 SymbolStr;
     parameters:           VarDeclNode*[];
     body:                 BlockStmtNode*;
-    resolved_return_type: void*;
+    resolved_return_type: TypeRef;
 
-    IntrinsicDeclNode(name: string, span: SourceSpan)
+    IntrinsicDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::IntrinsicDeclaration, span) {
         this.name                 = name;
         this.parameters           = [];
         this.body                 = null;
-        this.resolved_return_type = null;
+        this.resolved_return_type = TypeRef::invalid();
     }
 
-    has_body() -> boolean { return this.body != null; }
+    has_body() -> boolean                 { return this.body != null; }
+    has_resolved_return_type() -> boolean { return this.resolved_return_type.is_valid(); }
 
     add_parameter(param: VarDeclNode*) -> void {
         this.parameters.push(param);
     }
 
-    set_body(b: BlockStmtNode*) -> void             { this.body = b; }
-    set_resolved_return_type(t: void*) -> void      { this.resolved_return_type = t; }
+    set_body(b: BlockStmtNode*) -> void                { this.body = b; }
+    set_resolved_return_type(t: TypeRef) -> void       { this.resolved_return_type = t; }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -223,16 +226,17 @@ public:
 
 type class IntrinsicConstDeclNode : DeclarationNode {
 public:
-    name:          string;
-    resolved_type: void*;
+    name:          SymbolStr;
+    resolved_type: TypeRef;
 
-    IntrinsicConstDeclNode(name: string, span: SourceSpan)
+    IntrinsicConstDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::IntrinsicConstDeclaration, span) {
         this.name          = name;
-        this.resolved_type = null;
+        this.resolved_type = TypeRef::invalid();
     }
 
-    set_resolved_type(t: void*) -> void { this.resolved_type = t; }
+    has_resolved_type() -> boolean      { return this.resolved_type.is_valid(); }
+    set_resolved_type(t: TypeRef) -> void { this.resolved_type = t; }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -244,7 +248,7 @@ type class ImportDeclNode : DeclarationNode {
 public:
     module_path:      string;
     alias:            string;
-    specific_imports: string[];
+    specific_imports: SymbolStr[];
     style:            ImportStyle;
 
     ImportDeclNode(module_path: string, style: ImportStyle, span: SourceSpan)
@@ -259,7 +263,7 @@ public:
 
     set_alias(a: string) -> void { this.alias = a; }
 
-    add_specific_import(name: string) -> void {
+    add_specific_import(name: SymbolStr) -> void {
         this.specific_imports.push(name);
     }
 
@@ -288,12 +292,12 @@ public:
 
 type class StructDeclNode : DeclarationNode {
 public:
-    name:           string;
+    name:           SymbolStr;
     generic_params: GenericParamNode*[];
     fields:         FieldDeclNode*[];
     methods:        MethodNode*[];
 
-    StructDeclNode(name: string, span: SourceSpan)
+    StructDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::StructDeclaration, span) {
         this.name           = name;
         this.generic_params = [];
@@ -323,23 +327,23 @@ public:
 
 type class ClassDeclNode : DeclarationNode {
 public:
-    name:           string;
+    name:           SymbolStr;
     generic_params: GenericParamNode*[];
     fields:         FieldDeclNode*[];
     methods:        MethodNode*[];
-    base_class:     string;
+    base_class:     SymbolStr;
 
-    ClassDeclNode(name: string, span: SourceSpan)
+    ClassDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::ClassDeclaration, span) {
         this.name           = name;
         this.generic_params = [];
         this.fields         = [];
         this.methods        = [];
-        this.base_class     = "";
+        this.base_class     = SymbolStr::empty();
     }
 
     is_generic() -> boolean     { return this.generic_params.length > 0; }
-    has_base_class() -> boolean { return this.base_class != ""; }
+    has_base_class() -> boolean { return this.base_class.is_valid(); }
 
     add_generic_param(param: GenericParamNode*) -> void {
         this.generic_params.push(param);
@@ -353,7 +357,7 @@ public:
         this.methods.push(method);
     }
 
-    set_base_class(name: string) -> void {
+    set_base_class(name: SymbolStr) -> void {
         this.base_class = name;
     }
 
@@ -365,12 +369,12 @@ public:
 
 type class TraitDeclNode : DeclarationNode {
 public:
-    name:           string;
+    name:           SymbolStr;
     generic_params: GenericParamNode*[];
     methods:        FunctionDeclNode*[];
     base_traits:    BaseTraitInfo[];
 
-    TraitDeclNode(name: string, span: SourceSpan)
+    TraitDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::TraitDeclaration, span) {
         this.name           = name;
         this.generic_params = [];
@@ -400,25 +404,25 @@ public:
 
 type class TypeAliasDeclNode : DeclarationNode {
 public:
-    alias_name:        string;
-    generic_params:    string[];
+    alias_name:        SymbolStr;
+    generic_params:    SymbolStr[];
     target_annotation: TypeAnnotation*;
-    resolved_target:   void*;
+    resolved_target:   TypeRef;
 
-    TypeAliasDeclNode(alias_name: string, span: SourceSpan)
+    TypeAliasDeclNode(alias_name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::TypeAliasDeclaration, span) {
         this.alias_name        = alias_name;
         this.generic_params    = [];
         this.target_annotation = null;
-        this.resolved_target   = null;
+        this.resolved_target   = TypeRef::invalid();
     }
 
     is_generic() -> boolean          { return this.generic_params.length > 0; }
-    has_resolved_target() -> boolean { return this.resolved_target != null; }
+    has_resolved_target() -> boolean { return this.resolved_target.is_valid(); }
 
-    set_generic_params(params: string[]) -> void      { this.generic_params = params; }
+    set_generic_params(params: SymbolStr[]) -> void    { this.generic_params = params; }
     set_target_annotation(a: TypeAnnotation*) -> void  { this.target_annotation = a; }
-    set_resolved_target(t: void*) -> void              { this.resolved_target = t; }
+    set_resolved_target(t: TypeRef) -> void            { this.resolved_target = t; }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -428,11 +432,11 @@ public:
 
 type class EnumDeclNode : DeclarationNode {
 public:
-    name:           string;
+    name:           SymbolStr;
     generic_params: GenericParamNode*[];
     variants:       EnumVariantNode*[];
 
-    EnumDeclNode(name: string, span: SourceSpan)
+    EnumDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::EnumDeclaration, span) {
         this.name           = name;
         this.generic_params = [];
@@ -457,12 +461,12 @@ public:
 
 type class EnumVariantNode : DeclarationNode {
 public:
-    name:             string;
-    associated_types: string[];
+    name:             SymbolStr;
+    associated_types: SymbolStr[];
     explicit_value:   i64;
     has_value:        boolean;
 
-    EnumVariantNode(name: string, span: SourceSpan)
+    EnumVariantNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::EnumDeclaration, span) {
         this.name             = name;
         this.associated_types = [];
@@ -470,7 +474,7 @@ public:
         this.has_value        = false;
     }
 
-    add_associated_type(t: string) -> void {
+    add_associated_type(t: SymbolStr) -> void {
         this.associated_types.push(t);
     }
 
@@ -487,11 +491,11 @@ public:
 
 type class ImplBlockNode : DeclarationNode {
 public:
-    target_type: string;
+    target_type: SymbolStr;
     fields:      FieldDeclNode*[];
     methods:     MethodNode*[];
 
-    ImplBlockNode(target_type: string, span: SourceSpan)
+    ImplBlockNode(target_type: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::ImplementationBlock, span) {
         this.target_type = target_type;
         this.fields      = [];
@@ -535,29 +539,29 @@ public:
 
 type class FieldDeclNode : DeclarationNode {
 public:
-    name:            string;
+    name:            SymbolStr;
     visibility:      Visibility;
     default_value:   ExpressionNode*;
     type_annotation: TypeAnnotation*;
-    resolved_type:   void*;
+    resolved_type:   TypeRef;
 
-    FieldDeclNode(name: string, span: SourceSpan)
+    FieldDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::VariableDeclaration, span) {
         this.name            = name;
         this.visibility      = Visibility::Public;
         this.default_value   = null;
         this.type_annotation = null;
-        this.resolved_type   = null;
+        this.resolved_type   = TypeRef::invalid();
     }
 
     has_default_value() -> boolean   { return this.default_value != null; }
     has_type_annotation() -> boolean { return this.type_annotation != null; }
-    has_resolved_type() -> boolean   { return this.resolved_type != null; }
+    has_resolved_type() -> boolean   { return this.resolved_type.is_valid(); }
 
     set_visibility(v: Visibility) -> void         { this.visibility = v; }
     set_default_value(v: ExpressionNode*) -> void { this.default_value = v; }
     set_type_annotation(a: TypeAnnotation*) -> void { this.type_annotation = a; }
-    set_resolved_type(t: void*) -> void           { this.resolved_type = t; }
+    set_resolved_type(t: TypeRef) -> void         { this.resolved_type = t; }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -567,16 +571,16 @@ public:
 
 type class GenericParamNode : DeclarationNode {
 public:
-    name:        string;
-    constraints: string[];
+    name:        SymbolStr;
+    constraints: SymbolStr[];
 
-    GenericParamNode(name: string, span: SourceSpan)
+    GenericParamNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::Declaration, span) {
         this.name        = name;
         this.constraints = [];
     }
 
-    add_constraint(c: string) -> void {
+    add_constraint(c: SymbolStr) -> void {
         this.constraints = this.constraints + [c];
     }
 
