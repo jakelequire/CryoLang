@@ -2291,6 +2291,137 @@ namespace Cryo::Codegen
                                                            member_access->member() + ".elem.ptr");
                             }
                         }
+                        else if (field_type->isStructTy())
+                        {
+                            // Field is a struct type - check if it's an Array<T> struct
+                            llvm::StructType *array_struct = llvm::cast<llvm::StructType>(field_type);
+                            std::string field_struct_name = array_struct->hasName()
+                                                                ? array_struct->getName().str()
+                                                                : "";
+
+                            bool is_array_struct =
+                                field_struct_name.find("Array<") != std::string::npos ||
+                                field_struct_name.find("Array_") != std::string::npos;
+
+                            if (is_array_struct)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "ExpressionCodegen(address): Member field '{}' is Array<T> struct '{}', "
+                                          "extracting elements pointer for indexing",
+                                          member_access->member(), field_struct_name);
+
+                                // Primary: resolve element type from Cryo type system
+                                llvm::Type *elem_type = nullptr;
+
+                                std::string parent_struct_name = struct_type->hasName()
+                                                                     ? struct_type->getName().str()
+                                                                     : "";
+                                if (!parent_struct_name.empty())
+                                {
+                                    if (auto *template_reg = ctx().template_registry())
+                                    {
+                                        std::vector<std::string> candidates = {parent_struct_name};
+                                        if (!ctx().namespace_context().empty())
+                                            candidates.push_back(ctx().namespace_context() + "::" + parent_struct_name);
+
+                                        for (const auto &candidate : candidates)
+                                        {
+                                            const auto *field_info = template_reg->get_struct_field_types(candidate);
+                                            if (field_info && field_idx < field_info->field_types.size())
+                                            {
+                                                TypeRef cryo_field_type = field_info->field_types[field_idx];
+                                                if (cryo_field_type && cryo_field_type->kind() == TypeKind::Array)
+                                                {
+                                                    auto *arr = static_cast<const Cryo::ArrayType *>(cryo_field_type.get());
+                                                    if (arr->element())
+                                                        elem_type = get_llvm_type(arr->element());
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Fallback: parse LLVM struct name to extract element type
+                                if (!elem_type)
+                                {
+                                    std::string elem_type_name;
+
+                                    size_t angle_pos = field_struct_name.find('<');
+                                    if (angle_pos != std::string::npos)
+                                    {
+                                        size_t close_pos = field_struct_name.rfind('>');
+                                        if (close_pos != std::string::npos)
+                                            elem_type_name = field_struct_name.substr(
+                                                angle_pos + 1, close_pos - angle_pos - 1);
+                                    }
+                                    else
+                                    {
+                                        size_t underscore_pos = field_struct_name.find('_');
+                                        if (underscore_pos != std::string::npos)
+                                            elem_type_name = field_struct_name.substr(underscore_pos + 1);
+                                    }
+
+                                    if (!elem_type_name.empty())
+                                    {
+                                        if (elem_type_name == "i32" || elem_type_name == "int")
+                                            elem_type = llvm::Type::getInt32Ty(llvm_ctx());
+                                        else if (elem_type_name == "i64")
+                                            elem_type = llvm::Type::getInt64Ty(llvm_ctx());
+                                        else if (elem_type_name == "i16")
+                                            elem_type = llvm::Type::getInt16Ty(llvm_ctx());
+                                        else if (elem_type_name == "i8")
+                                            elem_type = llvm::Type::getInt8Ty(llvm_ctx());
+                                        else if (elem_type_name == "f64")
+                                            elem_type = llvm::Type::getDoubleTy(llvm_ctx());
+                                        else if (elem_type_name == "f32")
+                                            elem_type = llvm::Type::getFloatTy(llvm_ctx());
+                                        else if (elem_type_name == "string")
+                                            elem_type = llvm::PointerType::get(llvm_ctx(), 0);
+                                        else if (elem_type_name == "boolean")
+                                            elem_type = llvm::Type::getInt1Ty(llvm_ctx());
+                                        else
+                                        {
+                                            llvm::StructType *elem_struct =
+                                                llvm::StructType::getTypeByName(llvm_ctx(), elem_type_name);
+                                            if (elem_struct)
+                                                elem_type = elem_struct;
+                                        }
+                                    }
+                                }
+
+                                if (elem_type)
+                                {
+                                    // Array<T> struct layout: {ptr, i64, i64} = {elements, length, capacity}
+                                    // Extract the elements pointer (field 0) from the Array struct field
+                                    llvm::Value *elements_ptr_ptr = builder().CreateStructGEP(
+                                        array_struct, member_ptr, 0,
+                                        member_access->member() + ".elements.ptr");
+
+                                    llvm::Value *elements_ptr = create_load(
+                                        elements_ptr_ptr,
+                                        llvm::PointerType::get(llvm_ctx(), 0),
+                                        member_access->member() + ".elements.load");
+
+                                    // Generate index expression
+                                    llvm::Value *index_val = generate(node->index());
+                                    if (!index_val)
+                                    {
+                                        report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
+                                                     "Failed to generate index expression");
+                                        return nullptr;
+                                    }
+                                    if (!index_val->getType()->isIntegerTy())
+                                        index_val = cast_if_needed(index_val,
+                                                                   llvm::Type::getInt64Ty(llvm_ctx()));
+
+                                    // Return address of element (for assignment targets)
+                                    return builder().CreateGEP(
+                                        elem_type, elements_ptr, index_val,
+                                        member_access->member() + ".elem.ptr");
+                                }
+                            }
+                        }
                         else if (auto *arr_type = llvm::dyn_cast<llvm::ArrayType>(field_type))
                         {
                             array_ptr = member_ptr;
