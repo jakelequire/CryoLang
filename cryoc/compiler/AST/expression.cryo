@@ -7,6 +7,8 @@ namespace Compiler::AST::Expression;
 import Compiler::Diag;
 import Compiler::Lex;
 import Compiler::AST::Node;
+import Compiler::Types;
+import Compiler::Resolver::SymbolStr;
 
 
 // ============================================================================
@@ -15,15 +17,14 @@ import Compiler::AST::Node;
 
 type class ExpressionNode : ASTNode {
 public:
-// TODO: Replace `void*` with actual type representation once we have it.
-    resolved_type: void*;
+    resolved_type: TypeRef;
 
     ExpressionNode(kind: NodeKind, span: SourceSpan) : ASTNode(kind, span) {
-        this.resolved_type = null;
+        this.resolved_type = TypeRef::invalid();
     }
 
-    set_resolved_type(t: void*) -> void { this.resolved_type = t; }
-    has_resolved_type() -> boolean      { return this.resolved_type != null; }
+    set_resolved_type(t: TypeRef) -> void { this.resolved_type = t; }
+    has_resolved_type() -> boolean        { return this.resolved_type.is_valid(); }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -54,10 +55,10 @@ public:
 
 type class IdentifierNode : ExpressionNode {
 public:
-    name:                string;
+    name:                SymbolStr;
     is_global_reference: boolean;
 
-    IdentifierNode(name: string, span: SourceSpan)
+    IdentifierNode(name: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::Identifier, span) {
         this.name                = name;
         this.is_global_reference = false;
@@ -174,7 +175,7 @@ type class CallExprNode : ExpressionNode {
 public:
     callee:       ExpressionNode*;
     arguments:    ExpressionNode*[];
-    generic_args: string[];
+    generic_args: SymbolStr[];
 
     CallExprNode(callee: ExpressionNode*, span: SourceSpan)
         : ExpressionNode(NodeKind::CallExpression, span) {
@@ -187,7 +188,7 @@ public:
         this.arguments.push(arg);
     }
 
-    set_generic_args(args: string[]) -> void {
+    set_generic_args(args: SymbolStr[]) -> void {
         this.generic_args = args;
     }
 
@@ -199,12 +200,12 @@ public:
 
 type class NewExprNode : ExpressionNode {
 public:
-    type_name:    string;
-    generic_args: string[];
+    type_name:    SymbolStr;
+    generic_args: SymbolStr[];
     arguments:    ExpressionNode*[];
     array_size:   ExpressionNode*;
 
-    NewExprNode(type_name: string, span: SourceSpan)
+    NewExprNode(type_name: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::NewExpression, span) {
         this.type_name    = type_name;
         this.generic_args = [];
@@ -218,7 +219,7 @@ public:
         this.arguments.push(arg);
     }
 
-    set_generic_args(args: string[]) -> void {
+    set_generic_args(args: SymbolStr[]) -> void {
         this.generic_args = args;
     }
 
@@ -234,10 +235,10 @@ public:
 
 type class SizeofExprNode : ExpressionNode {
 public:
-    type_name: string;
+    type_name: SymbolStr;
     type_span: SourceSpan;
 
-    SizeofExprNode(type_name: string, type_span: SourceSpan, span: SourceSpan)
+    SizeofExprNode(type_name: SymbolStr, type_span: SourceSpan, span: SourceSpan)
         : ExpressionNode(NodeKind::SizeofExpression, span) {
         this.type_name = type_name;
         this.type_span = type_span;
@@ -251,10 +252,10 @@ public:
 
 type class AlignofExprNode : ExpressionNode {
 public:
-    type_name: string;
+    type_name: SymbolStr;
     type_span: SourceSpan;
 
-    AlignofExprNode(type_name: string, type_span: SourceSpan, span: SourceSpan)
+    AlignofExprNode(type_name: SymbolStr, type_span: SourceSpan, span: SourceSpan)
         : ExpressionNode(NodeKind::AlignofExpression, span) {
         this.type_name = type_name;
         this.type_span = type_span;
@@ -270,19 +271,19 @@ type class CastExprNode : ExpressionNode {
 public:
     expression:        ExpressionNode*;
     target_annotation: TypeAnnotation*;
-    resolved_target:   void*;
+    resolved_target:   TypeRef;
 
     CastExprNode(expression: ExpressionNode*, target_annotation: TypeAnnotation*,
                  span: SourceSpan)
         : ExpressionNode(NodeKind::CastExpression, span) {
         this.expression        = expression;
         this.target_annotation = target_annotation;
-        this.resolved_target   = null;
+        this.resolved_target   = TypeRef::invalid();
     }
 
-    has_resolved_target() -> boolean { return this.resolved_target != null; }
+    has_resolved_target() -> boolean { return this.resolved_target.is_valid(); }
 
-    set_resolved_target(t: void*) -> void {
+    set_resolved_target(t: TypeRef) -> void {
         this.resolved_target = t;
     }
 
@@ -294,18 +295,18 @@ public:
 
 type class StructLiteralNode : ExpressionNode {
 public:
-    struct_type:  string;
-    generic_args: string[];
+    struct_type:  SymbolStr;
+    generic_args: SymbolStr[];
     field_inits:  FieldInit[];
 
-    StructLiteralNode(struct_type: string, span: SourceSpan)
+    StructLiteralNode(struct_type: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::StructLiteral, span) {
         this.struct_type  = struct_type;
         this.generic_args = [];
         this.field_inits  = [];
     }
 
-    set_generic_args(args: string[]) -> void {
+    set_generic_args(args: SymbolStr[]) -> void {
         this.generic_args = args;
     }
 
@@ -378,13 +379,13 @@ public:
 type class LambdaExprNode : ExpressionNode {
 public:
     parameters:  VarDeclNode*[];
-    return_type: void*;
+    return_type: TypeRef;
     body:        StatementNode*;
 
     LambdaExprNode(span: SourceSpan)
         : ExpressionNode(NodeKind::LambdaExpression, span) {
         this.parameters  = [];
-        this.return_type = null;
+        this.return_type = TypeRef::invalid();
         this.body        = null;
     }
 
@@ -392,7 +393,7 @@ public:
         this.parameters.push(param);
     }
 
-    set_return_type(t: void*) -> void {
+    set_return_type(t: TypeRef) -> void {
         this.return_type = t;
     }
 
@@ -426,10 +427,10 @@ public:
 type class MemberAccessNode : ExpressionNode {
 public:
     object:      ExpressionNode*;
-    member:      string;
+    member:      SymbolStr;
     member_span: SourceSpan;
 
-    MemberAccessNode(object: ExpressionNode*, member: string,
+    MemberAccessNode(object: ExpressionNode*, member: SymbolStr,
                      member_span: SourceSpan, span: SourceSpan)
         : ExpressionNode(NodeKind::MemberAccess, span) {
         this.object      = object;
@@ -445,18 +446,18 @@ public:
 
 type class ScopeResolutionNode : ExpressionNode {
 public:
-    scope_name:   string;
-    member_name:  string;
-    generic_args: string[];
+    scope_name:   SymbolStr;
+    member_name:  SymbolStr;
+    generic_args: SymbolStr[];
 
-    ScopeResolutionNode(scope_name: string, member_name: string, span: SourceSpan)
+    ScopeResolutionNode(scope_name: SymbolStr, member_name: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::ScopeResolution, span) {
         this.scope_name   = scope_name;
         this.member_name  = member_name;
         this.generic_args = [];
     }
 
-    set_generic_args(args: string[]) -> void {
+    set_generic_args(args: SymbolStr[]) -> void {
         this.generic_args = args;
     }
 
