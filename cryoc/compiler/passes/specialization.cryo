@@ -1,0 +1,356 @@
+///! Specialization Passes
+///!
+///! Three pass implementations for the generic specialization pipeline:
+///!
+///!   1. TemplateRegistration — Scans the AST for generic declarations and
+///!      registers them in the TemplateRegistry.
+///!
+///!   2. Monomorphization — Runs the worklist-driven Monomorphizer to produce
+///!      concrete types and specialized ASTs for every InstantiatedType.
+///!
+///!   3. GenericExpressionResolution — Injects specialized ASTs into the
+///!      ProgramNode so codegen sees only concrete declarations.
+
+namespace Compiler::Passes::Specialization;
+
+import Compiler::Diag;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::Passes::PassID;
+import Compiler::CompilationContext;
+import Compiler::Types;
+import Compiler::Types::TemplateRegistry;
+import Compiler::Types::GenericRegistry;
+import Compiler::Types::Monomorphizer;
+import Compiler::Resolver::InternTable;
+
+
+// ============================================================================
+// Pass 1: Template Registration
+// ============================================================================
+
+/// Scans the AST for generic declarations (structs, enums, classes, functions,
+/// traits) and registers them in the TemplateRegistry.  Also associates impl
+/// blocks with their target template.
+function run_template_registration_pass(ctx: CompilationContext*) -> PassResult {
+    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+    if (ctx.debug_mode) {
+        printf("[TemplateRegistration] Scanning for generic declarations\n");
+    }
+
+    // Initialize registries on context
+    ctx.init_generics();
+
+    // Get the AST root
+    const root: ProgramNode* = ctx.artifacts.ast.root as ProgramNode*;
+    if (root == null) {
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                       "TemplateRegistration: no AST root");
+        return PassResult::failure(1);
+    }
+
+    // Get the template registry
+    const registry: TemplateRegistry* = ctx.template_registry;
+    if (registry == null) {
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                       "TemplateRegistration: no template registry");
+        return PassResult::failure(1);
+    }
+
+    // Get the arena from typed_ast
+    const arena: TypeArena* = ctx.artifacts.typed_ast.type_arena;
+
+    // Walk top-level statements
+    for (mut i: i64 = 0; i < root.statements.length; i++) {
+        const stmt: ASTNode* = root.statements[i];
+        if (stmt == null) { continue; }
+
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                register_struct_template(stmt as StructDeclNode*, registry, arena, ctx);
+            }
+            NodeKind::EnumDeclaration => {
+                register_enum_template(stmt as EnumDeclNode*, registry, arena, ctx);
+            }
+            NodeKind::ClassDeclaration => {
+                register_class_template(stmt as ClassDeclNode*, registry, arena, ctx);
+            }
+            NodeKind::FunctionDeclaration => {
+                register_function_template(stmt as FunctionDeclNode*, registry, arena, ctx);
+            }
+            NodeKind::TraitDeclaration => {
+                register_trait_template(stmt as TraitDeclNode*, registry, arena, ctx);
+            }
+            NodeKind::ImplementationBlock => {
+                register_impl_block(stmt as ImplBlockNode*, registry);
+            }
+            _ => {
+                // Not a declaration that can be generic
+            }
+        }
+    }
+
+    if (ctx.debug_mode) {
+        printf("[TemplateRegistration] Registered %lld templates\n", registry.count());
+    }
+
+    return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::TemplatesRegistered]);
+}
+
+
+// ============================================================================
+// Template registration helpers
+// ============================================================================
+
+function register_struct_template(node: StructDeclNode*, registry: TemplateRegistry*,
+                                  arena: TypeArena*, ctx: CompilationContext*) -> void {
+    if (!node.is_generic()) { return; }
+
+    mut param_names: string[] = [];
+    mut param_type_ids: u64[] = [];
+    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+        const gp: GenericParamNode* = node.generic_params[i];
+        param_names = param_names + [gp.name];
+        // Create a generic param type in the arena for this parameter
+        const param_ref: TypeRef = arena.create_generic_param(gp.name, i as u64);
+        param_type_ids = param_type_ids + [param_ref.id];
+    }
+
+    const qualified: string = ctx.current_namespace != ""
+        ? ctx.current_namespace + "::" + node.name
+        : node.name;
+
+    // Look up or create the base type
+    const base_type: TypeRef = arena.lookup_by_name(qualified);
+
+    const entry: TemplateEntry = TemplateEntry::new(
+        node.name, qualified, ctx.source_file,
+        param_names, param_type_ids,
+        node as ASTNode*, NodeKind::StructDeclaration,
+        base_type
+    );
+    registry.register(entry);
+}
+
+function register_enum_template(node: EnumDeclNode*, registry: TemplateRegistry*,
+                                arena: TypeArena*, ctx: CompilationContext*) -> void {
+    if (!node.is_generic()) { return; }
+
+    mut param_names: string[] = [];
+    mut param_type_ids: u64[] = [];
+    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+        const gp: GenericParamNode* = node.generic_params[i];
+        param_names = param_names + [gp.name];
+        const param_ref: TypeRef = arena.create_generic_param(gp.name, i as u64);
+        param_type_ids = param_type_ids + [param_ref.id];
+    }
+
+    const qualified: string = ctx.current_namespace != ""
+        ? ctx.current_namespace + "::" + node.name
+        : node.name;
+
+    const base_type: TypeRef = arena.lookup_by_name(qualified);
+
+    const entry: TemplateEntry = TemplateEntry::new(
+        node.name, qualified, ctx.source_file,
+        param_names, param_type_ids,
+        node as ASTNode*, NodeKind::EnumDeclaration,
+        base_type
+    );
+    registry.register(entry);
+}
+
+function register_class_template(node: ClassDeclNode*, registry: TemplateRegistry*,
+                                 arena: TypeArena*, ctx: CompilationContext*) -> void {
+    if (!node.is_generic()) { return; }
+
+    mut param_names: string[] = [];
+    mut param_type_ids: u64[] = [];
+    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+        const gp: GenericParamNode* = node.generic_params[i];
+        param_names = param_names + [gp.name];
+        const param_ref: TypeRef = arena.create_generic_param(gp.name, i as u64);
+        param_type_ids = param_type_ids + [param_ref.id];
+    }
+
+    const qualified: string = ctx.current_namespace != ""
+        ? ctx.current_namespace + "::" + node.name
+        : node.name;
+
+    const base_type: TypeRef = arena.lookup_by_name(qualified);
+
+    const entry: TemplateEntry = TemplateEntry::new(
+        node.name, qualified, ctx.source_file,
+        param_names, param_type_ids,
+        node as ASTNode*, NodeKind::ClassDeclaration,
+        base_type
+    );
+    registry.register(entry);
+}
+
+function register_function_template(node: FunctionDeclNode*, registry: TemplateRegistry*,
+                                    arena: TypeArena*, ctx: CompilationContext*) -> void {
+    if (!node.is_generic()) { return; }
+
+    mut param_names: string[] = [];
+    mut param_type_ids: u64[] = [];
+    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+        const gp: GenericParamNode* = node.generic_params[i];
+        param_names = param_names + [gp.name];
+        const param_ref: TypeRef = arena.create_generic_param(gp.name, i as u64);
+        param_type_ids = param_type_ids + [param_ref.id];
+    }
+
+    const qualified: string = ctx.current_namespace != ""
+        ? ctx.current_namespace + "::" + node.name
+        : node.name;
+
+    const base_type: TypeRef = TypeRef::invalid();
+
+    const entry: TemplateEntry = TemplateEntry::new(
+        node.name, qualified, ctx.source_file,
+        param_names, param_type_ids,
+        node as ASTNode*, NodeKind::FunctionDeclaration,
+        base_type
+    );
+    registry.register(entry);
+}
+
+function register_trait_template(node: TraitDeclNode*, registry: TemplateRegistry*,
+                                 arena: TypeArena*, ctx: CompilationContext*) -> void {
+    if (!node.is_generic()) { return; }
+
+    mut param_names: string[] = [];
+    mut param_type_ids: u64[] = [];
+    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+        const gp: GenericParamNode* = node.generic_params[i];
+        param_names = param_names + [gp.name];
+        const param_ref: TypeRef = arena.create_generic_param(gp.name, i as u64);
+        param_type_ids = param_type_ids + [param_ref.id];
+    }
+
+    const qualified: string = ctx.current_namespace != ""
+        ? ctx.current_namespace + "::" + node.name
+        : node.name;
+
+    const base_type: TypeRef = arena.lookup_by_name(qualified);
+
+    const entry: TemplateEntry = TemplateEntry::new(
+        node.name, qualified, ctx.source_file,
+        param_names, param_type_ids,
+        node as ASTNode*, NodeKind::TraitDeclaration,
+        base_type
+    );
+    registry.register(entry);
+}
+
+function register_impl_block(node: ImplBlockNode*, registry: TemplateRegistry*) -> void {
+    // Check if the target type is a registered template
+    if (registry.get_by_name(node.target_type) != null ||
+        registry.get_by_short_name(node.target_type) != null) {
+        registry.register_impl_block(node.target_type, node);
+    }
+}
+
+
+// ============================================================================
+// Pass 2: Monomorphization
+// ============================================================================
+
+/// Creates a Monomorphizer and processes all pending generic instantiations.
+function run_monomorphization_pass(ctx: CompilationContext*) -> PassResult {
+    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+    if (ctx.debug_mode) {
+        printf("[Monomorphization] Processing generic instantiations\n");
+    }
+
+    // Get required components
+    const arena: TypeArena* = ctx.artifacts.typed_ast.type_arena;
+    if (arena == null) {
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                       "Monomorphization: no TypeArena");
+        return PassResult::failure(1);
+    }
+
+    const template_reg: TemplateRegistry* = ctx.template_registry;
+    const generic_reg: GenericRegistry* = ctx.generic_registry;
+    if (template_reg == null || generic_reg == null) {
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                       "Monomorphization: registries not initialized");
+        return PassResult::failure(1);
+    }
+
+    // Create and run monomorphizer
+    const mono_ptr: Monomorphizer* = malloc(sizeof(Monomorphizer));
+    *mono_ptr = Monomorphizer::new(arena, template_reg, generic_reg, &ctx.intern_table);
+
+    const success: boolean = mono_ptr.process_all();
+
+    // Store monomorphizer on context for the next pass
+    ctx.monomorphizer = mono_ptr;
+
+    if (ctx.debug_mode) {
+        printf("[Monomorphization] Completed: %lld specializations\n",
+               mono_ptr.specialization_count());
+    }
+
+    if (!success) {
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                       "Monomorphization failed");
+    }
+
+    return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::Monomorphized]);
+}
+
+
+// ============================================================================
+// Pass 3: Generic Expression Resolution
+// ============================================================================
+
+/// Injects specialized ASTs into the ProgramNode and marks generic templates
+/// for codegen to skip.
+function run_generic_expression_resolution_pass(ctx: CompilationContext*) -> PassResult {
+    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+    if (ctx.debug_mode) {
+        printf("[GenericExpressionResolution] Injecting specialized ASTs\n");
+    }
+
+    const mono: Monomorphizer* = ctx.monomorphizer;
+    if (mono == null) {
+        // No monomorphizer means no generics were used — that's OK
+        return PassResult::ok([Provision::GenericExpressionsResolved]);
+    }
+
+    // Get all specialized ASTs
+    const specialized_asts: ASTNode*[] = mono.get_all_specialized_asts();
+
+    if (specialized_asts.length == 0) {
+        if (ctx.debug_mode) {
+            printf("[GenericExpressionResolution] No specialized ASTs to inject\n");
+        }
+        return PassResult::ok([Provision::GenericExpressionsResolved]);
+    }
+
+    // Inject into ProgramNode
+    const root: ProgramNode* = ctx.artifacts.ast.root as ProgramNode*;
+    if (root == null) {
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                       "GenericExpressionResolution: no AST root");
+        return PassResult::failure(1);
+    }
+
+    for (mut i: i64 = 0; i < specialized_asts.length; i++) {
+        root.add_statement(specialized_asts[i]);
+    }
+
+    if (ctx.debug_mode) {
+        printf("[GenericExpressionResolution] Injected %lld specialized declarations\n",
+               specialized_asts.length);
+    }
+
+    return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::GenericExpressionsResolved]);
+}

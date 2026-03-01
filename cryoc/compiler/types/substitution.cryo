@@ -1,0 +1,246 @@
+///! Type Substitution
+///!
+///! Maps GenericParam/BoundedParam TypeIDs to concrete TypeRefs and
+///! recursively applies substitutions through compound types.
+///! Used by the monomorphization pipeline to transform generic type
+///! references into their concrete counterparts.
+
+namespace Compiler::Types::Substitution;
+
+
+// ============================================================================
+// TypeSubstitution — Generic parameter → concrete type mapping
+// ============================================================================
+
+/// Maps generic parameter TypeIDs to concrete TypeRef replacements.
+/// Parallel arrays: param_ids[i] corresponds to replacements[i].
+type struct TypeSubstitution {
+    param_ids:    u64[];       // GenericParamType/BoundedParamType TypeIDs
+    replacements: TypeRef[];   // Parallel: the concrete replacements
+
+
+    // ----------------------------------------------------------------
+    // Construction
+    // ----------------------------------------------------------------
+
+    /// Create a substitution from parallel arrays of param TypeIDs and concrete types.
+    static from_params(param_type_ids: u64[], type_args: TypeRef[]) -> TypeSubstitution {
+        return TypeSubstitution {
+            param_ids:    param_type_ids,
+            replacements: type_args,
+        };
+    }
+
+    /// Create an empty substitution.
+    static empty() -> TypeSubstitution {
+        return TypeSubstitution {
+            param_ids:    [],
+            replacements: [],
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Mutation
+    // ----------------------------------------------------------------
+
+    /// Add a single param → replacement mapping.
+    add(mut &this, param_id: u64, replacement: TypeRef) -> void {
+        this.param_ids    = this.param_ids + [param_id];
+        this.replacements = this.replacements + [replacement];
+    }
+
+
+    // ----------------------------------------------------------------
+    // Lookup
+    // ----------------------------------------------------------------
+
+    /// Look up the replacement for a given param TypeID.
+    /// Returns TypeRef::invalid() if not found.
+    get(&this, param_id: u64) -> TypeRef {
+        for (mut i: i64 = 0; i < this.param_ids.length; i++) {
+            if (this.param_ids[i] == param_id) {
+                return this.replacements[i];
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Whether this substitution has any mappings.
+    is_empty(&this) -> boolean {
+        return this.param_ids.length == 0;
+    }
+
+    /// Number of param → replacement pairs.
+    size(&this) -> i64 {
+        return this.param_ids.length;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Recursive application
+    // ----------------------------------------------------------------
+
+    /// Apply this substitution to a type, recursively walking through
+    /// compound types.  Returns the substituted type (may be the same
+    /// TypeRef if no substitution was needed).
+    apply(&this, ty: TypeRef, arena: TypeArena*) -> TypeRef {
+        if (ty.is_invalid()) {
+            return ty;
+        }
+
+        const t: Type* = arena.lookup(ty.id);
+        if (t == null) {
+            return ty;
+        }
+
+        return match (t.kind) {
+            TypeKind::GenericParam => {
+                this.apply_generic_param(ty, t, arena)
+            }
+            TypeKind::BoundedParam => {
+                this.apply_bounded_param(ty, t, arena)
+            }
+            TypeKind::Pointer => {
+                this.apply_pointer(ty, t, arena)
+            }
+            TypeKind::Reference => {
+                this.apply_reference(ty, t, arena)
+            }
+            TypeKind::Array => {
+                this.apply_array(ty, t, arena)
+            }
+            TypeKind::Optional => {
+                this.apply_optional(ty, t, arena)
+            }
+            TypeKind::Function => {
+                this.apply_function(ty, t, arena)
+            }
+            TypeKind::Tuple => {
+                this.apply_tuple(ty, t, arena)
+            }
+            TypeKind::InstantiatedType => {
+                this.apply_instantiation(ty, t, arena)
+            }
+            _ => {
+                // Primitives, Struct, Class, Enum, Trait, etc. — no substitution needed
+                ty
+            }
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Per-kind application helpers
+    // ----------------------------------------------------------------
+
+    apply_generic_param(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+        const replacement: TypeRef = this.get(ty.id);
+        if (replacement.is_valid()) {
+            return replacement;
+        }
+        return ty;
+    }
+
+    apply_bounded_param(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+        const replacement: TypeRef = this.get(ty.id);
+        if (replacement.is_valid()) {
+            return replacement;
+        }
+        return ty;
+    }
+
+    apply_pointer(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+        const ptr: PointerType* = t as PointerType*;
+        const new_pointee: TypeRef = this.apply(ptr.pointee, arena);
+        if (new_pointee.equals(ptr.pointee)) {
+            return ty;  // Short-circuit: nothing changed
+        }
+        return arena.get_pointer_to(new_pointee);
+    }
+
+    apply_reference(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+        const ref: ReferenceType* = t as ReferenceType*;
+        const new_referent: TypeRef = this.apply(ref.referent, arena);
+        if (new_referent.equals(ref.referent)) {
+            return ty;
+        }
+        return arena.get_reference_to(new_referent, ref.mutability);
+    }
+
+    apply_array(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+        const arr: ArrayType* = t as ArrayType*;
+        const new_element: TypeRef = this.apply(arr.element, arena);
+        if (new_element.equals(arr.element)) {
+            return ty;
+        }
+        return arena.get_array_of(new_element, arr.size);
+    }
+
+    apply_optional(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+        const opt: OptionalType* = t as OptionalType*;
+        const new_wrapped: TypeRef = this.apply(opt.wrapped, arena);
+        if (new_wrapped.equals(opt.wrapped)) {
+            return ty;
+        }
+        return arena.get_optional_of(new_wrapped);
+    }
+
+    apply_function(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+        const func: FunctionType* = t as FunctionType*;
+        const new_ret: TypeRef = this.apply(func.return_type, arena);
+
+        mut changed: boolean = !new_ret.equals(func.return_type);
+        mut new_params: TypeRef[] = [];
+        for (mut i: i64 = 0; i < func.param_types.length; i++) {
+            const new_p: TypeRef = this.apply(func.param_types[i], arena);
+            new_params = new_params + [new_p];
+            if (!new_p.equals(func.param_types[i])) {
+                changed = true;
+            }
+        }
+
+        if (!changed) {
+            return ty;
+        }
+        return arena.get_function(new_ret, new_params, func.is_variadic);
+    }
+
+    apply_tuple(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+        const tup: TupleType* = t as TupleType*;
+
+        mut changed: boolean = false;
+        mut new_elems: TypeRef[] = [];
+        for (mut i: i64 = 0; i < tup.elements.length; i++) {
+            const new_e: TypeRef = this.apply(tup.elements[i], arena);
+            new_elems = new_elems + [new_e];
+            if (!new_e.equals(tup.elements[i])) {
+                changed = true;
+            }
+        }
+
+        if (!changed) {
+            return ty;
+        }
+        return arena.get_tuple(new_elems);
+    }
+
+    apply_instantiation(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+        const inst: InstantiatedType* = t as InstantiatedType*;
+
+        mut changed: boolean = false;
+        mut new_args: TypeRef[] = [];
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            const new_a: TypeRef = this.apply(inst.type_args[i], arena);
+            new_args = new_args + [new_a];
+            if (!new_a.equals(inst.type_args[i])) {
+                changed = true;
+            }
+        }
+
+        if (!changed) {
+            return ty;
+        }
+        return arena.create_instantiation(inst.generic_base, new_args);
+    }
+}

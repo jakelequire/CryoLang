@@ -1,0 +1,839 @@
+///! AST Cloner
+///!
+///! Deep-clones AST subtrees via the visitor pattern.  Each visit() override
+///! allocates a new node, copies scalar fields, and recursively clones children.
+///! Resolved type fields are set to null on clones — the type substituter fills
+///! them during generic specialization.
+///!
+///! Used by the monomorphization pipeline: the ASTSpecializer clones a generic
+///! declaration, then the ASTTypeSubstituter rewrites the clone's type annotations.
+
+namespace Compiler::AST::Cloner;
+
+import Compiler::Diag;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::AST::Visitor;
+
+
+// ============================================================================
+// ASTCloner — Deep-copy visitor
+// ============================================================================
+
+type class ASTCloner : BaseASTVisitor {
+public:
+    /// The result of the most recent visit() call.  After calling
+    /// node.accept(this), retrieve the clone from this field.
+    result: ASTNode*;
+
+    ASTCloner() : BaseASTVisitor() {
+        this.result = null;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Top-level entry points
+    // ----------------------------------------------------------------
+
+    /// Clone any ASTNode.
+    clone_node(node: ASTNode*) -> ASTNode* {
+        if (node == null) { return null; }
+        node.accept(this);
+        return this.result;
+    }
+
+    /// Clone an expression node (cast wrapper).
+    clone_expr(node: ExpressionNode*) -> ExpressionNode* {
+        if (node == null) { return null; }
+        node.accept(this);
+        return this.result as ExpressionNode*;
+    }
+
+    /// Clone a statement node (cast wrapper).
+    clone_stmt(node: StatementNode*) -> StatementNode* {
+        if (node == null) { return null; }
+        node.accept(this);
+        return this.result as StatementNode*;
+    }
+
+    /// Clone a declaration node (cast wrapper).
+    clone_decl(node: DeclarationNode*) -> DeclarationNode* {
+        if (node == null) { return null; }
+        node.accept(this);
+        return this.result as DeclarationNode*;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Type annotation cloning (not visitor-based — manual deep copy)
+    // ----------------------------------------------------------------
+
+    /// Deep-copy a type annotation tree.
+    clone_type_annotation(ann: TypeAnnotation*) -> TypeAnnotation* {
+        if (ann == null) { return null; }
+
+        // Allocate a new TypeAnnotation and match on the variant
+        const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+
+        match (*ann) {
+            TypeAnnotation::Primitive(prim) => {
+                const new_prim: PrimitiveAnnotation* = malloc(sizeof(PrimitiveAnnotation));
+                *new_prim = PrimitiveAnnotation { name: prim.name, span: prim.span };
+                *result = TypeAnnotation::Primitive(new_prim);
+            }
+            TypeAnnotation::Named(named) => {
+                const new_named: NamedAnnotation* = malloc(sizeof(NamedAnnotation));
+                *new_named = NamedAnnotation { name: named.name, span: named.span };
+                *result = TypeAnnotation::Named(new_named);
+            }
+            TypeAnnotation::Pointer(ptr) => {
+                const new_ptr: PointerAnnotation* = malloc(sizeof(PointerAnnotation));
+                *new_ptr = PointerAnnotation {
+                    inner: this.clone_type_annotation(ptr.inner),
+                    span:  ptr.span,
+                };
+                *result = TypeAnnotation::Pointer(new_ptr);
+            }
+            TypeAnnotation::Reference(ref) => {
+                const new_ref: ReferenceAnnotation* = malloc(sizeof(ReferenceAnnotation));
+                *new_ref = ReferenceAnnotation {
+                    inner:      this.clone_type_annotation(ref.inner),
+                    is_mutable: ref.is_mutable,
+                    span:       ref.span,
+                };
+                *result = TypeAnnotation::Reference(new_ref);
+            }
+            TypeAnnotation::Array(arr) => {
+                const new_arr: ArrayAnnotation* = malloc(sizeof(ArrayAnnotation));
+                *new_arr = ArrayAnnotation {
+                    element: this.clone_type_annotation(arr.element),
+                    size:    arr.size,
+                    span:    arr.span,
+                };
+                *result = TypeAnnotation::Array(new_arr);
+            }
+            TypeAnnotation::Function(func) => {
+                mut new_params: TypeAnnotation*[] = [];
+                for (mut i: i64 = 0; i < func.parameters.length; i++) {
+                    new_params = new_params + [this.clone_type_annotation(func.parameters[i])];
+                }
+                const new_func: FunctionAnnotation* = malloc(sizeof(FunctionAnnotation));
+                *new_func = FunctionAnnotation {
+                    parameters:  new_params,
+                    return_type: this.clone_type_annotation(func.return_type),
+                    span:        func.span,
+                };
+                *result = TypeAnnotation::Function(new_func);
+            }
+            TypeAnnotation::Tuple(tup) => {
+                mut new_elems: TypeAnnotation*[] = [];
+                for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                    new_elems = new_elems + [this.clone_type_annotation(tup.elements[i])];
+                }
+                const new_tup: TupleAnnotation* = malloc(sizeof(TupleAnnotation));
+                *new_tup = TupleAnnotation {
+                    elements: new_elems,
+                    span:     tup.span,
+                };
+                *result = TypeAnnotation::Tuple(new_tup);
+            }
+            TypeAnnotation::Optional(opt) => {
+                const new_opt: OptionalAnnotation* = malloc(sizeof(OptionalAnnotation));
+                *new_opt = OptionalAnnotation {
+                    inner: this.clone_type_annotation(opt.inner),
+                    span:  opt.span,
+                };
+                *result = TypeAnnotation::Optional(new_opt);
+            }
+            TypeAnnotation::Generic(gen) => {
+                mut new_args: TypeAnnotation*[] = [];
+                for (mut i: i64 = 0; i < gen.args.length; i++) {
+                    new_args = new_args + [this.clone_type_annotation(gen.args[i])];
+                }
+                const new_gen: GenericAnnotation* = malloc(sizeof(GenericAnnotation));
+                *new_gen = GenericAnnotation {
+                    base: this.clone_type_annotation(gen.base),
+                    args: new_args,
+                    span: gen.span,
+                };
+                *result = TypeAnnotation::Generic(new_gen);
+            }
+        }
+
+        return result;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Helper: copy DeclarationNode base fields
+    // ----------------------------------------------------------------
+
+    copy_decl_base(src: DeclarationNode*, dst: DeclarationNode*) -> void {
+        dst.documentation = src.documentation;
+        dst.source_module = src.source_module;
+        dst.name_span     = src.name_span;
+        dst.has_error      = src.has_error;
+    }
+
+
+    // ================================================================
+    // Expression visitors
+    // ================================================================
+
+    override visit(node: LiteralNode*) -> void {
+        const c: LiteralNode* = new LiteralNode(node.value, node.literal_kind, node.span);
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: IdentifierNode*) -> void {
+        const c: IdentifierNode* = new IdentifierNode(node.name, node.span);
+        c.is_global_reference = node.is_global_reference;
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: BinaryExprNode*) -> void {
+        const c: BinaryExprNode* = new BinaryExprNode(
+            node.op,
+            this.clone_expr(node.left),
+            this.clone_expr(node.right),
+            node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: UnaryExprNode*) -> void {
+        const c: UnaryExprNode* = new UnaryExprNode(
+            node.op,
+            this.clone_expr(node.operand),
+            node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: TernaryExprNode*) -> void {
+        const c: TernaryExprNode* = new TernaryExprNode(
+            this.clone_expr(node.condition),
+            this.clone_expr(node.true_expr),
+            this.clone_expr(node.false_expr),
+            node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: IfExprNode*) -> void {
+        const c: IfExprNode* = new IfExprNode(
+            this.clone_expr(node.condition),
+            this.clone_expr(node.then_expr),
+            this.clone_expr(node.else_expr),
+            node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: MatchExprNode*) -> void {
+        const c: MatchExprNode* = new MatchExprNode(
+            this.clone_expr(node.subject), node.span
+        );
+        for (mut i: i64 = 0; i < node.arms.length; i++) {
+            c.add_arm(this.clone_match_arm(node.arms[i]));
+        }
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: CallExprNode*) -> void {
+        const c: CallExprNode* = new CallExprNode(
+            this.clone_expr(node.callee), node.span
+        );
+        for (mut i: i64 = 0; i < node.arguments.length; i++) {
+            c.add_argument(this.clone_expr(node.arguments[i]));
+        }
+        c.generic_args = node.generic_args;
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: NewExprNode*) -> void {
+        const c: NewExprNode* = new NewExprNode(node.type_name, node.span);
+        for (mut i: i64 = 0; i < node.arguments.length; i++) {
+            c.add_argument(this.clone_expr(node.arguments[i]));
+        }
+        c.generic_args = node.generic_args;
+        if (node.has_array_size()) {
+            c.set_array_size(this.clone_expr(node.array_size));
+        }
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: SizeofExprNode*) -> void {
+        const c: SizeofExprNode* = new SizeofExprNode(
+            node.type_name, node.type_span, node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: AlignofExprNode*) -> void {
+        const c: AlignofExprNode* = new AlignofExprNode(
+            node.type_name, node.type_span, node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: CastExprNode*) -> void {
+        const c: CastExprNode* = new CastExprNode(
+            this.clone_expr(node.expression),
+            this.clone_type_annotation(node.target_annotation),
+            node.span
+        );
+        // resolved_target left as null on clone
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: StructLiteralNode*) -> void {
+        const c: StructLiteralNode* = new StructLiteralNode(node.struct_type, node.span);
+        c.generic_args = node.generic_args;
+        for (mut i: i64 = 0; i < node.field_inits.length; i++) {
+            const fi: FieldInit = node.field_inits[i];
+            c.add_field_init(FieldInit {
+                field_name: fi.field_name,
+                value:      this.clone_expr(fi.value as ExpressionNode*) as void*,
+                span:       fi.span,
+            });
+        }
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: ArrayLiteralNode*) -> void {
+        const c: ArrayLiteralNode* = new ArrayLiteralNode(node.span);
+        for (mut i: i64 = 0; i < node.elements.length; i++) {
+            c.add_element(this.clone_expr(node.elements[i]));
+        }
+        c.element_type = node.element_type;
+        c.repeat_count = node.repeat_count;
+        if (node.repeat_count_expr != null) {
+            c.set_repeat_count_expr(this.clone_expr(node.repeat_count_expr));
+        }
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: TupleLiteralNode*) -> void {
+        const c: TupleLiteralNode* = new TupleLiteralNode(node.span);
+        for (mut i: i64 = 0; i < node.elements.length; i++) {
+            c.add_element(this.clone_expr(node.elements[i]));
+        }
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: LambdaExprNode*) -> void {
+        const c: LambdaExprNode* = new LambdaExprNode(node.span);
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            c.add_parameter(this.clone_var_decl(node.parameters[i]));
+        }
+        // return_type left as null on clone
+        if (node.body != null) {
+            c.set_body(this.clone_stmt(node.body));
+        }
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: ArrayAccessNode*) -> void {
+        const c: ArrayAccessNode* = new ArrayAccessNode(
+            this.clone_expr(node.array),
+            this.clone_expr(node.index),
+            node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: MemberAccessNode*) -> void {
+        const c: MemberAccessNode* = new MemberAccessNode(
+            this.clone_expr(node.object),
+            node.member,
+            node.member_span,
+            node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: ScopeResolutionNode*) -> void {
+        const c: ScopeResolutionNode* = new ScopeResolutionNode(
+            node.scope_name, node.member_name, node.span
+        );
+        c.generic_args = node.generic_args;
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+
+    // ================================================================
+    // Statement visitors
+    // ================================================================
+
+    override visit(node: BlockStmtNode*) -> void {
+        const c: BlockStmtNode* = new BlockStmtNode(node.span);
+        for (mut i: i64 = 0; i < node.statements.length; i++) {
+            c.add_statement(this.clone_stmt(node.statements[i]));
+        }
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: UnsafeBlockStmtNode*) -> void {
+        node.block.accept(this);
+        const cloned_block: BlockStmtNode* = this.result as BlockStmtNode*;
+        const c: UnsafeBlockStmtNode* = new UnsafeBlockStmtNode(cloned_block, node.span);
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: ReturnStmtNode*) -> void {
+        const c: ReturnStmtNode* = new ReturnStmtNode(
+            this.clone_expr(node.expression), node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: IfStmtNode*) -> void {
+        const c: IfStmtNode* = new IfStmtNode(
+            this.clone_expr(node.condition),
+            this.clone_stmt(node.then_stmt),
+            this.clone_stmt(node.else_stmt),
+            node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: WhileStmtNode*) -> void {
+        const c: WhileStmtNode* = new WhileStmtNode(
+            this.clone_expr(node.condition),
+            this.clone_stmt(node.body),
+            node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: DoWhileStmtNode*) -> void {
+        const c: DoWhileStmtNode* = new DoWhileStmtNode(
+            this.clone_stmt(node.body),
+            this.clone_expr(node.condition),
+            node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: ForStmtNode*) -> void {
+        const c: ForStmtNode* = new ForStmtNode(
+            this.clone_node(node.init),
+            this.clone_expr(node.condition),
+            this.clone_expr(node.update),
+            this.clone_stmt(node.body),
+            node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: MatchStmtNode*) -> void {
+        const c: MatchStmtNode* = new MatchStmtNode(
+            this.clone_expr(node.subject), node.span
+        );
+        for (mut i: i64 = 0; i < node.arms.length; i++) {
+            c.add_arm(this.clone_match_arm(node.arms[i]));
+        }
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: SwitchStmtNode*) -> void {
+        const c: SwitchStmtNode* = new SwitchStmtNode(
+            this.clone_expr(node.expression), node.span
+        );
+        for (mut i: i64 = 0; i < node.cases.length; i++) {
+            node.cases[i].accept(this);
+            c.add_case(this.result as CaseStmtNode*);
+        }
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: CaseStmtNode*) -> void {
+        node.body.accept(this);
+        const cloned_body: BlockStmtNode* = this.result as BlockStmtNode*;
+        const c: CaseStmtNode* = new CaseStmtNode(
+            this.clone_expr(node.value),
+            cloned_body,
+            node.is_default,
+            node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: BreakStmtNode*) -> void {
+        const c: BreakStmtNode* = new BreakStmtNode(node.span);
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: ContinueStmtNode*) -> void {
+        const c: ContinueStmtNode* = new ContinueStmtNode(node.span);
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: ExprStmtNode*) -> void {
+        const c: ExprStmtNode* = new ExprStmtNode(
+            this.clone_expr(node.expression), node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: DeclStmtNode*) -> void {
+        const c: DeclStmtNode* = new DeclStmtNode(
+            this.clone_decl(node.declaration), node.span
+        );
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+
+    // ================================================================
+    // Declaration visitors
+    // ================================================================
+
+    override visit(node: VarDeclNode*) -> void {
+        const c: VarDeclNode* = this.clone_var_decl(node);
+        this.result = c;
+    }
+
+    override visit(node: FunctionDeclNode*) -> void {
+        const c: FunctionDeclNode* = this.clone_func_decl(node);
+        this.result = c;
+    }
+
+    override visit(node: MethodNode*) -> void {
+        const cloned_func: FunctionDeclNode* = this.clone_func_decl(node.func);
+        const c: MethodNode* = new MethodNode(cloned_func, node.span);
+        this.copy_decl_base(node, c);
+        c.visibility            = node.visibility;
+        c.is_constructor        = node.is_constructor;
+        c.is_destructor         = node.is_destructor;
+        c.is_static             = node.is_static;
+        c.is_default_destructor = node.is_default_destructor;
+        c.is_virtual            = node.is_virtual;
+        c.is_override           = node.is_override;
+        c.base_ctor_name        = node.base_ctor_name;
+        mut cloned_args: ExpressionNode*[] = [];
+        for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
+            cloned_args = cloned_args + [this.clone_expr(node.base_ctor_args[i])];
+        }
+        c.base_ctor_args = cloned_args;
+        this.result = c;
+    }
+
+    override visit(node: IntrinsicDeclNode*) -> void {
+        const c: IntrinsicDeclNode* = new IntrinsicDeclNode(node.name, node.span);
+        this.copy_decl_base(node, c);
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            c.add_parameter(this.clone_var_decl(node.parameters[i]));
+        }
+        if (node.has_body()) {
+            node.body.accept(this);
+            c.set_body(this.result as BlockStmtNode*);
+        }
+        // resolved_return_type left as null
+        this.result = c;
+    }
+
+    override visit(node: IntrinsicConstDeclNode*) -> void {
+        const c: IntrinsicConstDeclNode* = new IntrinsicConstDeclNode(node.name, node.span);
+        this.copy_decl_base(node, c);
+        // resolved_type left as null
+        this.result = c;
+    }
+
+    override visit(node: ImportDeclNode*) -> void {
+        const c: ImportDeclNode* = new ImportDeclNode(node.module_path, node.style, node.span);
+        this.copy_decl_base(node, c);
+        c.alias = node.alias;
+        c.specific_imports = node.specific_imports;
+        this.result = c;
+    }
+
+    override visit(node: ModuleDeclNode*) -> void {
+        const c: ModuleDeclNode* = new ModuleDeclNode(node.path, node.is_public, node.span);
+        this.copy_decl_base(node, c);
+        this.result = c;
+    }
+
+    override visit(node: StructDeclNode*) -> void {
+        const c: StructDeclNode* = new StructDeclNode(node.name, node.span);
+        this.copy_decl_base(node, c);
+        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+        }
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            c.add_field(this.clone_field_decl(node.fields[i]));
+        }
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            node.methods[i].accept(this);
+            c.add_method(this.result as MethodNode*);
+        }
+        this.result = c;
+    }
+
+    override visit(node: ClassDeclNode*) -> void {
+        const c: ClassDeclNode* = new ClassDeclNode(node.name, node.span);
+        this.copy_decl_base(node, c);
+        c.base_class = node.base_class;
+        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+        }
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            c.add_field(this.clone_field_decl(node.fields[i]));
+        }
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            node.methods[i].accept(this);
+            c.add_method(this.result as MethodNode*);
+        }
+        this.result = c;
+    }
+
+    override visit(node: TraitDeclNode*) -> void {
+        const c: TraitDeclNode* = new TraitDeclNode(node.name, node.span);
+        this.copy_decl_base(node, c);
+        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+        }
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            c.add_method(this.clone_func_decl(node.methods[i]));
+        }
+        c.base_traits = node.base_traits;
+        this.result = c;
+    }
+
+    override visit(node: TypeAliasDeclNode*) -> void {
+        const c: TypeAliasDeclNode* = new TypeAliasDeclNode(node.alias_name, node.span);
+        this.copy_decl_base(node, c);
+        c.generic_params = node.generic_params;
+        if (node.target_annotation != null) {
+            c.set_target_annotation(this.clone_type_annotation(node.target_annotation));
+        }
+        // resolved_target left as null
+        this.result = c;
+    }
+
+    override visit(node: EnumDeclNode*) -> void {
+        const c: EnumDeclNode* = new EnumDeclNode(node.name, node.span);
+        this.copy_decl_base(node, c);
+        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+        }
+        for (mut i: i64 = 0; i < node.variants.length; i++) {
+            c.add_variant(this.clone_enum_variant(node.variants[i]));
+        }
+        this.result = c;
+    }
+
+    override visit(node: EnumVariantNode*) -> void {
+        const c: EnumVariantNode* = this.clone_enum_variant(node);
+        this.result = c;
+    }
+
+    override visit(node: ImplBlockNode*) -> void {
+        const c: ImplBlockNode* = new ImplBlockNode(node.target_type, node.span);
+        this.copy_decl_base(node, c);
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            c.add_field(this.clone_field_decl(node.fields[i]));
+        }
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            node.methods[i].accept(this);
+            c.add_method(this.result as MethodNode*);
+        }
+        this.result = c;
+    }
+
+    override visit(node: ExternBlockNode*) -> void {
+        const c: ExternBlockNode* = new ExternBlockNode(node.linkage_type, node.span);
+        this.copy_decl_base(node, c);
+        for (mut i: i64 = 0; i < node.functions.length; i++) {
+            c.add_function(this.clone_func_decl(node.functions[i]));
+        }
+        this.result = c;
+    }
+
+    override visit(node: FieldDeclNode*) -> void {
+        const c: FieldDeclNode* = this.clone_field_decl(node);
+        this.result = c;
+    }
+
+    override visit(node: GenericParamNode*) -> void {
+        const c: GenericParamNode* = this.clone_generic_param(node);
+        this.result = c;
+    }
+
+
+    // ================================================================
+    // Other visitors
+    // ================================================================
+
+    override visit(node: ProgramNode*) -> void {
+        const c: ProgramNode* = new ProgramNode(node.span);
+        c.namespace_name = node.namespace_name;
+        for (mut i: i64 = 0; i < node.statements.length; i++) {
+            c.add_statement(this.clone_node(node.statements[i]));
+        }
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: MatchArmNode*) -> void {
+        const c: MatchArmNode* = this.clone_match_arm(node);
+        this.result = c;
+    }
+
+    override visit(node: PatternNode*) -> void {
+        const c: PatternNode* = new PatternNode(node.pattern_kind, node.span);
+        c.value        = node.value;
+        c.binding_name = node.binding_name;
+        c.has_error    = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: EnumPatternNode*) -> void {
+        const c: EnumPatternNode* = new EnumPatternNode(node.span);
+        c.value        = node.value;
+        c.binding_name = node.binding_name;
+        c.enum_name    = node.enum_name;
+        c.variant_name = node.variant_name;
+        c.elements     = node.elements;  // PatternElement[] — value types, shallow copy is fine
+        c.has_error    = node.has_error;
+        this.result = c;
+    }
+
+    override visit(node: DirectiveNode*) -> void {
+        const c: DirectiveNode* = new DirectiveNode(node.directive_kind, node.span);
+        c.arguments = node.arguments;
+        c.has_error = node.has_error;
+        this.result = c;
+    }
+
+
+    // ================================================================
+    // Typed clone helpers (avoid code duplication)
+    // ================================================================
+
+    /// Clone a VarDeclNode.
+    clone_var_decl(node: VarDeclNode*) -> VarDeclNode* {
+        const c: VarDeclNode* = new VarDeclNode(node.name, node.span);
+        this.copy_decl_base(node, c);
+        c.is_mutable = node.is_mutable;
+        c.is_auto    = node.is_auto;
+        c.is_global  = node.is_global;
+        if (node.has_initializer()) {
+            c.set_initializer(this.clone_expr(node.initializer));
+        }
+        if (node.has_type_annotation()) {
+            c.set_type_annotation(this.clone_type_annotation(node.type_annotation));
+        }
+        // resolved_type left as null
+        return c;
+    }
+
+    /// Clone a FunctionDeclNode.
+    clone_func_decl(node: FunctionDeclNode*) -> FunctionDeclNode* {
+        const c: FunctionDeclNode* = new FunctionDeclNode(node.name, node.span);
+        this.copy_decl_base(node, c);
+        c.is_public   = node.is_public;
+        c.is_static   = node.is_static;
+        c.is_inline   = node.is_inline;
+        c.is_variadic = node.is_variadic;
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            c.add_parameter(this.clone_var_decl(node.parameters[i]));
+        }
+        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+        }
+        c.trait_bounds = node.trait_bounds;
+        if (node.return_type_annotation != null) {
+            c.set_return_type_annotation(this.clone_type_annotation(node.return_type_annotation));
+        }
+        if (node.has_body()) {
+            node.body.accept(this);
+            c.set_body(this.result as BlockStmtNode*);
+        }
+        // resolved_return_type left as null
+        return c;
+    }
+
+    /// Clone a FieldDeclNode.
+    clone_field_decl(node: FieldDeclNode*) -> FieldDeclNode* {
+        const c: FieldDeclNode* = new FieldDeclNode(node.name, node.span);
+        this.copy_decl_base(node, c);
+        c.visibility = node.visibility;
+        if (node.has_default_value()) {
+            c.set_default_value(this.clone_expr(node.default_value));
+        }
+        if (node.has_type_annotation()) {
+            c.set_type_annotation(this.clone_type_annotation(node.type_annotation));
+        }
+        // resolved_type left as null
+        return c;
+    }
+
+    /// Clone a GenericParamNode.
+    clone_generic_param(node: GenericParamNode*) -> GenericParamNode* {
+        const c: GenericParamNode* = new GenericParamNode(node.name, node.span);
+        this.copy_decl_base(node, c);
+        c.constraints = node.constraints;
+        return c;
+    }
+
+    /// Clone an EnumVariantNode.
+    clone_enum_variant(node: EnumVariantNode*) -> EnumVariantNode* {
+        const c: EnumVariantNode* = new EnumVariantNode(node.name, node.span);
+        this.copy_decl_base(node, c);
+        c.associated_types = node.associated_types;
+        c.explicit_value   = node.explicit_value;
+        c.has_value        = node.has_value;
+        return c;
+    }
+
+    /// Clone a MatchArmNode.
+    clone_match_arm(node: MatchArmNode*) -> MatchArmNode* {
+        const c: MatchArmNode* = new MatchArmNode(node.span);
+        for (mut i: i64 = 0; i < node.patterns.length; i++) {
+            node.patterns[i].accept(this);
+            c.add_pattern(this.result as PatternNode*);
+        }
+        if (node.body != null) {
+            c.set_body(this.clone_stmt(node.body));
+        }
+        c.has_error = node.has_error;
+        return c;
+    }
+}
