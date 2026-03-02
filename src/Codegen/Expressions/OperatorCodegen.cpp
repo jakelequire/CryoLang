@@ -2893,6 +2893,19 @@ namespace Cryo::Codegen
         llvm::Value *addr = get_lvalue_address(operand);
         if (!addr)
         {
+            // Materialize rvalue into a stack temporary so we can take its address.
+            // This handles patterns like `&this.current().kind` where the result of
+            // a method call is a temporary value.
+            llvm::Value *rvalue = generate_operand(operand);
+            if (rvalue && rvalue->getType()->isSized())
+            {
+                llvm::AllocaInst *tmp = create_entry_alloca(rvalue->getType(), "addr_of_tmp");
+                builder().CreateStore(rvalue, tmp);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "OperatorCodegen: Materialized rvalue into stack temporary for address-of");
+                return tmp;
+            }
+
             report_error(ErrorCode::E0616_UNARY_OPERATION_ERROR, operand,
                          "Cannot take address of non-lvalue");
             return nullptr;
