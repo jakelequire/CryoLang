@@ -15,6 +15,8 @@ import Compiler::Artifacts;
 import Compiler::Passes::PassID;
 import Compiler::ModuleGraph;
 import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Arena;
 import Compiler::Types::TemplateRegistry;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Monomorphizer;
@@ -148,14 +150,18 @@ public:
     // Remove later when all components are fully typed and can be initialized in the constructor
     // ----------------------------------------------------------------
 
-    /// Initialize the type system components (type arena, registries).
-    /// Called by the TypeDeclaration pass.
+    /// Initialize the type system components (TypeArena, TypeChecker, TypeResolver).
+    /// Called by the TypeDeclaration pass.  Creates the TypeArena and stores it
+    /// in the TypedAST artifact where all downstream passes expect to find it.
     init_type_system(mut &this) -> void {
         // Ensure resolver is initialized (symbols live there now)
         this.init_resolver();
-        if (this.type_checker == null) {
-            // TypeArena is created and stored in the TypedAST artifact
-            // TypeChecker and TypeResolver are created on demand by passes
+
+        // Create the TypeArena if it doesn't exist yet
+        if (this.artifacts.typed_ast.type_arena == null) {
+            mut arena: TypeArena* = malloc(sizeof(TypeArena));
+            *arena = TypeArena::new();
+            this.artifacts.set_type_arena(arena);
         }
     }
 
@@ -174,23 +180,36 @@ public:
     }
 
     /// Initialize generics infrastructure (TemplateRegistry, GenericRegistry, ASTSpecializer).
-    /// Called by the TemplateRegistration pass.
+    /// Called by the TemplateRegistration pass.  Requires TypeArena to exist
+    /// (init_type_system must be called first, which the TypeDeclaration pass does).
     init_generics(mut &this) -> void {
+        // Ensure type system is initialized — the arena must exist for generics
+        if (this.artifacts.typed_ast.type_arena == null) {
+            this.init_type_system();
+        }
+
+        const arena: TypeArena* = this.artifacts.typed_ast.type_arena;
+
         if (this.template_registry == null) {
-            const reg: TemplateRegistry* = malloc(sizeof(TemplateRegistry));
+            mut reg: TemplateRegistry* = malloc(sizeof(TemplateRegistry));
             *reg = TemplateRegistry::new();
             this.template_registry = reg;
         }
-        if (this.generic_registry == null && this.artifacts.typed_ast.type_arena != null) {
-            const greg: GenericRegistry* = malloc(sizeof(GenericRegistry));
-            *greg = GenericRegistry::new(this.artifacts.typed_ast.type_arena);
+        if (this.generic_registry == null) {
+            mut greg: GenericRegistry* = malloc(sizeof(GenericRegistry));
+            *greg = GenericRegistry::new(arena);
             this.generic_registry = greg;
         }
-        if (this.ast_specializer == null && this.artifacts.typed_ast.type_arena != null) {
-            const spec: ASTSpecializer* = malloc(sizeof(ASTSpecializer));
-            *spec = ASTSpecializer::new(this.artifacts.typed_ast.type_arena, &this.intern_table);
+        if (this.ast_specializer == null) {
+            mut spec: ASTSpecializer* = malloc(sizeof(ASTSpecializer));
+            *spec = ASTSpecializer::new(arena, &this.intern_table);
             this.ast_specializer = spec;
         }
+
+        // Synchronize typed_ast artifact so passes can access registries
+        // from either ctx.* or ctx.artifacts.typed_ast.* consistently
+        this.artifacts.set_template_registry(this.template_registry);
+        this.artifacts.set_generic_registry(this.generic_registry);
     }
 
     /// Initialize the code generation backend.

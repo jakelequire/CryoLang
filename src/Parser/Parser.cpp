@@ -4709,6 +4709,19 @@ namespace Cryo
         std::string type_name = std::string(_current_token.text());
         advance(); // consume type name
 
+        // Handle qualified type names: new Module::Type or new EnumType::Variant
+        while (_current_token.is(TokenKind::TK_COLONCOLON))
+        {
+            advance(); // consume '::'
+            if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !is_type_token())
+            {
+                error("Expected type name after '::'");
+                return nullptr;
+            }
+            type_name += "::" + std::string(_current_token.text());
+            advance(); // consume the next segment
+        }
+
         auto new_expr = _builder.create_new_expression(new_location, type_name);
 
         // Handle generic types like GenericStruct<string>
@@ -4753,71 +4766,81 @@ namespace Cryo
             return new_expr;
         }
 
-        // Parse constructor arguments
-        consume(TokenKind::TK_L_PAREN, "Expected '(' for constructor call");
-
-        // Check if this is a struct literal ({field: value})
+        // Check for heap-allocated struct literal syntax: new StructName { field: value, ... }
         if (_current_token.is(TokenKind::TK_L_BRACE))
         {
-            // This is invalid syntax: 'new' keyword cannot be used with struct literal syntax
-            if (_diagnostics)
-            {
-                Span span = Span::at(new_location, _source_file);
-                _diagnostics->emit(
-                    Diag::error(ErrorCode::E0357_INVALID_INSTANTIATION,
-                                "cannot use 'new' keyword with struct literal syntax for type '" + type_name + "'")
-                        .at(span)
-                        .help("Use struct literal syntax without 'new': `" + type_name + " { ... }`"));
-            }
-
-            // Error recovery: skip the invalid struct literal syntax
-            // Consume the opening brace
             advance(); // consume '{'
 
-            // Skip until we find the closing brace
-            int brace_count = 1;
-            while (!_current_token.is(TokenKind::TK_EOF) && brace_count > 0)
+            auto struct_literal = _builder.create_struct_literal(new_location, type_name);
+            struct_literal->set_heap_allocated(true);
+
+            // Copy generic arguments from new_expr to struct_literal
+            for (const auto &generic_arg : new_expr->generic_args())
             {
-                if (_current_token.is(TokenKind::TK_L_BRACE))
-                {
-                    brace_count++;
-                }
-                else if (_current_token.is(TokenKind::TK_R_BRACE))
-                {
-                    brace_count--;
-                }
-                advance();
+                struct_literal->add_generic_arg(generic_arg);
             }
 
-            // Consume the closing parenthesis if present
-            if (_current_token.is(TokenKind::TK_R_PAREN))
-            {
-                advance();
-            }
-
-            // Return a valid new expression node without arguments for error recovery
-            return new_expr;
-        }
-        else
-        {
-            // Regular constructor call with positional arguments
-            if (!_current_token.is(TokenKind::TK_R_PAREN))
+            // Parse field initializers
+            if (!_current_token.is(TokenKind::TK_R_BRACE))
             {
                 do
                 {
-                    // Parse positional arguments (no named parameter support)
-                    auto arg = parse_expression();
-                    if (arg)
+                    if (_current_token.is(TokenKind::TK_R_BRACE))
                     {
-                        new_expr->add_argument(std::move(arg));
+                        break;
                     }
-                } while (match(TokenKind::TK_COMMA));
+
+                    if (!_current_token.is(TokenKind::TK_IDENTIFIER) && !_current_token.is_keyword())
+                    {
+                        error("Expected field name in struct literal");
+                        return nullptr;
+                    }
+
+                    std::string field_name = std::string(_current_token.text());
+                    auto field_name_loc = _current_token.location();
+                    advance(); // consume field name
+
+                    consume(TokenKind::TK_COLON, "Expected ':' after field name");
+
+                    auto field_value = parse_expression();
+                    if (!field_value)
+                    {
+                        error("Expected expression for field value");
+                        return nullptr;
+                    }
+
+                    auto field_init = std::make_unique<FieldInitializerNode>(field_name, std::move(field_value), field_name_loc);
+                    struct_literal->add_field_initializer(std::move(field_init));
+
+                } while (match(TokenKind::TK_COMMA) ||
+                         ((_current_token.is(TokenKind::TK_IDENTIFIER) || _current_token.is_keyword()) &&
+                          peek_next().is(TokenKind::TK_COLON)));
             }
 
-            consume(TokenKind::TK_R_PAREN, "Expected ')' after constructor arguments");
+            consume(TokenKind::TK_R_BRACE, "Expected '}' after struct literal fields");
 
-            return new_expr;
+            return struct_literal;
         }
+
+        // Parse constructor arguments: new Type(arg1, arg2, ...)
+        consume(TokenKind::TK_L_PAREN, "Expected '(' or '{' for constructor/struct literal");
+
+        // Regular constructor call with positional arguments
+        if (!_current_token.is(TokenKind::TK_R_PAREN))
+        {
+            do
+            {
+                auto arg = parse_expression();
+                if (arg)
+                {
+                    new_expr->add_argument(std::move(arg));
+                }
+            } while (match(TokenKind::TK_COMMA));
+        }
+
+        consume(TokenKind::TK_R_PAREN, "Expected ')' after constructor arguments");
+
+        return new_expr;
     }
 
     std::unique_ptr<ExpressionNode> Parser::parse_sizeof_expression()

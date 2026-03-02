@@ -2212,6 +2212,7 @@ namespace Cryo
         std::string _struct_type;
         std::vector<std::string> _generic_args; // For generic types
         std::vector<std::unique_ptr<FieldInitializerNode>> _field_initializers;
+        bool _is_heap_allocated = false; // true when created via 'new StructName { ... }'
 
     public:
         StructLiteralNode(SourceLocation loc, std::string struct_type)
@@ -2220,8 +2221,10 @@ namespace Cryo
         const std::string &struct_type() const { return _struct_type; }
         const std::vector<std::string> &generic_args() const { return _generic_args; }
         const std::vector<std::unique_ptr<FieldInitializerNode>> &field_initializers() const { return _field_initializers; }
+        bool is_heap_allocated() const { return _is_heap_allocated; }
 
         void add_generic_arg(const std::string &type) { _generic_args.push_back(type); }
+        void set_heap_allocated(bool v) { _is_heap_allocated = v; }
 
         void add_field_initializer(std::unique_ptr<FieldInitializerNode> initializer)
         {
@@ -2230,7 +2233,7 @@ namespace Cryo
 
         void print(std::ostream &os, int indent = 0) const override
         {
-            os << std::string(indent, ' ') << "StructLiteral: " << _struct_type;
+            os << std::string(indent, ' ') << (is_heap_allocated() ? "HeapStructLiteral: " : "StructLiteral: ") << _struct_type;
             if (!_generic_args.empty())
             {
                 os << "<";

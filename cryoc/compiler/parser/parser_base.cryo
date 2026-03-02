@@ -1,0 +1,438 @@
+///! ParserBase
+///!
+///! Base class providing the token cursor, source span construction, error
+///! reporting, and recovery infrastructure shared by all parser layers.
+
+namespace Compiler::Parser::ParserBase;
+
+import Compiler::Lex;
+import Compiler::Diag;
+import Compiler::CompilationContext;
+import Compiler::Resolver::SymbolStr;
+
+
+// ============================================================================
+// ParserBase — Token cursor, spans, errors, recovery
+// ============================================================================
+
+type class ParserBase {
+public:
+    tokens:        Token[];
+    pos:           int;
+    source_file:   string;
+    ctx:           CompilationContext*;
+    panic_mode:    boolean;
+    error_count:   int;
+    scope_depth:   int;
+    brace_depth:   int;
+    paren_depth:   int;
+    bracket_depth: int;
+
+    // Context flags
+    in_method_body:   boolean;
+    in_class_members: boolean;
+    in_impl_block:    boolean;
+
+    // Doc comment accumulation
+    pending_doc_comments: string[];
+
+    // For self-referential type detection
+    current_type_name: string;
+
+
+    // ----------------------------------------------------------------
+    // Construction
+    // ----------------------------------------------------------------
+
+    ParserBase(tokens: Token[], source_file: string, ctx: CompilationContext*) {
+        this.tokens       = tokens;
+        this.pos          = 0;
+        this.source_file  = source_file;
+        this.ctx          = ctx;
+        this.panic_mode   = false;
+        this.error_count  = 0;
+        this.scope_depth  = 0;
+        this.brace_depth  = 0;
+        this.paren_depth  = 0;
+        this.bracket_depth = 0;
+
+        this.in_method_body   = false;
+        this.in_class_members = false;
+        this.in_impl_block    = false;
+
+        this.pending_doc_comments = [];
+        this.current_type_name    = "";
+    }
+
+
+    // ----------------------------------------------------------------
+    // Token Cursor API
+    // ----------------------------------------------------------------
+
+    /// Peek at the current token without consuming it.
+    current() -> Token {
+        if (this.pos >= this.tokens.length) {
+            return Token::eof(0, 0);
+        }
+        return this.tokens[this.pos];
+    }
+
+    /// Peek at a token at offset from current position.
+    peek_at(offset: int) -> Token {
+        const idx: int = this.pos + offset;
+        if (idx < 0 || idx >= this.tokens.length) {
+            return Token::eof(0, 0);
+        }
+        return this.tokens[idx];
+    }
+
+    /// Consume the current token and return it.
+    /// Skips over comments and doc comments, tracking bracket depth.
+    advance() -> Token {
+        if (this.pos >= this.tokens.length) {
+            return Token::eof(0, 0);
+        }
+
+        const tok: Token = this.tokens[this.pos];
+        this.pos = this.pos + 1;
+
+        // Track bracket depth
+        match (&tok.kind) {
+            TokenType::LBrace   => { this.brace_depth = this.brace_depth + 1; }
+            TokenType::RBrace   => { this.brace_depth = this.brace_depth - 1; }
+            TokenType::LParen   => { this.paren_depth = this.paren_depth + 1; }
+            TokenType::RParen   => { this.paren_depth = this.paren_depth - 1; }
+            TokenType::LSquare  => { this.bracket_depth = this.bracket_depth + 1; }
+            TokenType::RSquare  => { this.bracket_depth = this.bracket_depth - 1; }
+            _ => {}
+        }
+
+        // Skip over comments, collecting doc comments
+        while (this.pos < this.tokens.length) {
+            const next: Token = this.tokens[this.pos];
+            match (&next.kind) {
+                TokenType::Comment => {
+                    this.pos = this.pos + 1;
+                }
+                TokenType::DocCommentLine => {
+                    this.pending_doc_comments.push(next.lexeme);
+                    this.pos = this.pos + 1;
+                }
+                TokenType::DocCommentBlock => {
+                    this.pending_doc_comments.push(next.lexeme);
+                    this.pos = this.pos + 1;
+                }
+                _ => { break; }
+            }
+        }
+
+        return tok;
+    }
+
+    /// Check if the current token is of the given kind.
+    check(kind: TokenType) -> boolean {
+        return this.current().kind == kind;
+    }
+
+    /// Check if the current token is any of the given kinds.
+    check_any(kinds: TokenType[]) -> boolean {
+        const cur: TokenType = this.current().kind;
+        for (mut i: int = 0; i < kinds.length; i++) {
+            if (cur == kinds[i]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Consume and return true if the current token matches the given kind.
+    match_tok(kind: TokenType) -> boolean {
+        if (this.check(kind)) {
+            this.advance();
+            return true;
+        }
+        return false;
+    }
+
+    /// Consume and return true if the current token matches any of the given kinds.
+    match_any(kinds: TokenType[]) -> boolean {
+        if (this.check_any(kinds)) {
+            this.advance();
+            return true;
+        }
+        return false;
+    }
+
+    /// Expect and consume a token of the given kind.
+    /// Reports an error and enters panic mode if the token doesn't match.
+    consume(kind: TokenType, message: string) -> Token {
+        if (this.check(kind)) {
+            return this.advance();
+        }
+
+        this.error_expected(message);
+        return this.current();
+    }
+
+    /// Check if we've reached the end of the token stream.
+    is_at_end() -> boolean {
+        return this.pos >= this.tokens.length || this.check(TokenType::EOF);
+    }
+
+
+    // ----------------------------------------------------------------
+    // SourceSpan Helpers
+    // ----------------------------------------------------------------
+
+    /// Create a SourceSpan from a single token.
+    span_from_token(tok: Token) -> SourceSpan {
+        const end_col: u32 = tok.column as u32 + tok.lexeme.length() as u32;
+        return SourceSpan::new(
+            this.source_file,
+            tok.line as u32, tok.column as u32,
+            tok.line as u32, end_col
+        );
+    }
+
+    /// Get the span of the current token.
+    current_span() -> SourceSpan {
+        return this.span_from_token(this.current());
+    }
+
+    /// Create a span from a start token to the previously consumed token.
+    span_from(start: Token) -> SourceSpan {
+        // The previous token is at pos - 1
+        if (this.pos > 0 && this.pos <= this.tokens.length) {
+            const end_tok: Token = this.tokens[this.pos - 1];
+            const end_col: u32 = end_tok.column as u32 + end_tok.lexeme.length() as u32;
+            return SourceSpan::new(
+                this.source_file,
+                start.line as u32, start.column as u32,
+                end_tok.line as u32, end_col
+            );
+        }
+        return this.span_from_token(start);
+    }
+
+    /// Merge two spans into one covering both.
+    static merge_spans(a: SourceSpan, b: SourceSpan) -> SourceSpan {
+        mut start_line: u32 = a.start_line;
+        mut start_col:  u32 = a.start_col;
+        mut end_line:   u32 = b.end_line;
+        mut end_col:    u32 = b.end_col;
+
+        if (b.start_line < a.start_line ||
+            (b.start_line == a.start_line && b.start_col < a.start_col)) {
+            start_line = b.start_line;
+            start_col  = b.start_col;
+        }
+        if (a.end_line > b.end_line ||
+            (a.end_line == b.end_line && a.end_col > b.end_col)) {
+            end_line = a.end_line;
+            end_col  = a.end_col;
+        }
+
+        return SourceSpan::new(a.file, start_line, start_col, end_line, end_col);
+    }
+
+
+    // ----------------------------------------------------------------
+    // Error Reporting
+    // ----------------------------------------------------------------
+
+    /// Report an error at the current position.
+    report_error(code: ErrorCode, message: string) -> void {
+        this.panic_mode = true;
+        this.error_count = this.error_count + 1;
+        this.ctx.emit_error_at(code, message, this.current_span());
+    }
+
+    /// Report an error at a specific span.
+    report_error_at(code: ErrorCode, message: string, span: SourceSpan) -> void {
+        this.panic_mode = true;
+        this.error_count = this.error_count + 1;
+        this.ctx.emit_error_at(code, message, span);
+    }
+
+    /// Report "expected X, found Y" error.
+    error_expected(expected: string) -> void {
+        const tok: Token = this.current();
+        const message: string = sprintf("expected %s, found '%s'", expected, tok.lexeme);
+        this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, message);
+    }
+
+    /// Report "unexpected token X" error.
+    error_unexpected() -> void {
+        const tok: Token = this.current();
+        const message: string = sprintf("unexpected token '%s'", tok.lexeme);
+        this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN, message);
+    }
+
+    /// Report "unexpected EOF" error.
+    error_eof(context: string) -> void {
+        const message: string = sprintf("unexpected end of file while parsing %s", context);
+        this.report_error(ErrorCode::E0112_UNEXPECTED_EOF, message);
+    }
+
+
+    // ----------------------------------------------------------------
+    // Error Recovery
+    // ----------------------------------------------------------------
+
+    /// Consume tokens until we find a synchronization point.
+    /// Clears panic_mode when a recovery point is reached.
+    synchronize() -> void {
+        this.panic_mode = false;
+
+        while (!this.is_at_end()) {
+            // Sync after semicolons
+            if (this.check(TokenType::Semicolon)) {
+                this.advance();
+                return;
+            }
+
+            // Sync at declaration starts
+            if (this.is_declaration_start()) {
+                return;
+            }
+
+            // Sync at statement starts
+            if (this.is_statement_start()) {
+                return;
+            }
+
+            // Sync at closing braces (end of block)
+            if (this.check(TokenType::RBrace)) {
+                return;
+            }
+
+            this.advance();
+        }
+    }
+
+    /// Check if the current token could start a declaration.
+    is_declaration_start() -> boolean {
+        const kind: TokenType = this.current().kind;
+        return match (kind) {
+            TokenType::KwFunction  => { true }
+            TokenType::KwConst     => { true }
+            TokenType::KwMut       => { true }
+            TokenType::KwType      => { true }
+            TokenType::KwStruct    => { true }
+            TokenType::KwClass     => { true }
+            TokenType::KwEnum      => { true }
+            TokenType::KwTrait     => { true }
+            TokenType::KwImport    => { true }
+            TokenType::KwModule    => { true }
+            TokenType::KwExtern    => { true }
+            TokenType::KwImplement => { true }
+            TokenType::KwPublic    => { true }
+            TokenType::KwPrivate   => { true }
+            TokenType::KwProtected => { true }
+            TokenType::KwNamespace => { true }
+            TokenType::KwIntrinsic => { true }
+            TokenType::KwStatic    => { true }
+            _                      => { false }
+        };
+    }
+
+    /// Check if the current token could start a statement.
+    is_statement_start() -> boolean {
+        const kind: TokenType = this.current().kind;
+        return match (kind) {
+            TokenType::KwIf       => { true }
+            TokenType::KwWhile    => { true }
+            TokenType::KwFor      => { true }
+            TokenType::KwDo       => { true }
+            TokenType::KwReturn   => { true }
+            TokenType::KwBreak    => { true }
+            TokenType::KwContinue => { true }
+            TokenType::KwMatch    => { true }
+            TokenType::KwSwitch   => { true }
+            TokenType::KwUnsafe   => { true }
+            TokenType::LBrace     => { true }
+            _                     => { false }
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Utility
+    // ----------------------------------------------------------------
+
+    /// Intern a token's lexeme via the compilation context.
+    intern_lexeme(tok: Token) -> SymbolStr {
+        return this.ctx.intern(tok.lexeme);
+    }
+
+    /// Skip doc comment tokens and accumulate their text.
+    collect_doc_comments() -> void {
+        while (this.pos < this.tokens.length) {
+            const tok: Token = this.current();
+            match (&tok.kind) {
+                TokenType::DocCommentLine => {
+                    this.pending_doc_comments.push(tok.lexeme);
+                    this.pos = this.pos + 1;
+                }
+                TokenType::DocCommentBlock => {
+                    this.pending_doc_comments.push(tok.lexeme);
+                    this.pos = this.pos + 1;
+                }
+                TokenType::Comment => {
+                    this.pos = this.pos + 1;
+                }
+                _ => { break; }
+            }
+        }
+    }
+
+    /// Extract and clear pending doc comments, joining them with newlines.
+    take_documentation() -> string {
+        if (this.pending_doc_comments.length == 0) {
+            return "";
+        }
+        mut result: string = "";
+        for (mut i: int = 0; i < this.pending_doc_comments.length; i++) {
+            if (i > 0) {
+                result.append("\n");
+            }
+            result.append(this.pending_doc_comments[i]);
+        }
+        this.pending_doc_comments = [];
+        return result;
+    }
+
+    /// Increment scope depth.
+    enter_scope() -> void {
+        this.scope_depth = this.scope_depth + 1;
+    }
+
+    /// Decrement scope depth.
+    exit_scope() -> void {
+        this.scope_depth = this.scope_depth - 1;
+    }
+
+    /// Handle `>>` splitting for nested generics.
+    /// When expecting `>` but finding `>>`, logically split it:
+    /// consume the first `>` and leave a synthetic `>` for the next read.
+    consume_right_angle() -> void {
+        if (this.check(TokenType::RAngle)) {
+            this.advance();
+            return;
+        }
+        if (this.check(TokenType::GreaterGreater)) {
+            // Logically consume one `>` by replacing `>>` with `>`
+            // We modify the token in-place: shorten lexeme and advance column
+            const tok: Token = this.tokens[this.pos];
+            this.tokens[this.pos] = Token::new(
+                TokenType::RAngle,
+                ">",
+                tok.line,
+                tok.column + 1
+            );
+            // Don't advance — the remaining `>` is now the current token
+            return;
+        }
+        this.error_expected("'>'");
+    }
+}

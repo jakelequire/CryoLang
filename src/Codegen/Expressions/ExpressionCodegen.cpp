@@ -5471,31 +5471,39 @@ namespace Cryo::Codegen
         }
 
         // Check if we're in a constructor - constructors should allocate on heap
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Checking constructor status");
-        bool is_constructor = false;
-        llvm::BasicBlock *insert_block = builder().GetInsertBlock();
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Insert block is {}",
-                  insert_block ? "non-null" : "null");
-        llvm::Function *current_fn = insert_block ? insert_block->getParent() : nullptr;
-        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Current function is {}",
-                  current_fn ? "non-null" : "null");
+        LOG_DEBUG(Cryo::LogComponent::CODEGEN, "generate_struct_literal: Checking allocation mode");
 
-        if (current_fn)
+        // Check if this struct literal was created via 'new StructName { ... }' syntax
+        bool is_heap = node->is_heap_allocated();
+
+        bool is_constructor = is_heap;
+        if (!is_heap)
         {
-            std::string fn_name = current_fn->getName().str();
-            // Simple heuristic: if function returns a pointer and the name contains the struct type
-            // it's likely a constructor
-            llvm::Type *ret_type = current_fn->getReturnType();
-            if (ret_type)
+            // Fallback heuristic for constructors: if function returns a pointer and the name
+            // contains the struct type, it's likely a constructor
+            llvm::BasicBlock *insert_block = builder().GetInsertBlock();
+            llvm::Function *current_fn = insert_block ? insert_block->getParent() : nullptr;
+
+            if (current_fn)
             {
-                is_constructor = ret_type->isPointerTy() &&
-                                 fn_name.find(type_name) != std::string::npos;
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "Function '{}' constructor check: {} (return type: {}, contains '{}': {})",
-                          fn_name, is_constructor ? "yes" : "no",
-                          ret_type->isPointerTy() ? "pointer" : "non-pointer",
-                          type_name, fn_name.find(type_name) != std::string::npos ? "yes" : "no");
+                std::string fn_name = current_fn->getName().str();
+                llvm::Type *ret_type = current_fn->getReturnType();
+                if (ret_type)
+                {
+                    is_constructor = ret_type->isPointerTy() &&
+                                     fn_name.find(type_name) != std::string::npos;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "Function '{}' constructor check: {} (return type: {}, contains '{}': {})",
+                              fn_name, is_constructor ? "yes" : "no",
+                              ret_type->isPointerTy() ? "pointer" : "non-pointer",
+                              type_name, fn_name.find(type_name) != std::string::npos ? "yes" : "no");
+                }
             }
+        }
+        else
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "generate_struct_literal: Heap-allocated via 'new' keyword for type '{}'", type_name);
         }
 
         llvm::Value *struct_storage = nullptr;
@@ -6009,6 +6017,10 @@ namespace Cryo::Codegen
 
             for (const auto &ctor_name : ctor_patterns)
             {
+                // Only look up in the current LLVM module — never use ctx().get_function()
+                // for constructor resolution.  The function registry can hold stale pointers
+                // from earlier compilation passes, and dereferencing them causes SIGSEGV
+                // (the Function's internal type pointer may be corrupt after module changes).
                 ctor_fn = module()->getFunction(ctor_name);
                 if (ctor_fn)
                 {
@@ -6017,14 +6029,22 @@ namespace Cryo::Codegen
                               ctor_name, type_name_for_alloc);
                     break;
                 }
-                // Also try context's function registry
-                ctor_fn = ctx().get_function(ctor_name);
-                if (ctor_fn)
+            }
+
+            // If direct lookup failed, try resolve_function_by_name which generates
+            // qualified candidates via SRM and handles cross-module declarations safely
+            if (!ctor_fn)
+            {
+                for (const auto &ctor_name : ctor_patterns)
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "generate_new: Found constructor '{}' in registry for type {}",
-                              ctor_name, type_name_for_alloc);
-                    break;
+                    ctor_fn = resolve_function_by_name(ctor_name);
+                    if (ctor_fn)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_new: Resolved constructor '{}' via SRM for type {}",
+                                  ctor_name, type_name_for_alloc);
+                        break;
+                    }
                 }
             }
 
