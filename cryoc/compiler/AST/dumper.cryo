@@ -1,0 +1,931 @@
+///! AST Dumper
+///!
+///! Prints a formatted AST tree to stdout, matching the output style of the
+///! C++ ASTDumper (tree-drawing characters, Clang-style node names).
+///! Extends BaseASTVisitor — each node type dispatches via accept()/visit().
+
+namespace Compiler::AST::Dumper;
+
+import Compiler::Diag;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::AST::Visitor;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+
+
+// ============================================================================
+// ASTDumper — Visitor that prints an indented AST tree to stdout
+// ============================================================================
+
+type class ASTDumper : BaseASTVisitor {
+public:
+    is_last_stack: boolean[];
+    intern_table:  InternTable*;
+
+    ASTDumper(intern: InternTable*) {
+        this.is_last_stack = [];
+        this.intern_table  = intern;
+    }
+
+    // ----------------------------------------------------------------
+    // Entry point
+    // ----------------------------------------------------------------
+
+    /// Dump the AST rooted at `root` to stdout.
+    static dump(root: ProgramNode*, intern: InternTable*) -> void {
+        if (root == null) {
+            printf("(null)\n");
+            return;
+        }
+
+        mut dumper: ASTDumper = ASTDumper(intern);
+        root.accept(&dumper);
+    }
+
+    // ----------------------------------------------------------------
+    // Tree drawing helpers
+    // ----------------------------------------------------------------
+
+    /// Print the tree-drawing prefix for the current nesting level.
+    print_prefix() -> void {
+        const depth: int = this.is_last_stack.length;
+        for (mut i: int = 0; i < depth; i++) {
+            if (i == depth - 1) {
+                if (this.is_last_stack[i]) {
+                    printf("`-");
+                } else {
+                    printf("|-");
+                }
+            } else {
+                if (this.is_last_stack[i]) {
+                    printf("  ");
+                } else {
+                    printf("| ");
+                }
+            }
+        }
+    }
+
+    /// Print source location in `<line:N:N>` format.
+    print_location(span: SourceSpan) -> void {
+        if (span.has_location()) {
+            printf(" <line:%u:%u>", span.start_line, span.start_col);
+        }
+    }
+
+    /// Resolve a SymbolStr to its string representation.
+    resolve(sym: SymbolStr) -> string {
+        return this.intern_table.resolve(sym);
+    }
+
+    // ----------------------------------------------------------------
+    // Child traversal
+    // ----------------------------------------------------------------
+
+    push_level(is_last: boolean) -> void {
+        this.is_last_stack.push(is_last);
+    }
+
+    pop_level() -> void {
+        if (this.is_last_stack.length > 0) {
+            this.is_last_stack.pop();
+        }
+    }
+
+    /// Push indentation, dispatch through the visitor, pop indentation.
+    dump_child(node: ASTNode*, is_last: boolean) -> void {
+        if (node == null) { return; }
+        this.push_level(is_last);
+        node.accept(this);
+        this.pop_level();
+    }
+
+
+    // ================================================================
+    // Base-class fallbacks (catch unhandled node types)
+    // ================================================================
+
+    override visit(node: ExpressionNode*) -> void {
+        this.print_prefix();
+        printf("Expression");
+        this.print_location(node.span);
+        printf("\n");
+    }
+
+    override visit(node: StatementNode*) -> void {
+        this.print_prefix();
+        printf("Statement");
+        this.print_location(node.span);
+        printf("\n");
+    }
+
+    override visit(node: DeclarationNode*) -> void {
+        this.print_prefix();
+        printf("Declaration");
+        this.print_location(node.span);
+        printf("\n");
+    }
+
+
+    // ================================================================
+    // Program
+    // ================================================================
+
+    override visit(node: ProgramNode*) -> void {
+        this.print_prefix();
+        printf("TranslationUnitDecl");
+        this.print_location(node.span);
+        if (node.namespace_name != "") {
+            printf(" '%s'", node.namespace_name);
+        }
+        printf("\n");
+
+        for (mut i: int = 0; i < node.statements.length; i++) {
+            const is_last: boolean = (i == node.statements.length - 1);
+            this.dump_child(node.statements[i], is_last);
+        }
+    }
+
+
+    // ================================================================
+    // Expressions
+    // ================================================================
+
+    override visit(node: LiteralNode*) -> void {
+        this.print_prefix();
+
+        match (node.literal_kind) {
+            LiteralKind::Integer => { printf("IntegerLiteral"); }
+            LiteralKind::Float   => { printf("FloatLiteral"); }
+            LiteralKind::String  => { printf("StringLiteral"); }
+            LiteralKind::Char    => { printf("CharLiteral"); }
+            LiteralKind::Boolean => { printf("BooleanLiteral"); }
+            LiteralKind::Null    => { printf("NullLiteral"); }
+        }
+
+        this.print_location(node.span);
+        printf(" %s", node.value);
+        printf("\n");
+    }
+
+    override visit(node: IdentifierNode*) -> void {
+        this.print_prefix();
+        printf("DeclRefExpr");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        printf("\n");
+    }
+
+    override visit(node: BinaryExprNode*) -> void {
+        this.print_prefix();
+        printf("BinaryOperator");
+        this.print_location(node.span);
+        printf(" '%s'", node.op.lexeme);
+        printf("\n");
+
+        this.dump_child(node.left as ASTNode*, false);
+        this.dump_child(node.right as ASTNode*, true);
+    }
+
+    override visit(node: UnaryExprNode*) -> void {
+        this.print_prefix();
+        printf("UnaryOperator");
+        this.print_location(node.span);
+        printf(" '%s'", node.op.lexeme);
+        printf("\n");
+
+        this.dump_child(node.operand as ASTNode*, true);
+    }
+
+    override visit(node: TernaryExprNode*) -> void {
+        this.print_prefix();
+        printf("TernaryExpr");
+        this.print_location(node.span);
+        printf("\n");
+
+        this.dump_child(node.condition as ASTNode*, false);
+        this.dump_child(node.true_expr as ASTNode*, false);
+        this.dump_child(node.false_expr as ASTNode*, true);
+    }
+
+    override visit(node: IfExprNode*) -> void {
+        this.print_prefix();
+        printf("IfExpr");
+        this.print_location(node.span);
+        printf("\n");
+
+        const has_else: boolean = (node.else_expr != null);
+        this.dump_child(node.condition as ASTNode*, false);
+        this.dump_child(node.then_expr as ASTNode*, !has_else);
+        if (has_else) {
+            this.dump_child(node.else_expr as ASTNode*, true);
+        }
+    }
+
+    override visit(node: MatchExprNode*) -> void {
+        this.print_prefix();
+        printf("MatchExpr");
+        this.print_location(node.span);
+        printf("\n");
+
+        const arm_count: int = node.arms.length();
+        this.dump_child(node.subject as ASTNode*, arm_count == 0);
+        for (mut i: int = 0; i < arm_count; i++) {
+            const is_last: boolean = (i == arm_count - 1);
+            this.dump_child(node.arms[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: CallExprNode*) -> void {
+        this.print_prefix();
+        printf("CallExpr");
+        this.print_location(node.span);
+        printf("\n");
+
+        const arg_count: int = node.arguments.length;
+        this.dump_child(node.callee as ASTNode*, arg_count == 0);
+        for (mut i: int = 0; i < arg_count; i++) {
+            const is_last: boolean = (i == arg_count - 1);
+            this.dump_child(node.arguments[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: NewExprNode*) -> void {
+        this.print_prefix();
+        printf("NewExpr");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.type_name));
+        printf("\n");
+
+        for (mut i: int = 0; i < node.arguments.length; i++) {
+            const is_last: boolean = (i == node.arguments.length - 1) && !node.has_array_size();
+            this.dump_child(node.arguments[i] as ASTNode*, is_last);
+        }
+        if (node.has_array_size()) {
+            this.dump_child(node.array_size as ASTNode*, true);
+        }
+    }
+
+    override visit(node: SizeofExprNode*) -> void {
+        this.print_prefix();
+        printf("SizeofExpr");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.type_name));
+        printf("\n");
+    }
+
+    override visit(node: AlignofExprNode*) -> void {
+        this.print_prefix();
+        printf("AlignofExpr");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.type_name));
+        printf("\n");
+    }
+
+    override visit(node: CastExprNode*) -> void {
+        this.print_prefix();
+        printf("CastExpr");
+        this.print_location(node.span);
+        printf("\n");
+
+        this.dump_child(node.expression as ASTNode*, true);
+    }
+
+    override visit(node: StructLiteralNode*) -> void {
+        this.print_prefix();
+        printf("StructLiteral");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.struct_type));
+        printf("\n");
+
+        // FieldInit is a plain struct (not an ASTNode), handle inline.
+        for (mut i: int = 0; i < node.field_inits.length; i++) {
+            const is_last: boolean = (i == node.field_inits.length - 1);
+            const init: FieldInit = node.field_inits[i];
+
+            this.push_level(is_last);
+            this.print_prefix();
+            printf("FieldInit '%s'", this.resolve(init.field_name));
+            printf("\n");
+            if (init.value != null) {
+                this.dump_child(init.value as ASTNode*, true);
+            }
+            this.pop_level();
+        }
+    }
+
+    override visit(node: ArrayLiteralNode*) -> void {
+        this.print_prefix();
+        printf("ArrayLiteral");
+        this.print_location(node.span);
+        if (node.element_type != "") {
+            printf(" element_type='%s'", node.element_type);
+        }
+        printf("\n");
+
+        for (mut i: int = 0; i < node.elements.length; i++) {
+            const is_last: boolean = (i == node.elements.length - 1);
+            this.dump_child(node.elements[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: TupleLiteralNode*) -> void {
+        this.print_prefix();
+        printf("TupleLiteral");
+        this.print_location(node.span);
+        printf("\n");
+
+        for (mut i: int = 0; i < node.elements.length; i++) {
+            const is_last: boolean = (i == node.elements.length - 1);
+            this.dump_child(node.elements[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: LambdaExprNode*) -> void {
+        this.print_prefix();
+        printf("LambdaExpr");
+        this.print_location(node.span);
+        printf("\n");
+
+        for (mut i: int = 0; i < node.parameters.length; i++) {
+            const is_last: boolean = (i == node.parameters.length - 1) && (node.body == null);
+            this.dump_child(node.parameters[i] as ASTNode*, is_last);
+        }
+        if (node.body != null) {
+            this.dump_child(node.body as ASTNode*, true);
+        }
+    }
+
+    override visit(node: ArrayAccessNode*) -> void {
+        this.print_prefix();
+        printf("ArrayAccessExpr");
+        this.print_location(node.span);
+        printf("\n");
+
+        this.dump_child(node.array as ASTNode*, false);
+        this.dump_child(node.index as ASTNode*, true);
+    }
+
+    override visit(node: MemberAccessNode*) -> void {
+        this.print_prefix();
+        printf("MemberAccessExpr");
+        this.print_location(node.span);
+        printf(" .%s", this.resolve(node.member));
+        printf("\n");
+
+        this.dump_child(node.object as ASTNode*, true);
+    }
+
+    override visit(node: ScopeResolutionNode*) -> void {
+        this.print_prefix();
+        printf("ScopeResolutionExpr");
+        this.print_location(node.span);
+        printf(" '%s'::'%s'", this.resolve(node.scope_name), this.resolve(node.member_name));
+        printf("\n");
+    }
+
+
+    // ================================================================
+    // Statements
+    // ================================================================
+
+    override visit(node: BlockStmtNode*) -> void {
+        this.print_prefix();
+        printf("CompoundStmt");
+        this.print_location(node.span);
+        printf("\n");
+
+        for (mut i: int = 0; i < node.statements.length; i++) {
+            const is_last: boolean = (i == node.statements.length - 1);
+            this.dump_child(node.statements[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: UnsafeBlockStmtNode*) -> void {
+        this.print_prefix();
+        printf("UnsafeBlockStmt");
+        this.print_location(node.span);
+        printf("\n");
+
+        if (node.block != null) {
+            this.dump_child(node.block as ASTNode*, true);
+        }
+    }
+
+    override visit(node: ReturnStmtNode*) -> void {
+        this.print_prefix();
+        printf("ReturnStmt");
+        this.print_location(node.span);
+        printf("\n");
+
+        if (node.has_expression()) {
+            this.dump_child(node.expression as ASTNode*, true);
+        }
+    }
+
+    override visit(node: IfStmtNode*) -> void {
+        this.print_prefix();
+        printf("IfStmt");
+        this.print_location(node.span);
+        printf("\n");
+
+        const has_else: boolean = node.has_else();
+        this.dump_child(node.condition as ASTNode*, false);
+        this.dump_child(node.then_stmt as ASTNode*, !has_else);
+        if (has_else) {
+            this.dump_child(node.else_stmt as ASTNode*, true);
+        }
+    }
+
+    override visit(node: WhileStmtNode*) -> void {
+        this.print_prefix();
+        printf("WhileStmt");
+        this.print_location(node.span);
+        printf("\n");
+
+        this.dump_child(node.condition as ASTNode*, false);
+        this.dump_child(node.body as ASTNode*, true);
+    }
+
+    override visit(node: DoWhileStmtNode*) -> void {
+        this.print_prefix();
+        printf("DoWhileStmt");
+        this.print_location(node.span);
+        printf("\n");
+
+        this.dump_child(node.body as ASTNode*, false);
+        this.dump_child(node.condition as ASTNode*, true);
+    }
+
+    override visit(node: ForStmtNode*) -> void {
+        this.print_prefix();
+        printf("ForStmt");
+        this.print_location(node.span);
+        printf("\n");
+
+        const has_update: boolean = (node.update != null);
+        const has_body: boolean = (node.body != null);
+
+        this.dump_child(node.init, false);
+        this.dump_child(node.condition as ASTNode*, !has_update && !has_body);
+        if (has_update) {
+            this.dump_child(node.update as ASTNode*, !has_body);
+        }
+        if (has_body) {
+            this.dump_child(node.body as ASTNode*, true);
+        }
+    }
+
+    override visit(node: MatchStmtNode*) -> void {
+        this.print_prefix();
+        printf("MatchStmt");
+        this.print_location(node.span);
+        printf("\n");
+
+        const arm_count: int = node.arms.length;
+        this.dump_child(node.subject as ASTNode*, arm_count == 0);
+        for (mut i: int = 0; i < arm_count; i++) {
+            const is_last: boolean = (i == arm_count - 1);
+            this.dump_child(node.arms[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: SwitchStmtNode*) -> void {
+        this.print_prefix();
+        printf("SwitchStmt");
+        this.print_location(node.span);
+        printf("\n");
+
+        const case_count: int = node.cases.length;
+        this.dump_child(node.expression as ASTNode*, case_count == 0);
+        for (mut i: int = 0; i < case_count; i++) {
+            const is_last: boolean = (i == case_count - 1);
+            this.dump_child(node.cases[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: CaseStmtNode*) -> void {
+        this.print_prefix();
+        if (node.is_default) {
+            printf("DefaultStmt");
+        } else {
+            printf("CaseStmt");
+        }
+        this.print_location(node.span);
+        printf("\n");
+
+        if (!node.is_default && node.value != null) {
+            this.dump_child(node.value as ASTNode*, node.body == null);
+        }
+        if (node.body != null) {
+            this.dump_child(node.body as ASTNode*, true);
+        }
+    }
+
+    override visit(node: BreakStmtNode*) -> void {
+        this.print_prefix();
+        printf("BreakStmt");
+        this.print_location(node.span);
+        printf("\n");
+    }
+
+    override visit(node: ContinueStmtNode*) -> void {
+        this.print_prefix();
+        printf("ContinueStmt");
+        this.print_location(node.span);
+        printf("\n");
+    }
+
+    override visit(node: ExprStmtNode*) -> void {
+        this.print_prefix();
+        printf("ExprStmt");
+        this.print_location(node.span);
+        printf("\n");
+
+        this.dump_child(node.expression as ASTNode*, true);
+    }
+
+    override visit(node: DeclStmtNode*) -> void {
+        this.print_prefix();
+        printf("DeclStmt");
+        this.print_location(node.span);
+        printf("\n");
+
+        this.dump_child(node.declaration as ASTNode*, true);
+    }
+
+
+    // ================================================================
+    // Declarations
+    // ================================================================
+
+    override visit(node: VarDeclNode*) -> void {
+        this.print_prefix();
+        printf("VarDecl");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        if (node.is_mutable) { printf(" mutable"); }
+        if (node.is_global)  { printf(" global"); }
+        printf("\n");
+
+        if (node.has_initializer()) {
+            this.dump_child(node.initializer as ASTNode*, true);
+        }
+    }
+
+    override visit(node: FunctionDeclNode*) -> void {
+        this.print_prefix();
+        printf("FunctionDecl");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        if (node.is_public)   { printf(" public"); }
+        if (node.is_static)   { printf(" static"); }
+        if (node.is_inline)   { printf(" inline"); }
+        if (node.is_variadic) { printf(" variadic"); }
+        printf("\n");
+
+        // Generic params
+        for (mut i: int = 0; i < node.generic_params.length; i++) {
+            const is_last: boolean = (i == node.generic_params.length - 1)
+                && (node.parameters.length == 0) && !node.has_body();
+            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+        }
+
+        // Parameters
+        for (mut i: int = 0; i < node.parameters.length; i++) {
+            const is_last: boolean = (i == node.parameters.length - 1) && !node.has_body();
+            this.dump_child(node.parameters[i] as ASTNode*, is_last);
+        }
+
+        // Body
+        if (node.has_body()) {
+            this.dump_child(node.body as ASTNode*, true);
+        }
+    }
+
+    override visit(node: MethodNode*) -> void {
+        this.print_prefix();
+
+        if (node.is_constructor) {
+            printf("ConstructorDecl");
+        } else if (node.is_destructor) {
+            printf("DestructorDecl");
+        } else {
+            printf("MethodDecl");
+        }
+        this.print_location(node.span);
+
+        if (node.func != null) {
+            printf(" '%s'", this.resolve(node.func.name));
+        }
+
+        printf(" %s", node.visibility.label());
+        if (node.is_static)   { printf(" static"); }
+        if (node.is_virtual)  { printf(" virtual"); }
+        if (node.is_override) { printf(" override"); }
+        printf("\n");
+
+        // Dump the inner function's parameters + body
+        if (node.func != null) {
+            for (mut i: int = 0; i < node.func.parameters.length; i++) {
+                const is_last: boolean = (i == node.func.parameters.length - 1)
+                    && !node.func.has_body();
+                this.dump_child(node.func.parameters[i] as ASTNode*, is_last);
+            }
+            if (node.func.has_body()) {
+                this.dump_child(node.func.body as ASTNode*, true);
+            }
+        }
+    }
+
+    override visit(node: IntrinsicDeclNode*) -> void {
+        this.print_prefix();
+        printf("IntrinsicDecl");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        printf("\n");
+
+        for (mut i: int = 0; i < node.parameters.length; i++) {
+            const is_last: boolean = (i == node.parameters.length - 1) && !node.has_body();
+            this.dump_child(node.parameters[i] as ASTNode*, is_last);
+        }
+        if (node.has_body()) {
+            this.dump_child(node.body as ASTNode*, true);
+        }
+    }
+
+    override visit(node: IntrinsicConstDeclNode*) -> void {
+        this.print_prefix();
+        printf("IntrinsicConstDecl");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        printf("\n");
+    }
+
+    override visit(node: ImportDeclNode*) -> void {
+        this.print_prefix();
+        printf("ImportDecl");
+        this.print_location(node.span);
+        printf(" '%s'", node.module_path);
+        if (node.has_alias()) {
+            printf(" as '%s'", node.alias);
+        }
+        printf("\n");
+    }
+
+    override visit(node: ModuleDeclNode*) -> void {
+        this.print_prefix();
+        printf("ModuleDecl");
+        this.print_location(node.span);
+        printf(" '%s'", node.path);
+        if (node.is_public) { printf(" public"); }
+        printf("\n");
+    }
+
+    override visit(node: StructDeclNode*) -> void {
+        this.print_prefix();
+        printf("StructDecl");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        if (node.is_generic()) { printf(" generic"); }
+        printf("\n");
+
+        // Generic params
+        for (mut i: int = 0; i < node.generic_params.length; i++) {
+            const is_last: boolean = (i == node.generic_params.length - 1)
+                && (node.fields.length == 0) && (node.methods.length == 0);
+            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+        }
+
+        // Fields — dispatched through visitor (FieldDeclNode has its own visit)
+        for (mut i: int = 0; i < node.fields.length; i++) {
+            const is_last: boolean = (i == node.fields.length - 1) && (node.methods.length == 0);
+            this.dump_child(node.fields[i] as ASTNode*, is_last);
+        }
+
+        // Methods — dispatched through visitor (MethodNode has its own visit)
+        for (mut i: int = 0; i < node.methods.length; i++) {
+            const is_last: boolean = (i == node.methods.length - 1);
+            this.dump_child(node.methods[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: ClassDeclNode*) -> void {
+        this.print_prefix();
+        printf("ClassDecl");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        if (node.has_base_class()) {
+            printf(" : '%s'", this.resolve(node.base_class));
+        }
+        if (node.is_generic()) { printf(" generic"); }
+        printf("\n");
+
+        for (mut i: int = 0; i < node.generic_params.length; i++) {
+            const is_last: boolean = (i == node.generic_params.length - 1)
+                && (node.fields.length == 0) && (node.methods.length == 0);
+            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+        }
+
+        for (mut i: int = 0; i < node.fields.length; i++) {
+            const is_last: boolean = (i == node.fields.length - 1) && (node.methods.length == 0);
+            this.dump_child(node.fields[i] as ASTNode*, is_last);
+        }
+
+        for (mut i: int = 0; i < node.methods.length; i++) {
+            const is_last: boolean = (i == node.methods.length - 1);
+            this.dump_child(node.methods[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: EnumDeclNode*) -> void {
+        this.print_prefix();
+        printf("EnumDecl");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        if (node.is_generic()) { printf(" generic"); }
+        printf("\n");
+
+        for (mut i: int = 0; i < node.generic_params.length; i++) {
+            const is_last: boolean = (i == node.generic_params.length - 1)
+                && (node.variants.length == 0);
+            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+        }
+
+        // Variants — dispatched through visitor (EnumVariantNode has its own visit)
+        for (mut i: int = 0; i < node.variants.length; i++) {
+            const is_last: boolean = (i == node.variants.length - 1);
+            this.dump_child(node.variants[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: EnumVariantNode*) -> void {
+        this.print_prefix();
+        printf("EnumVariant");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        if (node.has_value) {
+            printf(" = %d", node.explicit_value);
+        }
+        if (node.associated_types.length > 0) {
+            printf(" (");
+            for (mut i: int = 0; i < node.associated_types.length; i++) {
+                if (i > 0) { printf(", "); }
+                printf("%s", this.resolve(node.associated_types[i]));
+            }
+            printf(")");
+        }
+        printf("\n");
+    }
+
+    override visit(node: TraitDeclNode*) -> void {
+        this.print_prefix();
+        printf("TraitDecl");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        if (node.is_generic()) { printf(" generic"); }
+        printf("\n");
+
+        for (mut i: int = 0; i < node.generic_params.length; i++) {
+            const is_last: boolean = (i == node.generic_params.length - 1)
+                && (node.methods.length == 0);
+            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+        }
+
+        for (mut i: int = 0; i < node.methods.length; i++) {
+            const is_last: boolean = (i == node.methods.length - 1);
+            this.dump_child(node.methods[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: TypeAliasDeclNode*) -> void {
+        this.print_prefix();
+        printf("TypeAliasDecl");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.alias_name));
+        if (node.is_generic()) { printf(" generic"); }
+        printf("\n");
+    }
+
+    override visit(node: ImplBlockNode*) -> void {
+        this.print_prefix();
+        printf("ImplementBlock");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.target_type));
+        printf("\n");
+
+        for (mut i: int = 0; i < node.fields.length; i++) {
+            const is_last: boolean = (i == node.fields.length - 1)
+                && (node.methods.length == 0);
+            this.dump_child(node.fields[i] as ASTNode*, is_last);
+        }
+
+        for (mut i: int = 0; i < node.methods.length; i++) {
+            const is_last: boolean = (i == node.methods.length - 1);
+            this.dump_child(node.methods[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: ExternBlockNode*) -> void {
+        this.print_prefix();
+        printf("ExternBlock");
+        this.print_location(node.span);
+        if (node.linkage_type != "") {
+            printf(" '%s'", node.linkage_type);
+        }
+        printf("\n");
+
+        for (mut i: int = 0; i < node.functions.length; i++) {
+            const is_last: boolean = (i == node.functions.length - 1);
+            this.dump_child(node.functions[i] as ASTNode*, is_last);
+        }
+    }
+
+    override visit(node: FieldDeclNode*) -> void {
+        this.print_prefix();
+        printf("FieldDecl");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        printf(" %s", node.visibility.label());
+        printf("\n");
+
+        if (node.has_default_value()) {
+            this.dump_child(node.default_value as ASTNode*, true);
+        }
+    }
+
+    override visit(node: GenericParamNode*) -> void {
+        this.print_prefix();
+        printf("GenericParam");
+        this.print_location(node.span);
+        printf(" '%s'", this.resolve(node.name));
+        if (node.constraints.length > 0) {
+            printf(" :");
+            for (mut i: int = 0; i < node.constraints.length; i++) {
+                printf(" %s", this.resolve(node.constraints[i]));
+            }
+        }
+        printf("\n");
+    }
+
+
+    // ================================================================
+    // Pattern, Match Arm, Directive
+    // ================================================================
+
+    override visit(node: MatchArmNode*) -> void {
+        this.print_prefix();
+        printf("MatchArm");
+        this.print_location(node.span);
+        printf("\n");
+
+        for (mut i: int = 0; i < node.patterns.length; i++) {
+            const is_last: boolean = (i == node.patterns.length - 1) && (node.body == null);
+            this.dump_child(node.patterns[i] as ASTNode*, is_last);
+        }
+        if (node.body != null) {
+            this.dump_child(node.body as ASTNode*, true);
+        }
+    }
+
+    override visit(node: PatternNode*) -> void {
+        this.print_prefix();
+        printf("Pattern");
+        this.print_location(node.span);
+
+        match (node.pattern_kind) {
+            PatternKind::Literal    => { printf(" literal"); }
+            PatternKind::Identifier => { printf(" identifier"); }
+            PatternKind::Wildcard   => { printf(" wildcard"); }
+            PatternKind::Enum       => { printf(" enum"); }
+            PatternKind::Range      => { printf(" range"); }
+        }
+
+        if (node.value.is_valid()) {
+            printf(" '%s'", this.resolve(node.value));
+        }
+        printf("\n");
+    }
+
+    override visit(node: EnumPatternNode*) -> void {
+        this.print_prefix();
+        printf("EnumPattern");
+        this.print_location(node.span);
+        if (node.enum_name.is_valid()) {
+            printf(" '%s'::'%s'", this.resolve(node.enum_name), this.resolve(node.variant_name));
+        }
+        printf("\n");
+    }
+
+    override visit(node: DirectiveNode*) -> void {
+        this.print_prefix();
+        printf("Directive");
+        this.print_location(node.span);
+        printf(" '%s'", node.directive_kind);
+        printf("\n");
+    }
+}
