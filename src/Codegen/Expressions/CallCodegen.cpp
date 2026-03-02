@@ -365,10 +365,29 @@ namespace Cryo::Codegen
                         {
                             TypeRef nested_type = nested_member->get_resolved_type();
                             if (nested_type.is_valid() &&
-                                (nested_type->kind() == Cryo::TypeKind::Pointer ||
-                                 nested_type->kind() == Cryo::TypeKind::String))
+                                nested_type->kind() == Cryo::TypeKind::Pointer)
                             {
+                                // Pointer field (e.g., ctx: CompilationContext*) — load to get the
+                                // pointed-to object's address, which is the correct 'this' for methods.
                                 needs_load = true;
+                            }
+                            // NOTE: String fields are NOT loaded here. String is a primitive value type
+                            // represented as ptr in LLVM. Methods with &this expect a pointer TO the
+                            // string value (char**). The GEP address of the field provides that pointer.
+                            // Loading would give the raw char* value, causing methods to crash.
+                        }
+
+                        // Counter-check: if LLVM-level check set needs_load but the field is
+                        // actually a String type (not a pointer-to-object), don't load.
+                        if (needs_load)
+                        {
+                            TypeRef nested_type = nested_member->get_resolved_type();
+                            if (nested_type.is_valid() && nested_type->kind() == Cryo::TypeKind::String)
+                            {
+                                needs_load = false;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "Field '{}' is String type — keeping GEP address as receiver (not loading)",
+                                          nested_member->member());
                             }
                         }
 
@@ -5714,6 +5733,51 @@ namespace Cryo::Codegen
                           "generate_instance_method: Loading value from pointer for 'this' parameter (simple enum)");
                 this_arg = builder().CreateLoad(this_param_type, receiver, "this.load");
             }
+            // Handle string method calls where receiver is a raw string value (char*).
+            // Methods with &this on string expect a pointer TO the string (char**),
+            // but the receiver might be the string value itself (e.g., extracted from
+            // a struct field or register-passed parameter like tok.lexeme.length()).
+            // Both are ptr in opaque pointer mode.
+            //
+            // Detection: check the method function name for "::string::" which indicates
+            // a method on the primitive string type. AST resolved types may not be set
+            // on intermediate MemberAccess nodes, so we use the function name instead.
+            else if (this_param_type->isPointerTy() && receiver->getType()->isPointerTy())
+            {
+                bool is_string_method = false;
+
+                // Check method function name for string type methods
+                std::string fn_name = method->getName().str();
+                if (fn_name.find("::string::") != std::string::npos)
+                    is_string_method = true;
+
+                // Also check AST type as a fallback
+                if (!is_string_method && callee && callee->object())
+                {
+                    TypeRef obj_type = callee->object()->get_resolved_type();
+                    if (obj_type.is_valid() && obj_type->kind() == Cryo::TypeKind::String)
+                        is_string_method = true;
+                }
+
+                if (is_string_method)
+                {
+                    // Receiver is a string value but method expects &string (pointer to string).
+                    // Check if receiver is already an address (alloca/GEP) — if so, it's correct.
+                    bool is_address = llvm::isa<llvm::AllocaInst>(receiver) ||
+                                      llvm::isa<llvm::GetElementPtrInst>(receiver) ||
+                                      llvm::isa<llvm::GlobalVariable>(receiver);
+                    if (!is_address)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_instance_method: Materializing string receiver for &this method '{}'"
+                                  " (receiver is non-addressable ptr)",
+                                  fn_name);
+                        llvm::AllocaInst *tmp = create_entry_alloca(receiver->getType(), "string.this.tmp");
+                        builder().CreateStore(receiver, tmp);
+                        this_arg = tmp;
+                    }
+                }
+            }
         }
         call_args.push_back(this_arg);
         for (size_t i = 0; i < args.size(); ++i)
@@ -6402,7 +6466,11 @@ namespace Cryo::Codegen
                                                      const std::vector<llvm::Type *> &arg_types)
     {
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                  "resolve_constructor: Looking for constructor of type '{}'", type_name);
+                  "resolve_constructor: Looking for constructor of type '{}' (arg_types.size={})",
+                  type_name, arg_types.size());
+
+        // Expected param count: arg_types (caller-provided args) + 1 for 'this' pointer
+        unsigned expected_params = arg_types.size() + 1;
 
         // Generate type candidates using SRM
         auto type_candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
@@ -6439,6 +6507,31 @@ namespace Cryo::Codegen
                 llvm::Function *fn = module()->getFunction(ctor_name);
                 if (fn)
                 {
+                    // If arg_types is non-empty, verify parameter count matches
+                    if (!arg_types.empty() && fn->getFunctionType()->getNumParams() != expected_params)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_constructor: '{}' has {} params but expected {} — searching for overloaded variant",
+                                  ctor_name, fn->getFunctionType()->getNumParams(), expected_params);
+
+                        // Search for overloaded variants: "CtorName(Type1,Type2,...)"
+                        for (auto &mod_fn : module()->functions())
+                        {
+                            llvm::StringRef fn_name = mod_fn.getName();
+                            if (fn_name.starts_with(ctor_name) &&
+                                fn_name.size() > ctor_name.size() &&
+                                fn_name[ctor_name.size()] == '(' &&
+                                mod_fn.getFunctionType()->getNumParams() == expected_params)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_constructor: Found overloaded '{}' with correct param count", fn_name.str());
+                                return &mod_fn;
+                            }
+                        }
+                        // Continue to next candidate pattern
+                        continue;
+                    }
+
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "resolve_constructor: Found '{}' in module", ctor_name);
                     return fn;
@@ -6448,6 +6541,14 @@ namespace Cryo::Codegen
                 fn = ctx().get_function(ctor_name);
                 if (fn)
                 {
+                    if (!arg_types.empty() && fn->getFunctionType()->getNumParams() != expected_params)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_constructor: '{}' (from registry) has {} params but expected {} — skipping",
+                                  ctor_name, fn->getFunctionType()->getNumParams(), expected_params);
+                        continue;
+                    }
+
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "resolve_constructor: Found '{}' in function registry", ctor_name);
                     return fn;
