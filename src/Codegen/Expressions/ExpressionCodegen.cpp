@@ -748,23 +748,58 @@ namespace Cryo::Codegen
 
                         if (is_array_struct)
                         {
-                            // Array<T> struct: {ptr, i32, i32} = {elements, length, capacity}
+                            // Array<T> struct: {ptr, i64, i64} = {elements, length, capacity}
                             unsigned arr_field_idx = (member_name == "length") ? 1 : 2;
 
                             llvm::Value *inner_obj = generate(inner_member->object());
                             if (inner_obj)
                             {
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "ExpressionCodegen: Array<T> struct field '{}' .{} via LLVM type fallback",
-                                          inner_member->member(), member_name);
+                                // Validate inner_obj's actual LLVM type before using it.
+                                // resolve_member_info may resolve to the wrong Cryo type (e.g.,
+                                // TupleType instead of TupleAnnotation) when variable_types_map
+                                // has a stale or incorrect TypeRef.  We must verify that the
+                                // generated value is actually a struct (or pointer-to-struct)
+                                // that we can GEP/extract into.
+                                llvm::StructType *actual_struct = inner_struct_type;
+                                llvm::Type *inner_obj_type = inner_obj->getType();
 
-                                llvm::Type *length_type = field_struct->getElementType(arr_field_idx);
-
-                                if (inner_obj->getType()->isPointerTy())
+                                if (inner_obj_type->isPointerTy())
                                 {
-                                    // this is a pointer - GEP to array field, then GEP to length/capacity
+                                    // With opaque pointers, we need the alloca to know the pointee type.
+                                    // The identifier codegen loads from allocas, but for member access
+                                    // the object might still be a pointer (alloca or GEP result).
+                                    llvm::StructType *pointee_struct = nullptr;
+                                    if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(inner_obj))
+                                    {
+                                        pointee_struct = llvm::dyn_cast<llvm::StructType>(alloca_inst->getAllocatedType());
+                                    }
+                                    if (!pointee_struct)
+                                    {
+                                        // Pointer doesn't point to a struct — can't GEP
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "ExpressionCodegen: inner_obj is pointer but pointee is not a struct, "
+                                                  "skipping array fallback for '{}.{}'",
+                                                  inner_member->member(), member_name);
+                                        goto skip_array_fallback;
+                                    }
+                                    if (pointee_struct != inner_struct_type)
+                                    {
+                                        if (inner_field_idx >= pointee_struct->getNumElements())
+                                            goto skip_array_fallback;
+                                        actual_struct = pointee_struct;
+                                        auto *actual_field = actual_struct->getElementType(inner_field_idx);
+                                        if (auto *fs = llvm::dyn_cast<llvm::StructType>(actual_field))
+                                            field_struct = fs;
+                                        else
+                                            goto skip_array_fallback;
+                                    }
+
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "ExpressionCodegen: Array<T> struct field '{}' .{} via LLVM type fallback (ptr)",
+                                              inner_member->member(), member_name);
+                                    llvm::Type *length_type = field_struct->getElementType(arr_field_idx);
                                     llvm::Value *array_field_ptr = builder().CreateStructGEP(
-                                        inner_struct_type, inner_obj, inner_field_idx,
+                                        actual_struct, inner_obj, inner_field_idx,
                                         inner_member->member() + ".ptr");
                                     llvm::Value *arr_member_ptr = builder().CreateStructGEP(
                                         field_struct, array_field_ptr, arr_field_idx,
@@ -772,17 +807,45 @@ namespace Cryo::Codegen
                                     return builder().CreateLoad(
                                         length_type, arr_member_ptr, "arr." + member_name);
                                 }
-                                else
+                                else if (inner_obj_type->isStructTy())
                                 {
-                                    // Struct value - extract array field, then extract length/capacity
+                                    // inner_obj is a struct value — use ExtractValue
+                                    auto *val_struct = llvm::cast<llvm::StructType>(inner_obj_type);
+                                    if (val_struct != inner_struct_type)
+                                    {
+                                        if (inner_field_idx >= val_struct->getNumElements())
+                                            goto skip_array_fallback;
+                                        actual_struct = val_struct;
+                                        auto *actual_field = actual_struct->getElementType(inner_field_idx);
+                                        if (auto *fs = llvm::dyn_cast<llvm::StructType>(actual_field))
+                                            field_struct = fs;
+                                        else
+                                            goto skip_array_fallback;
+                                    }
+
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "ExpressionCodegen: Array<T> struct field '{}' .{} via LLVM type fallback (val)",
+                                              inner_member->member(), member_name);
                                     llvm::Value *array_val = builder().CreateExtractValue(
                                         inner_obj, {inner_field_idx},
                                         inner_member->member() + ".extract");
                                     return builder().CreateExtractValue(
                                         array_val, {arr_field_idx}, "arr." + member_name);
                                 }
+                                else
+                                {
+                                    // inner_obj is neither pointer nor struct (e.g., i64 from
+                                    // a mis-bound enum pattern variable) — skip entirely
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "ExpressionCodegen: inner_obj type ({}) is not struct or pointer, "
+                                              "skipping array fallback for '{}.{}'",
+                                              inner_obj_type->getTypeID(),
+                                              inner_member->member(), member_name);
+                                    goto skip_array_fallback;
+                                }
                             }
                         }
+                        skip_array_fallback:;
                     }
                 }
             }
