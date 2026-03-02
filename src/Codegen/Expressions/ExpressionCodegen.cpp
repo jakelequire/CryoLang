@@ -6118,6 +6118,7 @@ namespace Cryo::Codegen
 
         llvm::Type *alloc_type = nullptr;
         std::string type_name_for_alloc = node->type_name();
+        bool has_static_factory_suffix = false; // True when type_name included "::method" suffix
 
         // Check if this is a generic type instantiation
         if (!node->generic_args().empty())
@@ -6314,6 +6315,38 @@ namespace Cryo::Codegen
             }
         }
 
+        // If the type still wasn't found, check if the name includes a static method
+        // suffix (e.g., "Resolver::new" → allocate "Resolver", call factory "Resolver::new").
+        // The parser concatenates all "Foo::bar" segments into type_name, but "bar" may be
+        // a static factory method, not a type component.
+        if (!alloc_type)
+        {
+            std::string full_name = node->type_name();
+            auto sep = full_name.rfind("::");
+            if (sep != std::string::npos)
+            {
+                std::string prefix_type = full_name.substr(0, sep);
+                alloc_type = ctx().get_type(prefix_type);
+                if (!alloc_type)
+                {
+                    // Try with namespace qualification
+                    std::string ns = ctx().namespace_context();
+                    if (!ns.empty())
+                        alloc_type = ctx().get_type(ns + "::" + prefix_type);
+                }
+                if (alloc_type)
+                {
+                    // Found the real type — update type_name_for_alloc so constructor
+                    // lookup patterns use the correct base type name.
+                    type_name_for_alloc = prefix_type;
+                    has_static_factory_suffix = true;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_new: Resolved '{}' as type '{}' with static method suffix",
+                              full_name, prefix_type);
+                }
+            }
+        }
+
         if (!alloc_type)
         {
             report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
@@ -6388,8 +6421,10 @@ namespace Cryo::Codegen
         }
 
         // Call the constructor — always for classes (even with zero args),
-        // only when args are present for structs (which use static factories)
-        if (!node->arguments().empty() || symbols().lookup_class_type(node->type_name()).is_valid())
+        // only when args are present for structs (which use static factories),
+        // and always when the type_name included a "::method" suffix (e.g., new Resolver::new(...))
+        if (!node->arguments().empty() || has_static_factory_suffix ||
+            symbols().lookup_class_type(node->type_name()).is_valid())
         {
             // Look up the constructor using multiple patterns (consistent with CallCodegen)
             llvm::Function *ctor_fn = nullptr;
