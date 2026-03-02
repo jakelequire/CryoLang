@@ -3682,6 +3682,48 @@ namespace Cryo::Codegen
             }
             field_idx = static_cast<unsigned>(field_idx_signed);
 
+            // Safety: if the field was found via inheritance but the current LLVM
+            // struct doesn't have that many elements, switch to the base class
+            // struct that actually contains the field.
+            if (struct_type && field_idx >= struct_type->getNumElements())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Field index {} >= struct '{}' element count {} - walking inheritance",
+                          field_idx, type_name, struct_type->getNumElements());
+
+                TypeRef class_ref = ctx().symbols().lookup_class_type(type_name);
+                if (class_ref.is_valid())
+                {
+                    auto *cls = dynamic_cast<const Cryo::ClassType *>(class_ref.get());
+                    while (cls && cls->has_base_class())
+                    {
+                        auto *base = dynamic_cast<const Cryo::ClassType *>(cls->base_class().get());
+                        if (!base)
+                            break;
+
+                        llvm::StructType *base_st = llvm::StructType::getTypeByName(
+                            module()->getContext(), base->name());
+                        if (base_st && !base_st->isOpaque() && field_idx < base_st->getNumElements())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "get_lvalue_address: Switching to base struct '{}' ({} elems) for field index {}",
+                                      base->name(), base_st->getNumElements(), field_idx);
+                            struct_type = base_st;
+                            break;
+                        }
+                        cls = base;
+                    }
+                }
+
+                if (field_idx >= struct_type->getNumElements())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "get_lvalue_address: Field index {} still out of range after inheritance walk",
+                              field_idx);
+                    return nullptr;
+                }
+            }
+
             // Create GEP for field access
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "get_lvalue_address: Creating GEP for {}.{} at index {}",

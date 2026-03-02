@@ -934,6 +934,35 @@ namespace Cryo::Codegen
             }
 
             // Load the field value using the resolved type information
+            // Safety: if field_idx is out of range, walk inheritance to find the correct base struct
+            if (struct_type && field_idx >= struct_type->getNumElements())
+            {
+                std::string sname = struct_type->hasName() ? struct_type->getName().str() : "";
+                if (!sname.empty())
+                {
+                    TypeRef cref = ctx().symbols().lookup_class_type(sname);
+                    if (cref.is_valid())
+                    {
+                        auto *cls = dynamic_cast<const Cryo::ClassType *>(cref.get());
+                        while (cls && cls->has_base_class())
+                        {
+                            auto *base = dynamic_cast<const Cryo::ClassType *>(cls->base_class().get());
+                            if (!base) break;
+                            llvm::StructType *bst = llvm::StructType::getTypeByName(
+                                module()->getContext(), base->name());
+                            if (bst && !bst->isOpaque() && field_idx < bst->getNumElements())
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_member_access: Switched struct_type to base '{}' for getElementType({})",
+                                          base->name(), field_idx);
+                                struct_type = bst;
+                                break;
+                            }
+                            cls = base;
+                        }
+                    }
+                }
+            }
             llvm::Type *field_type = struct_type->getElementType(field_idx);
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "ExpressionCodegen: Loading member '{}' from pointer with field type ID {}",
@@ -1020,6 +1049,32 @@ namespace Cryo::Codegen
                 if (resolve_member_info(nested_member->object(), nested_member->member(),
                                         inner_struct_type, inner_field_idx))
                 {
+                    // Safety: if inner_field_idx is out of range, walk inheritance
+                    if (inner_struct_type && inner_field_idx >= inner_struct_type->getNumElements())
+                    {
+                        std::string isname = inner_struct_type->hasName() ? inner_struct_type->getName().str() : "";
+                        if (!isname.empty())
+                        {
+                            TypeRef icref = ctx().symbols().lookup_class_type(isname);
+                            if (icref.is_valid())
+                            {
+                                auto *icls = dynamic_cast<const Cryo::ClassType *>(icref.get());
+                                while (icls && icls->has_base_class())
+                                {
+                                    auto *ibase = dynamic_cast<const Cryo::ClassType *>(icls->base_class().get());
+                                    if (!ibase) break;
+                                    llvm::StructType *ibst = llvm::StructType::getTypeByName(
+                                        module()->getContext(), ibase->name());
+                                    if (ibst && !ibst->isOpaque() && inner_field_idx < ibst->getNumElements())
+                                    {
+                                        inner_struct_type = ibst;
+                                        break;
+                                    }
+                                    icls = ibase;
+                                }
+                            }
+                        }
+                    }
                     llvm::Type *field_type = inner_struct_type->getElementType(inner_field_idx);
                     if (field_type->isPointerTy())
                     {
@@ -3510,10 +3565,57 @@ namespace Cryo::Codegen
                             if (field_idx >= 0)
                             {
                                 out_field_idx = static_cast<unsigned>(field_idx);
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "resolve_member_info: Resolved this.{} to index {} via current_type_name",
-                                          member_name, out_field_idx);
-                                return true;
+
+                                // If the field was found via inheritance but the current
+                                // struct doesn't have that many elements, switch to the
+                                // base class struct that actually contains the field.
+                                if (out_field_idx >= out_struct_type->getNumElements())
+                                {
+                                    TypeRef class_ref = ctx().symbols().lookup_class_type(current_type);
+                                    if (class_ref.is_valid())
+                                    {
+                                        auto *cls = dynamic_cast<const Cryo::ClassType *>(class_ref.get());
+                                        while (cls && cls->has_base_class())
+                                        {
+                                            auto *base = dynamic_cast<const Cryo::ClassType *>(cls->base_class().get());
+                                            if (!base) break;
+                                            llvm::StructType *base_st = llvm::StructType::getTypeByName(
+                                                module()->getContext(), base->name());
+                                            if (base_st && !base_st->isOpaque() && out_field_idx < base_st->getNumElements())
+                                            {
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_member_info: Switching from '{}' ({} elems) to base '{}' ({} elems) for this.{}",
+                                                          current_type, out_struct_type->getNumElements(),
+                                                          base->name(), base_st->getNumElements(), member_name);
+                                                out_struct_type = base_st;
+                                                break;
+                                            }
+                                            cls = base;
+                                        }
+                                    }
+                                    if (out_field_idx >= out_struct_type->getNumElements())
+                                    {
+                                        // Still out of range — don't return, fall through to other paths
+                                        out_struct_type = nullptr;
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "resolve_member_info: Field index {} still out of range, continuing fallback",
+                                                  out_field_idx);
+                                    }
+                                    else
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "resolve_member_info: Resolved this.{} to index {} via current_type_name (base class struct)",
+                                                  member_name, out_field_idx);
+                                        return true;
+                                    }
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_member_info: Resolved this.{} to index {} via current_type_name",
+                                              member_name, out_field_idx);
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -4583,6 +4685,60 @@ namespace Cryo::Codegen
         }
 
         out_field_idx = static_cast<unsigned>(field_idx);
+
+        // Safety: if the field was found via inheritance walking but the current
+        // LLVM struct doesn't have that many elements (struct body wasn't rebuilt
+        // with inherited fields), switch to a base class struct that actually
+        // contains the field.  The pointer is layout-compatible because inherited
+        // fields are always at the beginning of the derived struct.
+        if (out_struct_type && out_field_idx >= out_struct_type->getNumElements())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "resolve_member_info: Field index {} >= struct '{}' element count {} - walking inheritance for correct struct type",
+                      out_field_idx, type_name, out_struct_type->getNumElements());
+
+            TypeRef class_ref = ctx().symbols().lookup_class_type(type_name);
+            if (!class_ref.is_valid() && mangled_type_name != type_name)
+                class_ref = ctx().symbols().lookup_class_type(mangled_type_name);
+
+            if (class_ref.is_valid())
+            {
+                auto *cls = dynamic_cast<const Cryo::ClassType *>(class_ref.get());
+                while (cls && cls->has_base_class())
+                {
+                    auto *base = dynamic_cast<const Cryo::ClassType *>(cls->base_class().get());
+                    if (!base)
+                        break;
+
+                    llvm::StructType *base_st = llvm::StructType::getTypeByName(
+                        module()->getContext(), base->name());
+                    if (base_st && !base_st->isOpaque() && out_field_idx < base_st->getNumElements())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_member_info: Switching struct type from '{}' ({} elems) to base '{}' ({} elems) for field index {}",
+                                  type_name, out_struct_type->getNumElements(),
+                                  base->name(), base_st->getNumElements(), out_field_idx);
+                        out_struct_type = base_st;
+                        break;
+                    }
+                    cls = base;
+                }
+            }
+
+            // Final check: if still out of range, fail gracefully
+            if (out_field_idx >= out_struct_type->getNumElements())
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_member_info: Field index {} still out of range after inheritance walk (struct has {} elements)",
+                          out_field_idx, out_struct_type->getNumElements());
+                if (out_failure_reason)
+                    *out_failure_reason = "field index " + std::to_string(out_field_idx) +
+                                          " out of range for struct '" + type_name + "' (" +
+                                          std::to_string(out_struct_type->getNumElements()) + " elements)";
+                return false;
+            }
+        }
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "resolve_member_info: Resolved {}.{} to index {}",
                   type_name, member_name, out_field_idx);
