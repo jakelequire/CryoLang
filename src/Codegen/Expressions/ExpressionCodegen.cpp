@@ -6196,6 +6196,124 @@ namespace Cryo::Codegen
             alloc_type = ctx().get_type(node->type_name());
         }
 
+        // If the type wasn't found, check if this is an enum variant (e.g., "TypeAnnotation::Primitive")
+        if (!alloc_type)
+        {
+            std::string full_name = node->type_name();
+            auto sep = full_name.rfind("::");
+            if (sep != std::string::npos)
+            {
+                std::string enum_name = full_name.substr(0, sep);
+                std::string variant_name = full_name.substr(sep + 2);
+
+                // Look up the enum's LLVM type
+                llvm::Type *enum_llvm_type = ctx().get_type(enum_name);
+                if (!enum_llvm_type)
+                {
+                    // Try with namespace prefix
+                    std::string ns = ctx().namespace_context();
+                    if (!ns.empty())
+                        enum_llvm_type = ctx().get_type(ns + "::" + enum_name);
+                }
+                // Also try looking up via generate_lookup_candidates (handles cross-module types)
+                if (!enum_llvm_type)
+                {
+                    TypeRef enum_type_ref = symbols().lookup_enum_type(enum_name);
+                    if (enum_type_ref.is_valid())
+                        enum_llvm_type = types().map(enum_type_ref);
+                }
+
+                if (enum_llvm_type && enum_llvm_type->isStructTy())
+                {
+                    auto *enum_struct = llvm::cast<llvm::StructType>(enum_llvm_type);
+
+                    // Find the discriminant value for this variant
+                    auto &enum_variants = ctx().enum_variants_map();
+                    llvm::Value *disc_val = nullptr;
+                    for (const auto &[key, val] : enum_variants)
+                    {
+                        // Match against "EnumName::VariantName" or qualified variants
+                        if (key == full_name || key == variant_name ||
+                            (key.size() > variant_name.size() + 2 &&
+                             key.substr(key.size() - variant_name.size() - 2) == "::" + variant_name &&
+                             key.find(enum_name) != std::string::npos))
+                        {
+                            disc_val = val;
+                            break;
+                        }
+                    }
+
+                    if (disc_val)
+                    {
+                        // Generate arguments (the enum variant payload)
+                        std::vector<llvm::Value *> payload_args;
+                        for (const auto &arg : node->arguments())
+                        {
+                            llvm::Value *arg_val = generate(arg.get());
+                            if (arg_val)
+                                payload_args.push_back(arg_val);
+                        }
+
+                        // Allocate on the heap
+                        const llvm::DataLayout &dl = module()->getDataLayout();
+                        uint64_t size = dl.getTypeAllocSize(enum_struct);
+
+                        llvm::Function *malloc_fn = module()->getFunction("malloc");
+                        if (!malloc_fn)
+                        {
+                            llvm::Type *i64_type = llvm::Type::getInt64Ty(llvm_ctx());
+                            llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
+                            llvm::FunctionType *malloc_type = llvm::FunctionType::get(ptr_type, {i64_type}, false);
+                            malloc_fn = llvm::Function::Create(malloc_type, llvm::Function::ExternalLinkage,
+                                                               "malloc", module());
+                        }
+
+                        llvm::Value *size_val_alloc = llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), size);
+                        llvm::Value *heap_ptr = builder().CreateCall(malloc_fn, {size_val_alloc},
+                                                                     "new." + enum_name + "." + variant_name);
+
+                        // Store discriminant
+                        llvm::Value *disc_gep = builder().CreateStructGEP(enum_struct, heap_ptr, 0, "disc_ptr");
+                        llvm::Value *disc_cast = disc_val;
+                        if (disc_val->getType() != enum_struct->getElementType(0))
+                            disc_cast = builder().CreateIntCast(disc_val, enum_struct->getElementType(0), true, "disc.cast");
+                        builder().CreateStore(disc_cast, disc_gep);
+
+                        // Store payload
+                        if (!payload_args.empty() && enum_struct->getNumElements() > 1)
+                        {
+                            llvm::Value *payload_gep = builder().CreateStructGEP(enum_struct, heap_ptr, 1, "payload_ptr");
+                            // For single-payload variants (most common), store directly
+                            if (payload_args.size() == 1)
+                            {
+                                builder().CreateStore(payload_args[0], payload_gep);
+                            }
+                            else
+                            {
+                                // Multiple payload fields — store sequentially via byte offsets
+                                size_t byte_offset = 0;
+                                for (size_t i = 0; i < payload_args.size(); i++)
+                                {
+                                    llvm::Value *field_ptr = builder().CreateConstGEP1_32(
+                                        llvm::Type::getInt8Ty(llvm_ctx()), payload_gep, byte_offset, "field_ptr");
+                                    builder().CreateStore(payload_args[i], field_ptr);
+                                    if (payload_args[i]->getType()->isSized())
+                                        byte_offset += dl.getTypeAllocSize(payload_args[i]->getType());
+                                    else
+                                        byte_offset += 8;
+                                }
+                            }
+                        }
+
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "ExpressionCodegen: Heap-allocated enum variant {}::{} ({} payload args)",
+                                  enum_name, variant_name, payload_args.size());
+                        return heap_ptr;
+                    }
+                }
+            }
+        }
+
         if (!alloc_type)
         {
             report_error(ErrorCode::E0625_LITERAL_GENERATION_ERROR, node,
