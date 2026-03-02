@@ -4176,10 +4176,18 @@ namespace Cryo::Codegen
                 {
                     // Try to find the return type by looking up the method
                     Cryo::ExpressionNode *callee = call_expr->callee();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_member_info: CallExpr callee is MemberAccess: {}, is Identifier: {}",
+                              dynamic_cast<Cryo::MemberAccessNode *>(callee) != nullptr,
+                              dynamic_cast<Cryo::IdentifierNode *>(callee) != nullptr);
                     if (auto *member_callee = dynamic_cast<Cryo::MemberAccessNode *>(callee))
                     {
                         // It's a method call like this.peek() - look up the method's return type
                         std::string method_name = member_callee->member();
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_member_info: Method name: '{}', receiver is Identifier: {}",
+                                  method_name,
+                                  dynamic_cast<Cryo::IdentifierNode *>(member_callee->object()) != nullptr);
 
                         // Get the receiver type
                         TypeRef receiver_type;
@@ -4190,11 +4198,48 @@ namespace Cryo::Codegen
                             if (it != var_types.end() && it->second.is_valid())
                             {
                                 receiver_type = it->second;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_member_info: Found receiver '{}' in var_types: {}",
+                                          recv_id->name(), receiver_type->display_name());
+                            }
+                            else
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_member_info: Receiver '{}' NOT in var_types (found={}, valid={})",
+                                          recv_id->name(),
+                                          it != var_types.end(),
+                                          it != var_types.end() ? it->second.is_valid() : false);
                             }
                         }
                         else if (member_callee->object()->get_resolved_type().is_valid())
                         {
                             receiver_type = member_callee->object()->get_resolved_type();
+                        }
+
+                        // Also try current_type_name() as a fallback for 'this'
+                        if (!receiver_type.is_valid())
+                        {
+                            std::string cur_type = ctx().current_type_name();
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_member_info: Trying current_type_name fallback: '{}'",
+                                      cur_type);
+                            if (!cur_type.empty())
+                            {
+                                TypeRef cls_ref = ctx().symbols().lookup_class_type(cur_type);
+                                if (cls_ref.is_valid())
+                                {
+                                    receiver_type = cls_ref;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_member_info: Got receiver from current_type_name: {}",
+                                              receiver_type->display_name());
+                                }
+                                else
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_member_info: lookup_class_type('{}') failed",
+                                              cur_type);
+                                }
+                            }
                         }
 
                         if (receiver_type.is_valid())
@@ -4218,14 +4263,81 @@ namespace Cryo::Codegen
                                 receiver_type_name.pop_back();
                             }
 
-                            // Look up the method's return type
+                            // Look up the method's return type — also walk the class inheritance chain
                             std::vector<std::string> method_candidates;
                             std::string ns = ctx().namespace_context();
+
+                            // Build candidates for the receiver type and all its base classes
+                            std::vector<std::string> type_names_to_try;
+                            type_names_to_try.push_back(receiver_type_name);
+
+                            // Walk the class inheritance chain
+                            {
+                                TypeRef walk_ref = receiver_type;
+                                // Unwrap pointer/reference for class lookup
+                                if (walk_ref->kind() == Cryo::TypeKind::Pointer)
+                                {
+                                    auto *ptr = dynamic_cast<const Cryo::PointerType *>(walk_ref.get());
+                                    if (ptr && ptr->pointee())
+                                        walk_ref = ptr->pointee();
+                                }
+                                else if (walk_ref->kind() == Cryo::TypeKind::Reference)
+                                {
+                                    auto *ref = dynamic_cast<const Cryo::ReferenceType *>(walk_ref.get());
+                                    if (ref && ref->referent())
+                                        walk_ref = ref->referent();
+                                }
+                                auto *cls = dynamic_cast<const Cryo::ClassType *>(walk_ref.get());
+                                // If not found directly, try looking up by name
+                                if (!cls)
+                                {
+                                    TypeRef cls_ref = ctx().symbols().lookup_class_type(receiver_type_name);
+                                    if (cls_ref.is_valid())
+                                        cls = dynamic_cast<const Cryo::ClassType *>(cls_ref.get());
+                                }
+                                while (cls && cls->has_base_class())
+                                {
+                                    auto *base = dynamic_cast<const Cryo::ClassType *>(cls->base_class().get());
+                                    if (!base)
+                                        break;
+                                    type_names_to_try.push_back(base->name());
+                                    cls = base;
+                                }
+                            }
+
+                            // Derive the parent namespace (strip last segment from ns)
+                            // e.g., "Compiler::Parser::Parser" -> "Compiler::Parser"
+                            std::string ns_parent;
                             if (!ns.empty())
                             {
-                                method_candidates.push_back(ns + "::" + receiver_type_name + "::" + method_name);
+                                auto last_sep = ns.rfind("::");
+                                if (last_sep != std::string::npos)
+                                    ns_parent = ns.substr(0, last_sep);
                             }
-                            method_candidates.push_back(receiver_type_name + "::" + method_name);
+
+                            for (const auto &type_name : type_names_to_try)
+                            {
+                                if (!ns.empty())
+                                    method_candidates.push_back(ns + "::" + type_name + "::" + method_name);
+                                method_candidates.push_back(type_name + "::" + method_name);
+
+                                // For base classes (not the receiver itself), also try the base class's
+                                // own file namespace: parent_ns::BaseClass::BaseClass::method
+                                if (type_name != receiver_type_name && !ns_parent.empty())
+                                {
+                                    method_candidates.push_back(ns_parent + "::" + type_name + "::" + type_name + "::" + method_name);
+                                }
+                            }
+
+                            // Debug: log all candidates being tried
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_member_info: receiver='{}', ns='{}', types_to_try={}, candidates={}",
+                                      receiver_type_name, ns, type_names_to_try.size(), method_candidates.size());
+                            for (size_t ci = 0; ci < method_candidates.size(); ++ci)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_member_info: candidate[{}] = '{}'", ci, method_candidates[ci]);
+                            }
 
                             for (const auto &candidate : method_candidates)
                             {
@@ -4237,6 +4349,50 @@ namespace Cryo::Codegen
                                               "resolve_member_info: Resolved method '{}' return type to '{}'",
                                               candidate, obj_type->display_name());
                                     break;
+                                }
+                            }
+
+                            // If still not found, try TemplateRegistry annotations
+                            if (!obj_type)
+                            {
+                                auto *tmpl_reg = ctx().template_registry();
+                                if (tmpl_reg)
+                                {
+                                    for (const auto &candidate : method_candidates)
+                                    {
+                                        std::string annotation = tmpl_reg->get_method_return_type_annotation(candidate);
+                                        if (!annotation.empty())
+                                        {
+                                            // Try to resolve the annotation to a struct type
+                                            // Extract the simple name from the fully qualified annotation
+                                            std::string simple_name = annotation;
+                                            auto last_sep = annotation.rfind("::");
+                                            if (last_sep != std::string::npos)
+                                                simple_name = annotation.substr(last_sep + 2);
+
+                                            // Try to find the Cryo TypeRef for it (check struct, class, enum)
+                                            TypeRef ret_type = ctx().symbols().lookup_struct_type(simple_name);
+                                            if (!ret_type.is_valid())
+                                                ret_type = ctx().symbols().lookup_class_type(simple_name);
+                                            if (!ret_type.is_valid())
+                                                ret_type = ctx().symbols().lookup_enum_type(simple_name);
+                                            if (!ret_type.is_valid())
+                                                ret_type = ctx().symbols().lookup_struct_type(annotation);
+                                            if (!ret_type.is_valid())
+                                                ret_type = ctx().symbols().lookup_class_type(annotation);
+                                            if (!ret_type.is_valid())
+                                                ret_type = ctx().symbols().lookup_enum_type(annotation);
+
+                                            if (ret_type.is_valid())
+                                            {
+                                                obj_type = ret_type;
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_member_info: Resolved method '{}' return type to '{}' via TemplateRegistry annotation",
+                                                          candidate, obj_type->display_name());
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

@@ -219,15 +219,12 @@ namespace Cryo
                 else if (has_circular_dependency(parent_resolved))
                 {
                     // The parent module is already being loaded (we are inside it).
-                    // This happens when e.g. CLI/_module.cryo imports CLI::Commands and
-                    // the resolution falls back to loading the CLI parent module — which
-                    // is the file we are currently parsing. Return failure to avoid
-                    // infinite recursion.
-                    result.success = false;
-                    result.error_message = "Circular dependency in fallback: " + parent_resolved + " is already being loaded";
+                    // Do a shallow load to get the parent's direct symbols without
+                    // recursively expanding its `public module` submodules.
                     LOG_DEBUG(LogComponent::GENERAL,
-                              "ModuleLoader: Fallback skipped - '{}' is already being loaded (circular)",
+                              "ModuleLoader: Fallback circular dep on '{}'. Doing shallow load.",
                               parent_resolved);
+                    result = load_module_shallow(parent_resolved, parent_path);
                 }
                 else
                 {
@@ -314,6 +311,33 @@ namespace Cryo
         // Check for circular dependency
         if (has_circular_dependency(resolved_path))
         {
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "ModuleLoader: Circular import detected for '{}'. Performing shallow load (direct symbols only, no submodule expansion).",
+                      resolved_path);
+
+            // Instead of failing, do a shallow load: re-parse the _module.cryo file and
+            // extract only its directly-defined symbols (enums, structs, functions, etc.)
+            // WITHOUT recursively loading `public module` submodules.
+            // This breaks the cycle while still making the module's own types available.
+            ImportResult result = load_module_shallow(resolved_path, import_path);
+            if (result.success)
+            {
+                // Apply filtering for specific imports if needed
+                if (import_node.is_specific_import() && result.success)
+                {
+                    if (import_node.specific_imports().size() == 1)
+                    {
+                        result.namespace_alias = import_node.specific_imports()[0];
+                    }
+                    else
+                    {
+                        result = filter_specific_imports(std::move(result), import_node.specific_imports());
+                    }
+                }
+                return result;
+            }
+
+            // If shallow load also fails, report the circular dependency error
             auto get_import_stack = [this]()
             {
                 std::string stack = "\n";
@@ -328,7 +352,6 @@ namespace Cryo
                 }
                 return stack.empty() ? "(empty)" : stack;
             };
-            ImportResult result;
             result.success = false;
             std::string err_msg = "Circular import detected: " + resolved_path + " is already being loaded" + " (import stack: " + get_import_stack() + ")";
             result.error_message = err_msg;
@@ -444,10 +467,30 @@ namespace Cryo
                 return "";
         }
 
-        // Append the last segment (lowercased) — resolve_module_file_path will add .cryo
+        // Resolve the last segment case-insensitively too — it could be a directory
+        // (e.g., AST/) or a file prefix (e.g., node → node.cryo).
+        // resolve_module_file_path will add .cryo or /_module.cryo as needed.
         std::string last_seg = segments.back();
-        std::transform(last_seg.begin(), last_seg.end(), last_seg.begin(), ::tolower);
-        return (current / last_seg).string();
+        std::string last_lower = last_seg;
+        std::transform(last_lower.begin(), last_lower.end(), last_lower.begin(), ::tolower);
+
+        if (fs::is_directory(current))
+        {
+            for (const auto &entry : fs::directory_iterator(current))
+            {
+                std::string entry_name = entry.path().filename().string();
+                std::string entry_lower = entry_name;
+                std::transform(entry_lower.begin(), entry_lower.end(), entry_lower.begin(), ::tolower);
+
+                if (entry_lower == last_lower)
+                {
+                    return (current / entry_name).string();
+                }
+            }
+        }
+
+        // No case-insensitive match found; fall back to lowercased last segment
+        return (current / last_lower).string();
     }
 
     std::string ModuleLoader::resolve_import_path(const std::string &import_path)
@@ -2212,6 +2255,184 @@ namespace Cryo
         return symbol_map;
     }
 
+    ModuleLoader::ImportResult ModuleLoader::load_module_shallow(const std::string &file_path, const std::string &import_path)
+    {
+        ImportResult result;
+
+        if (!std::filesystem::exists(file_path))
+        {
+            result.success = false;
+            result.error_message = "Shallow load: file not found: " + file_path;
+            return result;
+        }
+
+        // Save context
+        ModuleID saved_module = _symbol_table.current_module();
+        std::string saved_file_dir = _current_file_dir;
+        _current_file_dir = get_parent_directory(file_path);
+
+        try
+        {
+            auto file = make_file_from_path(file_path);
+            if (!file)
+            {
+                _current_file_dir = saved_file_dir;
+                result.success = false;
+                result.error_message = "Shallow load: failed to read file: " + file_path;
+                return result;
+            }
+
+            auto lexer = std::make_unique<Lexer>(std::move(file));
+            Parser parser(std::move(lexer), _ast_context);
+            auto ast = parser.parse_program();
+
+            if (!ast)
+            {
+                _symbol_table.set_current_module(saved_module);
+                _current_file_dir = saved_file_dir;
+                result.success = false;
+                result.error_message = "Shallow load: failed to parse: " + file_path;
+                return result;
+            }
+
+            result.module_name = parser.current_namespace();
+            if (result.module_name.empty() || result.module_name == "Global")
+            {
+                std::filesystem::path path(import_path);
+                result.module_name = path.stem().string();
+            }
+
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "ModuleLoader: Shallow load of '{}' (namespace '{}'). Extracting direct symbols only.",
+                      file_path, result.module_name);
+
+            // Extract ONLY directly-defined symbols — skip `public module` declarations.
+            // This is a simplified version of create_symbol_map that avoids recursive loading.
+            TypeArena &type_arena = _symbol_table.arena();
+            ModuleID module_id = _ast_context.modules().get_or_create_module(result.module_name);
+
+            for (const auto &stmt : ast->statements())
+            {
+                auto *decl = dynamic_cast<DeclarationNode *>(stmt.get());
+                if (!decl)
+                    continue;
+
+                if (auto *func_decl = dynamic_cast<FunctionDeclarationNode *>(decl))
+                {
+                    TypeRef func_type = create_function_type_from_declaration(func_decl, &type_arena);
+                    if (func_type.is_valid())
+                    {
+                        Symbol symbol(func_decl->name(), SymbolKind::Function, func_type, module_id, func_decl->location());
+                        symbol.scope = result.module_name;
+                        result.symbol_map[func_decl->name()] = symbol;
+                    }
+                    result.exported_symbols.push_back(func_decl->name());
+                }
+                else if (auto *var_decl = dynamic_cast<VariableDeclarationNode *>(decl))
+                {
+                    Symbol symbol(var_decl->name(), SymbolKind::Variable, TypeRef(), module_id, var_decl->location());
+                    symbol.scope = result.module_name;
+                    result.symbol_map[var_decl->name()] = symbol;
+                    result.exported_symbols.push_back(var_decl->name());
+                }
+                if (auto *struct_decl = dynamic_cast<StructDeclarationNode *>(decl))
+                {
+                    QualifiedTypeName qname{module_id, struct_decl->name()};
+                    TypeRef existing = type_arena.lookup_type_by_name(struct_decl->name());
+                    if (!existing.is_valid())
+                        existing = type_arena.create_struct(qname);
+                    Symbol symbol(struct_decl->name(), SymbolKind::Type, existing, module_id, struct_decl->location());
+                    symbol.scope = result.module_name;
+                    result.symbol_map[struct_decl->name()] = symbol;
+                    result.exported_symbols.push_back(struct_decl->name());
+                }
+                else if (auto *class_decl = dynamic_cast<ClassDeclarationNode *>(decl))
+                {
+                    QualifiedTypeName qname{module_id, class_decl->name()};
+                    TypeRef existing = type_arena.lookup_type_by_name(class_decl->name());
+                    if (!existing.is_valid())
+                        existing = type_arena.create_class(qname);
+                    Symbol symbol(class_decl->name(), SymbolKind::Type, existing, module_id, class_decl->location());
+                    symbol.scope = result.module_name;
+                    result.symbol_map[class_decl->name()] = symbol;
+                    result.exported_symbols.push_back(class_decl->name());
+                }
+                else if (auto *enum_decl = dynamic_cast<EnumDeclarationNode *>(decl))
+                {
+                    QualifiedTypeName qname{module_id, enum_decl->name()};
+                    TypeRef existing = type_arena.lookup_type_by_name(enum_decl->name());
+                    if (!existing.is_valid())
+                        existing = type_arena.create_enum(qname);
+                    Symbol symbol(enum_decl->name(), SymbolKind::Type, existing, module_id, enum_decl->location());
+                    symbol.scope = result.module_name;
+                    result.symbol_map[enum_decl->name()] = symbol;
+                    result.exported_symbols.push_back(enum_decl->name());
+
+                    // Also register enum variants
+                    for (const auto &variant : enum_decl->variants())
+                    {
+                        if (auto *ev = dynamic_cast<EnumVariantNode *>(variant.get()))
+                        {
+                            Symbol variant_sym(ev->name(), SymbolKind::EnumVariant, existing, module_id, ev->location());
+                            variant_sym.scope = result.module_name;
+                            result.symbol_map[ev->name()] = variant_sym;
+                        }
+                    }
+                }
+                else if (auto *trait_decl = dynamic_cast<TraitDeclarationNode *>(decl))
+                {
+                    QualifiedTypeName qname{module_id, trait_decl->name()};
+                    TypeRef existing = type_arena.lookup_type_by_name(trait_decl->name());
+                    if (!existing.is_valid())
+                        existing = type_arena.create_trait(qname);
+                    Symbol symbol(trait_decl->name(), SymbolKind::Type, existing, module_id, trait_decl->location());
+                    symbol.scope = result.module_name;
+                    result.symbol_map[trait_decl->name()] = symbol;
+                    result.exported_symbols.push_back(trait_decl->name());
+                }
+                else if (auto *alias_decl = dynamic_cast<TypeAliasDeclarationNode *>(decl))
+                {
+                    Symbol symbol(alias_decl->alias_name(), SymbolKind::Type, TypeRef(), module_id, alias_decl->location());
+                    symbol.scope = result.module_name;
+                    result.symbol_map[alias_decl->alias_name()] = symbol;
+                    result.exported_symbols.push_back(alias_decl->alias_name());
+                }
+                else if (auto *intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(decl))
+                {
+                    TypeRef intrinsic_type = create_function_type_from_declaration(intrinsic_decl, &type_arena);
+                    if (intrinsic_type.is_valid())
+                    {
+                        Symbol symbol(intrinsic_decl->name(), SymbolKind::Intrinsic, intrinsic_type, module_id, intrinsic_decl->location());
+                        symbol.scope = result.module_name;
+                        result.symbol_map[intrinsic_decl->name()] = symbol;
+                    }
+                    result.exported_symbols.push_back(intrinsic_decl->name());
+                }
+                // NOTE: ModuleDeclarationNode (public module X;) is intentionally skipped
+                // to avoid recursive loading that would cause the circular dependency.
+            }
+
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "ModuleLoader: Shallow load complete for '{}'. Got {} direct symbols.",
+                      file_path, result.symbol_map.size());
+
+            // Restore context
+            _symbol_table.set_current_module(saved_module);
+            _current_file_dir = saved_file_dir;
+
+            result.success = true;
+            return result;
+        }
+        catch (const std::exception &e)
+        {
+            _symbol_table.set_current_module(saved_module);
+            _current_file_dir = saved_file_dir;
+            result.success = false;
+            result.error_message = std::string("Shallow load exception: ") + e.what();
+            return result;
+        }
+    }
+
     bool ModuleLoader::has_circular_dependency(const std::string &module_path)
     {
         return _loading_modules.find(module_path) != _loading_modules.end();
@@ -2538,6 +2759,61 @@ namespace Cryo
                                 LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered class '{}' in GenericRegistry with {} params",
                                           class_decl->name(), params.size());
                             }
+                        }
+                    }
+
+                    else
+                    {
+                        // For non-generic classes, register their field types for cross-module resolution
+                        // (mirrors the non-generic struct handling above)
+                        std::string qualified_name = module_name.empty() ? class_decl->name() : module_name + "::" + class_decl->name();
+                        LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Processing non-generic class '{}' (qualified: '{}')", class_decl->name(), qualified_name);
+
+                        std::vector<std::string> field_names;
+                        std::vector<TypeRef> field_types;
+                        std::vector<std::string> field_annotations;
+
+                        for (const auto &field : class_decl->fields())
+                        {
+                            if (field)
+                            {
+                                field_names.push_back(field->name());
+                                std::string annotation = field->has_type_annotation() ? field->type_annotation()->to_string() : "";
+                                field_annotations.push_back(annotation);
+                                TypeRef field_type = field->get_resolved_type();
+                                if (field_type.is_valid() && !field_type.is_error())
+                                {
+                                    field_types.push_back(field_type);
+                                }
+                                else
+                                {
+                                    std::string type_str = field->type_annotation() ? field->type_annotation()->to_string() : "unknown";
+                                    field_type = resolve_primitive_type(type_str, _ast_context.types());
+                                    if (field_type.is_valid() && !field_type.is_error())
+                                    {
+                                        field_types.push_back(field_type);
+                                    }
+                                    else
+                                    {
+                                        Symbol *type_sym = _symbol_table.lookup_symbol(type_str);
+                                        if (type_sym && type_sym->type.is_valid() && !type_sym->type.is_error())
+                                        {
+                                            field_type = type_sym->type;
+                                        }
+                                        field_types.push_back(field_type);
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!field_types.empty())
+                        {
+                            _template_registry.register_struct_field_types(qualified_name, field_names, field_types, module_name, field_annotations);
+                            if (qualified_name != class_decl->name())
+                            {
+                                _template_registry.register_struct_field_types(class_decl->name(), field_names, field_types, module_name, field_annotations);
+                            }
+                            LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered class field types: {} with {} fields", qualified_name, field_types.size());
                         }
                     }
 
