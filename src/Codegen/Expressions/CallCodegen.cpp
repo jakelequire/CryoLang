@@ -4628,8 +4628,73 @@ namespace Cryo::Codegen
                             if (type_name.empty())
                             {
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "No field info in TemplateRegistry for type: {} (tried {} candidates)",
+                                          "No field info in TemplateRegistry for type: {} (tried {} candidates), trying base classes",
                                           parent_type_name, type_candidates.size());
+
+                                // Walk the class inheritance chain to find inherited fields
+                                TypeRef cls_ref = ctx().symbols().lookup_class_type(parent_type_name);
+                                if (cls_ref.is_valid())
+                                {
+                                    auto *cls = dynamic_cast<const Cryo::ClassType *>(cls_ref.get());
+                                    while (cls && cls->has_base_class() && type_name.empty())
+                                    {
+                                        auto *base = dynamic_cast<const Cryo::ClassType *>(cls->base_class().get());
+                                        if (!base)
+                                            break;
+
+                                        std::string base_name = base->name();
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "Trying base class '{}' for field '{}'",
+                                                  base_name, member_name);
+
+                                        auto base_candidates = generate_lookup_candidates(base_name, Cryo::SymbolKind::Type);
+                                        for (const auto &bc : base_candidates)
+                                        {
+                                            const TemplateRegistry::StructFieldInfo *base_fi = template_reg->get_struct_field_types(bc);
+                                            if (base_fi)
+                                            {
+                                                for (size_t i = 0; i < base_fi->field_names.size(); ++i)
+                                                {
+                                                    if (base_fi->field_names[i] == member_name && i < base_fi->field_types.size())
+                                                    {
+                                                        TypeRef ft = base_fi->field_types[i];
+                                                        if (ft.is_valid())
+                                                        {
+                                                            type_name = ft->display_name();
+                                                            if (ft->kind() == Cryo::TypeKind::Pointer)
+                                                            {
+                                                                auto *ptr = dynamic_cast<const Cryo::PointerType *>(ft.get());
+                                                                if (ptr && ptr->pointee().is_valid())
+                                                                    type_name = ptr->pointee()->display_name();
+                                                            }
+                                                            else if (!type_name.empty() && type_name.back() == '*')
+                                                            {
+                                                                type_name.pop_back();
+                                                            }
+
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                                      "Resolved inherited field {}.{} -> {} (via base class '{}', candidate '{}')",
+                                                                      parent_type_name, member_name, type_name, base_name, bc);
+                                                        }
+                                                        else if (i < base_fi->field_type_annotations.size() && !base_fi->field_type_annotations[i].empty())
+                                                        {
+                                                            // Use annotation fallback
+                                                            type_name = base_fi->field_type_annotations[i];
+                                                            if (!type_name.empty() && (type_name.back() == '*' || type_name.back() == '&'))
+                                                                type_name.pop_back();
+                                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                                      "Resolved inherited field {}.{} -> {} (via base class '{}' annotation)",
+                                                                      parent_type_name, member_name, type_name, base_name);
+                                                        }
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            if (!type_name.empty()) break;
+                                        }
+                                        cls = base;
+                                    }
+                                }
                             }
                         }
 
