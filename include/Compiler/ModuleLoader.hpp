@@ -280,6 +280,20 @@ namespace Cryo
         ImportResult filter_specific_imports(ImportResult result, const std::vector<std::string> &specific_imports);
 
         /**
+         * @brief Shallow-load a module file to break circular dependencies.
+         *
+         * Re-parses the file and extracts only its directly-defined symbols
+         * (enums, structs, classes, functions, etc.) WITHOUT processing
+         * `public module` submodule declarations. This avoids the recursive
+         * loading that causes the cycle.
+         *
+         * @param file_path Absolute path to the module file
+         * @param import_path Original import path for error messages
+         * @return ImportResult with direct symbols only
+         */
+        ImportResult load_module_shallow(const std::string &file_path, const std::string &import_path);
+
+        /**
          * @brief Check if we have a circular import dependency
          * @param module_path The module path being loaded
          * @return True if circular dependency detected
