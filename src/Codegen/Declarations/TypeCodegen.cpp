@@ -1240,38 +1240,45 @@ namespace Cryo::Codegen
             cryo_field_type_refs.reserve(field_names.size());
             field_type_annotations.reserve(field_names.size());
 
-            if (cryo_class && !cryo_class->fields().empty())
+            // Iterate over field_names (which includes inherited + own fields) to ensure
+            // the type_refs and annotations vectors have the same size as field_names.
+            for (const auto &fname : field_names)
             {
-                for (size_t fi = 0; fi < cryo_class->fields().size(); ++fi)
+                TypeRef ftype{};
+                std::string ann;
+
+                // Try ClassType fields first (may include inherited fields)
+                if (cryo_class)
                 {
-                    const auto &field = cryo_class->fields()[fi];
-                    cryo_field_type_refs.push_back(field.type.is_valid() ? field.type : TypeRef{});
-                    // Get annotation string from the AST node field with matching name.
-                    // Cannot use index-based access because cryo_class->fields() includes
-                    // inherited base-class fields while node->fields() does not.
-                    std::string ann;
-                    for (const auto &ast_field : node->fields())
+                    for (const auto &cf : cryo_class->fields())
                     {
-                        if (ast_field && ast_field->name() == field.name && ast_field->has_type_annotation())
+                        if (cf.name == fname)
                         {
-                            ann = ast_field->type_annotation()->to_string();
+                            ftype = cf.type.is_valid() ? cf.type : TypeRef{};
                             break;
                         }
                     }
-                    field_type_annotations.push_back(ann);
                 }
-            }
-            else
-            {
-                for (const auto &field : node->fields())
+
+                // Try AST node fields for annotation (own fields only)
+                for (const auto &ast_field : node->fields())
                 {
-                    TypeRef ftype = field->get_resolved_type();
-                    cryo_field_type_refs.push_back(ftype.is_valid() && !ftype.is_error() ? ftype : TypeRef{});
-                    if (field->has_type_annotation())
-                        field_type_annotations.push_back(field->type_annotation()->to_string());
-                    else
-                        field_type_annotations.push_back("");
+                    if (ast_field && ast_field->name() == fname)
+                    {
+                        if (!ftype.is_valid())
+                        {
+                            TypeRef ast_type = ast_field->get_resolved_type();
+                            if (ast_type.is_valid() && !ast_type.is_error())
+                                ftype = ast_type;
+                        }
+                        if (ast_field->has_type_annotation())
+                            ann = ast_field->type_annotation()->to_string();
+                        break;
+                    }
                 }
+
+                cryo_field_type_refs.push_back(ftype);
+                field_type_annotations.push_back(ann);
             }
 
             std::string source_ns = ctx().namespace_context();
