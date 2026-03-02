@@ -4176,18 +4176,10 @@ namespace Cryo::Codegen
                 {
                     // Try to find the return type by looking up the method
                     Cryo::ExpressionNode *callee = call_expr->callee();
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "resolve_member_info: CallExpr callee is MemberAccess: {}, is Identifier: {}",
-                              dynamic_cast<Cryo::MemberAccessNode *>(callee) != nullptr,
-                              dynamic_cast<Cryo::IdentifierNode *>(callee) != nullptr);
                     if (auto *member_callee = dynamic_cast<Cryo::MemberAccessNode *>(callee))
                     {
                         // It's a method call like this.peek() - look up the method's return type
                         std::string method_name = member_callee->member();
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "resolve_member_info: Method name: '{}', receiver is Identifier: {}",
-                                  method_name,
-                                  dynamic_cast<Cryo::IdentifierNode *>(member_callee->object()) != nullptr);
 
                         // Get the receiver type
                         TypeRef receiver_type;
@@ -4198,17 +4190,6 @@ namespace Cryo::Codegen
                             if (it != var_types.end() && it->second.is_valid())
                             {
                                 receiver_type = it->second;
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "resolve_member_info: Found receiver '{}' in var_types: {}",
-                                          recv_id->name(), receiver_type->display_name());
-                            }
-                            else
-                            {
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "resolve_member_info: Receiver '{}' NOT in var_types (found={}, valid={})",
-                                          recv_id->name(),
-                                          it != var_types.end(),
-                                          it != var_types.end() ? it->second.is_valid() : false);
                             }
                         }
                         else if (member_callee->object()->get_resolved_type().is_valid())
@@ -4220,25 +4201,11 @@ namespace Cryo::Codegen
                         if (!receiver_type.is_valid())
                         {
                             std::string cur_type = ctx().current_type_name();
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "resolve_member_info: Trying current_type_name fallback: '{}'",
-                                      cur_type);
                             if (!cur_type.empty())
                             {
                                 TypeRef cls_ref = ctx().symbols().lookup_class_type(cur_type);
                                 if (cls_ref.is_valid())
-                                {
                                     receiver_type = cls_ref;
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                              "resolve_member_info: Got receiver from current_type_name: {}",
-                                              receiver_type->display_name());
-                                }
-                                else
-                                {
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                              "resolve_member_info: lookup_class_type('{}') failed",
-                                              cur_type);
-                                }
                             }
                         }
 
@@ -4327,16 +4294,6 @@ namespace Cryo::Codegen
                                 {
                                     method_candidates.push_back(ns_parent + "::" + type_name + "::" + type_name + "::" + method_name);
                                 }
-                            }
-
-                            // Debug: log all candidates being tried
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "resolve_member_info: receiver='{}', ns='{}', types_to_try={}, candidates={}",
-                                      receiver_type_name, ns, type_names_to_try.size(), method_candidates.size());
-                            for (size_t ci = 0; ci < method_candidates.size(); ++ci)
-                            {
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "resolve_member_info: candidate[{}] = '{}'", ci, method_candidates[ci]);
                             }
 
                             for (const auto &candidate : method_candidates)
