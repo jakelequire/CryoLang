@@ -1641,6 +1641,44 @@ namespace Cryo::Codegen
         if (!struct_type || !ptr)
             return nullptr;
 
+        // Safety: if field_idx is out of range for this struct, the field was likely
+        // found via class inheritance walking in get_struct_field_index.
+        // Walk the class hierarchy to find the base class struct that contains this field.
+        auto *st = llvm::dyn_cast<llvm::StructType>(struct_type);
+        if (st && field_idx >= st->getNumElements())
+        {
+            std::string struct_name = st->hasName() ? st->getName().str() : "";
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "create_struct_gep: field_idx {} >= {} elements in '{}', walking inheritance",
+                      field_idx, st->getNumElements(), struct_name);
+
+            if (!struct_name.empty())
+            {
+                TypeRef class_ref = ctx().symbols().lookup_class_type(struct_name);
+                if (class_ref.is_valid())
+                {
+                    auto *cls = dynamic_cast<const Cryo::ClassType *>(class_ref.get());
+                    while (cls && cls->has_base_class())
+                    {
+                        auto *base = dynamic_cast<const Cryo::ClassType *>(cls->base_class().get());
+                        if (!base)
+                            break;
+                        llvm::StructType *base_st = llvm::StructType::getTypeByName(
+                            module()->getContext(), base->name());
+                        if (base_st && !base_st->isOpaque() && field_idx < base_st->getNumElements())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "create_struct_gep: Switched to base class '{}' ({} elems) for field_idx {}",
+                                      base->name(), base_st->getNumElements(), field_idx);
+                            struct_type = base_st;
+                            break;
+                        }
+                        cls = base;
+                    }
+                }
+            }
+        }
+
         return builder().CreateStructGEP(struct_type, ptr, field_idx,
                                          name.empty() ? "field.ptr" : name);
     }
