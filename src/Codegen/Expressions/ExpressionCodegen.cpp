@@ -6435,6 +6435,41 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Overload resolution: if the found constructor's parameter count
+            // doesn't match the actual argument count, search for overloaded variants.
+            // Overloaded constructors have names like "Type::Type(ParamType1,ParamType2)".
+            if (ctor_fn)
+            {
+                unsigned expected_params = node->arguments().size() + 1; // +1 for 'this' ptr
+                if (ctor_fn->getFunctionType()->getNumParams() != expected_params)
+                {
+                    std::string base_ctor_name = ctor_fn->getName().str();
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_new: Constructor '{}' has {} params but expected {} — searching for overloaded variant",
+                              base_ctor_name, ctor_fn->getFunctionType()->getNumParams(), expected_params);
+
+                    llvm::Function *overloaded = nullptr;
+                    for (auto &fn : module()->functions())
+                    {
+                        llvm::StringRef fn_name = fn.getName();
+                        // Look for functions starting with base ctor name + "("
+                        if (fn_name.starts_with(base_ctor_name) &&
+                            fn_name.size() > base_ctor_name.size() &&
+                            fn_name[base_ctor_name.size()] == '(' &&
+                            fn.getFunctionType()->getNumParams() == expected_params)
+                        {
+                            overloaded = &fn;
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "generate_new: Found overloaded constructor '{}' with correct param count",
+                                      fn_name.str());
+                            break;
+                        }
+                    }
+                    if (overloaded)
+                        ctor_fn = overloaded;
+                }
+            }
+
             if (ctor_fn)
             {
                 llvm::FunctionType *fn_type = ctor_fn->getFunctionType();
