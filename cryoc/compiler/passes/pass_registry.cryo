@@ -15,6 +15,14 @@ import Compiler::Artifacts;
 import Compiler::CompilationContext;
 import Compiler::Lex;
 import Compiler::Lex::Lexer;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Arena;
+import Compiler::Parser;
+import Compiler::Parser::Parser;
 import Compiler::Resolver::NameResolution;
 import Compiler::Passes::Specialization;
 import Utils;
@@ -43,6 +51,7 @@ type struct PassStats {
         };
     }
 }
+
 
 
 // ============================================================================
@@ -346,19 +355,31 @@ function run_pass(id: PassID, ctx: CompilationContext*) -> PassResult {
         PassID::Lexing => {
             run_lexing_pass(ctx)
         }
+        PassID::Parsing => {
+            run_parsing_pass(ctx)
+        }
+        PassID::ASTValidation => {
+            run_ast_validation_pass(ctx)
+        }
         PassID::NameResolution => {
-            run_name_resolution_pass(ctx)
+            NameResolutionPass::run(ctx)
+        }
+        PassID::TypeDeclaration => {
+            run_type_declaration_pass(ctx)
         }
         PassID::TemplateRegistration => {
-            run_template_registration_pass(ctx)
+            SpecializationPasses::run_template_registration(ctx)
         }
         PassID::Monomorphization => {
-            run_monomorphization_pass(ctx)
+            SpecializationPasses::run_monomorphization(ctx)
         }
         PassID::GenericExpressionResolution => {
-            run_generic_expression_resolution_pass(ctx)
+            SpecializationPasses::run_generic_expression_resolution(ctx)
         }
         _ => {
+            if (ctx.debug_mode) {
+                printf("[Pipeline] SKIPPED: %s (not yet implemented)\n", meta.name);
+            }
             PassResult::ok(meta.provisions)
         }
     };
@@ -396,8 +417,8 @@ function run_lexing_pass(ctx: CompilationContext*) -> PassResult {
         return PassResult::failure(1);
     }
 
-    const file: File = File::new(source_path);
-    const lexer: Lexer = Lexer::new(file);
+    const file: File      = File::new(source_path);
+    const lexer: Lexer    = Lexer::new(file);
     const tokens: Token[] = lexer.lex();
 
     if (tokens.length == 0) {
@@ -408,7 +429,7 @@ function run_lexing_pass(ctx: CompilationContext*) -> PassResult {
     // Store results in artifacts
     ctx.artifacts.tokens = TokenStream::new(tokens, source_path, "");
 
-    if (true) {
+    if (ctx.debug_mode) {
         printf("[Lexing] Produced %d tokens\n", tokens.length);
         for (mut i: int = 0; i < tokens.length; i++) {
             const tok: Token = tokens[i];
@@ -421,19 +442,49 @@ function run_lexing_pass(ctx: CompilationContext*) -> PassResult {
 
 
 // ============================================================================
-// Parsing Pass (stub)
+// Parsing Pass
 // ============================================================================
 
 /// Parses the token stream into an AST.
 function run_parsing_pass(ctx: CompilationContext*) -> PassResult {
+    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
     if (ctx.debug_mode) {
-        printf("[Parsing] Parsing: %s (not yet implemented)\n", ctx.source_file);
+        printf("[Parsing] Parsing: %s\n", ctx.source_file);
     }
 
-    // TODO: Build parser from ctx.artifacts.tokens
-    // ctx.artifacts.ast = ASTOutput { root: parser.parse(), ... };
+    // Verify we have tokens
+    if (!ctx.artifacts.tokens.is_valid()) {
+        ctx.emit_error(ErrorCode::E0116_PARSE_EXCEPTION,
+            "no tokens available for parsing (lexing pass may have failed)");
+        return PassResult::failure(1);
+    }
 
-    return PassResult::ok([Provision::AST]);
+    // Create parser and parse
+    mut parser: Parser = Parser::from_context(ctx);
+    const root: ProgramNode* = parser.parse();
+
+    if (root == null) {
+        ctx.emit_error(ErrorCode::E0116_PARSE_EXCEPTION,
+            "parser produced null AST root");
+        return PassResult::failure(1);
+    }
+
+    // Store the result in artifacts
+    ctx.artifacts.ast = ASTOutput {
+        root:           root as void*,
+        namespace_name: root.namespace_name,
+    };
+
+    if (ctx.debug_mode) {
+        printf("[Parsing] Produced AST with %d top-level statements\n",
+            root.statements.length);
+    }
+
+    // Parse errors are already recorded in ctx.diagnostics via the DiagnosticSink.
+    // PassResult::from_snapshot below will pick them up automatically.
+
+    return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::AST]);
 }
 
 
@@ -454,44 +505,104 @@ function run_ast_validation_pass(ctx: CompilationContext*) -> PassResult {
 
 
 // ============================================================================
-// Cross-module free function stubs
-//
-// These delegate to the real implementations in their respective modules.
-// They exist because the compiler does not yet propagate transitive imports
-// into the LLVM module — codegen processes pass_registry function bodies
-// before the imported modules' function declarations are created, causing
-// E0636 "Unknown function" errors.  Once transitive free-function resolution
-// is fixed in CompilerInstance/ModuleLoader, these stubs can be removed.
+// Type Declaration Pass
 // ============================================================================
 
-function run_name_resolution_pass(ctx: CompilationContext*) -> PassResult {
+/// Initializes the type system (TypeArena, TypeChecker, TypeResolver) and
+/// walks top-level declarations to create Type objects in the arena.
+/// This pass bridges the gap between name resolution and type resolution:
+/// after this pass, every declared struct/enum/class/trait has a TypeRef.
+function run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
+    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
     if (ctx.debug_mode) {
-        printf("[NameResolution] Resolving names (stub — real impl in NameResolution module)\n");
+        printf("[TypeDeclaration] Initializing type system and collecting declarations\n");
     }
 
-    return PassResult::ok([Provision::NamesResolved]);
-}
+    // Initialize the TypeArena and related components
+    ctx.init_type_system();
 
-function run_template_registration_pass(ctx: CompilationContext*) -> PassResult {
-    if (ctx.debug_mode) {
-        printf("[TemplateRegistration] Registering templates (stub)\n");
+    const arena: TypeArena* = ctx.artifacts.typed_ast.type_arena;
+    if (arena == null) {
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            "TypeDeclaration: TypeArena was not created by init_type_system()");
+        return PassResult::failure(1);
     }
 
-    return PassResult::ok([Provision::TemplatesRegistered]);
-}
-
-function run_monomorphization_pass(ctx: CompilationContext*) -> PassResult {
-    if (ctx.debug_mode) {
-        printf("[Monomorphization] Processing instantiations (stub)\n");
+    // Get the AST root
+    const root: ProgramNode* = ctx.artifacts.ast.root as ProgramNode*;
+    if (root == null) {
+        if (ctx.debug_mode) {
+            printf("[TypeDeclaration] No AST root available, skipping\n");
+        }
+        return PassResult::ok([Provision::TypeDeclarations]);
     }
 
-    return PassResult::ok([Provision::MonomorphizationComplete]);
-}
+    // Determine the module name for qualified type names
+    const module_name: string = ctx.current_namespace != ""
+        ? ctx.current_namespace
+        : ctx.source_file;
 
-function run_generic_expression_resolution_pass(ctx: CompilationContext*) -> PassResult {
-    if (ctx.debug_mode) {
-        printf("[GenericExpressionResolution] Resolving generic expressions (stub)\n");
+    // Walk top-level statements and create types for declarations
+    mut type_count: i64 = 0;
+    for (mut i: i64 = 0; i < root.statements.length; i++) {
+        const stmt: ASTNode* = root.statements[i];
+        if (stmt == null) { continue; }
+
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                const node: StructDeclNode* = stmt as StructDeclNode*;
+                const name_str: string = ctx.resolve_str(node.name);
+                const qualified: string = ctx.current_namespace != ""
+                    ? ctx.current_namespace + "::" + name_str
+                    : name_str;
+                arena.create_struct(qualified, module_name);
+                type_count++;
+            }
+            NodeKind::EnumDeclaration => {
+                const node: EnumDeclNode* = stmt as EnumDeclNode*;
+                const name_str: string = ctx.resolve_str(node.name);
+                const qualified: string = ctx.current_namespace != ""
+                    ? ctx.current_namespace + "::" + name_str
+                    : name_str;
+                arena.create_enum(qualified, module_name);
+                type_count++;
+            }
+            NodeKind::ClassDeclaration => {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                const name_str: string = ctx.resolve_str(node.name);
+                const qualified: string = ctx.current_namespace != ""
+                    ? ctx.current_namespace + "::" + name_str
+                    : name_str;
+                arena.create_class(qualified, module_name);
+                type_count++;
+            }
+            NodeKind::TraitDeclaration => {
+                const node: TraitDeclNode* = stmt as TraitDeclNode*;
+                const name_str: string = ctx.resolve_str(node.name);
+                const qualified: string = ctx.current_namespace != ""
+                    ? ctx.current_namespace + "::" + name_str
+                    : name_str;
+                arena.create_trait(qualified, module_name);
+                type_count++;
+            }
+            NodeKind::TypeAliasDeclaration => {
+                const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
+                const name_str: string = ctx.resolve_str(node.alias_name);
+                // Target type will be resolved in TypeResolution pass
+                arena.create_type_alias(name_str, TypeRef::invalid());
+                type_count++;
+            }
+            _ => {
+                // Functions, variables, imports, etc. don't create Type objects here
+            }
+        }
     }
 
-    return PassResult::ok([Provision::GenericExpressionsResolved]);
+    if (ctx.debug_mode) {
+        printf("[TypeDeclaration] Created %lld type declarations (%lld total types in arena)\n",
+            type_count, arena.type_count());
+    }
+
+    return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::TypeDeclarations]);
 }

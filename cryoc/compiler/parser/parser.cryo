@@ -1,0 +1,1614 @@
+///! Parser
+///!
+///! Top-level parser class extending ExprParser with statement and declaration
+///! parsing.  This is the main entry point for the parsing pass.
+
+namespace Compiler::Parser::Parser;
+
+import Compiler::Lex;
+import Compiler::Diag;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::CompilationContext;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Parser::ParserBase;
+import Compiler::Parser::ExprParser;
+
+
+// ============================================================================
+// Parser — Declarations, Statements, Top-Level Dispatch
+// ============================================================================
+
+type class Parser : ExprParser {
+public:
+
+    Parser(tokens: Token[], source_file: string, ctx: CompilationContext*)
+        : ExprParser(tokens, source_file, ctx) {
+    }
+
+    /// Create a parser from the compilation context's token stream.
+    static from_context(ctx: CompilationContext*) -> Parser {
+        return Parser(
+            ctx.artifacts.tokens.tokens,
+            ctx.artifacts.tokens.source_file,
+            ctx
+        );
+    }
+
+
+    // ================================================================
+    // Entry Point
+    // ================================================================
+
+    /// Parse the entire program, producing a ProgramNode.
+    parse() -> ProgramNode* {
+        // Skip leading comments/doc comments
+        this.collect_doc_comments();
+
+        const start: Token = this.current();
+        mut program: ProgramNode* = new ProgramNode(this.span_from_token(start));
+
+        while (!this.is_at_end()) {
+            if (this.panic_mode) {
+                this.synchronize();
+                if (this.is_at_end()) { break; }
+            }
+
+            // Collect doc comments before each top-level item
+            this.collect_doc_comments();
+            if (this.is_at_end()) { break; }
+
+            const node: ASTNode* = this.parse_top_level();
+            if (node != null) {
+                program.add_statement(node);
+            }
+        }
+
+        program.span = this.span_from(start);
+        return program;
+    }
+
+
+    // ================================================================
+    // Top-Level Dispatch
+    // ================================================================
+
+    /// Dispatch to the appropriate declaration or statement parser based on
+    /// the current token.
+    parse_top_level() -> ASTNode* {
+        const tok: Token = this.current();
+        const doc: string = this.take_documentation();
+
+        // Namespace declaration
+        if (tok.kind == TokenType::KwNamespace) {
+            return this.parse_namespace_declaration();
+        }
+
+        // Module declaration (public module Foo;)
+        if (tok.kind == TokenType::KwPublic && this.peek_at(1).kind == TokenType::KwModule) {
+            return this.parse_module_declaration();
+        }
+
+        // Public declarations
+        if (tok.kind == TokenType::KwPublic) {
+            this.advance(); // consume 'public'
+            const decl: ASTNode* = this.parse_declaration(true, doc);
+            return decl;
+        }
+
+        // Private declarations
+        if (tok.kind == TokenType::KwPrivate) {
+            this.advance();
+            const decl: ASTNode* = this.parse_declaration(false, doc);
+            return decl;
+        }
+
+        // Import declaration
+        if (tok.kind == TokenType::KwImport) {
+            const imp: ImportDeclNode* = this.parse_import_declaration();
+            if (imp != null && doc != "") {
+                imp.set_documentation(doc);
+            }
+            return imp;
+        }
+
+        // Extern block
+        if (tok.kind == TokenType::KwExtern) {
+            const ext: ExternBlockNode* = this.parse_extern_block();
+            if (ext != null && doc != "") {
+                ext.set_documentation(doc);
+            }
+            return ext;
+        }
+
+        // Implement block
+        if (tok.kind == TokenType::KwImplement) {
+            const impl_blk: ImplBlockNode* = this.parse_implementation_block();
+            if (impl_blk != null && doc != "") {
+                impl_blk.set_documentation(doc);
+            }
+            return impl_blk;
+        }
+
+        // Directive: #[attr]
+        if (tok.kind == TokenType::Hash) {
+            return this.parse_directive();
+        }
+
+        // Regular declaration (function, type, const, mut, etc.)
+        return this.parse_declaration(false, doc);
+    }
+
+    /// Parse a declaration based on the current token.
+    parse_declaration(is_public: boolean, doc: string) -> ASTNode* {
+        const tok: Token = this.current();
+
+        // Function declaration
+        if (tok.kind == TokenType::KwFunction) {
+            const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
+            if (func != null && doc != "") {
+                func.set_documentation(doc);
+            }
+            return func;
+        }
+
+        // Variable declaration: const or mut
+        if (tok.kind == TokenType::KwConst || tok.kind == TokenType::KwMut) {
+            const vd: VarDeclNode* = this.parse_variable_declaration();
+            if (vd != null) {
+                if (doc != "") { vd.set_documentation(doc); }
+                if (this.scope_depth == 0) { vd.set_global(true); }
+            }
+            return vd;
+        }
+
+        // Type declarations: type struct/class/enum/trait/alias
+        if (tok.kind == TokenType::KwType) {
+            const next: Token = this.peek_at(1);
+
+            if (next.kind == TokenType::KwStruct) {
+                const sd: StructDeclNode* = this.parse_struct_declaration();
+                if (sd != null && doc != "") { sd.set_documentation(doc); }
+                return sd;
+            }
+            if (next.kind == TokenType::KwClass) {
+                const cd: ClassDeclNode* = this.parse_class_declaration();
+                if (cd != null && doc != "") { cd.set_documentation(doc); }
+                return cd;
+            }
+            if (next.kind == TokenType::KwEnum) {
+                const ed: EnumDeclNode* = this.parse_enum_declaration();
+                if (ed != null && doc != "") { ed.set_documentation(doc); }
+                return ed;
+            }
+            if (next.kind == TokenType::KwTrait) {
+                const td: TraitDeclNode* = this.parse_trait_declaration();
+                if (td != null && doc != "") { td.set_documentation(doc); }
+                return td;
+            }
+
+            // Type alias: type Alias = Target;
+            return this.parse_type_alias_declaration();
+        }
+
+        // Static keyword before function
+        if (tok.kind == TokenType::KwStatic && this.peek_at(1).kind == TokenType::KwFunction) {
+            this.advance(); // consume 'static'
+            const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
+            if (func != null) {
+                func.set_static(true);
+                if (doc != "") { func.set_documentation(doc); }
+            }
+            return func;
+        }
+
+        // Intrinsic declaration
+        if (tok.kind == TokenType::KwIntrinsic) {
+            const intr: IntrinsicDeclNode* = this.parse_intrinsic_declaration();
+            if (intr != null && doc != "") { intr.set_documentation(doc); }
+            return intr;
+        }
+
+        // Fall through to statement
+        return this.parse_statement();
+    }
+
+
+    // ================================================================
+    // Declaration Parsing
+    // ================================================================
+
+    /// Parse a variable declaration: const/mut name: Type = expr;
+    parse_variable_declaration() -> VarDeclNode* {
+        const start: Token = this.current();
+        const is_mutable: boolean = this.current().kind == TokenType::KwMut;
+        this.advance(); // consume 'const' or 'mut'
+
+        const name_tok: Token = this.consume(TokenType::Identifier, "variable name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut node: VarDeclNode* = new VarDeclNode(name, this.span_from_token(start));
+        node.set_mutable(is_mutable);
+        node.set_name_span(this.span_from_token(name_tok));
+
+        // Optional type annotation
+        if (this.match_tok(TokenType::Colon)) {
+            const type_ann: TypeAnnotation* = this.parse_type_annotation();
+            node.set_type_annotation(type_ann);
+        }
+
+        // Optional initializer
+        if (this.match_tok(TokenType::Equal)) {
+            const init: ExpressionNode* = this.parse_expression();
+            node.set_initializer(init);
+        }
+
+        this.consume(TokenType::Semicolon, "';'");
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse a function declaration: function name<T>(params) -> RetType { body }
+    parse_function_declaration(is_public: boolean) -> FunctionDeclNode* {
+        const start: Token = this.advance(); // consume 'function'
+        const name_tok: Token = this.consume(TokenType::Identifier, "function name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
+        func.set_public(is_public);
+        func.set_name_span(this.span_from_token(name_tok));
+
+        // Optional generic parameters
+        if (this.check(TokenType::LAngle)) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            for (mut i: int = 0; i < gen_params.length; i++) {
+                func.add_generic_param(gen_params[i]);
+            }
+        }
+
+        // Parameter list
+        this.consume(TokenType::LParen, "'('");
+        if (!this.check(TokenType::RParen)) {
+            const params: VarDeclNode*[] = this.parse_parameter_list();
+            for (mut i: int = 0; i < params.length; i++) {
+                func.add_parameter(params[i]);
+            }
+        }
+        this.consume(TokenType::RParen, "')'");
+
+        // Optional return type
+        if (this.match_tok(TokenType::Arrow)) {
+            const ret_type: TypeAnnotation* = this.parse_type_annotation();
+            func.set_return_type_annotation(ret_type);
+        }
+
+        // Optional where clause
+        if (this.check(TokenType::KwWhere)) {
+            const bounds: TraitBound[] = this.parse_trait_bounds();
+            for (mut i: int = 0; i < bounds.length; i++) {
+                func.add_trait_bound(bounds[i]);
+            }
+        }
+
+        // Function body or semicolon (forward declaration)
+        if (this.check(TokenType::LBrace)) {
+            const body: BlockStmtNode* = this.parse_block_statement();
+            func.set_body(body);
+        } else {
+            this.consume(TokenType::Semicolon, "';' or '{'");
+        }
+
+        func.span = this.span_from(start);
+        return func;
+    }
+
+    /// Parse a parameter list (inside parentheses).
+    parse_parameter_list() -> VarDeclNode*[] {
+        mut params: VarDeclNode*[] = [];
+
+        while (true) {
+            // Check for variadic: ...
+            if (this.check(TokenType::Ellipsis)) {
+                this.advance();
+                // Mark previous or current function as variadic
+                break;
+            }
+
+            const param: VarDeclNode* = this.parse_parameter();
+            if (param != null) {
+                params.push(param);
+            }
+
+            if (!this.match_tok(TokenType::Comma)) {
+                break;
+            }
+        }
+
+        return params;
+    }
+
+    /// Parse a single parameter: [mut] name: Type [= default]
+    parse_parameter() -> VarDeclNode* {
+        const start: Token = this.current();
+        mut is_mutable: boolean = false;
+
+        // Optional 'mut' keyword
+        if (this.check(TokenType::KwMut)) {
+            is_mutable = true;
+            this.advance();
+        }
+
+        // Check for &this parameter (method self reference)
+        if (this.check(TokenType::Amp) && this.peek_at(1).kind == TokenType::KwThis) {
+            // &this or mut &this
+            this.advance(); // consume '&'
+            const this_tok: Token = this.advance(); // consume 'this'
+            const pname: SymbolStr = this.ctx.intern("&this");
+            mut param: VarDeclNode* = new VarDeclNode(pname, this.span_from(start));
+            param.set_mutable(is_mutable);
+            return param;
+        }
+
+        const name_tok: Token = this.consume(TokenType::Identifier, "parameter name");
+        const pname: SymbolStr = this.intern_lexeme(name_tok);
+        mut param: VarDeclNode* = new VarDeclNode(pname, this.span_from_token(name_tok));
+        param.set_mutable(is_mutable);
+
+        // Type annotation
+        if (this.match_tok(TokenType::Colon)) {
+            const type_ann: TypeAnnotation* = this.parse_type_annotation();
+            param.set_type_annotation(type_ann);
+        }
+
+        // Default value
+        if (this.match_tok(TokenType::Equal)) {
+            const default_val: ExpressionNode* = this.parse_expression();
+            param.set_initializer(default_val);
+        }
+
+        param.span = this.span_from(start);
+        return param;
+    }
+
+    /// Parse a struct declaration: type struct Name<T> { fields, methods }
+    parse_struct_declaration() -> StructDeclNode* {
+        const start: Token = this.advance(); // consume 'type'
+        this.advance(); // consume 'struct'
+
+        const name_tok: Token = this.consume(TokenType::Identifier, "struct name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut node: StructDeclNode* = new StructDeclNode(name, this.span_from_token(start));
+        node.set_name_span(this.span_from_token(name_tok));
+        this.current_type_name = name_tok.lexeme;
+
+        // Optional generic parameters
+        if (this.check(TokenType::LAngle)) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            for (mut i: int = 0; i < gen_params.length; i++) {
+                node.add_generic_param(gen_params[i]);
+            }
+        }
+
+        this.consume(TokenType::LBrace, "'{'");
+        this.parse_type_body(node, null);
+        this.consume(TokenType::RBrace, "'}'");
+
+        this.current_type_name = "";
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse a class declaration: type class Name<T> : Base { fields, methods }
+    parse_class_declaration() -> ClassDeclNode* {
+        const start: Token = this.advance(); // consume 'type'
+        this.advance(); // consume 'class'
+
+        const name_tok: Token = this.consume(TokenType::Identifier, "class name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut node: ClassDeclNode* = new ClassDeclNode(name, this.span_from_token(start));
+        node.set_name_span(this.span_from_token(name_tok));
+        this.current_type_name = name_tok.lexeme;
+
+        // Optional generic parameters
+        if (this.check(TokenType::LAngle)) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            for (mut i: int = 0; i < gen_params.length; i++) {
+                node.add_generic_param(gen_params[i]);
+            }
+        }
+
+        // Optional base class: : BaseClass
+        if (this.match_tok(TokenType::Colon)) {
+            const base_tok: Token = this.consume(TokenType::Identifier, "base class name");
+            node.set_base_class(this.intern_lexeme(base_tok));
+        }
+
+        this.consume(TokenType::LBrace, "'{'");
+        this.parse_type_body(null, node);
+        this.consume(TokenType::RBrace, "'}'");
+
+        this.current_type_name = "";
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse the body of a struct or class declaration (fields, methods, visibility).
+    parse_type_body(struct_node: StructDeclNode*, class_node: ClassDeclNode*) -> void {
+        this.in_class_members = true;
+        mut current_visibility: Visibility = Visibility::Private;
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            this.collect_doc_comments();
+            if (this.check(TokenType::RBrace)) { break; }
+            const doc: string = this.take_documentation();
+
+            // Visibility labels: public: / private: / protected:
+            if (this.check(TokenType::KwPublic) && this.peek_at(1).kind == TokenType::Colon) {
+                current_visibility = Visibility::Public;
+                this.advance(); this.advance(); // consume 'public' ':'
+                continue;
+            }
+            if (this.check(TokenType::KwPrivate) && this.peek_at(1).kind == TokenType::Colon) {
+                current_visibility = Visibility::Private;
+                this.advance(); this.advance();
+                continue;
+            }
+            if (this.check(TokenType::KwProtected) && this.peek_at(1).kind == TokenType::Colon) {
+                current_visibility = Visibility::Protected;
+                this.advance(); this.advance();
+                continue;
+            }
+
+            // Constructor: ClassName(params) { body }
+            if (this.check(TokenType::Identifier) && this.current().lexeme == this.current_type_name &&
+                this.peek_at(1).kind == TokenType::LParen) {
+                const method: MethodNode* = this.parse_constructor(current_visibility);
+                if (method != null) {
+                    if (doc != "") { method.set_documentation(doc); }
+                    if (struct_node != null) { struct_node.add_method(method); }
+                    if (class_node != null) { class_node.add_method(method); }
+                }
+                continue;
+            }
+
+            // Destructor: ~ClassName() { body }
+            if (this.check(TokenType::Tilde)) {
+                const method: MethodNode* = this.parse_destructor(current_visibility);
+                if (method != null) {
+                    if (doc != "") { method.set_documentation(doc); }
+                    if (struct_node != null) { struct_node.add_method(method); }
+                    if (class_node != null) { class_node.add_method(method); }
+                }
+                continue;
+            }
+
+            // Static method or static field
+            if (this.check(TokenType::KwStatic)) {
+                const method: MethodNode* = this.parse_method_with_modifiers(current_visibility, true, false, false);
+                if (method != null) {
+                    if (doc != "") { method.set_documentation(doc); }
+                    if (struct_node != null) { struct_node.add_method(method); }
+                    if (class_node != null) { class_node.add_method(method); }
+                }
+                continue;
+            }
+
+            // Virtual method
+            if (this.check(TokenType::KwMutable) && this.current().lexeme == "virtual") {
+                const method: MethodNode* = this.parse_method_with_modifiers(current_visibility, false, true, false);
+                if (method != null) {
+                    if (doc != "") { method.set_documentation(doc); }
+                    if (struct_node != null) { struct_node.add_method(method); }
+                    if (class_node != null) { class_node.add_method(method); }
+                }
+                continue;
+            }
+
+            // Override method
+            if (this.check(TokenType::Identifier) && this.current().lexeme == "override") {
+                const method: MethodNode* = this.parse_method_with_modifiers(current_visibility, false, false, true);
+                if (method != null) {
+                    if (doc != "") { method.set_documentation(doc); }
+                    if (struct_node != null) { struct_node.add_method(method); }
+                    if (class_node != null) { class_node.add_method(method); }
+                }
+                continue;
+            }
+
+            // Method: name(params) -> RetType { body }
+            // Or field: name: Type;
+            if (this.check(TokenType::Identifier)) {
+                // Disambiguate: method vs field
+                // Method pattern: name ( or name < (generic method)
+                const next: Token = this.peek_at(1);
+                if (next.kind == TokenType::LParen || next.kind == TokenType::LAngle) {
+                    const method: MethodNode* = this.parse_method(current_visibility);
+                    if (method != null) {
+                        if (doc != "") { method.set_documentation(doc); }
+                        if (struct_node != null) { struct_node.add_method(method); }
+                        if (class_node != null) { class_node.add_method(method); }
+                    }
+                } else {
+                    const field: FieldDeclNode* = this.parse_field_declaration();
+                    if (field != null) {
+                        field.set_visibility(current_visibility);
+                        if (doc != "") { field.set_documentation(doc); }
+                        if (struct_node != null) { struct_node.add_field(field); }
+                        if (class_node != null) { class_node.add_field(field); }
+                    }
+                }
+                continue;
+            }
+
+            // Unknown token in type body
+            this.error_unexpected();
+            this.advance();
+        }
+
+        this.in_class_members = false;
+    }
+
+    /// Parse a constructor: ClassName(params) [: BaseClass(args)] { body }
+    parse_constructor(visibility: Visibility) -> MethodNode* {
+        const start: Token = this.current();
+        const name_tok: Token = this.advance(); // consume class name
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+
+        // Parse as function declaration
+        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
+
+        this.consume(TokenType::LParen, "'('");
+        if (!this.check(TokenType::RParen)) {
+            const params: VarDeclNode*[] = this.parse_parameter_list();
+            for (mut i: int = 0; i < params.length; i++) {
+                func.add_parameter(params[i]);
+            }
+        }
+        this.consume(TokenType::RParen, "')'");
+
+        mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
+        method.set_constructor(true);
+        method.set_visibility(visibility);
+
+        // Optional base constructor call: : Base(args)
+        if (this.match_tok(TokenType::Colon)) {
+            const base_tok: Token = this.consume(TokenType::Identifier, "base class name");
+            method.set_base_ctor_name(this.intern_lexeme(base_tok));
+            this.consume(TokenType::LParen, "'('");
+            while (!this.check(TokenType::RParen) && !this.is_at_end()) {
+                const arg: ExpressionNode* = this.parse_expression();
+                if (arg != null) {
+                    method.add_base_ctor_arg(arg);
+                }
+                if (!this.match_tok(TokenType::Comma)) { break; }
+            }
+            this.consume(TokenType::RParen, "')'");
+        }
+
+        // Body
+        if (this.check(TokenType::LBrace)) {
+            const body: BlockStmtNode* = this.parse_block_statement();
+            func.set_body(body);
+        }
+
+        method.span = this.span_from(start);
+        return method;
+    }
+
+    /// Parse a destructor: ~ClassName() { body }
+    parse_destructor(visibility: Visibility) -> MethodNode* {
+        const start: Token = this.advance(); // consume '~'
+        const name_tok: Token = this.advance(); // consume class name
+        const name: SymbolStr = this.ctx.intern("~" + name_tok.lexeme);
+
+        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
+
+        this.consume(TokenType::LParen, "'('");
+        this.consume(TokenType::RParen, "')'");
+
+        mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
+        method.set_destructor(true);
+        method.set_visibility(visibility);
+
+        // Check for = default
+        if (this.match_tok(TokenType::Equal)) {
+            if (this.check(TokenType::KwDefault)) {
+                this.advance();
+                method.set_default_destructor(true);
+                this.consume(TokenType::Semicolon, "';'");
+                method.span = this.span_from(start);
+                return method;
+            }
+        }
+
+        if (this.check(TokenType::LBrace)) {
+            const body: BlockStmtNode* = this.parse_block_statement();
+            func.set_body(body);
+        }
+
+        method.span = this.span_from(start);
+        return method;
+    }
+
+    /// Parse a method with optional modifiers (static, virtual, override).
+    parse_method_with_modifiers(visibility: Visibility, is_static: boolean,
+                                 is_virtual: boolean, is_override: boolean) -> MethodNode* {
+        this.advance(); // consume modifier keyword
+
+        const method: MethodNode* = this.parse_method(visibility);
+        if (method != null) {
+            if (is_static) { method.set_static(true); }
+            if (is_virtual) { method.set_virtual(true); }
+            if (is_override) { method.set_override(true); }
+        }
+        return method;
+    }
+
+    /// Parse a method: name<T>(params) -> RetType { body }
+    parse_method(visibility: Visibility) -> MethodNode* {
+        const start: Token = this.current();
+        const name_tok: Token = this.advance(); // consume method name
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+
+        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
+        func.set_name_span(this.span_from_token(name_tok));
+
+        // Optional generic parameters
+        if (this.check(TokenType::LAngle)) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            for (mut i: int = 0; i < gen_params.length; i++) {
+                func.add_generic_param(gen_params[i]);
+            }
+        }
+
+        // Parameter list
+        this.consume(TokenType::LParen, "'('");
+        if (!this.check(TokenType::RParen)) {
+            const params: VarDeclNode*[] = this.parse_parameter_list();
+            for (mut i: int = 0; i < params.length; i++) {
+                func.add_parameter(params[i]);
+            }
+        }
+        this.consume(TokenType::RParen, "')'");
+
+        // Optional return type
+        if (this.match_tok(TokenType::Arrow)) {
+            const ret_type: TypeAnnotation* = this.parse_type_annotation();
+            func.set_return_type_annotation(ret_type);
+        }
+
+        mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
+        method.set_visibility(visibility);
+
+        // Body or semicolon
+        if (this.check(TokenType::LBrace)) {
+            this.in_method_body = true;
+            const body: BlockStmtNode* = this.parse_block_statement();
+            func.set_body(body);
+            this.in_method_body = false;
+        } else {
+            this.consume(TokenType::Semicolon, "';' or '{'");
+        }
+
+        method.span = this.span_from(start);
+        return method;
+    }
+
+    /// Parse a field declaration: name: Type [= default];
+    parse_field_declaration() -> FieldDeclNode* {
+        const start: Token = this.current();
+        const name_tok: Token = this.advance(); // consume field name
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut field: FieldDeclNode* = new FieldDeclNode(name, this.span_from_token(start));
+        field.set_name_span(this.span_from_token(name_tok));
+
+        // Type annotation
+        this.consume(TokenType::Colon, "':'");
+        const type_ann: TypeAnnotation* = this.parse_type_annotation();
+        field.set_type_annotation(type_ann);
+
+        // Optional default value
+        if (this.match_tok(TokenType::Equal)) {
+            const default_val: ExpressionNode* = this.parse_expression();
+            field.set_default_value(default_val);
+        }
+
+        this.consume(TokenType::Semicolon, "';'");
+        field.span = this.span_from(start);
+        return field;
+    }
+
+    /// Parse an enum declaration: type enum Name<T> { variants }
+    parse_enum_declaration() -> EnumDeclNode* {
+        const start: Token = this.advance(); // consume 'type'
+        this.advance(); // consume 'enum'
+
+        const name_tok: Token = this.consume(TokenType::Identifier, "enum name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut node: EnumDeclNode* = new EnumDeclNode(name, this.span_from_token(start));
+        node.set_name_span(this.span_from_token(name_tok));
+
+        // Optional generic parameters
+        if (this.check(TokenType::LAngle)) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            for (mut i: int = 0; i < gen_params.length; i++) {
+                node.add_generic_param(gen_params[i]);
+            }
+        }
+
+        this.consume(TokenType::LBrace, "'{'");
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            this.collect_doc_comments();
+            if (this.check(TokenType::RBrace)) { break; }
+            const doc: string = this.take_documentation();
+
+            const variant: EnumVariantNode* = this.parse_enum_variant();
+            if (variant != null) {
+                if (doc != "") { variant.set_documentation(doc); }
+                node.add_variant(variant);
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse an enum variant: Name; or Name(Type); or Name = value;
+    parse_enum_variant() -> EnumVariantNode* {
+        const start: Token = this.current();
+        const name_tok: Token = this.consume(TokenType::Identifier, "variant name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut variant: EnumVariantNode* = new EnumVariantNode(name, this.span_from_token(start));
+
+        // Associated types: Variant(Type1, Type2)
+        if (this.check(TokenType::LParen)) {
+            this.advance();
+            while (!this.check(TokenType::RParen) && !this.is_at_end()) {
+                // Associated type name — could be a full type annotation
+                const type_tok: Token = this.current();
+                mut type_name: string = type_tok.lexeme;
+                this.advance();
+
+                // Handle qualified: A::B
+                while (this.check(TokenType::ColonColon)) {
+                    this.advance();
+                    type_name = type_name + "::" + this.current().lexeme;
+                    this.advance();
+                }
+                // Handle pointer/array suffix
+                while (this.check(TokenType::Star)) {
+                    type_name = type_name + "*";
+                    this.advance();
+                }
+                
+                const type_name_sym: SymbolStr = this.ctx.intern(type_name);
+                variant.add_associated_type(type_name_sym);
+                if (!this.match_tok(TokenType::Comma)) { break; }
+            }
+            this.consume(TokenType::RParen, "')'");
+        }
+
+        // Explicit value: Variant = 42
+        if (this.match_tok(TokenType::Equal)) {
+            const val_tok: Token = this.current();
+            if (val_tok.kind == TokenType::NumericConstant) {
+                this.advance();
+                // Simple integer parse: use 0 as placeholder
+                variant.set_explicit_value(0);
+            }
+        }
+
+        this.consume(TokenType::Semicolon, "';'");
+        variant.span = this.span_from(start);
+        return variant;
+    }
+
+    /// Parse a trait declaration: type trait Name<T> [: Base] { methods }
+    parse_trait_declaration() -> TraitDeclNode* {
+        const start: Token = this.advance(); // consume 'type'
+        this.advance(); // consume 'trait'
+
+        const name_tok: Token = this.consume(TokenType::Identifier, "trait name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut node: TraitDeclNode* = new TraitDeclNode(name, this.span_from_token(start));
+        node.set_name_span(this.span_from_token(name_tok));
+
+        // Optional generic parameters
+        if (this.check(TokenType::LAngle)) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            for (mut i: int = 0; i < gen_params.length; i++) {
+                node.add_generic_param(gen_params[i]);
+            }
+        }
+
+        // Optional base traits: : Trait1, Trait2<T>
+        if (this.match_tok(TokenType::Colon)) {
+            while (true) {
+                const base_tok: Token = this.consume(TokenType::Identifier, "base trait name");
+                const base_name: SymbolStr = this.intern_lexeme(base_tok);
+                mut type_params: SymbolStr[] = [];
+
+                if (this.check(TokenType::LAngle)) {
+                    type_params = this.parse_generic_args();
+                }
+
+                const info: BaseTraitInfo = BaseTraitInfo {
+                    name:            base_name,
+                    type_parameters: type_params,
+                };
+                node.add_base_trait(info);
+
+                if (!this.match_tok(TokenType::Comma)) { break; }
+            }
+        }
+
+        this.consume(TokenType::LBrace, "'{'");
+
+        // Parse trait methods (declarations, possibly with default bodies)
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            this.collect_doc_comments();
+            if (this.check(TokenType::RBrace)) { break; }
+
+            if (this.check(TokenType::Identifier) || this.check(TokenType::KwFunction)) {
+                // Parse as function declaration
+                mut is_fn: boolean = false;
+                if (this.check(TokenType::KwFunction)) {
+                    is_fn = true;
+                }
+                const func: FunctionDeclNode* = this.parse_function_declaration(false);
+                if (func != null) {
+                    node.add_method(func);
+                }
+            } else {
+                this.error_unexpected();
+                this.advance();
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse a type alias: type Alias = Target; or type Alias<T> = Target;
+    parse_type_alias_declaration() -> TypeAliasDeclNode* {
+        const start: Token = this.advance(); // consume 'type'
+        const name_tok: Token = this.consume(TokenType::Identifier, "type alias name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut node: TypeAliasDeclNode* = new TypeAliasDeclNode(name, this.span_from_token(start));
+        node.set_name_span(this.span_from_token(name_tok));
+
+        // Optional generic parameters (as simple SymbolStr list)
+        if (this.check(TokenType::LAngle)) {
+            const gen_args: SymbolStr[] = this.parse_generic_args();
+            node.set_generic_params(gen_args);
+        }
+
+        this.consume(TokenType::Equal, "'='");
+        const target: TypeAnnotation* = this.parse_type_annotation();
+        node.set_target_annotation(target);
+        this.consume(TokenType::Semicolon, "';'");
+
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse an import declaration (5 styles).
+    parse_import_declaration() -> ImportDeclNode* {
+        const start: Token = this.advance(); // consume 'import'
+
+        // Build module path: A::B::C
+        mut path: string = "";
+        const first_tok: Token = this.consume(TokenType::Identifier, "module name");
+        path = first_tok.lexeme;
+
+        while (this.check(TokenType::ColonColon)) {
+            this.advance();
+            const next: Token = this.current();
+            // Could be identifier or * (wildcard)
+            if (next.kind == TokenType::Star) {
+                // Wildcard import: import A::B::*
+                this.advance();
+                path = path + "::*";
+                mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Wildcard, this.span_from_token(start));
+                this.consume(TokenType::Semicolon, "';'");
+                imp.span = this.span_from(start);
+                return imp;
+            }
+            if (next.kind == TokenType::LBrace) {
+                // Selective import: import A::B::{X, Y}
+                this.advance(); // consume '{'
+                mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Specific, this.span_from_token(start));
+                while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+                    const item_tok: Token = this.consume(TokenType::Identifier, "import name");
+                    imp.add_specific_import(this.intern_lexeme(item_tok));
+                    if (!this.match_tok(TokenType::Comma)) { break; }
+                }
+                this.consume(TokenType::RBrace, "'}'");
+                this.consume(TokenType::Semicolon, "';'");
+                imp.span = this.span_from(start);
+                return imp;
+            }
+            path = path + "::" + next.lexeme;
+            this.advance();
+        }
+
+        mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Wildcard, this.span_from_token(start));
+
+        // Optional alias: import A::B as C
+        if (this.check(TokenType::KwAs)) {
+            this.advance();
+            const alias_tok: Token = this.consume(TokenType::Identifier, "alias name");
+            imp.set_alias(alias_tok.lexeme);
+        }
+
+        this.consume(TokenType::Semicolon, "';'");
+        imp.span = this.span_from(start);
+        return imp;
+    }
+
+    /// Parse a namespace declaration: namespace A::B;
+    parse_namespace_declaration() -> ASTNode* {
+        const start: Token = this.advance(); // consume 'namespace'
+        mut path: string = "";
+        const first_tok: Token = this.consume(TokenType::Identifier, "namespace name");
+        path = first_tok.lexeme;
+
+        while (this.check(TokenType::ColonColon)) {
+            this.advance();
+            const next: Token = this.consume(TokenType::Identifier, "namespace segment");
+            path = path + "::" + next.lexeme;
+        }
+
+        this.consume(TokenType::Semicolon, "';'");
+
+        // Create a module declaration node representing the namespace
+        const span: SourceSpan = this.span_from(start);
+        return new ModuleDeclNode(path, true, span);
+    }
+
+    /// Parse a module declaration: public module Name;
+    parse_module_declaration() -> ModuleDeclNode* {
+        const start: Token = this.current();
+        mut is_public: boolean = false;
+        if (this.check(TokenType::KwPublic)) {
+            is_public = true;
+            this.advance();
+        }
+        this.consume(TokenType::KwModule, "'module'");
+        const name_tok: Token = this.consume(TokenType::Identifier, "module name");
+
+        // Handle qualified module names: A::B
+        mut path: string = name_tok.lexeme;
+        while (this.check(TokenType::ColonColon)) {
+            this.advance();
+            const next: Token = this.consume(TokenType::Identifier, "module name segment");
+            path = path + "::" + next.lexeme;
+        }
+
+        this.consume(TokenType::Semicolon, "';'");
+        const span: SourceSpan = this.span_from(start);
+        return new ModuleDeclNode(path, is_public, span);
+    }
+
+    /// Parse an implementation block: implement enum/struct Name { methods }
+    parse_implementation_block() -> ImplBlockNode* {
+        const start: Token = this.advance(); // consume 'implement'
+
+        // Optional type keyword (enum, struct)
+        if (this.check(TokenType::KwEnum) || this.check(TokenType::KwStruct)) {
+            this.advance();
+        }
+
+        const type_tok: Token = this.consume(TokenType::Identifier, "type name");
+        const type_name: SymbolStr = this.intern_lexeme(type_tok);
+        mut node: ImplBlockNode* = new ImplBlockNode(type_name, this.span_from_token(start));
+        this.current_type_name = type_tok.lexeme;
+        this.in_impl_block = true;
+
+        this.consume(TokenType::LBrace, "'{'");
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            this.collect_doc_comments();
+            if (this.check(TokenType::RBrace)) { break; }
+            const doc: string = this.take_documentation();
+
+            // Methods in impl blocks
+            if (this.check(TokenType::Identifier) || this.check(TokenType::KwFunction) ||
+                this.check(TokenType::KwStatic) || this.check(TokenType::KwPublic) ||
+                this.check(TokenType::KwPrivate)) {
+
+                mut vis: Visibility = Visibility::Public;
+                mut is_static: boolean = false;
+
+                if (this.check(TokenType::KwPublic)) {
+                    vis = Visibility::Public;
+                    this.advance();
+                } else if (this.check(TokenType::KwPrivate)) {
+                    vis = Visibility::Private;
+                    this.advance();
+                }
+
+                if (this.check(TokenType::KwStatic)) {
+                    is_static = true;
+                    this.advance();
+                }
+
+                const method: MethodNode* = this.parse_method(vis);
+                if (method != null) {
+                    if (is_static) { method.set_static(true); }
+                    if (doc != "") { method.set_documentation(doc); }
+                    node.add_method(method);
+                }
+            } else {
+                this.error_unexpected();
+                this.advance();
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        this.in_impl_block = false;
+        this.current_type_name = "";
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse an extern block: extern "C" { function declarations }
+    parse_extern_block() -> ExternBlockNode* {
+        const start: Token = this.advance(); // consume 'extern'
+        mut linkage: string = "C";
+
+        // Optional linkage type: "C"
+        if (this.check(TokenType::StringLiteral)) {
+            linkage = this.current().lexeme;
+            this.advance();
+        }
+
+        mut node: ExternBlockNode* = new ExternBlockNode(linkage, this.span_from_token(start));
+
+        this.consume(TokenType::LBrace, "'{'");
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            this.collect_doc_comments();
+            if (this.check(TokenType::RBrace)) { break; }
+
+            if (this.check(TokenType::KwFunction)) {
+                const func: FunctionDeclNode* = this.parse_extern_function();
+                if (func != null) {
+                    node.add_function(func);
+                }
+            } else {
+                this.error_unexpected();
+                this.advance();
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse an extern function declaration (no body).
+    parse_extern_function() -> FunctionDeclNode* {
+        const func: FunctionDeclNode* = this.parse_function_declaration(false);
+        return func;
+    }
+
+    /// Parse an intrinsic declaration: intrinsic name(params) -> RetType { body }
+    parse_intrinsic_declaration() -> IntrinsicDeclNode* {
+        const start: Token = this.advance(); // consume 'intrinsic'
+        const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut node: IntrinsicDeclNode* = new IntrinsicDeclNode(name, this.span_from_token(start));
+
+        // Parameter list
+        this.consume(TokenType::LParen, "'('");
+        if (!this.check(TokenType::RParen)) {
+            const params: VarDeclNode*[] = this.parse_parameter_list();
+            for (mut i: int = 0; i < params.length; i++) {
+                node.add_parameter(params[i]);
+            }
+        }
+        this.consume(TokenType::RParen, "')'");
+
+        // Optional return type
+        if (this.match_tok(TokenType::Arrow)) {
+            // We don't have return_type_annotation on IntrinsicDeclNode
+            // just skip the type annotation for now
+            this.parse_type_annotation();
+        }
+
+        // Optional body
+        if (this.check(TokenType::LBrace)) {
+            const body: BlockStmtNode* = this.parse_block_statement();
+            node.set_body(body);
+        } else {
+            this.consume(TokenType::Semicolon, "';'");
+        }
+
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse generic type parameters: <T, U: Constraint>
+    parse_generic_params() -> GenericParamNode*[] {
+        mut params: GenericParamNode*[] = [];
+        this.advance(); // consume '<'
+
+        while (!this.check(TokenType::RAngle) &&
+               !this.check(TokenType::GreaterGreater) &&
+               !this.is_at_end()) {
+            const start: Token = this.current();
+            const name_tok: Token = this.consume(TokenType::Identifier, "type parameter name");
+            const name: SymbolStr = this.intern_lexeme(name_tok);
+            mut param: GenericParamNode* = new GenericParamNode(name, this.span_from_token(start));
+
+            // Optional constraints: T: Constraint1 + Constraint2
+            if (this.match_tok(TokenType::Colon)) {
+                while (true) {
+                    const constraint_tok: Token = this.consume(TokenType::Identifier, "constraint name");
+                    param.add_constraint(this.intern_lexeme(constraint_tok));
+                    if (!this.match_tok(TokenType::Plus)) { break; }
+                }
+            }
+
+            param.span = this.span_from(start);
+            params.push(param);
+
+            if (!this.match_tok(TokenType::Comma)) {
+                break;
+            }
+        }
+
+        this.consume_right_angle();
+        return params;
+    }
+
+    /// Parse trait bounds: where T: Trait, U: OtherTrait
+    parse_trait_bounds() -> TraitBound[] {
+        mut bounds: TraitBound[] = [];
+        this.advance(); // consume 'where'
+
+        while (true) {
+            const type_param_tok: Token = this.consume(TokenType::Identifier, "type parameter");
+            this.consume(TokenType::Colon, "':'");
+            const trait_tok: Token = this.consume(TokenType::Identifier, "trait name");
+
+            const bound: TraitBound = TraitBound {
+                type_parameter: this.intern_lexeme(type_param_tok),
+                trait_name:     this.intern_lexeme(trait_tok),
+                span:           this.span_from(type_param_tok),
+            };
+            bounds.push(bound);
+
+            if (!this.match_tok(TokenType::Comma)) { break; }
+        }
+
+        return bounds;
+    }
+
+    /// Parse a directive: #[attr] or #[attr(args)]
+    parse_directive() -> DirectiveNode* {
+        const start: Token = this.advance(); // consume '#'
+        this.consume(TokenType::LSquare, "'['");
+
+        const kind_tok: Token = this.consume(TokenType::Identifier, "directive name");
+        mut dir: DirectiveNode* = new DirectiveNode(kind_tok.lexeme, this.span_from_token(start));
+
+        // Optional arguments: #[attr(arg1, arg2)]
+        if (this.check(TokenType::LParen)) {
+            this.advance();
+            while (!this.check(TokenType::RParen) && !this.is_at_end()) {
+                const arg: Token = this.current();
+                dir.add_argument(arg.lexeme);
+                this.advance();
+                if (!this.match_tok(TokenType::Comma)) { break; }
+            }
+            this.consume(TokenType::RParen, "')'");
+        }
+
+        this.consume(TokenType::RSquare, "']'");
+        dir.span = this.span_from(start);
+        return dir;
+    }
+
+
+    // ================================================================
+    // Statement Parsing
+    // ================================================================
+
+    /// Parse a statement based on the current token.
+    parse_statement() -> StatementNode* {
+        if (this.panic_mode || this.is_at_end()) { return null; }
+
+        const tok: Token = this.current();
+
+        // Block statement
+        if (tok.kind == TokenType::LBrace) {
+            return this.parse_block_statement();
+        }
+
+        // If statement
+        if (tok.kind == TokenType::KwIf) {
+            return this.parse_if_statement();
+        }
+
+        // While statement
+        if (tok.kind == TokenType::KwWhile) {
+            return this.parse_while_statement();
+        }
+
+        // Do-while statement
+        if (tok.kind == TokenType::KwDo) {
+            return this.parse_do_while_statement();
+        }
+
+        // For statement
+        if (tok.kind == TokenType::KwFor) {
+            return this.parse_for_statement();
+        }
+
+        // Match statement
+        if (tok.kind == TokenType::KwMatch) {
+            return this.parse_match_statement();
+        }
+
+        // Switch statement
+        if (tok.kind == TokenType::KwSwitch) {
+            return this.parse_switch_statement();
+        }
+
+        // Return statement
+        if (tok.kind == TokenType::KwReturn) {
+            return this.parse_return_statement();
+        }
+
+        // Break statement
+        if (tok.kind == TokenType::KwBreak) {
+            return this.parse_break_statement();
+        }
+
+        // Continue statement
+        if (tok.kind == TokenType::KwContinue) {
+            return this.parse_continue_statement();
+        }
+
+        // Unsafe block
+        if (tok.kind == TokenType::KwUnsafe) {
+            return this.parse_unsafe_block();
+        }
+
+        // Variable declarations (as statements)
+        if (tok.kind == TokenType::KwConst || tok.kind == TokenType::KwMut) {
+            const var_decl: VarDeclNode* = this.parse_variable_declaration();
+            if (var_decl != null) {
+                return new DeclStmtNode(var_decl, var_decl.span);
+            }
+            return null;
+        }
+
+        // Expression statement (fallthrough)
+        return this.parse_expression_statement();
+    }
+
+    /// Parse a block statement: { statement* }
+    parse_block_statement() -> BlockStmtNode* {
+        const start: Token = this.advance(); // consume '{'
+        this.enter_scope();
+        mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(start));
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            if (this.panic_mode) {
+                this.synchronize();
+                if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
+            }
+
+            this.collect_doc_comments();
+            if (this.check(TokenType::RBrace)) { break; }
+            const doc: string = this.take_documentation();
+
+            // Inside a block, we can have declarations or statements
+            if (this.is_declaration_start()) {
+                const decl: ASTNode* = this.parse_declaration(false, doc);
+                if (decl != null) {
+                    // Wrap declaration in a DeclStmtNode if it's a DeclarationNode
+                    // Otherwise it might already be a StatementNode
+                    const decl_stmt: DeclStmtNode* = new DeclStmtNode(decl as DeclarationNode*, decl.span);
+                    block.add_statement(decl_stmt);
+                }
+            } else {
+                const stmt: StatementNode* = this.parse_statement();
+                if (stmt != null) {
+                    block.add_statement(stmt);
+                }
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        this.exit_scope();
+        block.span = this.span_from(start);
+        return block;
+    }
+
+    /// Parse an if statement: if (cond) stmt [else stmt]
+    parse_if_statement() -> IfStmtNode* {
+        const start: Token = this.advance(); // consume 'if'
+        this.consume(TokenType::LParen, "'('");
+        const condition: ExpressionNode* = this.parse_expression();
+        this.consume(TokenType::RParen, "')'");
+
+        const then_stmt: StatementNode* = this.parse_statement_or_block();
+
+        mut else_stmt: StatementNode* = null;
+        if (this.match_tok(TokenType::KwElse)) {
+            else_stmt = this.parse_statement_or_block();
+        } else if (this.check(TokenType::KwElif)) {
+            // elif → rewrite as else if
+            this.tokens[this.pos] = Token::new(TokenType::KwIf, "if",
+                this.current().line, this.current().column);
+            else_stmt = this.parse_if_statement();
+        }
+
+        const span: SourceSpan = this.span_from(start);
+        return new IfStmtNode(condition, then_stmt, else_stmt, span);
+    }
+
+    /// Parse a while statement: while (cond) stmt
+    parse_while_statement() -> WhileStmtNode* {
+        const start: Token = this.advance(); // consume 'while'
+        this.consume(TokenType::LParen, "'('");
+        const condition: ExpressionNode* = this.parse_expression();
+        this.consume(TokenType::RParen, "')'");
+
+        const body: StatementNode* = this.parse_statement_or_block();
+        return new WhileStmtNode(condition, body, this.span_from(start));
+    }
+
+    /// Parse a do-while statement: do stmt while (cond);
+    parse_do_while_statement() -> DoWhileStmtNode* {
+        const start: Token = this.advance(); // consume 'do'
+        const body: StatementNode* = this.parse_statement_or_block();
+        this.consume(TokenType::KwWhile, "'while'");
+        this.consume(TokenType::LParen, "'('");
+        const condition: ExpressionNode* = this.parse_expression();
+        this.consume(TokenType::RParen, "')'");
+        this.consume(TokenType::Semicolon, "';'");
+        return new DoWhileStmtNode(body, condition, this.span_from(start));
+    }
+
+    /// Parse a for statement: for (init; cond; update) body
+    /// or for-in: for (item in collection) body
+    parse_for_statement() -> StatementNode* {
+        const start: Token = this.advance(); // consume 'for'
+        this.consume(TokenType::LParen, "'('");
+
+        // Check for for-in syntax: for (name in expr)
+        if (this.check(TokenType::Identifier) && this.peek_at(1).kind == TokenType::KwIn) {
+            // For-in loop — parse as for(; ; ) with special init
+            const iter_tok: Token = this.advance(); // consume iterator name
+            this.advance(); // consume 'in'
+            const collection: ExpressionNode* = this.parse_expression();
+            this.consume(TokenType::RParen, "')'");
+            const body: StatementNode* = this.parse_statement_or_block();
+
+            // Create a desugared for loop
+            // For now, create a for loop with the collection as condition
+            const iter_name: SymbolStr = this.intern_lexeme(iter_tok);
+            mut iter_var: VarDeclNode* = new VarDeclNode(iter_name, this.span_from_token(iter_tok));
+            return new ForStmtNode(iter_var, collection, null, body, this.span_from(start));
+        }
+
+        // C-style for: for (init; cond; update) body
+        mut init: ASTNode* = null;
+        if (!this.check(TokenType::Semicolon)) {
+            if (this.check(TokenType::KwConst) || this.check(TokenType::KwMut)) {
+                init = this.parse_variable_declaration();
+            } else {
+                const expr: ExpressionNode* = this.parse_expression();
+                this.consume(TokenType::Semicolon, "';'");
+                init = expr;
+            }
+        } else {
+            this.advance(); // consume ';'
+        }
+
+        mut condition: ExpressionNode* = null;
+        if (!this.check(TokenType::Semicolon)) {
+            condition = this.parse_expression();
+        }
+        this.consume(TokenType::Semicolon, "';'");
+
+        mut update: ExpressionNode* = null;
+        if (!this.check(TokenType::RParen)) {
+            update = this.parse_expression();
+        }
+        this.consume(TokenType::RParen, "')'");
+
+        const body: StatementNode* = this.parse_statement_or_block();
+        return new ForStmtNode(init, condition, update, body, this.span_from(start));
+    }
+
+    /// Parse a match statement: match (expr) { arms }
+    parse_match_statement() -> MatchStmtNode* {
+        const start: Token = this.advance(); // consume 'match'
+        this.consume(TokenType::LParen, "'('");
+        const subject: ExpressionNode* = this.parse_expression();
+        this.consume(TokenType::RParen, "')'");
+        this.consume(TokenType::LBrace, "'{'");
+
+        mut match_stmt: MatchStmtNode* = new MatchStmtNode(subject, this.span_from_token(start));
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            const arm: MatchArmNode* = this.parse_match_arm();
+            if (arm != null) {
+                match_stmt.add_arm(arm);
+            }
+            if (this.panic_mode) {
+                this.synchronize();
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        match_stmt.span = this.span_from(start);
+        return match_stmt;
+    }
+
+    /// Parse a match arm for a statement match: pattern => { body }
+    parse_match_arm() -> MatchArmNode* {
+        const start: Token = this.current();
+        mut arm: MatchArmNode* = new MatchArmNode(this.span_from_token(start));
+
+        // Parse pattern(s) separated by |
+        while (true) {
+            const pat: PatternNode* = this.parse_pattern();
+            if (pat != null) {
+                arm.add_pattern(pat);
+            }
+            if (!this.match_tok(TokenType::Pipe)) {
+                break;
+            }
+        }
+
+        this.consume(TokenType::FatArrow, "'=>'");
+
+        // Body: block statement
+        if (this.check(TokenType::LBrace)) {
+            const body: BlockStmtNode* = this.parse_block_statement();
+            arm.set_body(body);
+        } else {
+            // Single statement/expression
+            const stmt: StatementNode* = this.parse_statement();
+            if (stmt != null) {
+                arm.set_body(stmt);
+            }
+        }
+
+        arm.span = this.span_from(start);
+        return arm;
+    }
+
+    /// Parse a pattern (for match statements).
+    parse_pattern() -> PatternNode* {
+        return this.parse_pattern_internal();
+    }
+
+    /// Parse a switch statement: switch (expr) { cases }
+    parse_switch_statement() -> SwitchStmtNode* {
+        const start: Token = this.advance(); // consume 'switch'
+        this.consume(TokenType::LParen, "'('");
+        const expr: ExpressionNode* = this.parse_expression();
+        this.consume(TokenType::RParen, "')'");
+        this.consume(TokenType::LBrace, "'{'");
+
+        mut switch_stmt: SwitchStmtNode* = new SwitchStmtNode(expr, this.span_from_token(start));
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            const case_node: CaseStmtNode* = this.parse_case_statement();
+            if (case_node != null) {
+                switch_stmt.add_case(case_node);
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        switch_stmt.span = this.span_from(start);
+        return switch_stmt;
+    }
+
+    /// Parse a case statement: case expr: { body } or default: { body }
+    parse_case_statement() -> CaseStmtNode* {
+        const start: Token = this.current();
+        mut is_default: boolean = false;
+        mut value: ExpressionNode* = null;
+
+        if (this.check(TokenType::KwDefault)) {
+            is_default = true;
+            this.advance();
+        } else if (this.check(TokenType::KwCase)) {
+            this.advance();
+            value = this.parse_expression();
+        } else {
+            this.error_expected("'case' or 'default'");
+            return null;
+        }
+
+        this.consume(TokenType::Colon, "':'");
+
+        // Case body (block or statements until next case/default/rbrace)
+        mut body: BlockStmtNode* = null;
+        if (this.check(TokenType::LBrace)) {
+            body = this.parse_block_statement();
+        } else {
+            body = new BlockStmtNode(this.current_span());
+            while (!this.check(TokenType::KwCase) && !this.check(TokenType::KwDefault) &&
+                   !this.check(TokenType::RBrace) && !this.is_at_end()) {
+                const stmt: StatementNode* = this.parse_statement();
+                if (stmt != null) {
+                    body.add_statement(stmt);
+                }
+            }
+            body.span = this.span_from(start);
+        }
+
+        return new CaseStmtNode(value, body, is_default, this.span_from(start));
+    }
+
+    /// Parse a return statement: return [expr];
+    parse_return_statement() -> ReturnStmtNode* {
+        const start: Token = this.advance(); // consume 'return'
+        mut expr: ExpressionNode* = null;
+
+        if (!this.check(TokenType::Semicolon) && !this.check(TokenType::RBrace)) {
+            expr = this.parse_expression();
+        }
+
+        this.consume(TokenType::Semicolon, "';'");
+        return new ReturnStmtNode(expr, this.span_from(start));
+    }
+
+    /// Parse a break statement: break;
+    parse_break_statement() -> BreakStmtNode* {
+        const start: Token = this.advance(); // consume 'break'
+        this.consume(TokenType::Semicolon, "';'");
+        return new BreakStmtNode(this.span_from(start));
+    }
+
+    /// Parse a continue statement: continue;
+    parse_continue_statement() -> ContinueStmtNode* {
+        const start: Token = this.advance(); // consume 'continue'
+        this.consume(TokenType::Semicolon, "';'");
+        return new ContinueStmtNode(this.span_from(start));
+    }
+
+    /// Parse an expression statement: expr;
+    parse_expression_statement() -> ExprStmtNode* {
+        const expr: ExpressionNode* = this.parse_expression();
+        if (expr == null) {
+            // Try to recover
+            if (!this.is_at_end()) {
+                this.advance();
+            }
+            return null;
+        }
+        this.consume(TokenType::Semicolon, "';'");
+        return new ExprStmtNode(expr, expr.span);
+    }
+
+    /// Parse an unsafe block: unsafe { ... }
+    parse_unsafe_block() -> UnsafeBlockStmtNode* {
+        const start: Token = this.advance(); // consume 'unsafe'
+        const block: BlockStmtNode* = this.parse_block_statement();
+        return new UnsafeBlockStmtNode(block, this.span_from(start));
+    }
+
+    /// Helper: parse a statement that should be a block, or wrap in one.
+    parse_statement_or_block() -> StatementNode* {
+        if (this.check(TokenType::LBrace)) {
+            return this.parse_block_statement();
+        }
+        return this.parse_statement();
+    }
+}

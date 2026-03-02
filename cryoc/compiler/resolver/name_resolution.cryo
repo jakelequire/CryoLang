@@ -737,46 +737,53 @@ public:
 
 
 // ============================================================================
-// Entry point
+// Entry point — static method for cross-module resolution
 // ============================================================================
 
-/// Run the name resolution pass on the compilation context.
-function run_name_resolution_pass(ctx: CompilationContext*) -> PassResult {
-    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+/// Wrapper struct so the entry point is a static method, which the C++ compiler
+/// can resolve cross-module (free functions in imported namespaces cannot be
+/// resolved at codegen time due to compilation ordering).
+type struct NameResolutionPass {
+    /// Run the name resolution pass on the compilation context.
+    static run(ctx: CompilationContext*) -> PassResult {
+        const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
-    // Initialize the resolver if needed
-    ctx.init_resolver();
+        // Initialize the resolver if needed
+        ctx.init_resolver();
 
-    if (ctx.resolver == null) {
-        ctx.emit_error(ErrorCode::E0805_INTERNAL_ERROR, "Failed to initialize Resolver");
-        return PassResult::failure(1);
-    }
-
-    // Set current module
-    if (ctx.current_namespace != "") {
-        ctx.resolver.set_module(ctx.current_namespace);
-    }
-
-    // Get AST root from artifacts
-    const root: ProgramNode* = ctx.artifacts.ast.root as ProgramNode*;
-    if (root == null) {
-        // No AST available yet — this is OK for stub passes
-        if (ctx.debug_mode) {
-            printf("[NameResolution] No AST root available, skipping\n");
+        if (ctx.resolver == null) {
+            ctx.emit_error(ErrorCode::E0805_INTERNAL_ERROR, "Failed to initialize Resolver");
+            return PassResult::failure(1);
         }
-        return PassResult::ok([Provision::NamesResolved]);
+
+        // Set current module
+        if (ctx.current_namespace != "") {
+            ctx.resolver.set_module(ctx.current_namespace);
+        }
+
+        // Get AST root from artifacts
+        const root: ProgramNode* = ctx.artifacts.ast.root as ProgramNode*;
+        if (root == null) {
+            if (ctx.debug_mode) {
+                printf("[NameResolution] No AST root available, skipping\n");
+            }
+            return PassResult::ok([Provision::NamesResolved]);
+        }
+
+        // Store the resolver on the typed_ast artifact so downstream passes can find it
+        ctx.artifacts.set_resolver(ctx.resolver);
+
+        // Create and run the visitor
+        const visitor: NameResolver = NameResolver(ctx.resolver, ctx);
+        root.accept(&visitor as ASTVisitor*);
+
+        if (ctx.debug_mode) {
+            printf("[NameResolution] Resolved %lld symbols in %lld scopes, %lld map entries\n",
+                ctx.resolver.symbol_count(),
+                ctx.resolver.scope_count(),
+                ctx.resolver.resolution_map.count());
+        }
+
+        return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::NamesResolved]);
     }
-
-    // Create and run the visitor
-    const visitor: NameResolver = NameResolver(ctx.resolver, ctx);
-    root.accept(&visitor as ASTVisitor*);
-
-    if (ctx.debug_mode) {
-        printf("[NameResolution] Resolved %lld symbols in %lld scopes, %lld map entries\n",
-            ctx.resolver.symbol_count(),
-            ctx.resolver.scope_count(),
-            ctx.resolver.resolution_map.count());
-    }
-
-    return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::NamesResolved]);
 }

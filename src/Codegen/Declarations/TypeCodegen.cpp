@@ -1152,6 +1152,62 @@ namespace Cryo::Codegen
             }
         }
 
+        // Ensure inherited fields are included in the LLVM struct layout.
+        // The StructFieldTypeSyncPass should flatten inherited fields into cryo_class->fields(),
+        // but this can fail for cross-module class hierarchies (base class in a different module).
+        // As a safety net, if we detect missing inherited fields, prepend them from the base
+        // class's already-built LLVM struct.
+        if (!node->base_class().empty())
+        {
+            std::string base_name = node->base_class();
+            llvm::StructType *base_struct = llvm::StructType::getTypeByName(llvm_ctx(), base_name);
+            if (base_struct && !base_struct->isOpaque())
+            {
+                unsigned base_elem_count = base_struct->getNumElements();
+                // Current field_types includes only own fields (+ possibly vtable).
+                // The base struct already has its own vtable + inherited fields.
+                // If our layout is smaller than the base, we're missing inherited fields.
+                if (field_types.size() < base_elem_count)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "TypeCodegen: Class '{}' has {} elements but base '{}' has {} - prepending inherited fields",
+                              name, field_types.size(), base_name, base_elem_count);
+
+                    // Rebuild: start with all base class elements, then append our own non-vtable fields
+                    std::vector<llvm::Type *> full_fields;
+                    std::vector<std::string> full_names;
+
+                    // Copy all elements from base struct (includes vtable + all inherited fields)
+                    for (unsigned i = 0; i < base_elem_count; ++i)
+                        full_fields.push_back(base_struct->getElementType(i));
+
+                    // Copy base field names from registration
+                    auto &base_field_map = ctx().get_struct_field_indices(base_name);
+                    if (!base_field_map.empty())
+                    {
+                        // Reconstruct ordered names from the index map
+                        full_names.resize(base_elem_count);
+                        for (const auto &[fname, fidx] : base_field_map)
+                            if (fidx < base_elem_count)
+                                full_names[fidx] = fname;
+                    }
+
+                    // Append own fields (skip vtable pointer if we added one — it's already in base)
+                    unsigned own_start = needs_vtable ? 1 : 0;
+                    for (unsigned i = own_start; i < field_types.size(); ++i)
+                        full_fields.push_back(field_types[i]);
+                    for (unsigned i = 0; i < all_field_names.size(); ++i)
+                        full_names.push_back(all_field_names[i]);
+
+                    field_types = std::move(full_fields);
+                    all_field_names = std::move(full_names);
+
+                    // Update vtable flag — base already accounts for it
+                    needs_vtable = false; // Already included from base
+                }
+            }
+        }
+
         // Set class body - always set even if empty to mark as non-opaque
         class_type->setBody(field_types);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "TypeCodegen: Set class {} body with {} fields", name, field_types.size());
