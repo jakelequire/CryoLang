@@ -25,6 +25,7 @@ import Compiler::AST::Pattern;
 import Compiler::AST::Visitor;
 import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
+import Utils::Logger;
 
 
 
@@ -50,6 +51,7 @@ public:
 
     /// Walk top-level statements and forward-declare all names.
     forward_declare(program: ProgramNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] forward_declare() with %d statements", program.statements.length);
         for (mut i: int = 0; i < program.statements.length; i++) {
             const stmt: ASTNode* = program.statements[i];
             this.forward_declare_node(stmt);
@@ -163,6 +165,8 @@ public:
     // -- Declarations --
 
     override visit(node: FunctionDeclNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(FunctionDecl) name='%s' generics=%d",
+            node.name, node.generic_params.length);
         // Enter function scope
         this.resolver.enter_scope(ScopeKind::Function, node.name, node.span);
 
@@ -198,6 +202,7 @@ public:
     }
 
     override visit(node: StructDeclNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(StructDecl) name='%s'", node.name);
         // Enter type body scope
         this.resolver.enter_scope(ScopeKind::TypeBody, node.name, node.span);
 
@@ -227,6 +232,7 @@ public:
     }
 
     override visit(node: ClassDeclNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(ClassDecl) name='%s'", node.name);
         this.resolver.enter_scope(ScopeKind::TypeBody, node.name, node.span);
 
         // Declare generic params
@@ -255,6 +261,7 @@ public:
     }
 
     override visit(node: EnumDeclNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(EnumDecl) name='%s'", node.name);
         this.resolver.enter_scope(ScopeKind::TypeBody, node.name, node.span);
 
         // Declare generic params
@@ -278,6 +285,7 @@ public:
     }
 
     override visit(node: TraitDeclNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(TraitDecl) name='%s'", node.name);
         this.resolver.enter_scope(ScopeKind::Trait, node.name, node.span);
 
         // Declare generic params
@@ -387,6 +395,7 @@ public:
         if (sym_id.is_valid()) {
             this.resolver.record_resolution(node.span, sym_id);
         } else {
+            LOG_DEBUG(LogComponent::General, "[NameResolver] Identifier '%s' not found in scope", node.name);
             // Check import aliases
             const alias_id: SymbolID = this.resolver.lookup_import_alias(node.name);
             if (alias_id.is_valid()) {
@@ -690,6 +699,7 @@ public:
     /// Process an import declaration: bring imported names into current scope.
     process_import(node: ImportDeclNode*) -> void {
         const module_path: string = node.module_path;
+        LOG_DEBUG(LogComponent::General, "[NameResolver] process_import() module='%s'", module_path);
         const exports: SymbolID[] = this.resolver.get_exports(module_path);
 
         if (node.style == ImportStyle::Wildcard) {
@@ -746,6 +756,7 @@ public:
 type struct NameResolutionPass {
     /// Run the name resolution pass on the compilation context.
     static run(ctx: CompilationContext*) -> PassResult {
+        LOG_DEBUG(LogComponent::General, "[NameResolution] run() entry");
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         // Initialize the resolver if needed
@@ -764,9 +775,7 @@ type struct NameResolutionPass {
         // Get AST root from artifacts
         const root: ProgramNode* = ctx.artifacts.ast.root as ProgramNode*;
         if (root == null) {
-            if (ctx.debug_mode) {
-                printf("[NameResolution] No AST root available, skipping\n");
-            }
+            LOG_DEBUG(LogComponent::General, "[NameResolution] No AST root available, skipping");
             return PassResult::ok([Provision::NamesResolved]);
         }
 
@@ -777,12 +786,10 @@ type struct NameResolutionPass {
         const visitor: NameResolver = NameResolver(ctx.resolver, ctx);
         root.accept(&visitor as ASTVisitor*);
 
-        if (ctx.debug_mode) {
-            printf("[NameResolution] Resolved %lld symbols in %lld scopes, %lld map entries\n",
-                ctx.resolver.symbol_count(),
-                ctx.resolver.scope_count(),
-                ctx.resolver.resolution_map.count());
-        }
+        LOG_DEBUG(LogComponent::General, "[NameResolution] Resolved %lld symbols in %lld scopes, %lld map entries",
+            ctx.resolver.symbol_count(),
+            ctx.resolver.scope_count(),
+            ctx.resolver.resolution_map.count());
 
         return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::NamesResolved]);
     }
