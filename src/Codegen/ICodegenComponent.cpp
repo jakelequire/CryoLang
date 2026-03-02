@@ -50,20 +50,29 @@ namespace Cryo::Codegen
                 return fn;
             }
 
-            // Try context's function registry
+            // Try context's function registry — but validate the pointer belongs
+            // to our module.  Registry entries can become stale during multi-module
+            // compilation when functions are replaced or the module is re-verified.
             if (llvm::Function *fn = ctx().get_function(candidate))
             {
-                // Validate that the function is properly formed
-                if (fn->getName().empty())
+                if (fn->getParent() == module())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "resolve_function_by_name: Found '{}' in registry as '{}' but function has empty name, skipping",
-                              name, candidate);
-                    continue;
+                              "resolve_function_by_name: Found '{}' in registry as '{}'", name, candidate);
+                    return fn;
+                }
+                // Stale registry entry — try to re-resolve by the function's actual name
+                // in our module (the name in the registry may differ from the LLVM name)
+                if (llvm::Function *local_fn = module()->getFunction(fn->getName()))
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_function_by_name: Re-resolved stale '{}' -> '{}' in module",
+                              candidate, fn->getName().str());
+                    return local_fn;
                 }
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "resolve_function_by_name: Found '{}' in registry as '{}'", name, candidate);
-                return fn;
+                          "resolve_function_by_name: Registry entry '{}' has stale pointer (wrong module), skipping",
+                          candidate);
             }
         }
 

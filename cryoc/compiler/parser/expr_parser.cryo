@@ -1,0 +1,1375 @@
+///! ExprParser
+///!
+///! Expression and type annotation parsing layer.  Extends ParserBase with
+///! Pratt-style precedence-climbing for binary operators, prefix/postfix
+///! unary handling, and recursive type annotation parsing.
+
+namespace Compiler::Parser::ExprParser;
+
+import Compiler::Lex;
+import Compiler::Diag;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::CompilationContext;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Parser::ParserBase;
+
+
+// ============================================================================
+// ExprParser — Expression + Type Annotation Parsing
+// ============================================================================
+
+type class ExprParser : ParserBase {
+public:
+
+    ExprParser(tokens: Token[], source_file: string, ctx: CompilationContext*)
+        : ParserBase(tokens, source_file, ctx) {
+    }
+
+
+    // ================================================================
+    // Expression Parsing — Entry Points
+    // ================================================================
+
+    /// Top-level expression entry point.
+    parse_expression() -> ExpressionNode* {
+        return this.parse_assignment();
+    }
+
+    /// Parse assignment expression (right-associative).
+    /// assignment = conditional ( ( '=' | '+=' | ... ) assignment )?
+    parse_assignment() -> ExpressionNode* {
+        mut left: ExpressionNode* = this.parse_conditional();
+        if (left == null || this.panic_mode) { return left; }
+
+        if (is_assignment_op(this.current().kind)) {
+            const op: Token = this.advance();
+            const right: ExpressionNode* = this.parse_assignment();
+            if (right == null) {
+                this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                    "expected expression after assignment operator");
+                return left;
+            }
+            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
+            return new BinaryExprNode(op, left, right, span);
+        }
+
+        return left;
+    }
+
+    /// Parse ternary conditional (right-associative).
+    /// conditional = binary ( '?' expression ':' conditional )?
+    parse_conditional() -> ExpressionNode* {
+        mut expr: ExpressionNode* = this.parse_binary_expression(2);
+        if (expr == null || this.panic_mode) { return expr; }
+
+        if (this.check(TokenType::Question)) {
+            this.advance();
+            const true_expr: ExpressionNode* = this.parse_expression();
+            if (true_expr == null) {
+                this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                    "expected expression after '?'");
+                return expr;
+            }
+            this.consume(TokenType::Colon, "':'");
+            const false_expr: ExpressionNode* = this.parse_conditional();
+            if (false_expr == null) {
+                this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                    "expected expression after ':'");
+                return expr;
+            }
+            const span: SourceSpan = ParserBase::merge_spans(expr.span, false_expr.span);
+            return new TernaryExprNode(expr, true_expr, false_expr, span);
+        }
+
+        return expr;
+    }
+
+    /// Pratt-style precedence-climbing binary expression parser.
+    /// binary = cast ( binop binary )*
+    parse_binary_expression(min_prec: int) -> ExpressionNode* {
+        mut left: ExpressionNode* = this.parse_cast();
+        if (left == null || this.panic_mode) { return left; }
+
+        while (true) {
+            const prec: int = get_binary_precedence(this.current().kind);
+            if (prec < min_prec || prec == 0) {
+                break;
+            }
+
+            const op: Token = this.advance();
+            const right: ExpressionNode* = this.parse_binary_expression(prec + 1);
+            if (right == null) {
+                this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                    sprintf("expected expression after '%s'", op.lexeme));
+                return left;
+            }
+            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
+            left = new BinaryExprNode(op, left, right, span);
+        }
+
+        return left;
+    }
+
+    /// Parse cast expression: unary ( 'as' type )*
+    parse_cast() -> ExpressionNode* {
+        mut expr: ExpressionNode* = this.parse_unary();
+        if (expr == null || this.panic_mode) { return expr; }
+
+        while (this.check(TokenType::KwAs)) {
+            this.advance();
+            const target: TypeAnnotation* = this.parse_type_annotation();
+            if (target == null) {
+                this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                    "expected type after 'as'");
+                return expr;
+            }
+            const span: SourceSpan = ParserBase::merge_spans(expr.span, this.current_span());
+            expr = new CastExprNode(expr, target, span);
+        }
+
+        return expr;
+    }
+
+    /// Parse unary prefix expression.
+    /// unary = ( '-' | '!' | '*' | '&' | '~' | '++' | '--' ) unary | postfix
+    parse_unary() -> ExpressionNode* {
+        if (is_unary_prefix_op(this.current().kind)) {
+            const op: Token = this.advance();
+            const operand: ExpressionNode* = this.parse_unary();
+            if (operand == null) {
+                this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                    sprintf("expected expression after unary '%s'", op.lexeme));
+                return null;
+            }
+            const span: SourceSpan = ParserBase::merge_spans(
+                this.span_from_token(op), operand.span);
+            return new UnaryExprNode(op, operand, span);
+        }
+
+        return this.parse_primary_with_postfix();
+    }
+
+
+    // ================================================================
+    // Primary + Postfix
+    // ================================================================
+
+    /// Parse a primary expression and then handle any postfix operations.
+    parse_primary_with_postfix() -> ExpressionNode* {
+        mut expr: ExpressionNode* = this.parse_primary();
+        if (expr == null || this.panic_mode) { return expr; }
+        return this.parse_postfix(expr);
+    }
+
+    /// Parse postfix operations: call, index, member access, ++/--.
+    parse_postfix(expr: ExpressionNode*) -> ExpressionNode* {
+        while (true) {
+            if (this.panic_mode || this.is_at_end()) { break; }
+
+            if (this.check(TokenType::LParen)) {
+                // Function call
+                expr = this.parse_call_args(expr);
+            } else if (this.check(TokenType::LSquare)) {
+                // Array access
+                expr = this.parse_array_access_expr(expr);
+            } else if (this.check(TokenType::Period)) {
+                // Member access
+                expr = this.parse_member_access_expr(expr);
+            } else if (this.check(TokenType::Arrow)) {
+                // Pointer member access (treat like member access)
+                this.advance();
+                const member_tok: Token       = this.consume(TokenType::Identifier, "member name");
+                const member: SymbolStr       = this.intern_lexeme(member_tok);
+                const member_span: SourceSpan = this.span_from_token(member_tok);
+                const span: SourceSpan        = ParserBase::merge_spans(expr.span, member_span);
+
+                // First dereference, then member access
+                const deref_op: Token        = Token::new(TokenType::Star, "*", member_tok.line, member_tok.column);
+                const deref: ExpressionNode* = new UnaryExprNode(deref_op, expr, expr.span);
+
+                expr = new MemberAccessNode(deref, member, member_span, span);
+            } else if (this.check(TokenType::ColonColon)) {
+                // Scope resolution
+                this.advance();
+
+                const member_tok: Token      = this.consume(TokenType::Identifier, "member name after '::'");
+                const scope_name: SymbolStr  = this.get_expr_name(expr);
+                const member_name: SymbolStr = this.intern_lexeme(member_tok);
+                const span: SourceSpan       = ParserBase::merge_spans(expr.span, this.span_from_token(member_tok));
+                mut sr: ScopeResolutionNode* = new ScopeResolutionNode(scope_name, member_name, span);
+
+                // Check for generic args on the scope-resolved member
+                if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+                    const gen_args: SymbolStr[] = this.parse_generic_args();
+                    sr.set_generic_args(gen_args);
+                }
+
+                expr = sr;
+            } else if (this.check(TokenType::PlusPlus) || this.check(TokenType::MinusMinus)) {
+                // Postfix increment/decrement
+                const op: Token        = this.advance();
+                const span: SourceSpan = ParserBase::merge_spans(expr.span, this.span_from_token(op));
+                
+                expr = new UnaryExprNode(op, expr, span);
+            } else {
+                break;
+            }
+        }
+        return expr;
+    }
+
+
+    // ================================================================
+    // Primary Expressions
+    // ================================================================
+
+    /// Parse a primary expression (literals, identifiers, grouping, etc.).
+    parse_primary() -> ExpressionNode* {
+        if (this.panic_mode || this.is_at_end()) { return null; }
+
+        const tok: Token = this.current();
+
+        // Numeric literal
+        if (tok.kind == TokenType::NumericConstant) {
+            return this.parse_number_literal();
+        }
+
+        // String literal
+        if (tok.kind == TokenType::StringLiteral || tok.kind == TokenType::RawStringLiteral) {
+            return this.parse_string_literal();
+        }
+
+        // Char literal
+        if (tok.kind == TokenType::CharConstant) {
+            return this.parse_char_literal();
+        }
+
+        // Boolean literal
+        if (tok.kind == TokenType::KwTrue || tok.kind == TokenType::KwFalse) {
+            const btok: Token = this.advance();
+            const value: string = btok.lexeme;
+            return new LiteralNode(value, LiteralKind::Boolean, this.span_from_token(btok));
+        }
+
+        // Null literal
+        if (tok.kind == TokenType::KwNull) {
+            const ntok: Token = this.advance();
+            return new LiteralNode("null", LiteralKind::Null, this.span_from_token(ntok));
+        }
+
+        // 'this' keyword
+        if (tok.kind == TokenType::KwThis) {
+            const ttok: Token = this.advance();
+            const name: SymbolStr = this.intern_lexeme(ttok);
+            return new IdentifierNode(name, this.span_from_token(ttok));
+        }
+
+        // If expression
+        if (tok.kind == TokenType::KwIf) {
+            return this.parse_if_expression();
+        }
+
+        // Match expression
+        if (tok.kind == TokenType::KwMatch) {
+            return this.parse_match_expression();
+        }
+
+        // New expression
+        if (tok.kind == TokenType::KwNew) {
+            return this.parse_new_expression();
+        }
+
+        // Sizeof expression
+        if (tok.kind == TokenType::KwSizeof) {
+            return this.parse_sizeof_expression();
+        }
+
+        // Alignof expression
+        if (tok.kind == TokenType::KwAlignof) {
+            return this.parse_alignof_expression();
+        }
+
+        // Array literal
+        if (tok.kind == TokenType::LSquare) {
+            return this.parse_array_literal();
+        }
+
+        // Parenthesized expression, tuple, or lambda
+        if (tok.kind == TokenType::LParen) {
+            return this.parse_paren_expr_or_lambda();
+        }
+
+        // Identifier (including scope resolution, generic calls, struct literals)
+        if (tok.kind == TokenType::Identifier) {
+            return this.parse_identifier_or_call();
+        }
+
+        // Primitive type used as identifier (e.g., i32::max_value())
+        if (this.is_primitive_type_token()) {
+            const ptok: Token = this.advance();
+            const name: SymbolStr = this.intern_lexeme(ptok);
+            return new IdentifierNode(name, this.span_from_token(ptok));
+        }
+
+        // Any remaining keyword used as identifier (for built-in function names, etc.)
+        if (tok.kind.is_keyword()) {
+            const ktok: Token = this.advance();
+            const name: SymbolStr = this.intern_lexeme(ktok);
+            return new IdentifierNode(name, this.span_from_token(ktok));
+        }
+
+        this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+            sprintf("expected expression, found '%s'", tok.lexeme));
+        return null;
+    }
+
+
+    // ================================================================
+    // Primary Helpers
+    // ================================================================
+
+    /// Parse a numeric literal.
+    parse_number_literal() -> ExpressionNode* {
+        const tok: Token = this.advance();
+        // Determine if float or integer by checking for '.' or 'e'/'E'
+        mut kind: LiteralKind = LiteralKind::Integer;
+        for (mut i: int = 0; i < tok.lexeme.length; i++) {
+            const c: char = tok.lexeme[i];
+            if (c == '.' || c == 'e' || c == 'E') {
+                kind = LiteralKind::Float;
+                break;
+            }
+        }
+        return new LiteralNode(tok.lexeme, kind, this.span_from_token(tok));
+    }
+
+    /// Parse a string literal.
+    parse_string_literal() -> ExpressionNode* {
+        const tok: Token = this.advance();
+        return new LiteralNode(tok.lexeme, LiteralKind::String, this.span_from_token(tok));
+    }
+
+    /// Parse a character literal.
+    parse_char_literal() -> ExpressionNode* {
+        const tok: Token = this.advance();
+        return new LiteralNode(tok.lexeme, LiteralKind::Char, this.span_from_token(tok));
+    }
+
+    /// Parse an identifier, handling scope resolution, generic calls, and struct literals.
+    parse_identifier_or_call() -> ExpressionNode* {
+        const tok: Token = this.advance();
+        const name: SymbolStr = this.intern_lexeme(tok);
+        mut expr: ExpressionNode* = new IdentifierNode(name, this.span_from_token(tok));
+
+        // Check for generic args: Name<T, U>
+        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+            const gen_args: SymbolStr[] = this.parse_generic_args();
+
+            // After generic args, check what follows
+            if (this.check(TokenType::LParen)) {
+                // Generic function call: func<T>(args)
+                // Check if uppercase first char → struct constructor
+                if (tok.lexeme.length > 0 && tok.lexeme[0] >= 'A' && tok.lexeme[0] <= 'Z') {
+                    // Could be struct constructor or function call — check for '{'
+                    // For now treat all Name<T>(...) as call
+                }
+                mut call: CallExprNode* = new CallExprNode(expr, expr.span);
+                call.set_generic_args(gen_args);
+                this.advance(); // consume '('
+                if (!this.check(TokenType::RParen)) {
+                    while (true) {
+                        const arg: ExpressionNode* = this.parse_expression();
+                        if (arg != null) {
+                            call.add_argument(arg);
+                        }
+                        if (!this.match_tok(TokenType::Comma)) {
+                            break;
+                        }
+                    }
+                }
+                this.consume(TokenType::RParen, "')'");
+                call.span = this.span_from(tok);
+                return call;
+            } else if (this.check(TokenType::LBrace)) {
+                // Generic struct literal: Name<T> { field: value }
+                return this.parse_struct_literal_body(name, gen_args, tok);
+            } else if (this.check(TokenType::ColonColon)) {
+                // Generic scope resolution: Name<T>::member
+                // Leave for postfix to handle
+                mut sr_node: ScopeResolutionNode* = null;
+                // Store generic args on the identifier node via cast
+                // Actually, create a CallExprNode shell with generic args
+                mut call: CallExprNode* = new CallExprNode(expr, expr.span);
+                call.set_generic_args(gen_args);
+                return call;
+            }
+            // Generic args parsed but nothing useful follows — just continue with postfix
+        }
+
+        // Check for struct literal: Name { field: value }
+        // Only if uppercase first character (type name convention)
+        if (this.check(TokenType::LBrace) && tok.lexeme.length > 0 &&
+            tok.lexeme[0] >= 'A' && tok.lexeme[0] <= 'Z') {
+            // But NOT if we're at the start of a block statement context
+            // Use a simple heuristic: if the next token after '{' is 'ident:' → struct literal
+            if (this.is_struct_literal_ahead()) {
+                const empty_args: SymbolStr[] = [];
+                return this.parse_struct_literal_body(name, empty_args, tok);
+            }
+        }
+
+        return expr;
+    }
+
+    /// Check if what follows '{' looks like a struct literal (field: value pattern).
+    is_struct_literal_ahead() -> boolean {
+        // Look for pattern: { identifier : expr
+        if (!this.check(TokenType::LBrace)) { return false; }
+        const tok1: Token = this.peek_at(1);
+        const tok2: Token = this.peek_at(2);
+        if (tok1.kind == TokenType::Identifier && tok2.kind == TokenType::Colon) {
+            return true;
+        }
+        // Empty struct literal: {}
+        if (tok1.kind == TokenType::RBrace) {
+            return true;
+        }
+        return false;
+    }
+
+    /// Parse the body of a struct literal after the name and optional generic args.
+    parse_struct_literal_body(name: SymbolStr, gen_args: SymbolStr[], start: Token) -> ExpressionNode* {
+        mut lit: StructLiteralNode* = new StructLiteralNode(name, this.span_from_token(start));
+        if (gen_args.length > 0) {
+            lit.set_generic_args(gen_args);
+        }
+
+        this.consume(TokenType::LBrace, "'{'");
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            const field_tok: Token = this.consume(TokenType::Identifier, "field name");
+            const field_name: SymbolStr = this.intern_lexeme(field_tok);
+            this.consume(TokenType::Colon, "':'");
+            const value: ExpressionNode* = this.parse_expression();
+
+            const field_span: SourceSpan = this.span_from(field_tok);
+            const init: FieldInit = FieldInit {
+                field_name: field_name,
+                value:      value as void*,
+                span:       field_span,
+            };
+            lit.add_field_init(init);
+
+            if (!this.match_tok(TokenType::Comma)) {
+                break;
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        lit.span = this.span_from(start);
+        return lit;
+    }
+
+    /// Parse parenthesized expression, tuple literal, or lambda.
+    parse_paren_expr_or_lambda() -> ExpressionNode* {
+        const start: Token = this.advance(); // consume '('
+
+        // Empty parens: () -> could be void or lambda params
+        if (this.check(TokenType::RParen)) {
+            this.advance();
+            if (this.check(TokenType::Arrow)) {
+                // Lambda with no parameters: () -> body
+                return this.parse_lambda_after_params([], start);
+            }
+            // Void literal / unit value — create null literal
+            return new LiteralNode("void", LiteralKind::Null, this.span_from(start));
+        }
+
+        // Check for lambda: (name: Type, ...) -> body
+        // Lambda pattern: identifier ':' means parameter declaration
+        if (this.check(TokenType::Identifier) && this.peek_at(1).kind == TokenType::Colon) {
+            return this.parse_lambda_expression(start);
+        }
+
+        // Parse as expression (possibly tuple)
+        const first: ExpressionNode* = this.parse_expression();
+        if (first == null) {
+            this.consume(TokenType::RParen, "')'");
+            return null;
+        }
+
+        // Check for tuple: (expr, expr, ...)
+        if (this.check(TokenType::Comma)) {
+            mut tup: TupleLiteralNode* = new TupleLiteralNode(this.span_from_token(start));
+            tup.add_element(first);
+            while (this.match_tok(TokenType::Comma)) {
+                if (this.check(TokenType::RParen)) { break; }
+                const elem: ExpressionNode* = this.parse_expression();
+                if (elem != null) {
+                    tup.add_element(elem);
+                }
+            }
+            this.consume(TokenType::RParen, "')'");
+            tup.span = this.span_from(start);
+            return tup;
+        }
+
+        // Parenthesized expression
+        this.consume(TokenType::RParen, "')'");
+        return first;
+    }
+
+    /// Parse a lambda starting from the parameter list (after '(' was consumed).
+    parse_lambda_expression(start: Token) -> ExpressionNode* {
+        // Parse parameter list
+        mut params: VarDeclNode*[] = [];
+        while (!this.check(TokenType::RParen) && !this.is_at_end()) {
+            const name_tok: Token = this.consume(TokenType::Identifier, "parameter name");
+            const pname: SymbolStr = this.intern_lexeme(name_tok);
+            mut param: VarDeclNode* = new VarDeclNode(pname, this.span_from_token(name_tok));
+
+            if (this.match_tok(TokenType::Colon)) {
+                const ptype: TypeAnnotation* = this.parse_type_annotation();
+                param.set_type_annotation(ptype);
+            }
+
+            params.push(param);
+            if (!this.match_tok(TokenType::Comma)) {
+                break;
+            }
+        }
+        this.consume(TokenType::RParen, "')'");
+
+        return this.parse_lambda_after_params(params, start);
+    }
+
+    /// Parse the rest of a lambda after its parameter list has been parsed.
+    parse_lambda_after_params(params: VarDeclNode*[], start: Token) -> ExpressionNode* {
+        this.consume(TokenType::Arrow, "'->'");
+
+        mut lambda: LambdaExprNode* = new LambdaExprNode(this.span_from_token(start));
+        for (mut i: int = 0; i < params.length; i++) {
+            lambda.add_parameter(params[i]);
+        }
+
+        // Body can be a block or a single expression
+        if (this.check(TokenType::LBrace)) {
+            // Parsed as a block statement later — need forward reference
+            // For now just parse an expression
+            const body_expr: ExpressionNode* = this.parse_expression();
+            if (body_expr != null) {
+                const expr_stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
+                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
+                block.add_statement(expr_stmt);
+                lambda.set_body(block);
+            }
+        } else {
+            const body_expr: ExpressionNode* = this.parse_expression();
+            if (body_expr != null) {
+                const expr_stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
+                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
+                block.add_statement(expr_stmt);
+                lambda.set_body(block);
+            }
+        }
+
+        lambda.span = this.span_from(start);
+        return lambda;
+    }
+
+    /// Parse an array literal: [ expr, expr, ... ]
+    parse_array_literal() -> ExpressionNode* {
+        const start: Token = this.advance(); // consume '['
+        mut arr: ArrayLiteralNode* = new ArrayLiteralNode(this.span_from_token(start));
+
+        if (!this.check(TokenType::RSquare)) {
+            // Parse first element
+            const first: ExpressionNode* = this.parse_expression();
+            if (first != null) {
+                arr.add_element(first);
+
+                // Check for repeat syntax: [value; count]
+                if (this.check(TokenType::Semicolon)) {
+                    this.advance();
+                    const count_expr: ExpressionNode* = this.parse_expression();
+                    if (count_expr != null) {
+                        arr.set_repeat_count_expr(count_expr);
+                    }
+                } else {
+                    // Regular array: [a, b, c]
+                    while (this.match_tok(TokenType::Comma)) {
+                        if (this.check(TokenType::RSquare)) { break; }
+                        const elem: ExpressionNode* = this.parse_expression();
+                        if (elem != null) {
+                            arr.add_element(elem);
+                        }
+                    }
+                }
+            }
+        }
+
+        this.consume(TokenType::RSquare, "']'");
+        arr.span = this.span_from(start);
+        return arr;
+    }
+
+    /// Parse a new expression: new Type(args) or new Type[size]
+    parse_new_expression() -> ExpressionNode* {
+        const start: Token = this.advance(); // consume 'new'
+        const type_tok: Token = this.consume(TokenType::Identifier, "type name");
+        const type_name: SymbolStr = this.intern_lexeme(type_tok);
+        mut node: NewExprNode* = new NewExprNode(type_name, this.span_from_token(start));
+
+        // Optional generic args
+        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+            const gen_args: SymbolStr[] = this.parse_generic_args();
+            node.set_generic_args(gen_args);
+        }
+
+        if (this.check(TokenType::LParen)) {
+            // Constructor call: new Type(args)
+            this.advance();
+            if (!this.check(TokenType::RParen)) {
+                while (true) {
+                    const arg: ExpressionNode* = this.parse_expression();
+                    if (arg != null) {
+                        node.add_argument(arg);
+                    }
+                    if (!this.match_tok(TokenType::Comma)) {
+                        break;
+                    }
+                }
+            }
+            this.consume(TokenType::RParen, "')'");
+        } else if (this.check(TokenType::LSquare)) {
+            // Array allocation: new Type[size]
+            this.advance();
+            const size_expr: ExpressionNode* = this.parse_expression();
+            if (size_expr != null) {
+                node.set_array_size(size_expr);
+            }
+            this.consume(TokenType::RSquare, "']'");
+        }
+
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse sizeof(Type)
+    parse_sizeof_expression() -> ExpressionNode* {
+        const start: Token = this.advance(); // consume 'sizeof'
+        this.consume(TokenType::LParen, "'('");
+        const type_tok: Token = this.current();
+        const type_name: SymbolStr = this.intern_lexeme(type_tok);
+        const type_span: SourceSpan = this.span_from_token(type_tok);
+        this.advance();
+
+        // Handle qualified names: sizeof(Foo::Bar)
+        while (this.check(TokenType::ColonColon)) {
+            this.advance();
+            this.advance();  // consume member name
+        }
+
+        this.consume(TokenType::RParen, "')'");
+        return new SizeofExprNode(type_name, type_span, this.span_from(start));
+    }
+
+    /// Parse alignof(Type)
+    parse_alignof_expression() -> ExpressionNode* {
+        const start: Token = this.advance(); // consume 'alignof'
+        this.consume(TokenType::LParen, "'('");
+        const type_tok: Token = this.current();
+        const type_name: SymbolStr = this.intern_lexeme(type_tok);
+        const type_span: SourceSpan = this.span_from_token(type_tok);
+        this.advance();
+        this.consume(TokenType::RParen, "')'");
+        return new AlignofExprNode(type_name, type_span, this.span_from(start));
+    }
+
+    /// Parse if expression: if (cond) { then } else { else }
+    parse_if_expression() -> ExpressionNode* {
+        const start: Token = this.advance(); // consume 'if'
+        this.consume(TokenType::LParen, "'('");
+        const condition: ExpressionNode* = this.parse_expression();
+        this.consume(TokenType::RParen, "')'");
+
+        // Then branch — expect a block with a single expression
+        this.consume(TokenType::LBrace, "'{'");
+        const then_expr: ExpressionNode* = this.parse_expression();
+        this.consume(TokenType::RBrace, "'}'");
+
+        // Else branch
+        mut else_expr: ExpressionNode* = null;
+        if (this.match_tok(TokenType::KwElse)) {
+            this.consume(TokenType::LBrace, "'{'");
+            else_expr = this.parse_expression();
+            this.consume(TokenType::RBrace, "'}'");
+        }
+
+        const span: SourceSpan = this.span_from(start);
+        return new IfExprNode(condition, then_expr, else_expr, span);
+    }
+
+    /// Parse match expression: match (subject) { arms }
+    parse_match_expression() -> ExpressionNode* {
+        const start: Token = this.advance(); // consume 'match'
+        this.consume(TokenType::LParen, "'('");
+        const subject: ExpressionNode* = this.parse_expression();
+        this.consume(TokenType::RParen, "')'");
+        this.consume(TokenType::LBrace, "'{'");
+
+        mut match_expr: MatchExprNode* = new MatchExprNode(subject, this.span_from_token(start));
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            const arm: MatchArmNode* = this.parse_match_arm_internal();
+            if (arm != null) {
+                match_expr.add_arm(arm);
+            }
+            if (this.panic_mode) {
+                this.synchronize();
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        match_expr.span = this.span_from(start);
+        return match_expr;
+    }
+
+    /// Parse a single match arm: pattern => { body }
+    parse_match_arm_internal() -> MatchArmNode* {
+        const start: Token = this.current();
+        mut arm: MatchArmNode* = new MatchArmNode(this.span_from_token(start));
+
+        // Parse pattern(s) separated by |
+        while (true) {
+            const pat: PatternNode* = this.parse_pattern_internal();
+            if (pat != null) {
+                arm.add_pattern(pat);
+            }
+            if (!this.match_tok(TokenType::Pipe)) {
+                break;
+            }
+        }
+
+        // Expect => { body }
+        this.consume(TokenType::FatArrow, "'=>'");
+
+        // Body is either a block or a single expression wrapped in an expression statement
+        if (this.check(TokenType::LBrace)) {
+            const bstart: Token = this.advance();
+            mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(bstart));
+
+            // Parse body as expression(s) — match arm bodies are expressions
+            const body_expr: ExpressionNode* = this.parse_expression();
+            if (body_expr != null) {
+                const stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
+                block.add_statement(stmt);
+            }
+
+            // Allow optional semicolons inside
+            this.match_tok(TokenType::Semicolon);
+
+            this.consume(TokenType::RBrace, "'}'");
+            block.span = this.span_from(bstart);
+            arm.set_body(block);
+        } else {
+            const body_expr: ExpressionNode* = this.parse_expression();
+            if (body_expr != null) {
+                const stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
+                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
+                block.add_statement(stmt);
+                arm.set_body(block);
+            }
+        }
+
+        arm.span = this.span_from(start);
+        return arm;
+    }
+
+    /// Parse a pattern (internal, used by match expressions and statements).
+    parse_pattern_internal() -> PatternNode* {
+        const start: Token = this.current();
+
+        // Wildcard: _
+        if (this.check(TokenType::Identifier) && this.current().lexeme == "_") {
+            this.advance();
+            return new PatternNode(PatternKind::Wildcard, this.span_from(start));
+        }
+
+        // Enum pattern: EnumName::Variant or EnumName::Variant(bindings)
+        if (this.check(TokenType::Identifier) && this.peek_at(1).kind == TokenType::ColonColon) {
+            return this.parse_enum_pattern_internal();
+        }
+
+        // Literal pattern (number, string, bool)
+        if (this.current().kind == TokenType::NumericConstant ||
+            this.current().kind == TokenType::StringLiteral ||
+            this.current().kind == TokenType::KwTrue ||
+            this.current().kind == TokenType::KwFalse) {
+            const lit_tok: Token = this.advance();
+            mut pat: PatternNode* = new PatternNode(PatternKind::Literal, this.span_from(start));
+            pat.set_value(this.intern_lexeme(lit_tok));
+            return pat;
+        }
+
+        // Negative number literal: -123
+        if (this.check(TokenType::Minus) && this.peek_at(1).kind == TokenType::NumericConstant) {
+            this.advance(); // consume '-'
+            const lit_tok: Token = this.advance();
+            const neg_value: string = "-" + lit_tok.lexeme;
+            mut pat: PatternNode* = new PatternNode(PatternKind::Literal, this.span_from(start));
+            pat.set_value(this.ctx.intern(neg_value));
+            return pat;
+        }
+
+        // Identifier pattern (binding)
+        if (this.check(TokenType::Identifier)) {
+            const id_tok: Token = this.advance();
+            mut pat: PatternNode* = new PatternNode(PatternKind::Identifier, this.span_from(start));
+            pat.set_binding_name(this.intern_lexeme(id_tok));
+            return pat;
+        }
+
+        this.report_error(ErrorCode::E0113_INVALID_PATTERN,
+            sprintf("expected pattern, found '%s'", this.current().lexeme));
+        return null;
+    }
+
+    /// Parse an enum pattern: EnumName::Variant or EnumName::Variant(bindings)
+    parse_enum_pattern_internal() -> PatternNode* {
+        const start: Token = this.current();
+        const enum_tok: Token = this.advance(); // enum name
+        this.consume(TokenType::ColonColon, "'::'");
+        const variant_tok: Token = this.consume(TokenType::Identifier, "variant name");
+
+        mut pat: EnumPatternNode* = new EnumPatternNode(this.span_from_token(start));
+        pat.set_enum_name(this.intern_lexeme(enum_tok));
+        pat.set_variant_name(this.intern_lexeme(variant_tok));
+
+        // Optional destructuring: Variant(a, b, _)
+        if (this.check(TokenType::LParen)) {
+            this.advance();
+            while (!this.check(TokenType::RParen) && !this.is_at_end()) {
+                if (this.current().lexeme == "_") {
+                    const ws: SourceSpan = this.current_span();
+                    this.advance();
+                    const wc: PatternWildcard* = new PatternWildcard { span: ws };
+                    pat.add_element(PatternElement::Wildcard(wc));
+                } else if (this.check(TokenType::Identifier)) {
+                    const bind_tok: Token = this.advance();
+                    const bs: SourceSpan = this.span_from_token(bind_tok);
+                    const bn: SymbolStr = this.intern_lexeme(bind_tok);
+                    const pb: PatternBinding* = new PatternBinding { name: bn, span: bs };
+                    pat.add_element(PatternElement::Binding(pb));
+                } else if (this.check(TokenType::NumericConstant)) {
+                    const num_tok: Token = this.advance();
+                    const ns: SourceSpan = this.span_from_token(num_tok);
+                    // Check for integer vs float
+                    mut is_float: boolean = false;
+                    for (mut i: int = 0; i < num_tok.lexeme.length; i++) {
+                        if (num_tok.lexeme[i] == '.' || num_tok.lexeme[i] == 'e') {
+                            is_float = true;
+                            break;
+                        }
+                    }
+                    if (is_float) {
+                        const pf: PatternLiteralFloat* = new PatternLiteralFloat { value: 0.0, span: ns };
+                        pat.add_element(PatternElement::LiteralFloat(pf));
+                    } else {
+                        const pi: PatternLiteralInt* = new PatternLiteralInt { value: 0, span: ns };
+                        pat.add_element(PatternElement::LiteralInt(pi));
+                    }
+                } else {
+                    this.report_error(ErrorCode::E0113_INVALID_PATTERN,
+                        "expected binding, wildcard, or literal in enum pattern");
+                    break;
+                }
+
+                if (!this.match_tok(TokenType::Comma)) {
+                    break;
+                }
+            }
+            this.consume(TokenType::RParen, "')'");
+        }
+
+        pat.span = this.span_from(start);
+        return pat;
+    }
+
+
+    // ================================================================
+    // Postfix Helpers
+    // ================================================================
+
+    /// Parse function call arguments: callee(arg1, arg2, ...)
+    parse_call_args(callee: ExpressionNode*) -> CallExprNode* {
+        this.advance(); // consume '('
+        mut call: CallExprNode* = new CallExprNode(callee, callee.span);
+
+        if (!this.check(TokenType::RParen)) {
+            while (true) {
+                const arg: ExpressionNode* = this.parse_expression();
+                if (arg != null) {
+                    call.add_argument(arg);
+                }
+                if (!this.match_tok(TokenType::Comma)) {
+                    break;
+                }
+            }
+        }
+
+        const end: Token = this.consume(TokenType::RParen, "')'");
+        call.span = ParserBase::merge_spans(callee.span, this.span_from_token(end));
+        return call;
+    }
+
+    /// Parse array access: array[index]
+    parse_array_access_expr(array: ExpressionNode*) -> ArrayAccessNode* {
+        this.advance(); // consume '['
+        const index: ExpressionNode* = this.parse_expression();
+        const end: Token = this.consume(TokenType::RSquare, "']'");
+        const span: SourceSpan = ParserBase::merge_spans(array.span, this.span_from_token(end));
+        return new ArrayAccessNode(array, index, span);
+    }
+
+    /// Parse member access: object.member
+    parse_member_access_expr(object: ExpressionNode*) -> MemberAccessNode* {
+        this.advance(); // consume '.'
+        const member_tok: Token = this.consume(TokenType::Identifier, "member name");
+        const member: SymbolStr = this.intern_lexeme(member_tok);
+        const member_span: SourceSpan = this.span_from_token(member_tok);
+        const span: SourceSpan = ParserBase::merge_spans(object.span, member_span);
+        return new MemberAccessNode(object, member, member_span, span);
+    }
+
+
+    // ================================================================
+    // Generic Disambiguation
+    // ================================================================
+
+    /// Scan forward to determine if `<` begins generic type arguments.
+    /// Returns true if we find a matching `>` followed by `(`, `{`, or `::`.
+    is_generic_call_ahead() -> boolean {
+        mut angle_depth: int = 1;
+        mut offset: int = 1;
+        const max_lookahead: int = 50;
+
+        while (offset < max_lookahead) {
+            const tok: Token = this.peek_at(offset);
+
+            // EOF — not a generic
+            if (tok.kind == TokenType::EOF) { return false; }
+
+            if (tok.kind == TokenType::LAngle) {
+                angle_depth = angle_depth + 1;
+            } else if (tok.kind == TokenType::RAngle) {
+                angle_depth = angle_depth - 1;
+                if (angle_depth == 0) {
+                    // Check what follows the closing >
+                    const next: Token = this.peek_at(offset + 1);
+                    if (next.kind == TokenType::LParen ||
+                        next.kind == TokenType::LBrace ||
+                        next.kind == TokenType::ColonColon) {
+                        return true;
+                    }
+                    // Also allow > followed by > (nested generic closing)
+                    if (next.kind == TokenType::RAngle) {
+                        return true;
+                    }
+                    // Also allow > at end of type annotation context (e.g., in parameter lists)
+                    if (next.kind == TokenType::Comma ||
+                        next.kind == TokenType::RParen ||
+                        next.kind == TokenType::Semicolon ||
+                        next.kind == TokenType::Equal) {
+                        return true;
+                    }
+                    return false;
+                }
+            } else if (tok.kind == TokenType::GreaterGreater) {
+                // >> could be two > tokens for nested generics
+                angle_depth = angle_depth - 2;
+                if (angle_depth <= 0) {
+                    return true;
+                }
+            }
+
+            // Tokens that cannot appear in type arguments → not generic
+            if (tok.kind == TokenType::Semicolon ||
+                tok.kind == TokenType::LBrace ||
+                tok.kind == TokenType::RBrace ||
+                tok.kind == TokenType::KwIf ||
+                tok.kind == TokenType::KwWhile ||
+                tok.kind == TokenType::KwFor ||
+                tok.kind == TokenType::KwReturn) {
+                return false;
+            }
+
+            offset = offset + 1;
+        }
+
+        return false;
+    }
+
+    /// Parse generic type arguments: <T1, T2, ...>
+    parse_generic_args() -> SymbolStr[] {
+        mut args: SymbolStr[] = [];
+        this.advance(); // consume '<'
+
+        while (!this.check(TokenType::RAngle) &&
+               !this.check(TokenType::GreaterGreater) &&
+               !this.is_at_end()) {
+            // Each arg is a type name (possibly qualified)
+            const arg_tok: Token = this.current();
+            mut arg_name: string = "";
+
+            if (this.check(TokenType::Identifier) || this.is_primitive_type_token()) {
+                arg_name = this.current().lexeme;
+                this.advance();
+
+                // Handle qualified type names: A::B
+                while (this.check(TokenType::ColonColon)) {
+                    this.advance();
+                    arg_name = arg_name + "::" + this.current().lexeme;
+                    this.advance();
+                }
+
+                // Handle nested generics: A<B>
+                if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+                    // Consume nested generic args for the name but flatten
+                    arg_name = arg_name + "<";
+                    const nested: SymbolStr[] = this.parse_generic_args();
+                    for (mut i: int = 0; i < nested.length; i++) {
+                        if (i > 0) { arg_name = arg_name + ", "; }
+                        arg_name = arg_name + this.ctx.resolve_str(nested[i]);
+                    }
+                    arg_name = arg_name + ">";
+                }
+
+                // Handle pointer suffix: T*
+                while (this.check(TokenType::Star)) {
+                    arg_name = arg_name + "*";
+                    this.advance();
+                }
+
+                // Handle array suffix: T[]
+                while (this.check(TokenType::LSquare) && this.peek_at(1).kind == TokenType::RSquare) {
+                    arg_name = arg_name + "[]";
+                    this.advance();
+                    this.advance();
+                }
+
+            } else {
+                // Unknown token in generic args
+                this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                    sprintf("expected type name in generic arguments, found '%s'", this.current().lexeme));
+                break;
+            }
+
+            args.push(this.ctx.intern(arg_name));
+
+            if (!this.match_tok(TokenType::Comma)) {
+                break;
+            }
+        }
+
+        this.consume_right_angle();
+        return args;
+    }
+
+
+    // ================================================================
+    // Type Annotation Parsing
+    // ================================================================
+
+    /// Parse a full type annotation.
+    parse_type_annotation() -> TypeAnnotation* {
+        // Reference types: &T or &mut T
+        if (this.check(TokenType::Amp)) {
+            return this.parse_reference_type();
+        }
+
+        // Function or tuple types: (T, U) -> R
+        if (this.check(TokenType::LParen)) {
+            return this.parse_function_or_tuple_type();
+        }
+
+        // Base type + optional suffixes
+        const base: TypeAnnotation* = this.parse_base_type();
+        if (base == null) { return null; }
+        return this.parse_type_suffixes(base);
+    }
+
+    /// Parse a base type (primitive or named).
+    parse_base_type() -> TypeAnnotation* {
+        const tok: Token = this.current();
+
+        // Void
+        if (tok.kind == TokenType::KwVoid) {
+            this.advance();
+            const name: SymbolStr = this.ctx.intern("void");
+            const ann: PrimitiveAnnotation* = new PrimitiveAnnotation {
+                name: name,
+                span: this.span_from_token(tok),
+            };
+            return new TypeAnnotation::Primitive(ann);
+        }
+
+        // Primitive types
+        if (this.is_primitive_type_token()) {
+            this.advance();
+            const name: SymbolStr = this.ctx.intern(tok.lexeme);
+            const ann: PrimitiveAnnotation* = new PrimitiveAnnotation {
+                name: name,
+                span: this.span_from_token(tok),
+            };
+            return new TypeAnnotation::Primitive(ann);
+        }
+
+        // Named type (user-defined)
+        if (tok.kind == TokenType::Identifier) {
+            this.advance();
+            mut full_name: string = tok.lexeme;
+
+            // Handle qualified names: A::B::C
+            while (this.check(TokenType::ColonColon)) {
+                this.advance();
+                const next: Token = this.current();
+                full_name = full_name + "::" + next.lexeme;
+                this.advance();
+            }
+
+            const name: SymbolStr = this.ctx.intern(full_name);
+
+            // Check for generic parameters: Type<A, B>
+            if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+                const base_ann: TypeAnnotation* = new TypeAnnotation::Named(
+                    new NamedAnnotation {
+                        name: name,
+                        span: this.span_from_token(tok),
+                    }
+                );
+
+                mut type_args: TypeAnnotation*[] = [];
+                this.advance(); // consume '<'
+                while (!this.check(TokenType::RAngle) &&
+                       !this.check(TokenType::GreaterGreater) &&
+                       !this.is_at_end()) {
+                    const arg: TypeAnnotation* = this.parse_type_annotation();
+                    if (arg != null) {
+                        type_args.push(arg);
+                    }
+                    if (!this.match_tok(TokenType::Comma)) {
+                        break;
+                    }
+                }
+                this.consume_right_angle();
+
+                const gen_ann: GenericAnnotation* = new GenericAnnotation {
+                    base: base_ann,
+                    args: type_args,
+                    span: this.span_from(tok),
+                };
+                return new TypeAnnotation::Generic(gen_ann);
+            }
+
+            const named_ann: NamedAnnotation* = new NamedAnnotation {
+                name: name,
+                span: this.span_from_token(tok),
+            };
+            return new TypeAnnotation::Named(named_ann);
+        }
+
+        this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+            sprintf("expected type, found '%s'", tok.lexeme));
+        return null;
+    }
+
+    /// Parse type suffixes: *, [], [N], ?
+    parse_type_suffixes(base: TypeAnnotation*) -> TypeAnnotation* {
+        mut result: TypeAnnotation* = base;
+
+        while (true) {
+            // Pointer suffix: T*
+            if (this.check(TokenType::Star)) {
+                this.advance();
+                const ptr_ann: PointerAnnotation* = new PointerAnnotation {
+                    inner: result,
+                    span:  this.current_span(),
+                };
+                result = new TypeAnnotation::Pointer(ptr_ann);
+            }
+            // Array suffix: T[] or T[N]
+            else if (this.check(TokenType::LSquare)) {
+                this.advance();
+                if (this.check(TokenType::RSquare)) {
+                    // Dynamic array: T[]
+                    this.advance();
+                    const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
+                        element: result,
+                        size:    -1,
+                        span:    this.current_span(),
+                    };
+                    result = new TypeAnnotation::Array(arr_ann);
+                } else {
+                    // Fixed-size array: T[N]
+                    // Parse the size as a numeric constant
+                    const size_tok: Token = this.current();
+                    mut size: i64 = 0;
+                    if (size_tok.kind == TokenType::NumericConstant) {
+                        // Simple integer parse — just use atoi equivalent
+                        this.advance();
+                    }
+                    this.consume(TokenType::RSquare, "']'");
+                    const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
+                        element: result,
+                        size:    size,
+                        span:    this.current_span(),
+                    };
+                    result = new TypeAnnotation::Array(arr_ann);
+                }
+            }
+            // Optional suffix: T?
+            else if (this.check(TokenType::Question)) {
+                this.advance();
+                const opt_ann: OptionalAnnotation* = new OptionalAnnotation {
+                    inner: result,
+                    span:  this.current_span(),
+                };
+                result = new TypeAnnotation::Optional(opt_ann);
+            }
+            else {
+                break;
+            }
+        }
+
+        return result;
+    }
+
+    /// Parse a reference type: &T or &mut T
+    parse_reference_type() -> TypeAnnotation* {
+        const start: Token = this.advance(); // consume '&'
+        mut is_mutable: boolean = false;
+        if (this.check(TokenType::KwMut)) {
+            this.advance();
+            is_mutable = true;
+        }
+        const inner: TypeAnnotation* = this.parse_type_annotation();
+        if (inner == null) { return null; }
+        const ref_ann: ReferenceAnnotation* = new ReferenceAnnotation {
+            inner:      inner,
+            is_mutable: is_mutable,
+            span:       this.span_from(start),
+        };
+        return new TypeAnnotation::Reference(ref_ann);
+    }
+
+    /// Parse function type or tuple type: (T, U) -> R or (T, U)
+    parse_function_or_tuple_type() -> TypeAnnotation* {
+        const start: Token = this.advance(); // consume '('
+
+        mut params: TypeAnnotation*[] = [];
+        if (!this.check(TokenType::RParen)) {
+            while (true) {
+                const param: TypeAnnotation* = this.parse_type_annotation();
+                if (param != null) {
+                    params.push(param);
+                }
+                if (!this.match_tok(TokenType::Comma)) {
+                    break;
+                }
+            }
+        }
+        this.consume(TokenType::RParen, "')'");
+
+        // Check for function type: (params) -> return_type
+        if (this.check(TokenType::Arrow)) {
+            this.advance();
+            const ret: TypeAnnotation* = this.parse_type_annotation();
+            const fn_ann: FunctionAnnotation* = new FunctionAnnotation {
+                parameters:  params,
+                return_type: ret,
+                span:        this.span_from(start),
+            };
+            return new TypeAnnotation::Function(fn_ann);
+        }
+
+        // Tuple type: (T, U)
+        if (params.length == 1) {
+            // Single-element tuple or parenthesized type
+            return params[0];
+        }
+
+        const tup_ann: TupleAnnotation* = new TupleAnnotation {
+            elements: params,
+            span:     this.span_from(start),
+        };
+        return new TypeAnnotation::Tuple(tup_ann);
+    }
+
+
+    // ================================================================
+    // Type Helper Predicates
+    // ================================================================
+
+    /// Check if the current token starts a type annotation.
+    is_type_start() -> boolean {
+        if (this.is_primitive_type_token()) { return true; }
+        return match (&this.current().kind) {
+            TokenType::Identifier => { true }
+            TokenType::KwVoid     => { true }
+            TokenType::Amp        => { true }
+            TokenType::LParen     => { true }
+            _                     => { false }
+        };
+    }
+
+    /// Check if the current token is a primitive type keyword.
+    is_primitive_type_token() -> boolean {
+        return match (&this.current().kind) {
+            TokenType::KwBoolean => { true }
+            TokenType::KwInt     => { true }
+            TokenType::KwI8      => { true }
+            TokenType::KwI16     => { true }
+            TokenType::KwI32     => { true }
+            TokenType::KwI64     => { true }
+            TokenType::KwI128    => { true }
+            TokenType::KwUint    => { true }
+            TokenType::KwUint8   => { true }
+            TokenType::KwUint16  => { true }
+            TokenType::KwUint32  => { true }
+            TokenType::KwUint64  => { true }
+            TokenType::KwUint128 => { true }
+            TokenType::KwFloat   => { true }
+            TokenType::KwF32     => { true }
+            TokenType::KwF64     => { true }
+            TokenType::KwDouble  => { true }
+            TokenType::KwChar    => { true }
+            TokenType::KwString  => { true }
+            TokenType::KwAny     => { true }
+            _                    => { false }
+        };
+    }
+
+
+    // ================================================================
+    // Utilities
+    // ================================================================
+
+    /// Try to extract the name from an expression node (for scope resolution).
+    get_expr_name(expr: ExpressionNode*) -> SymbolStr {
+        if (expr.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = expr as IdentifierNode*;
+            return id.name;
+        }
+        if (expr.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+            return sr.scope_name;
+        }
+        return SymbolStr::empty();
+    }
+}

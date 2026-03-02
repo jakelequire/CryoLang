@@ -532,24 +532,63 @@ namespace Cryo::Codegen
             }
         }
 
-        /** @brief Get field index for a struct field, returns -1 if not found */
+        /** @brief Get field index for a struct field, returns -1 if not found.
+         *  Walks the class inheritance chain so that inherited fields are found
+         *  even when the derived class registration is incomplete. */
         int get_struct_field_index(const std::string &type_name, const std::string &field_name) const
         {
+            // Direct lookup in the registration map
             auto type_it = _struct_field_indices.find(type_name);
-            if (type_it == _struct_field_indices.end())
-                return -1;
+            if (type_it != _struct_field_indices.end())
+            {
+                auto field_it = type_it->second.find(field_name);
+                if (field_it != type_it->second.end())
+                    return static_cast<int>(field_it->second);
+            }
 
-            auto field_it = type_it->second.find(field_name);
-            if (field_it == type_it->second.end())
-                return -1;
+            // Walk the class inheritance chain — inherited fields are prepended
+            // in the LLVM struct layout, so their indices are consistent across
+            // derived and base class registrations.
+            TypeRef class_ref = _symbols.lookup_class_type(type_name);
+            if (class_ref.is_valid())
+            {
+                auto *cls = dynamic_cast<const Cryo::ClassType *>(class_ref.get());
+                while (cls && cls->has_base_class())
+                {
+                    auto *base = dynamic_cast<const Cryo::ClassType *>(cls->base_class().get());
+                    if (!base)
+                        break;
 
-            return static_cast<int>(field_it->second);
+                    // Try base class name in the registration map
+                    const std::string &base_name = base->name();
+                    auto base_it = _struct_field_indices.find(base_name);
+                    if (base_it != _struct_field_indices.end())
+                    {
+                        auto field_it = base_it->second.find(field_name);
+                        if (field_it != base_it->second.end())
+                            return static_cast<int>(field_it->second);
+                    }
+
+                    cls = base;
+                }
+            }
+
+            return -1;
         }
 
         /** @brief Check if struct has a field */
         bool has_struct_field(const std::string &type_name, const std::string &field_name) const
         {
             return get_struct_field_index(type_name, field_name) >= 0;
+        }
+
+        /** @brief Get the raw field index map for a type (name -> index).
+         *  Returns an empty map if the type is not registered. */
+        const std::unordered_map<std::string, unsigned> &get_struct_field_indices(const std::string &type_name) const
+        {
+            static const std::unordered_map<std::string, unsigned> empty;
+            auto it = _struct_field_indices.find(type_name);
+            return it != _struct_field_indices.end() ? it->second : empty;
         }
 
         //===================================================================
