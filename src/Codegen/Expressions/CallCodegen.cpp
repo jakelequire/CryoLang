@@ -5439,6 +5439,21 @@ namespace Cryo::Codegen
                                 if (elem_type) break;
                             }
                         }
+                        // If the found type is an opaque (unsized) struct, it can't be used
+                        // for array element sizing.  Fall back to pointer type.
+                        if (elem_type)
+                        {
+                            if (auto *st = llvm::dyn_cast<llvm::StructType>(elem_type))
+                            {
+                                if (st->isOpaque())
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "Built-in array method: found opaque struct '{}' for element type '{}', using ptr fallback",
+                                              st->hasName() ? st->getName().str() : "<anon>", elem_name);
+                                    elem_type = types().ptr_type();
+                                }
+                            }
+                        }
                         if (!elem_type)
                             elem_type = types().ptr_type(); // fallback: treat as pointer-sized
                     }
@@ -7679,7 +7694,13 @@ namespace Cryo::Codegen
 
             LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Generating built-in Array::push");
 
-            llvm::Value *value = cast_if_needed(args[0], elem_type);
+            llvm::Value *value = args[0] ? cast_if_needed(args[0], elem_type) : nullptr;
+            if (!value)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Generating built-in Array::push: argument value is null, cannot proceed");
+                return nullptr;
+            }
 
             // Load current length and capacity
             llvm::Value *len_ptr = builder().CreateStructGEP(array_struct, receiver, 1, "arr.len.ptr");
