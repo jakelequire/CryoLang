@@ -188,10 +188,6 @@ namespace Cryo::Codegen
 
             // Try LLVM module - with param signature suffix (e.g., "Type::method(i32)")
             // Definitions may include parameter types in the name for overload disambiguation.
-            // IMPORTANT: Only return immediately if no exact-name match was found for this
-            // candidate. Otherwise the param-suffix scan can pick up a different overload
-            // (e.g., "String::new(u64)" instead of "String::new") when the exact match
-            // exists as a declaration.
             {
                 std::string prefix = qualified_method + "(";
                 for (auto &fn : module()->functions())
@@ -200,15 +196,26 @@ namespace Cryo::Codegen
                     if (fn_name.size() > qualified_method.size() &&
                         fn_name.substr(0, prefix.size()) == prefix)
                     {
-                        if (!fn.isDeclaration() && !found_exact_match)
+                        if (!fn.isDeclaration())
                         {
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "resolve_method_by_name: Found definition '{}.{}' with param suffix as '{}'",
-                                      type_name, method_name, fn_name);
-                            return &fn;
-                        }
-                        if (!declaration_fallback && qualified_method.substr(0, 8) != "Global::")
+                            // When the exact-name match was only a declaration, prefer the
+                            // suffixed definition — they represent the same method.
+                            // When no exact match exists, return immediately.
+                            if (!found_exact_match)
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_method_by_name: Found definition '{}.{}' with param suffix as '{}'",
+                                          type_name, method_name, fn_name);
+                                return &fn;
+                            }
+                            // Exact-name declare exists but this is the actual definition —
+                            // prefer the definition as fallback over the bodiless declare.
                             declaration_fallback = &fn;
+                        }
+                        else if (!declaration_fallback && qualified_method.substr(0, 8) != "Global::")
+                        {
+                            declaration_fallback = &fn;
+                        }
                     }
                 }
             }

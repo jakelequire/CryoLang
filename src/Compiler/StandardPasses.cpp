@@ -3413,6 +3413,29 @@ namespace Cryo
             }
             break;
         }
+        case NodeKind::MemberAccess:
+        {
+            auto *member_access = static_cast<MemberAccessNode *>(expr);
+
+            // Skip if already resolved
+            if (member_access->has_resolved_type())
+                break;
+
+            // Recursively resolve the object expression first (handles chains like a.b.c)
+            resolve_expression(member_access->object(), TypeRef{}, ctx);
+
+            // Now resolve the member access itself to determine the field type
+            TypeRef field_type = resolve_member_access_type(member_access, ctx);
+            if (field_type.is_valid())
+            {
+                member_access->set_resolved_type(field_type);
+                LOG_DEBUG(LogComponent::GENERAL,
+                          "GenericExpressionResolutionPass: Resolved MemberAccess '.{}' to type '{}'",
+                          member_access->member(),
+                          field_type->display_name());
+            }
+            break;
+        }
         default:
             // For other expressions, continue walking child expressions
             break;
@@ -3880,6 +3903,16 @@ namespace Cryo
         if (!obj_type.is_valid())
             return TypeRef{};
 
+        // Auto-dereference pointer types (e.g., node.field where node is StructType*)
+        if (obj_type->kind() == TypeKind::Pointer)
+        {
+            auto *ptr_type = static_cast<const PointerType *>(obj_type.get());
+            if (ptr_type->pointee().is_valid())
+            {
+                obj_type = ptr_type->pointee();
+            }
+        }
+
         const std::string &field_name = member_access->member();
 
         // Look up the member type from the object type
@@ -3962,6 +3995,17 @@ namespace Cryo
                         return concrete;
                 }
                 return field_type;
+            }
+        }
+        else if (obj_type->kind() == TypeKind::Array)
+        {
+            // Array built-in properties: .length, .capacity
+            if (field_name == "length" || field_name == "len" || field_name == "capacity")
+            {
+                auto *ac = _compiler.ast_context();
+                if (ac)
+                    return ac->types().get_int();
+                return TypeRef{};
             }
         }
 

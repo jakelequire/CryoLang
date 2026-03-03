@@ -5312,8 +5312,56 @@ namespace Cryo::Codegen
             }
         }
 
-        // Resolve the method
-        llvm::Function *method = resolve_method(type_name, method_name);
+        // Resolve the method — try overloaded name first (with param type suffix),
+        // then fall back to generic resolution.
+        llvm::Function *method = nullptr;
+
+        // Build overload suffix from call argument types to find the exact overload.
+        // This handles methods like visit(ProgramNode*) vs visit(ExpressionNode*)
+        // which would otherwise be indistinguishable (all ptrs in opaque pointer mode).
+        if (!node->arguments().empty())
+        {
+            std::string overload_suffix = "(";
+            bool all_types_resolved = true;
+            for (size_t i = 0; i < node->arguments().size(); ++i)
+            {
+                if (i > 0)
+                    overload_suffix += ",";
+                TypeRef arg_type = node->arguments()[i]->get_resolved_type();
+                if (arg_type.is_valid())
+                {
+                    overload_suffix += arg_type->display_name();
+                }
+                else
+                {
+                    all_types_resolved = false;
+                    break;
+                }
+            }
+            overload_suffix += ")";
+
+            if (all_types_resolved)
+            {
+                auto type_candidates = generate_lookup_candidates(type_name, Cryo::SymbolKind::Type);
+                type_candidates.insert(type_candidates.begin(), type_name);
+                for (const auto &tc : type_candidates)
+                {
+                    std::string overloaded_name = tc + "::" + method_name + overload_suffix;
+                    if (llvm::Function *fn = module()->getFunction(overloaded_name))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_instance_method: Found overloaded method '{}'",
+                                  overloaded_name);
+                        method = fn;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Fall back to generic resolution (handles non-overloaded methods)
+        if (!method)
+            method = resolve_method(type_name, method_name);
         if (!method)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,

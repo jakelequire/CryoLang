@@ -867,18 +867,46 @@ namespace Cryo::Codegen
                 }
             }
 
-            // Fallback: try creating Array<T> struct from array annotation
-            if (!field_llvm_type && field->has_type_annotation()
-                && field->type_annotation()->kind == Cryo::TypeAnnotationKind::Array)
+            // Fallback: try creating Array<T> struct from annotation
+            if (!field_llvm_type && field->has_type_annotation())
             {
-                llvm::StructType *array_struct = get_or_create_array_struct_from_annotation(
-                    field->type_annotation(), llvm_ctx());
-                if (array_struct)
+                auto *ann = field->type_annotation();
+                if (ann->kind == Cryo::TypeAnnotationKind::Array)
                 {
-                    field_llvm_type = array_struct;
+                    field_llvm_type = get_or_create_array_struct_from_annotation(ann, llvm_ctx());
+                }
+                else if (ann->kind == Cryo::TypeAnnotationKind::Named)
+                {
+                    const std::string &ann_name = ann->name;
+                    if (ann_name.size() >= 2
+                        && ann_name[ann_name.size() - 2] == '['
+                        && ann_name[ann_name.size() - 1] == ']')
+                    {
+                        std::string elem_name = ann_name.substr(0, ann_name.size() - 2);
+                        std::string array_name = "Array<" + elem_name + ">";
+                        llvm::StructType *existing =
+                            llvm::StructType::getTypeByName(llvm_ctx(), array_name);
+                        field_llvm_type = existing ? existing
+                            : llvm::StructType::create(llvm_ctx(),
+                                {llvm::PointerType::get(llvm_ctx(), 0),
+                                 llvm::Type::getInt64Ty(llvm_ctx()),
+                                 llvm::Type::getInt64Ty(llvm_ctx())},
+                                array_name);
+                    }
+                    else if (!ann_name.empty() && ann_name.back() == '*')
+                    {
+                        field_llvm_type = llvm::PointerType::get(llvm_ctx(), 0);
+                    }
+                }
+                else if (ann->kind == Cryo::TypeAnnotationKind::Pointer)
+                {
+                    field_llvm_type = llvm::PointerType::get(llvm_ctx(), 0);
+                }
+                if (field_llvm_type)
+                {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "=== STRUCT_GEN: Field '{}' resolved as dynamic array -> '{}' ===",
-                              field->name(), array_struct->getName().str());
+                              "=== STRUCT_GEN: Field '{}' resolved from annotation '{}' -> LLVM type ===",
+                              field->name(), ann->to_string());
                 }
             }
 
@@ -1079,25 +1107,69 @@ namespace Cryo::Codegen
                 llvm::Type *field_type = field.type.is_valid() ? types().map(field.type) : nullptr;
                 if (!field_type)
                 {
-                    // Try to resolve array type from AST annotation when TypeRef is unavailable.
+                    // Try to resolve type from AST annotation when TypeRef is unavailable.
                     // Match by name (not index) because cryo_class->fields() includes inherited
                     // fields while node->fields() does not.
                     for (const auto &ast_field : node->fields())
                     {
-                        if (ast_field && ast_field->name() == field.name
-                            && ast_field->has_type_annotation()
-                            && ast_field->type_annotation()->kind == Cryo::TypeAnnotationKind::Array)
+                        if (!ast_field || ast_field->name() != field.name
+                            || !ast_field->has_type_annotation())
+                            continue;
+
+                        auto *ann = ast_field->type_annotation();
+
+                        // Case 1: Properly structured Array annotation
+                        if (ann->kind == Cryo::TypeAnnotationKind::Array)
                         {
-                            field_type = get_or_create_array_struct_from_annotation(
-                                ast_field->type_annotation(), llvm_ctx());
-                            if (field_type)
-                            {
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "Class field '{}' resolved as dynamic array from annotation -> '{}'",
-                                          field.name, llvm::cast<llvm::StructType>(field_type)->getName().str());
-                            }
-                            break;
+                            field_type = get_or_create_array_struct_from_annotation(ann, llvm_ctx());
                         }
+                        // Case 2: Named annotation whose name ends with "[]" (e.g., "MatchArmNode*[]")
+                        // The parser sometimes stores compound types as flat Named strings.
+                        else if (ann->kind == Cryo::TypeAnnotationKind::Named)
+                        {
+                            const std::string &ann_name = ann->name;
+                            if (ann_name.size() >= 2
+                                && ann_name[ann_name.size() - 2] == '['
+                                && ann_name[ann_name.size() - 1] == ']')
+                            {
+                                // Extract element type name (everything before "[]")
+                                std::string elem_name = ann_name.substr(0, ann_name.size() - 2);
+                                std::string array_name = "Array<" + elem_name + ">";
+
+                                llvm::StructType *existing =
+                                    llvm::StructType::getTypeByName(llvm_ctx(), array_name);
+                                if (existing)
+                                {
+                                    field_type = existing;
+                                }
+                                else
+                                {
+                                    field_type = llvm::StructType::create(llvm_ctx(),
+                                        {llvm::PointerType::get(llvm_ctx(), 0),
+                                         llvm::Type::getInt64Ty(llvm_ctx()),
+                                         llvm::Type::getInt64Ty(llvm_ctx())},
+                                        array_name);
+                                }
+                            }
+                            // Named annotation that looks like a pointer (e.g., "StatementNode*")
+                            else if (!ann_name.empty() && ann_name.back() == '*')
+                            {
+                                field_type = llvm::PointerType::get(llvm_ctx(), 0);
+                            }
+                        }
+                        // Case 3: Pointer annotation — in opaque-pointer mode, all pointers are ptr
+                        else if (ann->kind == Cryo::TypeAnnotationKind::Pointer)
+                        {
+                            field_type = llvm::PointerType::get(llvm_ctx(), 0);
+                        }
+
+                        if (field_type)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Class field '{}' resolved from annotation '{}' -> LLVM type",
+                                      field.name, ann->to_string());
+                        }
+                        break;
                     }
                 }
                 if (field_type)
@@ -1128,16 +1200,45 @@ namespace Cryo::Codegen
                 {
                     field_llvm_type = types().map(cryo_field_type);
                 }
-                if (!field_llvm_type && field->has_type_annotation()
-                    && field->type_annotation()->kind == Cryo::TypeAnnotationKind::Array)
+                if (!field_llvm_type && field->has_type_annotation())
                 {
-                    field_llvm_type = get_or_create_array_struct_from_annotation(
-                        field->type_annotation(), llvm_ctx());
+                    auto *ann = field->type_annotation();
+                    if (ann->kind == Cryo::TypeAnnotationKind::Array)
+                    {
+                        field_llvm_type = get_or_create_array_struct_from_annotation(ann, llvm_ctx());
+                    }
+                    else if (ann->kind == Cryo::TypeAnnotationKind::Named)
+                    {
+                        const std::string &ann_name = ann->name;
+                        if (ann_name.size() >= 2
+                            && ann_name[ann_name.size() - 2] == '['
+                            && ann_name[ann_name.size() - 1] == ']')
+                        {
+                            std::string elem_name = ann_name.substr(0, ann_name.size() - 2);
+                            std::string array_name = "Array<" + elem_name + ">";
+                            llvm::StructType *existing =
+                                llvm::StructType::getTypeByName(llvm_ctx(), array_name);
+                            field_llvm_type = existing ? existing
+                                : llvm::StructType::create(llvm_ctx(),
+                                    {llvm::PointerType::get(llvm_ctx(), 0),
+                                     llvm::Type::getInt64Ty(llvm_ctx()),
+                                     llvm::Type::getInt64Ty(llvm_ctx())},
+                                    array_name);
+                        }
+                        else if (!ann_name.empty() && ann_name.back() == '*')
+                        {
+                            field_llvm_type = llvm::PointerType::get(llvm_ctx(), 0);
+                        }
+                    }
+                    else if (ann->kind == Cryo::TypeAnnotationKind::Pointer)
+                    {
+                        field_llvm_type = llvm::PointerType::get(llvm_ctx(), 0);
+                    }
                     if (field_llvm_type)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "Class field '{}' resolved as dynamic array from annotation -> '{}'",
-                                  field->name(), llvm::cast<llvm::StructType>(field_llvm_type)->getName().str());
+                                  "Class field '{}' resolved from annotation '{}' -> LLVM type",
+                                  field->name(), ann->to_string());
                     }
                 }
                 if (field_llvm_type)
