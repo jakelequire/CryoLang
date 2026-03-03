@@ -3487,7 +3487,7 @@ namespace Cryo::Codegen
                     llvm::Function *base_ctor = nullptr;
                     std::string ns = ctx().namespace_context();
 
-                    // 1) Try: <module_ns>::<base_name>::<base_name>::<base_name>
+                    // 1) Try: <module_ns>::<base_ctor_fn_name>
                     //    where module_ns = ns with current class stripped off
                     if (!ns.empty())
                     {
@@ -3497,13 +3497,13 @@ namespace Cryo::Codegen
                         if (last_sep != std::string::npos)
                             module_ns = module_ns.substr(0, last_sep);
 
-                        std::string qualified = module_ns + "::" + base_name + "::" + base_ctor_fn_name;
+                        std::string qualified = module_ns + "::" + base_ctor_fn_name;
                         base_ctor = module()->getFunction(qualified);
                         if (base_ctor)
                             base_ctor_fn_name = qualified;
                     }
 
-                    // 2) Try: <full_ns>::<base_name>::<base_name> (current class ns)
+                    // 2) Try: <full_ns>::<base_ctor_fn_name> (current class ns)
                     if (!base_ctor && !ns.empty())
                     {
                         std::string qualified = ns + "::" + base_ctor_fn_name;
@@ -3516,14 +3516,22 @@ namespace Cryo::Codegen
                     if (!base_ctor)
                         base_ctor = module()->getFunction(base_ctor_fn_name);
 
-                    // 4) Scan all functions for a match containing the base ctor name
+                    // 4) Scan all functions, stripping param suffix for matching
+                    //    e.g. "NS::ASTNode::ASTNode(NodeKind,SourceSpan)" should
+                    //    match base_ctor_fn_name "ASTNode::ASTNode"
                     if (!base_ctor)
                     {
                         for (auto &fn : module()->functions())
                         {
                             llvm::StringRef fn_name = fn.getName();
-                            if (fn_name.ends_with("::" + base_ctor_fn_name) ||
-                                fn_name == base_ctor_fn_name)
+                            // Strip param suffix (e.g. "(NodeKind,SourceSpan)") for comparison
+                            std::string fn_base = fn_name.str();
+                            size_t paren = fn_base.find('(');
+                            if (paren != std::string::npos)
+                                fn_base = fn_base.substr(0, paren);
+
+                            if (fn_base == base_ctor_fn_name ||
+                                llvm::StringRef(fn_base).ends_with("::" + base_ctor_fn_name))
                             {
                                 base_ctor = &fn;
                                 base_ctor_fn_name = fn_name.str();
@@ -3562,10 +3570,23 @@ namespace Cryo::Codegen
                             // scan the module for an overloaded version that does.
                             if (base_ctor->arg_size() != base_args.size())
                             {
+                                // Strip param suffix from base_ctor_fn_name for prefix matching
+                                std::string ctor_base_name = base_ctor_fn_name;
+                                size_t ctor_paren = ctor_base_name.find('(');
+                                if (ctor_paren != std::string::npos)
+                                    ctor_base_name = ctor_base_name.substr(0, ctor_paren);
+
                                 llvm::Function *overload = nullptr;
                                 for (auto &fn : module()->functions())
                                 {
-                                    if (fn.getName().starts_with(base_ctor_fn_name) &&
+                                    llvm::StringRef fn_name = fn.getName();
+                                    // Strip param suffix from candidate too
+                                    std::string fn_base = fn_name.str();
+                                    size_t fn_paren = fn_base.find('(');
+                                    if (fn_paren != std::string::npos)
+                                        fn_base = fn_base.substr(0, fn_paren);
+
+                                    if (fn_base == ctor_base_name &&
                                         fn.arg_size() == base_args.size())
                                     {
                                         overload = &fn;

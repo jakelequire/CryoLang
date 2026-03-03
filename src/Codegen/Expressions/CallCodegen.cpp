@@ -5327,8 +5327,30 @@ namespace Cryo::Codegen
             {
                 if (i > 0)
                     overload_suffix += ",";
+
+                std::string type_str;
                 TypeRef arg_type = node->arguments()[i]->get_resolved_type();
-                if (arg_type.is_valid())
+
+                // For cast expressions (e.g., `node as ProgramNode*`), use the cast's
+                // target type for overload disambiguation instead of the original type.
+                if (!arg_type.is_valid())
+                {
+                    auto *cast_expr = dynamic_cast<Cryo::CastExpressionNode *>(node->arguments()[i].get());
+                    if (cast_expr)
+                    {
+                        arg_type = cast_expr->get_resolved_target_type();
+                        if (!arg_type.is_valid() && cast_expr->has_target_type_annotation())
+                        {
+                            type_str = cast_expr->target_type_annotation()->to_string();
+                        }
+                    }
+                }
+
+                if (!type_str.empty())
+                {
+                    overload_suffix += type_str;
+                }
+                else if (arg_type.is_valid())
                 {
                     overload_suffix += arg_type->display_name();
                 }
