@@ -167,8 +167,10 @@ namespace Cryo::Codegen
                       "resolve_method_by_name: Trying '{}'", qualified_method);
 
             // Try LLVM module - exact match first
+            bool found_exact_match = false;
             if (llvm::Function *fn = module()->getFunction(qualified_method))
             {
+                found_exact_match = true;
                 if (!fn->isDeclaration())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -185,7 +187,11 @@ namespace Cryo::Codegen
             }
 
             // Try LLVM module - with param signature suffix (e.g., "Type::method(i32)")
-            // Definitions may include parameter types in the name for overload disambiguation
+            // Definitions may include parameter types in the name for overload disambiguation.
+            // IMPORTANT: Only return immediately if no exact-name match was found for this
+            // candidate. Otherwise the param-suffix scan can pick up a different overload
+            // (e.g., "String::new(u64)" instead of "String::new") when the exact match
+            // exists as a declaration.
             {
                 std::string prefix = qualified_method + "(";
                 for (auto &fn : module()->functions())
@@ -194,7 +200,7 @@ namespace Cryo::Codegen
                     if (fn_name.size() > qualified_method.size() &&
                         fn_name.substr(0, prefix.size()) == prefix)
                     {
-                        if (!fn.isDeclaration())
+                        if (!fn.isDeclaration() && !found_exact_match)
                         {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                       "resolve_method_by_name: Found definition '{}.{}' with param suffix as '{}'",
