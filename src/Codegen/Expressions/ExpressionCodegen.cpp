@@ -734,15 +734,16 @@ namespace Cryo::Codegen
             {
                 llvm::StructType *inner_struct_type = nullptr;
                 unsigned inner_field_idx = 0;
-                if (resolve_member_info(inner_member->object(), inner_member->member(),
-                                        inner_struct_type, inner_field_idx))
+                bool inner_resolved = resolve_member_info(inner_member->object(), inner_member->member(),
+                                        inner_struct_type, inner_field_idx);
+                if (inner_resolved)
                 {
                     llvm::Type *field_llvm_type = inner_struct_type->getElementType(inner_field_idx);
                     if (auto *field_struct = llvm::dyn_cast<llvm::StructType>(field_llvm_type))
                     {
                         std::string field_struct_name = field_struct->hasName()
                                                            ? field_struct->getName().str()
-                                                           : "";
+                                                           : "<anonymous>";
                         bool is_array_struct =
                             field_struct_name.find("Array<") != std::string::npos ||
                             field_struct_name.find("Array_") != std::string::npos;
@@ -847,6 +848,130 @@ namespace Cryo::Codegen
                             }
                         }
                         skip_array_fallback:;
+                    }
+                    // Fallback: field LLVM type is NOT a struct (e.g., i64 placeholder from
+                    // unresolved array field during class generation).  Look up the field's
+                    // Cryo type from TemplateRegistry and, if it's an array, find or create
+                    // the proper Array<T> LLVM struct to generate the access.
+                    else
+                    {
+                        // Get the owning struct's type name from variable_types_map
+                        std::string owner_type_name;
+                        if (auto *inner_ident = dynamic_cast<Cryo::IdentifierNode *>(inner_member->object()))
+                        {
+                            auto &var_types = ctx().variable_types_map();
+                            auto vit = var_types.find(inner_ident->name());
+                            if (vit != var_types.end() && vit->second.is_valid())
+                                owner_type_name = resolve_struct_type_name(vit->second);
+                        }
+                        if (owner_type_name.empty())
+                            owner_type_name = inner_struct_type->hasName()
+                                ? inner_struct_type->getName().str() : "";
+
+                        if (!owner_type_name.empty())
+                        {
+                            if (auto *tmpl_reg = ctx().template_registry())
+                            {
+                                // Try various name candidates for the TemplateRegistry lookup
+                                std::vector<std::string> candidates = {owner_type_name};
+                                if (!ctx().namespace_context().empty())
+                                    candidates.push_back(ctx().namespace_context() + "::" + owner_type_name);
+                                std::string type_ns = ctx().get_type_namespace(owner_type_name);
+                                if (!type_ns.empty())
+                                    candidates.push_back(type_ns + "::" + owner_type_name);
+
+                                for (const auto &cand : candidates)
+                                {
+                                    const auto *field_info = tmpl_reg->get_struct_field_types(cand);
+                                    if (!field_info)
+                                        continue;
+
+                                    // Find the field by name to get its Cryo TypeRef
+                                    for (size_t fi = 0; fi < field_info->field_names.size(); ++fi)
+                                    {
+                                        if (field_info->field_names[fi] != inner_member->member())
+                                            continue;
+
+                                        // Account for vtable offset: LLVM index may differ from logical index
+                                        // Check the field_types vector using logical index
+                                        if (fi >= field_info->field_types.size())
+                                            break;
+
+                                        TypeRef field_cryo_type = field_info->field_types[fi];
+                                        if (!field_cryo_type.is_valid() || field_cryo_type->kind() != Cryo::TypeKind::Array)
+                                        {
+                                            // Also check field annotations for array type
+                                            if (fi < field_info->field_type_annotations.size())
+                                            {
+                                                const std::string &ann = field_info->field_type_annotations[fi];
+                                                if (ann.find("[]") != std::string::npos)
+                                                {
+                                                    // It's an array annotation — create the array struct
+                                                    llvm::StructType *arr_struct = llvm::StructType::get(llvm_ctx(), {
+                                                        llvm::PointerType::get(llvm_ctx(), 0),
+                                                        llvm::Type::getInt64Ty(llvm_ctx()),
+                                                        llvm::Type::getInt64Ty(llvm_ctx())});
+                                                    if (arr_struct)
+                                                    {
+                                                        unsigned arr_field_idx = (member_name == "length") ? 1 : 2;
+                                                        llvm::Value *inner_obj = generate(inner_member->object());
+                                                        if (inner_obj && inner_obj->getType()->isPointerTy())
+                                                        {
+                                                            // Fix the parent struct's field type in-place so future accesses work
+                                                            // GEP through the parent struct to the array field
+                                                            llvm::Value *arr_ptr = builder().CreateStructGEP(
+                                                                inner_struct_type, inner_obj, inner_field_idx,
+                                                                inner_member->member() + ".ptr");
+                                                            // The arr_ptr points to an i64 slot, but we know it's actually an Array struct.
+                                                            // Use bitcast-equivalent (in opaque ptr mode, just use the correct type for GEP)
+                                                            llvm::Value *len_ptr = builder().CreateStructGEP(
+                                                                arr_struct, arr_ptr, arr_field_idx,
+                                                                "arr." + member_name + ".ptr");
+                                                            return builder().CreateLoad(
+                                                                llvm::Type::getInt64Ty(llvm_ctx()), len_ptr,
+                                                                "arr." + member_name);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            break;
+                                        }
+
+                                        // Field IS an Array type — get or create the LLVM array struct
+                                        llvm::Type *arr_llvm_type = get_llvm_type(field_cryo_type);
+                                        auto *arr_struct = arr_llvm_type
+                                            ? llvm::dyn_cast<llvm::StructType>(arr_llvm_type) : nullptr;
+                                        if (!arr_struct)
+                                        {
+                                            // Fallback: use a generic {ptr, i64, i64} array struct
+                                            arr_struct = llvm::StructType::get(llvm_ctx(), {
+                                                        llvm::PointerType::get(llvm_ctx(), 0),
+                                                        llvm::Type::getInt64Ty(llvm_ctx()),
+                                                        llvm::Type::getInt64Ty(llvm_ctx())});
+                                        }
+                                        if (arr_struct)
+                                        {
+                                            unsigned arr_field_idx = (member_name == "length") ? 1 : 2;
+                                            llvm::Value *inner_obj = generate(inner_member->object());
+                                            if (inner_obj && inner_obj->getType()->isPointerTy())
+                                            {
+                                                llvm::Value *arr_ptr = builder().CreateStructGEP(
+                                                    inner_struct_type, inner_obj, inner_field_idx,
+                                                    inner_member->member() + ".ptr");
+                                                llvm::Value *len_ptr = builder().CreateStructGEP(
+                                                    arr_struct, arr_ptr, arr_field_idx,
+                                                    "arr." + member_name + ".ptr");
+                                                return builder().CreateLoad(
+                                                    llvm::Type::getInt64Ty(llvm_ctx()), len_ptr,
+                                                    "arr." + member_name);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    break; // Found the struct in TemplateRegistry, stop searching candidates
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2112,6 +2237,12 @@ namespace Cryo::Codegen
                             element_type = llvm::Type::getDoubleTy(llvm_ctx());
                         else if (elem_name == "boolean" || elem_name == "bool")
                             element_type = llvm::Type::getInt1Ty(llvm_ctx());
+                        else if (elem_name.size() > 1 && elem_name.back() == '*')
+                        {
+                            // Pointer element type (e.g., "ASTNode*", "void*", "Type*")
+                            // In LLVM's opaque pointer model, all pointers are just `ptr`
+                            element_type = llvm::PointerType::get(llvm_ctx(), 0);
+                        }
                         else
                         {
                             // Try named struct first, then resolve_type_by_name
@@ -3747,7 +3878,8 @@ namespace Cryo::Codegen
                 // Recursively resolve the outer object's type
                 llvm::StructType *outer_struct = nullptr;
                 unsigned outer_field_idx = 0;
-                if (resolve_member_info(member_access->object(), member_access->member(), outer_struct, outer_field_idx))
+                bool inner_ok = resolve_member_info(member_access->object(), member_access->member(), outer_struct, outer_field_idx);
+                if (inner_ok)
                 {
                     // Get the outer object type to look up field types in TemplateRegistry
                     TypeRef outer_obj_type = member_access->object()->get_resolved_type();
@@ -3932,6 +4064,31 @@ namespace Cryo::Codegen
                             if (field_struct->hasName())
                             {
                                 std::string field_type_name = field_struct->getName().str();
+
+                                // Check if this is a dynamic array struct (Array<T>)
+                                // These have the shape {ptr, i64, i64} and support .length/.capacity
+                                bool is_array_struct =
+                                    field_type_name.find("Array<") != std::string::npos ||
+                                    field_type_name.find("Array_") != std::string::npos;
+                                if (is_array_struct &&
+                                    (member_name == "length" || member_name == "len"))
+                                {
+                                    out_struct_type = field_struct;
+                                    out_field_idx = 1;
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_member_info: Resolved {}.{} to array length "
+                                              "via LLVM array struct fallback (struct: '{}')",
+                                              member_access->member(), member_name, field_type_name);
+                                    return true;
+                                }
+                                if (is_array_struct &&
+                                    (member_name == "capacity" || member_name == "cap"))
+                                {
+                                    out_struct_type = field_struct;
+                                    out_field_idx = 2;
+                                    return true;
+                                }
+
                                 int idx = ctx().get_struct_field_index(field_type_name, member_name);
                                 if (idx >= 0)
                                 {
@@ -6516,16 +6673,24 @@ namespace Cryo::Codegen
                 unsigned expected_params = node->arguments().size() + 1; // +1 for 'this' ptr
                 if (ctor_fn->getFunctionType()->getNumParams() != expected_params)
                 {
-                    std::string base_ctor_name = ctor_fn->getName().str();
+                    std::string full_ctor_name = ctor_fn->getName().str();
+                    // Strip existing param suffix to get the base name for searching.
+                    // e.g., "Ns::Type::Type(SourceSpan)" → "Ns::Type::Type"
+                    std::string base_ctor_name = full_ctor_name;
+                    size_t paren_pos = full_ctor_name.find('(');
+                    if (paren_pos != std::string::npos)
+                        base_ctor_name = full_ctor_name.substr(0, paren_pos);
+
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "generate_new: Constructor '{}' has {} params but expected {} — searching for overloaded variant",
-                              base_ctor_name, ctor_fn->getFunctionType()->getNumParams(), expected_params);
+                              "generate_new: Constructor '{}' has {} params but expected {} — searching for overloaded variant (base='{}')",
+                              full_ctor_name, ctor_fn->getFunctionType()->getNumParams(), expected_params, base_ctor_name);
 
                     llvm::Function *overloaded = nullptr;
                     for (auto &fn : module()->functions())
                     {
                         llvm::StringRef fn_name = fn.getName();
                         // Look for functions starting with base ctor name + "("
+                        // that have the correct param count
                         if (fn_name.starts_with(base_ctor_name) &&
                             fn_name.size() > base_ctor_name.size() &&
                             fn_name[base_ctor_name.size()] == '(' &&
@@ -6599,6 +6764,17 @@ namespace Cryo::Codegen
                         llvm::Value *arg_val = generate(arg.get());
                         if (arg_val)
                             ctor_args.push_back(arg_val);
+                    }
+
+                    // Coerce arguments to match constructor signature
+                    // (e.g., ptr → struct load for by-value struct params like SourceSpan)
+                    for (size_t i = 1; i < ctor_args.size() && i < fn_type->getNumParams(); ++i)
+                    {
+                        llvm::Type *param_type = fn_type->getParamType(i);
+                        if (ctor_args[i]->getType() != param_type)
+                        {
+                            ctor_args[i] = cast_if_needed(ctor_args[i], param_type);
+                        }
                     }
 
                     builder().CreateCall(ctor_fn, ctor_args);
