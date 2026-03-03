@@ -1172,18 +1172,7 @@ namespace Cryo::Codegen
             }
         }
 
-        // Safety net: if the field is a struct type but the value is a pointer
-        // (e.g. an alloca holding the struct), load the struct value first.
-        if (member_field_type && member_field_type->isStructTy() && value->getType()->isPointerTy())
-        {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "Member assignment: Loading struct value from pointer before storing to struct field");
-            llvm::Value *loaded = builder().CreateLoad(member_field_type, value, "struct.load");
-            builder().CreateStore(loaded, member_ptr);
-            return loaded;
-        }
-
-        // Regular assignment for non-struct types
+        // Regular assignment for non-struct types or when types don't match
         if (_memory)
         {
             _memory->create_store(value, member_ptr);
