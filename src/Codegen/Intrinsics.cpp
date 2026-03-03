@@ -2801,16 +2801,11 @@ namespace Cryo::Codegen
         // Get or create sprintf function
         llvm::Function *sprintf_func = get_or_create_libc_function("sprintf", sprintf_type);
 
-        // Detect calling convention:
-        // - CryoLang style: sprintf(format, args...) — args[0] is format (pointer), args[1] may not be pointer
-        // - C style: sprintf(buffer, format, args...) — args[0] and args[1] are both pointers
-        bool cryo_style = (args.size() == 1) ||
-                          (!args[0]->getType()->isPointerTy()) ||
-                          (args.size() >= 2 && !args[1]->getType()->isPointerTy());
-
-        if (cryo_style)
+        // CryoLang convention: sprintf(format, args...) → auto-allocate buffer
+        // This intrinsic is only reached from Cryo source code, so we always
+        // use the CryoLang style (the C-style heuristic fails when all args
+        // are pointers, which is the common case for string formatting).
         {
-            // CryoLang convention: sprintf(format, args...) → auto-allocate buffer
             if (!args[0]->getType()->isPointerTy())
             {
                 report_error("__sprintf__ format argument must be a string (pointer)");
@@ -2854,46 +2849,6 @@ namespace Cryo::Codegen
             // Return the buffer pointer (the formatted string)
             return buffer;
         }
-
-        // C-style convention: sprintf(buffer, format, args...)
-        if (!args[0]->getType()->isPointerTy() || !args[1]->getType()->isPointerTy())
-        {
-            report_error("__sprintf__ buffer and format arguments must be pointers");
-            return nullptr;
-        }
-
-        // Convert arguments for variadic call ABI compliance
-        std::vector<llvm::Value *> converted_args;
-        converted_args.reserve(args.size());
-
-        for (size_t i = 0; i < args.size(); ++i)
-        {
-            llvm::Value *arg = args[i];
-            llvm::Type *arg_type = arg->getType();
-
-            // For Windows x64 ABI: convert small integers to i32, keep i64 as i64
-            if (arg_type->isIntegerTy())
-            {
-                unsigned bit_width = arg_type->getIntegerBitWidth();
-                if (bit_width < 32)
-                {
-                    // Promote small integers to i32 for Windows ABI
-                    arg = builder.CreateZExt(arg, llvm::Type::getInt32Ty(context), "sprintf.arg.promote");
-                }
-            }
-            // For floating point: ensure f32 gets promoted to f64 in variadic calls
-            else if (arg_type->isFloatTy())
-            {
-                arg = builder.CreateFPExt(arg, llvm::Type::getDoubleTy(context), "sprintf.arg.fpext");
-            }
-
-            converted_args.push_back(arg);
-        }
-
-        // Call sprintf
-        llvm::CallInst *call = builder.CreateCall(sprintf_func, converted_args, "sprintf.result");
-
-        return call;
     }
 
     llvm::Value *Intrinsics::generate_fprintf(const std::vector<llvm::Value *> &args)

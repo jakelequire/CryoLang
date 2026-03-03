@@ -1,4 +1,5 @@
 #include "Codegen/Expressions/ExpressionCodegen.hpp"
+#include "Codegen/Expressions/CallCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "Codegen/Declarations/TypeCodegen.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
@@ -6466,6 +6467,43 @@ namespace Cryo::Codegen
                                   "generate_new: Resolved constructor '{}' via SRM for type {}",
                                   ctor_name, type_name_for_alloc);
                         break;
+                    }
+                }
+            }
+
+            // If both direct and SRM-based lookup failed, scan all module
+            // functions for a constructor whose name ends with "::TypeName::TypeName".
+            // This handles cross-namespace constructor resolution, e.g. when
+            // type_name_for_alloc is "PatternNode" but the constructor is registered
+            // as "Compiler::AST::Pattern::PatternNode::PatternNode".
+            if (!ctor_fn)
+            {
+                std::string simple_name = node->type_name();
+                auto sep = simple_name.rfind("::");
+                if (sep != std::string::npos)
+                    simple_name = simple_name.substr(sep + 2);
+
+                std::string ctor_suffix = "::" + simple_name + "::" + simple_name;
+                for (auto &fn : module()->functions())
+                {
+                    llvm::StringRef fn_name = fn.getName();
+                    // Match "...::TypeName::TypeName" (base constructor) or
+                    // "...::TypeName::TypeName(" (overloaded constructor)
+                    if (fn_name.size() > ctor_suffix.size())
+                    {
+                        size_t pos = fn_name.rfind(ctor_suffix);
+                        if (pos != llvm::StringRef::npos)
+                        {
+                            size_t end = pos + ctor_suffix.size();
+                            if (end == fn_name.size() || fn_name[end] == '(')
+                            {
+                                ctor_fn = &fn;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_new: Found constructor '{}' via suffix match for type {}",
+                                          fn_name.str(), type_name_for_alloc);
+                                break;
+                            }
+                        }
                     }
                 }
             }

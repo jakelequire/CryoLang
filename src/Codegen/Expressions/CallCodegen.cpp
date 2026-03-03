@@ -6537,10 +6537,28 @@ namespace Cryo::Codegen
                     return fn;
                 }
 
-                // Check context's function registry
+                // Check context's function registry — but validate the pointer
+                // belongs to our module.  Registry entries can become stale during
+                // multi-module compilation when functions are replaced.
                 fn = ctx().get_function(ctor_name);
                 if (fn)
                 {
+                    if (fn->getParent() != module())
+                    {
+                        // Stale registry entry — try to re-resolve by the function's
+                        // actual name in our module
+                        llvm::Function *local_fn = module()->getFunction(fn->getName());
+                        if (local_fn)
+                            fn = local_fn;
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_constructor: Registry entry '{}' has stale pointer (wrong module), skipping",
+                                      ctor_name);
+                            continue;
+                        }
+                    }
+
                     if (!arg_types.empty() && fn->getFunctionType()->getNumParams() != expected_params)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
