@@ -1113,8 +1113,15 @@ namespace Cryo::Codegen
                 return value;
             }
 
-            // If value points to the same struct type as the field expects
-            if (value_pointed_type == member_field_type)
+            // If value points to the same (or layout-identical) struct type as the field expects
+            bool types_match = (value_pointed_type == member_field_type);
+            if (!types_match && value_pointed_type && value_pointed_type->isStructTy() && member_field_type->isStructTy())
+            {
+                auto *src_st = llvm::cast<llvm::StructType>(value_pointed_type);
+                auto *dst_st = llvm::cast<llvm::StructType>(member_field_type);
+                types_match = src_st->isLayoutIdentical(dst_st);
+            }
+            if (types_match)
             {
                 // Check if the struct type is fully defined (sized) before attempting memcpy
                 if (!member_field_type->isSized())
@@ -1165,7 +1172,18 @@ namespace Cryo::Codegen
             }
         }
 
-        // Regular assignment for non-struct types or when types don't match
+        // Safety net: if the field is a struct type but the value is a pointer
+        // (e.g. an alloca holding the struct), load the struct value first.
+        if (member_field_type && member_field_type->isStructTy() && value->getType()->isPointerTy())
+        {
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "Member assignment: Loading struct value from pointer before storing to struct field");
+            llvm::Value *loaded = builder().CreateLoad(member_field_type, value, "struct.load");
+            builder().CreateStore(loaded, member_ptr);
+            return loaded;
+        }
+
+        // Regular assignment for non-struct types
         if (_memory)
         {
             _memory->create_store(value, member_ptr);
