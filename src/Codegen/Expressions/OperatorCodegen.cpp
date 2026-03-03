@@ -1877,6 +1877,96 @@ namespace Cryo::Codegen
 
         llvm::Type *type = lhs->getType();
 
+        // String comparison: use strcmp instead of pointer comparison.
+        // Strings are lowered to i8* (pointers) at the LLVM level.
+        // Since resolved types are often null at codegen time, we detect
+        // string comparisons by checking:
+        //   1) The semantic type (operand_type) if available, OR
+        //   2) Whether either LLVM operand is a string constant (global array)
+        //   3) Whether the AST node references a string literal
+        auto is_string_constant = [](llvm::Value *v) -> bool
+        {
+            // Direct global variable pointing to a constant array (string literal)
+            if (auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(v))
+                return gv->isConstant() && gv->hasInitializer() &&
+                       gv->getInitializer()->getType()->isArrayTy();
+            // GEP of a global string constant
+            if (auto *gep = llvm::dyn_cast<llvm::GEPOperator>(v))
+            {
+                if (auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(gep->getPointerOperand()))
+                    return gv->isConstant() && gv->hasInitializer() &&
+                           gv->getInitializer()->getType()->isArrayTy();
+            }
+            // ConstantExpr wrapping a GEP
+            if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(v))
+            {
+                if (ce->getOpcode() == llvm::Instruction::GetElementPtr)
+                {
+                    if (auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(ce->getOperand(0)))
+                        return gv->isConstant() && gv->hasInitializer() &&
+                               gv->getInitializer()->getType()->isArrayTy();
+                }
+            }
+            return false;
+        };
+
+        bool is_string_cmp = false;
+        if (type->isPointerTy() && rhs->getType()->isPointerTy())
+        {
+            // Check semantic type first
+            if (operand_type && operand_type->kind() == Cryo::TypeKind::String)
+                is_string_cmp = true;
+            // Check if either operand is a string literal constant
+            else if (is_string_constant(lhs) || is_string_constant(rhs))
+                is_string_cmp = true;
+            // Check AST node for string literal children
+            else if (node)
+            {
+                auto is_string_literal_node = [](Cryo::ASTNode *n) -> bool
+                {
+                    if (!n || n->kind() != Cryo::NodeKind::Literal)
+                        return false;
+                    auto *lit = dynamic_cast<Cryo::LiteralNode *>(n);
+                    return lit && lit->literal_kind() == TokenKind::TK_STRING_LITERAL;
+                };
+                if (is_string_literal_node(node->left()) ||
+                    is_string_literal_node(node->right()))
+                    is_string_cmp = true;
+            }
+        }
+
+        if (is_string_cmp)
+        {
+            llvm::FunctionCallee strcmp_fn = module()->getOrInsertFunction(
+                "strcmp",
+                llvm::FunctionType::get(
+                    llvm::Type::getInt32Ty(llvm_ctx()),
+                    {llvm::PointerType::get(llvm_ctx(), 0),
+                     llvm::PointerType::get(llvm_ctx(), 0)},
+                    false));
+
+            llvm::Value *cmp_result = builder().CreateCall(strcmp_fn, {lhs, rhs}, "strcmp.result");
+            llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0);
+
+            switch (op)
+            {
+            case TokenKind::TK_EQUALEQUAL:
+                return builder().CreateICmpEQ(cmp_result, zero, "str_eq");
+            case TokenKind::TK_EXCLAIMEQUAL:
+                return builder().CreateICmpNE(cmp_result, zero, "str_ne");
+            case TokenKind::TK_L_ANGLE:
+                return builder().CreateICmpSLT(cmp_result, zero, "str_lt");
+            case TokenKind::TK_R_ANGLE:
+                return builder().CreateICmpSGT(cmp_result, zero, "str_gt");
+            case TokenKind::TK_LESSEQUAL:
+                return builder().CreateICmpSLE(cmp_result, zero, "str_le");
+            case TokenKind::TK_GREATEREQUAL:
+                return builder().CreateICmpSGE(cmp_result, zero, "str_ge");
+            default:
+                break;
+            }
+        }
+
         if (type->isIntegerTy())
         {
             bool is_signed = operand_type ? is_signed_integer_type(operand_type) : true;
