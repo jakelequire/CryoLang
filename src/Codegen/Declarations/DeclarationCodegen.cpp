@@ -3410,9 +3410,66 @@ namespace Cryo::Codegen
             {
                 if (struct_method->is_constructor() && !struct_method->base_ctor_name().empty())
                 {
-                    std::string base_ctor_fn_name = struct_method->base_ctor_name() + "::" +
-                                                     struct_method->base_ctor_name();
-                    llvm::Function *base_ctor = module()->getFunction(base_ctor_fn_name);
+                    // Build base constructor name using the same qualification
+                    // scheme as regular method names: BaseClass::BaseClass with
+                    // namespace prefix.
+                    std::string base_name = struct_method->base_ctor_name();
+                    std::string base_ctor_fn_name = generate_method_name(base_name, base_name);
+
+                    // The base constructor is registered under the base class's own
+                    // namespace, NOT the derived class's namespace. For example:
+                    //   Compiler::Parser::ParserBase::ParserBase::ParserBase
+                    // not Compiler::Parser::ExprParser::ParserBase::ParserBase
+                    //
+                    // Strategy: try multiple name patterns to find the base ctor.
+                    llvm::Function *base_ctor = nullptr;
+                    std::string ns = ctx().namespace_context();
+
+                    // 1) Try: <module_ns>::<base_name>::<base_name>::<base_name>
+                    //    where module_ns = ns with current class stripped off
+                    if (!ns.empty())
+                    {
+                        // Strip the current class from namespace to get module namespace
+                        std::string module_ns = ns;
+                        auto last_sep = module_ns.rfind("::");
+                        if (last_sep != std::string::npos)
+                            module_ns = module_ns.substr(0, last_sep);
+
+                        std::string qualified = module_ns + "::" + base_name + "::" + base_ctor_fn_name;
+                        base_ctor = module()->getFunction(qualified);
+                        if (base_ctor)
+                            base_ctor_fn_name = qualified;
+                    }
+
+                    // 2) Try: <full_ns>::<base_name>::<base_name> (current class ns)
+                    if (!base_ctor && !ns.empty())
+                    {
+                        std::string qualified = ns + "::" + base_ctor_fn_name;
+                        base_ctor = module()->getFunction(qualified);
+                        if (base_ctor)
+                            base_ctor_fn_name = qualified;
+                    }
+
+                    // 3) Try unqualified: <base_name>::<base_name>
+                    if (!base_ctor)
+                        base_ctor = module()->getFunction(base_ctor_fn_name);
+
+                    // 4) Scan all functions for a match containing the base ctor name
+                    if (!base_ctor)
+                    {
+                        for (auto &fn : module()->functions())
+                        {
+                            llvm::StringRef fn_name = fn.getName();
+                            if (fn_name.ends_with("::" + base_ctor_fn_name) ||
+                                fn_name == base_ctor_fn_name)
+                            {
+                                base_ctor = &fn;
+                                base_ctor_fn_name = fn_name.str();
+                                break;
+                            }
+                        }
+                    }
+
                     if (base_ctor)
                     {
                         // Get 'this' pointer
@@ -3437,6 +3494,24 @@ namespace Cryo::Codegen
                                     if (arg_val)
                                         base_args.push_back(arg_val);
                                 }
+                            }
+
+                            // If the found constructor doesn't match our arg count,
+                            // scan the module for an overloaded version that does.
+                            if (base_ctor->arg_size() != base_args.size())
+                            {
+                                llvm::Function *overload = nullptr;
+                                for (auto &fn : module()->functions())
+                                {
+                                    if (fn.getName().starts_with(base_ctor_fn_name) &&
+                                        fn.arg_size() == base_args.size())
+                                    {
+                                        overload = &fn;
+                                        break;
+                                    }
+                                }
+                                if (overload)
+                                    base_ctor = overload;
                             }
 
                             builder().CreateCall(base_ctor, base_args);
