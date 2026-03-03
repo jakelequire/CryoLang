@@ -43,7 +43,9 @@ public:
         }
 
         mut dumper: ASTDumper = ASTDumper(intern);
-        root.accept(&dumper);
+        // Use dispatch_visit — both virtual dispatch and method overload
+        // resolution are unreliable in the C++ compiler's codegen.
+        dumper.dispatch_visit(root as ASTNode*);
     }
 
     // ----------------------------------------------------------------
@@ -96,12 +98,86 @@ public:
         }
     }
 
-    /// Push indentation, dispatch through the visitor, pop indentation.
+    /// Push indentation, dispatch to the correct visit() based on node kind.
+    /// Uses manual dispatch instead of virtual accept() since vtable dispatch
+    /// is not reliable in the C++ compiler's codegen yet.
     dump_child(node: ASTNode*, is_last: boolean) -> void {
         if (node == null) { return; }
         this.push_level(is_last);
-        node.accept(this);
+        this.dispatch_visit(node);
         this.pop_level();
+    }
+
+    /// Manual visitor dispatch based on NodeKind.
+    dispatch_visit(node: ASTNode*) -> void {
+        if (node == null) { return; }
+        match (node.kind) {
+            // Program
+            NodeKind::Program => { this.visit(node as ProgramNode*); }
+
+            // Expressions
+            NodeKind::Literal          => { this.visit(node as LiteralNode*); }
+            NodeKind::Identifier       => { this.visit(node as IdentifierNode*); }
+            NodeKind::BinaryExpression => { this.visit(node as BinaryExprNode*); }
+            NodeKind::UnaryExpression  => { this.visit(node as UnaryExprNode*); }
+            NodeKind::TernaryExpression => { this.visit(node as TernaryExprNode*); }
+            NodeKind::IfExpression     => { this.visit(node as IfExprNode*); }
+            NodeKind::MatchExpression  => { this.visit(node as MatchExprNode*); }
+            NodeKind::CallExpression   => { this.visit(node as CallExprNode*); }
+            NodeKind::NewExpression    => { this.visit(node as NewExprNode*); }
+            NodeKind::SizeofExpression => { this.visit(node as SizeofExprNode*); }
+            NodeKind::AlignofExpression => { this.visit(node as AlignofExprNode*); }
+            NodeKind::CastExpression   => { this.visit(node as CastExprNode*); }
+            NodeKind::StructLiteral    => { this.visit(node as StructLiteralNode*); }
+            NodeKind::ArrayLiteral     => { this.visit(node as ArrayLiteralNode*); }
+            NodeKind::TupleLiteral     => { this.visit(node as TupleLiteralNode*); }
+            NodeKind::LambdaExpression => { this.visit(node as LambdaExprNode*); }
+            NodeKind::ArrayAccess      => { this.visit(node as ArrayAccessNode*); }
+            NodeKind::MemberAccess     => { this.visit(node as MemberAccessNode*); }
+            NodeKind::ScopeResolution  => { this.visit(node as ScopeResolutionNode*); }
+
+            // Statements
+            NodeKind::BlockStatement       => { this.visit(node as BlockStmtNode*); }
+            NodeKind::UnsafeBlockStatement => { this.visit(node as UnsafeBlockStmtNode*); }
+            NodeKind::ReturnStatement      => { this.visit(node as ReturnStmtNode*); }
+            NodeKind::IfStatement          => { this.visit(node as IfStmtNode*); }
+            NodeKind::WhileStatement       => { this.visit(node as WhileStmtNode*); }
+            NodeKind::DoWhileStatement     => { this.visit(node as DoWhileStmtNode*); }
+            NodeKind::ForStatement         => { this.visit(node as ForStmtNode*); }
+            NodeKind::MatchStatement       => { this.visit(node as MatchStmtNode*); }
+            NodeKind::SwitchStatement      => { this.visit(node as SwitchStmtNode*); }
+            NodeKind::CaseStatement        => { this.visit(node as CaseStmtNode*); }
+            NodeKind::BreakStatement       => { this.visit(node as BreakStmtNode*); }
+            NodeKind::ContinueStatement    => { this.visit(node as ContinueStmtNode*); }
+            NodeKind::ExpressionStatement  => { this.visit(node as ExprStmtNode*); }
+            NodeKind::DeclarationStatement => { this.visit(node as DeclStmtNode*); }
+
+            // Declarations
+            NodeKind::VariableDeclaration      => { this.visit(node as VarDeclNode*); }
+            NodeKind::FunctionDeclaration      => { this.visit(node as FunctionDeclNode*); }
+            NodeKind::IntrinsicDeclaration     => { this.visit(node as IntrinsicDeclNode*); }
+            NodeKind::IntrinsicConstDeclaration => { this.visit(node as IntrinsicConstDeclNode*); }
+            NodeKind::ImportDeclaration        => { this.visit(node as ImportDeclNode*); }
+            NodeKind::ModuleDeclaration        => { this.visit(node as ModuleDeclNode*); }
+            NodeKind::StructDeclaration        => { this.visit(node as StructDeclNode*); }
+            NodeKind::ClassDeclaration         => { this.visit(node as ClassDeclNode*); }
+            NodeKind::EnumDeclaration          => { this.visit(node as EnumDeclNode*); }
+            NodeKind::TraitDeclaration         => { this.visit(node as TraitDeclNode*); }
+            NodeKind::TypeAliasDeclaration     => { this.visit(node as TypeAliasDeclNode*); }
+            NodeKind::ImplementationBlock      => { this.visit(node as ImplBlockNode*); }
+            NodeKind::ExternBlock              => { this.visit(node as ExternBlockNode*); }
+
+            // Other
+            NodeKind::MatchArm    => { this.visit(node as MatchArmNode*); }
+            NodeKind::Pattern     => { this.visit(node as PatternNode*); }
+            NodeKind::EnumPattern => { this.visit(node as EnumPatternNode*); }
+            NodeKind::Directive   => { this.visit(node as DirectiveNode*); }
+
+            _ => {
+                this.print_prefix();
+                printf("<unknown node kind %d>\n", node.kind as int);
+            }
+        }
     }
 
 
@@ -232,7 +308,7 @@ public:
         this.print_location(node.span);
         printf("\n");
 
-        const arm_count: int = node.arms.length();
+        const arm_count: int = node.arms.length;
         this.dump_child(node.subject as ASTNode*, arm_count == 0);
         for (mut i: int = 0; i < arm_count; i++) {
             const is_last: boolean = (i == arm_count - 1);

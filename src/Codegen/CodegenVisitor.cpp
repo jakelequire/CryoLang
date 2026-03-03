@@ -803,8 +803,16 @@ namespace Cryo::Codegen
         }
         else
         {
-            // In method bodies only mode, check if the struct type exists
+            // In method bodies only mode, find the struct type that was created during Stage 1.
+            // Try simple name first, then namespace-qualified name (the type may have been
+            // registered with the full namespace prefix during pre-registration).
             struct_type = llvm::StructType::getTypeByName(_ctx->llvm_context(), node.name());
+            if (!struct_type)
+            {
+                std::string ns = _ctx->namespace_context();
+                if (!ns.empty())
+                    struct_type = llvm::StructType::getTypeByName(_ctx->llvm_context(), ns + "::" + node.name());
+            }
             if (!struct_type)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -946,8 +954,15 @@ namespace Cryo::Codegen
         }
         else
         {
-            // In method bodies only mode, check if the class type exists
+            // In method bodies only mode, find the class type that was created during Stage 1.
+            // Try simple name first, then namespace-qualified name.
             class_type = llvm::StructType::getTypeByName(_ctx->llvm_context(), node.name());
+            if (!class_type)
+            {
+                std::string ns = _ctx->namespace_context();
+                if (!ns.empty())
+                    class_type = llvm::StructType::getTypeByName(_ctx->llvm_context(), ns + "::" + node.name());
+            }
             if (!class_type)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,

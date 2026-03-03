@@ -730,22 +730,49 @@ namespace Cryo::Codegen
         // (needed for signature validation before checking existing functions)
         llvm::FunctionType *fn_type = get_function_type(node, !is_static, parent_type);
 
-        // Build a unique name for overloaded methods by including parameter types
+        // Build a unique name for overloaded methods by including parameter types.
+        // We collect both resolved TypeRefs and string names (from type annotations)
+        // to handle the case where semantic analysis hasn't resolved all param types.
         std::vector<TypeRef> param_types;
+        std::vector<std::string> param_type_strs;
         for (const auto &param : node->parameters())
         {
-            if (param->name() != "this" && param->get_resolved_type())
+            if (param->name() == "this")
+                continue;
+
+            if (param->get_resolved_type())
             {
                 param_types.push_back(param->get_resolved_type());
+                param_type_strs.push_back(param->get_resolved_type().get()->display_name());
+            }
+            else if (param->has_type_annotation())
+            {
+                // Fallback: use the source-level type annotation string.
+                // This ensures overloaded methods get distinct names even when
+                // the type resolver hasn't fully resolved pointer-to-struct types.
+                param_type_strs.push_back(param->type_annotation()->to_string());
             }
         }
         std::string overload_name = llvm_fn_name;
-        if (!param_types.empty())
+        if (!param_type_strs.empty())
         {
-            overload_name = generate_method_name(parent_type, node->name(), param_types);
+            // Build suffix from param type strings: "(Type1,Type2,...)"
+            std::string suffix = "(";
+            for (size_t i = 0; i < param_type_strs.size(); ++i)
+            {
+                if (i > 0)
+                    suffix += ",";
+                suffix += param_type_strs[i];
+            }
+            suffix += ")";
+
             if (!ns_context.empty())
             {
-                overload_name = ns_context + "::" + generate_method_name(parent_type, node->name(), param_types);
+                overload_name = ns_context + "::" + generate_method_name(parent_type, node->name()) + suffix;
+            }
+            else
+            {
+                overload_name = generate_method_name(parent_type, node->name()) + suffix;
             }
         }
 
@@ -787,127 +814,137 @@ namespace Cryo::Codegen
             }
             // Fall through to create fresh function
         }
-        // Also check base name (for backward compatibility with non-overloaded methods)
-        else if (llvm::Function *existing = module()->getFunction(llvm_fn_name))
+        // Also check base name — but ONLY when this is NOT a distinct overload.
+        // In opaque-pointer mode all pointer params are `ptr`, so two overloads like
+        // visit(ProgramNode*) and visit(ExpressionNode*) have the same LLVM FunctionType.
+        // Without this guard, the second overload would be silently merged into the first.
+        else if (overload_name == llvm_fn_name)
         {
-            // Only reuse if types match - don't erase for overloads
-            if (fn_type && existing->getFunctionType() == fn_type)
+            if (llvm::Function *existing = module()->getFunction(llvm_fn_name))
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Method '{}' already exists with matching types",
-                          llvm_fn_name);
-                ensure_arg_names(existing);
-                return existing;
-            }
-            // Types differ. If the existing function is a declaration-only extern
-            // AND has the same number of parameters, we still want to reuse it
-            // (keeping the same name) so that callers don't end up with an
-            // orphaned extern. Generate the body using the extern's existing
-            // signature - in opaque pointer mode, the argument types are
-            // interchangeable since all pointers and integers are passed through
-            // the same calling convention.
-            // IMPORTANT: If the param counts differ, this is a genuine overload
-            // (e.g., no-arg vs with-arg constructor), not just a type mismatch.
-            if (existing->isDeclaration() && fn_type &&
-                existing->getFunctionType()->getNumParams() == fn_type->getNumParams())
-            {
-                // Only reuse if parameter types are compatible (all pointers in opaque ptr mode).
-                // If any parameter differs in kind (e.g., i32 vs struct), this is a genuine
-                // overload with the same arity, not a type mismatch we can paper over.
-                bool params_compatible = true;
-                for (unsigned pi = 0; pi < fn_type->getNumParams(); ++pi)
-                {
-                    llvm::Type *existing_pt = existing->getFunctionType()->getParamType(pi);
-                    llvm::Type *new_pt = fn_type->getParamType(pi);
-                    if (existing_pt != new_pt)
-                    {
-                        // In opaque pointer mode, all pointers are `ptr` so they match.
-                        // Only allow reuse if both are the same type class (both ptr, both same int width, etc.)
-                        bool both_ptrs = existing_pt->isPointerTy() && new_pt->isPointerTy();
-                        if (!both_ptrs)
-                        {
-                            params_compatible = false;
-                            break;
-                        }
-                    }
-                }
-                if (params_compatible)
+                // Only reuse if types match - don't erase for overloads
+                if (fn_type && existing->getFunctionType() == fn_type)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "DeclarationCodegen: Reusing extern declaration '{}' despite type mismatch "
-                              "(definition will use extern's signature)",
+                              "DeclarationCodegen: Method '{}' already exists with matching types",
                               llvm_fn_name);
                     ensure_arg_names(existing);
                     return existing;
                 }
-                // Parameters are genuinely different types — fall through to create overloaded function
+                // Types differ. If the existing function is a declaration-only extern
+                // AND has the same number of parameters, we still want to reuse it
+                // (keeping the same name) so that callers don't end up with an
+                // orphaned extern.
+                // IMPORTANT: If the param counts differ, this is a genuine overload
+                // (e.g., no-arg vs with-arg constructor), not just a type mismatch.
+                if (existing->isDeclaration() && fn_type &&
+                    existing->getFunctionType()->getNumParams() == fn_type->getNumParams())
+                {
+                    bool params_compatible = true;
+                    for (unsigned pi = 0; pi < fn_type->getNumParams(); ++pi)
+                    {
+                        llvm::Type *existing_pt = existing->getFunctionType()->getParamType(pi);
+                        llvm::Type *new_pt = fn_type->getParamType(pi);
+                        if (existing_pt != new_pt)
+                        {
+                            bool both_ptrs = existing_pt->isPointerTy() && new_pt->isPointerTy();
+                            if (!both_ptrs)
+                            {
+                                params_compatible = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (params_compatible)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Reusing extern declaration '{}' despite type mismatch "
+                                  "(definition will use extern's signature)",
+                                  llvm_fn_name);
+                        ensure_arg_names(existing);
+                        return existing;
+                    }
+                }
+                if (existing->isDeclaration() && fn_type && existing->use_empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Replacing pre-registered stub '{}' (param count {} -> {})",
+                              llvm_fn_name,
+                              existing->getFunctionType()->getNumParams(),
+                              fn_type->getNumParams());
+                    existing->eraseFromParent();
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Method '{}' exists with different types (overload), using '{}'",
+                              llvm_fn_name, overload_name);
+                    llvm_fn_name = overload_name;
+                }
             }
-            // If the existing function is a declaration-only stub (from pre-registration)
-            // with a DIFFERENT param count, the stub was generated with the wrong signature.
-            // Replace it with the correct definition instead of creating an overloaded name.
-            if (existing->isDeclaration() && fn_type && existing->use_empty())
+            else if (llvm::Function *existing = module()->getFunction(base_method_name))
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Replacing pre-registered stub '{}' (param count {} -> {})",
-                          llvm_fn_name,
-                          existing->getFunctionType()->getNumParams(),
-                          fn_type->getNumParams());
-                existing->eraseFromParent();
-                // Fall through to create the function with the correct type
-            }
-            else
-            {
-                // Types differ and existing has a body (or different param count) - this is a true overload
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Method '{}' exists with different types (overload), using '{}'",
-                          llvm_fn_name, overload_name);
-                llvm_fn_name = overload_name;
+                if (fn_type && existing->getFunctionType() == fn_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Method '{}' already exists (base_method_name='{}') with matching types",
+                              llvm_fn_name, base_method_name);
+                    ensure_arg_names(existing);
+                    return existing;
+                }
+                if (existing->isDeclaration() && fn_type &&
+                    existing->getFunctionType()->getNumParams() == fn_type->getNumParams())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Reusing extern declaration (base='{}') despite type mismatch",
+                              base_method_name);
+                    ensure_arg_names(existing);
+                    return existing;
+                }
+                if (existing->isDeclaration() && fn_type && existing->use_empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Replacing pre-registered stub (base='{}') (param count {} -> {})",
+                              base_method_name,
+                              existing->getFunctionType()->getNumParams(),
+                              fn_type->getNumParams());
+                    existing->eraseFromParent();
+                    llvm_fn_name = base_method_name;
+                }
+                else
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Method base '{}' exists with different types (overload), using '{}'",
+                              base_method_name, overload_name);
+                    llvm_fn_name = overload_name;
+                }
             }
         }
-        else if (llvm::Function *existing = module()->getFunction(base_method_name))
+        // When we have a distinct overload name (method has typed parameters),
+        // use it as the actual function name to prevent overload collisions.
+        // Save the original base name so we can clean up stale declarations later.
+        std::string original_base_fn_name = llvm_fn_name;
+        if (overload_name != llvm_fn_name)
         {
-            // Only reuse if types match - don't erase for overloads
-            if (fn_type && existing->getFunctionType() == fn_type)
+            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                      "DeclarationCodegen: Using overloaded name '{}' instead of base '{}'",
+                      overload_name, llvm_fn_name);
+
+            // Also register template annotations under the overloaded name
+            // (they were registered earlier under the base name)
+            if (template_registry)
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Method '{}' already exists (base_method_name='{}') with matching types",
-                          llvm_fn_name, base_method_name);
-                ensure_arg_names(existing);
-                return existing;
+                std::string base_annotation = template_registry->get_method_return_type_annotation(llvm_fn_name);
+                if (!base_annotation.empty())
+                {
+                    template_registry->register_method_return_type_annotation(overload_name, base_annotation);
+                }
+                template_registry->register_method_is_static(overload_name, is_static);
             }
-            // Same logic: reuse extern declarations to avoid orphaned symbols,
-            // but only when param counts match (different count = genuine overload)
-            if (existing->isDeclaration() && fn_type &&
-                existing->getFunctionType()->getNumParams() == fn_type->getNumParams())
-            {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Reusing extern declaration (base='{}') despite type mismatch",
-                          base_method_name);
-                ensure_arg_names(existing);
-                return existing;
-            }
-            // If the existing function is a declaration-only stub (from pre-registration)
-            // with a DIFFERENT param count, the stub was generated with the wrong signature.
-            // Replace it so callers find the correct definition under the base name.
-            if (existing->isDeclaration() && fn_type && existing->use_empty())
-            {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Replacing pre-registered stub (base='{}') (param count {} -> {})",
-                          base_method_name,
-                          existing->getFunctionType()->getNumParams(),
-                          fn_type->getNumParams());
-                existing->eraseFromParent();
-                llvm_fn_name = base_method_name;
-            }
-            else
-            {
-                // Types differ - this is an overload, use overload_name
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "DeclarationCodegen: Method base '{}' exists with different types (overload), using '{}'",
-                          base_method_name, overload_name);
-                llvm_fn_name = overload_name;
-            }
+
+            llvm_fn_name = overload_name;
         }
+
         if (!fn_type)
         {
             report_error(ErrorCode::E0633_FUNCTION_BODY_ERROR, node,
@@ -915,7 +952,7 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Create function with fully-qualified name
+        // Create function with fully-qualified name (includes param suffix for overloads)
         llvm::Function *fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage,
                                                     llvm_fn_name, module());
 
@@ -964,6 +1001,31 @@ namespace Cryo::Codegen
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "DeclarationCodegen: Registered method as: {}", llvm_fn_name);
+        }
+
+        // If this function was created with an overloaded name (param suffix),
+        // check if there's a stale declaration at the base name. If so, replace
+        // all uses of the stale declaration with this function and remove it.
+        // This prevents linker errors where call sites reference the base name
+        // but the body lives under the suffixed name.
+        if (llvm_fn_name != original_base_fn_name)
+        {
+            if (llvm::Function *stale = module()->getFunction(original_base_fn_name))
+            {
+                if (stale->isDeclaration() && stale != fn)
+                {
+                    // Only RAUW if signatures are compatible (same param count)
+                    if (stale->getFunctionType()->getNumParams() == fn->getFunctionType()->getNumParams())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Replacing stale declaration '{}' with overloaded definition '{}'",
+                                  original_base_fn_name, llvm_fn_name);
+                        stale->replaceAllUsesWith(fn);
+                        ctx().unregister_function(stale);
+                        stale->eraseFromParent();
+                    }
+                }
+            }
         }
 
         // Register method return type (TypeRef) for cross-module extern declarations
