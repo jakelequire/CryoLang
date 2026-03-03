@@ -921,28 +921,93 @@ namespace Cryo::Codegen
             }
         }
         // When we have a distinct overload name (method has typed parameters),
-        // use it as the actual function name to prevent overload collisions.
-        // Save the original base name so we can clean up stale declarations later.
+        // check whether the base name (or unqualified base name) already has a
+        // compatible declaration stub that we should reuse. Only use the suffixed
+        // name for true overloads (i.e., when a DEFINITION already exists).
         std::string original_base_fn_name = llvm_fn_name;
         if (overload_name != llvm_fn_name)
         {
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "DeclarationCodegen: Using overloaded name '{}' instead of base '{}'",
-                      overload_name, llvm_fn_name);
+            bool use_overloaded = true; // default: use suffixed name
 
-            // Also register template annotations under the overloaded name
-            // (they were registered earlier under the base name)
-            if (template_registry)
-            {
-                std::string base_annotation = template_registry->get_method_return_type_annotation(llvm_fn_name);
-                if (!base_annotation.empty())
+            // Helper lambda: try to reuse or erase a stale stub at a given name.
+            // Returns the function to reuse (and sets use_overloaded=false), or null.
+            auto try_reuse_stub = [&](const std::string &check_name) -> llvm::Function * {
+                llvm::Function *existing = module()->getFunction(check_name);
+                if (!existing)
+                    return nullptr;
+
+                if (fn_type && existing->getFunctionType() == fn_type)
                 {
-                    template_registry->register_method_return_type_annotation(overload_name, base_annotation);
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Reusing '{}' (exact type match)", check_name);
+                    ensure_arg_names(existing);
+                    return existing;
                 }
-                template_registry->register_method_is_static(overload_name, is_static);
+                if (existing->isDeclaration() && fn_type &&
+                    existing->getFunctionType()->getNumParams() == fn_type->getNumParams())
+                {
+                    bool params_compatible = true;
+                    for (unsigned pi = 0; pi < fn_type->getNumParams(); ++pi)
+                    {
+                        llvm::Type *ep = existing->getFunctionType()->getParamType(pi);
+                        llvm::Type *np = fn_type->getParamType(pi);
+                        if (ep != np && !(ep->isPointerTy() && np->isPointerTy()))
+                        { params_compatible = false; break; }
+                    }
+                    if (params_compatible)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Reusing stub '{}' (compatible params)", check_name);
+                        ensure_arg_names(existing);
+                        return existing;
+                    }
+                }
+                // Stale stub with wrong params — erase if unused, keep base name
+                if (existing->isDeclaration() && fn_type && existing->use_empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Erasing stale stub '{}' (params {} -> {})",
+                              check_name, existing->getFunctionType()->getNumParams(),
+                              fn_type->getNumParams());
+                    existing->eraseFromParent();
+                    use_overloaded = false;
+                    llvm_fn_name = check_name; // create with this name
+                }
+                else if (!existing->isDeclaration())
+                {
+                    // Definition exists → true overload, must use suffixed name
+                }
+                return nullptr;
+            };
+
+            // Try namespace-qualified name first, then unqualified base name
+            if (llvm::Function *reused = try_reuse_stub(llvm_fn_name))
+                return reused;
+            if (base_method_name != llvm_fn_name)
+            {
+                if (llvm::Function *reused = try_reuse_stub(base_method_name))
+                    return reused;
             }
 
-            llvm_fn_name = overload_name;
+            if (use_overloaded)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Using overloaded name '{}' instead of base '{}'",
+                          overload_name, llvm_fn_name);
+
+                // Also register template annotations under the overloaded name
+                if (template_registry)
+                {
+                    std::string base_annotation = template_registry->get_method_return_type_annotation(llvm_fn_name);
+                    if (!base_annotation.empty())
+                    {
+                        template_registry->register_method_return_type_annotation(overload_name, base_annotation);
+                    }
+                    template_registry->register_method_is_static(overload_name, is_static);
+                }
+
+                llvm_fn_name = overload_name;
+            }
         }
 
         if (!fn_type)
