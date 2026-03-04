@@ -1529,8 +1529,10 @@ namespace Cryo
                                             }
 
                                             // Also fix the EXISTING entry: give it a qualified_name
-                                            // with its own overload suffix so pre_register_functions
-                                            // creates a correctly-named LLVM declaration for it too.
+                                            // so pre_register_functions creates a correctly-named
+                                            // LLVM declaration for it too. For 0-param overloads,
+                                            // use the base name (no suffix) so it stays distinct
+                                            // from the suffixed overload.
                                             if (existing_it->second.qualified_name.empty())
                                             {
                                                 auto *old_func_type = static_cast<const FunctionType *>(
@@ -1547,6 +1549,12 @@ namespace Cryo
                                                     old_suffix += ")";
                                                     existing_it->second.qualified_name = module_name + "::" +
                                                         qualified_method_name + old_suffix;
+                                                }
+                                                else
+                                                {
+                                                    // 0-param overload: set qualified_name without suffix
+                                                    existing_it->second.qualified_name = module_name + "::" +
+                                                        qualified_method_name;
                                                 }
                                             }
                                         }
@@ -2199,12 +2207,36 @@ namespace Cryo
                                         // Set qualified_name with LLVM-style overload suffix so that
                                         // pre_register_functions creates the correct LLVM function name
                                         // matching the stdlib definition (e.g., String::new(u64)).
-                                        // Only add suffix for methods with params — 0-arg methods don't
-                                        // have a suffix in the LLVM function name.
                                         if (new_func->param_count() > 0)
                                         {
                                             method_symbol.qualified_name = module_name + "::" +
                                                 qualified_method_name + "(" + suffix + ")";
+                                        }
+
+                                        // Also fix the EXISTING entry's qualified_name
+                                        if (existing_it->second.qualified_name.empty())
+                                        {
+                                            auto *old_func = static_cast<const FunctionType *>(
+                                                existing_it->second.type.get());
+                                            if (old_func && old_func->param_count() > 0)
+                                            {
+                                                std::string old_suffix = "(";
+                                                for (size_t pi = 0; pi < old_func->param_count(); ++pi)
+                                                {
+                                                    if (pi > 0) old_suffix += ",";
+                                                    auto &p = old_func->param_types()[pi];
+                                                    old_suffix += p.is_valid() ? p->display_name() : "?";
+                                                }
+                                                old_suffix += ")";
+                                                existing_it->second.qualified_name = module_name + "::" +
+                                                    qualified_method_name + old_suffix;
+                                            }
+                                            else
+                                            {
+                                                // 0-param overload: set qualified_name without suffix
+                                                existing_it->second.qualified_name = module_name + "::" +
+                                                    qualified_method_name;
+                                            }
                                         }
                                     }
                                 }
