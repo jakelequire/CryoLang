@@ -60,6 +60,9 @@ public:
     // -- Interned strings (lives for the entire compilation) --
     intern_table: InternTable;
 
+    // -- Type system (initialized lazily by TypeDeclaration pass) --
+    type_arena: TypeArena*;
+
 private:
     // Owned components (temp void* during development, typed structs later when created).
     // Initialized lazily by passes that need them.
@@ -101,6 +104,7 @@ public:
             provisions:     ProvisionSet::empty(),
             module_graph:   ModuleGraph::new(),
             intern_table:   InternTable::new(),
+            type_arena:     null,
 
             lexer:              null,
             parser:             null,
@@ -183,6 +187,12 @@ public:
             .display(&this.intern_table);
     }
 
+    /// Resolve an interned symbol and qualify it in one step.
+    /// Combines resolve_str() + qualify_name() — the most common pattern in passes.
+    qualify_symbol(&this, sym: SymbolStr) -> string {
+        return this.qualify_name(this.intern_table.resolve(sym));
+    }
+
     /// Build a structured QualifiedName: namespace + leaf.
     qualify(&this, leaf: string) -> QualifiedName {
         if (this.current_namespace.is_empty()) {
@@ -199,18 +209,17 @@ public:
     // ----------------------------------------------------------------
 
     /// Initialize the type system components (TypeArena, TypeChecker, TypeResolver).
-    /// Called by the TypeDeclaration pass.  Creates the TypeArena and stores it
-    /// in the TypedAST artifact where all downstream passes expect to find it.
+    /// Called by the TypeDeclaration pass.
     init_type_system(mut &this) -> void {
         LOG_DEBUG(LogComponent::General, "[CompilationContext] init_type_system()");
         // Ensure resolver is initialized (symbols live there now)
         this.init_resolver();
 
         // Create the TypeArena if it doesn't exist yet
-        if (this.artifacts.typed_ast.type_arena == null) {
+        if (this.type_arena == null) {
             mut arena: TypeArena* = malloc(sizeof(TypeArena));
             *arena = TypeArena::new();
-            this.artifacts.set_type_arena(arena);
+            this.type_arena = arena;
         }
 
         // Create the ModuleTypeRegistry if it doesn't exist yet
@@ -226,7 +235,7 @@ public:
         if (this.type_resolver == null) {
             mut tr: TypeResolver* = malloc(sizeof(TypeResolver));
             *tr = TypeResolver::with_registries(
-                this.artifacts.typed_ast.type_arena,
+                this.type_arena,
                 &this.intern_table,
                 this.generic_registry,
                 this.module_type_registry
@@ -258,11 +267,11 @@ public:
     init_generics(mut &this) -> void {
         LOG_DEBUG(LogComponent::General, "[CompilationContext] init_generics()");
         // Ensure type system is initialized — the arena must exist for generics
-        if (this.artifacts.typed_ast.type_arena == null) {
+        if (this.type_arena == null) {
             this.init_type_system();
         }
 
-        const arena: TypeArena* = this.artifacts.typed_ast.type_arena;
+        const arena: TypeArena* = this.type_arena;
 
         if (this.template_registry == null) {
             mut reg: TemplateRegistry* = malloc(sizeof(TemplateRegistry));
@@ -286,10 +295,6 @@ public:
             this.type_resolver.generic_registry = this.generic_registry;
         }
 
-        // Synchronize typed_ast artifact so passes can access registries
-        // from either ctx.* or ctx.artifacts.typed_ast.* consistently
-        this.artifacts.set_template_registry(this.template_registry);
-        this.artifacts.set_generic_registry(this.generic_registry);
     }
 
     /// Initialize the code generation backend.

@@ -1156,6 +1156,32 @@ namespace Cryo::Codegen
                             {
                                 field_type = llvm::PointerType::get(llvm_ctx(), 0);
                             }
+                            else
+                            {
+                                // Plain Named type (e.g., "NodeKind"). Check if it's a known
+                                // LLVM named struct; if not, it's likely an enum (i32).
+                                llvm::StructType *named_st =
+                                    llvm::StructType::getTypeByName(llvm_ctx(), ann_name);
+                                if (named_st)
+                                {
+                                    field_type = named_st;
+                                }
+                                else
+                                {
+                                    // Try arena lookup for enums
+                                    TypeRef ref = ctx().symbols().arena().lookup_type_by_name(ann_name);
+                                    if (ref.is_valid())
+                                        field_type = types().map(ref);
+                                    else
+                                    {
+                                        // Not a struct, not in arena — assume enum (i32)
+                                        field_type = llvm::Type::getInt32Ty(llvm_ctx());
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "Class field '{}': unresolved Named '{}' — assuming enum (i32)",
+                                                  field.name, ann_name);
+                                    }
+                                }
+                            }
                         }
                         // Case 3: Pointer annotation — in opaque-pointer mode, all pointers are ptr
                         else if (ann->kind == Cryo::TypeAnnotationKind::Pointer)
@@ -1170,6 +1196,20 @@ namespace Cryo::Codegen
                                       field.name, ann->to_string());
                         }
                         break;
+                    }
+                }
+                // If still unresolved, this is likely an inherited field whose type
+                // wasn't resolved. Try to get the type from the base class's LLVM struct.
+                if (!field_type && !node->base_class().empty())
+                {
+                    llvm::StructType *base_st =
+                        llvm::StructType::getTypeByName(llvm_ctx(), node->base_class());
+                    if (base_st && !base_st->isOpaque() && fi < base_st->getNumElements())
+                    {
+                        field_type = base_st->getElementType(fi);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Class field '{}' resolved from base '{}' element {} -> LLVM type",
+                                  field.name, node->base_class(), fi);
                     }
                 }
                 if (field_type)
@@ -1241,6 +1281,55 @@ namespace Cryo::Codegen
                                   field->name(), ann->to_string());
                     }
                 }
+                // If annotation-based resolution failed, try looking up as an enum type.
+                // Enums are i32 in Cryo, not i64.
+                if (!field_llvm_type && field->has_type_annotation())
+                {
+                    auto *ann = field->type_annotation();
+                    if (ann->kind == Cryo::TypeAnnotationKind::Named)
+                    {
+                        // First try the type system lookups
+                        TypeRef resolved_ref = ctx().symbols().lookup_enum_type(ann->name);
+                        if (!resolved_ref.is_valid())
+                            resolved_ref = ctx().symbols().arena().lookup_type_by_name(ann->name);
+                        if (resolved_ref.is_valid() && resolved_ref->kind() == Cryo::TypeKind::Enum)
+                        {
+                            field_llvm_type = llvm::Type::getInt32Ty(llvm_ctx());
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "Class field '{}' resolved as enum type '{}' -> i32",
+                                      field->name(), ann->name);
+                        }
+                        else if (resolved_ref.is_valid())
+                        {
+                            // Resolved to a non-enum type — try to map it
+                            field_llvm_type = types().map(resolved_ref);
+                        }
+                        else
+                        {
+                            // Type system lookup failed entirely.
+                            // Check if there's an LLVM named struct for this type.
+                            llvm::StructType *named_st =
+                                llvm::StructType::getTypeByName(llvm_ctx(), ann->name);
+                            if (named_st)
+                            {
+                                field_llvm_type = named_st;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "Class field '{}' resolved to LLVM named struct '{}'",
+                                          field->name(), ann->name);
+                            }
+                            else
+                            {
+                                // No LLVM struct type found — likely an enum (i32) since
+                                // structs/classes create named LLVM types but enums don't.
+                                field_llvm_type = llvm::Type::getInt32Ty(llvm_ctx());
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "Class field '{}': unresolved Named type '{}' — "
+                                          "assuming enum (i32)",
+                                          field->name(), ann->name);
+                            }
+                        }
+                    }
+                }
                 if (field_llvm_type)
                 {
                     field_types.push_back(field_llvm_type);
@@ -1253,11 +1342,12 @@ namespace Cryo::Codegen
             }
         }
 
-        // Ensure inherited fields are included in the LLVM struct layout.
-        // The StructFieldTypeSyncPass should flatten inherited fields into cryo_class->fields(),
-        // but this can fail for cross-module class hierarchies (base class in a different module).
-        // As a safety net, if we detect missing inherited fields, prepend them from the base
-        // class's already-built LLVM struct.
+        // Ensure inherited fields match the base class's actual LLVM layout.
+        // The ClassType's inherited fields may be incomplete if populate_type_fields_pass
+        // couldn't resolve all base class field types (e.g., cross-module enum types not
+        // yet registered when the base class was processed).  The base class's LLVM struct,
+        // however, IS correct because its codegen falls back to AST fields.
+        // Always rebuild from the base's LLVM type to guarantee correctness.
         if (!node->base_class().empty())
         {
             std::string base_name = node->base_class();
@@ -1265,20 +1355,27 @@ namespace Cryo::Codegen
             if (base_struct && !base_struct->isOpaque())
             {
                 unsigned base_elem_count = base_struct->getNumElements();
-                // Current field_types includes only own fields (+ possibly vtable).
-                // The base struct already has its own vtable + inherited fields.
-                // If our layout is smaller than the base, we're missing inherited fields.
-                if (field_types.size() < base_elem_count)
+
+                // Identify which fields in field_types are "own" (not inherited).
+                // The own fields are those declared directly on this class (node->fields()).
+                size_t own_field_count = node->fields().size();
+                size_t inherited_count = field_types.size() > own_field_count
+                                             ? field_types.size() - own_field_count
+                                             : 0;
+
+                // If the number of inherited fields we have doesn't match the base's
+                // element count, the ClassType's inherited fields are incomplete or wrong.
+                if (inherited_count != base_elem_count)
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "TypeCodegen: Class '{}' has {} elements but base '{}' has {} - prepending inherited fields",
-                              name, field_types.size(), base_name, base_elem_count);
+                              "TypeCodegen: Class '{}' has {} inherited fields but base '{}' has {} elements - rebuilding from base LLVM type",
+                              name, inherited_count, base_name, base_elem_count);
 
-                    // Rebuild: start with all base class elements, then append our own non-vtable fields
+                    // Rebuild: base class LLVM fields + own fields from the end of field_types
                     std::vector<llvm::Type *> full_fields;
                     std::vector<std::string> full_names;
 
-                    // Copy all elements from base struct (includes vtable + all inherited fields)
+                    // Copy all elements from base struct (correct layout)
                     for (unsigned i = 0; i < base_elem_count; ++i)
                         full_fields.push_back(base_struct->getElementType(i));
 
@@ -1286,25 +1383,24 @@ namespace Cryo::Codegen
                     auto &base_field_map = ctx().get_struct_field_indices(base_name);
                     if (!base_field_map.empty())
                     {
-                        // Reconstruct ordered names from the index map
                         full_names.resize(base_elem_count);
                         for (const auto &[fname, fidx] : base_field_map)
                             if (fidx < base_elem_count)
                                 full_names[fidx] = fname;
                     }
 
-                    // Append own fields (skip vtable pointer if we added one — it's already in base)
-                    unsigned own_start = needs_vtable ? 1 : 0;
-                    for (unsigned i = own_start; i < field_types.size(); ++i)
+                    // Append own fields (the last own_field_count entries in field_types)
+                    size_t own_start = field_types.size() - own_field_count;
+                    for (size_t i = own_start; i < field_types.size(); ++i)
                         full_fields.push_back(field_types[i]);
-                    for (unsigned i = 0; i < all_field_names.size(); ++i)
+                    for (size_t i = all_field_names.size() - own_field_count; i < all_field_names.size(); ++i)
                         full_names.push_back(all_field_names[i]);
 
                     field_types = std::move(full_fields);
                     all_field_names = std::move(full_names);
 
-                    // Update vtable flag — base already accounts for it
-                    needs_vtable = false; // Already included from base
+                    // Base already accounts for vtable
+                    needs_vtable = false;
                 }
             }
         }
