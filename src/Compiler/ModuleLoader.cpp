@@ -2609,7 +2609,7 @@ namespace Cryo
         }
 
         // Create FunctionType
-        return type_arena->get_function(return_type, parameter_types);
+        return type_arena->get_function(return_type, parameter_types, func_decl->is_variadic());
     }
 
     TypeRef ModuleLoader::create_function_type_from_declaration(const IntrinsicDeclarationNode *intrinsic_decl, TypeArena *type_arena)

@@ -1,8 +1,10 @@
 #include "LSP/Providers/HoverProvider.hpp"
+#include "LSP/Providers/ImplBlockCollector.hpp"
 #include "LSP/ASTSearchHelpers.hpp"
 #include "LSP/PositionFinder.hpp"
 #include "LSP/Transport.hpp"
 #include "Compiler/CompilerInstance.hpp"
+#include "Compiler/ModuleLoader.hpp"
 #include "AST/ASTVisitor.hpp"
 #include "Types/TypeAnnotation.hpp"
 #include "Lexer/lexer.hpp"
@@ -380,6 +382,10 @@ namespace CryoLSP
             auto *method = static_cast<Cryo::StructMethodNode *>(func);
             if (method->is_static())
                 sig += "static ";
+            if (method->is_virtual())
+                sig += "virtual ";
+            if (method->is_override())
+                sig += "override ";
         }
         else
         {
@@ -960,6 +966,64 @@ namespace CryoLSP
     }
 
     // ============================================================================
+    // Impl Block Methods for Hover
+    // ============================================================================
+
+    std::string HoverProvider::getImplMethodsHover(const std::string &type_name, Cryo::CompilerInstance *instance)
+    {
+        if (!instance)
+            return "";
+
+        ImplBlockCollector collector(type_name);
+        if (instance->ast_root())
+            collector.collect(instance->ast_root());
+        if (instance->module_loader())
+        {
+            for (const auto &[mod_name, mod_ast] : instance->module_loader()->get_imported_asts())
+            {
+                if (mod_ast)
+                    collector.collect_additional(mod_ast.get());
+            }
+        }
+
+        if (collector.methods.empty())
+            return "";
+
+        std::string result = "\n\n---\n\n**Methods:**\n```cryo\n";
+        for (const auto &entry : collector.methods)
+        {
+            auto *method = entry.method;
+            if (!method || method->is_destructor())
+                continue;
+
+            if (method->is_static())
+                result += "static ";
+            result += method->name() + "(";
+
+            bool first = true;
+            for (const auto &param : method->parameters())
+            {
+                if (!param)
+                    continue;
+                if (param->name() == "this")
+                    continue;
+                if (!first)
+                    result += ", ";
+                first = false;
+                result += param->name() + ": " + getParamTypeStr(param.get());
+            }
+            result += ")";
+
+            std::string ret = getReturnTypeStr(method);
+            if (!ret.empty())
+                result += " -> " + ret;
+            result += "\n";
+        }
+        result += "```";
+        return result;
+    }
+
+    // ============================================================================
     // Keyword Documentation
     // ============================================================================
 
@@ -1003,6 +1067,10 @@ namespace CryoLSP
             {"protected", {"protected", "A visibility modifier indicating that the following members are accessible within the same module and by subclasses (if inheritance is supported).\n\n**Example:**\n```cryo\ntype class Foo {\nprotected:\n    x: int,\n}\n```"}},
 
             {"as", {"as", "Used for type casting and renaming imports.\n\n**Example:**\n```cryo\nconst x: int = 42;\nconst y: f32 = x as f32; // Cast int to float\n\nimport math as m; // Rename import\n```"}},
+
+            {"virtual", {"virtual", "Marks a class method as virtual, enabling dynamic dispatch.\n\nVirtual methods can be overridden by subclasses. The call is resolved at runtime based on the actual object type.\n\n**Example:**\n```cryo\ntype class Animal {\npublic:\n    virtual speak(this) -> string {\n        return \"...\";\n    }\n}\n```"}},
+
+            {"override", {"override", "Marks a class method as overriding a virtual method from a parent class.\n\nThe method must match the signature of a virtual method in the base class. The compiler verifies the override is valid.\n\n**Example:**\n```cryo\ntype class Dog : Animal {\npublic:\n    override speak(this) -> string {\n        return \"Woof!\";\n    }\n}\n```"}},
         };
 
         auto it = keywords.find(keyword);
@@ -1612,9 +1680,10 @@ namespace CryoLSP
         if (found.kind == FoundNode::Kind::TypeReference && !found.identifier_name.empty())
         {
             hover_text = getPrimitiveTypeHover(found.identifier_name);
-            // If it's a primitive, return immediately
+            // If it's a primitive, return immediately (with impl methods appended)
             if (!hover_text.empty())
             {
+                hover_text += getImplMethodsHover(found.identifier_name, instance);
                 Hover hover;
                 hover.contents.kind = "markdown";
                 hover.contents.value = hover_text;
@@ -1642,6 +1711,7 @@ namespace CryoLSP
             hover_text = getPrimitiveTypeHover(found.identifier_name);
             if (!hover_text.empty())
             {
+                hover_text += getImplMethodsHover(found.identifier_name, instance);
                 Hover hover;
                 hover.contents.kind = "markdown";
                 hover.contents.value = hover_text;
@@ -1662,6 +1732,7 @@ namespace CryoLSP
             hover_text = getPrimitiveTypeHover(found.identifier_name);
             if (!hover_text.empty())
             {
+                hover_text += getImplMethodsHover(found.identifier_name, instance);
                 Hover hover;
                 hover.contents.kind = "markdown";
                 hover.contents.value = hover_text;
@@ -2382,6 +2453,8 @@ namespace CryoLSP
 
             // Strip generic arguments for lookups: "Array<Token>" -> "Array"
             std::string lookup_name = stripGenericArgs(found.identifier_name);
+            // Strip pointer/reference modifiers: "FloatType*" -> "FloatType"
+            lookup_name = stripTypeModifiers(lookup_name);
             // Parse concrete type args for generic substitution in hover display
             std::vector<std::string> type_args = parseGenericArgs(found.identifier_name);
 

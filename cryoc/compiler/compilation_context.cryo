@@ -17,12 +17,15 @@ import Compiler::ModuleGraph;
 import Compiler::Types;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Arena;
+import Compiler::Types::Registry;
+import Compiler::Types::Resolver;
 import Compiler::Types::TemplateRegistry;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Monomorphizer;
 import Compiler::AST::Specializer;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
+import Compiler::Resolver::QualifiedName;
 import Compiler::Resolver::Resolver;
 import Utils::Logger;
 
@@ -38,7 +41,7 @@ public:
     source_file:       string;
     include_paths:     string[];
     debug_mode:        boolean;
-    current_namespace: string;
+    current_namespace: QualifiedName;
 
     // -- Phase outputs (populated by passes) --
     artifacts: PhaseArtifacts;
@@ -63,17 +66,18 @@ private:
     lexer:              void*;
     parser:             void*;
     ast_context:        void*;
-    resolver:           Resolver*;
-    type_resolver:      TypeResolver*;
-    type_checker:       TypeChecker*;
-    generic_registry:   GenericRegistry*;
-    monomorphizer:      Monomorphizer*;
-    ast_specializer:    ASTSpecializer*;
-    template_registry:  TemplateRegistry*;
-    module_loader:      void*;
-    codegen:            void*;
-    linker:             void*;
-    directive_registry: void*;
+    resolver:               Resolver*;
+    type_resolver:          TypeResolver*;
+    type_checker:           TypeChecker*;
+    generic_registry:       GenericRegistry*;
+    monomorphizer:          Monomorphizer*;
+    ast_specializer:        ASTSpecializer*;
+    template_registry:      TemplateRegistry*;
+    module_type_registry:   ModuleTypeRegistry*;
+    module_loader:          void*;
+    codegen:                void*;
+    linker:                 void*;
+    directive_registry:     void*;
 
 public:
     /// Create a new compilation context for the given mode and source file.
@@ -88,7 +92,7 @@ public:
             source_file:       source_file,
             include_paths:     [],
             debug_mode:        false,
-            current_namespace: "",
+            current_namespace: QualifiedName::empty(),
 
             artifacts:      PhaseArtifacts::new(),
             diagnostics:    DiagnosticSink::new(),
@@ -107,8 +111,9 @@ public:
             generic_registry:   null,
             monomorphizer:      null,
             ast_specializer:    null,
-            template_registry:  null,
-            module_loader:      null,
+            template_registry:      null,
+            module_type_registry:   null,
+            module_loader:          null,
             codegen:            null,
             linker:             null,
             directive_registry: null,
@@ -144,6 +149,48 @@ public:
         return this.intern_table.resolve(sym);
     }
 
+    /// Get a pointer to the intern table.
+    /// Use this instead of &ctx.intern_table when accessing through an
+    /// inherited pointer (e.g. this.ctx in parser subclasses), where field
+    /// access through class hierarchies doesn't resolve correctly.
+    get_intern_table(mut &this) -> InternTable* {
+        return &this.intern_table;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Namespace helpers
+    // ----------------------------------------------------------------
+
+    /// Whether a namespace has been set for this compilation unit.
+    has_namespace(&this) -> boolean {
+        return !this.current_namespace.is_empty();
+    }
+
+    /// The namespace as a display string (for APIs that need strings).
+    namespace_display(&this) -> string {
+        return this.current_namespace.display(&this.intern_table);
+    }
+
+    /// Build a qualified display string: "Namespace::leaf" or just "leaf".
+    /// Replaces the repeated ternary pattern:
+    ///   ctx.current_namespace != "" ? ctx.current_namespace + "::" + leaf : leaf
+    qualify_name(&this, leaf: string) -> string {
+        if (this.current_namespace.is_empty()) {
+            return leaf;
+        }
+        return this.current_namespace.child(&this.intern_table, leaf)
+            .display(&this.intern_table);
+    }
+
+    /// Build a structured QualifiedName: namespace + leaf.
+    qualify(&this, leaf: string) -> QualifiedName {
+        if (this.current_namespace.is_empty()) {
+            return QualifiedName::single(&this.intern_table, leaf);
+        }
+        return this.current_namespace.child(&this.intern_table, leaf);
+    }
+
 
     // ----------------------------------------------------------------
     // Lazy component initialization
@@ -164,6 +211,27 @@ public:
             mut arena: TypeArena* = malloc(sizeof(TypeArena));
             *arena = TypeArena::new();
             this.artifacts.set_type_arena(arena);
+        }
+
+        // Create the ModuleTypeRegistry if it doesn't exist yet
+        if (this.module_type_registry == null) {
+            mut mtr: ModuleTypeRegistry* = malloc(sizeof(ModuleTypeRegistry));
+            *mtr = ModuleTypeRegistry::new();
+            this.module_type_registry = mtr;
+        }
+
+        // Create the TypeResolver with all available dependencies.
+        // GenericRegistry may be null at this point (initialized later by init_generics),
+        // but will be wired in when init_generics runs.
+        if (this.type_resolver == null) {
+            mut tr: TypeResolver* = malloc(sizeof(TypeResolver));
+            *tr = TypeResolver::with_registries(
+                this.artifacts.typed_ast.type_arena,
+                &this.intern_table,
+                this.generic_registry,
+                this.module_type_registry
+            );
+            this.type_resolver = tr;
         }
     }
 
@@ -210,6 +278,12 @@ public:
             mut spec: ASTSpecializer* = malloc(sizeof(ASTSpecializer));
             *spec = ASTSpecializer::new(arena, &this.intern_table);
             this.ast_specializer = spec;
+        }
+
+        // Wire GenericRegistry into the TypeResolver so resolve_generic()
+        // routes through the dedup cache instead of creating directly in the arena.
+        if (this.type_resolver != null && this.type_resolver.generic_registry == null) {
+            this.type_resolver.generic_registry = this.generic_registry;
         }
 
         // Synchronize typed_ast artifact so passes can access registries
@@ -318,7 +392,7 @@ public:
         this.artifacts.reset_for_next_module();
         this.provisions.clear();
         this.source_file = next_source;
-        this.current_namespace = "";
+        this.current_namespace = QualifiedName::empty();
 
         // Reset resolver cursor (preserves cross-module state)
         if (this.resolver != null) {

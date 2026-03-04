@@ -1,6 +1,8 @@
 #include "LSP/Providers/CompletionProvider.hpp"
+#include "LSP/Providers/ImplBlockCollector.hpp"
 #include "LSP/Transport.hpp"
 #include "Compiler/CompilerInstance.hpp"
+#include "Compiler/ModuleLoader.hpp"
 #include "AST/ASTVisitor.hpp"
 #include "Types/SymbolTable.hpp"
 #include "Types/TypeAnnotation.hpp"
@@ -71,72 +73,7 @@ namespace CryoLSP
         Cryo::ASTNode *_result = nullptr;
     };
 
-    // Collects ALL impl block methods/fields for a given target type name
-    class ImplBlockCollector : public Cryo::BaseASTVisitor
-    {
-    public:
-        ImplBlockCollector(const std::string &target) : _target(target) {}
-
-        struct MethodEntry
-        {
-            Cryo::StructMethodNode *method = nullptr;
-        };
-
-        struct FieldEntry
-        {
-            Cryo::StructFieldNode *field = nullptr;
-        };
-
-        void collect(Cryo::ASTNode *root)
-        {
-            methods.clear();
-            fields.clear();
-            if (root)
-                root->accept(*this);
-        }
-
-        void visit(Cryo::ProgramNode &node) override
-        {
-            for (const auto &child : node.statements())
-                if (child)
-                    child->accept(*this);
-        }
-
-        void visit(Cryo::DeclarationStatementNode &node) override
-        {
-            if (node.declaration())
-                node.declaration()->accept(*this);
-        }
-
-        void visit(Cryo::ImplementationBlockNode &node) override
-        {
-            // Strip generic params from target_type for matching (e.g., "Option<T>" -> "Option")
-            std::string target = node.target_type();
-            auto angle = target.find('<');
-            if (angle != std::string::npos)
-                target = target.substr(0, angle);
-
-            if (target != _target)
-                return;
-
-            for (const auto &method : node.method_implementations())
-            {
-                if (method)
-                    methods.push_back({method.get()});
-            }
-            for (const auto &field : node.field_implementations())
-            {
-                if (field)
-                    fields.push_back({field.get()});
-            }
-        }
-
-        std::vector<MethodEntry> methods;
-        std::vector<FieldEntry> fields;
-
-    private:
-        std::string _target;
-    };
+    // ImplBlockCollector is now in LSP/Providers/ImplBlockCollector.hpp
 
     // Deep AST walker to find a variable/parameter declaration and extract its type name.
     // This is needed because in LSP mode (parse-only), the symbol table doesn't contain
@@ -655,9 +592,17 @@ namespace CryoLSP
                 addMethodItem(method.get(), true); // skip static
         }
 
-        // Also collect from impl blocks for this type
+        // Also collect from impl blocks for this type (local + imported ASTs)
         ImplBlockCollector collector(baseTypeName);
         collector.collect(instance->ast_root());
+        if (instance->module_loader())
+        {
+            for (const auto &[mod_name, mod_ast] : instance->module_loader()->get_imported_asts())
+            {
+                if (mod_ast)
+                    collector.collect_additional(mod_ast.get());
+            }
+        }
         for (const auto &entry : collector.fields)
             addFieldItem(entry.field);
         for (const auto &entry : collector.methods)
@@ -786,9 +731,17 @@ namespace CryoLSP
             }
         }
 
-        // Also collect static methods from impl blocks
+        // Also collect static methods from impl blocks (local + imported ASTs)
         ImplBlockCollector collector(typeName);
         collector.collect(instance->ast_root());
+        if (instance->module_loader())
+        {
+            for (const auto &[mod_name, mod_ast] : instance->module_loader()->get_imported_asts())
+            {
+                if (mod_ast)
+                    collector.collect_additional(mod_ast.get());
+            }
+        }
         for (const auto &entry : collector.methods)
             addStaticMethodItem(entry.method);
     }

@@ -420,4 +420,37 @@ namespace CryoLSP
         return args;
     }
 
+    std::string stripTypeModifiers(const std::string &name)
+    {
+        std::string result = name;
+
+        // Strip trailing pointer asterisks: "FloatType**" -> "FloatType"
+        while (!result.empty() && result.back() == '*')
+            result.pop_back();
+
+        // Strip trailing array brackets: "int[]" -> "int", "int[10]" -> "int"
+        if (result.size() >= 2 && result.back() == ']')
+        {
+            auto open = result.rfind('[');
+            if (open != std::string::npos)
+                result = result.substr(0, open);
+        }
+
+        // Strip leading reference/mut: "&Type" -> "Type", "&mut Type" -> "Type"
+        if (!result.empty() && result[0] == '&')
+        {
+            result = result.substr(1);
+            if (result.substr(0, 4) == "mut ")
+                result = result.substr(4);
+        }
+
+        // Trim whitespace
+        while (!result.empty() && result[0] == ' ')
+            result = result.substr(1);
+        while (!result.empty() && result.back() == ' ')
+            result.pop_back();
+
+        return result;
+    }
+
 } // namespace CryoLSP

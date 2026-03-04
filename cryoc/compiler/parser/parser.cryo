@@ -15,6 +15,7 @@ import Compiler::AST::Declaration;
 import Compiler::AST::Pattern;
 import Compiler::CompilationContext;
 import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::QualifiedName;
 import Compiler::Parser::ParserBase;
 import Compiler::Parser::ExprParser;
 import Utils::Logger;
@@ -912,10 +913,10 @@ public:
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_import_declaration()");
         const start: Token = this.advance(); // consume 'import'
 
-        // Build module path: A::B::C
-        mut path: string = "";
+        // Build module path incrementally: A::B::C
+        mut qn: QualifiedName = QualifiedName::empty();
         const first_tok: Token = this.consume(TokenType::Identifier, "module name");
-        path = first_tok.lexeme;
+        qn.push(this.ctx.get_intern_table(), first_tok.lexeme);
 
         while (this.check(TokenType::ColonColon)) {
             this.advance();
@@ -924,7 +925,7 @@ public:
             if (next.kind == TokenType::Star) {
                 // Wildcard import: import A::B::*
                 this.advance();
-                path = path + "::*";
+                const path: string = qn.display(this.ctx.get_intern_table()) + "::*";
                 mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Wildcard, this.span_from_token(start));
                 this.consume(TokenType::Semicolon, "';'");
                 imp.span = this.span_from(start);
@@ -933,6 +934,7 @@ public:
             if (next.kind == TokenType::LBrace) {
                 // Selective import: import A::B::{X, Y}
                 this.advance(); // consume '{'
+                const path: string = qn.display(this.ctx.get_intern_table());
                 mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Specific, this.span_from_token(start));
                 while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
                     const item_tok: Token = this.consume(TokenType::Identifier, "import name");
@@ -944,10 +946,11 @@ public:
                 imp.span = this.span_from(start);
                 return imp;
             }
-            path = path + "::" + next.lexeme;
+            qn.push(this.ctx.get_intern_table(), next.lexeme);
             this.advance();
         }
 
+        const path: string = qn.display(this.ctx.get_intern_table());
         mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Wildcard, this.span_from_token(start));
 
         // Optional alias: import A::B as C
@@ -965,21 +968,21 @@ public:
     /// Parse a namespace declaration: namespace A::B;
     parse_namespace_declaration() -> ASTNode* {
         const start: Token = this.advance(); // consume 'namespace'
-        mut path: string = "";
+        mut qn: QualifiedName = QualifiedName::empty();
         const first_tok: Token = this.consume(TokenType::Identifier, "namespace name");
-        path = first_tok.lexeme;
+        qn.push(this.ctx.get_intern_table(), first_tok.lexeme);
 
         while (this.check(TokenType::ColonColon)) {
             this.advance();
             const next: Token = this.consume(TokenType::Identifier, "namespace segment");
-            path = path + "::" + next.lexeme;
+            qn.push(this.ctx.get_intern_table(), next.lexeme);
         }
 
         this.consume(TokenType::Semicolon, "';'");
 
         // Create a module declaration node representing the namespace
         const span: SourceSpan = this.span_from(start);
-        return new ModuleDeclNode(path, true, span);
+        return new ModuleDeclNode(qn.display(this.ctx.get_intern_table()), true, span);
     }
 
     /// Parse a module declaration: public module Name;
@@ -994,16 +997,17 @@ public:
         const name_tok: Token = this.consume(TokenType::Identifier, "module name");
 
         // Handle qualified module names: A::B
-        mut path: string = name_tok.lexeme;
+        mut qn: QualifiedName = QualifiedName::empty();
+        qn.push(this.ctx.get_intern_table(), name_tok.lexeme);
         while (this.check(TokenType::ColonColon)) {
             this.advance();
             const next: Token = this.consume(TokenType::Identifier, "module name segment");
-            path = path + "::" + next.lexeme;
+            qn.push(this.ctx.get_intern_table(), next.lexeme);
         }
 
         this.consume(TokenType::Semicolon, "';'");
         const span: SourceSpan = this.span_from(start);
-        return new ModuleDeclNode(path, is_public, span);
+        return new ModuleDeclNode(qn.display(this.ctx.get_intern_table()), is_public, span);
     }
 
     /// Parse an implementation block: implement enum/struct Name { methods }

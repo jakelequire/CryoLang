@@ -3129,11 +3129,11 @@ namespace Cryo
                                 .at(call));
                     }
                 }
-                else if (is_variadic_func && actual_count < expected_count)
+                else if (is_variadic_func && expected_count > 0 && actual_count < expected_count - 1)
                 {
                     std::ostringstream oss;
                     oss << "function '" << callee_name << "' expects at least "
-                        << expected_count << " argument(s), but "
+                        << (expected_count - 1) << " argument(s), but "
                         << actual_count << " were provided";
 
                     if (_compiler.diagnostics())
