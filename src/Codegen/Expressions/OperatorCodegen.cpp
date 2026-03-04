@@ -4268,15 +4268,31 @@ namespace Cryo::Codegen
                 return nullptr;
             }
 
-            // If the array came from a member access and the field is a pointer type
-            // (not an array type), we need to load the pointer value first.
-            // get_lvalue_address gives us the address of the pointer field; we must
-            // dereference it to get the actual array base pointer before indexing.
-            if (is_member_access_array && array_type && array_type->kind() == Cryo::TypeKind::Pointer)
+            // If the array came from a member access, `array_val` points to the field
+            // inside the parent struct.  We must dereference through the field to reach
+            // the actual element storage before indexing:
+            //   - TypeKind::Pointer  → the field IS the base pointer; load it.
+            //   - TypeKind::Array    → the field is an Array<T> struct whose first
+            //                          field (index 0) is the `T*` data pointer; GEP
+            //                          to field 0 then load the pointer.
+            if (is_member_access_array && array_type)
             {
-                array_val = builder().CreateLoad(builder().getPtrTy(), array_val, "ptr.load");
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "get_lvalue_address: Loaded pointer field before array indexing");
+                if (array_type->kind() == Cryo::TypeKind::Pointer)
+                {
+                    array_val = builder().CreateLoad(builder().getPtrTy(), array_val, "ptr.load");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "get_lvalue_address: Loaded pointer field before array indexing");
+                }
+                else if (array_type->kind() == Cryo::TypeKind::Array)
+                {
+                    // array_val points to the Array<T> struct { T* elements, i64 len, i64 cap }.
+                    // We need to load the elements pointer (field 0) to get the real T* base.
+                    // Field 0 is at byte offset 0, so we can load a ptr directly from array_val.
+                    array_val = builder().CreateLoad(
+                        builder().getPtrTy(), array_val, "arr.data.ptr");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "get_lvalue_address: Loaded Array<T>.elements pointer before indexing");
+                }
             }
 
             // Create GEP for array element access

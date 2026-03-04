@@ -61,7 +61,6 @@ type struct PassStats {
 type struct PassRegistry {
     passes:     PassID[];
     stats:      PassStats[];
-    provisions: ProvisionSet;
     validated:  boolean;
     verbose:    boolean;
 
@@ -69,7 +68,6 @@ type struct PassRegistry {
         return PassRegistry {
             passes:     [],
             stats:      [],
-            provisions: ProvisionSet::empty(),
             validated:  false,
             verbose:    false,
         };
@@ -155,10 +153,9 @@ type struct PassRegistry {
             this.stats[i].errors_emitted = result.errors_emitted;
             this.stats[i].warnings_emitted = result.warnings_emitted;
 
-            // Register provisions on success
+            // Register provisions on the context (single source of truth)
             if (result.success) {
                 for (mut j: int = 0; j < result.provisions.length; j++) {
-                    this.provisions.mark(result.provisions[j]);
                     ctx->provisions.mark(result.provisions[j]);
                 }
             }
@@ -208,7 +205,6 @@ type struct PassRegistry {
 
             if (result.success) {
                 for (mut j: int = 0; j < result.provisions.length; j++) {
-                    this.provisions.mark(result.provisions[j]);
                     ctx->provisions.mark(result.provisions[j]);
                 }
             }
@@ -221,9 +217,10 @@ type struct PassRegistry {
         return !ctx->diagnostics.has_errors();
     }
 
-    /// Reset provisions and stats for the next module in a batch.
+    /// Reset stats for the next module in a batch.
+    /// Provisions are tracked on CompilationContext and reset via
+    /// CompilationContext::reset_for_next_module().
     reset(mut &this) -> void {
-        this.provisions.clear();
         for (mut i: int = 0; i < this.stats.length; i++) {
             this.stats[i] = PassStats::new(this.passes[i]);
         }
@@ -472,7 +469,7 @@ function run_parsing_pass(ctx: CompilationContext*) -> PassResult {
 
     // Store the result in artifacts
     ctx.artifacts.ast = ASTOutput {
-        root:           root as void*,
+        root:           root,
         namespace_name: root.namespace_name,
     };
 
@@ -527,7 +524,7 @@ function run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
     // Initialize the TypeArena and related components
     ctx.init_type_system();
 
-    const arena: TypeArena* = ctx.artifacts.typed_ast.type_arena;
+    const arena: TypeArena* = ctx.type_arena;
     if (arena == null) {
         ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
             "TypeDeclaration: TypeArena was not created by init_type_system()");
@@ -535,7 +532,7 @@ function run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
     }
 
     // Get the AST root
-    const root: ProgramNode* = ctx.artifacts.ast.root as ProgramNode*;
+    const root: ProgramNode* = ctx.artifacts.ast.root;
     if (root == null) {
         if (ctx.debug_mode) {
             printf("[TypeDeclaration] No AST root available, skipping\n");
@@ -557,37 +554,28 @@ function run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
         match (stmt.kind) {
             NodeKind::StructDeclaration => {
                 const node: StructDeclNode* = stmt as StructDeclNode*;
-                const name_str: string = ctx.resolve_str(node.name);
-                const qualified: string = ctx.qualify_name(name_str);
-                arena.create_struct(qualified, module_name);
+                arena.create_struct(ctx.qualify_symbol(node.name), module_name);
                 type_count++;
             }
             NodeKind::EnumDeclaration => {
                 const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                const name_str: string = ctx.resolve_str(node.name);
-                const qualified: string = ctx.qualify_name(name_str);
-                arena.create_enum(qualified, module_name);
+                arena.create_enum(ctx.qualify_symbol(node.name), module_name);
                 type_count++;
             }
             NodeKind::ClassDeclaration => {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                const name_str: string = ctx.resolve_str(node.name);
-                const qualified: string = ctx.qualify_name(name_str);
-                arena.create_class(qualified, module_name);
+                arena.create_class(ctx.qualify_symbol(node.name), module_name);
                 type_count++;
             }
             NodeKind::TraitDeclaration => {
                 const node: TraitDeclNode* = stmt as TraitDeclNode*;
-                const name_str: string = ctx.resolve_str(node.name);
-                const qualified: string = ctx.qualify_name(name_str);
-                arena.create_trait(qualified, module_name);
+                arena.create_trait(ctx.qualify_symbol(node.name), module_name);
                 type_count++;
             }
             NodeKind::TypeAliasDeclaration => {
                 const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
-                const name_str: string = ctx.resolve_str(node.alias_name);
-                // Target type will be resolved in TypeResolution pass
-                arena.create_type_alias(name_str, TypeRef::invalid());
+                // Type aliases use unqualified name; target resolved in TypeResolution pass
+                arena.create_type_alias(ctx.resolve_str(node.alias_name), TypeRef::invalid());
                 type_count++;
             }
             _ => {
