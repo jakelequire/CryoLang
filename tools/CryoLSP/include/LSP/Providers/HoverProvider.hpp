@@ -9,6 +9,11 @@
 #include <string>
 #include <vector>
 
+namespace Cryo
+{
+    class CompilerInstance;
+}
+
 namespace CryoLSP
 {
 
@@ -48,6 +53,9 @@ namespace CryoLSP
 
         // Format hover for primitive type names (int, string, bool, etc.)
         static std::string getPrimitiveTypeHover(const std::string &type_name);
+
+        // Append impl block methods to hover text for a given type (searches imported ASTs)
+        static std::string getImplMethodsHover(const std::string &type_name, Cryo::CompilerInstance *instance);
 
         // Format hover for language keywords (struct, class, enum, etc.)
         static std::string getKeywordHover(const std::string &keyword);

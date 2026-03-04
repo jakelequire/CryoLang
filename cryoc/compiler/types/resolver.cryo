@@ -12,6 +12,9 @@ import Compiler::Diag;
 import Compiler::AST;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
+import Compiler::Resolver::QualifiedName;
+import Compiler::Types::GenericRegistry;
+import Compiler::Types::Registry;
 import Utils::Logger;
 
 
@@ -23,6 +26,7 @@ import Utils::Logger;
 type struct ResolutionContext {
     current_module:   string;
     source_file:      string;
+    import_modules:   string[];     // Modules imported by this compilation unit
     // TODO: Using a string array + parallel TypeRef array for generic bindings is a bit clunky;
     // consider a more structured approach.
     generic_bindings: string[];     // Parallel arrays: generic name → bound TypeRef
@@ -32,6 +36,7 @@ type struct ResolutionContext {
         return ResolutionContext {
             current_module:   current_module,
             source_file:      source_file,
+            import_modules:   [],
             generic_bindings: [],
             binding_refs:     [],
         };
@@ -60,13 +65,29 @@ type struct ResolutionContext {
 // ============================================================================
 
 type struct TypeResolver {
-    arena:        TypeArena*;
-    intern_table: InternTable*;
+    arena:            TypeArena*;
+    intern_table:     InternTable*;
+    generic_registry: GenericRegistry*;
+    module_registry:  ModuleTypeRegistry*;
 
     static new(arena: TypeArena*, intern_table: InternTable*) -> TypeResolver {
         return TypeResolver {
-            arena:        arena,
-            intern_table: intern_table,
+            arena:            arena,
+            intern_table:     intern_table,
+            generic_registry: null,
+            module_registry:  null,
+        };
+    }
+
+    /// Construct with full dependencies (preferred).
+    static with_registries(arena: TypeArena*, intern_table: InternTable*,
+                           generic_registry: GenericRegistry*,
+                           module_registry: ModuleTypeRegistry*) -> TypeResolver {
+        return TypeResolver {
+            arena:            arena,
+            intern_table:     intern_table,
+            generic_registry: generic_registry,
+            module_registry:  module_registry,
         };
     }
 
@@ -163,26 +184,57 @@ type struct TypeResolver {
 
     /// Resolve a named type (user-defined or generic binding).
     /// Accepts a SymbolStr, resolves to string for arena lookup.
+    ///
+    /// Fallback chain:
+    ///   1. Generic bindings (T → i32 from enclosing generic context)
+    ///   2. Arena direct lookup (types registered in this compilation unit)
+    ///   3. Module-qualified lookup (current_module::name)
+    ///   4. Module type registry (cross-module imports, public types only)
     resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*) -> TypeRef {
         const name_str: string = this.intern_table.resolve(name);
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_named() name='%s'", name_str);
 
-        // Check generic bindings first
+        // 1. Check generic bindings first
         mut binding: TypeRef = ctx.lookup_binding(name_str);
         if (binding.is_valid()) {
             return binding;
         }
 
-        // Look up in arena's user-defined caches
+        // 2. Look up in arena's user-defined caches
         mut found: TypeRef = this.arena.lookup_by_name(name_str);
         if (found.is_valid()) {
             return found;
         }
 
-        // Try qualified name with current module
+        // 3. Try qualified name with current module
         if (ctx.current_module != "") {
-            mut qualified: string = sprintf("%s::%s", ctx.current_module, name_str);
+            const mod_qn: QualifiedName = QualifiedName::parse(this.intern_table, ctx.current_module);
+            const full_qn: QualifiedName = mod_qn.child(this.intern_table, name_str);
+            const qualified: string = full_qn.display(this.intern_table);
             found = this.arena.lookup_by_name(qualified);
+            if (found.is_valid()) {
+                return found;
+            }
+        }
+
+        // 4. Try module type registry for cross-module imported types
+        if (this.module_registry != null) {
+            // First try direct lookup in the current module
+            if (ctx.current_module != "") {
+                found = this.module_registry.lookup_type(ctx.current_module, name_str);
+                if (found.is_valid()) {
+                    return found;
+                }
+            }
+
+            // Then try across all imported modules (public types only)
+            found = this.module_registry.lookup_type_in_imports(name_str, ctx.import_modules);
+            if (found.is_valid()) {
+                return found;
+            }
+
+            // Try type alias resolution
+            found = this.module_registry.lookup_alias(name_str);
             if (found.is_valid()) {
                 return found;
             }
@@ -215,6 +267,9 @@ type struct TypeResolver {
     }
 
     /// Resolve a generic type instantiation annotation.
+    /// Routes through GenericRegistry for deduplication when available,
+    /// ensuring the Monomorphizer can discover all instantiations via
+    /// collect_unmonomorphized().
     resolve_generic(&this, g: GenericAnnotation*, ctx: ResolutionContext*) -> TypeRef {
         mut base: TypeRef = this.resolve(g.base, ctx);
 
@@ -223,6 +278,12 @@ type struct TypeResolver {
             args.push(this.resolve(g.args[i], ctx));
         }
 
+        // Use GenericRegistry for dedup so the Monomorphizer sees all instantiations
+        if (this.generic_registry != null) {
+            return this.generic_registry.instantiate(base, args);
+        }
+
+        // Fallback: create directly in arena (no dedup, no mono tracking)
         return this.arena.create_instantiation(base, args);
     }
 }
