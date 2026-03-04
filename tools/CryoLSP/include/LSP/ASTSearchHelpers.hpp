@@ -153,4 +153,7 @@ namespace CryoLSP
     // Parse generic type arguments: "Array<Token, i32>" -> {"Token", "i32"}
     std::vector<std::string> parseGenericArgs(const std::string &name);
 
+    // Strip pointer/reference modifiers: "FloatType*" -> "FloatType", "&mut string" -> "string"
+    std::string stripTypeModifiers(const std::string &name);
+
 } // namespace CryoLSP

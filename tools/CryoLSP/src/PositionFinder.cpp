@@ -114,13 +114,30 @@ namespace CryoLSP
         if (!ann || ann->location.line() == 0)
             return false;
 
-        if (matchesPosition(ann->location, ann->name.size()))
+        // For simple types (Primitive, Named), match on the name directly
+        if (!ann->name.empty() && matchesPosition(ann->location, ann->name.size()))
         {
             _result.node = nullptr; // No AST node - identified by name
             _result.identifier_name = ann->name;
             _result.kind = FoundNode::Kind::TypeReference;
             return true;
         }
+
+        // For compound types (Pointer, Reference, Optional, Array), recurse into inner type
+        // e.g., `FloatType*` has kind=Pointer with inner=Named("FloatType")
+        if (ann->inner)
+        {
+            if (checkTypeAnnotation(ann->inner.get()))
+                return true;
+        }
+
+        // For Generic, also check the base type (inner) and type argument elements
+        for (const auto &elem : ann->elements)
+        {
+            if (checkTypeAnnotation(&elem))
+                return true;
+        }
+
         return false;
     }
 

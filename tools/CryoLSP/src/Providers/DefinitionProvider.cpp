@@ -211,7 +211,8 @@ namespace CryoLSP
             return std::nullopt;
 
         // Strip generic args for lookup: "Array<Token>" -> "Array"
-        std::string lookup_name = stripGenericArgs(found.identifier_name);
+        // Strip pointer/reference modifiers: "FloatType*" -> "FloatType"
+        std::string lookup_name = stripTypeModifiers(stripGenericArgs(found.identifier_name));
 
         using Kind = FoundNode::Kind;
 
