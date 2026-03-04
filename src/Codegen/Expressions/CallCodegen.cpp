@@ -5816,10 +5816,24 @@ namespace Cryo::Codegen
             {
                 bool is_string_method = false;
 
-                // Check method function name for string type methods
+                // Check if this is a method on the PRIMITIVE string type (char*),
+                // not the String STRUCT type. Extract the type name from the
+                // qualified method name:
+                //   "std::core::primitives::string::length" -> type = "string" (primitive)
+                //   "std::collections::string::String::length" -> type = "String" (struct)
                 std::string fn_name = method->getName().str();
-                if (fn_name.find("::string::") != std::string::npos)
-                    is_string_method = true;
+                {
+                    size_t last_sep = fn_name.rfind("::");
+                    if (last_sep != std::string::npos)
+                    {
+                        std::string before = fn_name.substr(0, last_sep);
+                        size_t type_sep = before.rfind("::");
+                        std::string type_name = (type_sep != std::string::npos)
+                            ? before.substr(type_sep + 2) : before;
+                        if (type_name == "string")
+                            is_string_method = true;
+                    }
+                }
 
                 // Also check AST type as a fallback
                 if (!is_string_method && callee && callee->object())

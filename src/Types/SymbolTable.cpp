@@ -355,7 +355,15 @@ namespace Cryo
             // (e.g., "Baz" when the module declares "namespace Baz::Qix"), so sym.name
             // could be "U::add" or "Baz::Bang::print" which don't match the definition.
             // The definition uses scope + "::" + base_name (e.g., "Utils::add", "Baz::Qix::Bang::print").
-            if (!symbol.scope.empty() && symbol.scope != "Global")
+            //
+            // IMPORTANT: If ModuleLoader already set qualified_name (e.g., with an overload
+            // suffix like "String::new(u64)"), preserve it — don't overwrite with the
+            // unsuffixed version.
+            if (!symbol.qualified_name.empty())
+            {
+                qualified_sym.qualified_name = symbol.qualified_name;
+            }
+            else if (!symbol.scope.empty() && symbol.scope != "Global")
             {
                 std::string scope_prefix = symbol.scope + "::";
                 if (base_name.substr(0, scope_prefix.size()) == scope_prefix)
