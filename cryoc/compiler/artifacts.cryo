@@ -8,10 +8,7 @@
 namespace Compiler::Artifacts;
 
 import Compiler::Lex;
-import Compiler::Types;
-import Compiler::Types::TemplateRegistry;
-import Compiler::Types::GenericRegistry;
-import Compiler::Resolver::Resolver;
+import Compiler::AST::Node;
 import Utils::Logger;
 
 
@@ -57,7 +54,7 @@ type struct TokenStream {
 
 /// The result of parsing a token stream into an AST.
 type struct ASTOutput {
-    root:           void*;     // ProgramNode* (typed once AST types exist)
+    root:           void*;     // ProgramNode* (void* for ABI stability — class pointers have different layout)
     namespace_name: string;
 
     static empty() -> ASTOutput {
@@ -70,34 +67,10 @@ type struct ASTOutput {
     is_valid(&this) -> boolean {
         return this.root != null;
     }
-}
 
-
-// ============================================================================
-// TypedAST — Output of Type Resolution + Semantic Analysis
-// TODO: (Placeholder) Removed after type system is implemented and AST can be fully typed and self-contained.
-// ============================================================================
-
-/// AST annotated with type information and populated registries.
-type struct TypedAST {
-    root:              void*;            // ProgramNode* with type annotations
-    type_arena:        TypeArena*;
-    resolver:          Resolver*;
-    template_registry: TemplateRegistry*;
-    generic_registry:  GenericRegistry*;
-
-    static empty() -> TypedAST {
-        return TypedAST {
-            root:              null,
-            type_arena:        null,
-            resolver:          null,
-            template_registry: null,
-            generic_registry:  null,
-        };
-    }
-
-    is_valid(&this) -> boolean {
-        return this.root != null;
+    /// Typed accessor for the AST root. Centralizes the single cast.
+    program(&this) -> ProgramNode* {
+        return this.root as ProgramNode*;
     }
 }
 
@@ -154,7 +127,6 @@ type struct LinkedOutput {
 type struct PhaseArtifacts {
     tokens:     TokenStream;
     ast:        ASTOutput;
-    typed_ast:  TypedAST;
     ir:         IROutput;
     linked:     LinkedOutput;
 
@@ -166,7 +138,6 @@ type struct PhaseArtifacts {
         return PhaseArtifacts {
             tokens:            TokenStream::empty(),
             ast:               ASTOutput::empty(),
-            typed_ast:         TypedAST::empty(),
             ir:                IROutput::empty(),
             linked:            LinkedOutput::empty(),
             preserved_asts:    [],
@@ -179,34 +150,8 @@ type struct PhaseArtifacts {
     reset_for_next_module(mut &this) -> void {
         this.tokens    = TokenStream::empty();
         this.ast       = ASTOutput::empty();
-        this.typed_ast = TypedAST::empty();
         this.ir        = IROutput::empty();
         this.linked    = LinkedOutput::empty();
-    }
-
-    // ----------------------------------------------------------------
-    // TypedAST field setters
-    // (Avoids 3-deep member assignment chains which codegen can't handle yet)
-    // ----------------------------------------------------------------
-
-    set_type_arena(mut &this, arena: TypeArena*) -> void {
-        LOG_DEBUG(LogComponent::General, "[Artifacts] set_type_arena()");
-        this.typed_ast.type_arena = arena;
-    }
-
-    set_resolver(mut &this, resolver: Resolver*) -> void {
-        LOG_DEBUG(LogComponent::General, "[Artifacts] set_resolver()");
-        this.typed_ast.resolver = resolver;
-    }
-
-    set_template_registry(mut &this, registry: TemplateRegistry*) -> void {
-        LOG_DEBUG(LogComponent::General, "[Artifacts] set_template_registry()");
-        this.typed_ast.template_registry = registry;
-    }
-
-    set_generic_registry(mut &this, registry: GenericRegistry*) -> void {
-        LOG_DEBUG(LogComponent::General, "[Artifacts] set_generic_registry()");
-        this.typed_ast.generic_registry = registry;
     }
 
     /// Save the current AST for cross-module template access in stdlib batch mode.

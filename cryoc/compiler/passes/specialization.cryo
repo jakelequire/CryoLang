@@ -33,146 +33,47 @@ import Utils::Logger;
 // Template registration helpers (free functions)
 // ============================================================================
 
-function register_struct_template(node: StructDeclNode*, registry: TemplateRegistry*,
-                                  arena: TypeArena*, ctx: CompilationContext*) -> void {
-    if (!node.is_generic()) { return; }
-    LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering struct template");
+/// Unified template registration for any generic declaration.
+/// Extracts generic parameter metadata, qualifies the name, looks up the
+/// base type in the arena, and registers a TemplateEntry.
+///
+/// `name` and `generic_params` are the common fields every generic
+/// declaration shares.  `ast_node` is the original declaration cast to
+/// ASTNode*.  `node_kind` identifies which declaration type it is.
+/// `lookup_base` controls whether the base type is looked up in the arena
+/// (true for types: struct/enum/class/trait) or left invalid (false for
+/// functions, which have no arena entry).
+function register_generic_template(name: SymbolStr, generic_params: GenericParamNode*[],
+                                   ast_node: ASTNode*, node_kind: NodeKind,
+                                   lookup_base: boolean,
+                                   registry: TemplateRegistry*, arena: TypeArena*,
+                                   ctx: CompilationContext*) -> void {
+    if (generic_params.length == 0) { return; }
 
-    const name_str: string = ctx.resolve_str(node.name);
+    const name_str: string = ctx.resolve_str(name);
+    const qualified: string = ctx.qualify_symbol(name);
+    LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering %s template '%s'",
+        node_kind.to_string(), name_str);
+
     mut param_names: string[] = [];
     mut param_type_ids: u64[] = [];
-    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-        const gp: GenericParamNode* = node.generic_params[i];
+    for (mut i: i64 = 0; i < generic_params.length; i++) {
+        const gp: GenericParamNode* = generic_params[i];
         const gp_name: string = ctx.resolve_str(gp.name);
         param_names = param_names + [gp_name];
         const param_ref: TypeRef = arena.create_generic_param(gp_name, i as u64);
         param_type_ids = param_type_ids + [param_ref.id];
     }
 
-    const qualified: string = ctx.qualify_name(name_str);
-
-    const base_type: TypeRef = arena.lookup_by_name(qualified);
-
-    const entry: TemplateEntry = TemplateEntry::new(
-        name_str, qualified, ctx.source_file,
-        param_names, param_type_ids,
-        node as ASTNode*, NodeKind::StructDeclaration,
-        base_type
-    );
-    registry.register(entry);
-}
-
-function register_enum_template(node: EnumDeclNode*, registry: TemplateRegistry*,
-                                arena: TypeArena*, ctx: CompilationContext*) -> void {
-    if (!node.is_generic()) { return; }
-    LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering enum template");
-
-    const name_str: string = ctx.resolve_str(node.name);
-    mut param_names: string[] = [];
-    mut param_type_ids: u64[] = [];
-    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-        const gp: GenericParamNode* = node.generic_params[i];
-        const gp_name: string = ctx.resolve_str(gp.name);
-        param_names = param_names + [gp_name];
-        const param_ref: TypeRef = arena.create_generic_param(gp_name, i as u64);
-        param_type_ids = param_type_ids + [param_ref.id];
+    mut base_type: TypeRef = TypeRef::invalid();
+    if (lookup_base) {
+        base_type = arena.lookup_by_name(qualified);
     }
 
-    const qualified: string = ctx.qualify_name(name_str);
-
-    const base_type: TypeRef = arena.lookup_by_name(qualified);
-
     const entry: TemplateEntry = TemplateEntry::new(
         name_str, qualified, ctx.source_file,
         param_names, param_type_ids,
-        node as ASTNode*, NodeKind::EnumDeclaration,
-        base_type
-    );
-    registry.register(entry);
-}
-
-function register_class_template(node: ClassDeclNode*, registry: TemplateRegistry*,
-                                 arena: TypeArena*, ctx: CompilationContext*) -> void {
-    if (!node.is_generic()) { return; }
-    LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering class template");
-
-    const name_str: string = ctx.resolve_str(node.name);
-    mut param_names: string[] = [];
-    mut param_type_ids: u64[] = [];
-    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-        const gp: GenericParamNode* = node.generic_params[i];
-        const gp_name: string = ctx.resolve_str(gp.name);
-        param_names = param_names + [gp_name];
-        const param_ref: TypeRef = arena.create_generic_param(gp_name, i as u64);
-        param_type_ids = param_type_ids + [param_ref.id];
-    }
-
-    const qualified: string = ctx.qualify_name(name_str);
-
-    const base_type: TypeRef = arena.lookup_by_name(qualified);
-
-    const entry: TemplateEntry = TemplateEntry::new(
-        name_str, qualified, ctx.source_file,
-        param_names, param_type_ids,
-        node as ASTNode*, NodeKind::ClassDeclaration,
-        base_type
-    );
-    registry.register(entry);
-}
-
-function register_function_template(node: FunctionDeclNode*, registry: TemplateRegistry*,
-                                    arena: TypeArena*, ctx: CompilationContext*) -> void {
-    if (!node.is_generic()) { return; }
-    LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering function template");
-
-    const name_str: string = ctx.resolve_str(node.name);
-    mut param_names: string[] = [];
-    mut param_type_ids: u64[] = [];
-    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-        const gp: GenericParamNode* = node.generic_params[i];
-        const gp_name: string = ctx.resolve_str(gp.name);
-        param_names = param_names + [gp_name];
-        const param_ref: TypeRef = arena.create_generic_param(gp_name, i as u64);
-        param_type_ids = param_type_ids + [param_ref.id];
-    }
-
-    const qualified: string = ctx.qualify_name(name_str);
-
-    const base_type: TypeRef = TypeRef::invalid();
-
-    const entry: TemplateEntry = TemplateEntry::new(
-        name_str, qualified, ctx.source_file,
-        param_names, param_type_ids,
-        node as ASTNode*, NodeKind::FunctionDeclaration,
-        base_type
-    );
-    registry.register(entry);
-}
-
-function register_trait_template(node: TraitDeclNode*, registry: TemplateRegistry*,
-                                 arena: TypeArena*, ctx: CompilationContext*) -> void {
-    if (!node.is_generic()) { return; }
-    LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering trait template");
-
-    const name_str: string = ctx.resolve_str(node.name);
-    mut param_names: string[] = [];
-    mut param_type_ids: u64[] = [];
-    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-        const gp: GenericParamNode* = node.generic_params[i];
-        const gp_name: string = ctx.resolve_str(gp.name);
-        param_names = param_names + [gp_name];
-        const param_ref: TypeRef = arena.create_generic_param(gp_name, i as u64);
-        param_type_ids = param_type_ids + [param_ref.id];
-    }
-
-    const qualified: string = ctx.qualify_name(name_str);
-
-    const base_type: TypeRef = arena.lookup_by_name(qualified);
-
-    const entry: TemplateEntry = TemplateEntry::new(
-        name_str, qualified, ctx.source_file,
-        param_names, param_type_ids,
-        node as ASTNode*, NodeKind::TraitDeclaration,
+        ast_node, node_kind,
         base_type
     );
     registry.register(entry);
@@ -214,7 +115,7 @@ type struct SpecializationPasses {
         ctx.init_generics();
 
         // Get the AST root
-        const root: ProgramNode* = ctx.artifacts.ast.root as ProgramNode*;
+        const root: ProgramNode* = ctx.artifacts.ast.root;
         if (root == null) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                            "TemplateRegistration: no AST root");
@@ -229,8 +130,8 @@ type struct SpecializationPasses {
             return PassResult::failure(1);
         }
 
-        // Get the arena from typed_ast
-        const arena: TypeArena* = ctx.artifacts.typed_ast.type_arena;
+        // Get the arena from context
+        const arena: TypeArena* = ctx.type_arena;
 
         // Walk top-level statements
         for (mut i: i64 = 0; i < root.statements.length; i++) {
@@ -239,19 +140,39 @@ type struct SpecializationPasses {
 
             match (stmt.kind) {
                 NodeKind::StructDeclaration => {
-                    register_struct_template(stmt as StructDeclNode*, registry, arena, ctx);
+                    const node: StructDeclNode* = stmt as StructDeclNode*;
+                    if (node.is_generic()) {
+                        register_generic_template(node.name, node.generic_params,
+                            stmt, NodeKind::StructDeclaration, true, registry, arena, ctx);
+                    }
                 }
                 NodeKind::EnumDeclaration => {
-                    register_enum_template(stmt as EnumDeclNode*, registry, arena, ctx);
+                    const node: EnumDeclNode* = stmt as EnumDeclNode*;
+                    if (node.is_generic()) {
+                        register_generic_template(node.name, node.generic_params,
+                            stmt, NodeKind::EnumDeclaration, true, registry, arena, ctx);
+                    }
                 }
                 NodeKind::ClassDeclaration => {
-                    register_class_template(stmt as ClassDeclNode*, registry, arena, ctx);
+                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                    if (node.is_generic()) {
+                        register_generic_template(node.name, node.generic_params,
+                            stmt, NodeKind::ClassDeclaration, true, registry, arena, ctx);
+                    }
                 }
                 NodeKind::FunctionDeclaration => {
-                    register_function_template(stmt as FunctionDeclNode*, registry, arena, ctx);
+                    const node: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                    if (node.is_generic()) {
+                        register_generic_template(node.name, node.generic_params,
+                            stmt, NodeKind::FunctionDeclaration, false, registry, arena, ctx);
+                    }
                 }
                 NodeKind::TraitDeclaration => {
-                    register_trait_template(stmt as TraitDeclNode*, registry, arena, ctx);
+                    const node: TraitDeclNode* = stmt as TraitDeclNode*;
+                    if (node.is_generic()) {
+                        register_generic_template(node.name, node.generic_params,
+                            stmt, NodeKind::TraitDeclaration, true, registry, arena, ctx);
+                    }
                 }
                 NodeKind::ImplementationBlock => {
                     register_impl_block(stmt as ImplBlockNode*, registry, ctx);
@@ -279,7 +200,7 @@ type struct SpecializationPasses {
         LOG_DEBUG(LogComponent::General, "[Monomorphization] Processing generic instantiations");
 
         // Get required components
-        const arena: TypeArena* = ctx.artifacts.typed_ast.type_arena;
+        const arena: TypeArena* = ctx.type_arena;
         if (arena == null) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                            "Monomorphization: no TypeArena");
@@ -341,7 +262,7 @@ type struct SpecializationPasses {
         }
 
         // Inject into ProgramNode
-        const root: ProgramNode* = ctx.artifacts.ast.root as ProgramNode*;
+        const root: ProgramNode* = ctx.artifacts.ast.root;
         if (root == null) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                            "GenericExpressionResolution: no AST root");

@@ -116,44 +116,30 @@ type struct CompilerInstance {
         };
     }
 
-    /// Compile a single source file with stdlib linking and prelude.
-    compile_file(&this, source: string) -> CompilationResult {
-        LOG_DEBUG(LogComponent::General, "[Compiler] compile_file: %s", source);
+    // ----------------------------------------------------------------
+    // Shared pipeline orchestration
+    // ----------------------------------------------------------------
 
-        if (this.config.debug) {
-            printf("[Compiler] Compiling: %s (mode: single-file)\n", source);
-        }
-
-        if (!File::exists(source)) {
-            printf("[Compiler] Error: File not found: %s\n", source);
-            return CompilationResult::failed(1, 0);
-        }
-
-        LOG_DEBUG(LogComponent::General, "[Compiler] Creating CompilationContext");
-        mut ctx: CompilationContext = CompilationContext::new(
-            CompileMode::SingleFile, source);
-        ctx.debug_mode = this.config.debug;
-
-        LOG_DEBUG(LogComponent::General, "[Compiler] Building standard pipeline");
-        mut pipeline: PassRegistry = PassRegistry::build_standard_pipeline();
-        LOG_DEBUG(LogComponent::General, "[Compiler] Pipeline built, setting verbose");
+    /// Run a pipeline on a context, handling AST dump, diagnostics, and
+    /// result construction.  All single-file compile_* methods delegate here.
+    run_pipeline(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
+                 output_path: string) -> CompilationResult {
         pipeline.set_verbose(this.config.verbose_passes);
 
-        LOG_DEBUG(LogComponent::General, "[Compiler] Validating pipeline");
         if (!pipeline.validate()) {
             LOG_DEBUG(LogComponent::General, "[Compiler] Pipeline validation FAILED");
             return CompilationResult::failed(1, 0);
         }
-        LOG_DEBUG(LogComponent::General, "[Compiler] Pipeline validated OK");
 
-        const success: boolean = pipeline.run_all(&ctx);
+        const success: boolean = pipeline.run_all(ctx);
+        printf("[DEBUG-CRASH] run_all returned, success=%d\n", success as int);
 
         // Dump AST if --ast was requested
-        LOG_DEBUG(LogComponent::AST, "[compile_file] read: ctx.artifacts.ast.root=%p, is_valid=%d",
-            ctx.artifacts.ast.root, ctx.artifacts.ast.is_valid() as int);
+        printf("[DEBUG-CRASH] checking show_ast=%d\n", this.config.show_ast as int);
+        printf("[DEBUG-CRASH] checking ast.is_valid=%d\n", ctx.artifacts.ast.is_valid() as int);
         if (this.config.show_ast && ctx.artifacts.ast.is_valid()) {
-            const ast_root: ProgramNode* = ctx.artifacts.ast.root as ProgramNode*;
-            LOG_DEBUG(LogComponent::AST, "[compile_file] cast root=%p, kind=%d", ast_root, ast_root.kind as int);
+            const ast_root: ProgramNode* = ctx.artifacts.ast.root;
+            printf("[DEBUG-CRASH] ast_root=%p\n", ast_root);
             ASTDumper::dump(ast_root, &ctx.intern_table);
         }
 
@@ -167,14 +153,37 @@ type struct CompilerInstance {
 
         if (this.config.debug) {
             printf("[Compiler] Finished: %s (%u errors, %u warnings)\n",
-                source, ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+                ctx.source_file, ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
 
         if (success) {
-            return CompilationResult::ok(ctx.artifacts.linked.object_file_path);
+            return CompilationResult::ok(output_path);
         }
         return CompilationResult::failed(
             ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+    }
+
+
+    // ----------------------------------------------------------------
+    // Public entry points
+    // ----------------------------------------------------------------
+
+    /// Compile a single source file with stdlib linking and prelude.
+    compile_file(&this, source: string) -> CompilationResult {
+        LOG_DEBUG(LogComponent::General, "[Compiler] compile_file: %s", source);
+        if (this.config.debug) {
+            printf("[Compiler] Compiling: %s (mode: single-file)\n", source);
+        }
+
+        if (!File::exists(source)) {
+            printf("[Compiler] Error: File not found: %s\n", source);
+            return CompilationResult::failed(1, 0);
+        }
+
+        mut ctx: CompilationContext = CompilationContext::new(CompileMode::SingleFile, source);
+        ctx.debug_mode = this.config.debug;
+        mut pipeline: PassRegistry = PassRegistry::build_standard_pipeline();
+        return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
     }
 
     /// Compile a single source file in raw mode (no stdlib, no prelude).
@@ -188,37 +197,10 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
 
-        mut ctx: CompilationContext = CompilationContext::new(
-            CompileMode::Raw, source);
+        mut ctx: CompilationContext = CompilationContext::new(CompileMode::Raw, source);
         ctx.debug_mode = this.config.debug;
-
         mut pipeline: PassRegistry = PassRegistry::build_raw_pipeline();
-        pipeline.set_verbose(this.config.verbose_passes);
-
-        if (!pipeline.validate()) {
-            return CompilationResult::failed(1, 0);
-        }
-
-        const success: boolean = pipeline.run_all(&ctx);
-
-        // Dump AST if --ast was requested
-        if (this.config.show_ast && ctx.artifacts.ast.is_valid()) {
-            ASTDumper::dump(ctx.artifacts.ast.root as ProgramNode*, &ctx.intern_table);
-        }
-
-        // Print diagnostic summary when errors occurred
-        if (ctx.diagnostics.has_errors()) {
-            if (ctx.diag_renderer != null) {
-                ctx.diag_renderer.print_summary(
-                    ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
-            }
-        }
-
-        if (success) {
-            return CompilationResult::ok(ctx.artifacts.linked.object_file_path);
-        }
-        return CompilationResult::failed(
-            ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+        return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
     }
 
     /// Compile for LSP: frontend + semantic analysis, no codegen.
@@ -227,48 +209,17 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
 
-        mut ctx: CompilationContext = CompilationContext::new(
-            CompileMode::Lsp, source);
-
+        mut ctx: CompilationContext = CompilationContext::new(CompileMode::Lsp, source);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
-        if (!pipeline.validate()) {
-            return CompilationResult::failed(1, 0);
-        }
-
-        const success: boolean = pipeline.run_all(&ctx);
-
-        // Dump AST if --ast was requested
-        if (this.config.show_ast && ctx.artifacts.ast.is_valid()) {
-            ASTDumper::dump(ctx.artifacts.ast.root as ProgramNode*, &ctx.intern_table);
-        }
-
-        if (success) {
-            return CompilationResult::ok("");
-        }
-        return CompilationResult::failed(
-            ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+        return this.run_pipeline(&ctx, &pipeline, "");
     }
 
     /// Compile for LSP from in-memory content (no file on disk).
     compile_for_lsp_content(&this, virtual_path: string, content: string) -> CompilationResult {
-        mut ctx: CompilationContext = CompilationContext::new(
-            CompileMode::Lsp, virtual_path);
-
-        // Set up in-memory source content in artifacts
+        mut ctx: CompilationContext = CompilationContext::new(CompileMode::Lsp, virtual_path);
         ctx.artifacts.tokens = TokenStream::new([], virtual_path, content);
-
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
-        if (!pipeline.validate()) {
-            return CompilationResult::failed(1, 0);
-        }
-
-        const success: boolean = pipeline.run_all(&ctx);
-
-        if (success) {
-            return CompilationResult::ok("");
-        }
-        return CompilationResult::failed(
-            ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+        return this.run_pipeline(&ctx, &pipeline, "");
     }
 
     /// Batch-compile the stdlib: iterate modules in dependency order,

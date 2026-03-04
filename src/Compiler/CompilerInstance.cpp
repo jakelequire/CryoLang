@@ -2187,6 +2187,19 @@ namespace Cryo
                                                  field->name(), struct_decl->name(), ann->to_string());
                                         field_type = TypeRef{};
                                     }
+
+                                    // Fallback: search the global TypeArena by name.
+                                    // This handles cross-namespace types that the scoped resolver can't find.
+                                    if (!field_type.is_valid() && ann->kind == TypeAnnotationKind::Named)
+                                    {
+                                        field_type = _ast_context->types().lookup_type_by_name(ann->name);
+                                        if (field_type.is_valid())
+                                        {
+                                            LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                                      "CompilerInstance: Resolved field '{}' in struct '{}' via global type lookup (type: '{}')",
+                                                      field->name(), struct_decl->name(), ann->name);
+                                        }
+                                    }
                                 }
                             }
 
@@ -2342,9 +2355,23 @@ namespace Cryo
                                     if (field_type.is_error())
                                     {
                                         LOG_WARN(Cryo::LogComponent::GENERAL,
-                                                 "CompilerInstance: Field '{}' in class '{}' still has unresolved type",
+                                                 "CompilerInstance: Field '{}' in class '{}' still has unresolved type, trying global lookup",
                                                  field->name(), class_decl->name());
                                         field_type = TypeRef{};
+                                    }
+
+                                    // Fallback: search the global TypeArena by name.
+                                    // This handles cross-namespace types (e.g., NodeKind from a parent namespace)
+                                    // that the scoped resolver can't find.
+                                    if (!field_type.is_valid() && ann->kind == TypeAnnotationKind::Named)
+                                    {
+                                        field_type = _ast_context->types().lookup_type_by_name(ann->name);
+                                        if (field_type.is_valid())
+                                        {
+                                            LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                                      "CompilerInstance: Resolved field '{}' in class '{}' via global type lookup (type: '{}')",
+                                                      field->name(), class_decl->name(), ann->name);
+                                        }
                                     }
                                 }
                             }
