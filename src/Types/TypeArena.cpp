@@ -1144,10 +1144,12 @@ namespace Cryo
                     return static_cast<int>(i);
             }
         }
-        // Fallback: caller has no overload suffix but vtable entry does
-        // (e.g., LLVM function name has no suffix but MethodInfo was registered with one).
-        // If there is exactly one vtable entry with this name, return it.
-        if (overload_suffix.empty())
+        // Fallback: match by name only when overload suffix doesn't match.
+        // This handles cases where:
+        //   - Caller has no suffix but vtable entry does (LLVM name lacks suffix)
+        //   - Caller has suffix but vtable entry has a differently-qualified one
+        //     (e.g., "(ExprVisitor*)" vs "(VisitorPattern::ExprVisitor*)")
+        // Safe when there is exactly one vtable entry with this name.
         {
             int found = -1;
             int count = 0;
