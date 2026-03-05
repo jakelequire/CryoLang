@@ -5791,15 +5791,9 @@ namespace Cryo::Codegen
                 if (last_sep != std::string::npos)
                     cryo_type = ctx().symbols().lookup_class_type(type_name.substr(last_sep + 2));
             }
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "Virtual dispatch check: type_name='{}', cryo_type valid={}, method='{}'",
-                      type_name, cryo_type.is_valid(), method_name);
             if (cryo_type.is_valid())
             {
                 auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "Virtual dispatch check: cryo_class={}, needs_vtable={}",
-                          (cryo_class != nullptr), cryo_class ? cryo_class->needs_vtable_pointer() : false);
                 if (cryo_class && cryo_class->needs_vtable_pointer())
                 {
                     // Extract overload suffix from the resolved method's LLVM name.
@@ -5822,9 +5816,6 @@ namespace Cryo::Codegen
                     }
 
                     int vtable_idx = cryo_class->vtable_index(method_name, vtable_overload_suffix);
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "Virtual dispatch: vtable_idx={}, method_name='{}', overload_suffix='{}'",
-                              vtable_idx, method_name, vtable_overload_suffix);
                     if (vtable_idx >= 0)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -5854,9 +5845,6 @@ namespace Cryo::Codegen
                             }
                         }
 
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "Virtual dispatch: class_llvm_type={} for '{}'",
-                                  (class_llvm_type != nullptr), type_name);
                         if (class_llvm_type)
                         {
                             llvm::Type *ptr_ty = llvm::PointerType::get(llvm_ctx(), 0);
@@ -5896,9 +5884,6 @@ namespace Cryo::Codegen
                                 }
                             }
 
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "Virtual dispatch: vtable_type={} (tried '{}')",
-                                      (vtable_type != nullptr), vtable_type_name);
                             if (vtable_type)
                             {
                                 // GEP into vtable for the method at vtable_idx

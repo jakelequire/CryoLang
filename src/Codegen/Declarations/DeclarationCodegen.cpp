@@ -2144,6 +2144,34 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Pattern 5: Brute-force scan for the current class when suffix matching
+            // fails (e.g., overload_suffix contains "<error: unresolved type: ...>").
+            // Search all functions for ones matching ClassName::methodName( or
+            // Namespace::ClassName::methodName(.
+            if (!fn)
+            {
+                // Try exact "ClassName::methodName" prefix match
+                std::vector<std::string> prefixes;
+                prefixes.push_back(class_name + "::" + entry.name);
+                if (!ns_context.empty())
+                    prefixes.push_back(ns_context + "::" + class_name + "::" + entry.name);
+
+                for (auto &F : module()->functions())
+                {
+                    std::string fname = F.getName().str();
+                    for (const auto &prefix : prefixes)
+                    {
+                        // Match either exact name or name followed by '(' (overloaded)
+                        if (fname == prefix || (fname.size() > prefix.size() && fname.substr(0, prefix.size()) == prefix && fname[prefix.size()] == '('))
+                        {
+                            fn = &F;
+                            break;
+                        }
+                    }
+                    if (fn) break;
+                }
+            }
+
             // A pure virtual method is one that is declared virtual but not override,
             // and has no body (LLVM function is a declaration-only stub).
             // Use null for these entries instead of the extern declaration.

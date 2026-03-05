@@ -4285,13 +4285,25 @@ namespace Cryo::Codegen
                 }
                 else if (array_type->kind() == Cryo::TypeKind::Array)
                 {
-                    // array_val points to the Array<T> struct { T* elements, i64 len, i64 cap }.
-                    // We need to load the elements pointer (field 0) to get the real T* base.
-                    // Field 0 is at byte offset 0, so we can load a ptr directly from array_val.
-                    array_val = builder().CreateLoad(
-                        builder().getPtrTy(), array_val, "arr.data.ptr");
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "get_lvalue_address: Loaded Array<T>.elements pointer before indexing");
+                    auto *arr_type = dynamic_cast<const Cryo::ArrayType *>(array_type.get());
+                    if (arr_type && arr_type->is_fixed_size())
+                    {
+                        // Fixed-size inline array (e.g., int[4]): the field IS the [N x T]
+                        // data in-place. No pointer load needed — array_val already points
+                        // to the first element.
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "get_lvalue_address: Fixed-size inline array field, no pointer load needed");
+                    }
+                    else
+                    {
+                        // Dynamic Array<T> struct { T* elements, i64 len, i64 cap }.
+                        // We need to load the elements pointer (field 0) to get the real T* base.
+                        // Field 0 is at byte offset 0, so we can load a ptr directly from array_val.
+                        array_val = builder().CreateLoad(
+                            builder().getPtrTy(), array_val, "arr.data.ptr");
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "get_lvalue_address: Loaded Array<T>.elements pointer before indexing");
+                    }
                 }
             }
 
