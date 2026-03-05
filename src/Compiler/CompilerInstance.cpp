@@ -2271,11 +2271,50 @@ namespace Cryo
                                 method->is_static());
                             mi.is_virtual = method->is_virtual();
                             mi.is_override = method->is_override();
+
+                            // Build overload suffix from parameter types for
+                            // overloaded virtual methods (e.g., visit(ProgramNode*) vs visit(ExpressionNode*)).
+                            // Skip the implicit 'this' parameter (first param for non-static methods).
+                            {
+                                std::string suffix = "(";
+                                bool first = true;
+                                for (const auto &param : method->parameters())
+                                {
+                                    if (!param) continue;
+                                    // Skip 'this' parameter
+                                    if (param->name() == "this") continue;
+
+                                    if (!first) suffix += ",";
+                                    first = false;
+
+                                    TypeRef param_type = param->get_resolved_type();
+                                    if (param_type.is_valid())
+                                    {
+                                        suffix += param_type->display_name();
+                                    }
+                                    else if (param->has_type_annotation())
+                                    {
+                                        suffix += param->type_annotation()->to_string();
+                                    }
+                                    else
+                                    {
+                                        suffix += "?";
+                                    }
+                                }
+                                suffix += ")";
+                                // Only set overload suffix if there are parameters
+                                // (avoids "()" suffix for parameterless methods)
+                                if (suffix != "()")
+                                {
+                                    mi.overload_suffix = suffix;
+                                }
+                            }
+
                             class_ptr->add_method(mi);
                             LOG_DEBUG(Cryo::LogComponent::GENERAL,
-                                      "CompilerInstance: Registered {} method '{}' on class '{}'",
+                                      "CompilerInstance: Registered {} method '{}{}' on class '{}'",
                                       method->is_virtual() ? "virtual" : "override",
-                                      method->name(), class_decl->name());
+                                      method->name(), mi.overload_suffix, class_decl->name());
                         }
                     }
 

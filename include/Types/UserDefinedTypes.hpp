@@ -43,6 +43,7 @@ namespace Cryo
     struct MethodInfo
     {
         std::string name;
+        std::string overload_suffix; // For overloaded methods: "(ParamType*)" etc.
         TypeRef function_type;   // FunctionType
         bool is_public = true;
         bool is_static = false;
@@ -51,6 +52,10 @@ namespace Cryo
 
         MethodInfo(std::string n, TypeRef ft, bool pub = true, bool stat = false)
             : name(std::move(n)), function_type(ft), is_public(pub), is_static(stat) {}
+
+        /// Unique key for vtable matching: name + overload_suffix.
+        /// Two methods match in the vtable iff their keys are equal.
+        std::string vtable_key() const { return overload_suffix.empty() ? name : name + overload_suffix; }
     };
 
     /**************************************************************************
@@ -212,8 +217,9 @@ namespace Cryo
 
         // Build the ordered vtable method list (base class methods first, overrides replace)
         std::vector<MethodInfo> build_vtable() const;
-        // Get the vtable index for a given method name, or -1 if not found
-        int vtable_index(const std::string &method_name) const;
+        // Get the vtable index for a given method name + overload suffix, or -1 if not found
+        int vtable_index(const std::string &method_name,
+                         const std::string &overload_suffix = "") const;
 
         // Type properties
         bool is_user_defined() const override { return true; }
