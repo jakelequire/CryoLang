@@ -1144,6 +1144,24 @@ namespace Cryo
                     return static_cast<int>(i);
             }
         }
+        // Fallback: caller has no overload suffix but vtable entry does
+        // (e.g., LLVM function name has no suffix but MethodInfo was registered with one).
+        // If there is exactly one vtable entry with this name, return it.
+        if (overload_suffix.empty())
+        {
+            int found = -1;
+            int count = 0;
+            for (size_t i = 0; i < vtable.size(); ++i)
+            {
+                if (vtable[i].name == method_name)
+                {
+                    found = static_cast<int>(i);
+                    ++count;
+                }
+            }
+            if (count == 1)
+                return found;
+        }
         return -1;
     }
 
