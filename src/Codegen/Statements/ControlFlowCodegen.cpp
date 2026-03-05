@@ -924,6 +924,46 @@ namespace Cryo::Codegen
                 }
                 else if (value->getType()->isPointerTy() && pattern_val->getType()->isPointerTy())
                 {
+                    // Check if either operand is a string constant — if so, use
+                    // strcmp for content comparison instead of pointer equality.
+                    auto is_string_constant = [](llvm::Value *v) -> bool
+                    {
+                        if (auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(v))
+                            return gv->isConstant() && gv->hasInitializer() &&
+                                   gv->getInitializer()->getType()->isArrayTy();
+                        if (auto *gep = llvm::dyn_cast<llvm::GEPOperator>(v))
+                        {
+                            if (auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(gep->getPointerOperand()))
+                                return gv->isConstant() && gv->hasInitializer() &&
+                                       gv->getInitializer()->getType()->isArrayTy();
+                        }
+                        if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(v))
+                        {
+                            if (ce->getOpcode() == llvm::Instruction::GetElementPtr)
+                            {
+                                if (auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(ce->getOperand(0)))
+                                    return gv->isConstant() && gv->hasInitializer() &&
+                                           gv->getInitializer()->getType()->isArrayTy();
+                            }
+                        }
+                        return false;
+                    };
+
+                    if (is_string_constant(value) || is_string_constant(pattern_val))
+                    {
+                        // String match: use strcmp == 0
+                        llvm::FunctionCallee strcmp_fn = module()->getOrInsertFunction(
+                            "strcmp",
+                            llvm::FunctionType::get(
+                                llvm::Type::getInt32Ty(llvm_ctx()),
+                                {llvm::PointerType::get(llvm_ctx(), 0),
+                                 llvm::PointerType::get(llvm_ctx(), 0)},
+                                false));
+                        llvm::Value *cmp_result = builder().CreateCall(strcmp_fn, {value, pattern_val}, "strcmp.result");
+                        llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0);
+                        return builder().CreateICmpEQ(cmp_result, zero, "pattern.str.eq");
+                    }
+
                     return builder().CreateICmpEQ(value, pattern_val, "pattern.match");
                 }
             }
