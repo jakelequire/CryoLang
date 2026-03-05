@@ -5385,9 +5385,26 @@ namespace Cryo::Codegen
                 std::string type_str;
                 TypeRef arg_type = node->arguments()[i]->get_resolved_type();
 
+                // For 'this' identifiers without resolved type, use the enclosing
+                // class/struct type name.  This is critical for overloaded virtual
+                // methods like visitor.visit(this) where 'this' type determines
+                // which visit() overload to call.
+                if (!arg_type.is_valid())
+                {
+                    auto *id_node = dynamic_cast<Cryo::IdentifierNode *>(node->arguments()[i].get());
+                    if (id_node && id_node->name() == "this")
+                    {
+                        const std::string &current_type = ctx().current_type_name();
+                        if (!current_type.empty())
+                        {
+                            type_str = current_type + "*";
+                        }
+                    }
+                }
+
                 // For cast expressions (e.g., `node as ProgramNode*`), use the cast's
                 // target type for overload disambiguation instead of the original type.
-                if (!arg_type.is_valid())
+                if (!arg_type.is_valid() && type_str.empty())
                 {
                     auto *cast_expr = dynamic_cast<Cryo::CastExpressionNode *>(node->arguments()[i].get());
                     if (cast_expr)
@@ -5734,7 +5751,26 @@ namespace Cryo::Codegen
                 auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
                 if (cryo_class && cryo_class->needs_vtable_pointer())
                 {
-                    int vtable_idx = cryo_class->vtable_index(method_name);
+                    // Extract overload suffix from the resolved method's LLVM name.
+                    // E.g., "ASTVisitor::visit(ProgramNode*)" → "(ProgramNode*)"
+                    std::string vtable_overload_suffix;
+                    if (method)
+                    {
+                        std::string fn_name = method->getName().str();
+                        // Find the method name boundary — after the last "::"
+                        size_t last_sep2 = fn_name.rfind("::");
+                        if (last_sep2 != std::string::npos)
+                        {
+                            std::string after_sep = fn_name.substr(last_sep2 + 2);
+                            size_t paren = after_sep.find('(');
+                            if (paren != std::string::npos)
+                            {
+                                vtable_overload_suffix = after_sep.substr(paren);
+                            }
+                        }
+                    }
+
+                    int vtable_idx = cryo_class->vtable_index(method_name, vtable_overload_suffix);
                     if (vtable_idx >= 0)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
