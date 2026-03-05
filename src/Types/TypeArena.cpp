@@ -1095,16 +1095,19 @@ namespace Cryo
             }
         }
 
-        // Add or override with this class's virtual/override methods
+        // Add or override with this class's virtual/override methods.
+        // Match by vtable_key() (name + overload_suffix) so that overloaded
+        // methods like visit(ProgramNode*) and visit(ExpressionNode*) get
+        // separate vtable slots.
         for (const auto &method : _methods)
         {
             if (method.is_virtual || method.is_override)
             {
-                // Check if this overrides an existing entry
+                std::string key = method.vtable_key();
                 bool found = false;
                 for (auto &entry : vtable)
                 {
-                    if (entry.name == method.name)
+                    if (entry.vtable_key() == key)
                     {
                         entry = method; // Override
                         found = true;
@@ -1121,13 +1124,25 @@ namespace Cryo
         return vtable;
     }
 
-    int ClassType::vtable_index(const std::string &method_name) const
+    int ClassType::vtable_index(const std::string &method_name,
+                                const std::string &overload_suffix) const
     {
         auto vtable = build_vtable();
+        // Build the key the same way MethodInfo::vtable_key() does
+        std::string key = overload_suffix.empty() ? method_name : method_name + overload_suffix;
         for (size_t i = 0; i < vtable.size(); ++i)
         {
-            if (vtable[i].name == method_name)
+            if (vtable[i].vtable_key() == key)
                 return static_cast<int>(i);
+        }
+        // Fallback: try matching by name only (for non-overloaded methods)
+        if (!overload_suffix.empty())
+        {
+            for (size_t i = 0; i < vtable.size(); ++i)
+            {
+                if (vtable[i].name == method_name && vtable[i].overload_suffix.empty())
+                    return static_cast<int>(i);
+            }
         }
         return -1;
     }

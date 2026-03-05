@@ -2040,19 +2040,37 @@ namespace Cryo::Codegen
         {
             vtable_field_types.push_back(ptr_ty);
 
-            // Look up the actual LLVM function for this method
-            // Try multiple name patterns: unqualified, namespace-qualified
+            // Look up the actual LLVM function for this method.
+            // For overloaded methods, the LLVM function name includes the
+            // overload suffix, e.g., "ASTVisitor::visit(ProgramNode*)".
             llvm::Function *fn = nullptr;
 
-            // Pattern 1: ClassName::methodName
-            std::string fn_name = class_name + "::" + entry.name;
+            // Build method name with overload suffix
+            std::string method_with_suffix = entry.overload_suffix.empty()
+                ? entry.name
+                : entry.name + entry.overload_suffix;
+
+            // Pattern 1: ClassName::methodName or ClassName::methodName(Suffix)
+            std::string fn_name = class_name + "::" + method_with_suffix;
             fn = module()->getFunction(fn_name);
 
-            // Pattern 2: Namespace::ClassName::methodName
+            // Pattern 1b: Without suffix (fallback for non-overloaded)
+            if (!fn && !entry.overload_suffix.empty())
+            {
+                fn_name = class_name + "::" + entry.name;
+                fn = module()->getFunction(fn_name);
+            }
+
+            // Pattern 2: Namespace::ClassName::methodName(Suffix)
             if (!fn && !ns_context.empty())
             {
-                std::string qualified_fn = ns_context + "::" + class_name + "::" + entry.name;
+                std::string qualified_fn = ns_context + "::" + class_name + "::" + method_with_suffix;
                 fn = module()->getFunction(qualified_fn);
+                if (!fn && !entry.overload_suffix.empty())
+                {
+                    qualified_fn = ns_context + "::" + class_name + "::" + entry.name;
+                    fn = module()->getFunction(qualified_fn);
+                }
             }
 
             // If not found with class name, walk the inheritance chain to find
@@ -2062,14 +2080,24 @@ namespace Cryo::Codegen
                 auto *walk = dynamic_cast<const Cryo::ClassType *>(cryo_class->base_class().get());
                 while (walk && !fn)
                 {
-                    // Try unqualified base name
-                    std::string base_fn = walk->name() + "::" + entry.name;
+                    // Try with overload suffix first, then plain name
+                    std::string base_fn = walk->name() + "::" + method_with_suffix;
                     fn = module()->getFunction(base_fn);
+                    if (!fn && !entry.overload_suffix.empty())
+                    {
+                        base_fn = walk->name() + "::" + entry.name;
+                        fn = module()->getFunction(base_fn);
+                    }
                     // Try namespace-qualified base name
                     if (!fn && !ns_context.empty())
                     {
-                        std::string qualified_base = ns_context + "::" + walk->name() + "::" + entry.name;
+                        std::string qualified_base = ns_context + "::" + walk->name() + "::" + method_with_suffix;
                         fn = module()->getFunction(qualified_base);
+                        if (!fn && !entry.overload_suffix.empty())
+                        {
+                            qualified_base = ns_context + "::" + walk->name() + "::" + entry.name;
+                            fn = module()->getFunction(qualified_base);
+                        }
                     }
                     walk = walk->has_base_class()
                                ? dynamic_cast<const Cryo::ClassType *>(walk->base_class().get())
