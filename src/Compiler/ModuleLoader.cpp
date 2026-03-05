@@ -1810,6 +1810,81 @@ namespace Cryo
                         }
                     }
 
+                    // Register virtual/override methods on the ClassType so that
+                    // needs_vtable_pointer() returns true and codegen emits vtables.
+                    // This mirrors CompilerInstance::populate_type_fields_pass logic.
+                    if (class_type.is_valid())
+                    {
+                        auto *class_ptr = const_cast<ClassType *>(dynamic_cast<const ClassType *>(class_type.get()));
+                        if (class_ptr)
+                        {
+                            for (const auto &method : class_decl->methods())
+                            {
+                                if (method && (method->is_virtual() || method->is_override()))
+                                {
+                                    MethodInfo mi(
+                                        method->name(),
+                                        method->get_resolved_return_type(),
+                                        (method->visibility() == Visibility::Public),
+                                        method->is_static());
+                                    mi.is_virtual = method->is_virtual();
+                                    mi.is_override = method->is_override();
+
+                                    // Build overload suffix from parameter types for
+                                    // overloaded virtual methods (e.g., visit(ProgramNode*) vs visit(ExpressionNode*)).
+                                    {
+                                        std::string suffix = "(";
+                                        bool first = true;
+                                        for (const auto &param : method->parameters())
+                                        {
+                                            if (!param) continue;
+                                            if (param->name() == "this") continue;
+
+                                            if (!first) suffix += ",";
+                                            first = false;
+
+                                            TypeRef param_type = param->get_resolved_type();
+                                            if (param_type.is_valid() && !param_type.is_error())
+                                            {
+                                                suffix += param_type->display_name();
+                                            }
+                                            else if (param->has_type_annotation())
+                                            {
+                                                suffix += param->type_annotation()->to_string();
+                                            }
+                                            else
+                                            {
+                                                suffix += "?";
+                                            }
+                                        }
+                                        suffix += ")";
+                                        if (suffix != "()")
+                                        {
+                                            mi.overload_suffix = suffix;
+                                        }
+                                    }
+
+                                    class_ptr->add_method(mi);
+                                    LOG_DEBUG(LogComponent::GENERAL,
+                                              "ModuleLoader: Registered {} method '{}{}' on class '{}'",
+                                              method->is_virtual() ? "virtual" : "override",
+                                              method->name(), mi.overload_suffix, class_decl->name());
+                                }
+                            }
+
+                            // Detect abstract class
+                            bool is_abstract = false;
+                            for (const auto &method : class_decl->methods())
+                            {
+                                if (method && method->is_virtual() && !method->body())
+                                {
+                                    is_abstract = true;
+                                }
+                            }
+                            class_ptr->set_abstract(is_abstract);
+                        }
+                    }
+
                     // Create type symbol for class (with proper type if non-generic)
                     Symbol symbol(class_decl->name(), SymbolKind::Type, class_type, module_id, class_decl->location());
                     symbol.scope = module_name;

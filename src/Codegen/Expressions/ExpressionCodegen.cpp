@@ -1894,9 +1894,9 @@ namespace Cryo::Codegen
                                     for (const auto &candidate : candidates)
                                     {
                                         const auto *field_info = template_reg->get_struct_field_types(candidate);
-                                        if (field_info && field_idx < field_info->field_types.size())
+                                        if (field_info)
                                         {
-                                            TypeRef cryo_field_type = field_info->field_types[field_idx];
+                                            TypeRef cryo_field_type = field_info->get_field_type(member_access->member());
                                             if (cryo_field_type && cryo_field_type->kind() == TypeKind::Pointer)
                                             {
                                                 auto *ptr_type = static_cast<const Cryo::PointerType *>(cryo_field_type.get());
@@ -2495,9 +2495,9 @@ namespace Cryo::Codegen
                                     for (const auto &candidate : candidates)
                                     {
                                         const auto *field_info = template_reg->get_struct_field_types(candidate);
-                                        if (field_info && field_idx < field_info->field_types.size())
+                                        if (field_info)
                                         {
-                                            TypeRef cryo_field_type = field_info->field_types[field_idx];
+                                            TypeRef cryo_field_type = field_info->get_field_type(member_access->member());
                                             if (cryo_field_type && cryo_field_type->kind() == TypeKind::Pointer)
                                             {
                                                 auto *ptr_type = static_cast<const Cryo::PointerType *>(cryo_field_type.get());
@@ -2577,9 +2577,9 @@ namespace Cryo::Codegen
                                         for (const auto &candidate : candidates)
                                         {
                                             const auto *field_info = template_reg->get_struct_field_types(candidate);
-                                            if (field_info && field_idx < field_info->field_types.size())
+                                            if (field_info)
                                             {
-                                                TypeRef cryo_field_type = field_info->field_types[field_idx];
+                                                TypeRef cryo_field_type = field_info->get_field_type(member_access->member());
                                                 if (cryo_field_type && cryo_field_type->kind() == TypeKind::Array)
                                                 {
                                                     auto *arr = static_cast<const Cryo::ArrayType *>(cryo_field_type.get());
@@ -4027,25 +4027,15 @@ namespace Cryo::Codegen
                                 const auto *field_info = template_reg->get_struct_field_types(candidate);
                                 if (field_info)
                                 {
-                                    // outer_field_idx is the LLVM struct index (includes vtable pointer).
-                                    // TemplateRegistry stores logical fields only (no vtable).
-                                    // Adjust by checking if the outer type has a vtable offset.
-                                    unsigned logical_idx = outer_field_idx;
-                                    // Check for vtable offset: if outer_struct's element 0 is a pointer
-                                    // and field_info has fewer entries than outer_struct elements
-                                    if (outer_struct && outer_field_idx > 0 &&
-                                        outer_struct->getNumElements() > field_info->field_types.size())
+                                    // Use name-based lookup to avoid vtable pointer offset mismatch:
+                                    // outer_field_idx is a GEP index (may include vtable pointer),
+                                    // but field_info->field_types is indexed by logical field order.
+                                    obj_type = field_info->get_field_type(member_access->member());
+                                    if (obj_type.is_valid())
                                     {
-                                        logical_idx = outer_field_idx - (outer_struct->getNumElements() - field_info->field_types.size());
-                                    }
-
-                                    if (logical_idx < field_info->field_types.size())
-                                    {
-                                        obj_type = field_info->field_types[logical_idx];
                                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                  "resolve_member_info: Resolved nested member '{}' type to '{}' via TemplateRegistry (llvm_idx={}, logical_idx={})",
-                                                  member_access->member(), obj_type ? obj_type->display_name() : "<null>",
-                                                  outer_field_idx, logical_idx);
+                                                  "resolve_member_info: Resolved nested member '{}' type to '{}' via TemplateRegistry (by name)",
+                                                  member_access->member(), obj_type->display_name());
                                         break;
                                     }
                                 }
@@ -4167,13 +4157,16 @@ namespace Cryo::Codegen
                                         for (const auto &candidate : candidates)
                                         {
                                             const auto *field_info = template_reg->get_struct_field_types(candidate);
-                                            if (field_info && arr_field_idx < field_info->field_types.size())
+                                            if (field_info)
                                             {
-                                                array_type = field_info->field_types[arr_field_idx];
-                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                          "resolve_member_info: Resolved array field '{}' type to '{}' via current_type_name",
-                                                          arr_member->member(), array_type ? array_type->display_name() : "<null>");
-                                                break;
+                                                array_type = field_info->get_field_type(arr_member->member());
+                                                if (array_type.is_valid())
+                                                {
+                                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                              "resolve_member_info: Resolved array field '{}' type to '{}' via current_type_name",
+                                                              arr_member->member(), array_type->display_name());
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -4251,13 +4244,16 @@ namespace Cryo::Codegen
                                     for (const auto &candidate : candidates)
                                     {
                                         const auto *field_info = template_reg->get_struct_field_types(candidate);
-                                        if (field_info && arr_field_idx < field_info->field_types.size())
+                                        if (field_info)
                                         {
-                                            array_type = field_info->field_types[arr_field_idx];
-                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                      "resolve_member_info: Resolved array field '{}' type to '{}'",
-                                                      arr_member->member(), array_type ? array_type->display_name() : "<null>");
-                                            break;
+                                            array_type = field_info->get_field_type(arr_member->member());
+                                            if (array_type.is_valid())
+                                            {
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "resolve_member_info: Resolved array field '{}' type to '{}'",
+                                                          arr_member->member(), array_type->display_name());
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -4572,9 +4568,23 @@ namespace Cryo::Codegen
                                     for (const auto &candidate : candidates)
                                     {
                                         const auto *field_info = template_reg->get_struct_field_types(candidate);
-                                        if (field_info && field_idx_tmp < field_info->field_types.size())
+                                        if (field_info)
                                         {
-                                            TypeRef field_type = field_info->field_types[field_idx_tmp];
+                                            // Look up by field name to avoid vtable pointer offset mismatch:
+                                            // field_idx_tmp is a GEP index (includes vtable pointer at index 0
+                                            // for classes with virtual methods), but field_info->field_types
+                                            // is indexed by logical field order (no vtable pointer).
+                                            TypeRef field_type{};
+                                            std::string array_field_name = arr_member->member();
+                                            for (size_t fi = 0; fi < field_info->field_names.size(); ++fi)
+                                            {
+                                                if (field_info->field_names[fi] == array_field_name)
+                                                {
+                                                    if (fi < field_info->field_types.size())
+                                                        field_type = field_info->field_types[fi];
+                                                    break;
+                                                }
+                                            }
                                             if (field_type.is_valid())
                                             {
                                                 TypeRef element_type;

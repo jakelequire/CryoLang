@@ -445,6 +445,49 @@ namespace Cryo::Codegen
                             }
                         }
 
+                        // Final fallback: if type resolution couldn't determine needs_load,
+                        // check the GEP instruction's source struct type directly.
+                        // This handles cases where AST types aren't resolved (imported/cross-module).
+                        if (!needs_load && receiver)
+                        {
+                            if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(receiver))
+                            {
+                                llvm::Type *src_ty = gep->getSourceElementType();
+                                if (auto *src_struct = llvm::dyn_cast<llvm::StructType>(src_ty))
+                                {
+                                    // The last index in the GEP is the field index
+                                    unsigned num_indices = gep->getNumIndices();
+                                    if (num_indices >= 2)
+                                    {
+                                        if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(num_indices)))
+                                        {
+                                            unsigned field_idx = ci->getZExtValue();
+                                            if (field_idx < src_struct->getNumElements())
+                                            {
+                                                llvm::Type *field_ty = src_struct->getElementType(field_idx);
+                                                if (field_ty->isPointerTy())
+                                                {
+                                                    // Check that the Cryo type isn't String (char*) —
+                                                    // string fields should NOT be loaded for &this methods
+                                                    TypeRef nested_type = nested_member->get_resolved_type();
+                                                    bool is_string = nested_type.is_valid() &&
+                                                                     nested_type->kind() == Cryo::TypeKind::String;
+                                                    if (!is_string)
+                                                    {
+                                                        needs_load = true;
+                                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                                  "GEP fallback: field '{}' at index {} in struct '{}' is pointer — will load",
+                                                                  nested_member->member(), field_idx,
+                                                                  src_struct->hasName() ? src_struct->getName().str() : "<anon>");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if (needs_load)
                         {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -5537,10 +5580,12 @@ namespace Cryo::Codegen
                     for (const auto &candidate : candidates)
                     {
                         const TemplateRegistry::StructFieldInfo *field_info = template_reg->get_struct_field_types(candidate);
-                        if (field_info && static_cast<size_t>(field_idx) < field_info->field_types.size())
+                        if (field_info)
                         {
-                            field_cryo_type = field_info->field_types[field_idx];
-                            break;
+                            // Use name-based lookup to avoid vtable pointer offset mismatch
+                            field_cryo_type = field_info->get_field_type(method_name);
+                            if (field_cryo_type.is_valid())
+                                break;
                         }
                     }
                 }

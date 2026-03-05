@@ -63,6 +63,29 @@ namespace Cryo
             std::vector<TypeRef> field_types;
             std::vector<std::string> field_type_annotations; // Raw annotation strings for fallback resolution
             std::string source_namespace; // The namespace where the struct was originally defined
+
+            /// Look up a field's TypeRef by name (safe for classes with vtable pointers,
+            /// where GEP indices differ from logical field indices).
+            TypeRef get_field_type(const std::string &name) const
+            {
+                for (size_t i = 0; i < field_names.size(); ++i)
+                {
+                    if (field_names[i] == name && i < field_types.size())
+                        return field_types[i];
+                }
+                return TypeRef{};
+            }
+
+            /// Get the field type annotation string by name.
+            std::string get_field_annotation(const std::string &name) const
+            {
+                for (size_t i = 0; i < field_names.size(); ++i)
+                {
+                    if (field_names[i] == name && i < field_type_annotations.size())
+                        return field_type_annotations[i];
+                }
+                return {};
+            }
         };
 
         // Method metadata extracted from AST at registration time
