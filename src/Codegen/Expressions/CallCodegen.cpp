@@ -4449,6 +4449,206 @@ namespace Cryo::Codegen
                         }
                     }
 
+                    // Handle call-expression parent (e.g., this.current().kind in this.current().kind.is_unary_prefix_op())
+                    // The parent of the member access is a method call — resolve its return type
+                    else if (auto *parent_call = dynamic_cast<CallExpressionNode *>(member_access->object()))
+                    {
+                        // First try: resolved type on the call expression node itself
+                        if (parent_call->has_resolved_type())
+                        {
+                            TypeRef call_ret = parent_call->get_resolved_type();
+                            if (call_ret.is_valid())
+                            {
+                                parent_type_name = call_ret->display_name();
+                                if (!parent_type_name.empty() && (parent_type_name.back() == '*' || parent_type_name.back() == '&'))
+                                    parent_type_name.pop_back();
+                            }
+                        }
+
+                        // Fallback: infer return type from the inner method's LLVM function or TemplateRegistry
+                        if (parent_type_name.empty())
+                        {
+                            if (auto *inner_callee = dynamic_cast<MemberAccessNode *>(parent_call->callee()))
+                            {
+                                std::string inner_method_name = inner_callee->member();
+                                std::string inner_receiver_type;
+
+                                if (auto *inner_id = dynamic_cast<IdentifierNode *>(inner_callee->object()))
+                                {
+                                    if (inner_id->name() == "this")
+                                    {
+                                        inner_receiver_type = ctx().current_type_name();
+                                    }
+                                    else
+                                    {
+                                        auto &var_types = ctx().variable_types_map();
+                                        auto it = var_types.find(inner_id->name());
+                                        if (it != var_types.end() && it->second.is_valid())
+                                        {
+                                            inner_receiver_type = it->second->display_name();
+                                            if (!inner_receiver_type.empty() && (inner_receiver_type.back() == '*' || inner_receiver_type.back() == '&'))
+                                                inner_receiver_type.pop_back();
+                                        }
+                                    }
+                                }
+                                else if (auto *inner_member = dynamic_cast<MemberAccessNode *>(inner_callee->object()))
+                                {
+                                    // Handle nested member access receivers (e.g., this.parser.current())
+                                    std::string nested_field = inner_member->member();
+                                    std::string nested_root;
+                                    if (auto *root_id = dynamic_cast<IdentifierNode *>(inner_member->object()))
+                                    {
+                                        if (root_id->name() == "this")
+                                            nested_root = ctx().current_type_name();
+                                        else
+                                        {
+                                            auto &var_types = ctx().variable_types_map();
+                                            auto it = var_types.find(root_id->name());
+                                            if (it != var_types.end() && it->second.is_valid())
+                                            {
+                                                nested_root = it->second->display_name();
+                                                if (!nested_root.empty() && (nested_root.back() == '*' || nested_root.back() == '&'))
+                                                    nested_root.pop_back();
+                                            }
+                                        }
+                                    }
+                                    if (!nested_root.empty())
+                                    {
+                                        auto cands = generate_lookup_candidates(nested_root, Cryo::SymbolKind::Type);
+                                        if (auto *template_reg = ctx().template_registry())
+                                        {
+                                            for (const auto &cand : cands)
+                                            {
+                                                const TemplateRegistry::StructFieldInfo *fi = template_reg->get_struct_field_types(cand);
+                                                if (fi)
+                                                {
+                                                    for (size_t i = 0; i < fi->field_names.size(); ++i)
+                                                    {
+                                                        if (fi->field_names[i] == nested_field && i < fi->field_types.size())
+                                                        {
+                                                            TypeRef ft = fi->field_types[i];
+                                                            if (ft.is_valid())
+                                                            {
+                                                                inner_receiver_type = ft->display_name();
+                                                                if (!inner_receiver_type.empty() && (inner_receiver_type.back() == '*' || inner_receiver_type.back() == '&'))
+                                                                    inner_receiver_type.pop_back();
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                    if (!inner_receiver_type.empty()) break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (!inner_receiver_type.empty())
+                                {
+                                    // Build a list of types to try: the receiver type itself + any base classes
+                                    std::vector<std::string> types_to_try;
+                                    types_to_try.push_back(inner_receiver_type);
+
+                                    // Walk the class hierarchy to find base classes
+                                    {
+                                        std::string walk_type = inner_receiver_type;
+                                        for (int depth = 0; depth < 10 && !walk_type.empty(); ++depth)
+                                        {
+                                            auto walk_candidates = generate_lookup_candidates(walk_type, Cryo::SymbolKind::Type);
+                                            bool found_base = false;
+                                            for (const auto &wc : walk_candidates)
+                                            {
+                                                TypeRef class_type = ctx().symbols().lookup_class_type(wc);
+                                                if (class_type.is_valid() && class_type->kind() == Cryo::TypeKind::Class)
+                                                {
+                                                    auto *cls = dynamic_cast<const Cryo::ClassType *>(class_type.get());
+                                                    if (cls && cls->has_base_class())
+                                                    {
+                                                        std::string base = cls->base_class()->display_name();
+                                                        if (!base.empty() && (base.back() == '*' || base.back() == '&'))
+                                                            base.pop_back();
+                                                        if (!base.empty())
+                                                        {
+                                                            types_to_try.push_back(base);
+                                                            walk_type = base;
+                                                            found_base = true;
+                                                        }
+                                                    }
+                                                }
+                                                if (found_base) break;
+                                            }
+                                            if (!found_base) break;
+                                        }
+                                    }
+
+                                    // Try LLVM function return type for each type in hierarchy
+                                    for (const auto &try_type : types_to_try)
+                                    {
+                                        if (!parent_type_name.empty()) break;
+                                        llvm::Function *inner_fn = resolve_method_by_name(try_type, inner_method_name);
+                                        if (inner_fn)
+                                        {
+                                            llvm::Type *ret_type = inner_fn->getReturnType();
+                                            if (ret_type && !ret_type->isVoidTy())
+                                            {
+                                                if (ret_type->isStructTy())
+                                                {
+                                                    auto *st = llvm::cast<llvm::StructType>(ret_type);
+                                                    if (st->hasName())
+                                                    {
+                                                        parent_type_name = st->getName().str();
+                                                    }
+                                                }
+                                                else if (ret_type->isPointerTy())
+                                                {
+                                                    parent_type_name = "ptr";
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Fallback: TemplateRegistry method return type annotation (also with hierarchy)
+                                    if (parent_type_name.empty())
+                                    {
+                                        if (auto *template_reg = ctx().template_registry())
+                                        {
+                                            for (const auto &try_type : types_to_try)
+                                            {
+                                                if (!parent_type_name.empty()) break;
+                                                auto type_candidates = generate_lookup_candidates(try_type, Cryo::SymbolKind::Type);
+                                                for (const auto &cand : type_candidates)
+                                                {
+                                                    std::string qualified = cand + "::" + inner_method_name;
+                                                    std::string ret_annotation = template_reg->get_method_return_type_annotation(qualified);
+                                                    if (!ret_annotation.empty())
+                                                    {
+                                                        parent_type_name = ret_annotation;
+                                                        if (!parent_type_name.empty() && (parent_type_name.back() == '*' || parent_type_name.back() == '&'))
+                                                            parent_type_name.pop_back();
+                                                        break;
+                                                    }
+
+                                                    const TemplateRegistry::MethodMetadata *meta =
+                                                        template_reg->find_template_method(cand, inner_method_name);
+                                                    if (meta && !meta->return_type_annotation.empty())
+                                                    {
+                                                        parent_type_name = meta->return_type_annotation;
+                                                        if (!parent_type_name.empty() && (parent_type_name.back() == '*' || parent_type_name.back() == '&'))
+                                                            parent_type_name.pop_back();
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "Call-expression parent: resolved return type to '{}'", parent_type_name);
+                    }
+
                     // Handle array-indexed parent (e.g., entries[k].visibility in entries[k].visibility.is_public())
                     else if (auto *parent_arr = dynamic_cast<ArrayAccessNode *>(member_access->object()))
                     {
