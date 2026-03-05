@@ -2186,6 +2186,8 @@ namespace Cryo
             return i128_type();
         if (name == "u128")
             return i128_type(); // u128 uses same LLVM type as i128
+        if (name == "char")
+            return char_type();
 
         // Handle pointer types (e.g., "void*", "string*", "u8*", "WorkerData*")
         if (name.size() > 1 && name.back() == '*')

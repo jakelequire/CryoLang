@@ -293,10 +293,9 @@ private:
         const raw_len: u64 = (this.current as i64 - start as i64 - 1) as u64;
         const raw_text: string = substr(start, 0, raw_len);
 
-        // TODO: process_escape_sequences(raw_text)
-        // TODO: store in string pool
+        const processed: string = Lexer::process_escape_sequences(raw_text);
 
-        return this.make_token(TokenType::StringLiteral, raw_text);
+        return this.make_token(TokenType::StringLiteral, processed);
     }
 
     lex_character(&this) -> Token {
@@ -669,14 +668,68 @@ private:
         return c == ' ' || c == '\t' || c == '\n' || c == '\r';
     }
 
-    static is_punctuator(c: char) -> boolean {
-        // Placeholder implementation for checking if a character is a punctuation character.
-        todo("Unimplemented");
-    }
+    /// Processes escape sequences in a string literal, converting backslash
+    /// sequences (e.g. \n, \t, \\) into their actual character values.
+    static process_escape_sequences(raw: string) -> string {
+        const len: i64 = strlen(raw) as i64;
+        if (len == 0) {
+            return raw;
+        }
 
-    static is_operator(c: char) -> boolean {
-        // Placeholder implementation for checking if a character is an operator character.
-        todo("Unimplemented");
+        // Allocate a buffer large enough (escapes shrink, never grow)
+        mut buf: string = malloc(len + 1) as string;
+        mut wi: i64 = 0;  // write index
+        mut ri: i64 = 0;  // read index
+
+        while (ri < len) {
+            const c: char = *(raw + ri);
+
+            if (c != '\\' || ri + 1 >= len) {
+                *(buf + wi) = c;
+                wi = wi + 1;
+                ri = ri + 1;
+                continue;
+            }
+
+            // We have a backslash — look at the next character
+            const esc: char = *(raw + ri + 1);
+            ri = ri + 2; // consume both backslash and escape char
+
+            if (esc == 'n')       { *(buf + wi) = '\n'; wi = wi + 1; }
+            else if (esc == 't')  { *(buf + wi) = '\t'; wi = wi + 1; }
+            else if (esc == 'r')  { *(buf + wi) = '\r'; wi = wi + 1; }
+            else if (esc == '\\') { *(buf + wi) = '\\'; wi = wi + 1; }
+            else if (esc == '\'') { *(buf + wi) = '\''; wi = wi + 1; }
+            else if (esc == '"')  { *(buf + wi) = '"';  wi = wi + 1; }
+            else if (esc == '0')  { *(buf + wi) = '\0'; wi = wi + 1; }
+            else if (esc == 'x') {
+                // Hex escape: \xHH (up to 2 hex digits)
+                mut val: i64 = 0;
+                mut digits: int = 0;
+                while (digits < 2 && ri < len && Lexer::is_hex_digit(*(raw + ri))) {
+                    const d: char = *(raw + ri);
+                    mut dv: i64 = 0;
+                    if (d >= '0' && d <= '9')      { dv = d as i64 - '0' as i64; }
+                    else if (d >= 'a' && d <= 'f')  { dv = d as i64 - 'a' as i64 + 10; }
+                    else if (d >= 'A' && d <= 'F')  { dv = d as i64 - 'A' as i64 + 10; }
+                    val = val * 16 + dv;
+                    ri = ri + 1;
+                    digits = digits + 1;
+                }
+                *(buf + wi) = val as i8;
+                wi = wi + 1;
+            } else {
+                // Unknown escape — preserve both characters
+                *(buf + wi) = '\\';
+                wi = wi + 1;
+                *(buf + wi) = esc;
+                wi = wi + 1;
+            }
+        }
+
+        // Null-terminate
+        *(buf + wi) = '\0';
+        return buf;
     }
 }
 
