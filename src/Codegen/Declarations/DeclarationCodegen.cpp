@@ -2105,6 +2105,45 @@ namespace Cryo::Codegen
                 }
             }
 
+            // Pattern 4: Brute-force scan — the base class may live in a different
+            // namespace than the derived class.  Search all functions in the module
+            // for one whose name ends with "::BaseClassName::method(suffix)".
+            if (!fn)
+            {
+                std::string suffix_to_match = "::" + method_with_suffix;
+                auto *walk = cryo_class->has_base_class()
+                                 ? dynamic_cast<const Cryo::ClassType *>(cryo_class->base_class().get())
+                                 : nullptr;
+                while (walk && !fn)
+                {
+                    std::string needle = "::" + walk->name() + suffix_to_match;
+                    for (auto &F : module()->functions())
+                    {
+                        if (F.getName().ends_with(needle))
+                        {
+                            fn = &F;
+                            break;
+                        }
+                    }
+                    // Also try without overload suffix
+                    if (!fn && !entry.overload_suffix.empty())
+                    {
+                        std::string needle2 = "::" + walk->name() + "::" + entry.name;
+                        for (auto &F : module()->functions())
+                        {
+                            if (F.getName().ends_with(needle2))
+                            {
+                                fn = &F;
+                                break;
+                            }
+                        }
+                    }
+                    walk = walk->has_base_class()
+                               ? dynamic_cast<const Cryo::ClassType *>(walk->base_class().get())
+                               : nullptr;
+                }
+            }
+
             // A pure virtual method is one that is declared virtual but not override,
             // and has no body (LLVM function is a declaration-only stub).
             // Use null for these entries instead of the extern declaration.
