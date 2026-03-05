@@ -3,6 +3,10 @@
 ///! Resolves unresolved TypeAnnotation nodes (from the parser) into concrete
 ///! TypeRef handles by looking up types in the TypeArena.
 ///!
+///! Named-type resolution delegates to the Resolver's scope chain and
+///! cross-module infrastructure via resolve_type_qualified_name(), avoiding
+///! duplication of name lookup logic.
+///!
 ///! Design note: Reuses the existing TypeAnnotation enum from AST/_module.cryo
 ///! directly, avoiding the C++ compiler's duplication.
 
@@ -12,7 +16,7 @@ import Compiler::Diag;
 import Compiler::AST;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
-import Compiler::Resolver::QualifiedName;
+import Compiler::Resolver::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Registry;
 import Utils::Logger;
@@ -27,8 +31,6 @@ type struct ResolutionContext {
     current_module:   string;
     source_file:      string;
     import_modules:   string[];     // Modules imported by this compilation unit
-    // TODO: Using a string array + parallel TypeRef array for generic bindings is a bit clunky;
-    // consider a more structured approach.
     generic_bindings: string[];     // Parallel arrays: generic name → bound TypeRef
     binding_refs:     TypeRef[];
 
@@ -69,6 +71,7 @@ type struct TypeResolver {
     intern_table:     InternTable*;
     generic_registry: GenericRegistry*;
     module_registry:  ModuleTypeRegistry*;
+    name_resolver:    Resolver*;
 
     static new(arena: TypeArena*, intern_table: InternTable*) -> TypeResolver {
         return TypeResolver {
@@ -76,18 +79,21 @@ type struct TypeResolver {
             intern_table:     intern_table,
             generic_registry: null,
             module_registry:  null,
+            name_resolver:    null,
         };
     }
 
     /// Construct with full dependencies (preferred).
     static with_registries(arena: TypeArena*, intern_table: InternTable*,
                            generic_registry: GenericRegistry*,
-                           module_registry: ModuleTypeRegistry*) -> TypeResolver {
+                           module_registry: ModuleTypeRegistry*,
+                           name_resolver: Resolver*) -> TypeResolver {
         return TypeResolver {
             arena:            arena,
             intern_table:     intern_table,
             generic_registry: generic_registry,
             module_registry:  module_registry,
+            name_resolver:    name_resolver,
         };
     }
 
@@ -148,7 +154,6 @@ private:
     // ----------------------------------------------------------------
 
     /// Resolve a primitive type name to its arena singleton.
-    /// Accepts a SymbolStr, resolves to string internally for dispatch.
     resolve_primitive(&this, name: SymbolStr) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_primitive() name='%s'", this.intern_table.resolve(name));
         return match (this.intern_table.resolve(name)) {
@@ -178,19 +183,18 @@ private:
             "uint"    => { this.arena.get_u32() }
             "float"   => { this.arena.get_f64() }
             "double"  => { this.arena.get_f64() }
-            
+
             _         => { TypeRef::invalid() }
         }
     }
 
     /// Resolve a named type (user-defined or generic binding).
-    /// Accepts a SymbolStr, resolves to string for arena lookup.
     ///
     /// Fallback chain:
     ///   1. Generic bindings (T → i32 from enclosing generic context)
-    ///   2. Arena direct lookup (types registered in this compilation unit)
-    ///   3. Module-qualified lookup (current_module::name)
-    ///   4. Module type registry (cross-module imports, public types only)
+    ///   2. Arena direct lookup by bare name (fast path for same-module types)
+    ///   3. Resolver scope chain + cross-module lookup → qualified arena lookup
+    ///   4. Module type registry alias resolution (last resort)
     resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*) -> TypeRef {
         const name_str: string = this.intern_table.resolve(name);
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_named() name='%s'", name_str);
@@ -201,40 +205,27 @@ private:
             return binding;
         }
 
-        // 2. Look up in arena's user-defined caches
+        // 2. Direct arena lookup by bare name (fast path)
         mut found: TypeRef = this.arena.lookup_by_name(name_str);
         if (found.is_valid()) {
             return found;
         }
 
-        // 3. Try qualified name with current module
-        if (ctx.current_module != "") {
-            const mod_qn: QualifiedName = QualifiedName::parse(this.intern_table, ctx.current_module);
-            const full_qn: QualifiedName = mod_qn.child(this.intern_table, name_str);
-            const qualified: string = full_qn.display(this.intern_table);
-            found = this.arena.lookup_by_name(qualified);
-            if (found.is_valid()) {
-                return found;
-            }
-        }
-
-        // 4. Try module type registry for cross-module imported types
-        if (this.module_registry != null) {
-            // First try direct lookup in the current module
-            if (ctx.current_module != "") {
-                found = this.module_registry.lookup_type(ctx.current_module, name_str);
+        // 3. Delegate to Resolver for scope chain + cross-module lookup.
+        //    The Resolver already has all type symbols from NameResolution,
+        //    including imports.  It returns the qualified name for arena lookup.
+        if (this.name_resolver != null) {
+            const qualified: string = this.name_resolver.resolve_type_qualified_name(name);
+            if (qualified != "") {
+                found = this.arena.lookup_by_name(qualified);
                 if (found.is_valid()) {
                     return found;
                 }
             }
+        }
 
-            // Then try across all imported modules (public types only)
-            found = this.module_registry.lookup_type_in_imports(name_str, ctx.import_modules);
-            if (found.is_valid()) {
-                return found;
-            }
-
-            // Try type alias resolution
+        // 4. Type alias resolution via ModuleTypeRegistry (last resort)
+        if (this.module_registry != null) {
             found = this.module_registry.lookup_alias(name_str);
             if (found.is_valid()) {
                 return found;

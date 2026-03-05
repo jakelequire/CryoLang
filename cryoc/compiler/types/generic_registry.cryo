@@ -1,30 +1,87 @@
 ///! Generic Registry
 ///!
-///! Type-level instantiation cache and monomorphization tracker.  Sits between
-///! TypeResolver (which creates InstantiatedType objects) and the Monomorphizer
-///! (which processes them).
+///! Unified registry for all generic/template infrastructure.  Consolidates the
+///! previous GenericRegistry (instantiation cache + mono tracking) and
+///! TemplateRegistry (generic AST declarations + metadata) into a single
+///! source of truth.
 ///!
-///! When the type resolver encounters `Array<i32>`, it calls
-///! `generic_registry.instantiate(array_base, [i32_ref])` which deduplicates
-///! and returns a stable TypeRef.  Later, the Monomorphizer queries
-///! `collect_unmonomorphized()` to find all instantiations that still need
-///! specialization.
+///! Three responsibilities:
+///!   1. **Template storage** — Stores TemplateEntry records (AST + param
+///!      metadata) for every generic declaration.  The TemplateRegistration
+///!      pass populates these.
+///!   2. **Instantiation cache** — When the TypeResolver encounters
+///!      `Array<i32>`, it calls `instantiate(base, [i32_ref])` which
+///!      deduplicates and returns a stable TypeRef.
+///!   3. **Monomorphization tracking** — The Monomorphizer queries
+///!      `collect_unmonomorphized()` to find instantiations that still need
+///!      specialization, and marks them done via `mark_monomorphized()`.
 
 namespace Compiler::Types::GenericRegistry;
 
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+
 
 // ============================================================================
-// GenericRegistry — Instantiation cache + monomorphization tracker
+// TemplateEntry — Metadata for a single generic declaration
+// ============================================================================
+
+/// All information needed to specialize a single generic type or function.
+type struct TemplateEntry {
+    name:           string;              // Unqualified: "Array"
+    qualified_name: string;              // "std::collections::Array"
+    module_name:    string;
+    param_names:    string[];            // ["T", "E"]
+    param_type_ids: u64[];              // TypeIDs of GenericParamType objects
+    param_count:    i64;
+    ast_node:       ASTNode*;           // Original generic declaration
+    node_kind:      NodeKind;
+    base_type:      TypeRef;            // The uninstantiated generic type in arena
+    impl_blocks:    ImplBlockNode*[];   // Associated impl blocks
+
+    /// Create a new template entry.
+    static new(name: string, qualified_name: string, module_name: string,
+               param_names: string[], param_type_ids: u64[],
+               ast_node: ASTNode*, node_kind: NodeKind,
+               base_type: TypeRef) -> TemplateEntry {
+        return TemplateEntry {
+            name:           name,
+            qualified_name: qualified_name,
+            module_name:    module_name,
+            param_names:    param_names,
+            param_type_ids: param_type_ids,
+            param_count:    param_names.length,
+            ast_node:       ast_node,
+            node_kind:      node_kind,
+            base_type:      base_type,
+            impl_blocks:    [],
+        };
+    }
+}
+
+
+// ============================================================================
+// GenericRegistry — Unified template + instantiation registry
 // ============================================================================
 
 type struct GenericRegistry {
     arena: TypeArena*;
 
-    // Instantiation cache: key_string → InstantiatedType TypeRef
+    // -- Template storage (previously TemplateRegistry) --
+    // Primary index: qualified_name → entry
+    entry_names: string[];
+    entries:     TemplateEntry[];
+    // Secondary index: TypeID → index into entries
+    tmpl_type_ids:    u64[];
+    tmpl_type_indices: i64[];
+
+    // -- Instantiation cache --
+    // key_string → InstantiatedType TypeRef
     cache_keys: string[];
     cache_refs: TypeRef[];
 
-    // Monomorphization tracking: set of keys already processed
+    // -- Monomorphization tracking --
+    // Set of cache keys already processed
     mono_keys: string[];
 
 
@@ -34,23 +91,120 @@ type struct GenericRegistry {
 
     static new(arena: TypeArena*) -> GenericRegistry {
         return GenericRegistry {
-            arena:      arena,
-            cache_keys: [],
-            cache_refs: [],
-            mono_keys:  [],
+            arena:             arena,
+            entry_names:       [],
+            entries:           [],
+            tmpl_type_ids:     [],
+            tmpl_type_indices: [],
+            cache_keys:        [],
+            cache_refs:        [],
+            mono_keys:         [],
         };
     }
 
 
-    // ----------------------------------------------------------------
-    // Instantiation
-    // ----------------------------------------------------------------
+    // ================================================================
+    //  Template registration & lookup
+    // ================================================================
+
+    /// Register a template entry.  Deduplicates by qualified_name —
+    /// if an entry with the same name exists, it is overwritten.
+    register_template(mut &this, entry: TemplateEntry) -> void {
+        // Check for existing entry with same qualified_name
+        for (mut i: i64 = 0; i < this.entry_names.length; i++) {
+            if (this.entry_names[i] == entry.qualified_name) {
+                // Overwrite existing
+                this.entries[i] = entry;
+                if (entry.base_type.is_valid()) {
+                    this.update_type_index(entry.base_type.id, i);
+                }
+                return;
+            }
+        }
+
+        // New entry
+        const idx: i64 = this.entry_names.length;
+        this.entry_names = this.entry_names + [entry.qualified_name];
+        this.entries      = this.entries + [entry];
+
+        if (entry.base_type.is_valid()) {
+            this.tmpl_type_ids     = this.tmpl_type_ids + [entry.base_type.id];
+            this.tmpl_type_indices = this.tmpl_type_indices + [idx];
+        }
+    }
+
+    /// Associate an impl block with a registered template.
+    /// The target_name should match a registered template's qualified_name
+    /// or unqualified name.
+    register_impl_block(mut &this, target_name: string, block: ImplBlockNode*) -> void {
+        for (mut i: i64 = 0; i < this.entry_names.length; i++) {
+            if (this.entry_names[i] == target_name || this.entries[i].name == target_name) {
+                this.entries[i].impl_blocks.push(block);
+                return;
+            }
+        }
+    }
+
+    /// Look up a template entry by qualified name.
+    /// Returns null if not found.
+    get_template_by_name(&this, qualified_name: string) -> TemplateEntry* {
+        for (mut i: i64 = 0; i < this.entry_names.length; i++) {
+            if (this.entry_names[i] == qualified_name) {
+                return &this.entries[i];
+            }
+        }
+        return null;
+    }
+
+    /// Look up a template entry by the unqualified name.
+    /// Returns null if not found.  If multiple entries share the
+    /// same unqualified name, returns the first match.
+    get_template_by_short_name(&this, name: string) -> TemplateEntry* {
+        for (mut i: i64 = 0; i < this.entries.length; i++) {
+            if (this.entries[i].name == name) {
+                return &this.entries[i];
+            }
+        }
+        return null;
+    }
+
+    /// Look up a template entry by its base TypeID.
+    /// Returns null if not found.
+    get_template_by_type_id(&this, type_id: u64) -> TemplateEntry* {
+        for (mut i: i64 = 0; i < this.tmpl_type_ids.length; i++) {
+            if (this.tmpl_type_ids[i] == type_id) {
+                const idx: i64 = this.tmpl_type_indices[i];
+                return &this.entries[idx];
+            }
+        }
+        return null;
+    }
+
+    /// Check whether a TypeID corresponds to a registered template.
+    is_template(&this, type_id: u64) -> boolean {
+        for (mut i: i64 = 0; i < this.tmpl_type_ids.length; i++) {
+            if (this.tmpl_type_ids[i] == type_id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Number of registered templates.
+    template_count(&this) -> i64 {
+        return this.entries.length;
+    }
+
+
+    // ================================================================
+    //  Instantiation cache
+    // ================================================================
 
     /// Get or create an InstantiatedType for the given base + type args.
     /// Deduplicates via string key so the same instantiation always returns
     /// the same TypeRef.
     instantiate(mut &this, base: TypeRef, args: TypeRef[]) -> TypeRef {
-        const key: string = make_cache_key(base, args);
+        const key: string = this.make_cache_key(base, args);
 
         // Check cache
         for (mut i: i64 = 0; i < this.cache_keys.length; i++) {
@@ -67,13 +221,13 @@ type struct GenericRegistry {
     }
 
 
-    // ----------------------------------------------------------------
-    // Monomorphization tracking
-    // ----------------------------------------------------------------
+    // ================================================================
+    //  Monomorphization tracking
+    // ================================================================
 
     /// Check if an instantiation has already been monomorphized.
     is_monomorphized(&this, base: TypeRef, args: TypeRef[]) -> boolean {
-        const key: string = make_cache_key(base, args);
+        const key: string = this.make_cache_key(base, args);
         for (mut i: i64 = 0; i < this.mono_keys.length; i++) {
             if (this.mono_keys[i] == key) {
                 return true;
@@ -84,7 +238,7 @@ type struct GenericRegistry {
 
     /// Mark an instantiation as monomorphized (specialization completed).
     mark_monomorphized(mut &this, base: TypeRef, args: TypeRef[]) -> void {
-        const key: string = make_cache_key(base, args);
+        const key: string = this.make_cache_key(base, args);
         // Check for duplicate
         for (mut i: i64 = 0; i < this.mono_keys.length; i++) {
             if (this.mono_keys[i] == key) {
@@ -123,23 +277,33 @@ type struct GenericRegistry {
     mono_count(&this) -> i64 {
         return this.mono_keys.length;
     }
-}
 
-
-// ============================================================================
-// Cache key construction
-// ============================================================================
-
-/// Build a cache key string from a base TypeRef and type args.
-/// Format: "{base_id}<{arg_id_1},{arg_id_2}>"
-function make_cache_key(base: TypeRef, args: TypeRef[]) -> string {
-    mut key: string = sprintf("%llu<", base.id);
-    for (mut i: i64 = 0; i < args.length; i++) {
-        if (i > 0) {
-            key = key + ",";
+    make_cache_key(&this, base: TypeRef, args: TypeRef[]) -> string {
+        mut key: string = sprintf("%llu<", base.id);
+        for (mut i: i64 = 0; i < args.length; i++) {
+            if (i > 0) {
+                key = key + ",";
+            }
+            key = key + sprintf("%llu", args[i].id);
         }
-        key = key + sprintf("%llu", args[i].id);
+        key = key + ">";
+        return key;
     }
-    key = key + ">";
-    return key;
+
+    // ----------------------------------------------------------------
+    // Internal helpers
+    // ----------------------------------------------------------------
+
+    /// Update the secondary TypeID index for an existing entry.
+    update_type_index(mut &this, type_id: u64, entry_idx: i64) -> void {
+        for (mut i: i64 = 0; i < this.tmpl_type_ids.length; i++) {
+            if (this.tmpl_type_ids[i] == type_id) {
+                this.tmpl_type_indices[i] = entry_idx;
+                return;
+            }
+        }
+        // Not found — add new mapping
+        this.tmpl_type_ids.push(type_id);
+        this.tmpl_type_indices.push(entry_idx);
+    }
 }
