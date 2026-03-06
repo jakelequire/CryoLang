@@ -198,6 +198,12 @@ type struct Monomorphizer {
         );
         const concrete_type: TypeRef = this.create_concrete_type(entry, result.spec_name, &subst);
 
+        // Populate the concrete type's fields/variants from the original template AST.
+        // The original AST's FieldDeclNodes have resolved_type set (with GenericParam
+        // TypeRefs) from the TypeResolution pass.  Applying the substitution maps those
+        // to concrete TypeRefs, giving the specialized type complete field info.
+        this.populate_concrete_type(concrete_type, entry, &subst);
+
         // Set resolved_type on the InstantiatedType
         const inst_t: Type* = this.arena.lookup(request.generic_type.id);
         if (inst_t != null) {
@@ -246,6 +252,123 @@ type struct Monomorphizer {
                 this.arena.create_struct(spec_name, entry.module_name)
             }
         };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Concrete type population — bridge AST fields to type system
+    // ----------------------------------------------------------------
+
+    /// Walk the original template AST's fields/variants and apply the
+    /// TypeSubstitution to populate the concrete type in the arena.
+    populate_concrete_type(mut &this, concrete_type: TypeRef, entry: TemplateEntry*,
+                           subst: TypeSubstitution*) -> void {
+        const concrete_t: Type* = this.arena.lookup(concrete_type.id);
+        if (concrete_t == null) { return; }
+
+        match (entry.node_kind) {
+            NodeKind::StructDeclaration => {
+                this.populate_struct_fields(concrete_t as StructType*, entry, subst);
+            }
+            NodeKind::ClassDeclaration => {
+                this.populate_class_fields(concrete_t as ClassType*, entry, subst);
+            }
+            NodeKind::EnumDeclaration => {
+                this.populate_enum_variants(concrete_t as EnumType*, entry, subst);
+            }
+            _ => {}
+        }
+    }
+
+    /// Populate a specialized StructType's fields from the original template AST.
+    populate_struct_fields(mut &this, st: StructType*, entry: TemplateEntry*,
+                           subst: TypeSubstitution*) -> void {
+        const original: StructDeclNode* = entry.ast_node as StructDeclNode*;
+        if (original == null) { return; }
+
+        mut field_infos: FieldInfo[] = [];
+        for (mut i: i64 = 0; i < original.fields.length; i++) {
+            const field: FieldDeclNode* = original.fields[i];
+            if (field == null) { continue; }
+
+            const fname: string = this.intern_table.resolve(field.name);
+            const is_pub: boolean = field.visibility == Visibility::Public;
+
+            // Apply substitution: GenericParam TypeRefs → concrete TypeRefs
+            mut field_type: TypeRef = TypeRef::invalid();
+            if (field.resolved_type.is_valid()) {
+                field_type = subst.apply(field.resolved_type, this.arena);
+            }
+
+            field_infos.push(FieldInfo::new(fname, field_type, is_pub, true));
+        }
+        st.set_fields(field_infos);
+    }
+
+    /// Populate a specialized ClassType's fields from the original template AST.
+    populate_class_fields(mut &this, ct: ClassType*, entry: TemplateEntry*,
+                          subst: TypeSubstitution*) -> void {
+        const original: ClassDeclNode* = entry.ast_node as ClassDeclNode*;
+        if (original == null) { return; }
+
+        mut field_infos: FieldInfo[] = [];
+        for (mut i: i64 = 0; i < original.fields.length; i++) {
+            const field: FieldDeclNode* = original.fields[i];
+            if (field == null) { continue; }
+
+            const fname: string = this.intern_table.resolve(field.name);
+            const is_pub: boolean = field.visibility == Visibility::Public;
+
+            mut field_type: TypeRef = TypeRef::invalid();
+            if (field.resolved_type.is_valid()) {
+                field_type = subst.apply(field.resolved_type, this.arena);
+            }
+
+            field_infos.push(FieldInfo::new(fname, field_type, is_pub, true));
+        }
+        ct.set_fields(field_infos);
+    }
+
+    /// Populate a specialized EnumType's variants from the original template AST.
+    /// Enum variants store associated types as SymbolStr names (not TypeRefs),
+    /// so we map each name through the param→arg substitution.
+    populate_enum_variants(mut &this, et: EnumType*, entry: TemplateEntry*,
+                           subst: TypeSubstitution*) -> void {
+        const original: EnumDeclNode* = entry.ast_node as EnumDeclNode*;
+        if (original == null) { return; }
+
+        for (mut i: i64 = 0; i < original.variants.length; i++) {
+            const variant: EnumVariantNode* = original.variants[i];
+            if (variant == null) { continue; }
+
+            const vname: string = this.intern_table.resolve(variant.name);
+
+            // Resolve each associated type name to a concrete TypeRef
+            mut payload_types: TypeRef[] = [];
+            for (mut j: i64 = 0; j < variant.associated_types.length; j++) {
+                const type_name: string = this.intern_table.resolve(variant.associated_types[j]);
+                mut resolved: TypeRef = TypeRef::invalid();
+
+                // Check if this name is a generic parameter — map to concrete arg
+                for (mut k: i64 = 0; k < entry.param_names.length; k++) {
+                    if (type_name == entry.param_names[k]) {
+                        if (k < subst.replacements.length) {
+                            resolved = subst.replacements[k];
+                        }
+                        break;
+                    }
+                }
+
+                // Not a generic param — try resolving as a concrete type name
+                if (!resolved.is_valid()) {
+                    resolved = this.arena.lookup_by_name(type_name);
+                }
+
+                payload_types.push(resolved);
+            }
+
+            et.add_variant(EnumVariantInfo::new(vname, payload_types, i as u64));
+        }
     }
 
 
