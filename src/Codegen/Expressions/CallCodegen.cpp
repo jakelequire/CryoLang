@@ -346,61 +346,18 @@ namespace Cryo::Codegen
 
                                 if (base_type.is_valid())
                                 {
-                                    auto *cls = dynamic_cast<const Cryo::ClassType *>(base_type.get());
-                                    auto *st = cls ? nullptr : dynamic_cast<const Cryo::StructType *>(base_type.get());
-                                    std::optional<size_t> field_idx;
-                                    // The LLVM struct to inspect for the field type.
-                                    // For inherited fields this may switch to a base class struct.
-                                    llvm::StructType *field_owner_llvm_type = parent_llvm_type;
-                                    const Cryo::ClassType *field_owner_cls = cls;
-
-                                    if (cls)
-                                        field_idx = cls->field_index(nested_member->member());
-                                    else if (st)
-                                        field_idx = st->field_index(nested_member->member());
-
-                                    // If the field wasn't found directly, walk the class inheritance
-                                    // chain. Inherited fields live in the base class's LLVM struct,
-                                    // so we also switch which LLVM type we inspect.
-                                    if (!field_idx.has_value() && cls)
+                                    // Use get_struct_field_index which correctly accounts for
+                                    // vtable pointers AND inherited fields in the LLVM struct layout.
+                                    // cls->field_index() only returns own-field indices, which is
+                                    // WRONG for classes with inheritance (the LLVM struct is flat
+                                    // with base class fields prepended).
+                                    int full_llvm_idx = ctx().get_struct_field_index(parent_type_name, nested_member->member());
+                                    if (full_llvm_idx >= 0)
                                     {
-                                        const Cryo::ClassType *walk = cls;
-                                        while (walk && walk->has_base_class())
+                                        size_t llvm_idx = static_cast<size_t>(full_llvm_idx);
+                                        if (llvm_idx < parent_llvm_type->getNumElements())
                                         {
-                                            auto *base_cls = dynamic_cast<const Cryo::ClassType *>(walk->base_class().get());
-                                            if (!base_cls)
-                                                break;
-
-                                            field_idx = base_cls->field_index(nested_member->member());
-                                            if (field_idx.has_value())
-                                            {
-                                                // Switch to the base class LLVM struct for the element-type check
-                                                llvm::StructType *base_llvm = llvm::StructType::getTypeByName(
-                                                    llvm_ctx(), base_cls->name());
-                                                if (base_llvm && !base_llvm->isOpaque())
-                                                {
-                                                    field_owner_llvm_type = base_llvm;
-                                                    field_owner_cls = base_cls;
-                                                }
-                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                                          "Field '{}' found in base class '{}' at index {} (inherited by '{}')",
-                                                          nested_member->member(), base_cls->name(), *field_idx, parent_type_name);
-                                                break;
-                                            }
-                                            walk = base_cls;
-                                        }
-                                    }
-
-                                    if (field_idx.has_value())
-                                    {
-                                        // Account for vtable pointer offset (field 0 is vptr for classes with vtable)
-                                        size_t llvm_idx = *field_idx;
-                                        if (field_owner_cls && field_owner_cls->needs_vtable_pointer())
-                                            llvm_idx += 1; // vtable pointer is at index 0
-
-                                        if (llvm_idx < field_owner_llvm_type->getNumElements())
-                                        {
-                                            llvm::Type *field_llvm_type = field_owner_llvm_type->getElementType(llvm_idx);
+                                            llvm::Type *field_llvm_type = parent_llvm_type->getElementType(llvm_idx);
                                             if (field_llvm_type->isPointerTy())
                                             {
                                                 needs_load = true;
@@ -409,6 +366,12 @@ namespace Cryo::Codegen
                                                           nested_member->member(), parent_type_name, llvm_idx);
                                             }
                                         }
+                                    }
+                                    else
+                                    {
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "Field '{}' not found in '{}' via get_struct_field_index",
+                                                  nested_member->member(), parent_type_name);
                                     }
                                 }
                             }
