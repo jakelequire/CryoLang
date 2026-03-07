@@ -1594,12 +1594,18 @@ namespace Cryo::Codegen
                     return CallKind::Intrinsic;
                 }
 
-                // Check if it's an enum variant
+                // Check if it's an enum variant vs. a static method on an enum
                 if (is_enum_type(obj_name))
                 {
+                    if (is_enum_variant(obj_name, method_name))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "classify_call: '{}::{}' is an enum variant", obj_name, method_name);
+                        return CallKind::EnumVariant;
+                    }
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "classify_call: '{}' is an enum type, returning EnumVariant", obj_name);
-                    return CallKind::EnumVariant;
+                              "classify_call: '{}::{}' is a static method on enum type", obj_name, method_name);
+                    return CallKind::StaticMethod;
                 }
 
                 // Check if it's a static method call (Type::method)
@@ -1670,9 +1676,15 @@ namespace Cryo::Codegen
                 {
                     if (is_enum_type(obj_qualified))
                     {
+                        if (is_enum_variant(obj_qualified, method_name))
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "classify_call: Qualified '{}::{}' is an enum variant", obj_qualified, method_name);
+                            return CallKind::EnumVariant;
+                        }
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "classify_call: Qualified '{}' is an enum type, returning EnumVariant", obj_qualified);
-                        return CallKind::EnumVariant;
+                                  "classify_call: Qualified '{}::{}' is a static method on enum type", obj_qualified, method_name);
+                        return CallKind::StaticMethod;
                     }
 
                     // Also try the last segment (e.g., "Shape" from "Shapes::Shape")
@@ -1682,10 +1694,17 @@ namespace Cryo::Codegen
                         std::string simple_name = obj_qualified.substr(last_sep + 2);
                         if (is_enum_type(simple_name))
                         {
+                            if (is_enum_variant(simple_name, method_name))
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "classify_call: Qualified '{}' -> simple '{}::{}' is an enum variant",
+                                          obj_qualified, simple_name, method_name);
+                                return CallKind::EnumVariant;
+                            }
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "classify_call: Qualified '{}' -> simple '{}' is an enum type, returning EnumVariant",
-                                      obj_qualified, simple_name);
-                            return CallKind::EnumVariant;
+                                      "classify_call: Qualified '{}' -> simple '{}::{}' is a static method on enum type",
+                                      obj_qualified, simple_name, method_name);
+                            return CallKind::StaticMethod;
                         }
                     }
                 }
@@ -1711,10 +1730,13 @@ namespace Cryo::Codegen
                 return CallKind::Intrinsic;
             }
 
-            // Check if it's an enum variant
+            // Check if it's an enum variant vs. a static method on an enum
+            // (implement blocks add static methods to enum types)
             if (is_enum_type(scope_name))
             {
-                return CallKind::EnumVariant;
+                if (is_enum_variant(scope_name, member_name))
+                    return CallKind::EnumVariant;
+                return CallKind::StaticMethod;
             }
 
             // Check if it's a static method call
@@ -1781,7 +1803,11 @@ namespace Cryo::Codegen
             {
                 std::string simple_type_name = scope_name.substr(last_sep + 2);
                 if (is_enum_type(simple_type_name))
-                    return CallKind::EnumVariant;
+                {
+                    if (is_enum_variant(simple_type_name, member_name))
+                        return CallKind::EnumVariant;
+                    return CallKind::StaticMethod;
+                }
                 if (is_struct_type(simple_type_name) || is_class_type(simple_type_name))
                     return CallKind::StaticMethod;
                 // Also check the symbol table directly (more reliable for imported types
@@ -7208,6 +7234,59 @@ namespace Cryo::Codegen
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "is_enum_type: '{}' not found as enum type", name);
         return false;
+    }
+
+    bool CallCodegen::is_enum_variant(const std::string &enum_name, const std::string &member_name) const
+    {
+        // Try direct symbol lookup for the enum type
+        Symbol *sym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(enum_name);
+        if (sym && sym->kind == SymbolKind::Type && sym->type.is_valid() &&
+            sym->type->kind() == TypeKind::Enum)
+        {
+            auto *enum_type = static_cast<const EnumType *>(sym->type.get());
+            if (enum_type->variant_index(member_name).has_value())
+                return true;
+            return false;
+        }
+
+        // Also try SRM lookup candidates (handles cross-module / qualified names)
+        auto &non_const_ctx = const_cast<CodegenContext &>(ctx());
+        auto candidates = non_const_ctx.srm().generate_lookup_candidates(enum_name, Cryo::SymbolKind::Type);
+        for (const auto &candidate : candidates)
+        {
+            Symbol *csym = const_cast<CallCodegen *>(this)->symbols().lookup_symbol(candidate);
+            if (csym && csym->kind == SymbolKind::Type && csym->type.is_valid() &&
+                csym->type->kind() == TypeKind::Enum)
+            {
+                auto *enum_type = static_cast<const EnumType *>(csym->type.get());
+                if (enum_type->variant_index(member_name).has_value())
+                    return true;
+                return false;
+            }
+        }
+
+        // Check TemplateRegistry for generic enum templates
+        Cryo::TemplateRegistry *template_registry = non_const_ctx.template_registry();
+        if (template_registry)
+        {
+            const Cryo::TemplateRegistry::TemplateInfo *tmpl_info =
+                template_registry->find_template(enum_name);
+            if (tmpl_info && tmpl_info->enum_template)
+            {
+                // Check the AST node's variants
+                auto *enum_decl = tmpl_info->enum_template;
+                for (const auto &v : enum_decl->variants())
+                {
+                    if (v->name() == member_name)
+                        return true;
+                }
+                return false;
+            }
+        }
+
+        // When we can't find the enum type definition to check variants,
+        // conservatively return true to preserve existing behavior
+        return true;
     }
 
     bool CallCodegen::is_class_type(const std::string &name) const
