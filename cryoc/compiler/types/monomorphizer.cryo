@@ -59,12 +59,13 @@ type struct Monomorphizer {
     pending:           MonomorphRequest[];
     pending_cursor:    i64;                  // Index cursor (avoids O(n) erase-from-front)
 
-    // Cache (parallel arrays)
+    // Cache
     spec_keys:         string[];
     spec_entries:      SpecializationEntry[];
+    spec_index:        HashMap<string, i64>;   // key → index in spec_entries
 
     // Cycle detection
-    in_progress:       string[];
+    in_progress:       HashMap<string, boolean>;
 
     // Error tracking
     error_count:       i64;
@@ -86,7 +87,8 @@ type struct Monomorphizer {
             pending_cursor:    0,
             spec_keys:         [],
             spec_entries:      [],
-            in_progress:       [],
+            spec_index:        HashMap<string, i64>::new(),
+            in_progress:       HashMap<string, boolean>::new(),
             error_count:       0,
         };
     }
@@ -126,7 +128,8 @@ type struct Monomorphizer {
             }
 
             // Mark as in-progress
-            this.in_progress = this.in_progress + [key];
+            const ip_h: u64 = hash_str(key);
+            this.in_progress.insert(key, true, ip_h);
 
             // Specialize
             const success: boolean = this.specialize_request(request, key);
@@ -228,8 +231,11 @@ type struct Monomorphizer {
             ast_node:         result.specialized_ast,
             impl_nodes:       result.impl_asts,
         };
+        const idx: i64 = this.spec_entries.length;
         this.spec_keys    = this.spec_keys + [key];
         this.spec_entries = this.spec_entries + [spec_entry];
+        const cache_h: u64 = hash_str(key);
+        this.spec_index.insert(key, idx, cache_h);
 
         // Discover nested instantiations
         this.request_nested_instantiations(concrete_type);
@@ -514,32 +520,19 @@ type struct Monomorphizer {
 
     /// Check if a key is already in the specialization cache.
     is_cached(&this, key: string) -> boolean {
-        for (mut i: i64 = 0; i < this.spec_keys.length; i++) {
-            if (this.spec_keys[i] == key) {
-                return true;
-            }
-        }
-        return false;
+        const h: u64 = hash_str(key);
+        return this.spec_index.get(key, h).is_some();
     }
 
     /// Check if a key is currently being processed (cycle detection).
     is_in_progress(&this, key: string) -> boolean {
-        for (mut i: i64 = 0; i < this.in_progress.length; i++) {
-            if (this.in_progress[i] == key) {
-                return true;
-            }
-        }
-        return false;
+        const h: u64 = hash_str(key);
+        return this.in_progress.get(key, h).is_some();
     }
 
     /// Remove a key from the in-progress set.
     remove_in_progress(mut &this, key: string) -> void {
-        mut new_list: string[] = [];
-        for (mut i: i64 = 0; i < this.in_progress.length; i++) {
-            if (this.in_progress[i] != key) {
-                new_list.push(this.in_progress[i]);
-            }
-        }
-        this.in_progress = new_list;
+        const h: u64 = hash_str(key);
+        this.in_progress.remove(key, h);
     }
 }
