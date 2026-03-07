@@ -2470,6 +2470,71 @@ namespace Cryo::Codegen
                                             }
                                         }
 
+                                        // If arg is a struct literal with generic args, try to resolve
+                                        // its type from the struct name + substituted generic args
+                                        if (!arg_type.is_valid())
+                                        {
+                                            if (auto *struct_lit = dynamic_cast<Cryo::StructLiteralNode *>(arg_nodes[i].get()))
+                                            {
+                                                if (!struct_lit->generic_args().empty() && generics)
+                                                {
+                                                    // Build type args from the struct literal's generic args
+                                                    std::vector<TypeRef> struct_type_args;
+                                                    auto &arena2 = ctx().symbols().arena();
+                                                    bool all_resolved = true;
+                                                    for (const auto &ga : struct_lit->generic_args())
+                                                    {
+                                                        std::string resolved_ga = ga;
+                                                        if (generics->in_type_param_scope())
+                                                        {
+                                                            std::string sub = generics->substitute_type_annotation(ga);
+                                                            if (!sub.empty() && sub != ga)
+                                                                resolved_ga = sub;
+                                                        }
+                                                        TypeRef ta = arena2.lookup_type_by_name(resolved_ga);
+                                                        if (!ta.is_valid() && resolved_ga.size() > 2 &&
+                                                            resolved_ga.substr(resolved_ga.size() - 2) == "[]")
+                                                        {
+                                                            TypeRef base = arena2.lookup_type_by_name(
+                                                                resolved_ga.substr(0, resolved_ga.size() - 2));
+                                                            if (base.is_valid())
+                                                                ta = arena2.get_array_of(base);
+                                                        }
+                                                        if (!ta.is_valid() && resolved_ga.size() > 1 &&
+                                                            resolved_ga.back() == '*')
+                                                        {
+                                                            TypeRef base = arena2.lookup_type_by_name(
+                                                                resolved_ga.substr(0, resolved_ga.size() - 1));
+                                                            if (base.is_valid())
+                                                                ta = arena2.get_pointer_to(base);
+                                                        }
+                                                        if (ta.is_valid())
+                                                            struct_type_args.push_back(ta);
+                                                        else
+                                                            all_resolved = false;
+                                                    }
+                                                    if (all_resolved && !struct_type_args.empty())
+                                                    {
+                                                        // Create the instantiated struct type
+                                                        std::string mangled_struct = generics->mangle_type_name(
+                                                            struct_lit->struct_type(), struct_type_args);
+                                                        arg_type = arena2.lookup_type_by_name(mangled_struct);
+                                                        if (!arg_type.is_valid())
+                                                        {
+                                                            // Try on-demand instantiation
+                                                            llvm::Type *inst = generics->get_instantiated_type(
+                                                                struct_lit->struct_type(), struct_type_args);
+                                                            if (inst)
+                                                                arg_type = arena2.lookup_type_by_name(mangled_struct);
+                                                        }
+                                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                                  "generate_enum_variant: Inferred struct literal type '{}' -> {}",
+                                                                  mangled_struct, arg_type.is_valid() ? arg_type->display_name() : "<invalid>");
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         if (arg_type.is_valid())
                                         {
                                             // If it's a GenericParam, substitute it

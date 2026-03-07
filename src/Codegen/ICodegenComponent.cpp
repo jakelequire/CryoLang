@@ -220,18 +220,32 @@ namespace Cryo::Codegen
                 }
             }
 
-            // Try context's function registry
+            // Try context's function registry — validate pointer belongs to current module
             if (llvm::Function *fn = ctx().get_function(qualified_method))
             {
-                if (!fn->isDeclaration())
+                if (fn->getParent() == module())
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "resolve_method_by_name: Found definition '{}.{}' in registry as '{}'",
-                              type_name, method_name, qualified_method);
-                    return fn;
+                    if (!fn->isDeclaration())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_method_by_name: Found definition '{}.{}' in registry as '{}'",
+                                  type_name, method_name, qualified_method);
+                        return fn;
+                    }
+                    if (!declaration_fallback && qualified_method.substr(0, 8) != "Global::")
+                        declaration_fallback = fn;
                 }
-                if (!declaration_fallback && qualified_method.substr(0, 8) != "Global::")
-                    declaration_fallback = fn;
+                else
+                {
+                    // Stale pointer — try re-resolve in current module
+                    if (llvm::Function *local_fn = module()->getFunction(qualified_method))
+                    {
+                        if (!local_fn->isDeclaration())
+                            return local_fn;
+                        if (!declaration_fallback && qualified_method.substr(0, 8) != "Global::")
+                            declaration_fallback = local_fn;
+                    }
+                }
             }
         }
 
@@ -290,10 +304,13 @@ namespace Cryo::Codegen
 
                 if (llvm::Function *fn = ctx().get_function(qualified_method))
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "resolve_method_by_name: Found '{}.{}' in registry via type namespace as '{}'",
-                              type_name, method_name, qualified_method);
-                    return fn;
+                    if (fn->getParent() == module())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_method_by_name: Found '{}.{}' in registry via type namespace as '{}'",
+                                  type_name, method_name, qualified_method);
+                        return fn;
+                    }
                 }
             }
         }
@@ -318,7 +335,8 @@ namespace Cryo::Codegen
 
             if (llvm::Function *fn = ctx().get_function(simple_method))
             {
-                return fn;
+                if (fn->getParent() == module())
+                    return fn;
             }
 
             // Try with std::core::primitives:: prefix
@@ -330,7 +348,8 @@ namespace Cryo::Codegen
 
             if (llvm::Function *fn = ctx().get_function(stdlib_method))
             {
-                return fn;
+                if (fn->getParent() == module())
+                    return fn;
             }
 
             // Method not found - return nullptr, let caller report error
@@ -389,17 +408,32 @@ namespace Cryo::Codegen
                 }
             }
 
-            // Also try in function registry
+            // Also try in function registry — but validate the pointer belongs
+            // to our module to avoid returning stale entries from previous compilations
             for (const auto &[name, fn] : ctx().functions_map())
             {
                 if (name.length() >= pattern_suffix.length() &&
                     name.compare(name.length() - pattern_suffix.length(),
                                  pattern_suffix.length(), pattern_suffix) == 0)
                 {
+                    // Validate the function pointer belongs to the current module
+                    if (fn && fn->getParent() == module())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_method_by_name: Found '{}.{}' in registry via pattern match as '{}'",
+                                  type_name, method_name, name);
+                        return fn;
+                    }
+                    // Stale registry entry — try to re-resolve by name in our module
+                    if (llvm::Function *local_fn = module()->getFunction(name))
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_method_by_name: Re-resolved stale registry entry '{}' in module",
+                                  name);
+                        return local_fn;
+                    }
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "resolve_method_by_name: Found '{}.{}' in registry via pattern match as '{}'",
-                              type_name, method_name, name);
-                    return fn;
+                              "resolve_method_by_name: Skipping stale registry entry '{}'", name);
                 }
             }
 
@@ -417,10 +451,13 @@ namespace Cryo::Codegen
             }
             if (llvm::Function *fn = ctx().get_function(simple_method))
             {
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "resolve_method_by_name: Found '{}.{}' in registry via simple name as '{}'",
-                          type_name, method_name, simple_method);
-                return fn;
+                if (fn->getParent() == module())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_method_by_name: Found '{}.{}' in registry via simple name as '{}'",
+                              type_name, method_name, simple_method);
+                    return fn;
+                }
             }
         }
 
@@ -571,12 +608,15 @@ namespace Cryo::Codegen
                     return existing;
                 }
 
-                // Check function registry
+                // Check function registry — validate pointer belongs to current module
                 if (llvm::Function *existing = ctx().get_function(full_method_name))
                 {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "resolve_method_by_name: Found in registry '{}'", full_method_name);
-                    return existing;
+                    if (existing->getParent() == module())
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "resolve_method_by_name: Found in registry '{}'", full_method_name);
+                        return existing;
+                    }
                 }
 
                 // Method exists in template but not yet compiled - create extern declaration

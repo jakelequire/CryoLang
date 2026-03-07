@@ -2224,6 +2224,7 @@ namespace Cryo
         bool is_heap_allocated() const { return _is_heap_allocated; }
 
         void add_generic_arg(const std::string &type) { _generic_args.push_back(type); }
+        void set_generic_args(std::vector<std::string> args) { _generic_args = std::move(args); }
         void set_heap_allocated(bool v) { _is_heap_allocated = v; }
 
         void add_field_initializer(std::unique_ptr<FieldInitializerNode> initializer)
