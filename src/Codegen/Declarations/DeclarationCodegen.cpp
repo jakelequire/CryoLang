@@ -1996,6 +1996,50 @@ namespace Cryo::Codegen
             }
         }
 
+        // If the derived class has no fields of its own (e.g., Parser : ExprParser
+        // with no additional fields), inherit the base class's LLVM layout.
+        if (field_types.empty() && !node->base_class().empty())
+        {
+            std::string base_name = node->base_class();
+            llvm::StructType *base_struct = llvm::StructType::getTypeByName(llvm_ctx(), base_name);
+            if (base_struct && !base_struct->isOpaque())
+            {
+                for (unsigned i = 0; i < base_struct->getNumElements(); ++i)
+                    field_types.push_back(base_struct->getElementType(i));
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "DeclarationCodegen: Class '{}' inherits {} fields from base '{}'",
+                          name, field_types.size(), base_name);
+            }
+            else
+            {
+                // Base LLVM struct not ready — walk the Cryo ClassType inheritance
+                // chain to find the root ancestor with declared fields.
+                TypeRef base_ref = ctx().symbols().lookup_class_type(base_name);
+                const Cryo::ClassType *walk = base_ref.is_valid()
+                    ? dynamic_cast<const Cryo::ClassType *>(base_ref.get())
+                    : nullptr;
+                while (walk && walk->fields().empty() && walk->has_base_class())
+                {
+                    auto *parent = dynamic_cast<const Cryo::ClassType *>(walk->base_class().get());
+                    if (!parent) break;
+                    walk = parent;
+                }
+                if (walk && !walk->fields().empty())
+                {
+                    for (const auto &f : walk->fields())
+                    {
+                        llvm::Type *ft = f.type.is_valid() ? get_llvm_type(f.type) : nullptr;
+                        if (!ft)
+                            ft = llvm::Type::getInt64Ty(llvm_ctx());
+                        field_types.push_back(ft);
+                    }
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Class '{}' inherits {} fields from ancestor ClassType",
+                              name, field_types.size());
+                }
+            }
+        }
+
         // Set class body (this works even if class was previously opaque)
         class_type->setBody(field_types);
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,

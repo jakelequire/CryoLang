@@ -1352,6 +1352,57 @@ namespace Cryo::Codegen
         {
             std::string base_name = node->base_class();
             llvm::StructType *base_struct = llvm::StructType::getTypeByName(llvm_ctx(), base_name);
+
+            // If the base class LLVM struct isn't ready yet (null or opaque), try to
+            // resolve its layout from the Cryo type system's ClassType fields.
+            // Walk up the inheritance chain until we find an ancestor with fields.
+            if (!base_struct || base_struct->isOpaque())
+            {
+                TypeRef base_cryo_ref = ctx().symbols().lookup_class_type(base_name);
+                const Cryo::ClassType *base_cls = base_cryo_ref.is_valid()
+                    ? dynamic_cast<const Cryo::ClassType *>(base_cryo_ref.get())
+                    : nullptr;
+
+                // Walk up the chain to find the first ancestor with declared fields
+                const Cryo::ClassType *field_source = base_cls;
+                while (field_source && field_source->fields().empty() && field_source->has_base_class())
+                {
+                    auto *grandparent = dynamic_cast<const Cryo::ClassType *>(
+                        field_source->base_class().get());
+                    if (!grandparent) break;
+                    field_source = grandparent;
+                }
+
+                if (field_source && !field_source->fields().empty())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "TypeCodegen: Base class '{}' LLVM struct not ready, building from ancestor ClassType ({} fields)",
+                              base_name, field_source->fields().size());
+
+                    // Create or complete the base struct from ancestor's fields
+                    if (!base_struct)
+                        base_struct = llvm::StructType::create(llvm_ctx(), base_name);
+
+                    std::vector<llvm::Type *> base_fields;
+                    std::vector<std::string> base_field_names;
+                    if (field_source->needs_vtable_pointer())
+                        base_fields.push_back(llvm::PointerType::get(llvm_ctx(), 0));
+
+                    for (const auto &bf : field_source->fields())
+                    {
+                        llvm::Type *bft = bf.type.is_valid() ? types().map(bf.type) : nullptr;
+                        if (!bft)
+                            bft = llvm::Type::getInt64Ty(llvm_ctx()); // fallback
+                        base_fields.push_back(bft);
+                        base_field_names.push_back(bf.name);
+                    }
+                    base_struct->setBody(base_fields);
+                    ctx().register_type(base_name, base_struct);
+                    types().register_struct(base_name, base_struct);
+                    ctx().register_struct_fields(base_name, base_field_names);
+                }
+            }
+
             if (base_struct && !base_struct->isOpaque())
             {
                 unsigned base_elem_count = base_struct->getNumElements();
