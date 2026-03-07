@@ -1,13 +1,15 @@
-///! ResolutionMap
-///!
-///! Maps AST source spans to resolved SymbolIDs.  Uses span-based string
-///! keys ("file:line:col") with parallel arrays.  After the NameResolution
-///! pass, downstream consumers look up results by span to get SymbolIDs.
+/// ResolutionMap
+///
+/// Maps AST source spans to resolved SymbolIDs.  Uses span-based string
+/// keys ("file:line:col") with HashMaps for O(1) lookup.  After the
+/// NameResolution pass, downstream consumers look up results by span
+/// to get SymbolIDs.
 
 namespace Compiler::Resolver::ResolutionMap;
 
 import Compiler::Resolver::SymbolID;
 import Compiler::Diag;
+import std::collections::hashmap;
 
 
 // ============================================================================
@@ -15,20 +17,16 @@ import Compiler::Diag;
 // ============================================================================
 
 type struct ResolutionMap {
-    // Single-symbol resolutions (parallel arrays)
-    keys:            string[];
-    values:          SymbolID[];
+    // Single-symbol resolutions
+    singles:   HashMap<string, SymbolID>;
 
-    // Overload set resolutions (parallel arrays)
-    overload_keys:   string[];
-    overload_values: SymbolID[][];
+    // Overload set resolutions
+    overloads: HashMap<string, SymbolID[]>;
 
     static new() -> ResolutionMap {
         return ResolutionMap {
-            keys:            [],
-            values:          [],
-            overload_keys:   [],
-            overload_values: [],
+            singles:   HashMap<string, SymbolID>::new(),
+            overloads: HashMap<string, SymbolID[]>::new(),
         };
     }
 
@@ -40,24 +38,21 @@ type struct ResolutionMap {
     /// Record a single resolution: this span refers to this symbol.
     record(mut &this, span: SourceSpan, sym_id: SymbolID) -> void {
         const key: string = ResolutionMap::make_key(span);
-        this.keys.push(key);
-        this.values.push(sym_id);
+        this.singles.insert(key, sym_id, hash_str(key));
     }
 
     /// Record an overload set resolution: this span could refer to any of these symbols.
     record_overloads(mut &this, span: SourceSpan, sym_ids: SymbolID[]) -> void {
         const key: string = ResolutionMap::make_key(span);
-        this.overload_keys.push(key);
-        this.overload_values.push(sym_ids);
+        this.overloads.insert(key, sym_ids, hash_str(key));
     }
 
     /// Look up the symbol for a span.  Returns invalid SymbolID if not found.
     resolve(&this, span: SourceSpan) -> SymbolID {
         const key: string = ResolutionMap::make_key(span);
-        for (mut i: i64 = 0; i < this.keys.length; i++) {
-            if (this.keys[i] == key) {
-                return this.values[i];
-            }
+        const opt: Option<SymbolID> = this.singles.get(key, hash_str(key));
+        if (opt.is_some()) {
+            return opt.unwrap();
         }
         return SymbolID::invalid();
     }
@@ -65,16 +60,15 @@ type struct ResolutionMap {
     /// Look up the overload set for a span.  Returns empty array if not found.
     resolve_overloads(&this, span: SourceSpan) -> SymbolID[] {
         const key: string = ResolutionMap::make_key(span);
-        for (mut i: i64 = 0; i < this.overload_keys.length; i++) {
-            if (this.overload_keys[i] == key) {
-                return this.overload_values[i];
-            }
+        const opt: Option<SymbolID[]> = this.overloads.get(key, hash_str(key));
+        if (opt.is_some()) {
+            return opt.unwrap();
         }
         return [];
     }
 
     /// Total number of single-symbol resolutions recorded.
     count(&this) -> i64 {
-        return this.keys.length;
+        return this.singles.length() as i64;
     }
 }

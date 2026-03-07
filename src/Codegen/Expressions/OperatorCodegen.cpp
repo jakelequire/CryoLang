@@ -64,21 +64,16 @@ namespace Cryo::Codegen
         }
 
         // Generate operand values
+        // If generate_operand returns nullptr, the visitor already reported the
+        // real error (e.g. "no field 'state'"). Silently propagate nullptr to
+        // avoid cascading "Failed to generate operand" noise.
         llvm::Value *lhs = generate_operand(node->left());
         if (!lhs)
-        {
-            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
-                         "Failed to generate left operand, generate_operand returned nullptr.");
             return nullptr;
-        }
 
         llvm::Value *rhs = generate_operand(node->right());
         if (!rhs)
-        {
-            report_error(ErrorCode::E0615_BINARY_OPERATION_ERROR, node,
-                         "Failed to generate right operand, generate_operand returned nullptr");
             return nullptr;
-        }
 
         // Check for string concatenation BEFORE classifying based on single operand type
         // This handles cases like: char + string, string + char, string + string
@@ -531,11 +526,7 @@ namespace Cryo::Codegen
         // Generate operand value for other operators
         llvm::Value *operand = generate_operand(node->operand());
         if (!operand)
-        {
-            report_error(ErrorCode::E0616_UNARY_OPERATION_ERROR, node,
-                         "Failed to generate unary operand");
             return nullptr;
-        }
 
         // Dispatch based on operator
         if (op == TokenKind::TK_MINUS)
@@ -1479,11 +1470,7 @@ namespace Cryo::Codegen
         // Generate the right-hand side value
         llvm::Value *rhs_value = generate_operand(rhs_expr);
         if (!rhs_value)
-        {
-            report_error(ErrorCode::E0614_ASSIGNMENT_ERROR, node,
-                         "Failed to generate right operand for compound assignment");
             return nullptr;
-        }
 
         // Ensure compatible types
         ensure_compatible_types(current_value, rhs_value);
@@ -3723,6 +3710,103 @@ namespace Cryo::Codegen
                 }
             }
 
+            // If struct not found, try mangling the display name
+            // e.g., "HashMapEntry<string, SymbolID[]>" -> "HashMapEntry_string_Array<SymbolID>"
+            if (!struct_type && type_name.find('<') != std::string::npos)
+            {
+                // Convert [] to Array<> first
+                std::string mangled = type_name;
+                while (mangled.find("[]") != std::string::npos)
+                {
+                    size_t bp = mangled.find("[]");
+                    size_t ns = bp;
+                    while (ns > 0 && mangled[ns - 1] != '<' && mangled[ns - 1] != ',' &&
+                           mangled[ns - 1] != ' ' && mangled[ns - 1] != '_')
+                        ns--;
+                    std::string before = mangled.substr(0, ns);
+                    std::string tp = mangled.substr(ns, bp - ns);
+                    std::string after = mangled.substr(bp + 2);
+                    mangled = before + "Array<" + tp + ">" + after;
+                }
+
+                // Find outermost <> (not Array<>) and mangle: replace < with _, etc.
+                size_t outer_angle = mangled.find('<');
+                bool is_array_bracket = (outer_angle != std::string::npos &&
+                                         outer_angle >= 5 &&
+                                         mangled.substr(outer_angle - 5, 5) == "Array");
+                if (outer_angle != std::string::npos && !is_array_bracket)
+                {
+                    std::string base = mangled.substr(0, outer_angle);
+                    size_t close = mangled.rfind('>');
+                    if (close != std::string::npos && close > outer_angle)
+                    {
+                        std::string args = mangled.substr(outer_angle + 1, close - outer_angle - 1);
+                        // Mangle args: replace non-Array < with _, preserve Array<>
+                        std::string mangled_result = base + "_";
+                        const char kO = '\x01', kC = '\x02';
+                        // Protect Array<> brackets
+                        size_t ap = 0;
+                        while ((ap = args.find("Array<", ap)) != std::string::npos)
+                        {
+                            args[ap + 5] = kO;
+                            int d = 1;
+                            for (size_t ci = ap + 6; ci < args.size() && d > 0; ++ci)
+                            {
+                                if (args[ci] == '<') d++;
+                                else if (args[ci] == '>') { d--; if (d == 0) args[ci] = kC; }
+                            }
+                            ap += 6;
+                        }
+                        std::replace(args.begin(), args.end(), '<', '_');
+                        std::replace(args.begin(), args.end(), '>', '_');
+                        std::replace(args.begin(), args.end(), ',', '_');
+                        std::replace(args.begin(), args.end(), ' ', '_');
+                        std::replace(args.begin(), args.end(), '*', 'p');
+                        std::replace(args.begin(), args.end(), kO, '<');
+                        std::replace(args.begin(), args.end(), kC, '>');
+                        // Remove trailing/duplicate underscores
+                        mangled_result += args;
+                        while (mangled_result.size() > 1 && mangled_result.back() == '_')
+                            mangled_result.pop_back();
+
+                        struct_type = llvm::StructType::getTypeByName(llvm_ctx(), mangled_result);
+                        if (!struct_type)
+                        {
+                            if (llvm::Type *t = ctx().get_type(mangled_result))
+                                struct_type = llvm::dyn_cast<llvm::StructType>(t);
+                        }
+                        if (struct_type)
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "get_lvalue_address: Mangled '{}' -> '{}' found struct",
+                                      type_name, mangled_result);
+                            type_name = mangled_result;
+                        }
+                    }
+                }
+            }
+
+            // Fallback: built-in Array types use "Array<X>" in LLVM but mangle to "Array_X"
+            if (!struct_type && type_name.substr(0, 6) == "Array_" &&
+                type_name.find('<') == std::string::npos)
+            {
+                std::string bracket_name = "Array<" + type_name.substr(6) + ">";
+                struct_type = llvm::StructType::getTypeByName(llvm_ctx(), bracket_name);
+                if (!struct_type)
+                {
+                    if (llvm::Type *t = ctx().get_type(bracket_name))
+                        struct_type = llvm::dyn_cast<llvm::StructType>(t);
+                }
+                if (struct_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "get_lvalue_address: Found built-in Array type '{}' for mangled '{}'",
+                              bracket_name, type_name);
+                    if (ctx().get_struct_field_index(type_name, "ptr") < 0)
+                        ctx().register_struct_fields(type_name, {"ptr", "len", "cap"});
+                }
+            }
+
             if (!struct_type)
             {
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -4077,6 +4161,56 @@ namespace Cryo::Codegen
                                         TypeRef resolved_param = generics->resolve_type_param(args);
                                         if (resolved_param.is_valid())
                                             substituted = base + "_" + resolved_param->display_name();
+                                    }
+                                    // Mangle display name fallback: convert [] to Array<>, then mangle
+                                    if (substituted.empty() && pointee_name.find('<') != std::string::npos)
+                                    {
+                                        std::string mn = pointee_name;
+                                        // Convert [] to Array<>
+                                        while (mn.find("[]") != std::string::npos)
+                                        {
+                                            size_t bp = mn.find("[]");
+                                            size_t ns = bp;
+                                            while (ns > 0 && mn[ns - 1] != '<' && mn[ns - 1] != ',' &&
+                                                   mn[ns - 1] != ' ' && mn[ns - 1] != '_')
+                                                ns--;
+                                            mn = mn.substr(0, ns) + "Array<" + mn.substr(ns, bp - ns) + ">" + mn.substr(bp + 2);
+                                        }
+                                        // Find outermost non-Array < and mangle
+                                        size_t oa = mn.find('<');
+                                        bool is_arr = (oa != std::string::npos && oa >= 5 && mn.substr(oa - 5, 5) == "Array");
+                                        if (oa != std::string::npos && !is_arr)
+                                        {
+                                            std::string b = mn.substr(0, oa);
+                                            size_t cl = mn.rfind('>');
+                                            if (cl != std::string::npos && cl > oa)
+                                            {
+                                                std::string a = mn.substr(oa + 1, cl - oa - 1);
+                                                const char kO = '\x01', kC = '\x02';
+                                                size_t ap = 0;
+                                                while ((ap = a.find("Array<", ap)) != std::string::npos)
+                                                {
+                                                    a[ap + 5] = kO;
+                                                    int d = 1;
+                                                    for (size_t ci = ap + 6; ci < a.size() && d > 0; ++ci)
+                                                    {
+                                                        if (a[ci] == '<') d++;
+                                                        else if (a[ci] == '>') { d--; if (d == 0) a[ci] = kC; }
+                                                    }
+                                                    ap += 6;
+                                                }
+                                                std::replace(a.begin(), a.end(), '<', '_');
+                                                std::replace(a.begin(), a.end(), '>', '_');
+                                                std::replace(a.begin(), a.end(), ',', '_');
+                                                std::replace(a.begin(), a.end(), ' ', '_');
+                                                std::replace(a.begin(), a.end(), '*', 'p');
+                                                std::replace(a.begin(), a.end(), kO, '<');
+                                                std::replace(a.begin(), a.end(), kC, '>');
+                                                substituted = b + "_" + a;
+                                                while (substituted.size() > 1 && substituted.back() == '_')
+                                                    substituted.pop_back();
+                                            }
+                                        }
                                     }
                                     if (!substituted.empty())
                                     {

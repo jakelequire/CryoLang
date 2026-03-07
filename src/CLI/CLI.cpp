@@ -673,6 +673,38 @@ namespace Cryo::CLI
         else
         {
             compiler->print_diagnostics();
+
+            // Even on failure, attempt to emit partial LLVM IR if --emit-llvm was requested
+            if (args.get_flag("emit-llvm") && compiler->codegen())
+            {
+                std::string output_path = args.output_file();
+                if (output_path.empty())
+                {
+                    output_path = file_path;
+                    size_t pos = output_path.find_last_of('.');
+                    if (pos != std::string::npos)
+                    {
+                        output_path = output_path.substr(0, pos) + ".bc";
+                    }
+                    else
+                    {
+                        output_path += ".bc";
+                    }
+                }
+
+                output_path = Cryo::Utils::OS::instance().normalize_path(output_path);
+
+                std::cout << "\nAttempting to emit partial LLVM IR despite errors..." << std::endl;
+                if (compiler->codegen()->emit_llvm_ir(output_path))
+                {
+                    std::cout << "✓ Partial LLVM IR emitted: " << output_path << std::endl;
+                }
+                else
+                {
+                    std::cerr << "⚠ Could not emit partial LLVM IR (no IR available)" << std::endl;
+                }
+            }
+
             return 1;
         }
     }

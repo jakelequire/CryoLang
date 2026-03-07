@@ -2300,45 +2300,83 @@ namespace Cryo::Codegen
 
     std::string ICodegenComponent::mangle_generic_type_name(const std::string &display_name)
     {
+        // Pre-process: convert X[] to Array<X> ([] is built-in Array<T>)
+        std::string processed = display_name;
+        while (processed.find("[]") != std::string::npos)
+        {
+            size_t bracket_pos = processed.find("[]");
+            // Find the start of the type name before []
+            size_t name_start = bracket_pos;
+            while (name_start > 0 && processed[name_start - 1] != '<' &&
+                   processed[name_start - 1] != ',' && processed[name_start - 1] != ' ')
+            {
+                name_start--;
+            }
+            std::string before = processed.substr(0, name_start);
+            std::string type_part = processed.substr(name_start, bracket_pos - name_start);
+            std::string after = processed.substr(bracket_pos + 2);
+            processed = before + "Array<" + type_part + ">" + after;
+        }
+
         // Check if this is a generic type with angle brackets (e.g., "Array<u64>")
-        size_t angle_pos = display_name.find('<');
+        size_t angle_pos = processed.find('<');
         if (angle_pos == std::string::npos)
         {
             // Not a generic type in display format, return as-is
-            return display_name;
+            return processed;
         }
 
         // Extract base name and type arguments
-        std::string base_name = display_name.substr(0, angle_pos);
+        std::string base_name = processed.substr(0, angle_pos);
 
         // Find matching closing bracket
-        size_t close_pos = display_name.rfind('>');
+        size_t close_pos = processed.rfind('>');
         if (close_pos == std::string::npos || close_pos <= angle_pos)
         {
-            return display_name;
+            return processed;
         }
 
         // Extract type arguments string (e.g., "u64" from "Array<u64>")
-        std::string args_str = display_name.substr(angle_pos + 1, close_pos - angle_pos - 1);
+        std::string args_str = processed.substr(angle_pos + 1, close_pos - angle_pos - 1);
 
         // Build mangled name: base_arg1_arg2_...
         std::string mangled = base_name + "_";
 
         // Parse type arguments (handle nested generics and multiple args)
+        // Track whether we're inside an Array<...> to preserve those brackets
         std::string current_arg;
         int depth = 0;
+        int array_depth = 0; // tracks nested Array< brackets to preserve
         for (size_t i = 0; i < args_str.size(); ++i)
         {
             char c = args_str[i];
             if (c == '<')
             {
                 depth++;
-                current_arg += '_';  // Replace < with _
+                // Check if this is an Array< that should preserve brackets
+                if (current_arg.size() >= 5 &&
+                    current_arg.substr(current_arg.size() - 5) == "Array")
+                {
+                    current_arg += '<';
+                    array_depth++;
+                }
+                else
+                {
+                    current_arg += '_';  // Replace < with _
+                }
             }
             else if (c == '>')
             {
                 depth--;
-                current_arg += '_';  // Replace > with _
+                if (array_depth > 0)
+                {
+                    current_arg += '>';
+                    array_depth--;
+                }
+                else
+                {
+                    current_arg += '_';  // Replace > with _
+                }
             }
             else if (c == ',' && depth == 0)
             {

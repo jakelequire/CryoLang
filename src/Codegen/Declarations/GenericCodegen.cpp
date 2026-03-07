@@ -227,6 +227,42 @@ namespace Cryo::Codegen
         // Check if LLVM type already exists (created by Monomorphizer)
         // If so, we still need to generate methods, but can reuse the type
         llvm::StructType *existing_struct = llvm::StructType::getTypeByName(llvm_ctx(), mangled);
+
+        // Fallback: built-in Array types are created by TypeMapper as "Array<String>"
+        // but generic instantiation mangles to "Array_String". Try the angle-bracket form.
+        if (!existing_struct && generic_name == "Array" && type_args.size() == 1 && type_args[0])
+        {
+            std::string bracket_name = "Array<" + type_args[0].get()->display_name() + ">";
+            existing_struct = llvm::StructType::getTypeByName(llvm_ctx(), bracket_name);
+            if (existing_struct)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "GenericCodegen: Found built-in Array type '{}' for mangled name '{}'",
+                          bracket_name, mangled);
+                // Register under the mangled name so lookups via "Array_String" work
+                ctx().register_type(mangled, existing_struct);
+                types().register_struct(mangled, existing_struct);
+                // Register field names under the mangled name too
+                // First try from the bracket name's field registration
+                std::vector<std::string> bracket_fields;
+                auto &arena = ctx().symbols().arena();
+                TypeRef cryo_type = arena.lookup_type_by_name(bracket_name);
+                if (cryo_type.is_valid() && cryo_type->kind() == Cryo::TypeKind::Struct)
+                {
+                    auto *struct_info = static_cast<const Cryo::StructType *>(cryo_type.get());
+                    if (struct_info->field_count() > 0)
+                    {
+                        for (const auto &f : struct_info->fields())
+                            bracket_fields.push_back(f.name);
+                    }
+                }
+                // Fallback: Array<T> always has {ptr, len, cap}
+                if (bracket_fields.empty())
+                    bracket_fields = {"ptr", "len", "cap"};
+                ctx().register_struct_fields(mangled, bracket_fields);
+            }
+        }
+
         llvm::StructType *existing_opaque_struct = nullptr;
         bool type_already_exists = false;
         if (existing_struct)
@@ -508,6 +544,7 @@ namespace Cryo::Codegen
             std::string saved_type_name = ctx().current_type_name();
             std::string saved_display_name = ctx().current_type_display_name();
             std::string saved_namespace = ctx().namespace_context();
+            auto saved_variable_types = ctx().variable_types_map();
 
             // Set namespace context to the template's defining namespace
             // This ensures SRM generates correct lookup candidates for module-level identifiers
@@ -753,6 +790,7 @@ namespace Cryo::Codegen
             }
             ctx().set_current_type_name(saved_type_name);
             ctx().set_current_type_display_name(saved_display_name);
+            ctx().variable_types_map() = saved_variable_types;
 
             ctx().set_namespace_context(saved_namespace);
         }
@@ -773,6 +811,7 @@ namespace Cryo::Codegen
                 std::string saved_type_name = ctx().current_type_name();
                 std::string saved_display_name = ctx().current_type_display_name();
                 std::string saved_namespace = ctx().namespace_context();
+                auto saved_variable_types = ctx().variable_types_map();
 
                 // Set namespace context to the template's defining namespace
                 if (!base_namespace.empty())
@@ -999,6 +1038,7 @@ namespace Cryo::Codegen
                 }
                 ctx().set_current_type_name(saved_type_name);
                 ctx().set_current_type_display_name(saved_display_name);
+                ctx().variable_types_map() = saved_variable_types;
 
                 ctx().set_namespace_context(saved_namespace);
             }
@@ -1435,6 +1475,7 @@ namespace Cryo::Codegen
             std::string saved_type_name = ctx().current_type_name();
             std::string saved_display_name = ctx().current_type_display_name();
             std::string saved_namespace = ctx().namespace_context();
+            auto saved_variable_types = ctx().variable_types_map();
 
             // Set namespace context to the template's defining namespace
             // This ensures SRM generates correct lookup candidates for module-level identifiers
@@ -1627,6 +1668,7 @@ namespace Cryo::Codegen
             }
             ctx().set_current_type_name(saved_type_name);
             ctx().set_current_type_display_name(saved_display_name);
+            ctx().variable_types_map() = saved_variable_types;
 
             ctx().set_namespace_context(saved_namespace);
         }
@@ -2142,6 +2184,7 @@ namespace Cryo::Codegen
                 std::string saved_type_name = ctx().current_type_name();
                 std::string saved_display_name = ctx().current_type_display_name();
                 std::string saved_namespace = ctx().namespace_context();
+                auto saved_variable_types = ctx().variable_types_map();
 
                 // Set namespace context to the template's defining namespace
                 // This ensures methods are registered with the correct fully-qualified name
@@ -2472,6 +2515,7 @@ namespace Cryo::Codegen
                 }
                 ctx().set_current_type_name(saved_type_name);
                 ctx().set_current_type_display_name(saved_display_name);
+                ctx().variable_types_map() = saved_variable_types;
 
                 ctx().set_namespace_context(saved_namespace);
             }
@@ -3182,7 +3226,32 @@ namespace Cryo::Codegen
             return "";
 
         // Check if the type annotation contains generic angle brackets
+        // Skip if the only '<' is from "Array<" in an already-mangled name
+        // (e.g., "HashMapEntry_string_Array<SymbolID>"), but NOT when the name
+        // IS "Array<T>" itself (which needs T substituted)
         size_t angle_pos = type_annotation.find('<');
+        {
+            bool only_array_brackets = true;
+            size_t sp = 0;
+            while ((sp = type_annotation.find('<', sp)) != std::string::npos)
+            {
+                if (sp < 5 || type_annotation.substr(sp - 5, 5) != "Array")
+                {
+                    only_array_brackets = false;
+                    break;
+                }
+                sp++;
+            }
+            if (only_array_brackets && angle_pos != std::string::npos)
+            {
+                // Only skip if "Array<" is NOT the base type itself.
+                // "Array<T>" needs T substituted; "Foo_Array<SymbolID>" is already concrete.
+                if (type_annotation.substr(0, 6) != "Array<")
+                {
+                    angle_pos = std::string::npos;
+                }
+            }
+        }
         if (angle_pos == std::string::npos)
         {
             // No angle brackets - check if it's a direct type parameter (like "T")
@@ -3296,12 +3365,105 @@ namespace Cryo::Codegen
                 {
                     substituted_args.push_back(type);
                 }
+                // Handle array suffix: "SymbolID[]" -> Array<SymbolID>
+                else if (arg.size() >= 2 && arg.substr(arg.size() - 2) == "[]")
+                {
+                    std::string inner_name = arg.substr(0, arg.size() - 2);
+                    // Recursively resolve the inner type (handles nested arrays like "T[][]")
+                    TypeRef inner_resolved = resolve_type_param(inner_name);
+                    if (!inner_resolved.is_valid())
+                        inner_resolved = symbols().arena().lookup_type_by_name(inner_name);
+                    if (!inner_resolved.is_valid())
+                    {
+                        // Try with namespace prefix
+                        std::string ns = ctx().namespace_context();
+                        if (!ns.empty())
+                            inner_resolved = symbols().arena().lookup_type_by_name(ns + "::" + inner_name);
+                    }
+                    if (!inner_resolved.is_valid())
+                    {
+                        // Try symbol table lookups (struct/class/enum)
+                        inner_resolved = symbols().lookup_struct_type(inner_name);
+                        if (!inner_resolved.is_valid())
+                            inner_resolved = symbols().lookup_class_type(inner_name);
+                        if (!inner_resolved.is_valid())
+                            inner_resolved = symbols().lookup_enum_type(inner_name);
+                    }
+                    if (inner_resolved.is_valid())
+                    {
+                        TypeRef array_type = symbols().arena().get_array_of(inner_resolved);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "substitute_type_annotation: Resolved array arg '{}' -> '{}'",
+                                  arg, array_type.is_valid() ? array_type->display_name() : "<invalid>");
+                        substituted_args.push_back(array_type);
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "substitute_type_annotation: Could not resolve array element type '{}'", inner_name);
+                        return "";
+                    }
+                }
+                // Handle nested generic args: "Inner<X>" where X is already concrete
+                else if (arg.find('<') != std::string::npos)
+                {
+                    std::string nested_mangled = substitute_type_annotation(arg);
+                    if (!nested_mangled.empty())
+                    {
+                        // Look up or create the type for the nested generic
+                        llvm::StructType *st = llvm::StructType::getTypeByName(llvm_ctx(), nested_mangled);
+                        if (st)
+                        {
+                            TypeRef nested_type = symbols().arena().lookup_type_by_name(nested_mangled);
+                            if (nested_type.is_valid())
+                            {
+                                substituted_args.push_back(nested_type);
+                            }
+                            else
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "substitute_type_annotation: Nested generic '{}' mangled to '{}' but no TypeRef found",
+                                          arg, nested_mangled);
+                                return "";
+                            }
+                        }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "substitute_type_annotation: Nested generic '{}' mangled to '{}' but not found in LLVM",
+                                      arg, nested_mangled);
+                            return "";
+                        }
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "substitute_type_annotation: Could not resolve nested generic arg '{}'", arg);
+                        return "";
+                    }
+                }
                 else
                 {
-                    // Unknown type - might be a nested generic or unresolved
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "substitute_type_annotation: Could not resolve type arg '{}'", arg);
-                    return "";
+                    // Unknown type - try with namespace prefix as last resort
+                    std::string ns = ctx().namespace_context();
+                    if (!ns.empty())
+                        type = symbols().arena().lookup_type_by_name(ns + "::" + arg);
+                    if (!type.is_valid())
+                        type = symbols().lookup_struct_type(arg);
+                    if (!type.is_valid())
+                        type = symbols().lookup_class_type(arg);
+                    if (!type.is_valid())
+                        type = symbols().lookup_enum_type(arg);
+                    if (type.is_valid())
+                    {
+                        substituted_args.push_back(type);
+                    }
+                    else
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "substitute_type_annotation: Could not resolve type arg '{}'", arg);
+                        return "";
+                    }
                 }
             }
         }
@@ -3649,12 +3811,45 @@ namespace Cryo::Codegen
             if (type_args[i])
             {
                 std::string arg_name = type_args[i].get()->display_name();
-                // Replace problematic characters
+
+                // Convert X[] to Array<X> ([] is built-in Array<T>)
+                while (arg_name.size() >= 2 &&
+                       arg_name.substr(arg_name.size() - 2) == "[]")
+                {
+                    arg_name = "Array<" + arg_name.substr(0, arg_name.size() - 2) + ">";
+                }
+
+                // Protect Array<...> brackets from sanitization
+                const char kOpen = '\x01';
+                const char kClose = '\x02';
+                {
+                    size_t pos = 0;
+                    while ((pos = arg_name.find("Array<", pos)) != std::string::npos)
+                    {
+                        arg_name[pos + 5] = kOpen;
+                        int depth = 1;
+                        for (size_t ci = pos + 6; ci < arg_name.size() && depth > 0; ++ci)
+                        {
+                            if (arg_name[ci] == '<') depth++;
+                            else if (arg_name[ci] == '>') { depth--; if (depth == 0) arg_name[ci] = kClose; }
+                        }
+                        pos += 6;
+                    }
+                }
+
+                // Replace problematic characters (Array<> brackets are protected)
                 std::replace(arg_name.begin(), arg_name.end(), '<', '_');
                 std::replace(arg_name.begin(), arg_name.end(), '>', '_');
                 std::replace(arg_name.begin(), arg_name.end(), ',', '_');
                 std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
                 std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                std::replace(arg_name.begin(), arg_name.end(), '[', '_');
+                std::replace(arg_name.begin(), arg_name.end(), ']', '_');
+
+                // Restore Array<> brackets
+                std::replace(arg_name.begin(), arg_name.end(), kOpen, '<');
+                std::replace(arg_name.begin(), arg_name.end(), kClose, '>');
+
                 result += arg_name;
             }
         }

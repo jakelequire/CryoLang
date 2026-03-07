@@ -738,7 +738,21 @@ namespace Cryo
         }
 
         // 3. Try stdlib root (standard library imports)
-        std::string stdlib_resolved = os.join_path(_stdlib_root, file_path);
+        // The stdlib namespace is "std" but the filesystem root is _stdlib_root
+        // (e.g. ./stdlib/).  If the import path starts with "std/", strip it so
+        // `import std::collections::hashmap` resolves to stdlib_root/collections/hashmap.cryo
+        // instead of the non-existent stdlib_root/std/collections/hashmap.cryo.
+        // Strip leading "std/" from stdlib paths — the stdlib namespace is "std"
+        // but _stdlib_root already points to the stdlib directory.
+        auto strip_std_prefix = [](const std::string &p) -> std::string
+        {
+            if (p.rfind("std/", 0) == 0)
+                return p.substr(4);
+            return p;
+        };
+
+        std::string stdlib_file_path = strip_std_prefix(file_path);
+        std::string stdlib_resolved = os.join_path(_stdlib_root, stdlib_file_path);
         std::string result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
         if (std::filesystem::exists(result))
         {
@@ -749,7 +763,7 @@ namespace Cryo
         // Last-segment lowercase for stdlib
         if (has_last_seg_lower)
         {
-            stdlib_resolved = os.join_path(_stdlib_root, last_seg_lower_path);
+            stdlib_resolved = os.join_path(_stdlib_root, strip_std_prefix(last_seg_lower_path));
             result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
             if (std::filesystem::exists(result))
             {
@@ -761,7 +775,7 @@ namespace Cryo
         // Last-segment snake_case for stdlib
         if (has_last_seg_snake)
         {
-            stdlib_resolved = os.join_path(_stdlib_root, last_seg_snake_path);
+            stdlib_resolved = os.join_path(_stdlib_root, strip_std_prefix(last_seg_snake_path));
             result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
             if (std::filesystem::exists(result))
             {
@@ -773,7 +787,7 @@ namespace Cryo
         // Fully lowercase for stdlib
         if (has_lower_variant)
         {
-            stdlib_resolved = os.join_path(_stdlib_root, lower_file_path);
+            stdlib_resolved = os.join_path(_stdlib_root, strip_std_prefix(lower_file_path));
             result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
             if (std::filesystem::exists(result))
             {
@@ -785,7 +799,7 @@ namespace Cryo
         // Fully snake_cased for stdlib
         if (has_snake_variant)
         {
-            stdlib_resolved = os.join_path(_stdlib_root, snake_file_path);
+            stdlib_resolved = os.join_path(_stdlib_root, strip_std_prefix(snake_file_path));
             result = resolve_module_file_path(stdlib_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
             if (std::filesystem::exists(result))
             {
