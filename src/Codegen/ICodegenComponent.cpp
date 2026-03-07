@@ -2492,7 +2492,10 @@ namespace Cryo::Codegen
         normalize_suffix(mangled, "uint", "u32");
         normalize_suffix(mangled, "float", "f32");
         normalize_suffix(mangled, "double", "f64");
-        normalize_suffix(mangled, "boolean", "bool");
+        // Normalize "bool" → "boolean" so both paths agree on the canonical name.
+        // GenericCodegen::mangle_type_name uses display_name() which returns "boolean".
+        // The boundary check prevents matching "bool" inside "boolean" (next char is 'e').
+        normalize_suffix(mangled, "bool", "boolean");
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "mangle_generic_type_name: '{}' -> '{}'", display_name, mangled);
