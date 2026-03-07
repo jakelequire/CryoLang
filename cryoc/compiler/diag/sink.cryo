@@ -17,6 +17,7 @@ type struct DiagnosticSink {
     renderer:          DiagRenderer*;
     config:            DiagConfig;
     reached_max_errors: boolean;
+    seen_keys:         HashMap<string, boolean>;
 
     static new() -> DiagnosticSink {
         return DiagnosticSink {
@@ -26,6 +27,7 @@ type struct DiagnosticSink {
             renderer:          null,
             config:            DiagConfig::default(),
             reached_max_errors: false,
+            seen_keys:         HashMap<string, boolean>::new(),
         };
     }
 
@@ -66,16 +68,14 @@ type struct DiagnosticSink {
         }
 
         // 4. Deduplication: skip if same (code, file, start_line, start_col)
-        const code_val: u32 = effective_diag.code.to_u32();
-        for (mut i: int = 0; i < this.diagnostics.length; i++) {
-            const existing: Diagnostic = this.diagnostics[i];
-            if (existing.code.to_u32() == code_val &&
-                existing.span.file == effective_diag.span.file &&
-                existing.span.start_line == effective_diag.span.start_line &&
-                existing.span.start_col == effective_diag.span.start_col) {
-                return;  // Duplicate — skip
-            }
+        const dedup_key: string = sprintf("%u:%s:%u:%u",
+            effective_diag.code.to_u32(), effective_diag.span.file,
+            effective_diag.span.start_line, effective_diag.span.start_col);
+        const h: u64 = hash_str(dedup_key);
+        if (this.seen_keys.contains_key(dedup_key, h)) {
+            return;  // Duplicate — skip
         }
+        this.seen_keys.insert(dedup_key, true, h);
 
         // 5. Update counters
         if (effective_diag.severity.is_error()) {

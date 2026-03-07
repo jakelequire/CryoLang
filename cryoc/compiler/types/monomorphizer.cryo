@@ -17,6 +17,7 @@ import Compiler::AST::Specializer;
 import Compiler::Types::Substitution;
 import Compiler::Types::GenericRegistry;
 import Compiler::Resolver::InternTable;
+import Compiler::Diag;
 
 
 // ============================================================================
@@ -51,6 +52,7 @@ type struct Monomorphizer {
     arena:             TypeArena*;
     generic_registry:  GenericRegistry*;
     intern_table:      InternTable*;
+    diagnostics:       DiagnosticSink*;
     specializer:       ASTSpecializer;
 
     // Worklist
@@ -73,11 +75,12 @@ type struct Monomorphizer {
     // ----------------------------------------------------------------
 
     static new(arena: TypeArena*, generic_registry: GenericRegistry*,
-               intern_table: InternTable*) -> Monomorphizer {
+               intern_table: InternTable*, diagnostics: DiagnosticSink*) -> Monomorphizer {
         return Monomorphizer {
             arena:             arena,
             generic_registry:  generic_registry,
             intern_table:      intern_table,
+            diagnostics:       diagnostics,
             specializer:       ASTSpecializer::new(arena, intern_table),
             pending:           [],
             pending_cursor:    0,
@@ -116,7 +119,8 @@ type struct Monomorphizer {
 
             // Cycle detection
             if (this.is_in_progress(key)) {
-                printf("[Monomorphizer] Error: cycle detected for %s\n", key);
+                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    sprintf("monomorphization cycle detected for %s", key)));
                 this.error_count = this.error_count + 1;
                 continue;
             }
@@ -155,7 +159,8 @@ type struct Monomorphizer {
                     return this.specialize_with_entry(request, key, by_name);
                 }
             }
-            printf("[Monomorphizer] Error: no template found for type ID %llu\n", request.base_type.id);
+            this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                sprintf("no template found for type ID %llu", request.base_type.id)));
             return false;
         }
 
@@ -166,8 +171,9 @@ type struct Monomorphizer {
                           entry: TemplateEntry*) -> boolean {
         // Validate arg count
         if (request.type_args.length != entry.param_count) {
-            printf("[Monomorphizer] Error: arg count mismatch for %s: expected %lld, got %lld\n",
-                   entry.qualified_name, entry.param_count, request.type_args.length);
+            this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                sprintf("arg count mismatch for %s: expected %lld, got %lld",
+                        entry.qualified_name, entry.param_count, request.type_args.length)));
             return false;
         }
 
@@ -187,8 +193,9 @@ type struct Monomorphizer {
             entry, request.type_args, type_arg_displays
         );
         if (!result.success) {
-            printf("[Monomorphizer] Error: specialization failed for %s: %s\n",
-                   entry.qualified_name, result.error_message);
+            this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                sprintf("specialization failed for %s: %s",
+                        entry.qualified_name, result.error_message)));
             return false;
         }
 
