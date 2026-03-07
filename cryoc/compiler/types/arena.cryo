@@ -11,6 +11,7 @@ namespace Compiler::Types::Arena;
 
 import Compiler::Diag;
 import Utils::Logger;
+import std::collections::hashmap;
 
 
 // ============================================================================
@@ -43,32 +44,20 @@ type struct TypeArena {
     f32_type:  TypeRef;
     f64_type:  TypeRef;
 
-    // -- Compound type dedup caches --
-    // These use string keys derived from the constituent TypeRef IDs.
-    pointer_cache:   string[];   // Parallel arrays: key + TypeRef pairs
-    pointer_refs:    TypeRef[];
-    reference_cache: string[];
-    reference_refs:  TypeRef[];
-    array_cache:     string[];
-    array_refs:      TypeRef[];
-    optional_cache:  string[];
-    optional_refs:   TypeRef[];
-    function_cache:  string[];
-    function_refs:   TypeRef[];
-    tuple_cache:     string[];
-    tuple_refs:      TypeRef[];
+    // -- Compound type dedup caches (key → TypeRef) --
+    pointer_cache:   HashMap<string, TypeRef>;
+    reference_cache: HashMap<string, TypeRef>;
+    array_cache:     HashMap<string, TypeRef>;
+    optional_cache:  HashMap<string, TypeRef>;
+    function_cache:  HashMap<string, TypeRef>;
+    tuple_cache:     HashMap<string, TypeRef>;
 
-    // -- User-defined type caches (by qualified name) --
-    struct_names: string[];
-    struct_refs:  TypeRef[];
-    class_names:  string[];
-    class_refs:   TypeRef[];
-    enum_names:   string[];
-    enum_refs:    TypeRef[];
-    trait_names:  string[];
-    trait_refs:   TypeRef[];
-    alias_names:  string[];
-    alias_refs:   TypeRef[];
+    // -- User-defined type caches (qualified name → TypeRef) --
+    struct_cache: HashMap<string, TypeRef>;
+    class_cache:  HashMap<string, TypeRef>;
+    enum_cache:   HashMap<string, TypeRef>;
+    trait_cache:  HashMap<string, TypeRef>;
+    alias_cache:  HashMap<string, TypeRef>;
 
 
     // ----------------------------------------------------------------
@@ -101,29 +90,17 @@ type struct TypeArena {
             f32_type:  TypeRef::invalid(),
             f64_type:  TypeRef::invalid(),
 
-            pointer_cache:   [],
-            pointer_refs:    [],
-            reference_cache: [],
-            reference_refs:  [],
-            array_cache:     [],
-            array_refs:      [],
-            optional_cache:  [],
-            optional_refs:   [],
-            function_cache:  [],
-            function_refs:   [],
-            tuple_cache:     [],
-            tuple_refs:      [],
-
-            struct_names: [],
-            struct_refs:  [],
-            class_names:  [],
-            class_refs:   [],
-            enum_names:   [],
-            enum_refs:    [],
-            trait_names:  [],
-            trait_refs:   [],
-            alias_names:  [],
-            alias_refs:   [],
+            pointer_cache:   HashMap<string, TypeRef>::new(),
+            reference_cache: HashMap<string, TypeRef>::new(),
+            array_cache:     HashMap<string, TypeRef>::new(),
+            optional_cache:  HashMap<string, TypeRef>::new(),
+            function_cache:  HashMap<string, TypeRef>::new(),
+            tuple_cache:     HashMap<string, TypeRef>::new(),
+            struct_cache:    HashMap<string, TypeRef>::new(),
+            class_cache:     HashMap<string, TypeRef>::new(),
+            enum_cache:      HashMap<string, TypeRef>::new(),
+            trait_cache:     HashMap<string, TypeRef>::new(),
+            alias_cache:     HashMap<string, TypeRef>::new(),
         };
 
         arena.init_primitives();
@@ -223,18 +200,13 @@ type struct TypeArena {
     /// Get or create a pointer type to the given pointee.
     get_pointer_to(mut &this, pointee: TypeRef) -> TypeRef {
         mut key: string = sprintf("ptr_%lu", pointee.id);
+        const h: u64 = hash_str(key);
 
-        // Check cache
-        for (mut i: i64 = 0; i < this.pointer_cache.length; i++) {
-            if (this.pointer_cache[i] == key) {
-                return this.pointer_refs[i];
-            }
-        }
+        const cached: Option<TypeRef> = this.pointer_cache.get(key, h);
+        if (cached.is_some()) { return cached.unwrap(); }
 
-        // Create new
         mut ref: TypeRef = this.alloc_type(new PointerType(this.next_id, pointee));
-        this.pointer_cache.push(key);
-        this.pointer_refs.push(ref);
+        this.pointer_cache.insert(key, ref, h);
         return ref;
     }
 
@@ -245,48 +217,39 @@ type struct TypeArena {
             mut_tag = "mut";
         }
         mut key: string = sprintf("ref_%s_%lu", mut_tag, referent.id);
+        const h: u64 = hash_str(key);
 
-        for (mut i: i64 = 0; i < this.reference_cache.length; i++) {
-            if (this.reference_cache[i] == key) {
-                return this.reference_refs[i];
-            }
-        }
+        const cached: Option<TypeRef> = this.reference_cache.get(key, h);
+        if (cached.is_some()) { return cached.unwrap(); }
 
         mut ref: TypeRef = this.alloc_type(new ReferenceType(this.next_id, referent, mutability));
-        this.reference_cache.push(key);
-        this.reference_refs.push(ref);
+        this.reference_cache.insert(key, ref, h);
         return ref;
     }
 
     /// Get or create an array type with the given element type and size.
     get_array_of(mut &this, element: TypeRef, size: i64) -> TypeRef {
         mut key: string = sprintf("array_%lu_%ld", element.id, size);
+        const h: u64 = hash_str(key);
 
-        for (mut i: i64 = 0; i < this.array_cache.length; i++) {
-            if (this.array_cache[i] == key) {
-                return this.array_refs[i];
-            }
-        }
+        const cached: Option<TypeRef> = this.array_cache.get(key, h);
+        if (cached.is_some()) { return cached.unwrap(); }
 
         mut ref: TypeRef = this.alloc_type(new ArrayType(this.next_id, element, size));
-        this.array_cache.push(key);
-        this.array_refs.push(ref);
+        this.array_cache.insert(key, ref, h);
         return ref;
     }
 
     /// Get or create an optional type wrapping the given type.
     get_optional_of(mut &this, wrapped: TypeRef) -> TypeRef {
         mut key: string = sprintf("opt_%lu", wrapped.id);
+        const h: u64 = hash_str(key);
 
-        for (mut i: i64 = 0; i < this.optional_cache.length; i++) {
-            if (this.optional_cache[i] == key) {
-                return this.optional_refs[i];
-            }
-        }
+        const cached: Option<TypeRef> = this.optional_cache.get(key, h);
+        if (cached.is_some()) { return cached.unwrap(); }
 
         mut ref: TypeRef = this.alloc_type(new OptionalType(this.next_id, wrapped));
-        this.optional_cache.push(key);
-        this.optional_refs.push(ref);
+        this.optional_cache.insert(key, ref, h);
         return ref;
     }
 
@@ -300,16 +263,13 @@ type struct TypeArena {
         if (is_variadic) {
             key = key + "_var";
         }
+        const h: u64 = hash_str(key);
 
-        for (mut i: i64 = 0; i < this.function_cache.length; i++) {
-            if (this.function_cache[i] == key) {
-                return this.function_refs[i];
-            }
-        }
+        const cached: Option<TypeRef> = this.function_cache.get(key, h);
+        if (cached.is_some()) { return cached.unwrap(); }
 
         mut ref: TypeRef = this.alloc_type(new FunctionType(this.next_id, ret, params, is_variadic));
-        this.function_cache.push(key);
-        this.function_refs.push(ref);
+        this.function_cache.insert(key, ref, h);
         return ref;
     }
 
@@ -319,16 +279,13 @@ type struct TypeArena {
         for (mut i: i64 = 0; i < elements.length; i++) {
             key = sprintf("%s_%lu", key, elements[i].id);
         }
+        const h: u64 = hash_str(key);
 
-        for (mut i: i64 = 0; i < this.tuple_cache.length; i++) {
-            if (this.tuple_cache[i] == key) {
-                return this.tuple_refs[i];
-            }
-        }
+        const cached: Option<TypeRef> = this.tuple_cache.get(key, h);
+        if (cached.is_some()) { return cached.unwrap(); }
 
         mut ref: TypeRef = this.alloc_type(new TupleType(this.next_id, elements));
-        this.tuple_cache.push(key);
-        this.tuple_refs.push(ref);
+        this.tuple_cache.insert(key, ref, h);
         return ref;
     }
 
@@ -340,74 +297,63 @@ type struct TypeArena {
     /// Create or retrieve a struct type by qualified name.
     create_struct(mut &this, qualified_name: string, module_name: string) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] create_struct() name='%s'", qualified_name);
-        // Check cache
-        for (mut i: i64 = 0; i < this.struct_names.length; i++) {
-            if (this.struct_names[i] == qualified_name) {
-                return this.struct_refs[i];
-            }
-        }
+        const h: u64 = hash_str(qualified_name);
+
+        const cached: Option<TypeRef> = this.struct_cache.get(qualified_name, h);
+        if (cached.is_some()) { return cached.unwrap(); }
 
         mut ref: TypeRef = this.alloc_type(new StructType(this.next_id, qualified_name, module_name));
-        this.struct_names.push(qualified_name);
-        this.struct_refs.push(ref);
+        this.struct_cache.insert(qualified_name, ref, h);
         return ref;
     }
 
     /// Create or retrieve a class type by qualified name.
     create_class(mut &this, qualified_name: string, module_name: string) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] create_class() name='%s'", qualified_name);
-        for (mut i: i64 = 0; i < this.class_names.length; i++) {
-            if (this.class_names[i] == qualified_name) {
-                return this.class_refs[i];
-            }
-        }
+        const h: u64 = hash_str(qualified_name);
+
+        const cached: Option<TypeRef> = this.class_cache.get(qualified_name, h);
+        if (cached.is_some()) { return cached.unwrap(); }
 
         mut ref: TypeRef = this.alloc_type(new ClassType(this.next_id, qualified_name, module_name));
-        this.class_names.push(qualified_name);
-        this.class_refs.push(ref);
+        this.class_cache.insert(qualified_name, ref, h);
         return ref;
     }
 
     /// Create or retrieve an enum type by qualified name.
     create_enum(mut &this, qualified_name: string, module_name: string) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] create_enum() name='%s'", qualified_name);
-        for (mut i: i64 = 0; i < this.enum_names.length; i++) {
-            if (this.enum_names[i] == qualified_name) {
-                return this.enum_refs[i];
-            }
-        }
+        const h: u64 = hash_str(qualified_name);
+
+        const cached: Option<TypeRef> = this.enum_cache.get(qualified_name, h);
+        if (cached.is_some()) { return cached.unwrap(); }
 
         mut ref: TypeRef = this.alloc_type(new EnumType(this.next_id, qualified_name, module_name));
-        this.enum_names.push(qualified_name);
-        this.enum_refs.push(ref);
+        this.enum_cache.insert(qualified_name, ref, h);
         return ref;
     }
 
     /// Create or retrieve a trait type by qualified name.
     create_trait(mut &this, qualified_name: string, module_name: string) -> TypeRef {
-        for (mut i: i64 = 0; i < this.trait_names.length; i++) {
-            if (this.trait_names[i] == qualified_name) {
-                return this.trait_refs[i];
-            }
-        }
+        const h: u64 = hash_str(qualified_name);
+
+        const cached: Option<TypeRef> = this.trait_cache.get(qualified_name, h);
+        if (cached.is_some()) { return cached.unwrap(); }
 
         mut ref: TypeRef = this.alloc_type(new TraitType(this.next_id, qualified_name, module_name));
-        this.trait_names.push(qualified_name);
-        this.trait_refs.push(ref);
+        this.trait_cache.insert(qualified_name, ref, h);
         return ref;
     }
 
     /// Create or retrieve a type alias.
     create_type_alias(mut &this, alias_name: string, target: TypeRef) -> TypeRef {
-        for (mut i: i64 = 0; i < this.alias_names.length; i++) {
-            if (this.alias_names[i] == alias_name) {
-                return this.alias_refs[i];
-            }
-        }
+        const h: u64 = hash_str(alias_name);
+
+        const cached: Option<TypeRef> = this.alias_cache.get(alias_name, h);
+        if (cached.is_some()) { return cached.unwrap(); }
 
         mut ref: TypeRef = this.alloc_type(new TypeAliasType(this.next_id, alias_name, target));
-        this.alias_names.push(alias_name);
-        this.alias_refs.push(ref);
+        this.alias_cache.insert(alias_name, ref, h);
         return ref;
     }
 
@@ -456,31 +402,23 @@ type struct TypeArena {
 
     /// Search all user-defined type caches by name.
     lookup_by_name(&this, name: string) -> TypeRef {
-        for (mut i: i64 = 0; i < this.struct_names.length; i++) {
-            if (this.struct_names[i] == name) {
-                return this.struct_refs[i];
-            }
-        }
-        for (mut i: i64 = 0; i < this.class_names.length; i++) {
-            if (this.class_names[i] == name) {
-                return this.class_refs[i];
-            }
-        }
-        for (mut i: i64 = 0; i < this.enum_names.length; i++) {
-            if (this.enum_names[i] == name) {
-                return this.enum_refs[i];
-            }
-        }
-        for (mut i: i64 = 0; i < this.trait_names.length; i++) {
-            if (this.trait_names[i] == name) {
-                return this.trait_refs[i];
-            }
-        }
-        for (mut i: i64 = 0; i < this.alias_names.length; i++) {
-            if (this.alias_names[i] == name) {
-                return this.alias_refs[i];
-            }
-        }
+        const h: u64 = hash_str(name);
+
+        const s: Option<TypeRef> = this.struct_cache.get(name, h);
+        if (s.is_some()) { return s.unwrap(); }
+
+        const c: Option<TypeRef> = this.class_cache.get(name, h);
+        if (c.is_some()) { return c.unwrap(); }
+
+        const e: Option<TypeRef> = this.enum_cache.get(name, h);
+        if (e.is_some()) { return e.unwrap(); }
+
+        const t: Option<TypeRef> = this.trait_cache.get(name, h);
+        if (t.is_some()) { return t.unwrap(); }
+
+        const a: Option<TypeRef> = this.alias_cache.get(name, h);
+        if (a.is_some()) { return a.unwrap(); }
+
         return TypeRef::invalid();
     }
 

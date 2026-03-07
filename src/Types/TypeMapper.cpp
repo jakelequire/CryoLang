@@ -598,6 +598,12 @@ namespace Cryo
             _llvm_ctx, fields, array_name);
 
         _struct_cache[array_name] = array_struct;
+        // Also cache under the mangled name so generic instantiation (Array_String) finds it
+        std::string mangled_name = "Array_" + elem_ref.get()->display_name();
+        _struct_cache[mangled_name] = array_struct;
+        // Also cache under the [] display name for consistency
+        std::string bracket_name = elem_ref.get()->display_name() + "[]";
+        _struct_cache[bracket_name] = array_struct;
         return array_struct;
     }
 
@@ -1483,16 +1489,37 @@ namespace Cryo
     /// used by GenericCodegen. This must match ICodegenComponent::mangle_generic_type_name().
     static std::string mangle_display_name(const std::string &display_name)
     {
-        size_t angle_pos = display_name.find('<');
+        // Pre-process: convert X[] to Array<X> ([] is built-in Array<T>)
+        std::string processed = display_name;
+        while (processed.find("[]") != std::string::npos)
+        {
+            size_t bracket_pos = processed.find("[]");
+            size_t name_start = bracket_pos;
+            while (name_start > 0 && processed[name_start - 1] != '<' &&
+                   processed[name_start - 1] != ',' && processed[name_start - 1] != ' ')
+            {
+                name_start--;
+            }
+            std::string before = processed.substr(0, name_start);
+            std::string type_part = processed.substr(name_start, bracket_pos - name_start);
+            std::string after = processed.substr(bracket_pos + 2);
+            processed = before + "Array<" + type_part + ">" + after;
+        }
+
+        size_t angle_pos = processed.find('<');
         if (angle_pos == std::string::npos)
-            return display_name;
+            return processed;
 
-        std::string base_name = display_name.substr(0, angle_pos);
-        size_t close_pos = display_name.rfind('>');
+        std::string base_name = processed.substr(0, angle_pos);
+        size_t close_pos = processed.rfind('>');
         if (close_pos == std::string::npos || close_pos <= angle_pos)
-            return display_name;
+            return processed;
 
-        std::string args_str = display_name.substr(angle_pos + 1, close_pos - angle_pos - 1);
+        // Array<T> is a built-in type — preserve its angle brackets in mangled names
+        if (base_name == "Array")
+            return processed;
+
+        std::string args_str = processed.substr(angle_pos + 1, close_pos - angle_pos - 1);
 
         // Split by commas respecting angle bracket nesting, then mangle each arg
         std::string mangled = base_name + "_";
@@ -2202,6 +2229,41 @@ namespace Cryo
             // For user-defined types like "WorkerData*", also return opaque ptr
             // The actual type will be handled through struct lookup
             return ptr_type();
+        }
+
+        // Handle dynamic array types (e.g., "SymbolID[]" -> Array<SymbolID>)
+        // [] is the built-in Array<T> type in Cryo
+        if (name.size() > 2 && name.substr(name.size() - 2) == "[]")
+        {
+            std::string elem_name = name.substr(0, name.size() - 2);
+            std::string array_name = "Array<" + elem_name + ">";
+
+            // Check if the Array<T> struct already exists
+            auto cache_it = _struct_cache.find(array_name);
+            if (cache_it != _struct_cache.end())
+            {
+                return cache_it->second;
+            }
+
+            llvm::StructType *existing = llvm::StructType::getTypeByName(_llvm_ctx, array_name);
+            if (existing)
+            {
+                _struct_cache[array_name] = existing;
+                _struct_cache[name] = existing; // Also cache under the [] name
+                return existing;
+            }
+
+            // Create the Array<T> struct: { ptr, i64, i64 }
+            std::vector<llvm::Type *> fields = {
+                ptr_type(), // elements: T*
+                i64_type(), // length: u64
+                i64_type()  // capacity: u64
+            };
+            llvm::StructType *array_struct = llvm::StructType::create(
+                _llvm_ctx, fields, array_name);
+            _struct_cache[array_name] = array_struct;
+            _struct_cache[name] = array_struct;
+            return array_struct;
         }
 
         return nullptr;

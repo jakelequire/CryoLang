@@ -476,6 +476,262 @@ namespace Cryo
                         }
                     }
 
+                    // If not a type param, try annotation-based substitution for
+                    // complex generic types (e.g., "HashMapEntry<K,V>*")
+                    if (!field_type.is_valid() && type_name.find('<') != std::string::npos)
+                    {
+                        // Substitute type params in the annotation string
+                        std::string substituted_name = type_name;
+                        for (size_t i = 0; i < type_params.size() && i < type_args.size(); ++i)
+                        {
+                            std::string param = type_params[i];
+                            std::string concrete = type_args[i]->display_name();
+                            // Replace occurrences of the type param in the annotation
+                            size_t pos = 0;
+                            while ((pos = substituted_name.find(param, pos)) != std::string::npos)
+                            {
+                                // Make sure it's a whole token (not part of a longer identifier)
+                                bool at_start = (pos == 0 || !std::isalnum(static_cast<unsigned char>(substituted_name[pos - 1])) && substituted_name[pos - 1] != '_');
+                                bool at_end = (pos + param.size() >= substituted_name.size() ||
+                                              (!std::isalnum(static_cast<unsigned char>(substituted_name[pos + param.size()])) && substituted_name[pos + param.size()] != '_'));
+                                if (at_start && at_end)
+                                {
+                                    substituted_name.replace(pos, param.size(), concrete);
+                                    pos += concrete.size();
+                                }
+                                else
+                                {
+                                    pos += param.size();
+                                }
+                            }
+                        }
+
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "Monomorphizer::create_concrete_struct: field '{}' substituted annotation '{}' -> '{}'",
+                                  field->name(), type_name, substituted_name);
+
+                        // Strip pointer suffix and resolve
+                        int ptr_depth = 0;
+                        std::string base_name = substituted_name;
+                        while (!base_name.empty() && base_name.back() == '*')
+                        {
+                            base_name.pop_back();
+                            ptr_depth++;
+                        }
+
+                        // Strip array suffix
+                        int arr_depth = 0;
+                        while (base_name.size() >= 2 && base_name.substr(base_name.size() - 2) == "[]")
+                        {
+                            base_name.erase(base_name.size() - 2);
+                            arr_depth++;
+                        }
+
+                        // Try to resolve the base type (may be an instantiated generic)
+                        if (base_name.find('<') != std::string::npos)
+                        {
+                            // Parse out the generic base and args
+                            size_t open = base_name.find('<');
+                            size_t close = base_name.rfind('>');
+                            if (open != std::string::npos && close != std::string::npos)
+                            {
+                                std::string gen_base = base_name.substr(0, open);
+                                std::string args_str = base_name.substr(open + 1, close - open - 1);
+
+                                // Build mangled name: Base_Arg1_Arg2
+                                std::string mangled = gen_base;
+                                // Split args by comma (respecting nested generics)
+                                std::vector<std::string> arg_strs;
+                                int depth = 0;
+                                size_t arg_start = 0;
+                                for (size_t ci = 0; ci <= args_str.size(); ++ci)
+                                {
+                                    if (ci == args_str.size() || (args_str[ci] == ',' && depth == 0))
+                                    {
+                                        std::string a = args_str.substr(arg_start, ci - arg_start);
+                                        while (!a.empty() && a.front() == ' ') a.erase(0, 1);
+                                        while (!a.empty() && a.back() == ' ') a.pop_back();
+                                        if (!a.empty()) arg_strs.push_back(a);
+                                        arg_start = ci + 1;
+                                    }
+                                    else if (args_str[ci] == '<') depth++;
+                                    else if (args_str[ci] == '>') depth--;
+                                }
+                                for (const auto &a : arg_strs)
+                                {
+                                    mangled += "_" + a;
+                                }
+                                // Convert X[] to Array<X> ([] is built-in Array<T>)
+                                while (mangled.find("[]") != std::string::npos)
+                                {
+                                    size_t bracket_pos = mangled.find("[]");
+                                    size_t name_start = bracket_pos;
+                                    while (name_start > 0 && mangled[name_start - 1] != '_' &&
+                                           mangled[name_start - 1] != '<' && mangled[name_start - 1] != ',')
+                                    {
+                                        name_start--;
+                                    }
+                                    std::string before = mangled.substr(0, name_start);
+                                    std::string type_name_part = mangled.substr(name_start, bracket_pos - name_start);
+                                    std::string after = mangled.substr(bracket_pos + 2);
+                                    mangled = before + "Array<" + type_name_part + ">" + after;
+                                }
+
+                                // Protect Array<...> brackets from sanitization
+                                const char kOpen = '\x01';
+                                const char kClose = '\x02';
+                                {
+                                    size_t pos = 0;
+                                    while ((pos = mangled.find("Array<", pos)) != std::string::npos)
+                                    {
+                                        mangled[pos + 5] = kOpen;
+                                        int depth = 1;
+                                        for (size_t ci = pos + 6; ci < mangled.size() && depth > 0; ++ci)
+                                        {
+                                            if (mangled[ci] == '<') depth++;
+                                            else if (mangled[ci] == '>') { depth--; if (depth == 0) mangled[ci] = kClose; }
+                                        }
+                                        pos += 6;
+                                    }
+                                }
+
+                                // Sanitize mangled name (Array<> brackets are protected)
+                                std::replace(mangled.begin(), mangled.end(), '<', '_');
+                                std::replace(mangled.begin(), mangled.end(), '>', '_');
+                                std::replace(mangled.begin(), mangled.end(), ',', '_');
+                                std::replace(mangled.begin(), mangled.end(), ' ', '_');
+                                std::replace(mangled.begin(), mangled.end(), '*', 'p');
+                                std::replace(mangled.begin(), mangled.end(), '&', 'r');
+                                std::replace(mangled.begin(), mangled.end(), '[', '_');
+                                std::replace(mangled.begin(), mangled.end(), ']', '_');
+
+                                // Restore Array<> brackets
+                                std::replace(mangled.begin(), mangled.end(), kOpen, '<');
+                                std::replace(mangled.begin(), mangled.end(), kClose, '>');
+
+                                // Remove trailing underscores
+                                while (!mangled.empty() && mangled.back() == '_') mangled.pop_back();
+                                // Remove consecutive underscores
+                                std::string cleaned;
+                                for (size_t ci = 0; ci < mangled.size(); ++ci)
+                                {
+                                    if (mangled[ci] == '_' && ci + 1 < mangled.size() && mangled[ci + 1] == '_')
+                                        continue;
+                                    cleaned += mangled[ci];
+                                }
+                                mangled = cleaned;
+
+                                field_type = _arena.lookup_type_by_name(mangled);
+                                if (!field_type.is_valid())
+                                {
+                                    // Also try looking up via the generic registry
+                                    field_type = _arena.lookup_type_by_name(gen_base + "<" + args_str + ">");
+                                }
+
+                                // If still not found, try to create the instantiation
+                                // The nested generic type may not have been instantiated yet
+                                if (!field_type.is_valid())
+                                {
+                                    // Look up the base generic type
+                                    TypeRef base_generic = _arena.lookup_type_by_name(gen_base);
+                                    if (base_generic.is_valid())
+                                    {
+                                        // Resolve each arg string to a TypeRef
+                                        std::vector<TypeRef> nested_args;
+                                        bool all_resolved = true;
+                                        for (const auto &a : arg_strs)
+                                        {
+                                            // Strip trailing [] and * modifiers
+                                            std::string base_a = a;
+                                            int arr_depth = 0;
+                                            int ptr_depth = 0;
+                                            while (base_a.size() >= 2 && base_a.substr(base_a.size() - 2) == "[]")
+                                            {
+                                                base_a.erase(base_a.size() - 2);
+                                                arr_depth++;
+                                            }
+                                            while (!base_a.empty() && base_a.back() == '*')
+                                            {
+                                                base_a.pop_back();
+                                                ptr_depth++;
+                                            }
+
+                                            TypeRef arg_ref = _arena.lookup_type_by_name(base_a);
+                                            if (!arg_ref.is_valid())
+                                            {
+                                                // Try primitives
+                                                if (base_a == "string") arg_ref = _arena.get_string();
+                                                else if (base_a == "i32" || base_a == "int") arg_ref = _arena.get_i32();
+                                                else if (base_a == "i64") arg_ref = _arena.get_i64();
+                                                else if (base_a == "u32") arg_ref = _arena.get_u32();
+                                                else if (base_a == "u64") arg_ref = _arena.get_u64();
+                                                else if (base_a == "u8") arg_ref = _arena.get_u8();
+                                                else if (base_a == "boolean") arg_ref = _arena.get_bool();
+                                                else if (base_a == "f32") arg_ref = _arena.get_f32();
+                                                else if (base_a == "f64") arg_ref = _arena.get_f64();
+                                                else if (base_a == "void") arg_ref = _arena.get_void();
+                                            }
+                                            // Re-wrap with pointer/array modifiers
+                                            if (arg_ref.is_valid())
+                                            {
+                                                for (int pi = 0; pi < ptr_depth; ++pi)
+                                                    arg_ref = _arena.get_pointer_to(arg_ref);
+                                                for (int ai = 0; ai < arr_depth; ++ai)
+                                                    arg_ref = _arena.get_array_of(arg_ref, std::nullopt);
+                                            }
+                                            if (arg_ref.is_valid())
+                                            {
+                                                nested_args.push_back(arg_ref);
+                                            }
+                                            else
+                                            {
+                                                all_resolved = false;
+                                                break;
+                                            }
+                                        }
+
+                                        if (all_resolved && !nested_args.empty())
+                                        {
+                                            // Synchronously specialize the nested type so it exists
+                                            // before we continue building the parent struct
+                                            specialize(base_generic, nested_args);
+
+                                            // Now look up the concrete type by mangled name
+                                            field_type = _arena.lookup_type_by_name(mangled);
+                                            if (!field_type.is_valid())
+                                            {
+                                                // Also try the instantiation type
+                                                field_type = _arena.create_instantiation(base_generic, nested_args);
+                                                _arena.register_instantiated_by_name(field_type);
+                                            }
+
+                                            LOG_DEBUG(LogComponent::GENERAL,
+                                                      "Monomorphizer::create_concrete_struct: created instantiation for '{}' -> valid={}",
+                                                      base_name, field_type.is_valid());
+                                        }
+                                    }
+                                }
+
+                                LOG_DEBUG(LogComponent::GENERAL,
+                                          "Monomorphizer::create_concrete_struct: resolved generic '{}' (mangled='{}') -> valid={}",
+                                          base_name, mangled, field_type.is_valid());
+                            }
+                        }
+                        else
+                        {
+                            field_type = _arena.lookup_type_by_name(base_name);
+                        }
+
+                        // Apply pointer wrapping
+                        if (field_type.is_valid())
+                        {
+                            for (int p = 0; p < arr_depth; ++p)
+                                field_type = _arena.get_array_of(field_type, std::nullopt);
+                            for (int p = 0; p < ptr_depth; ++p)
+                                field_type = _arena.get_pointer_to(field_type);
+                        }
+                    }
+
                     // If not a type param, try resolved type or name lookup
                     if (!field_type.is_valid())
                     {
@@ -829,12 +1085,47 @@ namespace Cryo
                     // Use a simplified name for mangling
                     std::string arg_name = args[i].get()->display_name();
 
-                    // Replace special characters
+                    // Convert X[] to Array<X> ([] is the built-in Array<T> type)
+                    while (arg_name.size() >= 2 &&
+                           arg_name.substr(arg_name.size() - 2) == "[]")
+                    {
+                        arg_name = "Array<" + arg_name.substr(0, arg_name.size() - 2) + ">";
+                    }
+
+                    // Protect Array<...> angle brackets from sanitization
+                    // by temporarily replacing them with placeholders
+                    const char kOpen = '\x01';
+                    const char kClose = '\x02';
+                    {
+                        size_t pos = 0;
+                        while ((pos = arg_name.find("Array<", pos)) != std::string::npos)
+                        {
+                            arg_name[pos + 5] = kOpen; // replace < after "Array"
+                            // Find the matching >
+                            int depth = 1;
+                            for (size_t ci = pos + 6; ci < arg_name.size() && depth > 0; ++ci)
+                            {
+                                if (arg_name[ci] == '<') depth++;
+                                else if (arg_name[ci] == '>') { depth--; if (depth == 0) arg_name[ci] = kClose; }
+                            }
+                            pos += 6;
+                        }
+                    }
+
+                    // Replace special characters (Array<> brackets are protected)
                     std::replace(arg_name.begin(), arg_name.end(), '<', '_');
                     std::replace(arg_name.begin(), arg_name.end(), '>', '_');
                     std::replace(arg_name.begin(), arg_name.end(), ',', '_');
                     std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
                     std::replace(arg_name.begin(), arg_name.end(), ':', '_');
+                    std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                    std::replace(arg_name.begin(), arg_name.end(), '&', 'r');
+                    std::replace(arg_name.begin(), arg_name.end(), '[', '_');
+                    std::replace(arg_name.begin(), arg_name.end(), ']', '_');
+
+                    // Restore Array<> brackets
+                    std::replace(arg_name.begin(), arg_name.end(), kOpen, '<');
+                    std::replace(arg_name.begin(), arg_name.end(), kClose, '>');
 
                     oss << arg_name;
                 }

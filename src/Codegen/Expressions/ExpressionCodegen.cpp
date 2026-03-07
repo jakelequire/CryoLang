@@ -3622,11 +3622,44 @@ namespace Cryo::Codegen
                         if (args[i].is_valid())
                         {
                             std::string arg_name = args[i]->display_name();
+
+                            // Convert X[] to Array<X> ([] is built-in Array<T>)
+                            while (arg_name.size() >= 2 &&
+                                   arg_name.substr(arg_name.size() - 2) == "[]")
+                            {
+                                arg_name = "Array<" + arg_name.substr(0, arg_name.size() - 2) + ">";
+                            }
+
+                            // Protect Array<...> brackets from sanitization
+                            const char kOpen = '\x01';
+                            const char kClose = '\x02';
+                            {
+                                size_t pos = 0;
+                                while ((pos = arg_name.find("Array<", pos)) != std::string::npos)
+                                {
+                                    arg_name[pos + 5] = kOpen;
+                                    int d = 1;
+                                    for (size_t ci = pos + 6; ci < arg_name.size() && d > 0; ++ci)
+                                    {
+                                        if (arg_name[ci] == '<') d++;
+                                        else if (arg_name[ci] == '>') { d--; if (d == 0) arg_name[ci] = kClose; }
+                                    }
+                                    pos += 6;
+                                }
+                            }
+
                             std::replace(arg_name.begin(), arg_name.end(), '<', '_');
                             std::replace(arg_name.begin(), arg_name.end(), '>', '_');
                             std::replace(arg_name.begin(), arg_name.end(), ',', '_');
                             std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
                             std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                            std::replace(arg_name.begin(), arg_name.end(), '[', '_');
+                            std::replace(arg_name.begin(), arg_name.end(), ']', '_');
+
+                            // Restore Array<> brackets
+                            std::replace(arg_name.begin(), arg_name.end(), kOpen, '<');
+                            std::replace(arg_name.begin(), arg_name.end(), kClose, '>');
+
                             mangled += arg_name;
                         }
                     }
@@ -3900,28 +3933,7 @@ namespace Cryo::Codegen
                             else if (inst->generic_base().is_valid())
                             {
                                 std::string base = inst->generic_base()->display_name();
-                                std::string mangled = base;
-                                const auto &args = inst->type_args();
-                                if (!args.empty())
-                                {
-                                    mangled += "_";
-                                    for (size_t i = 0; i < args.size(); ++i)
-                                    {
-                                        if (i > 0)
-                                            mangled += "_";
-                                        if (args[i].is_valid())
-                                        {
-                                            std::string arg_name = args[i]->display_name();
-                                            std::replace(arg_name.begin(), arg_name.end(), '<', '_');
-                                            std::replace(arg_name.begin(), arg_name.end(), '>', '_');
-                                            std::replace(arg_name.begin(), arg_name.end(), ',', '_');
-                                            std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
-                                            std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
-                                            mangled += arg_name;
-                                        }
-                                    }
-                                }
-                                outer_type_name = mangled;
+                                outer_type_name = resolve_struct_type_name(outer_obj_type);
                             }
                         }
                         else if (outer_obj_type->kind() == Cryo::TypeKind::Pointer)
@@ -3955,37 +3967,7 @@ namespace Cryo::Codegen
                             // Handle InstantiatedType - use monomorphized name
                             if (it->second->kind() == Cryo::TypeKind::InstantiatedType)
                             {
-                                auto *inst = static_cast<const Cryo::InstantiatedType *>(it->second.get());
-                                if (inst->has_resolved_type())
-                                {
-                                    outer_type_name = inst->resolved_type()->display_name();
-                                }
-                                else if (inst->generic_base().is_valid())
-                                {
-                                    std::string base = inst->generic_base()->display_name();
-                                    std::string mangled = base;
-                                    const auto &args = inst->type_args();
-                                    if (!args.empty())
-                                    {
-                                        mangled += "_";
-                                        for (size_t i = 0; i < args.size(); ++i)
-                                        {
-                                            if (i > 0)
-                                                mangled += "_";
-                                            if (args[i].is_valid())
-                                            {
-                                                std::string arg_name = args[i]->display_name();
-                                                std::replace(arg_name.begin(), arg_name.end(), '<', '_');
-                                                std::replace(arg_name.begin(), arg_name.end(), '>', '_');
-                                                std::replace(arg_name.begin(), arg_name.end(), ',', '_');
-                                                std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
-                                                std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
-                                                mangled += arg_name;
-                                            }
-                                        }
-                                    }
-                                    outer_type_name = mangled;
-                                }
+                                outer_type_name = resolve_struct_type_name(it->second);
                             }
                             else if (it->second->kind() == Cryo::TypeKind::Pointer)
                             {
@@ -4188,29 +4170,7 @@ namespace Cryo::Codegen
                                     }
                                     else if (inst->generic_base().is_valid())
                                     {
-                                        std::string base = inst->generic_base()->display_name();
-                                        std::string mangled = base;
-                                        const auto &args = inst->type_args();
-                                        if (!args.empty())
-                                        {
-                                            mangled += "_";
-                                            for (size_t i = 0; i < args.size(); ++i)
-                                            {
-                                                if (i > 0)
-                                                    mangled += "_";
-                                                if (args[i].is_valid())
-                                                {
-                                                    std::string arg_name = args[i]->display_name();
-                                                    std::replace(arg_name.begin(), arg_name.end(), '<', '_');
-                                                    std::replace(arg_name.begin(), arg_name.end(), '>', '_');
-                                                    std::replace(arg_name.begin(), arg_name.end(), ',', '_');
-                                                    std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
-                                                    std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
-                                                    mangled += arg_name;
-                                                }
-                                            }
-                                        }
-                                        arr_type_name = mangled;
+                                        arr_type_name = resolve_struct_type_name(arr_obj_type);
                                     }
                                 }
                                 else if (arr_obj_type->kind() == Cryo::TypeKind::Reference)
@@ -4699,101 +4659,213 @@ namespace Cryo::Codegen
                 }
                 else
                 {
-                    // Try substituting type parameters in the annotation (e.g., "HashSetEntry<T>" -> "HashSetEntry_string")
-                    redirected = generics->substitute_type_annotation(type_name);
-                    if (!redirected.empty())
+                    // Check if the type_name contains any '<' that needs generic substitution.
+                    // Skip if the only '<' is from "Array<" in an already-mangled name
+                    // (e.g., "HashMapEntry_string_Array<SymbolID>"), but NOT when the name
+                    // IS "Array<T>" itself (which needs T substituted).
+                    bool needs_substitution = false;
                     {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "resolve_member_info: Substituted type annotation {} -> {} in generic context",
-                                  type_name, redirected);
-                        type_name = redirected;
-                    }
-                    else if (type_name.find('<') != std::string::npos)
-                    {
-                        // Manual fallback: parse "HashSetEntry<T>" and resolve T individually
-                        size_t angle = type_name.find('<');
-                        std::string base = type_name.substr(0, angle);
-                        std::string args = type_name.substr(angle + 1);
-                        if (!args.empty() && args.back() == '>')
-                            args.pop_back();
-
-                        // Resolve each type param
-                        TypeRef resolved_param = generics->resolve_type_param(args);
-                        if (resolved_param.is_valid())
+                        size_t sp = 0;
+                        while ((sp = type_name.find('<', sp)) != std::string::npos)
                         {
-                            std::string mangled = base + "_" + resolved_param->display_name();
+                            if (sp < 5 || type_name.substr(sp - 5, 5) != "Array")
+                            {
+                                // Non-Array '<' found — definitely needs substitution
+                                needs_substitution = true;
+                                break;
+                            }
+                            // This is "Array<" — check if it's the base type itself
+                            // "Array<T>" starts at position 0, needs substitution
+                            // "Foo_Array<String>" has Array at position > 0, already concrete
+                            size_t array_start = sp - 5;
+                            if (array_start == 0)
+                            {
+                                needs_substitution = true;
+                                break;
+                            }
+                            sp++;
+                        }
+                    }
+
+                    // Also check for underscore-mangled names containing type params
+                    // (e.g., "Array_T" needs T substituted to "Array_String")
+                    if (!needs_substitution && type_name.find('_') != std::string::npos)
+                    {
+                        redirected = generics->substitute_type_annotation(type_name);
+                        if (!redirected.empty() && redirected != type_name)
+                        {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "resolve_member_info: Manual fallback resolved {} -> {} in generic context",
-                                      type_name, mangled);
-                            type_name = mangled;
+                                      "resolve_member_info: Underscore-mangled substitution {} -> {} in generic context",
+                                      type_name, redirected);
+                            type_name = redirected;
+                        }
+                    }
+
+                    if (needs_substitution)
+                    {
+                        // Try substituting type parameters in the annotation (e.g., "HashSetEntry<T>" -> "HashSetEntry_string")
+                        redirected = generics->substitute_type_annotation(type_name);
+                        if (!redirected.empty())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "resolve_member_info: Substituted type annotation {} -> {} in generic context",
+                                      type_name, redirected);
+                            type_name = redirected;
+                        }
+                        else
+                        {
+                            // Manual fallback: parse "HashSetEntry<T>" and resolve T individually
+                            size_t angle = type_name.find('<');
+                            std::string base = type_name.substr(0, angle);
+                            std::string args = type_name.substr(angle + 1);
+                            if (!args.empty() && args.back() == '>')
+                                args.pop_back();
+
+                            // Resolve each type param
+                            TypeRef resolved_param = generics->resolve_type_param(args);
+                            if (resolved_param.is_valid())
+                            {
+                                std::string mangled = base + "_" + resolved_param->display_name();
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "resolve_member_info: Manual fallback resolved {} -> {} in generic context",
+                                          type_name, mangled);
+                                type_name = mangled;
+                            }
                         }
                     }
                 }
             }
         }
 
+        // Pre-process: convert X[] to Array<X> in type_name
+        while (type_name.find("[]") != std::string::npos)
+        {
+            size_t bracket_pos = type_name.find("[]");
+            size_t name_start = bracket_pos;
+            while (name_start > 0 && type_name[name_start - 1] != '_' &&
+                   type_name[name_start - 1] != '<' && type_name[name_start - 1] != ',')
+            {
+                name_start--;
+            }
+            std::string before = type_name.substr(0, name_start);
+            std::string type_part = type_name.substr(name_start, bracket_pos - name_start);
+            std::string after = type_name.substr(bracket_pos + 2);
+            type_name = before + "Array<" + type_part + ">" + after;
+        }
+
         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                   "resolve_member_info: Looking up type '{}' for member '{}'",
                   type_name, member_name);
 
-        // Convert generic type names like "Array<Token>" to mangled form "Array_Token"
+        // Convert generic type names like "HashMap<string, u32>" to mangled form "HashMap_string_u32"
         // This is needed because LLVM struct types are stored with mangled names
+        // BUT: if the only '<' is inside "Array<...>" (already-mangled name), skip re-mangling
         std::string mangled_type_name = type_name;
-        if (type_name.find('<') != std::string::npos)
         {
-            // Parse generic type: "Array<Token>" -> base="Array", args=["Token"]
-            size_t angle_pos = type_name.find('<');
-            std::string base_name = type_name.substr(0, angle_pos);
-            std::string args_str = type_name.substr(angle_pos + 1);
-            if (!args_str.empty() && args_str.back() == '>')
+            // Check if there's a '<' that is NOT part of "Array<"
+            bool has_generic_angle = false;
+            size_t search_pos = 0;
+            while ((search_pos = type_name.find('<', search_pos)) != std::string::npos)
             {
-                args_str.pop_back();
-            }
-
-            // Build mangled name matching GenericCodegen::mangle_type_name format
-            // Parse comma-separated args respecting angle bracket nesting, then join with '_'
-            mangled_type_name = base_name + "_";
-            std::vector<std::string> parsed_args;
-            int depth = 0;
-            size_t arg_start = 0;
-            for (size_t ci = 0; ci < args_str.length(); ++ci)
-            {
-                if (args_str[ci] == '<')
-                    depth++;
-                else if (args_str[ci] == '>')
-                    depth--;
-                else if (args_str[ci] == ',' && depth == 0)
+                // Check if this '<' is preceded by "Array"
+                if (search_pos >= 5 && type_name.substr(search_pos - 5, 5) == "Array")
                 {
-                    std::string arg = args_str.substr(arg_start, ci - arg_start);
-                    size_t f = arg.find_first_not_of(" \t");
-                    size_t l = arg.find_last_not_of(" \t");
-                    if (f != std::string::npos)
-                        parsed_args.push_back(arg.substr(f, l - f + 1));
-                    arg_start = ci + 1;
+                    search_pos++;
+                    continue; // This is Array<...>, skip
                 }
+                has_generic_angle = true;
+                break;
             }
-            std::string last_arg = args_str.substr(arg_start);
-            size_t f = last_arg.find_first_not_of(" \t");
-            size_t l = last_arg.find_last_not_of(" \t");
-            if (f != std::string::npos)
-                parsed_args.push_back(last_arg.substr(f, l - f + 1));
 
-            for (size_t i = 0; i < parsed_args.size(); ++i)
+            if (has_generic_angle)
             {
-                if (i > 0)
-                    mangled_type_name += "_";
-                std::string arg = parsed_args[i];
-                std::replace(arg.begin(), arg.end(), '<', '_');
-                std::replace(arg.begin(), arg.end(), '>', '_');
-                std::replace(arg.begin(), arg.end(), ',', '_');
-                std::replace(arg.begin(), arg.end(), ' ', '_');
-                std::replace(arg.begin(), arg.end(), '*', 'p');
-                mangled_type_name += arg;
-            }
+                size_t angle_pos = search_pos;
+                std::string base_name = type_name.substr(0, angle_pos);
+                std::string args_str = type_name.substr(angle_pos + 1);
+                if (!args_str.empty() && args_str.back() == '>')
+                {
+                    args_str.pop_back();
+                }
 
-            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "resolve_member_info: Converted generic type '{}' to mangled name '{}'",
-                      type_name, mangled_type_name);
+                // Build mangled name matching GenericCodegen::mangle_type_name format
+                // Parse comma-separated args respecting angle bracket nesting, then join with '_'
+                mangled_type_name = base_name + "_";
+                std::vector<std::string> parsed_args;
+                int depth = 0;
+                size_t arg_start = 0;
+                for (size_t ci = 0; ci < args_str.length(); ++ci)
+                {
+                    if (args_str[ci] == '<')
+                        depth++;
+                    else if (args_str[ci] == '>')
+                        depth--;
+                    else if (args_str[ci] == ',' && depth == 0)
+                    {
+                        std::string arg = args_str.substr(arg_start, ci - arg_start);
+                        size_t f = arg.find_first_not_of(" \t");
+                        size_t l = arg.find_last_not_of(" \t");
+                        if (f != std::string::npos)
+                            parsed_args.push_back(arg.substr(f, l - f + 1));
+                        arg_start = ci + 1;
+                    }
+                }
+                std::string last_arg = args_str.substr(arg_start);
+                size_t f = last_arg.find_first_not_of(" \t");
+                size_t l = last_arg.find_last_not_of(" \t");
+                if (f != std::string::npos)
+                    parsed_args.push_back(last_arg.substr(f, l - f + 1));
+
+                {
+                    for (size_t i = 0; i < parsed_args.size(); ++i)
+                    {
+                        if (i > 0)
+                            mangled_type_name += "_";
+                        std::string arg = parsed_args[i];
+
+                        // Convert X[] to Array<X>
+                        while (arg.size() >= 2 && arg.substr(arg.size() - 2) == "[]")
+                        {
+                            arg = "Array<" + arg.substr(0, arg.size() - 2) + ">";
+                        }
+
+                        // Protect Array<...> brackets
+                        const char kOpen = '\x01';
+                        const char kClose = '\x02';
+                        {
+                            size_t pos = 0;
+                            while ((pos = arg.find("Array<", pos)) != std::string::npos)
+                            {
+                                arg[pos + 5] = kOpen;
+                                int d = 1;
+                                for (size_t ci = pos + 6; ci < arg.size() && d > 0; ++ci)
+                                {
+                                    if (arg[ci] == '<') d++;
+                                    else if (arg[ci] == '>') { d--; if (d == 0) arg[ci] = kClose; }
+                                }
+                                pos += 6;
+                            }
+                        }
+
+                        std::replace(arg.begin(), arg.end(), '<', '_');
+                        std::replace(arg.begin(), arg.end(), '>', '_');
+                        std::replace(arg.begin(), arg.end(), ',', '_');
+                        std::replace(arg.begin(), arg.end(), ' ', '_');
+                        std::replace(arg.begin(), arg.end(), '*', 'p');
+                        std::replace(arg.begin(), arg.end(), '[', '_');
+                        std::replace(arg.begin(), arg.end(), ']', '_');
+
+                        // Restore Array<> brackets
+                        std::replace(arg.begin(), arg.end(), kOpen, '<');
+                        std::replace(arg.begin(), arg.end(), kClose, '>');
+
+                        mangled_type_name += arg;
+                    }
+                }
+
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "resolve_member_info: Converted generic type '{}' to mangled name '{}'",
+                          type_name, mangled_type_name);
+            }
         }
 
         // Look up struct type in LLVM context (try mangled name first, then original)
@@ -4816,6 +4888,33 @@ namespace Cryo::Codegen
                 {
                     out_struct_type = llvm::dyn_cast<llvm::StructType>(type);
                 }
+            }
+        }
+
+        // Fallback: built-in Array types use "Array<X>" in LLVM but mangle to "Array_X"
+        if (!out_struct_type)
+        {
+            // Check if mangled_type_name is "Array_X" -> try "Array<X>"
+            if (mangled_type_name.substr(0, 6) == "Array_" && mangled_type_name.find('<') == std::string::npos)
+            {
+                std::string bracket_name = "Array<" + mangled_type_name.substr(6) + ">";
+                out_struct_type = llvm::StructType::getTypeByName(llvm_ctx(), bracket_name);
+                if (out_struct_type)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_member_info: Found built-in Array type '{}' for mangled '{}'",
+                              bracket_name, mangled_type_name);
+                    // Register fields under the mangled name if not already done
+                    if (ctx().get_struct_field_index(mangled_type_name, "ptr") < 0)
+                    {
+                        ctx().register_struct_fields(mangled_type_name, {"ptr", "len", "cap"});
+                    }
+                }
+            }
+            // Also try the reverse: "Array<X>" -> lookup directly
+            if (!out_struct_type && type_name.substr(0, 6) == "Array<")
+            {
+                out_struct_type = llvm::StructType::getTypeByName(llvm_ctx(), type_name);
             }
         }
 

@@ -1,8 +1,9 @@
-///! Scope
-///!
-///! Scope tree nodes for the Resolver.  Each Scope is a tree node with a
-///! parent pointer (ScopeID) and child list.  Symbols within a scope are
-///! stored in parallel arrays for name → SymbolID lookup.
+/// Scope
+///
+/// Scope tree nodes for the Resolver.  Each Scope is a tree node with a
+/// parent pointer (ScopeID) and child list.  Symbols within a scope are
+/// stored in parallel arrays for ordered iteration, with a HashMap index
+/// for O(1) name→SymbolID lookup.
 
 namespace Compiler::Resolver::Scope;
 
@@ -10,6 +11,7 @@ import Compiler::Resolver::SymbolID;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Diag;
 import Utils::Logger;
+import std::collections::hashmap;
 
 
 // ============================================================================
@@ -94,9 +96,12 @@ type struct Scope {
     owner_name:      string;
     span:            SourceSpan;
 
-    // Symbols declared in this scope (parallel arrays)
+    // Symbols declared in this scope (parallel arrays for iteration)
     symbol_names:    SymbolStr[];
     symbol_ids:      SymbolID[];
+
+    // Fast lookup index: SymbolStr.id → index in symbol_ids[]
+    symbol_index:    HashMap<u32, i64>;
 
     // Overloaded names (parallel arrays)
     overload_names:  SymbolStr[];
@@ -116,6 +121,7 @@ type struct Scope {
             span:            span,
             symbol_names:    [],
             symbol_ids:      [],
+            symbol_index:    HashMap<u32, i64>::new(),
             overload_names:  [],
             overload_lists:  [],
             child_scope_ids: [],
@@ -124,11 +130,12 @@ type struct Scope {
 
     /// Look up a symbol in this scope only.  Returns invalid SymbolID if not found.
     find(&this, name: SymbolStr) -> SymbolID {
-        for (mut i: i64 = 0; i < this.symbol_names.length; i++) {
-            if (this.symbol_names[i].equals(name)) {
-                LOG_DEBUG(LogComponent::General, "[Scope] find() found symbol in scope '%s'", this.owner_name);
-                return this.symbol_ids[i];
-            }
+        const h: u64 = hash_int(name.id as u64);
+        const opt: Option<i64> = this.symbol_index.get(name.id, h);
+        if (opt.is_some()) {
+            const idx: i64 = opt.unwrap();
+            LOG_DEBUG(LogComponent::General, "[Scope] find() found symbol in scope '%s'", this.owner_name);
+            return this.symbol_ids[idx];
         }
         return SymbolID::invalid();
     }
@@ -137,19 +144,21 @@ type struct Scope {
     /// allows_overload is true, adds to the overload set instead.
     /// Returns false if the name is a duplicate and overloading is not allowed.
     insert(mut &this, name: SymbolStr, sym_id: SymbolID, allows_overload: boolean) -> boolean {
+        const h: u64 = hash_int(name.id as u64);
+
         // Check for existing symbol with the same name
-        for (mut i: i64 = 0; i < this.symbol_names.length; i++) {
-            if (this.symbol_names[i].equals(name)) {
-                if (allows_overload) {
-                    this.add_overload(name, sym_id);
-                    return true;
-                }
-                return false;
+        if (this.symbol_index.contains_key(name.id, h)) {
+            if (allows_overload) {
+                this.add_overload(name, sym_id);
+                return true;
             }
+            return false;
         }
 
+        const idx: i64 = this.symbol_ids.length;
         this.symbol_names.push(name);
         this.symbol_ids.push(sym_id);
+        this.symbol_index.insert(name.id, idx, h);
         return true;
     }
 
@@ -171,10 +180,10 @@ type struct Scope {
         mut result: SymbolID[] = [];
 
         // Primary symbol
-        for (mut i: i64 = 0; i < this.symbol_names.length; i++) {
-            if (this.symbol_names[i].equals(name)) {
-                result.push(this.symbol_ids[i]);
-            }
+        const h: u64 = hash_int(name.id as u64);
+        const opt: Option<i64> = this.symbol_index.get(name.id, h);
+        if (opt.is_some()) {
+            result.push(this.symbol_ids[opt.unwrap()]);
         }
 
         // Overflow overloads

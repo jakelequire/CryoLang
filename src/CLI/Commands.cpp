@@ -432,6 +432,36 @@ namespace Cryo::CLI::Commands
         else
         {
             compiler->print_diagnostics();
+
+            // Even on failure, attempt to emit partial LLVM IR if --emit-llvm was requested
+            if (args.get_flag("emit-llvm") && compiler->codegen())
+            {
+                std::string output_path = args.output_file();
+                if (output_path.empty())
+                {
+                    output_path = input_file;
+                    size_t pos = output_path.find_last_of('.');
+                    if (pos != std::string::npos)
+                    {
+                        output_path = output_path.substr(0, pos) + ".bc";
+                    }
+                    else
+                    {
+                        output_path += ".bc";
+                    }
+                }
+
+                std::cout << "\nAttempting to emit partial LLVM IR despite errors..." << std::endl;
+                if (compiler->codegen()->emit_llvm_ir(output_path))
+                {
+                    std::cout << "✓ Partial LLVM IR emitted: " << output_path << std::endl;
+                }
+                else
+                {
+                    std::cerr << "⚠ Could not emit partial LLVM IR (no IR available)" << std::endl;
+                }
+            }
+
             return 1;
         }
     }
@@ -1136,7 +1166,42 @@ namespace Cryo::CLI::Commands
         if (!compilation_success)
         {
             std::cerr << "X Compilation failed!" << std::endl;
+
+            // Even on failure, attempt to emit partial LLVM IR if --emit-llvm was requested
+            bool emit_llvm_on_fail = args.get_flag("emit-llvm");
+            if (!emit_llvm_on_fail)
+            {
+                for (const auto &arg : config.args)
+                {
+                    if (arg == "--emit-llvm")
+                    {
+                        emit_llvm_on_fail = true;
+                        break;
+                    }
+                }
+            }
+
             compiler->print_diagnostics();
+
+            if (emit_llvm_on_fail && compiler->codegen())
+            {
+                std::string bc_path = os.join_path(config.output_dir, project_name + ".bc");
+                std::cout << "\nAttempting to emit partial LLVM IR despite errors..." << std::endl;
+                if (compiler->codegen()->emit_llvm_ir(bc_path))
+                {
+                    std::cout << "✓ Partial LLVM IR emitted: " << bc_path << std::endl;
+                    std::string ll_path = os.join_path(config.output_dir, project_name + ".ll");
+                    if (std::filesystem::exists(ll_path))
+                    {
+                        std::cout << "✓ Partial LLVM IR text emitted: " << ll_path << std::endl;
+                    }
+                }
+                else
+                {
+                    std::cerr << "⚠ Could not emit partial LLVM IR (no IR available)" << std::endl;
+                }
+            }
+
             return 1;
         }
 

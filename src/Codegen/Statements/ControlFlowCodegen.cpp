@@ -423,10 +423,7 @@ namespace Cryo::Codegen
         // Generate switch expression
         llvm::Value *switch_value = generate_expression(node->expression());
         if (!switch_value)
-        {
-            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "Failed to generate switch expression");
             return;
-        }
 
         // Create end block
         llvm::BasicBlock *end_block = create_block("switch.end", function);
@@ -743,10 +740,7 @@ namespace Cryo::Codegen
         // Generate the match expression
         llvm::Value *match_value = generate_expression(node->expr());
         if (!match_value)
-        {
-            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "Failed to generate match expression");
             return;
-        }
 
         // If match_value is an alloca storing a pointer (e.g., from match (&this)
         // where this is a reference parameter), load the pointer to get the
@@ -2083,7 +2077,8 @@ namespace Cryo::Codegen
         llvm::Value *condition_val = generate_expression(condition);
         if (!condition_val)
         {
-            report_error(ErrorCode::E0613_CONTROL_FLOW_ERROR, node, "Failed to generate condition");
+            // The expression visitor already reported the real error.
+            // Silently propagate nullptr to avoid cascading diagnostics.
             return nullptr;
         }
 

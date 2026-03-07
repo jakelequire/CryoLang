@@ -6,6 +6,8 @@
 
 namespace Compiler::Types::Registry;
 
+import std::collections::hashmap;
+
 
 // ============================================================================
 // TypeVisibility — Access control for registered types
@@ -59,7 +61,7 @@ type struct TypeRegistryEntry {
 // ============================================================================
 
 type struct ModuleTypeRegistry {
-    // module_name → list of TypeRegistryEntry (parallel arrays)
+    // module_name → list of TypeRegistryEntry (parallel arrays for iteration)
     module_names:    string[];
     module_entries:  TypeRegistryEntry[][];
 
@@ -71,6 +73,11 @@ type struct ModuleTypeRegistry {
     alias_base_names: string[];
     alias_base_refs:  string[];
 
+    // HashMap indices for O(1) lookup
+    module_index:     HashMap<string, i64>;  // module_name → index
+    alias_index:      HashMap<string, i64>;  // alias_name → index
+    alias_base_index: HashMap<string, i64>;  // alias base name → index
+
     static new() -> ModuleTypeRegistry {
         return ModuleTypeRegistry {
             module_names:     [],
@@ -79,6 +86,9 @@ type struct ModuleTypeRegistry {
             alias_targets:    [],
             alias_base_names: [],
             alias_base_refs:  [],
+            module_index:     HashMap<string, i64>::new(),
+            alias_index:      HashMap<string, i64>::new(),
+            alias_base_index: HashMap<string, i64>::new(),
         };
     }
 
@@ -91,17 +101,18 @@ type struct ModuleTypeRegistry {
     register_type(mut &this, module: string, name: string, ty: TypeRef, vis: TypeVisibility) -> void {
         mut entry: TypeRegistryEntry = TypeRegistryEntry::new(ty, vis, name);
 
-        // Find or create module entry list
-        for (mut i: i64 = 0; i < this.module_names.length; i++) {
-            if (this.module_names[i] == module) {
-                this.module_entries[i].push(entry);
-                return;
-            }
+        const h: u64 = hash_str(module);
+        const opt: Option<i64> = this.module_index.get(module, h);
+        if (opt.is_some()) {
+            this.module_entries[opt.unwrap()].push(entry);
+            return;
         }
 
         // New module
+        const idx: i64 = this.module_names.length;
         this.module_names.push(module);
         this.module_entries.push([entry]);
+        this.module_index.insert(module, idx, h);
     }
 
 
@@ -111,15 +122,13 @@ type struct ModuleTypeRegistry {
 
     /// Look up a type in a specific module by name.
     lookup_type(&this, module: string, name: string) -> TypeRef {
-        for (mut i: i64 = 0; i < this.module_names.length; i++) {
-            if (this.module_names[i] == module) {
-                mut entries: TypeRegistryEntry[] = this.module_entries[i];
-                for (mut j: i64 = 0; j < entries.length; j++) {
-                    if (entries[j].local_name == name) {
-                        return entries[j].entry_type;
-                    }
+        const opt: Option<i64> = this.module_index.get(module, hash_str(module));
+        if (opt.is_some()) {
+            mut entries: TypeRegistryEntry[] = this.module_entries[opt.unwrap()];
+            for (mut j: i64 = 0; j < entries.length; j++) {
+                if (entries[j].local_name == name) {
+                    return entries[j].entry_type;
                 }
-                return TypeRef::invalid();
             }
         }
         return TypeRef::invalid();
@@ -128,13 +137,12 @@ type struct ModuleTypeRegistry {
     /// Look up a type across a list of imported modules (public types only).
     lookup_type_in_imports(&this, name: string, imports: string[]) -> TypeRef {
         for (mut i: i64 = 0; i < imports.length; i++) {
-            for (mut j: i64 = 0; j < this.module_names.length; j++) {
-                if (this.module_names[j] == imports[i]) {
-                    mut entries: TypeRegistryEntry[] = this.module_entries[j];
-                    for (mut k: i64 = 0; k < entries.length; k++) {
-                        if (entries[k].local_name == name && entries[k].visibility.is_public()) {
-                            return entries[k].entry_type;
-                        }
+            const opt: Option<i64> = this.module_index.get(imports[i], hash_str(imports[i]));
+            if (opt.is_some()) {
+                mut entries: TypeRegistryEntry[] = this.module_entries[opt.unwrap()];
+                for (mut k: i64 = 0; k < entries.length; k++) {
+                    if (entries[k].local_name == name && entries[k].visibility.is_public()) {
+                        return entries[k].entry_type;
                     }
                 }
             }
@@ -144,10 +152,9 @@ type struct ModuleTypeRegistry {
 
     /// Get all types registered in a module.
     get_module_types(&this, module: string) -> TypeRegistryEntry[] {
-        for (mut i: i64 = 0; i < this.module_names.length; i++) {
-            if (this.module_names[i] == module) {
-                return this.module_entries[i];
-            }
+        const opt: Option<i64> = this.module_index.get(module, hash_str(module));
+        if (opt.is_some()) {
+            return this.module_entries[opt.unwrap()];
         }
         return [];
     }
@@ -155,15 +162,13 @@ type struct ModuleTypeRegistry {
     /// Get all public types registered in a module.
     get_public_types(&this, module: string) -> TypeRegistryEntry[] {
         mut result: TypeRegistryEntry[] = [];
-        for (mut i: i64 = 0; i < this.module_names.length; i++) {
-            if (this.module_names[i] == module) {
-                mut entries: TypeRegistryEntry[] = this.module_entries[i];
-                for (mut j: i64 = 0; j < entries.length; j++) {
-                    if (entries[j].visibility.is_public()) {
-                        result.push(entries[j]);
-                    }
+        const opt: Option<i64> = this.module_index.get(module, hash_str(module));
+        if (opt.is_some()) {
+            mut entries: TypeRegistryEntry[] = this.module_entries[opt.unwrap()];
+            for (mut j: i64 = 0; j < entries.length; j++) {
+                if (entries[j].visibility.is_public()) {
+                    result.push(entries[j]);
                 }
-                return result;
             }
         }
         return result;
@@ -176,23 +181,23 @@ type struct ModuleTypeRegistry {
 
     /// Register a type alias.
     register_type_alias(mut &this, alias: string, target: TypeRef) -> void {
-        // Check for existing alias
-        for (mut i: i64 = 0; i < this.alias_names.length; i++) {
-            if (this.alias_names[i] == alias) {
-                this.alias_targets[i] = target;
-                return;
-            }
+        const h: u64 = hash_str(alias);
+        const opt: Option<i64> = this.alias_index.get(alias, h);
+        if (opt.is_some()) {
+            this.alias_targets[opt.unwrap()] = target;
+            return;
         }
+        const idx: i64 = this.alias_names.length;
         this.alias_names.push(alias);
         this.alias_targets.push(target);
+        this.alias_index.insert(alias, idx, h);
     }
 
     /// Look up a type alias.
     lookup_alias(&this, name: string) -> TypeRef {
-        for (mut i: i64 = 0; i < this.alias_names.length; i++) {
-            if (this.alias_names[i] == name) {
-                return this.alias_targets[i];
-            }
+        const opt: Option<i64> = this.alias_index.get(name, hash_str(name));
+        if (opt.is_some()) {
+            return this.alias_targets[opt.unwrap()];
         }
         return TypeRef::invalid();
     }
@@ -204,15 +209,10 @@ type struct ModuleTypeRegistry {
         mut max_depth: i64 = 32;  // Prevent infinite loops
 
         for (mut depth: i64 = 0; depth < max_depth; depth = depth + 1) {
-            mut found: boolean = false;
-            for (mut i: i64 = 0; i < this.alias_base_names.length; i++) {
-                if (this.alias_base_names[i] == current) {
-                    current = this.alias_base_refs[i];
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
+            const opt: Option<i64> = this.alias_base_index.get(current, hash_str(current));
+            if (opt.is_some()) {
+                current = this.alias_base_refs[opt.unwrap()];
+            } else {
                 break;
             }
         }
@@ -222,24 +222,21 @@ type struct ModuleTypeRegistry {
 
     /// Register an alias base name mapping (alias → base type name).
     register_alias_base(mut &this, alias: string, base_name: string) -> void {
-        for (mut i: i64 = 0; i < this.alias_base_names.length; i++) {
-            if (this.alias_base_names[i] == alias) {
-                this.alias_base_refs[i] = base_name;
-                return;
-            }
+        const h: u64 = hash_str(alias);
+        const opt: Option<i64> = this.alias_base_index.get(alias, h);
+        if (opt.is_some()) {
+            this.alias_base_refs[opt.unwrap()] = base_name;
+            return;
         }
+        const idx: i64 = this.alias_base_names.length;
         this.alias_base_names.push(alias);
         this.alias_base_refs.push(base_name);
+        this.alias_base_index.insert(alias, idx, h);
     }
 
     /// Check whether a module has any registered types.
     has_module(&this, module: string) -> boolean {
-        for (mut i: i64 = 0; i < this.module_names.length; i++) {
-            if (this.module_names[i] == module) {
-                return true;
-            }
-        }
-        return false;
+        return this.module_index.contains_key(module, hash_str(module));
     }
 
     /// Total number of registered modules.

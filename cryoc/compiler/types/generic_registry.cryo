@@ -20,6 +20,7 @@ namespace Compiler::Types::GenericRegistry;
 
 import Compiler::AST::Node;
 import Compiler::AST::Declaration;
+import std::collections::hashmap;
 
 
 // ============================================================================
@@ -68,21 +69,25 @@ type struct GenericRegistry {
     arena: TypeArena*;
 
     // -- Template storage (previously TemplateRegistry) --
-    // Primary index: qualified_name → entry
+    // Primary data arrays (kept for ordered iteration)
     entry_names: string[];
     entries:     TemplateEntry[];
-    // Secondary index: TypeID → index into entries
+    // Secondary data arrays for TypeID→index (kept for iteration)
     tmpl_type_ids:    u64[];
     tmpl_type_indices: i64[];
 
+    // -- HashMap indices for O(1) lookup --
+    name_index: HashMap<string, i64>;   // qualified_name → entry index
+    type_index: HashMap<u64, i64>;      // TypeID → entry index
+
     // -- Instantiation cache --
-    // key_string → InstantiatedType TypeRef
+    // Kept as arrays for ordered iteration in collect_unmonomorphized
     cache_keys: string[];
     cache_refs: TypeRef[];
+    cache_index: HashMap<string, i64>;  // cache_key → index in cache_refs
 
     // -- Monomorphization tracking --
-    // Set of cache keys already processed
-    mono_keys: string[];
+    mono_set: HashMap<string, boolean>; // cache_key → true
 
 
     // ----------------------------------------------------------------
@@ -96,9 +101,12 @@ type struct GenericRegistry {
             entries:           [],
             tmpl_type_ids:     [],
             tmpl_type_indices: [],
+            name_index:        HashMap<string, i64>::new(),
+            type_index:        HashMap<u64, i64>::new(),
             cache_keys:        [],
             cache_refs:        [],
-            mono_keys:         [],
+            cache_index:       HashMap<string, i64>::new(),
+            mono_set:          HashMap<string, boolean>::new(),
         };
     }
 
@@ -110,26 +118,29 @@ type struct GenericRegistry {
     /// Register a template entry.  Deduplicates by qualified_name —
     /// if an entry with the same name exists, it is overwritten.
     register_template(mut &this, entry: TemplateEntry) -> void {
-        // Check for existing entry with same qualified_name
-        for (mut i: i64 = 0; i < this.entry_names.length; i++) {
-            if (this.entry_names[i] == entry.qualified_name) {
-                // Overwrite existing
-                this.entries[i] = entry;
-                if (entry.base_type.is_valid()) {
-                    this.update_type_index(entry.base_type.id, i);
-                }
-                return;
+        const h: u64 = hash_str(entry.qualified_name);
+        const existing: Option<i64> = this.name_index.get(entry.qualified_name, h);
+
+        if (existing.is_some()) {
+            // Overwrite existing
+            const i: i64 = existing.unwrap();
+            this.entries[i] = entry;
+            if (entry.base_type.is_valid()) {
+                this.update_type_index(entry.base_type.id, i);
             }
+            return;
         }
 
         // New entry
         const idx: i64 = this.entry_names.length;
         this.entry_names = this.entry_names + [entry.qualified_name];
         this.entries      = this.entries + [entry];
+        this.name_index.insert(entry.qualified_name, idx, h);
 
         if (entry.base_type.is_valid()) {
             this.tmpl_type_ids     = this.tmpl_type_ids + [entry.base_type.id];
             this.tmpl_type_indices = this.tmpl_type_indices + [idx];
+            this.type_index.insert(entry.base_type.id, idx, hash_int(entry.base_type.id));
         }
     }
 
@@ -137,8 +148,16 @@ type struct GenericRegistry {
     /// The target_name should match a registered template's qualified_name
     /// or unqualified name.
     register_impl_block(mut &this, target_name: string, block: ImplBlockNode*) -> void {
-        for (mut i: i64 = 0; i < this.entry_names.length; i++) {
-            if (this.entry_names[i] == target_name || this.entries[i].name == target_name) {
+        // Try qualified name first via index
+        const h: u64 = hash_str(target_name);
+        const opt: Option<i64> = this.name_index.get(target_name, h);
+        if (opt.is_some()) {
+            this.entries[opt.unwrap()].impl_blocks.push(block);
+            return;
+        }
+        // Fall back to linear scan by unqualified name
+        for (mut i: i64 = 0; i < this.entries.length; i++) {
+            if (this.entries[i].name == target_name) {
                 this.entries[i].impl_blocks.push(block);
                 return;
             }
@@ -148,10 +167,9 @@ type struct GenericRegistry {
     /// Look up a template entry by qualified name.
     /// Returns null if not found.
     get_template_by_name(&this, qualified_name: string) -> TemplateEntry* {
-        for (mut i: i64 = 0; i < this.entry_names.length; i++) {
-            if (this.entry_names[i] == qualified_name) {
-                return &this.entries[i];
-            }
+        const opt: Option<i64> = this.name_index.get(qualified_name, hash_str(qualified_name));
+        if (opt.is_some()) {
+            return &this.entries[opt.unwrap()];
         }
         return null;
     }
@@ -160,6 +178,7 @@ type struct GenericRegistry {
     /// Returns null if not found.  If multiple entries share the
     /// same unqualified name, returns the first match.
     get_template_by_short_name(&this, name: string) -> TemplateEntry* {
+        // No good key for unqualified name — keep linear scan (rare usage)
         for (mut i: i64 = 0; i < this.entries.length; i++) {
             if (this.entries[i].name == name) {
                 return &this.entries[i];
@@ -171,23 +190,16 @@ type struct GenericRegistry {
     /// Look up a template entry by its base TypeID.
     /// Returns null if not found.
     get_template_by_type_id(&this, type_id: u64) -> TemplateEntry* {
-        for (mut i: i64 = 0; i < this.tmpl_type_ids.length; i++) {
-            if (this.tmpl_type_ids[i] == type_id) {
-                const idx: i64 = this.tmpl_type_indices[i];
-                return &this.entries[idx];
-            }
+        const opt: Option<i64> = this.type_index.get(type_id, hash_int(type_id));
+        if (opt.is_some()) {
+            return &this.entries[opt.unwrap()];
         }
         return null;
     }
 
     /// Check whether a TypeID corresponds to a registered template.
     is_template(&this, type_id: u64) -> boolean {
-        for (mut i: i64 = 0; i < this.tmpl_type_ids.length; i++) {
-            if (this.tmpl_type_ids[i] == type_id) {
-                return true;
-            }
-        }
-        return false;
+        return this.type_index.contains_key(type_id, hash_int(type_id));
     }
 
     /// Number of registered templates.
@@ -205,18 +217,19 @@ type struct GenericRegistry {
     /// the same TypeRef.
     instantiate(mut &this, base: TypeRef, args: TypeRef[]) -> TypeRef {
         const key: string = this.make_cache_key(base, args);
+        const h: u64 = hash_str(key);
 
-        // Check cache
-        for (mut i: i64 = 0; i < this.cache_keys.length; i++) {
-            if (this.cache_keys[i] == key) {
-                return this.cache_refs[i];
-            }
+        const cached: Option<i64> = this.cache_index.get(key, h);
+        if (cached.is_some()) {
+            return this.cache_refs[cached.unwrap()];
         }
 
         // Cache miss — create new InstantiatedType
         const inst: TypeRef = this.arena.create_instantiation(base, args);
+        const idx: i64 = this.cache_keys.length;
         this.cache_keys = this.cache_keys + [key];
         this.cache_refs = this.cache_refs + [inst];
+        this.cache_index.insert(key, idx, h);
         return inst;
     }
 
@@ -228,24 +241,16 @@ type struct GenericRegistry {
     /// Check if an instantiation has already been monomorphized.
     is_monomorphized(&this, base: TypeRef, args: TypeRef[]) -> boolean {
         const key: string = this.make_cache_key(base, args);
-        for (mut i: i64 = 0; i < this.mono_keys.length; i++) {
-            if (this.mono_keys[i] == key) {
-                return true;
-            }
-        }
-        return false;
+        return this.mono_set.contains_key(key, hash_str(key));
     }
 
     /// Mark an instantiation as monomorphized (specialization completed).
     mark_monomorphized(mut &this, base: TypeRef, args: TypeRef[]) -> void {
         const key: string = this.make_cache_key(base, args);
-        // Check for duplicate
-        for (mut i: i64 = 0; i < this.mono_keys.length; i++) {
-            if (this.mono_keys[i] == key) {
-                return;
-            }
+        const h: u64 = hash_str(key);
+        if (!this.mono_set.contains_key(key, h)) {
+            this.mono_set.insert(key, true, h);
         }
-        this.mono_keys = this.mono_keys + [key];
     }
 
     /// Collect all cached instantiations that have not yet been monomorphized.
@@ -254,14 +259,7 @@ type struct GenericRegistry {
         mut result: TypeRef[] = [];
         for (mut i: i64 = 0; i < this.cache_keys.length; i++) {
             const key: string = this.cache_keys[i];
-            mut found: boolean = false;
-            for (mut j: i64 = 0; j < this.mono_keys.length; j++) {
-                if (this.mono_keys[j] == key) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
+            if (!this.mono_set.contains_key(key, hash_str(key))) {
                 result = result + [this.cache_refs[i]];
             }
         }
@@ -275,7 +273,7 @@ type struct GenericRegistry {
 
     /// Number of monomorphized instantiations.
     mono_count(&this) -> i64 {
-        return this.mono_keys.length;
+        return this.mono_set.length() as i64;
     }
 
     make_cache_key(&this, base: TypeRef, args: TypeRef[]) -> string {
@@ -296,6 +294,10 @@ type struct GenericRegistry {
 
     /// Update the secondary TypeID index for an existing entry.
     update_type_index(mut &this, type_id: u64, entry_idx: i64) -> void {
+        const h: u64 = hash_int(type_id);
+        // Update or insert in HashMap
+        this.type_index.insert(type_id, entry_idx, h);
+        // Also update parallel arrays for consistency
         for (mut i: i64 = 0; i < this.tmpl_type_ids.length; i++) {
             if (this.tmpl_type_ids[i] == type_id) {
                 this.tmpl_type_indices[i] = entry_idx;

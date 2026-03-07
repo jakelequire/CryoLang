@@ -2280,11 +2280,14 @@ namespace Cryo
                                 bool first = true;
                                 for (const auto &param : method->parameters())
                                 {
-                                    if (!param) continue;
+                                    if (!param)
+                                        continue;
                                     // Skip 'this' parameter
-                                    if (param->name() == "this") continue;
+                                    if (param->name() == "this")
+                                        continue;
 
-                                    if (!first) suffix += ",";
+                                    if (!first)
+                                        suffix += ",";
                                     first = false;
 
                                     TypeRef param_type = param->get_resolved_type();

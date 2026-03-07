@@ -2681,11 +2681,60 @@ namespace Cryo
                             std::string type_arg = std::string(_current_token.text());
                             advance(); // consume type argument
 
+                            // Handle nested generic types (e.g., HashMap<string, Option<T>>)
+                            if (_current_token.is(TokenKind::TK_L_ANGLE))
+                            {
+                                type_arg += "<";
+                                advance();
+                                int nested_depth = 1;
+                                while (nested_depth > 0 && !is_at_end())
+                                {
+                                    if (_current_token.is(TokenKind::TK_L_ANGLE))
+                                        nested_depth++;
+                                    else if (_current_token.is(TokenKind::TK_R_ANGLE))
+                                        nested_depth--;
+                                    else if (_current_token.is(TokenKind::TK_GREATERGREATER))
+                                    {
+                                        // >> is two closing angle brackets
+                                        nested_depth -= 2;
+                                    }
+                                    if (nested_depth > 0)
+                                    {
+                                        type_arg += std::string(_current_token.text());
+                                        advance();
+                                    }
+                                    else
+                                    {
+                                        // Consume the final '>'
+                                        type_arg += ">";
+                                        advance();
+                                    }
+                                }
+                            }
+
                             // Handle pointer modifiers (e.g., Array<Expr*>)
                             while (_current_token.is(TokenKind::TK_STAR))
                             {
                                 type_arg += "*";
                                 advance();
+                            }
+
+                            // Handle array modifiers (e.g., HashMap<string, SymbolID[]>)
+                            while (_current_token.is(TokenKind::TK_L_SQUARE))
+                            {
+                                type_arg += "[";
+                                advance();
+                                // Optionally collect a size (e.g., Type[10])
+                                if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
+                                {
+                                    type_arg += std::string(_current_token.text());
+                                    advance();
+                                }
+                                if (_current_token.is(TokenKind::TK_R_SQUARE))
+                                {
+                                    type_arg += "]";
+                                    advance();
+                                }
                             }
 
                             generic_args.push_back(type_arg);
@@ -2940,11 +2989,55 @@ namespace Cryo
                             std::string type_arg = std::string(_current_token.text());
                             advance(); // consume type argument
 
+                            // Handle nested generic types (e.g., HashMap<string, Option<T>>)
+                            if (_current_token.is(TokenKind::TK_L_ANGLE))
+                            {
+                                type_arg += "<";
+                                advance();
+                                int nested_depth = 1;
+                                while (nested_depth > 0 && !is_at_end())
+                                {
+                                    if (_current_token.is(TokenKind::TK_L_ANGLE))
+                                        nested_depth++;
+                                    else if (_current_token.is(TokenKind::TK_R_ANGLE))
+                                        nested_depth--;
+                                    else if (_current_token.is(TokenKind::TK_GREATERGREATER))
+                                        nested_depth -= 2;
+                                    if (nested_depth > 0)
+                                    {
+                                        type_arg += std::string(_current_token.text());
+                                        advance();
+                                    }
+                                    else
+                                    {
+                                        type_arg += ">";
+                                        advance();
+                                    }
+                                }
+                            }
+
                             // Handle pointer modifiers (e.g., Array<Expr*>)
                             while (_current_token.is(TokenKind::TK_STAR))
                             {
                                 type_arg += "*";
                                 advance();
+                            }
+
+                            // Handle array modifiers (e.g., HashMap<string, SymbolID[]>)
+                            while (_current_token.is(TokenKind::TK_L_SQUARE))
+                            {
+                                type_arg += "[";
+                                advance();
+                                if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
+                                {
+                                    type_arg += std::string(_current_token.text());
+                                    advance();
+                                }
+                                if (_current_token.is(TokenKind::TK_R_SQUARE))
+                                {
+                                    type_arg += "]";
+                                    advance();
+                                }
                             }
 
                             generic_args.push_back(type_arg);
@@ -4738,8 +4831,61 @@ namespace Cryo
                     return nullptr;
                 }
 
-                new_expr->add_generic_arg(std::string(_current_token.text()));
+                std::string type_arg = std::string(_current_token.text());
                 advance(); // consume type argument
+
+                // Handle nested generic types (e.g., Box<Option<T>>)
+                if (_current_token.is(TokenKind::TK_L_ANGLE))
+                {
+                    type_arg += "<";
+                    advance();
+                    int nested_depth = 1;
+                    while (nested_depth > 0 && !is_at_end())
+                    {
+                        if (_current_token.is(TokenKind::TK_L_ANGLE))
+                            nested_depth++;
+                        else if (_current_token.is(TokenKind::TK_R_ANGLE))
+                            nested_depth--;
+                        else if (_current_token.is(TokenKind::TK_GREATERGREATER))
+                            nested_depth -= 2;
+                        if (nested_depth > 0)
+                        {
+                            type_arg += std::string(_current_token.text());
+                            advance();
+                        }
+                        else
+                        {
+                            type_arg += ">";
+                            advance();
+                        }
+                    }
+                }
+
+                // Handle pointer modifiers (e.g., Box<Expr*>)
+                while (_current_token.is(TokenKind::TK_STAR))
+                {
+                    type_arg += "*";
+                    advance();
+                }
+
+                // Handle array modifiers (e.g., Box<SymbolID[]>)
+                while (_current_token.is(TokenKind::TK_L_SQUARE))
+                {
+                    type_arg += "[";
+                    advance();
+                    if (_current_token.is(TokenKind::TK_NUMERIC_CONSTANT))
+                    {
+                        type_arg += std::string(_current_token.text());
+                        advance();
+                    }
+                    if (_current_token.is(TokenKind::TK_R_SQUARE))
+                    {
+                        type_arg += "]";
+                        advance();
+                    }
+                }
+
+                new_expr->add_generic_arg(type_arg);
 
             } while (match(TokenKind::TK_COMMA));
 
