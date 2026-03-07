@@ -547,6 +547,30 @@ void ASTTypeSubstituter::visit(CastExpressionNode &node)
 
 void ASTTypeSubstituter::visit(StructLiteralNode &node)
 {
+    // Substitute generic args (e.g., HashMapIter<K, V> -> HashMapIter<string, i32>)
+    if (!node.generic_args().empty() && !_param_name_map.empty())
+    {
+        std::vector<std::string> substituted_args;
+        bool changed = false;
+        for (const auto &arg : node.generic_args())
+        {
+            auto it = _param_name_map.find(arg);
+            if (it != _param_name_map.end() && it->second.is_valid())
+            {
+                substituted_args.push_back(it->second->display_name());
+                changed = true;
+            }
+            else
+            {
+                substituted_args.push_back(arg);
+            }
+        }
+        if (changed)
+        {
+            node.set_generic_args(std::move(substituted_args));
+        }
+    }
+
     for (const auto &init : node.field_initializers())
     {
         if (init->value())

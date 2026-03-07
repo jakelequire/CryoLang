@@ -182,8 +182,41 @@ namespace Cryo::Codegen
 
     void CodegenVisitor::set_imported_asts(const std::unordered_map<std::string, std::unique_ptr<Cryo::ProgramNode>> *imported_asts)
     {
-        // Store for cross-module enum variant extraction
-        // Components that need this can access via context
+        if (!imported_asts)
+            return;
+
+        // Register transitive imports from imported modules with the SRM
+        // so that cross-module function/type resolution works
+        for (const auto &[mod_name, ast_ptr] : *imported_asts)
+        {
+            if (!ast_ptr)
+                continue;
+            for (const auto &stmt : ast_ptr->statements())
+            {
+                if (!stmt)
+                    continue;
+                auto *import_decl = dynamic_cast<Cryo::ImportDeclarationNode *>(stmt.get());
+                if (!import_decl)
+                {
+                    if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+                    {
+                        if (decl_stmt->declaration())
+                            import_decl = dynamic_cast<Cryo::ImportDeclarationNode *>(decl_stmt->declaration());
+                    }
+                }
+                if (import_decl)
+                {
+                    std::string import_path = import_decl->path();
+                    if (!import_path.empty())
+                    {
+                        _ctx->srm_context().add_imported_namespace(import_path);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "set_imported_asts: Registered transitive import '{}' from module '{}'",
+                                  import_path, mod_name);
+                    }
+                }
+            }
+        }
     }
 
     //===================================================================

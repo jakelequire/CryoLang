@@ -5892,12 +5892,40 @@ namespace Cryo::Codegen
                 TypeRef arg_type = arena.lookup_type_by_name(arg_name);
                 if (arg_type.is_valid())
                     arg_name = arg_type->display_name();
-                // Replace problematic characters for nested generics
+                // Convert X[] to Array<X> to match GenericCodegen::mangle_type_name
+                while (arg_name.size() >= 2 &&
+                       arg_name.substr(arg_name.size() - 2) == "[]")
+                {
+                    arg_name = "Array<" + arg_name.substr(0, arg_name.size() - 2) + ">";
+                }
+                // Protect Array<...> brackets from sanitization
+                const char kOpen = '\x01';
+                const char kClose = '\x02';
+                {
+                    size_t pos = 0;
+                    while ((pos = arg_name.find("Array<", pos)) != std::string::npos)
+                    {
+                        arg_name[pos + 5] = kOpen;
+                        int depth = 1;
+                        for (size_t ci = pos + 6; ci < arg_name.size() && depth > 0; ++ci)
+                        {
+                            if (arg_name[ci] == '<') depth++;
+                            else if (arg_name[ci] == '>') { depth--; if (depth == 0) arg_name[ci] = kClose; }
+                        }
+                        pos += 6;
+                    }
+                }
+                // Replace problematic characters (Array<> brackets are protected)
                 std::replace(arg_name.begin(), arg_name.end(), '<', '_');
                 std::replace(arg_name.begin(), arg_name.end(), '>', '_');
                 std::replace(arg_name.begin(), arg_name.end(), ',', '_');
                 std::replace(arg_name.begin(), arg_name.end(), ' ', '_');
                 std::replace(arg_name.begin(), arg_name.end(), '*', 'p');
+                std::replace(arg_name.begin(), arg_name.end(), '[', '_');
+                std::replace(arg_name.begin(), arg_name.end(), ']', '_');
+                // Restore Array<> brackets
+                std::replace(arg_name.begin(), arg_name.end(), kOpen, '<');
+                std::replace(arg_name.begin(), arg_name.end(), kClose, '>');
                 mangled += arg_name;
             }
 
@@ -5930,6 +5958,21 @@ namespace Cryo::Codegen
                                     ga = sub;
                             }
                             TypeRef ta = arena.lookup_type_by_name(ga);
+                            // Handle compound types like "SymbolID[]" (array), "T*" (pointer)
+                            if (!ta.is_valid() && ga.size() > 2 && ga.substr(ga.size() - 2) == "[]")
+                            {
+                                std::string base = ga.substr(0, ga.size() - 2);
+                                TypeRef base_type = arena.lookup_type_by_name(base);
+                                if (base_type.is_valid())
+                                    ta = arena.get_array_of(base_type);
+                            }
+                            if (!ta.is_valid() && ga.size() > 1 && ga.back() == '*')
+                            {
+                                std::string base = ga.substr(0, ga.size() - 1);
+                                TypeRef base_type = arena.lookup_type_by_name(base);
+                                if (base_type.is_valid())
+                                    ta = arena.get_pointer_to(base_type);
+                            }
                             if (ta.is_valid())
                                 resolved_type_args.push_back(ta);
                         }
