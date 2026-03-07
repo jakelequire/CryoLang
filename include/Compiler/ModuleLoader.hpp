@@ -177,6 +177,12 @@ namespace Cryo
          */
         const std::unordered_set<std::string> &get_all_local_import_names() const { return _all_local_import_names; }
 
+        /**
+         * @brief Look up a cached module by its import path (e.g., "std::collections::hashmap")
+         * @return Pointer to the cached ImportResult, or nullptr if not found
+         */
+        const ImportResult *get_cached_module_by_import_path(const std::string &import_path) const;
+
     private:
         /**
          * @brief Load a module from filesystem and parse it

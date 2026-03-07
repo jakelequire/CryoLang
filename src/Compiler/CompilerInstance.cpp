@@ -687,6 +687,82 @@ namespace Cryo
                 }
             }
 
+            // Register transitive imports: scan imported modules' ASTs for their
+            // import declarations and register those namespaces with the codegen SRM.
+            // Also register transitive function symbols in the symbol table so that
+            // create_forward_declaration_from_symbol can create extern declarations.
+            if (_codegen->get_visitor() && _module_loader)
+            {
+                auto *codegen_srm_ctx = _codegen->get_visitor()->get_srm_context();
+                if (codegen_srm_ctx)
+                {
+                    // Collect transitive import paths from all imported modules' ASTs
+                    std::unordered_set<std::string> transitive_imports;
+                    const auto &imported_asts = _module_loader->get_imported_asts();
+                    for (const auto &[mod_name, ast_ptr] : imported_asts)
+                    {
+                        if (!ast_ptr)
+                            continue;
+                        for (const auto &stmt : ast_ptr->statements())
+                        {
+                            if (!stmt)
+                                continue;
+                            Cryo::ImportDeclarationNode *import_decl = dynamic_cast<Cryo::ImportDeclarationNode *>(stmt.get());
+                            if (!import_decl)
+                            {
+                                if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+                                {
+                                    if (decl_stmt->declaration())
+                                        import_decl = dynamic_cast<Cryo::ImportDeclarationNode *>(decl_stmt->declaration());
+                                }
+                            }
+                            if (import_decl)
+                            {
+                                std::string import_path = import_decl->path();
+                                if (!import_path.empty())
+                                {
+                                    transitive_imports.insert(import_path);
+                                }
+                            }
+                        }
+                    }
+
+                    // Register each transitive import with the SRM and symbol table
+                    for (const auto &import_path : transitive_imports)
+                    {
+                        codegen_srm_ctx->add_imported_namespace(import_path);
+
+                        // Also register function symbols from this module in the symbol
+                        // table so create_forward_declaration_from_symbol can find them.
+                        // Use the module loader's cached results to get the symbol map.
+                        auto cached = _module_loader->get_cached_module_by_import_path(import_path);
+                        if (cached && !cached->symbol_map.empty())
+                        {
+                            // Only register function symbols to avoid namespace pollution
+                            std::unordered_map<std::string, Cryo::Symbol> func_symbols;
+                            for (const auto &[name, sym] : cached->symbol_map)
+                            {
+                                if (sym.kind == Cryo::SymbolKind::Function ||
+                                    sym.kind == Cryo::SymbolKind::Intrinsic)
+                                {
+                                    func_symbols[name] = sym;
+                                }
+                            }
+                            if (!func_symbols.empty())
+                            {
+                                _symbol_table->register_namespace(import_path, func_symbols);
+                                LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                          "Registered {} transitive function symbols from '{}'",
+                                          func_symbols.size(), import_path);
+                            }
+                        }
+
+                        LOG_DEBUG(Cryo::LogComponent::GENERAL,
+                                  "Registered transitive import '{}'", import_path);
+                    }
+                }
+            }
+
             // Note: TypeChecker doesn't have get_srm_context() or specialized method tracking.
             // import_specialized_methods and import_namespace_aliases need reimplementation for Types.
             if (_debug_mode && _codegen->get_visitor())
@@ -4232,6 +4308,73 @@ namespace Cryo
                     {
                         codegen_srm_ctx->register_namespace_alias(alias, target);
                         LOG_DEBUG(LogComponent::GENERAL, "IR gen phase: Synced namespace alias '{}' -> '{}'", alias, target);
+                    }
+                }
+            }
+
+            // Register transitive imports: scan imported modules' ASTs for their
+            // import declarations and register those namespaces with the codegen SRM.
+            // Also register transitive function symbols in the symbol table so that
+            // create_forward_declaration_from_symbol can create extern declarations.
+            if (_codegen->get_visitor() && _module_loader)
+            {
+                auto *codegen_srm_ctx2 = _codegen->get_visitor()->get_srm_context();
+                if (codegen_srm_ctx2)
+                {
+                    std::unordered_set<std::string> transitive_imports;
+                    const auto &imported_asts = _module_loader->get_imported_asts();
+                    for (const auto &[mod_name, ast_ptr] : imported_asts)
+                    {
+                        if (!ast_ptr)
+                            continue;
+                        for (const auto &stmt : ast_ptr->statements())
+                        {
+                            if (!stmt)
+                                continue;
+                            Cryo::ImportDeclarationNode *import_decl = dynamic_cast<Cryo::ImportDeclarationNode *>(stmt.get());
+                            if (!import_decl)
+                            {
+                                if (auto *decl_stmt = dynamic_cast<Cryo::DeclarationStatementNode *>(stmt.get()))
+                                {
+                                    if (decl_stmt->declaration())
+                                        import_decl = dynamic_cast<Cryo::ImportDeclarationNode *>(decl_stmt->declaration());
+                                }
+                            }
+                            if (import_decl)
+                            {
+                                std::string import_path = import_decl->path();
+                                if (!import_path.empty())
+                                    transitive_imports.insert(import_path);
+                            }
+                        }
+                    }
+
+                    for (const auto &import_path : transitive_imports)
+                    {
+                        codegen_srm_ctx2->add_imported_namespace(import_path);
+
+                        auto cached = _module_loader->get_cached_module_by_import_path(import_path);
+                        if (cached && !cached->symbol_map.empty())
+                        {
+                            std::unordered_map<std::string, Cryo::Symbol> func_symbols;
+                            for (const auto &[name, sym] : cached->symbol_map)
+                            {
+                                if (sym.kind == Cryo::SymbolKind::Function ||
+                                    sym.kind == Cryo::SymbolKind::Intrinsic)
+                                {
+                                    func_symbols[name] = sym;
+                                }
+                            }
+                            if (!func_symbols.empty())
+                            {
+                                _symbol_table->register_namespace(import_path, func_symbols);
+                                LOG_DEBUG(LogComponent::GENERAL,
+                                          "IR gen phase: Registered {} transitive function symbols from '{}'",
+                                          func_symbols.size(), import_path);
+                            }
+                        }
+
+                        LOG_DEBUG(LogComponent::GENERAL, "IR gen phase: Registered transitive import '{}'", import_path);
                     }
                 }
             }

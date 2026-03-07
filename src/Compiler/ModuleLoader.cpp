@@ -3549,6 +3549,20 @@ namespace Cryo
         return _imported_asts;
     }
 
+    const ModuleLoader::ImportResult *ModuleLoader::get_cached_module_by_import_path(const std::string &import_path) const
+    {
+        // The cache keys are resolved file paths, not import paths.
+        // We need to resolve the import path to a file path first,
+        // then look up in the cache.
+        // However, resolve_import_path is not const. Instead, search by module_name.
+        for (const auto &[file_path, result] : _loaded_modules)
+        {
+            if (result.success && result.module_name == import_path)
+                return &result;
+        }
+        return nullptr;
+    }
+
     void ModuleLoader::resolve_this_parameters_in_ast(ProgramNode &ast)
     {
         // After types are registered in create_symbol_map, we need to resolve any
