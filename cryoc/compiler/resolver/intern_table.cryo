@@ -1,20 +1,20 @@
-///! InternTable
-///!
-///! Owns every unique string used during compilation.  Calling intern()
-///! with the same character data always returns the same SymbolStr,
-///! making string equality a single integer comparison everywhere else.
-///!
-///! Internally stores strings in a flat parallel-array structure
-///! (matching the cryoc convention until a proper HashMap is available).
-///! ID 0 is pre-seeded as the empty string "".
-///!
-///! Lifetime: one InternTable per CompilationContext, never freed
-///! mid-compilation.  In stdlib-batch mode the table persists across
-///! modules so cross-module SymbolStr values remain valid.
+/// InternTable
+///
+/// Owns every unique string used during compilation.  Calling intern()
+/// with the same character data always returns the same SymbolStr,
+/// making string equality a single integer comparison everywhere else.
+///
+/// Uses a HashMap<string, u32> for O(1) deduplication lookups.
+/// ID 0 is pre-seeded as the empty string "".
+///
+/// Lifetime: one InternTable per CompilationContext, never freed
+/// mid-compilation.  In stdlib-batch mode the table persists across
+/// modules so cross-module SymbolStr values remain valid.
 
 namespace Compiler::Resolver::InternTable;
 
 import Compiler::Resolver::SymbolStr;
+import std::collections::hashmap;
 
 
 // ============================================================================
@@ -26,6 +26,9 @@ type struct InternTable {
     /// Entry 0 is always "".
     strings: string[];
 
+    /// Fast dedup index: string → SymbolStr ID.
+    lookup: HashMap<string, u32>;
+
     // ----------------------------------------------------------------
     // Construction
     // ----------------------------------------------------------------
@@ -34,9 +37,11 @@ type struct InternTable {
     static new() -> InternTable {
         mut table: InternTable = InternTable {
             strings: [],
+            lookup:  HashMap<string, u32>::new(),
         };
         // Seed index 0 = "" so SymbolStr::empty() always resolves.
         table.strings.push("");
+        table.lookup.insert("", 0, hash_str(""));
         return table;
     }
 
@@ -48,17 +53,16 @@ type struct InternTable {
     /// Intern a string.  Returns the existing SymbolStr if the text was
     /// already interned, or allocates a new entry and returns it.
     intern(mut &this, text: string) -> SymbolStr {
-        // Linear scan — acceptable for bootstrap; will be replaced with
-        // a hash-based lookup once cryoc has a HashMap.
-        for (mut i: u32 = 0; i < this.strings.length; i++) {
-            if (this.strings[i] == text) {
-                return SymbolStr::from_id(i);
-            }
+        const h: u64 = hash_str(text);
+        const existing: Option<u32> = this.lookup.get(text, h);
+        if (existing.is_some()) {
+            return SymbolStr::from_id(existing.unwrap());
         }
 
         // Not found — allocate a new entry.
         mut id: u32 = this.strings.length as u32;
         this.strings.push(text);
+        this.lookup.insert(text, id, h);
         return SymbolStr::from_id(id);
     }
 
@@ -74,21 +78,15 @@ type struct InternTable {
     /// Check whether a string has already been interned (without
     /// inserting it if absent).
     contains(&this, text: string) -> boolean {
-        for (mut i: u32 = 0; i < this.strings.length; i++) {
-            if (this.strings[i] == text) {
-                return true;
-            }
-        }
-        return false;
+        return this.lookup.contains_key(text, hash_str(text));
     }
 
     /// Look up a string without inserting.  Returns SymbolStr::empty()
     /// if the text has not been interned.
     lookup(&this, text: string) -> SymbolStr {
-        for (mut i: u32 = 0; i < this.strings.length; i++) {
-            if (this.strings[i] == text) {
-                return SymbolStr::from_id(i);
-            }
+        const opt: Option<u32> = this.lookup.get(text, hash_str(text));
+        if (opt.is_some()) {
+            return SymbolStr::from_id(opt.unwrap());
         }
         return SymbolStr::empty();
     }

@@ -115,16 +115,19 @@ int main(int argc, char *argv[])
         }
     }
 
+    // TEMP: I'm disabling the log file for now since there isn't work being done on the LSP right now,
+    // and it's creating clutter in the repo.
+
     // Default log file location: next to the binary
-    if (log_file_path.empty())
-    {
-        // Put it in the project root (same dir as bin/)
-        std::filesystem::path exe_path = std::filesystem::path(argv[0]).parent_path();
-        log_file_path = (exe_path / "cryolsp.log").string();
-    }
+    // if (log_file_path.empty())
+    // {
+    //     // Put it in the project root (same dir as bin/)
+    //     std::filesystem::path exe_path = std::filesystem::path(argv[0]).parent_path();
+    //     log_file_path = (exe_path / "cryolsp.log").string();
+    // }
 
     // Initialize log file (truncates previous)
-    CryoLSP::Transport::initLogFile(log_file_path);
+    // CryoLSP::Transport::initLogFile(log_file_path);
 
     CryoLSP::Transport::log("CryoLSP v1.0.0 starting on stdio");
     CryoLSP::Transport::log("Log file: " + log_file_path);

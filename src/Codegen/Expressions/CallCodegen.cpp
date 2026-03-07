@@ -2519,9 +2519,53 @@ namespace Cryo::Codegen
                             }
                         }
 
+                        // Last resort: if still not inferred, check the current function's
+                        // return type. If it's the same enum type (e.g., return type is
+                        // Option_u32 and we're constructing Option::Some), use it directly.
+                        if (!all_inferred)
+                        {
+                            llvm::Function *current_fn = builder().GetInsertBlock()
+                                                             ? builder().GetInsertBlock()->getParent()
+                                                             : nullptr;
+                            if (current_fn)
+                            {
+                                llvm::Type *ret_ty = current_fn->getReturnType();
+                                if (ret_ty && ret_ty->isStructTy())
+                                {
+                                    auto *ret_st = llvm::cast<llvm::StructType>(ret_ty);
+                                    if (ret_st->hasName())
+                                    {
+                                        std::string ret_name = ret_st->getName().str();
+                                        // Check if the return type starts with the enum name
+                                        // (e.g., "Option_u32" starts with "Option")
+                                        // Also handle short enum name (strip namespace)
+                                        std::string short_enum = resolved_enum_name;
+                                        size_t ns_pos = short_enum.rfind("::");
+                                        if (ns_pos != std::string::npos)
+                                            short_enum = short_enum.substr(ns_pos + 2);
+
+                                        if ((ret_name.size() > resolved_enum_name.size() &&
+                                             ret_name.substr(0, resolved_enum_name.size()) == resolved_enum_name &&
+                                             ret_name[resolved_enum_name.size()] == '_') ||
+                                            (ret_name.size() > short_enum.size() &&
+                                             ret_name.substr(0, short_enum.size()) == short_enum &&
+                                             ret_name[short_enum.size()] == '_'))
+                                        {
+                                            instantiated_enum_name = ret_name;
+                                            all_inferred = true;
+                                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                      "generate_enum_variant: Inferred instantiation '{}' from function return type",
+                                                      instantiated_enum_name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if (all_inferred)
                         {
-                            instantiated_enum_name = generics->mangle_type_name(resolved_enum_name, inferred_type_args);
+                            if (instantiated_enum_name == resolved_enum_name)
+                                instantiated_enum_name = generics->mangle_type_name(resolved_enum_name, inferred_type_args);
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                       "generate_enum_variant: Inferred instantiation '{}' for {}::{}",
                                       instantiated_enum_name, resolved_enum_name, variant_name);
@@ -2529,15 +2573,24 @@ namespace Cryo::Codegen
                             // Ensure the enum type is instantiated
                             if (!generics->has_type_instantiation(instantiated_enum_name))
                             {
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "generate_enum_variant: Instantiating enum '{}'",
-                                          instantiated_enum_name);
-                                bool had_inst_source = !ctx().instantiation_file().empty();
-                                if (!had_inst_source && node)
-                                    ctx().set_instantiation_source(node->source_file(), node->location());
-                                generics->instantiate_enum(resolved_enum_name, inferred_type_args);
-                                if (!had_inst_source)
-                                    ctx().clear_instantiation_source();
+                                // Only try to instantiate if we have valid type args
+                                bool has_valid_args = true;
+                                for (const auto &ta : inferred_type_args)
+                                {
+                                    if (!ta.is_valid()) { has_valid_args = false; break; }
+                                }
+                                if (has_valid_args)
+                                {
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "generate_enum_variant: Instantiating enum '{}'",
+                                              instantiated_enum_name);
+                                    bool had_inst_source = !ctx().instantiation_file().empty();
+                                    if (!had_inst_source && node)
+                                        ctx().set_instantiation_source(node->source_file(), node->location());
+                                    generics->instantiate_enum(resolved_enum_name, inferred_type_args);
+                                    if (!had_inst_source)
+                                        ctx().clear_instantiation_source();
+                                }
                             }
                         }
                         else
@@ -7865,8 +7918,16 @@ namespace Cryo::Codegen
         {
             TypeRef arg_type{};
 
-            // Count and strip trailing pointer modifiers (e.g., "Expr*" -> "Expr", pointer_depth=1)
+            // Count and strip trailing array modifiers (e.g., "SymbolID[]" -> "SymbolID", array_depth=1)
             std::string base_name = arg_name;
+            int array_depth = 0;
+            while (base_name.size() >= 2 && base_name.substr(base_name.size() - 2) == "[]")
+            {
+                base_name.erase(base_name.size() - 2);
+                array_depth++;
+            }
+
+            // Count and strip trailing pointer modifiers (e.g., "Expr*" -> "Expr", pointer_depth=1)
             int pointer_depth = 0;
             while (!base_name.empty() && base_name.back() == '*')
             {
@@ -7929,6 +7990,18 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "parse_type_args_from_string: Wrapped '{}' in {} pointer level(s) -> '{}'",
                           base_name, pointer_depth, arg_type->display_name());
+            }
+
+            // Wrap in array type(s) if trailing [] were present
+            if (arg_type.is_valid() && array_depth > 0)
+            {
+                for (int a = 0; a < array_depth; ++a)
+                {
+                    arg_type = symbols.arena().get_array_of(arg_type, std::nullopt);
+                }
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "parse_type_args_from_string: Wrapped '{}' in {} array level(s) -> '{}'",
+                          base_name, array_depth, arg_type->display_name());
             }
 
             if (arg_type.is_valid())
