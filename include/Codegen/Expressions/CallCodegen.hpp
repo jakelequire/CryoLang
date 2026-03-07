@@ -267,6 +267,14 @@ namespace Cryo::Codegen
         bool is_enum_type(const std::string &name) const;
 
         /**
+         * @brief Check if a member name is a known variant of the given enum type.
+         * @param enum_name  Enum type name (e.g. "TypeAnnotation")
+         * @param member_name  Potential variant name (e.g. "Pointer" or "clone_ptr")
+         * @return true only if member_name is a declared variant of the enum
+         */
+        bool is_enum_variant(const std::string &enum_name, const std::string &member_name) const;
+
+        /**
          * @brief Check if a name is a known class type (heap-allocated)
          * @param name Name to check
          * @return true if class type
