@@ -1,5 +1,6 @@
 namespace Compiler::Lex;
 
+import Compiler::Diag;
 import Utils::Logger;
 
 type struct Lexer {
@@ -14,10 +15,10 @@ private:
     current_token:    Token;
     previous_token:   Token;
     token_count:      u64;
-    string_pool:      string[];
+    sink:             DiagnosticSink*;
 
 public:
-    static new(file: File) -> Lexer {
+    static new(file: File, sink: DiagnosticSink*) -> Lexer {
         return Lexer {
             file:             file,
             buffer:           "",
@@ -29,7 +30,7 @@ public:
             current_token:    Token::new(TokenType::Unknown, "", 1, 1),
             previous_token:   Token::new(TokenType::Unknown, "", 1, 1),
             token_count:      0,
-            string_pool:      [],
+            sink:             sink,
         };
     }
 
@@ -125,7 +126,7 @@ private:
         }
 
         LOG_DEBUG(LogComponent::Lexer, "[Lexer] Unexpected character at line %d col %d", this.current_location.line, this.current_location.column);
-        return this.error_token("Unexpected character");
+        return this.emit_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, "Unexpected character");
     }
 
     // --- Internal helper methods for lexing ---
@@ -165,7 +166,7 @@ private:
 
                 if (this.current == hex_start) {
                     LOG_DEBUG(LogComponent::Lexer, "[Lexer] Invalid hexadecimal number at line %d", this.current_location.line);
-                    return this.error_token("Invalid hexadecimal number");
+                    return this.emit_error(ErrorCode::E0007_INVALID_HEX, "Invalid hexadecimal number");
                 }
 
                 is_special_base = true;
@@ -180,7 +181,7 @@ private:
 
                 if (this.current == bin_start) {
                     LOG_DEBUG(LogComponent::Lexer, "[Lexer] Invalid binary number at line %d", this.current_location.line);
-                    return this.error_token("Invalid binary number");
+                    return this.emit_error(ErrorCode::E0008_INVALID_BINARY, "Invalid binary number");
                 }
 
                 is_special_base = true;
@@ -195,7 +196,7 @@ private:
 
                 if (this.current == oct_start) {
                     LOG_DEBUG(LogComponent::Lexer, "[Lexer] Invalid octal number at line %d", this.current_location.line);
-                    return this.error_token("Invalid octal number");
+                    return this.emit_error(ErrorCode::E0009_INVALID_OCTAL, "Invalid octal number");
                 }
 
                 is_special_base = true;
@@ -282,7 +283,7 @@ private:
         // --- Unterminated check ---
         if (this.at_end()) {
             LOG_DEBUG(LogComponent::Lexer, "[Lexer] Unterminated string literal at line %d", this.current_location.line);
-            return this.error_token("Unterminated string literal");
+            return this.emit_error(ErrorCode::E0002_UNTERMINATED_STRING, "Unterminated string literal");
         }
 
         this.advance(); // consume closing quote
@@ -360,7 +361,7 @@ private:
         // --- Expect closing quote ---
         if (this.at_end() || this.peek() != '\'') {
             LOG_DEBUG(LogComponent::Lexer, "[Lexer] Unterminated character literal at line %d", this.current_location.line);
-            return this.error_token("Unterminated character literal");
+            return this.emit_error(ErrorCode::E0003_UNTERMINATED_CHAR, "Unterminated character literal");
         }
         this.advance(); // consume closing '\''
 
@@ -637,7 +638,22 @@ private:
         );
     }
 
-    error_token(&this, message: string) -> Token {
+    /// Emit a diagnostic and return an Unknown token.
+    /// The error is recorded in the DiagnosticSink immediately so downstream
+    /// passes never need to inspect Unknown token lexemes.
+    emit_error(&this, code: ErrorCode, message: string) -> Token {
+        if (this.sink != null) {
+            const span: SourceSpan = SourceSpan::new(
+                this.file.path(),
+                this.current_location.line as u32,
+                this.current_location.column as u32,
+                this.current_location.line as u32,
+                this.current_location.column as u32 + 1
+            );
+            mut diag: Diagnostic = Diagnostic::error(code, message);
+            diag = diag.at(span);
+            this.sink.emit(diag);
+        }
         return Token::new(
             TokenType::Unknown,
             message,

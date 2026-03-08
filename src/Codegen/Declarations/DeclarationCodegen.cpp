@@ -4515,21 +4515,19 @@ namespace Cryo::Codegen
                     llvm_name = sym.name;
                 }
 
-                // Skip unqualified function/method names if we're in a namespace context.
-                // These functions will be defined with qualified names during normal codegen,
-                // so pre-registering them with unqualified names would create mismatches.
-                // (e.g., pre-registering @handle_client when the definition will be @"HttpServer::handle_client")
+                // Qualify unqualified function/method names with the namespace context
+                // so the pre-registered declaration matches the qualified name that
+                // the definition will use during normal codegen.
+                // (e.g., "run_lexing_pass" becomes "Compiler::Passes::PassRegistry::run_lexing_pass")
                 if (llvm_name.find("::") == std::string::npos && (is_function || is_method))
                 {
                     std::string ns_context = ctx().namespace_context();
                     if (!ns_context.empty())
                     {
-                        // This is an unqualified function name in a namespace context.
-                        // Skip it - the function definition will create the proper qualified declaration.
+                        llvm_name = ns_context + "::" + llvm_name;
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "pre_register_functions: Skipping unqualified '{}' in namespace '{}' - will be defined with qualified name",
+                                  "pre_register_functions: Qualified '{}' with namespace '{}'",
                                   llvm_name, ns_context);
-                        return;
                     }
                 }
             }

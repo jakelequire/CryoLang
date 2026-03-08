@@ -162,13 +162,6 @@ type struct PassRegistry {
                     i + 1, this.passes.length, meta.name);
             }
 
-            // Register provisions on the context (single source of truth)
-            if (result.success) {
-                for (mut j: int = 0; j < result.provisions.length; j++) {
-                    ctx->provisions.mark(result.provisions[j]);
-                }
-            }
-
             // Abort on fatal failure
             if (!result.success && id.fatal_on_failure()) {
                 if (this.verbose) {
@@ -176,6 +169,15 @@ type struct PassRegistry {
                         i + 1, this.passes.length, meta.name);
                 }
                 return false;
+            }
+
+            // Register provisions from metadata on the context (single source of truth).
+            // Provisions are derived from get_pass_metadata(), not from PassResult,
+            // so passes cannot accidentally claim provisions they don't own.
+            if (result.success) {
+                for (mut j: int = 0; j < meta.provisions.length; j++) {
+                    ctx->provisions.mark(meta.provisions[j]);
+                }
             }
         }
 
@@ -218,14 +220,15 @@ type struct PassRegistry {
                     i + 1, meta.name);
             }
 
-            if (result.success) {
-                for (mut j: int = 0; j < result.provisions.length; j++) {
-                    ctx->provisions.mark(result.provisions[j]);
-                }
-            }
-
             if (!result.success && id.fatal_on_failure()) {
                 return false;
+            }
+
+            // Derive provisions from metadata, not from PassResult
+            if (result.success) {
+                for (mut j: int = 0; j < meta.provisions.length; j++) {
+                    ctx->provisions.mark(meta.provisions[j]);
+                }
             }
         }
 
@@ -399,7 +402,7 @@ function run_pass(id: PassID, ctx: CompilationContext*) -> PassResult {
         }
         _ => {
             printf("[Pipeline] STUB: %s (not yet implemented)\n", meta.name);
-            PassResult::stub(meta.provisions)
+            PassResult::stub()
         }
     };
 }
@@ -437,7 +440,7 @@ function run_lexing_pass(ctx: CompilationContext*) -> PassResult {
     }
 
     const file: File      = File::new(source_path);
-    const lexer: Lexer    = Lexer::new(file);
+    const lexer: Lexer    = Lexer::new(file, &ctx.diagnostics);
     const tokens: Token[] = lexer.lex();
 
     if (tokens.length == 0) {
@@ -445,20 +448,33 @@ function run_lexing_pass(ctx: CompilationContext*) -> PassResult {
         return PassResult::failure(1);
     }
 
+    // Filter out error tokens so the parser doesn't see them.
+    // Diagnostics were already emitted by the Lexer via the DiagnosticSink.
+    mut clean_tokens: Token[] = [];
+    mut had_errors: boolean = false;
+    for (mut i: int = 0; i < tokens.length; i++) {
+        if (tokens[i].kind == TokenType::Unknown) {
+            had_errors = true;
+        } else {
+            clean_tokens.push(tokens[i]);
+        }
+    }
+
+    const final_tokens: Token[] = if (had_errors) { clean_tokens } else { tokens };
+
     // Store results in artifacts
-    ctx.artifacts.tokens = TokenStream::new(tokens, source_path, "");
+    ctx.artifacts.tokens = TokenStream::new(final_tokens, source_path, "");
 
     if (ctx.debug_mode) {
-        printf("[Lexing] Produced %d tokens\n", tokens.length);
-        for (mut i: int = 0; i < tokens.length; i++) {
-            const tok: Token = tokens[i];
+        printf("[Lexing] Produced %d tokens\n", final_tokens.length);
+        for (mut i: int = 0; i < final_tokens.length; i++) {
+            const tok: Token = final_tokens[i];
             printf("  [%d] %s at %d:%d\n", i, tok.lexeme, tok.line, tok.column);
         }
     }
 
-    return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::Tokens]);
+    return PassResult::from_snapshot(ctx.diagnostics, snap);
 }
-
 
 // ============================================================================
 // Parsing Pass
@@ -508,7 +524,7 @@ function run_parsing_pass(ctx: CompilationContext*) -> PassResult {
     // Parse errors are already recorded in ctx.diagnostics via the DiagnosticSink.
     // PassResult::from_snapshot below will pick them up automatically.
 
-    return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::AST]);
+    return PassResult::from_snapshot(ctx.diagnostics, snap);
 }
 
 
@@ -520,7 +536,7 @@ function run_parsing_pass(ctx: CompilationContext*) -> PassResult {
 function run_ast_validation_pass(ctx: CompilationContext*) -> PassResult {
     // TODO: Walk AST and check for structural issues
     printf("[Pipeline] STUB: ASTValidation (not yet implemented)\n");
-    return PassResult::stub([Provision::ASTValidated]);
+    return PassResult::stub();
 }
 
 
@@ -555,7 +571,7 @@ function run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
         if (ctx.debug_mode) {
             printf("[TypeDeclaration] No AST root available, skipping\n");
         }
-        return PassResult::ok([Provision::TypeDeclarations]);
+        return PassResult::ok();
     }
 
     // Transfer the parsed namespace into the compilation context so that
@@ -614,5 +630,5 @@ function run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
             type_count, arena.type_count());
     }
 
-    return PassResult::from_snapshot(ctx.diagnostics, snap, [Provision::TypeDeclarations]);
+    return PassResult::from_snapshot(ctx.diagnostics, snap);
 }
