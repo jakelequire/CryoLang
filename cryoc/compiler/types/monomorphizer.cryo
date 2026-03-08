@@ -71,6 +71,9 @@ type struct Monomorphizer {
     // Error tracking
     error_count:       i64;
 
+    // Incremental injection tracking (for batch compilation)
+    injection_cursor:  i64;
+
 
     // ----------------------------------------------------------------
     // Construction
@@ -91,6 +94,7 @@ type struct Monomorphizer {
             spec_index:        HashMap<string, i64>::new(),
             in_progress:       HashMap<string, boolean>::new(),
             error_count:       0,
+            injection_cursor:  0,
         };
     }
 
@@ -452,6 +456,39 @@ type struct Monomorphizer {
                 // No nested types to discover
             }
         }
+    }
+
+
+    // ----------------------------------------------------------------
+    // Batch compilation support
+    // ----------------------------------------------------------------
+
+    /// Reset transient per-module state while preserving the specialization
+    /// cache and injection cursor.  Called between modules in StdlibBatch mode
+    /// so the Monomorphizer can be reused without losing cross-module results.
+    reset_for_next_module(mut &this) -> void {
+        this.pending        = [];
+        this.pending_cursor = 0;
+        this.in_progress    = HashMap<string, boolean>::new();
+        this.error_count    = 0;
+    }
+
+    /// Get only the specialized ASTs produced since the last call to this
+    /// method (or since construction).  Advances the injection cursor so
+    /// each module receives only its new specializations, avoiding duplicate
+    /// declarations in the ProgramNode during batch compilation.
+    get_new_specialized_asts(mut &this) -> ASTNode*[] {
+        mut result: ASTNode*[] = [];
+        for (mut i: i64 = this.injection_cursor; i < this.spec_entries.length; i++) {
+            if (this.spec_entries[i].ast_node != null) {
+                result.push(this.spec_entries[i].ast_node);
+            }
+            for (mut j: i64 = 0; j < this.spec_entries[i].impl_nodes.length; j++) {
+                result.push(this.spec_entries[i].impl_nodes[j]);
+            }
+        }
+        this.injection_cursor = this.spec_entries.length;
+        return result;
     }
 
 
