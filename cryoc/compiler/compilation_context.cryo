@@ -21,7 +21,6 @@ import Compiler::Types::Registry;
 import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Monomorphizer;
-import Compiler::AST::Specializer;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::QualifiedName;
@@ -73,7 +72,6 @@ private:
     type_checker:           TypeChecker*;
     generic_registry:       GenericRegistry*;
     monomorphizer:          Monomorphizer*;
-    ast_specializer:        ASTSpecializer*;
     module_type_registry:   ModuleTypeRegistry*;
     module_loader:          void*;
     codegen:                void*;
@@ -112,7 +110,6 @@ public:
             type_checker:       null,
             generic_registry:   null,
             monomorphizer:      null,
-            ast_specializer:    null,
             module_type_registry:   null,
             module_loader:          null,
             codegen:            null,
@@ -223,6 +220,17 @@ public:
             this.type_arena = _box_arena.leak();
         }
 
+        // Create the GenericRegistry early so that the TypeResolver can route
+        // generic instantiations through the dedup cache from the very first
+        // pass that resolves type annotations (FunctionSignature).  Previously
+        // this lived in init_generics() which ran after FunctionSignature,
+        // causing instantiations in function signatures to bypass the registry
+        // and become invisible to the Monomorphizer.
+        if (this.generic_registry == null) {
+            const _box_greg: Box<GenericRegistry> = Box<GenericRegistry>::new(GenericRegistry::new(this.type_arena));
+            this.generic_registry = _box_greg.leak();
+        }
+
         // Create the ModuleTypeRegistry if it doesn't exist yet
         if (this.module_type_registry == null) {
             const _box_mtr: Box<ModuleTypeRegistry> = Box<ModuleTypeRegistry>::new(ModuleTypeRegistry::new());
@@ -230,8 +238,6 @@ public:
         }
 
         // Create the TypeResolver with all available dependencies.
-        // GenericRegistry may be null at this point (initialized later by init_generics),
-        // but will be wired in when init_generics runs.
         // The Resolver (name_resolver) is initialized by the NameResolution pass
         // which runs before TypeDeclaration, so it should be available here.
         if (this.type_resolver == null) {
@@ -262,31 +268,18 @@ public:
         // Will create ModuleLoader with include_paths when defined.
     }
 
-    /// Initialize generics infrastructure (GenericRegistry, ASTSpecializer).
+    /// Initialize generics infrastructure.
     /// Called by the TemplateRegistration pass.  Requires TypeArena to exist
     /// (init_type_system must be called first, which the TypeDeclaration pass does).
+    /// Note: GenericRegistry is created in init_type_system() so it is available
+    /// to the TypeResolver before FunctionSignature runs.
+    /// Note: ASTSpecializer is created internally by the Monomorphizer — no
+    /// context-level instance is needed.
     init_generics(mut &this) -> void {
         LOG_DEBUG(LogComponent::General, "[CompilationContext] init_generics()");
-        // Ensure type system is initialized — the arena must exist for generics
+        // Ensure type system (and GenericRegistry) are initialized
         if (this.type_arena == null) {
             this.init_type_system();
-        }
-
-        const arena: TypeArena* = this.type_arena;
-
-        if (this.generic_registry == null) {
-            const _box_greg: Box<GenericRegistry> = Box<GenericRegistry>::new(GenericRegistry::new(arena));
-            this.generic_registry = _box_greg.leak();
-        }
-        if (this.ast_specializer == null) {
-            const _box_spec: Box<ASTSpecializer> = Box<ASTSpecializer>::new(ASTSpecializer::new(arena, &this.intern_table));
-            this.ast_specializer = _box_spec.leak();
-        }
-
-        // Wire GenericRegistry into the TypeResolver so resolve_generic()
-        // routes through the dedup cache instead of creating directly in the arena.
-        if (this.type_resolver != null && this.type_resolver.generic_registry == null) {
-            this.type_resolver.generic_registry = this.generic_registry;
         }
     }
 
