@@ -17,6 +17,7 @@ import Compiler::AST::Specializer;
 import Compiler::Types::Substitution;
 import Compiler::Types::GenericRegistry;
 import Compiler::Resolver::InternTable;
+import Compiler::Resolver::SymbolStr;
 import Compiler::Diag;
 
 
@@ -151,17 +152,10 @@ type struct Monomorphizer {
     // ----------------------------------------------------------------
 
     specialize_request(mut &this, request: MonomorphRequest, key: string) -> boolean {
-        // Look up template
+        // Look up template by TypeID — the single source of truth.
+        // If the type wasn't registered during TemplateRegistration, it's an error.
         const entry: TemplateEntry* = this.generic_registry.get_template_by_type_id(request.base_type.id);
         if (entry == null) {
-            // Also try by looking up the base type's display name
-            const base_t: Type* = this.arena.lookup(request.base_type.id);
-            if (base_t != null) {
-                const by_name: TemplateEntry* = this.generic_registry.get_template_by_short_name(base_t.display_name());
-                if (by_name != null) {
-                    return this.specialize_with_entry(request, key, by_name);
-                }
-            }
             this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 sprintf("no template found for type ID %llu", request.base_type.id)));
             return false;
@@ -304,7 +298,6 @@ type struct Monomorphizer {
             const field: FieldDeclNode* = original.fields[i];
             if (field == null) { continue; }
 
-            const fname: string = this.intern_table.resolve(field.name);
             const is_pub: boolean = field.visibility == Visibility::Public;
 
             // Apply substitution: GenericParam TypeRefs → concrete TypeRefs
@@ -313,7 +306,7 @@ type struct Monomorphizer {
                 field_type = subst.apply(field.resolved_type, this.arena);
             }
 
-            field_infos.push(FieldInfo::new(fname, field_type, is_pub, true));
+            field_infos.push(FieldInfo::new(field.name, field_type, is_pub, true));
         }
         st.set_fields(field_infos);
     }
@@ -329,7 +322,6 @@ type struct Monomorphizer {
             const field: FieldDeclNode* = original.fields[i];
             if (field == null) { continue; }
 
-            const fname: string = this.intern_table.resolve(field.name);
             const is_pub: boolean = field.visibility == Visibility::Public;
 
             mut field_type: TypeRef = TypeRef::invalid();
@@ -337,7 +329,7 @@ type struct Monomorphizer {
                 field_type = subst.apply(field.resolved_type, this.arena);
             }
 
-            field_infos.push(FieldInfo::new(fname, field_type, is_pub, true));
+            field_infos.push(FieldInfo::new(field.name, field_type, is_pub, true));
         }
         ct.set_fields(field_infos);
     }
@@ -354,17 +346,15 @@ type struct Monomorphizer {
             const variant: EnumVariantNode* = original.variants[i];
             if (variant == null) { continue; }
 
-            const vname: string = this.intern_table.resolve(variant.name);
-
             // Resolve each associated type name to a concrete TypeRef
             mut payload_types: TypeRef[] = [];
             for (mut j: i64 = 0; j < variant.associated_types.length; j++) {
-                const type_name: string = this.intern_table.resolve(variant.associated_types[j]);
+                const type_sym: SymbolStr = variant.associated_types[j];
                 mut resolved: TypeRef = TypeRef::invalid();
 
-                // Check if this name is a generic parameter — map to concrete arg
+                // Check if this name is a generic parameter — O(1) SymbolStr comparison
                 for (mut k: i64 = 0; k < entry.param_names.length; k++) {
-                    if (type_name == entry.param_names[k]) {
+                    if (type_sym.equals(entry.param_names[k])) {
                         if (k < subst.replacements.length) {
                             resolved = subst.replacements[k];
                         }
@@ -374,13 +364,14 @@ type struct Monomorphizer {
 
                 // Not a generic param — try resolving as a concrete type name
                 if (!resolved.is_valid()) {
+                    const type_name: string = this.intern_table.resolve(type_sym);
                     resolved = this.arena.lookup_by_name(type_name);
                 }
 
                 payload_types.push(resolved);
             }
 
-            et.add_variant(EnumVariantInfo::new(vname, payload_types, i as u64));
+            et.add_variant(EnumVariantInfo::new(variant.name, payload_types, i as u64));
         }
     }
 
