@@ -1,7 +1,8 @@
 /// ResolutionMap
 ///
-/// Maps AST source spans to resolved SymbolIDs.  Uses span-based string
-/// keys ("file:line:col") with HashMaps for O(1) lookup.  After the
+/// Maps AST source spans to resolved SymbolIDs.  Uses packed u64 keys
+/// (file_hash[31:0] | line[15:0] << 32 | col[15:0] << 48) with HashMaps
+/// for O(1) lookup with zero string allocation per query.  After the
 /// NameResolution pass, downstream consumers look up results by span
 /// to get SymbolIDs.
 
@@ -18,39 +19,44 @@ import std::collections::hashmap;
 
 type struct ResolutionMap {
     // Single-symbol resolutions
-    singles:   HashMap<string, SymbolID>;
+    singles:   HashMap<u64, SymbolID>;
 
     // Overload set resolutions
-    overloads: HashMap<string, SymbolID[]>;
+    overloads: HashMap<u64, SymbolID[]>;
 
     static new() -> ResolutionMap {
         return ResolutionMap {
-            singles:   HashMap<string, SymbolID>::new(),
-            overloads: HashMap<string, SymbolID[]>::new(),
+            singles:   HashMap<u64, SymbolID>::new(),
+            overloads: HashMap<u64, SymbolID[]>::new(),
         };
     }
 
-    /// Build a lookup key from a SourceSpan.
-    static make_key(span: SourceSpan) -> string {
-        return sprintf("%s:%u:%u", span.file, span.start_line, span.start_col);
+    /// Pack a SourceSpan into a u64 key.
+    /// Layout: bits [31:0] = truncated file hash, [47:32] = start_line, [63:48] = start_col
+    static make_key(span: SourceSpan) -> u64 {
+        const file_hash: u64 = hash_str(span.file);
+        const lo: u64 = file_hash & 0xFFFFFFFF;
+        const mid: u64 = (span.start_line as u64 & 0xFFFF) << 32;
+        const hi: u64 = (span.start_col as u64 & 0xFFFF) << 48;
+        return lo | mid | hi;
     }
 
     /// Record a single resolution: this span refers to this symbol.
     record(mut &this, span: SourceSpan, sym_id: SymbolID) -> void {
-        const key: string = ResolutionMap::make_key(span);
-        this.singles.insert(key, sym_id, hash_str(key));
+        const key: u64 = ResolutionMap::make_key(span);
+        this.singles.insert(key, sym_id, hash_int(key));
     }
 
     /// Record an overload set resolution: this span could refer to any of these symbols.
     record_overloads(mut &this, span: SourceSpan, sym_ids: SymbolID[]) -> void {
-        const key: string = ResolutionMap::make_key(span);
-        this.overloads.insert(key, sym_ids, hash_str(key));
+        const key: u64 = ResolutionMap::make_key(span);
+        this.overloads.insert(key, sym_ids, hash_int(key));
     }
 
     /// Look up the symbol for a span.  Returns invalid SymbolID if not found.
     resolve(&this, span: SourceSpan) -> SymbolID {
-        const key: string = ResolutionMap::make_key(span);
-        const opt: Option<SymbolID> = this.singles.get(key, hash_str(key));
+        const key: u64 = ResolutionMap::make_key(span);
+        const opt: Option<SymbolID> = this.singles.get(key, hash_int(key));
         if (opt.is_some()) {
             return opt.unwrap();
         }
@@ -59,8 +65,8 @@ type struct ResolutionMap {
 
     /// Look up the overload set for a span.  Returns empty array if not found.
     resolve_overloads(&this, span: SourceSpan) -> SymbolID[] {
-        const key: string = ResolutionMap::make_key(span);
-        const opt: Option<SymbolID[]> = this.overloads.get(key, hash_str(key));
+        const key: u64 = ResolutionMap::make_key(span);
+        const opt: Option<SymbolID[]> = this.overloads.get(key, hash_int(key));
         if (opt.is_some()) {
             return opt.unwrap();
         }
