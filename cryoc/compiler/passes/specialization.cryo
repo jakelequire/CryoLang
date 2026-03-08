@@ -212,15 +212,21 @@ type struct SpecializationPasses {
             return PassResult::failure(1);
         }
 
-        // Create and run monomorphizer
-        const _box_mono: Box<Monomorphizer> = Box<Monomorphizer>::new(
-            Monomorphizer::new(arena, generic_reg, &ctx.intern_table, &ctx.diagnostics));
-        const mono_ptr: Monomorphizer* = _box_mono.leak();
+        // Reuse existing monomorphizer across modules (batch compilation),
+        // or create one on first use.
+        mut mono_ptr: Monomorphizer* = ctx.monomorphizer;
+        if (mono_ptr != null) {
+            // Subsequent module: clear transient state, keep specialization cache
+            mono_ptr.reset_for_next_module();
+        } else {
+            // First module: allocate and store on context
+            const _box_mono: Box<Monomorphizer> = Box<Monomorphizer>::new(
+                Monomorphizer::new(arena, generic_reg, &ctx.intern_table, &ctx.diagnostics));
+            mono_ptr = _box_mono.leak();
+            ctx.monomorphizer = mono_ptr;
+        }
 
         const success: boolean = mono_ptr.process_all();
-
-        // Store monomorphizer on context for the next pass
-        ctx.monomorphizer = mono_ptr;
 
         LOG_DEBUG(LogComponent::General, "[Monomorphization] Completed: %lld specializations",
             mono_ptr.specialization_count());
@@ -251,8 +257,8 @@ type struct SpecializationPasses {
             return PassResult::ok([Provision::GenericExpressionsResolved]);
         }
 
-        // Get all specialized ASTs
-        const specialized_asts: ASTNode*[] = mono.get_all_specialized_asts();
+        // Get only specializations new since the last module (incremental injection)
+        const specialized_asts: ASTNode*[] = mono.get_new_specialized_asts();
 
         if (specialized_asts.length == 0) {
             LOG_DEBUG(LogComponent::General, "[GenericExpressionResolution] No specialized ASTs to inject");
