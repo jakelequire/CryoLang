@@ -383,6 +383,25 @@ namespace Cryo::Codegen
                                       field->name(), final_type->display_name());
                         }
                     }
+                    // Fix pointer wrapper lost by semantic analysis
+                    // Parser creates Named("T*") not Pointer(...), so check both annotation kinds.
+                    if (field->has_type_annotation() && final_type.is_valid() &&
+                        final_type->kind() != Cryo::TypeKind::Pointer)
+                    {
+                        const Cryo::TypeAnnotation *fann = field->type_annotation();
+                        bool ann_implies_pointer =
+                            (fann && fann->kind == Cryo::TypeAnnotationKind::Pointer) ||
+                            (fann && fann->kind == Cryo::TypeAnnotationKind::Named &&
+                             !fann->name.empty() && fann->name.back() == '*');
+                        if (ann_implies_pointer)
+                        {
+                            TypeRef from_ann = resolve_field_type_from_annotation(fann);
+                            if (from_ann.is_valid() && from_ann->kind() == Cryo::TypeKind::Pointer)
+                                final_type = from_ann;
+                            else
+                                final_type = symbols().arena().get_pointer_to(final_type);
+                        }
+                    }
                     substituted_field_types.push_back(final_type.is_valid() ? final_type : TypeRef{});
                 }
             }
@@ -433,6 +452,25 @@ namespace Cryo::Codegen
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                       "GenericCodegen: Resolved field '{}' type from annotation: {}",
                                       field->name(), final_type->display_name());
+                        }
+                    }
+                    // Fix pointer wrapper lost by semantic analysis
+                    // Parser creates Named("T*") not Pointer(...), so check both annotation kinds.
+                    if (field->has_type_annotation() && final_type.is_valid() &&
+                        final_type->kind() != Cryo::TypeKind::Pointer)
+                    {
+                        const Cryo::TypeAnnotation *fann = field->type_annotation();
+                        bool ann_implies_pointer =
+                            (fann && fann->kind == Cryo::TypeAnnotationKind::Pointer) ||
+                            (fann && fann->kind == Cryo::TypeAnnotationKind::Named &&
+                             !fann->name.empty() && fann->name.back() == '*');
+                        if (ann_implies_pointer)
+                        {
+                            TypeRef from_ann = resolve_field_type_from_annotation(fann);
+                            if (from_ann.is_valid() && from_ann->kind() == Cryo::TypeKind::Pointer)
+                                final_type = from_ann;
+                            else
+                                final_type = symbols().arena().get_pointer_to(final_type);
                         }
                     }
                     substituted_field_types.push_back(final_type.is_valid() ? final_type : TypeRef{});
@@ -699,8 +737,22 @@ namespace Cryo::Codegen
                     // Skip 'this' parameter (first param for instance methods)
                     if (param_name == "this")
                     {
-                        // 'this' is a pointer to the current type
+                        // 'this' is a pointer to the current type.
+                        // Use the same robust fallback chain as the enum codegen path:
+                        // try mangled name, then struct/enum lookup, then unmangled generic name,
+                        // and create a bare struct type as last resort.
                         TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
+                        if (!this_type.is_valid())
+                            this_type = symbols().lookup_struct_type(mangled);
+                        if (!this_type.is_valid())
+                            this_type = symbols().arena().lookup_type_by_name(generic_name);
+                        if (!this_type.is_valid())
+                        {
+                            Cryo::QualifiedTypeName qname;
+                            qname.name = mangled;
+                            qname.module = Cryo::ModuleID::invalid();
+                            this_type = symbols().arena().create_struct(qname);
+                        }
                         if (this_type.is_valid())
                         {
                             TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
@@ -948,8 +1000,20 @@ namespace Cryo::Codegen
 
                         if (param_name == "this")
                         {
-                            // 'this' is a pointer to the current type
+                            // 'this' is a pointer to the current type.
+                            // Robust fallback chain (see struct codegen path).
                             TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
+                            if (!this_type.is_valid())
+                                this_type = symbols().lookup_struct_type(mangled);
+                            if (!this_type.is_valid())
+                                this_type = symbols().arena().lookup_type_by_name(generic_name);
+                            if (!this_type.is_valid())
+                            {
+                                Cryo::QualifiedTypeName qname;
+                                qname.name = mangled;
+                                qname.module = Cryo::ModuleID::invalid();
+                                this_type = symbols().arena().create_struct(qname);
+                            }
                             if (this_type.is_valid())
                             {
                                 TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
@@ -1585,7 +1649,19 @@ namespace Cryo::Codegen
                         // Register parameter type in variable_types_map for method resolution
                         if (param_name == "this")
                         {
+                            // Robust fallback chain (see struct codegen path).
                             TypeRef this_type = symbols().arena().lookup_type_by_name(mangled);
+                            if (!this_type.is_valid())
+                                this_type = symbols().lookup_struct_type(mangled);
+                            if (!this_type.is_valid())
+                                this_type = symbols().arena().lookup_type_by_name(generic_name);
+                            if (!this_type.is_valid())
+                            {
+                                Cryo::QualifiedTypeName qname;
+                                qname.name = mangled;
+                                qname.module = Cryo::ModuleID::invalid();
+                                this_type = symbols().arena().create_struct(qname);
+                            }
                             if (this_type.is_valid())
                             {
                                 TypeRef this_ptr = symbols().arena().get_pointer_to(this_type);
@@ -3786,6 +3862,66 @@ namespace Cryo::Codegen
             return type;
         }
 
+        // Handle bare Struct/Class types that are actually generic templates.
+        // This happens when semantic analysis resolves a generic type annotation
+        // (e.g., HashMapEntry<K, V>) to just the base struct type (StructType("HashMapEntry"))
+        // without creating an InstantiatedType. When we're in a generic instantiation scope,
+        // we can construct the proper InstantiatedType by matching the template's type params
+        // to the current bindings.
+        if (type->kind() == TypeKind::Struct || type->kind() == TypeKind::Class)
+        {
+            auto *template_reg = ctx().template_registry();
+            if (template_reg && in_type_param_scope())
+            {
+                std::string type_name = type.get()->display_name();
+                const auto *tmpl_info = template_reg->find_template(type_name);
+                if (tmpl_info)
+                {
+                    // Get the template's type parameter names
+                    std::vector<std::string> param_names;
+                    if (tmpl_info->struct_template)
+                    {
+                        for (const auto &p : tmpl_info->struct_template->generic_parameters())
+                            param_names.push_back(p->name());
+                    }
+                    else if (tmpl_info->class_template)
+                    {
+                        for (const auto &p : tmpl_info->class_template->generic_parameters())
+                            param_names.push_back(p->name());
+                    }
+                    else if (tmpl_info->enum_template)
+                    {
+                        for (const auto &p : tmpl_info->enum_template->generic_parameters())
+                            param_names.push_back(p->name());
+                    }
+
+                    if (!param_names.empty())
+                    {
+                        // Resolve each type param from current bindings
+                        std::vector<TypeRef> resolved_args;
+                        for (const auto &pname : param_names)
+                        {
+                            TypeRef resolved = resolve_type_param(pname);
+                            if (resolved.is_valid())
+                                resolved_args.push_back(resolved);
+                            else
+                                break;
+                        }
+
+                        if (resolved_args.size() == param_names.size())
+                        {
+                            TypeRef inst = symbols().arena().create_instantiation(type, std::move(resolved_args));
+                            symbols().arena().register_instantiated_by_name(inst);
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "GenericCodegen: Substituted bare generic type {} -> {}",
+                                      type_name, inst->display_name());
+                            return inst;
+                        }
+                    }
+                }
+            }
+        }
+
         return type;
     }
 
@@ -4001,6 +4137,34 @@ namespace Cryo::Codegen
             TypeRef field_type = field->get_resolved_type();
             TypeRef substituted = substitute_type_params(field_type);
 
+            // Fix pointer wrapper lost by semantic analysis:
+            // The annotation may say T* but resolved_type lost the pointer.
+            // Parser creates Named("HashMapEntry<K, V>*") not Pointer(...), so check both.
+            if (field->has_type_annotation() && substituted.is_valid() &&
+                substituted->kind() != Cryo::TypeKind::Pointer)
+            {
+                const Cryo::TypeAnnotation *fann = field->type_annotation();
+                bool ann_implies_pointer =
+                    (fann && fann->kind == Cryo::TypeAnnotationKind::Pointer) ||
+                    (fann && fann->kind == Cryo::TypeAnnotationKind::Named &&
+                     !fann->name.empty() && fann->name.back() == '*');
+                if (ann_implies_pointer)
+                {
+                    TypeRef from_ann = resolve_field_type_from_annotation(fann);
+                    if (from_ann.is_valid() && from_ann->kind() == Cryo::TypeKind::Pointer)
+                    {
+                        substituted = from_ann;
+                    }
+                    else
+                    {
+                        substituted = symbols().arena().get_pointer_to(substituted);
+                    }
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "create_substituted_fields: Re-wrapped field '{}' in pointer per annotation -> {}",
+                              field->name(), substituted->display_name());
+                }
+            }
+
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                       "create_substituted_fields: Field '{}' type '{}' -> substituted '{}'",
                       field->name(),
@@ -4156,6 +4320,54 @@ namespace Cryo::Codegen
 
                 get_instantiated_type(base_name, type_args);
             }
+            return;
+        }
+
+        // Handle bare Struct/Class types that are generic templates.
+        // When semantic analysis resolved HashMapEntry<K,V> to just StructType("HashMapEntry"),
+        // we need to detect this and trigger instantiation with the current type param bindings.
+        if ((type->kind() == TypeKind::Struct || type->kind() == TypeKind::Class) && in_type_param_scope())
+        {
+            auto *template_reg = ctx().template_registry();
+            if (template_reg)
+            {
+                std::string type_name = type.get()->display_name();
+                const auto *tmpl_info = template_reg->find_template(type_name);
+                if (tmpl_info)
+                {
+                    std::vector<std::string> param_names;
+                    if (tmpl_info->struct_template)
+                        for (const auto &p : tmpl_info->struct_template->generic_parameters())
+                            param_names.push_back(p->name());
+                    else if (tmpl_info->class_template)
+                        for (const auto &p : tmpl_info->class_template->generic_parameters())
+                            param_names.push_back(p->name());
+                    else if (tmpl_info->enum_template)
+                        for (const auto &p : tmpl_info->enum_template->generic_parameters())
+                            param_names.push_back(p->name());
+
+                    if (!param_names.empty())
+                    {
+                        std::vector<TypeRef> resolved_args;
+                        for (const auto &pname : param_names)
+                        {
+                            TypeRef resolved = resolve_type_param(pname);
+                            if (resolved.is_valid())
+                                resolved_args.push_back(resolved);
+                            else
+                                break;
+                        }
+
+                        if (resolved_args.size() == param_names.size())
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "GenericCodegen: Ensuring bare generic dependent type {} is instantiated with current bindings",
+                                      type_name);
+                            get_instantiated_type(type_name, resolved_args);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -4167,6 +4379,47 @@ namespace Cryo::Codegen
 
         // Substitute return type
         TypeRef ret_type = substitute_type_params(node->get_resolved_return_type());
+
+        // Fallback: if substitution left a bare StructType or an unresolved type
+        // (common for nested generics like Option<HashMapPair<K,V>> where sema
+        // resolves to bare "Option"), re-resolve from the return type annotation.
+        if (node->has_return_type_annotation() && in_type_param_scope())
+        {
+            bool needs_annotation_fallback = false;
+            if (!ret_type.is_valid())
+                needs_annotation_fallback = true;
+            else if (ret_type->kind() == Cryo::TypeKind::Struct ||
+                     ret_type->kind() == Cryo::TypeKind::Enum ||
+                     ret_type->kind() == Cryo::TypeKind::Error)
+                needs_annotation_fallback = true;
+            else if (ret_type->kind() == Cryo::TypeKind::InstantiatedType)
+            {
+                // Check if any type arg is still a GenericParam (not fully substituted)
+                auto *inst = static_cast<const Cryo::InstantiatedType *>(ret_type.get());
+                for (const auto &arg : inst->type_args())
+                {
+                    if (arg.is_valid() && arg->kind() == Cryo::TypeKind::GenericParam)
+                    {
+                        needs_annotation_fallback = true;
+                        break;
+                    }
+                }
+            }
+
+            if (needs_annotation_fallback)
+            {
+                TypeRef from_ann = resolve_field_type_from_annotation(node->return_type_annotation());
+                if (from_ann.is_valid())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "create_substituted_function_type: Re-resolved return type from annotation: {} -> {}",
+                              ret_type.is_valid() ? ret_type->display_name() : "<invalid>",
+                              from_ann->display_name());
+                    ret_type = from_ann;
+                }
+            }
+        }
+
         // Ensure dependent types in return type are instantiated
         ensure_dependent_types_instantiated(ret_type);
         llvm::Type *llvm_ret = get_llvm_type(ret_type);

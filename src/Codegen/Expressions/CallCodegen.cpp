@@ -2572,6 +2572,18 @@ namespace Cryo::Codegen
                                                     arg_type = substituted;
                                                 }
                                             }
+                                            // If it's a bare struct/class that's a generic template,
+                                            // substitute type params to get the concrete instantiation.
+                                            // Sema may resolve "HashMapPair<K,V>" to bare StructType("HashMapPair").
+                                            else if (arg_type->kind() == TypeKind::Struct ||
+                                                     arg_type->kind() == TypeKind::Class)
+                                            {
+                                                TypeRef substituted = generics->substitute_type_params(arg_type);
+                                                if (substituted.is_valid() && substituted != arg_type)
+                                                {
+                                                    arg_type = substituted;
+                                                }
+                                            }
                                             inferred_type_args[j] = arg_type;
                                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                                       "generate_enum_variant: Inferred type param {} = {} from argument",
@@ -2923,6 +2935,46 @@ namespace Cryo::Codegen
             if (!enum_type && instantiated_enum_name != resolved_enum_name)
             {
                 enum_type = types().get_type(resolved_enum_name);
+            }
+
+            // If name-based lookup also failed, try inferring from the current function's
+            // return type. This handles cases where type inference produced a mangled name
+            // that doesn't match the actual registered enum type name.
+            if (!enum_type)
+            {
+                llvm::Function *current_fn = builder().GetInsertBlock()
+                                                 ? builder().GetInsertBlock()->getParent()
+                                                 : nullptr;
+                if (current_fn)
+                {
+                    llvm::Type *ret_ty = current_fn->getReturnType();
+                    if (ret_ty && ret_ty->isStructTy())
+                    {
+                        auto *ret_st = llvm::cast<llvm::StructType>(ret_ty);
+                        if (ret_st->hasName())
+                        {
+                            std::string ret_name = ret_st->getName().str();
+                            std::string short_enum = resolved_enum_name;
+                            size_t ns_pos = short_enum.rfind("::");
+                            if (ns_pos != std::string::npos)
+                                short_enum = short_enum.substr(ns_pos + 2);
+
+                            if ((ret_name.size() > resolved_enum_name.size() &&
+                                 ret_name.substr(0, resolved_enum_name.size()) == resolved_enum_name &&
+                                 ret_name[resolved_enum_name.size()] == '_') ||
+                                (ret_name.size() > short_enum.size() &&
+                                 ret_name.substr(0, short_enum.size()) == short_enum &&
+                                 ret_name[short_enum.size()] == '_'))
+                            {
+                                enum_type = ret_st;
+                                instantiated_enum_name = ret_name;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_enum_variant: Inferred enum type '{}' from function return type",
+                                          ret_name);
+                            }
+                        }
+                    }
+                }
             }
         }
 
