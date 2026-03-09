@@ -1212,6 +1212,45 @@ namespace Cryo::Codegen
                           name, cryo_var_type->display_name(), substituted->display_name());
                 cryo_var_type = substituted;
             }
+
+            // Fix pointer/generic wrapper lost by semantic analysis:
+            // Sema may resolve "HashMapEntry<K,V>*" to bare StructType("HashMapEntry"),
+            // losing both generic args AND pointer wrapper. The substitute_type_params fix above
+            // may recover generic args but not the pointer wrapper.
+            // The parser creates annotations as Named("HashMapEntry<K, V>*") not Pointer(Generic(...)),
+            // so we check both annotation kinds. Fall back to resolve_field_type_from_annotation
+            // which handles Named annotations with embedded pointer suffixes and type params.
+            const Cryo::TypeAnnotation *annotation = node->type_annotation();
+            if (annotation && cryo_var_type.is_valid() && cryo_var_type->kind() != Cryo::TypeKind::Pointer)
+            {
+                bool annotation_implies_pointer =
+                    (annotation->kind == Cryo::TypeAnnotationKind::Pointer) ||
+                    (annotation->kind == Cryo::TypeAnnotationKind::Named &&
+                     !annotation->name.empty() && annotation->name.back() == '*');
+
+                if (annotation_implies_pointer)
+                {
+                    // Use resolve_field_type_from_annotation for full annotation-based resolution
+                    // with type param substitution (K->u32, V->TypeRef, etc.)
+                    TypeRef from_annotation = _generics->resolve_field_type_from_annotation(annotation);
+                    if (from_annotation.is_valid() && from_annotation->kind() == Cryo::TypeKind::Pointer)
+                    {
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Re-resolved '{}' from annotation: {} -> {}",
+                                  name, cryo_var_type->display_name(), from_annotation->display_name());
+                        cryo_var_type = from_annotation;
+                    }
+                    else
+                    {
+                        // Fallback: just wrap in pointer if annotation resolution failed
+                        TypeRef wrapped = ctx().symbols().arena().get_pointer_to(cryo_var_type);
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "DeclarationCodegen: Re-wrapped '{}' type in pointer per annotation: {} -> {}",
+                                  name, cryo_var_type->display_name(), wrapped->display_name());
+                        cryo_var_type = wrapped;
+                    }
+                }
+            }
         }
 
         // Check if variable type is an error type (unresolved generics, undefined types, etc.)
@@ -1498,6 +1537,24 @@ namespace Cryo::Codegen
             if (substituted.is_valid())
             {
                 resolved_type = substituted;
+            }
+
+            // Fix pointer wrapper lost by semantic analysis (same fix as above)
+            const Cryo::TypeAnnotation *ann = node->type_annotation();
+            if (ann && resolved_type.is_valid() && resolved_type->kind() != Cryo::TypeKind::Pointer)
+            {
+                bool ann_implies_pointer =
+                    (ann->kind == Cryo::TypeAnnotationKind::Pointer) ||
+                    (ann->kind == Cryo::TypeAnnotationKind::Named &&
+                     !ann->name.empty() && ann->name.back() == '*');
+                if (ann_implies_pointer && _generics->in_type_param_scope())
+                {
+                    TypeRef from_ann = _generics->resolve_field_type_from_annotation(ann);
+                    if (from_ann.is_valid() && from_ann->kind() == Cryo::TypeKind::Pointer)
+                        resolved_type = from_ann;
+                    else
+                        resolved_type = ctx().symbols().arena().get_pointer_to(resolved_type);
+                }
             }
         }
         if (resolved_type)
@@ -2509,6 +2566,46 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "get_function_type: Substituted return type '{}' -> '{}'",
                           resolved_type->display_name(), substituted->display_name());
                 resolved_type = substituted;
+            }
+        }
+
+        // Annotation-based fallback for return types that substitute_type_params couldn't
+        // fully resolve (e.g., nested generics like Option<HashMapPair<K,V>> where sema
+        // resolves to bare StructType("Option") losing all type args).
+        if (_generics && _generics->in_type_param_scope() && node->has_return_type_annotation())
+        {
+            bool needs_fallback = false;
+            if (!resolved_type.is_valid())
+                needs_fallback = true;
+            else if (resolved_type->kind() == TypeKind::Struct ||
+                     resolved_type->kind() == TypeKind::Enum ||
+                     resolved_type->kind() == TypeKind::Error)
+                needs_fallback = true;
+            else if (resolved_type->kind() == TypeKind::InstantiatedType)
+            {
+                auto *inst = static_cast<const Cryo::InstantiatedType *>(resolved_type.get());
+                for (const auto &arg : inst->type_args())
+                {
+                    if (arg.is_valid() && arg->kind() == TypeKind::GenericParam)
+                    {
+                        needs_fallback = true;
+                        break;
+                    }
+                }
+            }
+
+            if (needs_fallback)
+            {
+                TypeRef from_ann = _generics->resolve_field_type_from_annotation(node->return_type_annotation());
+                if (from_ann.is_valid())
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "get_function_type: Re-resolved return type from annotation for '{}': {} -> {}",
+                              node->name(),
+                              resolved_type.is_valid() ? resolved_type->display_name() : "<invalid>",
+                              from_ann->display_name());
+                    resolved_type = from_ann;
+                }
             }
         }
 

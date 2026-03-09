@@ -1,0 +1,885 @@
+/// Semantic Analysis Passes
+///
+///   FunctionBodyTypeCheck (order 12) — Walks all function bodies and fills
+///   resolved_type on every ExpressionNode.  Uses the TypeChecker for
+///   operator validation and the TypeArena for type lookups.
+///
+///   This pass runs AFTER TypeResolution (which resolves annotations on
+///   declarations) and BEFORE Monomorphization (which clones and specializes
+///   generic ASTs).  By the time codegen runs, every expression node will
+///   have a concrete resolved_type — no type inference needed in the backend.
+
+namespace Compiler::Passes::Sema;
+
+import Compiler::Diag;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::AST::Visitor;
+import Compiler::Passes::PassID;
+import Compiler::CompilationContext;
+import Compiler::Lex;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Arena;
+import Compiler::Types::Checker;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::Resolver;
+import std::collections::hashmap;
+import Utils::Logger;
+
+
+// ============================================================================
+// TypeCheckVisitor — Visitor-based function body type checker
+// ============================================================================
+
+/// Walks all function bodies, filling resolved_type on every ExpressionNode.
+/// Built once from top-level declarations, then driven through the AST via
+/// the visitor pattern.  Uses HashMap for O(1) lookups in all lookup tables.
+type class TypeCheckVisitor : BaseASTVisitor {
+public:
+
+    // -- Shared environment (built once from top-level declarations) --
+    arena:   TypeArena*;
+    checker: TypeChecker;
+    intern:  InternTable*;
+    ctx:     CompilationContext*;
+
+    // Lookup maps (populated during build)
+    func_returns:   HashMap<u32, TypeRef>;    // SymbolStr.id → return type
+    method_returns: HashMap<u64, TypeRef>;    // packed(type_id, method_id) → return type
+    type_map:       HashMap<u32, TypeRef>;    // SymbolStr.id → TypeRef
+    global_vars:    HashMap<u32, TypeRef>;    // SymbolStr.id → TypeRef
+    type_reverse:   HashMap<u64, u32>;        // TypeRef.id  → SymbolStr.id
+
+    // -- Per-function state (reset via enter_function for each body) --
+    locals:      HashMap<u32, TypeRef>;    // local variable scope
+    undo_keys:   u32[];                    // scope undo log: keys modified
+    undo_prev:   TypeRef[];                // scope undo log: previous values
+    return_type: TypeRef;                  // current function return type
+    this_type:   TypeRef;                  // current method receiver type
+    this_sym:    SymbolStr;                // interned "this"
+    body_count:  i64;                      // counter for debug output
+
+
+    // ================================================================
+    // Construction
+    // ================================================================
+
+    TypeCheckVisitor(arena: TypeArena*, intern: InternTable*,
+                     ctx: CompilationContext*) : BaseASTVisitor() {
+        this.arena          = arena;
+        this.checker        = TypeChecker::new(arena);
+        this.intern         = intern;
+        this.ctx            = ctx;
+        this.func_returns   = HashMap<u32, TypeRef>::new();
+        this.method_returns = HashMap<u64, TypeRef>::new();
+        this.type_map       = HashMap<u32, TypeRef>::new();
+        this.global_vars    = HashMap<u32, TypeRef>::new();
+        this.type_reverse   = HashMap<u64, u32>::new();
+        this.locals         = HashMap<u32, TypeRef>::new();
+        this.undo_keys      = [];
+        this.undo_prev      = [];
+        this.return_type    = TypeRef::invalid();
+        this.this_type      = TypeRef::invalid();
+        this.this_sym       = intern.intern("this");
+        this.body_count     = 0;
+    }
+
+    /// Build a TypeCheckVisitor from the compilation context,
+    /// scanning all top-level declarations to populate lookup maps.
+    static build(ctx: CompilationContext*) -> TypeCheckVisitor {
+        const arena: TypeArena* = ctx.type_arena;
+        mut v: TypeCheckVisitor = TypeCheckVisitor(arena, ctx.get_intern_table(), ctx);
+
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+        if (root == null) { return v; }
+
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt != null) {
+                v.register_top_level(stmt);
+            }
+        }
+
+        return v;
+    }
+
+
+    // ================================================================
+    // Top-Level Registration
+    // ================================================================
+
+    /// Register a single top-level declaration into the lookup maps.
+    register_top_level(mut &this, stmt: ASTNode*) -> void {
+        match (stmt.kind) {
+            NodeKind::FunctionDeclaration => {
+                const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                this.register_func(func.name, func.resolved_return_type);
+            }
+            NodeKind::VariableDeclaration => {
+                const var_node: VarDeclNode* = stmt as VarDeclNode*;
+                if (var_node.resolved_type.is_valid()) {
+                    this.register_global(var_node.name, var_node.resolved_type);
+                }
+            }
+            NodeKind::StructDeclaration => {
+                const node: StructDeclNode* = stmt as StructDeclNode*;
+                this.register_type_name(node.name, this.ctx.qualify_symbol(node.name));
+                this.register_methods(node.name, node.methods);
+            }
+            NodeKind::ClassDeclaration => {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                this.register_type_name(node.name, this.ctx.qualify_symbol(node.name));
+                this.register_methods(node.name, node.methods);
+            }
+            NodeKind::EnumDeclaration => {
+                const node: EnumDeclNode* = stmt as EnumDeclNode*;
+                this.register_type_name(node.name, this.ctx.qualify_symbol(node.name));
+            }
+            NodeKind::TraitDeclaration => {
+                const node: TraitDeclNode* = stmt as TraitDeclNode*;
+                this.register_type_name(node.name, this.ctx.qualify_symbol(node.name));
+            }
+            NodeKind::ImplementationBlock => {
+                const node: ImplBlockNode* = stmt as ImplBlockNode*;
+                this.register_methods(node.target_type, node.methods);
+            }
+            _ => {}
+        }
+    }
+
+    register_func(mut &this, name: SymbolStr, ret: TypeRef) -> void {
+        const h: u64 = hash_int(name.id as u64);
+        this.func_returns.insert(name.id, ret, h);
+    }
+
+    register_global(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        const h: u64 = hash_int(name.id as u64);
+        this.global_vars.insert(name.id, ty, h);
+    }
+
+    register_type_name(mut &this, name: SymbolStr, qualified: string) -> void {
+        const ty: TypeRef = this.arena.lookup_by_name(qualified);
+        if (ty.is_valid()) {
+            const h: u64 = hash_int(name.id as u64);
+            this.type_map.insert(name.id, ty, h);
+            const rh: u64 = hash_int(ty.id);
+            this.type_reverse.insert(ty.id, name.id, rh);
+        }
+    }
+
+    register_methods(mut &this, type_sym: SymbolStr, methods: MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+            const key: u64 = pack_method_key(type_sym, method.func.name);
+            const h: u64 = hash_int(key);
+            this.method_returns.insert(key, method.func.resolved_return_type, h);
+        }
+    }
+
+
+    // ================================================================
+    // Lookup Helpers
+    // ================================================================
+
+    lookup_func_return(&this, name: SymbolStr) -> TypeRef {
+        const h: u64 = hash_int(name.id as u64);
+        return match (this.func_returns.get(name.id, h)) {
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+    lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
+        const key: u64 = pack_method_key(type_sym, method_sym);
+        const h: u64 = hash_int(key);
+        return match (this.method_returns.get(key, h)) {
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+    lookup_type_by_sym(&this, name: SymbolStr) -> TypeRef {
+        const h: u64 = hash_int(name.id as u64);
+        return match (this.type_map.get(name.id, h)) {
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+    lookup_global_var(&this, name: SymbolStr) -> TypeRef {
+        const h: u64 = hash_int(name.id as u64);
+        return match (this.global_vars.get(name.id, h)) {
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+    lookup_type_sym(&this, ty: TypeRef) -> SymbolStr {
+        const h: u64 = hash_int(ty.id);
+        return match (this.type_reverse.get(ty.id, h)) {
+            Option::Some(val) => { SymbolStr::from_id(val) }
+            Option::None      => { SymbolStr::empty() }
+        };
+    }
+
+    lookup_local(&this, name: SymbolStr) -> TypeRef {
+        const h: u64 = hash_int(name.id as u64);
+        return match (this.locals.get(name.id, h)) {
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+
+    // ================================================================
+    // Scope Management
+    // ================================================================
+
+    /// Save the current scope state.  Returns a checkpoint index into the
+    /// undo log that restore_scope() uses to roll back.
+    save_scope(&this) -> i64 {
+        return this.undo_keys.length;
+    }
+
+    /// Register a local variable, recording the previous binding (if any)
+    /// in the undo log so it can be restored on scope exit.
+    register_local(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        const key: u32 = name.id;
+        const h: u64 = hash_int(key as u64);
+
+        // Save previous binding for undo
+        this.undo_keys.push(key);
+        match (this.locals.get(key, h)) {
+            Option::Some(val) => { this.undo_prev.push(val); }
+            Option::None      => { this.undo_prev.push(TypeRef::invalid()); }
+        }
+
+        this.locals.insert(key, ty, h);
+    }
+
+    /// Roll back local variable bindings to a previous checkpoint,
+    /// restoring any shadowed outer-scope variables.
+    restore_scope(mut &this, save_point: i64) -> void {
+        // Undo in reverse order
+        for (mut i: i64 = this.undo_keys.length - 1; i >= save_point; i = i - 1) {
+            const key: u32 = this.undo_keys[i];
+            const prev: TypeRef = this.undo_prev[i];
+            const h: u64 = hash_int(key as u64);
+            if (prev.is_valid()) {
+                this.locals.insert(key, prev, h);
+            } else {
+                this.locals.remove(key, h);
+            }
+        }
+
+        // Truncate undo log back to save point
+        if (save_point < this.undo_keys.length) {
+            mut new_keys: u32[] = [];
+            mut new_prev: TypeRef[] = [];
+            for (mut i: i64 = 0; i < save_point; i++) {
+                new_keys.push(this.undo_keys[i]);
+                new_prev.push(this.undo_prev[i]);
+            }
+            this.undo_keys = new_keys;
+            this.undo_prev = new_prev;
+        }
+    }
+
+
+    // ================================================================
+    // Per-Function Setup
+    // ================================================================
+
+    /// Reset per-function state and register parameters + "this".
+    enter_function(mut &this, func: FunctionDeclNode*, fn_this_type: TypeRef) -> void {
+        this.locals    = HashMap<u32, TypeRef>::new();
+        this.undo_keys = [];
+        this.undo_prev = [];
+        this.return_type = func.resolved_return_type;
+        this.this_type   = fn_this_type;
+
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null) { continue; }
+            if (param.resolved_type.is_valid()) {
+                this.register_local(param.name, param.resolved_type);
+            }
+        }
+
+        if (fn_this_type.is_valid()) {
+            this.register_local(this.this_sym, fn_this_type);
+        }
+    }
+
+
+    // ================================================================
+    // Declaration Visitors
+    // ================================================================
+
+    override visit(node: ProgramNode*) -> void {
+        for (mut i: i64 = 0; i < node.statements.length; i++) {
+            const stmt: ASTNode* = node.statements[i];
+            if (stmt == null) { continue; }
+            this.dispatch_top_level(stmt);
+        }
+    }
+
+    dispatch_top_level(mut &this, stmt: ASTNode*) -> void {
+        match (stmt.kind) {
+            NodeKind::FunctionDeclaration => { this.visit(stmt as FunctionDeclNode*); }
+            NodeKind::StructDeclaration   => { this.visit(stmt as StructDeclNode*); }
+            NodeKind::ClassDeclaration    => { this.visit(stmt as ClassDeclNode*); }
+            NodeKind::TraitDeclaration    => { this.visit(stmt as TraitDeclNode*); }
+            NodeKind::ImplementationBlock => { this.visit(stmt as ImplBlockNode*); }
+            _ => {}
+        }
+    }
+
+    override visit(node: FunctionDeclNode*) -> void {
+        if (node.body == null || node.is_generic()) { return; }
+        this.enter_function(node, TypeRef::invalid());
+        this.visit(node.body);
+        this.body_count = this.body_count + 1;
+    }
+
+    override visit(node: StructDeclNode*) -> void {
+        if (node.is_generic()) { return; }
+        const qualified: string = this.ctx.qualify_symbol(node.name);
+        const st_type: TypeRef = this.arena.lookup_by_name(qualified);
+        this.visit_methods(node.methods, st_type);
+    }
+
+    override visit(node: ClassDeclNode*) -> void {
+        if (node.is_generic()) { return; }
+        const qualified: string = this.ctx.qualify_symbol(node.name);
+        const cl_type: TypeRef = this.arena.lookup_by_name(qualified);
+        this.visit_methods(node.methods, cl_type);
+    }
+
+    override visit(node: TraitDeclNode*) -> void {
+        if (node.is_generic()) { return; }
+        for (mut j: i64 = 0; j < node.methods.length; j++) {
+            const func: FunctionDeclNode* = node.methods[j];
+            if (func != null && func.body != null) {
+                this.enter_function(func, TypeRef::invalid());
+                this.visit(func.body);
+                this.body_count = this.body_count + 1;
+            }
+        }
+    }
+
+    override visit(node: ImplBlockNode*) -> void {
+        const impl_this: TypeRef = this.lookup_type_by_sym(node.target_type);
+        this.visit_methods(node.methods, impl_this);
+    }
+
+    /// Type-check all method bodies in a type or impl block.
+    visit_methods(mut &this, methods: MethodNode*[], owner_type: TypeRef) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null || method.func.body == null) {
+                continue;
+            }
+            const method_this: TypeRef = if (method.is_static) {
+                TypeRef::invalid()
+            } else {
+                owner_type
+            };
+            this.enter_function(method.func, method_this);
+            this.visit(method.func.body);
+            this.body_count = this.body_count + 1;
+        }
+    }
+
+
+    // ================================================================
+    // Statement Visitors
+    // ================================================================
+
+    /// Route a StatementNode* to the correct typed visitor override.
+    dispatch_stmt(mut &this, stmt: StatementNode*) -> void {
+        if (stmt == null) { return; }
+        const n: ASTNode* = stmt as ASTNode*;
+        match (n.kind) {
+            NodeKind::BlockStatement       => { this.visit(stmt as BlockStmtNode*); }
+            NodeKind::ExpressionStatement  => { this.visit(stmt as ExprStmtNode*); }
+            NodeKind::DeclarationStatement => { this.visit(stmt as DeclStmtNode*); }
+            NodeKind::ReturnStatement      => { this.visit(stmt as ReturnStmtNode*); }
+            NodeKind::IfStatement          => { this.visit(stmt as IfStmtNode*); }
+            NodeKind::WhileStatement       => { this.visit(stmt as WhileStmtNode*); }
+            NodeKind::DoWhileStatement     => { this.visit(stmt as DoWhileStmtNode*); }
+            NodeKind::ForStatement         => { this.visit(stmt as ForStmtNode*); }
+            NodeKind::MatchStatement       => { this.visit(stmt as MatchStmtNode*); }
+            NodeKind::LoopStatement        => { this.visit(stmt as LoopStmtNode*); }
+            NodeKind::UnsafeBlockStatement => { this.visit(stmt as UnsafeBlockStmtNode*); }
+            NodeKind::SwitchStatement      => { this.visit(stmt as SwitchStmtNode*); }
+            _ => {}
+        }
+    }
+
+    override visit(node: BlockStmtNode*) -> void {
+        if (node == null) { return; }
+        const save: i64 = this.save_scope();
+        for (mut i: i64 = 0; i < node.statements.length; i++) {
+            this.dispatch_stmt(node.statements[i]);
+        }
+        this.restore_scope(save);
+    }
+
+    override visit(node: ExprStmtNode*) -> void {
+        this.resolve_expr(node.expression);
+    }
+
+    override visit(node: DeclStmtNode*) -> void {
+        if (node.declaration == null) { return; }
+        const decl: ASTNode* = node.declaration;
+        if (decl.kind != NodeKind::VariableDeclaration) { return; }
+
+        const var_node: VarDeclNode* = decl as VarDeclNode*;
+        if (var_node.has_initializer()) {
+            const init_type: TypeRef = this.resolve_expr(var_node.initializer);
+            if (!var_node.has_resolved_type() && init_type.is_valid()) {
+                var_node.set_resolved_type(init_type);
+            }
+        }
+        if (var_node.resolved_type.is_valid()) {
+            this.register_local(var_node.name, var_node.resolved_type);
+        }
+    }
+
+    override visit(node: ReturnStmtNode*) -> void {
+        if (node.has_expression()) {
+            this.resolve_expr(node.expression);
+        }
+    }
+
+    override visit(node: IfStmtNode*) -> void {
+        this.resolve_expr(node.condition);
+        this.dispatch_stmt(node.then_stmt);
+        if (node.has_else()) {
+            this.dispatch_stmt(node.else_stmt);
+        }
+    }
+
+    override visit(node: WhileStmtNode*) -> void {
+        this.resolve_expr(node.condition);
+        this.dispatch_stmt(node.body);
+    }
+
+    override visit(node: DoWhileStmtNode*) -> void {
+        this.dispatch_stmt(node.body);
+        this.resolve_expr(node.condition);
+    }
+
+    override visit(node: ForStmtNode*) -> void {
+        if (node.init != null) {
+            if (node.init.kind == NodeKind::DeclarationStatement) {
+                this.visit(node.init as DeclStmtNode*);
+            } else if (node.init.kind == NodeKind::ExpressionStatement) {
+                const es: ExprStmtNode* = node.init as ExprStmtNode*;
+                this.resolve_expr(es.expression);
+            }
+        }
+        if (node.condition != null) { this.resolve_expr(node.condition); }
+        if (node.update != null)    { this.resolve_expr(node.update); }
+        this.dispatch_stmt(node.body);
+    }
+
+    override visit(node: MatchStmtNode*) -> void {
+        this.resolve_expr(node.subject);
+        for (mut i: i64 = 0; i < node.arms.length; i++) {
+            const arm: MatchArmNode* = node.arms[i];
+            if (arm != null && arm.body != null) {
+                this.dispatch_stmt(arm.body);
+            }
+        }
+    }
+
+    override visit(node: LoopStmtNode*) -> void {
+        this.dispatch_stmt(node.body);
+    }
+
+    override visit(node: UnsafeBlockStmtNode*) -> void {
+        if (node.block != null) {
+            this.visit(node.block);
+        }
+    }
+
+    override visit(node: SwitchStmtNode*) -> void {
+        this.resolve_expr(node.expression);
+        for (mut i: i64 = 0; i < node.cases.length; i++) {
+            const cs: CaseStmtNode* = node.cases[i];
+            if (cs == null) { continue; }
+            if (cs.value != null) { this.resolve_expr(cs.value); }
+            if (cs.body != null)  { this.visit(cs.body); }
+        }
+    }
+
+
+    // ================================================================
+    // Expression Resolution (returns TypeRef)
+    // ================================================================
+
+    /// Resolve the type of an expression bottom-up.
+    /// Sets resolved_type on the node and returns the TypeRef.
+    resolve_expr(mut &this, expr: ExpressionNode*) -> TypeRef {
+        if (expr == null) { return TypeRef::invalid(); }
+        if (expr.has_resolved_type()) { return expr.resolved_type; }
+
+        const n: ASTNode* = expr as ASTNode*;
+        const result: TypeRef = match (n.kind) {
+            NodeKind::Literal           => { this.resolve_literal(expr as LiteralNode*) }
+            NodeKind::Identifier        => { this.resolve_identifier(expr as IdentifierNode*) }
+            NodeKind::BinaryExpression  => { this.resolve_binary(expr as BinaryExprNode*) }
+            NodeKind::UnaryExpression   => { this.resolve_unary(expr as UnaryExprNode*) }
+            NodeKind::CallExpression    => { this.resolve_call(expr as CallExprNode*) }
+            NodeKind::MemberAccess      => { this.resolve_member_access(expr as MemberAccessNode*) }
+            NodeKind::ArrayAccess       => { this.resolve_array_access(expr as ArrayAccessNode*) }
+            NodeKind::CastExpression    => { this.resolve_cast(expr as CastExprNode*) }
+            NodeKind::IfExpression      => { this.resolve_if_expr(expr as IfExprNode*) }
+            NodeKind::TernaryExpression => { this.resolve_ternary(expr as TernaryExprNode*) }
+            NodeKind::MatchExpression   => { this.resolve_match_expr(expr as MatchExprNode*) }
+            NodeKind::StructLiteral     => { this.resolve_struct_literal(expr as StructLiteralNode*) }
+            NodeKind::ScopeResolution   => { this.resolve_scope_resolution(expr as ScopeResolutionNode*) }
+            NodeKind::NewExpression     => { this.resolve_new_expr(expr as NewExprNode*) }
+            NodeKind::ArrayLiteral      => { this.resolve_array_literal(expr as ArrayLiteralNode*) }
+            NodeKind::TupleLiteral      => { this.resolve_tuple_literal(expr as TupleLiteralNode*) }
+            NodeKind::SizeofExpression  => { this.arena.get_i64() }
+            NodeKind::AlignofExpression => { this.arena.get_i64() }
+            NodeKind::TypeofExpression  => {
+                const te: TypeofExprNode* = expr as TypeofExprNode*;
+                this.resolve_expr(te.operand);
+                this.arena.get_string()
+            }
+            NodeKind::DeleteExpression  => {
+                const de: DeleteExprNode* = expr as DeleteExprNode*;
+                this.resolve_expr(de.operand);
+                this.arena.get_void()
+            }
+            _ => { TypeRef::invalid() }
+        };
+
+        if (result.is_valid()) {
+            expr.set_resolved_type(result);
+        }
+        return result;
+    }
+
+
+    // ================================================================
+    // Individual Expression Resolvers
+    // ================================================================
+
+    resolve_literal(&this, lit: LiteralNode*) -> TypeRef {
+        return match (lit.literal_kind) {
+            LiteralKind::Integer => { this.arena.get_i32() }
+            LiteralKind::Float   => { this.arena.get_f64() }
+            LiteralKind::String  => { this.arena.get_string() }
+            LiteralKind::Char    => { this.arena.get_char() }
+            LiteralKind::Boolean => { this.arena.get_bool() }
+            LiteralKind::Null    => { this.arena.get_void() }
+        };
+    }
+
+    resolve_identifier(&this, ident: IdentifierNode*) -> TypeRef {
+        if (ident.name.equals(this.this_sym) && this.this_type.is_valid()) {
+            return this.this_type;
+        }
+        const local: TypeRef = this.lookup_local(ident.name);
+        if (local.is_valid()) { return local; }
+        return this.lookup_global_var(ident.name);
+    }
+
+    resolve_binary(mut &this, bin: BinaryExprNode*) -> TypeRef {
+        const lhs: TypeRef = this.resolve_expr(bin.left);
+        const rhs: TypeRef = this.resolve_expr(bin.right);
+
+        if (bin.op.kind.is_assignment_op()) { return lhs; }
+
+        if (lhs.is_valid() && rhs.is_valid()) {
+            const result: TypeCheckResult = this.checker.check_binary_op(
+                bin.op.lexeme, lhs, rhs);
+            if (result.success) { return result.result_type; }
+        }
+
+        if (lhs.is_valid()) { return lhs; }
+        if (rhs.is_valid()) { return rhs; }
+        return TypeRef::invalid();
+    }
+
+    resolve_unary(mut &this, unary: UnaryExprNode*) -> TypeRef {
+        const operand_type: TypeRef = this.resolve_expr(unary.operand);
+        if (!operand_type.is_valid()) { return TypeRef::invalid(); }
+
+        const result: TypeCheckResult = this.checker.check_unary_op(
+            unary.op.lexeme, operand_type);
+        if (result.success) { return result.result_type; }
+        return operand_type;
+    }
+
+    resolve_call(mut &this, call: CallExprNode*) -> TypeRef {
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            this.resolve_expr(call.arguments[i]);
+        }
+
+        const callee: ExpressionNode* = call.callee;
+        const callee_node: ASTNode* = callee as ASTNode*;
+
+        if (callee_node.kind == NodeKind::Identifier) {
+            return this.resolve_direct_call(callee as IdentifierNode*);
+        }
+        if (callee_node.kind == NodeKind::MemberAccess) {
+            return this.resolve_method_call(callee as MemberAccessNode*);
+        }
+        if (callee_node.kind == NodeKind::ScopeResolution) {
+            return this.resolve_scope_call(callee as ScopeResolutionNode*);
+        }
+
+        return this.resolve_expr(callee);
+    }
+
+    resolve_direct_call(mut &this, ident: IdentifierNode*) -> TypeRef {
+        const func_ret: TypeRef = this.lookup_func_return(ident.name);
+        if (func_ret.is_valid()) { return func_ret; }
+
+        // Constructor call (e.g., Dog("Buddy"))
+        const type_ref: TypeRef = this.lookup_type_by_sym(ident.name);
+        if (type_ref.is_valid()) { return type_ref; }
+
+        // TODO: Replace with proper builtin/extern resolution
+        const name: string = this.intern.resolve(ident.name);
+        if (name == "printf" || name == "exit") { return this.arena.get_i32(); }
+        if (name == "sprintf") { return this.arena.get_string(); }
+
+        return TypeRef::invalid();
+    }
+
+    resolve_method_call(mut &this, member: MemberAccessNode*) -> TypeRef {
+        const obj_type: TypeRef = this.resolve_expr(member.object);
+        if (!obj_type.is_valid()) { return TypeRef::invalid(); }
+
+        const type_sym: SymbolStr = this.lookup_type_sym(obj_type);
+        if (!type_sym.is_valid()) { return TypeRef::invalid(); }
+
+        const ret: TypeRef = this.lookup_method_return(type_sym, member.member);
+        if (ret.is_valid()) { member.set_resolved_type(ret); }
+        return ret;
+    }
+
+    resolve_scope_call(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
+        // Static method
+        const method_ret: TypeRef = this.lookup_method_return(
+            scope.scope_name, scope.member_name);
+        if (method_ret.is_valid()) {
+            scope.set_resolved_type(method_ret);
+            return method_ret;
+        }
+
+        // Enum variant constructor (e.g., Optional::Some(value))
+        const type_ref: TypeRef = this.lookup_type_by_sym(scope.scope_name);
+        if (type_ref.is_valid()) {
+            scope.set_resolved_type(type_ref);
+            return type_ref;
+        }
+
+        return TypeRef::invalid();
+    }
+
+    resolve_member_access(mut &this, member: MemberAccessNode*) -> TypeRef {
+        const obj_type: TypeRef = this.resolve_expr(member.object);
+        if (!obj_type.is_valid()) { return TypeRef::invalid(); }
+
+        // Struct/class field access via TypeChecker
+        const result: TypeCheckResult = this.checker.check_field_access(
+            obj_type, member.member);
+        if (result.success) { return result.result_type; }
+
+        // Fall back to method lookup
+        const type_sym: SymbolStr = this.lookup_type_sym(obj_type);
+        if (type_sym.is_valid()) {
+            return this.lookup_method_return(type_sym, member.member);
+        }
+
+        return TypeRef::invalid();
+    }
+
+    resolve_array_access(mut &this, access: ArrayAccessNode*) -> TypeRef {
+        const array_type: TypeRef = this.resolve_expr(access.array);
+        const index_type: TypeRef = this.resolve_expr(access.index);
+        if (!array_type.is_valid()) { return TypeRef::invalid(); }
+
+        const result: TypeCheckResult = this.checker.check_index_access(
+            array_type, index_type);
+        if (result.success) { return result.result_type; }
+        return TypeRef::invalid();
+    }
+
+    resolve_cast(mut &this, cast: CastExprNode*) -> TypeRef {
+        this.resolve_expr(cast.expression);
+        return cast.resolved_target;
+    }
+
+    resolve_if_expr(mut &this, if_expr: IfExprNode*) -> TypeRef {
+        this.resolve_expr(if_expr.condition);
+        const then_type: TypeRef = this.resolve_expr(if_expr.then_expr);
+        const else_type: TypeRef = this.resolve_expr(if_expr.else_expr);
+        if (then_type.is_valid()) { return then_type; }
+        if (else_type.is_valid()) { return else_type; }
+        return TypeRef::invalid();
+    }
+
+    resolve_ternary(mut &this, ternary: TernaryExprNode*) -> TypeRef {
+        this.resolve_expr(ternary.condition);
+        const true_type: TypeRef = this.resolve_expr(ternary.true_expr);
+        const false_type: TypeRef = this.resolve_expr(ternary.false_expr);
+        if (true_type.is_valid()) { return true_type; }
+        if (false_type.is_valid()) { return false_type; }
+        return TypeRef::invalid();
+    }
+
+    resolve_match_expr(mut &this, match_expr: MatchExprNode*) -> TypeRef {
+        this.resolve_expr(match_expr.subject);
+
+        mut result_type: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
+            const arm: MatchArmNode* = match_expr.arms[i];
+            if (arm == null || arm.body == null) { continue; }
+
+            const body_node: ASTNode* = arm.body as ASTNode*;
+            if (body_node.kind == NodeKind::BlockStatement) {
+                const block: BlockStmtNode* = arm.body as BlockStmtNode*;
+                for (mut j: i64 = 0; j < block.statements.length; j++) {
+                    this.dispatch_stmt(block.statements[j]);
+                }
+                // Infer arm type from the last expression statement
+                if (!result_type.is_valid() && block.statements.length > 0) {
+                    const last: StatementNode* =
+                        block.statements[block.statements.length - 1];
+                    const last_node: ASTNode* = last as ASTNode*;
+                    if (last_node.kind == NodeKind::ExpressionStatement) {
+                        const es: ExprStmtNode* = last as ExprStmtNode*;
+                        if (es.expression != null &&
+                            es.expression.has_resolved_type()) {
+                            result_type = es.expression.resolved_type;
+                        }
+                    }
+                }
+            } else {
+                this.dispatch_stmt(arm.body);
+            }
+        }
+
+        return result_type;
+    }
+
+    resolve_struct_literal(mut &this, lit: StructLiteralNode*) -> TypeRef {
+        for (mut i: i64 = 0; i < lit.field_inits.length; i++) {
+            this.resolve_expr(lit.field_inits[i].value);
+        }
+        return this.lookup_type_by_sym(lit.struct_type);
+    }
+
+    resolve_scope_resolution(&this, scope: ScopeResolutionNode*) -> TypeRef {
+        return this.lookup_type_by_sym(scope.scope_name);
+    }
+
+    resolve_new_expr(mut &this, new_expr: NewExprNode*) -> TypeRef {
+        for (mut i: i64 = 0; i < new_expr.arguments.length; i++) {
+            this.resolve_expr(new_expr.arguments[i]);
+        }
+        const base: TypeRef = this.lookup_type_by_sym(new_expr.type_name);
+        if (base.is_valid()) {
+            return this.arena.get_pointer_to(base);
+        }
+        return TypeRef::invalid();
+    }
+
+    resolve_array_literal(mut &this, arr: ArrayLiteralNode*) -> TypeRef {
+        mut elem_type: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i < arr.elements.length; i++) {
+            const t: TypeRef = this.resolve_expr(arr.elements[i]);
+            if (!elem_type.is_valid() && t.is_valid()) {
+                elem_type = t;
+            }
+        }
+        if (arr.repeat_count_expr != null) {
+            this.resolve_expr(arr.repeat_count_expr);
+        }
+        if (elem_type.is_valid()) {
+            return this.arena.get_array_of(elem_type, arr.elements.length);
+        }
+        return TypeRef::invalid();
+    }
+
+    resolve_tuple_literal(mut &this, tup: TupleLiteralNode*) -> TypeRef {
+        mut elem_types: TypeRef[] = [];
+        for (mut i: i64 = 0; i < tup.elements.length; i++) {
+            elem_types.push(this.resolve_expr(tup.elements[i]));
+        }
+        return this.arena.get_tuple(elem_types);
+    }
+}
+
+
+// ============================================================================
+// Helper: Pack two SymbolStr IDs into a u64 for method lookup keys
+// ============================================================================
+
+/// Combines a type's SymbolStr.id and a method's SymbolStr.id into a single
+/// u64 key for the method_returns HashMap.  Uses the upper 32 bits for the
+/// type and lower 32 bits for the method name.
+function pack_method_key(type_sym: SymbolStr, method_sym: SymbolStr) -> u64 {
+    return (type_sym.id as u64) * 4294967296 + (method_sym.id as u64);
+}
+
+
+// ============================================================================
+// SemanticPasses — Static dispatch for pass registry
+// ============================================================================
+
+type struct SemanticPasses {
+
+    /// Walk all function bodies and fill resolved_type on every ExpressionNode.
+    ///
+    /// By the time this pass completes, every expression in every non-generic
+    /// function body will have a concrete TypeRef.  Generic function bodies are
+    /// skipped — they are type-checked after monomorphization creates concrete
+    /// specializations.
+    static run_function_body_type_check(ctx: CompilationContext*) -> PassResult {
+        const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+        if (ctx.debug_mode) {
+            printf("[FunctionBodyTypeCheck] Type-checking function bodies\n");
+        }
+
+        const arena: TypeArena* = ctx.type_arena;
+        if (arena == null) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                "FunctionBodyTypeCheck: type system not initialized");
+            return PassResult::failure(1);
+        }
+
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+        if (root == null) {
+            return PassResult::ok();
+        }
+
+        // Build the visitor and drive it through the AST
+        mut visitor: TypeCheckVisitor = TypeCheckVisitor::build(ctx);
+        visitor.visit(root);
+
+        if (ctx.debug_mode) {
+            printf("[FunctionBodyTypeCheck] Type-checked %lld function bodies\n",
+                visitor.body_count);
+        }
+
+        return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+}

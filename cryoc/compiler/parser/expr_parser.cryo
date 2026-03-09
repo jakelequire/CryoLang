@@ -817,12 +817,19 @@ public:
         return new YieldExprNode(operand, this.span_from(start));
     }
 
+    /// Parse a parenthesized condition: '(' expression ')'.
+    /// Shared by if, match, while, switch, and do-while parsing.
+    parse_paren_condition() -> ExpressionNode* {
+        this.consume(TokenType::LParen, "'('");
+        const expr: ExpressionNode* = this.parse_expression();
+        this.consume(TokenType::RParen, "')'");
+        return expr;
+    }
+
     /// Parse if expression: if (cond) { then } else { else }
     parse_if_expression() -> ExpressionNode* {
         const start: Token = this.advance(); // consume 'if'
-        this.consume(TokenType::LParen, "'('");
-        const condition: ExpressionNode* = this.parse_expression();
-        this.consume(TokenType::RParen, "')'");
+        const condition: ExpressionNode* = this.parse_paren_condition();
 
         // Then branch — expect a block with a single expression
         this.consume(TokenType::LBrace, "'{'");
@@ -844,15 +851,13 @@ public:
     /// Parse match expression: match (subject) { arms }
     parse_match_expression() -> ExpressionNode* {
         const start: Token = this.advance(); // consume 'match'
-        this.consume(TokenType::LParen, "'('");
-        const subject: ExpressionNode* = this.parse_expression();
-        this.consume(TokenType::RParen, "')'");
+        const subject: ExpressionNode* = this.parse_paren_condition();
         this.consume(TokenType::LBrace, "'{'");
 
         mut match_expr: MatchExprNode* = new MatchExprNode(subject, this.span_from_token(start));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            const arm: MatchArmNode* = this.parse_match_arm_internal();
+            const arm: MatchArmNode* = this.parse_expr_match_arm();
             if (arm != null) {
                 match_expr.add_arm(arm);
             }
@@ -888,8 +893,11 @@ public:
         return arm;
     }
 
-    /// Parse a single match arm for expression context: pattern => { body }
-    parse_match_arm_internal() -> MatchArmNode* {
+    /// Parse a single match arm for expression context: pattern => expr.
+    /// Uses shared parse_match_arm_patterns() for pattern + '=>', then
+    /// handles the body as a single expression (possibly braced).
+    /// See also: Parser::parse_match_arm() for statement context.
+    parse_expr_match_arm() -> MatchArmNode* {
         const start: Token = this.current();
         mut arm: MatchArmNode* = this.parse_match_arm_patterns();
 
