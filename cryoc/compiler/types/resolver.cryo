@@ -73,21 +73,15 @@ type struct TypeResolver {
     module_registry:  ModuleTypeRegistry*;
     name_resolver:    Resolver*;
 
-    static new(arena: TypeArena*, intern_table: InternTable*) -> TypeResolver {
-        return TypeResolver {
-            arena:            arena,
-            intern_table:     intern_table,
-            generic_registry: null,
-            module_registry:  null,
-            name_resolver:    null,
-        };
-    }
-
-    /// Construct with full dependencies (preferred).
-    static with_registries(arena: TypeArena*, intern_table: InternTable*,
-                           generic_registry: GenericRegistry*,
-                           module_registry: ModuleTypeRegistry*,
-                           name_resolver: Resolver*) -> TypeResolver {
+    /// Construct with all required dependencies.
+    ///
+    /// All registries are mandatory — callers must supply them. This
+    /// prevents silent fallback paths where instantiations bypass the
+    /// GenericRegistry and become invisible to the Monomorphizer.
+    static new(arena: TypeArena*, intern_table: InternTable*,
+               generic_registry: GenericRegistry*,
+               module_registry: ModuleTypeRegistry*,
+               name_resolver: Resolver*) -> TypeResolver {
         return TypeResolver {
             arena:            arena,
             intern_table:     intern_table,
@@ -259,23 +253,55 @@ private:
     }
 
     /// Resolve a generic type instantiation annotation.
-    /// Routes through GenericRegistry for deduplication when available,
-    /// ensuring the Monomorphizer can discover all instantiations via
+    /// Routes through GenericRegistry for deduplication, ensuring the
+    /// Monomorphizer can discover all instantiations via
     /// collect_unmonomorphized().
+    ///
+    /// Requires GenericRegistry — no silent fallback. If the registry is
+    /// missing, the compiler has a pipeline ordering bug and must abort.
     resolve_generic(&this, g: GenericAnnotation*, ctx: ResolutionContext*) -> TypeRef {
         mut base: TypeRef = this.resolve(g.base, ctx);
 
+        // Bail early if the base type itself couldn't be resolved.
+        if (!base.is_valid()) {
+            LOG_DEBUG(LogComponent::TypeChecker,
+                "[TypeResolver] resolve_generic() base type is invalid — cannot instantiate");
+            return TypeRef::invalid();
+        }
+
         mut args: TypeRef[] = [];
         for (mut i: i64 = 0; i < g.args.length; i++) {
-            args.push(this.resolve(g.args[i], ctx));
+            mut arg: TypeRef = this.resolve(g.args[i], ctx);
+            if (!arg.is_valid()) {
+                LOG_DEBUG(LogComponent::TypeChecker,
+                    "[TypeResolver] resolve_generic() arg %d is invalid", i);
+                return TypeRef::invalid();
+            }
+            args.push(arg);
         }
 
-        // Use GenericRegistry for dedup so the Monomorphizer sees all instantiations
-        if (this.generic_registry != null) {
-            return this.generic_registry.instantiate(base, args);
+        // GenericRegistry is required — every instantiation must be tracked
+        // so the Monomorphizer can discover and specialize it.
+        if (this.generic_registry == null) {
+            LOG_DEBUG(LogComponent::TypeChecker,
+                "[TypeResolver] ICE: resolve_generic() called without GenericRegistry — "
+                "pipeline ordering bug, TemplateRegistration must run before TypeResolution");
+            return TypeRef::invalid();
         }
 
-        // Fallback: create directly in arena (no dedup, no mono tracking)
-        return this.arena.create_instantiation(base, args);
+        // Validate arg count matches the template's parameter count.
+        // Catches mistakes like Array<i32, string> when Array only takes <T>.
+        const entry: TemplateEntry* = this.generic_registry.get_template_by_type_id(base.id);
+        if (entry != null) {
+            if (args.length != entry.param_count) {
+                LOG_DEBUG(LogComponent::TypeChecker,
+                    "[TypeResolver] resolve_generic() arg count mismatch: "
+                    "expected %d, got %d",
+                    entry.param_count, args.length);
+                return TypeRef::invalid();
+            }
+        }
+
+        return this.generic_registry.instantiate(base, args);
     }
 }
