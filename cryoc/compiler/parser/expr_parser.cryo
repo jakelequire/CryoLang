@@ -201,7 +201,15 @@ public:
                 // Scope resolution
                 this.advance();
 
-                const member_tok: Token      = this.consume(TokenType::Identifier, "member name after '::'");
+                // Accept identifiers and keywords that are valid as member names
+                // (e.g. `new`, `default`) after '::'.
+                const member_tok: Token = if (this.check(TokenType::Identifier) ||
+                                              this.check(TokenType::KwNew) ||
+                                              this.check(TokenType::KwDefault)) {
+                    this.advance()
+                } else {
+                    this.consume(TokenType::Identifier, "member name after '::'")
+                };
                 const scope_name: SymbolStr  = this.get_expr_name(expr);
                 const member_name: SymbolStr = this.intern_lexeme(member_tok);
                 const span: SourceSpan       = ParserBase::merge_spans(expr.span, this.span_from_token(member_tok));
@@ -362,12 +370,24 @@ public:
     parse_number_literal() -> ExpressionNode* {
         const tok: Token = this.advance();
         // Determine if float or integer by checking for '.' or 'e'/'E'
+        // Special base literals (0x, 0b, 0o) are always integers.
         mut kind: LiteralKind = LiteralKind::Integer;
-        for (mut i: int = 0; i < tok.lexeme.length(); i++) {
-            const c: char = tok.lexeme[i];
-            if (c == '.' || c == 'e' || c == 'E') {
-                kind = LiteralKind::Float;
-                break;
+        mut is_special_base: boolean = false;
+        if (tok.lexeme.length() >= 2) {
+            if (tok.lexeme[0] == '0') {
+                const p: char = tok.lexeme[1];
+                if (p == 'x' || p == 'X' || p == 'b' || p == 'B' || p == 'o' || p == 'O') {
+                    is_special_base = true;
+                }
+            }
+        }
+        if (!is_special_base) {
+            for (mut i: int = 0; i < tok.lexeme.length(); i++) {
+                const c: char = tok.lexeme[i];
+                if (c == '.' || c == 'e' || c == 'E') {
+                    kind = LiteralKind::Float;
+                    break;
+                }
             }
         }
         return new LiteralNode(tok.lexeme, kind, this.span_from_token(tok));
@@ -460,6 +480,11 @@ public:
         if (tok1.kind == TokenType::Identifier && tok2.kind == TokenType::Colon) {
             return true;
         }
+        // Shorthand field init: { ident , ... } or { ident }
+        if (tok1.kind == TokenType::Identifier &&
+            (tok2.kind == TokenType::Comma || tok2.kind == TokenType::RBrace)) {
+            return true;
+        }
         // Empty struct literal: {}
         if (tok1.kind == TokenType::RBrace) {
             return true;
@@ -479,8 +504,16 @@ public:
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const field_tok: Token = this.consume(TokenType::Identifier, "field name");
             const field_name: SymbolStr = this.intern_lexeme(field_tok);
-            this.consume(TokenType::Colon, "':'");
-            const value: ExpressionNode* = this.parse_expression();
+
+            // Shorthand field init: { field } is sugar for { field: field }
+            mut value: ExpressionNode* = null;
+            if (this.check(TokenType::Colon)) {
+                this.advance(); // consume ':'
+                value = this.parse_expression();
+            } else {
+                // Shorthand: create an identifier expression referencing the same name
+                value = new IdentifierNode(field_name, this.span_from_token(field_tok));
+            }
 
             const field_span: SourceSpan = this.span_from(field_tok);
             const init: FieldInit = FieldInit {

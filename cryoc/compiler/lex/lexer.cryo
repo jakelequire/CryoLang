@@ -78,6 +78,31 @@ private:
             return this.make_token(TokenType::EOF, "");
         }
 
+        // --- Comments must be detected BEFORE advance() ---
+        // Check for // and /* patterns using peek/peek_ahead to avoid
+        // relying on post-advance pointer arithmetic (this.current - 1).
+        if (this.peek() == '/') {
+            const next_ch: char = this.peek_ahead(1);
+
+            if (next_ch == '/') {
+                // Line comment (//) or doc comment (///)
+                this.advance(); // consume first '/'
+                if (this.peek_ahead(1) == '/') {
+                    return this.lex_doc_comment();
+                }
+                return this.lex_comment();
+            }
+
+            if (next_ch == '*') {
+                // Block comment (/* */) or doc comment (/** */)
+                this.advance(); // consume first '/'
+                if (this.peek_ahead(1) == '*') {
+                    return this.lex_doc_comment();
+                }
+                return this.lex_comment();
+            }
+        }
+
         const token_start: string = this.current;
         const c: char = this.advance();
 
@@ -88,7 +113,7 @@ private:
 
         // --- Number ---
         if (Lexer::is_digit(c)) {
-            return this.lex_number();
+            return this.lex_number(c);
         }
 
         // --- String literal ---
@@ -99,22 +124,6 @@ private:
         // --- Character literal ---
         if (c == '\'') {
             return this.lex_character();
-        }
-
-        // --- Line comments and doc comments (// and ///) ---
-        if (c == '/' && this.peek() == '/') {
-            if (this.peek_ahead(1) == '/') {
-                return this.lex_doc_comment();
-            }
-            return this.lex_comment();
-        }
-
-        // --- Block comments and doc comments (/* and /**) ---
-        if (c == '/' && this.peek() == '*') {
-            if (this.peek_ahead(1) == '*') {
-                return this.lex_doc_comment();
-            }
-            return this.lex_comment();
         }
 
         // --- Punctuators ---
@@ -134,8 +143,12 @@ private:
         // Back up one character: lex_token() already consumed the first char via advance()
         const start: string = ptr_add(this.current as void*, -1) as string;
 
-        while (!this.at_end() && Lexer::is_alnum(this.peek())) {
-            this.advance();
+        while (!this.at_end()) {
+            if (Lexer::is_alnum(this.peek())) {
+                this.advance();
+            } else {
+                break;
+            }
         }
 
         const len: u64 = (this.current as i64 - start as i64) as u64;
@@ -146,22 +159,31 @@ private:
         return this.make_token(kind, text);
     }
 
-    lex_number(&this) -> Token {
+    lex_number(&this, first_char: char) -> Token {
         // Back up one character: lex_token() already consumed the first digit via advance()
         const start: string = ptr_add(this.current as void*, -1) as string;
 
         mut is_special_base: boolean = false;
 
         // --- Special base prefixes (0x, 0b, 0o) ---
-        if (*(this.current - 1) == '0' && !this.at_end()) {
+        // Use `first_char` (passed from lex_token) instead of dereferencing
+        // `*start`, as pointer dereference may not codegen correctly.
+        // Nested ifs instead of `&&` to avoid codegen issues with
+        // short-circuit evaluation in the C++ compiler.
+        if (first_char == '0') {
+        if (!this.at_end()) {
             const prefix: char = this.peek();
 
             if (prefix == 'x' || prefix == 'X') {
                 this.advance(); // consume 'x'/'X'
                 const hex_start: string = this.current;
 
-                while (!this.at_end() && (Lexer::is_hex_digit(this.peek()) || this.peek() == '_')) {
-                    this.advance();
+                while (!this.at_end()) {
+                    if (Lexer::is_hex_digit(this.peek()) || this.peek() == '_') {
+                        this.advance();
+                    } else {
+                        break;
+                    }
                 }
 
                 if (this.current == hex_start) {
@@ -175,8 +197,12 @@ private:
                 this.advance(); // consume 'b'/'B'
                 const bin_start: string = this.current;
 
-                while (!this.at_end() && (this.peek() == '0' || this.peek() == '1' || this.peek() == '_')) {
-                    this.advance();
+                while (!this.at_end()) {
+                    if (this.peek() == '0' || this.peek() == '1' || this.peek() == '_') {
+                        this.advance();
+                    } else {
+                        break;
+                    }
                 }
 
                 if (this.current == bin_start) {
@@ -190,8 +216,13 @@ private:
                 this.advance(); // consume 'o'/'O'
                 const oct_start: string = this.current;
 
-                while (!this.at_end() && ((this.peek() >= '0' && this.peek() <= '7') || this.peek() == '_')) {
-                    this.advance();
+                while (!this.at_end()) {
+                    const ch: char = this.peek();
+                    if ((ch >= '0' && ch <= '7') || ch == '_') {
+                        this.advance();
+                    } else {
+                        break;
+                    }
                 }
 
                 if (this.current == oct_start) {
@@ -202,42 +233,68 @@ private:
                 is_special_base = true;
             }
         }
+        }
 
         // --- Decimal digits (skipped for special bases) ---
+        // Note: avoid `&&` in while conditions due to codegen issues;
+        // use nested if + break instead.
         if (!is_special_base) {
-            while (!this.at_end() && (Lexer::is_digit(this.peek()) || this.peek() == '_')) {
-                this.advance();
+            while (!this.at_end()) {
+                if (Lexer::is_digit(this.peek()) || this.peek() == '_') {
+                    this.advance();
+                } else {
+                    break;
+                }
             }
 
             // --- Decimal point ---
-            if (!this.at_end() && this.peek() == '.') {
+            if (!this.at_end()) {
+            if (this.peek() == '.') {
                 const next: char = this.peek_ahead(1);
                 if (Lexer::is_digit(next)) {
                     this.advance(); // consume '.'
-                    while (!this.at_end() && (Lexer::is_digit(this.peek()) || this.peek() == '_')) {
-                        this.advance();
+                    while (!this.at_end()) {
+                        if (Lexer::is_digit(this.peek()) || this.peek() == '_') {
+                            this.advance();
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
+            }
 
             // --- Exponent ---
-            if (!this.at_end() && (this.peek() == 'e' || this.peek() == 'E')) {
+            if (!this.at_end()) {
+            if (this.peek() == 'e' || this.peek() == 'E') {
                 this.advance();
-                if (!this.at_end() && (this.peek() == '+' || this.peek() == '-')) {
-                    this.advance();
+                if (!this.at_end()) {
+                    if (this.peek() == '+' || this.peek() == '-') {
+                        this.advance();
+                    }
                 }
-                while (!this.at_end() && (Lexer::is_digit(this.peek()) || this.peek() == '_')) {
-                    this.advance();
+                while (!this.at_end()) {
+                    if (Lexer::is_digit(this.peek()) || this.peek() == '_') {
+                        this.advance();
+                    } else {
+                        break;
+                    }
                 }
+            }
             }
         }
 
         // --- Type suffixes (u8, i32, f64, etc.) ---
-        if (!this.at_end() && Lexer::is_alpha(this.peek())) {
+        if (!this.at_end()) {
+        if (Lexer::is_alpha(this.peek())) {
             const suffix_start: string = this.current;
 
-            while (!this.at_end() && Lexer::is_alnum(this.peek())) {
-                this.advance();
+            while (!this.at_end()) {
+                if (Lexer::is_alnum(this.peek())) {
+                    this.advance();
+                } else {
+                    break;
+                }
             }
 
             const suffix_len: u64 = (this.current as i64 - suffix_start as i64) as u64;
@@ -253,6 +310,7 @@ private:
                 // Not a valid suffix, backtrack
                 this.current = suffix_start;
             }
+        }
         }
 
         // --- Build token ---
@@ -373,17 +431,20 @@ private:
     }
 
     lex_comment(&this) -> Token {
-        const start: string = this.current - 1;
+        // `this.current` points to the second character of the comment opener
+        // (the second '/' for //, or '*' for /*).  Back up one for the token start.
+        const start: string = ptr_add(this.current as void*, -1) as string;
+        const opener: char = *this.current;
 
         // --- Line comment (//) ---
-        if (*(this.current - 1) == '/' && *this.current == '/') {
+        if (opener == '/') {
             this.advance(); // consume second '/'
             while (!this.at_end() && this.peek() != '\n') {
                 this.advance();
             }
 
         // --- Block comment (/* ... */) ---
-        } else if (*(this.current - 1) == '/' && *this.current == '*') {
+        } else if (opener == '*') {
             this.advance(); // consume '*'
 
             while (!this.at_end() && this.peek_ahead(1) != '\0') {
@@ -407,7 +468,9 @@ private:
     }
 
     lex_doc_comment(&this) -> Token {
-        const start: string = this.current - 1;
+        // `this.current` points to the second character of the opener.
+        // Back up one for the token start.
+        const start: string = ptr_add(this.current as void*, -1) as string;
         mut doc_kind: TokenType = TokenType::Unknown;
 
         // --- Line doc comment (///) ---
@@ -473,12 +536,18 @@ private:
             ']'  => { return TokenType::RSquare;    }
             ';'  => { return TokenType::Semicolon;  }
             ','  => { return TokenType::Comma;      }
-            '%'  => { return TokenType::Percent;    }
+            '%' => {
+                if (this.peek() == '=') { this.advance(); return TokenType::PercentEqual; }
+                return TokenType::Percent;
+            }
             '^'  => { return TokenType::Caret;      }
             '~'  => { return TokenType::Tilde;      }
             '!'  => { return TokenType::Exclaim;    }
             '@'  => { return TokenType::At;         }
-            '#'  => { return TokenType::Hash;       }
+            '#' => {
+                if (this.peek() == '#') { this.advance(); return TokenType::HashHash; }
+                return TokenType::Hash;
+            }
             '$'  => { return TokenType::Dollar;     }
             '\\' => { return TokenType::Backslash;  }
 
@@ -573,11 +642,6 @@ private:
             ':' => {
                 if (this.peek() == ':') { this.advance(); return TokenType::ColonColon; }
                 return TokenType::Colon;
-            }
-
-            '#' => {
-                if (this.peek() == '#') { this.advance(); return TokenType::HashHash; }
-                return TokenType::Hash;
             }
 
             _ => { return TokenType::Unknown; }
