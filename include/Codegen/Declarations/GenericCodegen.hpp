@@ -316,6 +316,12 @@ namespace Cryo::Codegen
          */
         Cryo::ASTNode *get_generic_function_def(const std::string &name);
 
+        /**
+         * @brief Resolve a type annotation using current type param bindings.
+         * Public so DeclarationCodegen can use it for variable type resolution.
+         */
+        TypeRef resolve_field_type_from_annotation(const TypeAnnotation *annotation);
+
     private:
         DeclarationCodegen *_declarations = nullptr;
         TypeCodegen *_type_codegen = nullptr;
@@ -397,18 +403,7 @@ namespace Cryo::Codegen
          */
         void ensure_dependent_types_instantiated(TypeRef type);
 
-        /**
-         * @brief Resolve a field's TypeAnnotation to a TypeRef using current type param bindings
-         *
-         * Similar to DeclarationCodegen::resolve_type_annotation but checks type parameter
-         * bindings first (via resolve_type_param) for Named/Primitive kinds. Used as fallback
-         * when field->get_resolved_type() returns empty (common for generic template bodies
-         * that skip type resolution).
-         *
-         * @param annotation The field's type annotation from parsing
-         * @return Resolved TypeRef, or empty if resolution fails
-         */
-        TypeRef resolve_field_type_from_annotation(const TypeAnnotation *annotation);
+        // resolve_field_type_from_annotation is declared public above
 
         /**
          * @brief Resolve a method parameter's type using substitution with annotation fallback

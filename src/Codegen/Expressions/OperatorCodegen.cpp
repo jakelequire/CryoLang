@@ -4011,6 +4011,21 @@ namespace Cryo::Codegen
             llvm::Type *element_type = nullptr;
             TypeRef array_type = array_access->array()->get_resolved_type();
 
+            // In generic contexts, sema may resolve "HashMapEntry<K,V>*" to bare
+            // StructType("HashMapEntry") — a struct type can't be array-indexed.
+            // Clear it so the TemplateRegistry fallback path below can find the
+            // correct pointer type from the instantiated struct's field info.
+            if (array_type.is_valid() &&
+                (array_type->kind() == Cryo::TypeKind::Struct ||
+                 array_type->kind() == Cryo::TypeKind::Class))
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "get_lvalue_address: Clearing bare struct type '{}' for array indexing — "
+                          "will use TemplateRegistry fallback",
+                          array_type->display_name());
+                array_type = TypeRef{};
+            }
+
             // If no resolved type, check variable_types_map (like in ExpressionCodegen)
             if (!array_type)
             {
@@ -4040,24 +4055,31 @@ namespace Cryo::Codegen
                     std::string base_type_name;
                     if (auto *base_ident = dynamic_cast<Cryo::IdentifierNode *>(member_access->object()))
                     {
-                        auto &var_types = ctx().variable_types_map();
-                        auto it = var_types.find(base_ident->name());
-                        if (it != var_types.end() && it->second.is_valid())
-                        {
-                            TypeRef base_type = it->second;
-                            base_type_name = base_type->display_name();
-                            if (base_type->kind() == Cryo::TypeKind::Pointer)
-                            {
-                                auto *ptr = dynamic_cast<const Cryo::PointerType *>(base_type.get());
-                                if (ptr && ptr->pointee())
-                                    base_type_name = ptr->pointee()->display_name();
-                            }
-                            else if (!base_type_name.empty() && base_type_name.back() == '*')
-                                base_type_name.pop_back();
-                        }
-                        else if (base_ident->name() == "this")
+                        // For "this", prefer current_type_name() which returns the mangled name
+                        // (e.g., "HashMapIter_u32_TypeRef") matching TemplateRegistry keys.
+                        // variable_types_map display_name() returns "HashMapIter<u32, TypeRef>"
+                        // which won't match.
+                        if (base_ident->name() == "this")
                         {
                             base_type_name = ctx().current_type_name();
+                        }
+                        else
+                        {
+                            auto &var_types = ctx().variable_types_map();
+                            auto it = var_types.find(base_ident->name());
+                            if (it != var_types.end() && it->second.is_valid())
+                            {
+                                TypeRef base_type = it->second;
+                                base_type_name = base_type->display_name();
+                                if (base_type->kind() == Cryo::TypeKind::Pointer)
+                                {
+                                    auto *ptr = dynamic_cast<const Cryo::PointerType *>(base_type.get());
+                                    if (ptr && ptr->pointee())
+                                        base_type_name = ptr->pointee()->display_name();
+                                }
+                                else if (!base_type_name.empty() && base_type_name.back() == '*')
+                                    base_type_name.pop_back();
+                            }
                         }
                     }
 
