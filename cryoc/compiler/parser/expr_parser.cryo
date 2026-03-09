@@ -217,7 +217,7 @@ public:
 
                 // Check for generic args on the scope-resolved member
                 if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
-                    const gen_args: SymbolStr[] = this.parse_generic_args();
+                    const gen_args: TypeAnnotation*[] = this.parse_generic_args();
                     sr.set_generic_args(gen_args);
                 }
 
@@ -413,7 +413,7 @@ public:
 
         // Check for generic args: Name<T, U>
         if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
-            const gen_args: SymbolStr[] = this.parse_generic_args();
+            const gen_args: TypeAnnotation*[] = this.parse_generic_args();
 
             // After generic args, check what follows
             if (this.check(TokenType::LParen)) {
@@ -461,7 +461,7 @@ public:
 
                 // Check for generic args on the member itself: Name<T>::member<U>
                 if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
-                    const member_gen_args: SymbolStr[] = this.parse_generic_args();
+                    const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
                     sr.set_generic_args(member_gen_args);
                 }
 
@@ -487,7 +487,7 @@ public:
 
             // Check for generic args on the member itself: Name::member<U>
             if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
-                const member_gen_args: SymbolStr[] = this.parse_generic_args();
+                const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
                 sr.set_generic_args(member_gen_args);
             }
 
@@ -498,7 +498,7 @@ public:
         // Relies on structural heuristic (ident followed by '{' then 'field:' pattern)
         // rather than naming conventions, so lowercase type names work too.
         if (this.check(TokenType::LBrace) && this.is_struct_literal_ahead()) {
-            const empty_args: SymbolStr[] = [];
+            const empty_args: TypeAnnotation*[] = [];
             return this.parse_struct_literal_body(name, empty_args, tok);
         }
 
@@ -527,7 +527,7 @@ public:
     }
 
     /// Parse the body of a struct literal after the name and optional generic args.
-    parse_struct_literal_body(name: SymbolStr, gen_args: SymbolStr[], start: Token) -> ExpressionNode* {
+    parse_struct_literal_body(name: SymbolStr, gen_args: TypeAnnotation*[], start: Token) -> ExpressionNode* {
         mut lit: StructLiteralNode* = new StructLiteralNode(name, this.span_from_token(start));
         if (gen_args.length > 0) {
             lit.set_generic_args(gen_args);
@@ -719,7 +719,7 @@ public:
 
         // Optional generic args
         if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
-            const gen_args: SymbolStr[] = this.parse_generic_args();
+            const gen_args: TypeAnnotation*[] = this.parse_generic_args();
             node.set_generic_args(gen_args);
         }
 
@@ -1149,63 +1149,24 @@ public:
         return false;
     }
 
-    /// Parse generic type arguments: <T1, T2, ...>
-    parse_generic_args() -> SymbolStr[] {
-        mut args: SymbolStr[] = [];
+    /// Parse generic type arguments: <T1, T2*, Array<int>, ...>
+    /// Returns structured TypeAnnotation nodes, preserving pointer, array,
+    /// optional, and nested generic structure.
+    parse_generic_args() -> TypeAnnotation*[] {
+        mut args: TypeAnnotation*[] = [];
         this.advance(); // consume '<'
 
         while (!this.check(TokenType::RAngle) &&
                !this.check(TokenType::GreaterGreater) &&
                !this.is_at_end()) {
-            // Each arg is a type name (possibly qualified)
-            const arg_tok: Token = this.current();
-            mut arg_name: string = "";
-
-            if (this.check(TokenType::Identifier) || this.is_primitive_type_token()) {
-                arg_name = this.current().lexeme;
-                this.advance();
-
-                // Handle qualified type names: A::B
-                while (this.check(TokenType::ColonColon)) {
-                    this.advance();
-                    arg_name.append("::");
-                    arg_name.append(this.current().lexeme);
-                    this.advance();
-                }
-
-                // Handle nested generics: A<B>
-                if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
-                    // Consume nested generic args for the name but flatten
-                    arg_name = arg_name + "<";
-                    const nested: SymbolStr[] = this.parse_generic_args();
-                    for (mut i: int = 0; i < nested.length; i++) {
-                        if (i > 0) { arg_name = arg_name + ", "; }
-                        arg_name = arg_name + this.ctx.resolve_str(nested[i]);
-                    }
-                    arg_name = arg_name + ">";
-                }
-
-                // Handle pointer suffix: T*
-                while (this.check(TokenType::Star)) {
-                    arg_name = arg_name + "*";
-                    this.advance();
-                }
-
-                // Handle array suffix: T[]
-                while (this.check(TokenType::LSquare) && this.peek_at(1).kind == TokenType::RSquare) {
-                    arg_name = arg_name + "[]";
-                    this.advance();
-                    this.advance();
-                }
-
+            const ann: TypeAnnotation* = this.parse_type_annotation();
+            if (ann != null) {
+                args.push(ann);
             } else {
-                // Unknown token in generic args
                 this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                    sprintf("expected type name in generic arguments, found '%s'", this.current().lexeme));
+                    sprintf("expected type in generic arguments, found '%s'", this.current().lexeme));
                 break;
             }
-
-            args.push(this.ctx.intern(arg_name));
 
             if (!this.match_tok(TokenType::Comma)) {
                 break;
@@ -1214,6 +1175,28 @@ public:
 
         this.consume_right_angle();
         return args;
+    }
+
+    /// Parse generic parameter names: <T, U, V>
+    /// Used for declaration sites (type aliases, impl blocks) where the
+    /// parameters are bare names, not full type annotations.
+    parse_generic_param_names() -> SymbolStr[] {
+        mut names: SymbolStr[] = [];
+        this.advance(); // consume '<'
+
+        while (!this.check(TokenType::RAngle) &&
+               !this.check(TokenType::GreaterGreater) &&
+               !this.is_at_end()) {
+            const param_tok: Token = this.consume(TokenType::Identifier, "type parameter name");
+            names.push(this.intern_lexeme(param_tok));
+
+            if (!this.match_tok(TokenType::Comma)) {
+                break;
+            }
+        }
+
+        this.consume_right_angle();
+        return names;
     }
 
 
