@@ -354,8 +354,27 @@ public:
             this.advance(); // consume '&'
             const this_tok: Token = this.advance(); // consume 'this'
             const pname: SymbolStr = this.ctx.intern("&this");
-            mut param: VarDeclNode* = new VarDeclNode(pname, this.span_from(start));
+            const span: SourceSpan = this.span_from(start);
+            mut param: VarDeclNode* = new VarDeclNode(pname, span);
             param.set_mutable(is_mutable);
+
+            // Synthesize type annotation: &TypeName (or &mut TypeName)
+            // so FunctionSignature pass can resolve the self parameter type.
+            if (this.current_type_name != "") {
+                const type_name: SymbolStr = this.ctx.intern(this.current_type_name);
+                const named_ann: NamedAnnotation* = new NamedAnnotation {
+                    name: type_name,
+                    span: span,
+                };
+                const inner: TypeAnnotation* = new TypeAnnotation::Named(named_ann);
+                const ref_ann: ReferenceAnnotation* = new ReferenceAnnotation {
+                    inner:      inner,
+                    is_mutable: is_mutable,
+                    span:       span,
+                };
+                param.set_type_annotation(new TypeAnnotation::Reference(ref_ann));
+            }
+
             return param;
         }
 
@@ -446,7 +465,6 @@ public:
 
     /// Parse the body of a struct or class declaration (fields, methods, visibility).
     parse_type_body(struct_node: StructDeclNode*, class_node: ClassDeclNode*) -> void {
-        this.in_class_members = true;
         mut current_visibility: Visibility = Visibility::Private;
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
@@ -558,7 +576,6 @@ public:
             this.advance();
         }
 
-        this.in_class_members = false;
     }
 
     /// Parse a constructor: ClassName(params) [: BaseClass(args)] { body }
@@ -695,10 +712,8 @@ public:
 
         // Body or semicolon
         if (this.check(TokenType::LBrace)) {
-            this.in_method_body = true;
             const body: BlockStmtNode* = this.parse_block_statement();
             func.set_body(body);
-            this.in_method_body = false;
         } else {
             this.consume(TokenType::Semicolon, "';' or '{'");
         }
@@ -1027,7 +1042,7 @@ public:
         const type_name: SymbolStr = this.intern_lexeme(type_tok);
         mut node: ImplBlockNode* = new ImplBlockNode(type_name, this.span_from_token(start));
         this.current_type_name = type_tok.lexeme;
-        this.in_impl_block = true;
+        // Parse implement block body
 
         // Optional generic parameters: implement enum Optional<T> { ... }
         if (this.check(TokenType::LAngle)) {
@@ -1087,7 +1102,6 @@ public:
         }
 
         this.consume(TokenType::RBrace, "'}'");
-        this.in_impl_block = false;
         this.current_type_name = "";
         node.span = this.span_from(start);
         return node;

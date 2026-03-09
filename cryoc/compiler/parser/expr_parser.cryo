@@ -445,27 +445,61 @@ public:
                 return this.parse_struct_literal_body(name, gen_args, tok);
             } else if (this.check(TokenType::ColonColon)) {
                 // Generic scope resolution: Name<T>::member
-                // Leave for postfix to handle
-                mut sr_node: ScopeResolutionNode* = null;
-                // Store generic args on the identifier node via cast
-                // Actually, create a CallExprNode shell with generic args
-                mut call: CallExprNode* = new CallExprNode(expr, expr.span);
-                call.set_generic_args(gen_args);
-                return call;
+                this.advance(); // consume '::'
+
+                const member_tok: Token = if (this.check(TokenType::Identifier) ||
+                                              this.check(TokenType::KwNew) ||
+                                              this.check(TokenType::KwDefault)) {
+                    this.advance()
+                } else {
+                    this.consume(TokenType::Identifier, "member name after '::'")
+                };
+                const member_name: SymbolStr = this.intern_lexeme(member_tok);
+                const span: SourceSpan = ParserBase::merge_spans(this.span_from_token(tok), this.span_from_token(member_tok));
+                mut sr: ScopeResolutionNode* = new ScopeResolutionNode(name, member_name, span);
+                sr.set_scope_generic_args(gen_args);
+
+                // Check for generic args on the member itself: Name<T>::member<U>
+                if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+                    const member_gen_args: SymbolStr[] = this.parse_generic_args();
+                    sr.set_generic_args(member_gen_args);
+                }
+
+                expr = sr;
             }
             // Generic args parsed but nothing useful follows — just continue with postfix
         }
 
-        // Check for struct literal: Name { field: value }
-        // Only if uppercase first character (type name convention)
-        if (this.check(TokenType::LBrace) && tok.lexeme.length() > 0 &&
-            tok.lexeme[0] >= 'A' && tok.lexeme[0] <= 'Z') {
-            // But NOT if we're at the start of a block statement context
-            // Use a simple heuristic: if the next token after '{' is 'ident:' → struct literal
-            if (this.is_struct_literal_ahead()) {
-                const empty_args: SymbolStr[] = [];
-                return this.parse_struct_literal_body(name, empty_args, tok);
+        // Check for scope resolution without generic args: Name::member
+        if (this.check(TokenType::ColonColon)) {
+            this.advance(); // consume '::'
+
+            const member_tok: Token = if (this.check(TokenType::Identifier) ||
+                                          this.check(TokenType::KwNew) ||
+                                          this.check(TokenType::KwDefault)) {
+                this.advance()
+            } else {
+                this.consume(TokenType::Identifier, "member name after '::'")
+            };
+            const member_name: SymbolStr = this.intern_lexeme(member_tok);
+            const span: SourceSpan = ParserBase::merge_spans(this.span_from_token(tok), this.span_from_token(member_tok));
+            mut sr: ScopeResolutionNode* = new ScopeResolutionNode(name, member_name, span);
+
+            // Check for generic args on the member itself: Name::member<U>
+            if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+                const member_gen_args: SymbolStr[] = this.parse_generic_args();
+                sr.set_generic_args(member_gen_args);
             }
+
+            expr = sr;
+        }
+
+        // Check for struct literal: Name { field: value }
+        // Relies on structural heuristic (ident followed by '{' then 'field:' pattern)
+        // rather than naming conventions, so lowercase type names work too.
+        if (this.check(TokenType::LBrace) && this.is_struct_literal_ahead()) {
+            const empty_args: SymbolStr[] = [];
+            return this.parse_struct_literal_body(name, empty_args, tok);
         }
 
         return expr;
@@ -1057,7 +1091,7 @@ public:
     is_generic_call_ahead() -> boolean {
         mut angle_depth: int = 1;
         mut offset: int = 1;
-        const max_lookahead: int = 50;
+        const max_lookahead: int = 200;
 
         while (offset < max_lookahead) {
             const tok: Token = this.peek_at(offset);
@@ -1472,7 +1506,11 @@ public:
         }
         if (node.kind == NodeKind::ScopeResolution) {
             const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
-            return sr.scope_name;
+            return sr.member_name;
+        }
+        if (node.kind == NodeKind::CallExpression) {
+            const call: CallExprNode* = expr as CallExprNode*;
+            return this.get_expr_name(call.callee);
         }
         return SymbolStr::empty();
     }
