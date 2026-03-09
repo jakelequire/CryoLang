@@ -38,15 +38,19 @@ import Utils::Logger;
 
 /// For each GenericParamNode, creates a GenericParamType in the arena and
 /// adds a binding (e.g., T → GenericParamType(T, 0)) to the resolution context.
+///
+/// Delegates arena creation to TypeResolutionPasses::create_generic_param_types
+/// so there is a single source of truth for GenericParamNode → TypeRef creation.
 function bind_generic_params(generic_params: GenericParamNode*[],
                              res_ctx: ResolutionContext*,
                              arena: TypeArena*,
                              ctx: CompilationContext*) -> void {
+    const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
+        generic_params, arena);
     for (mut i: i64 = 0; i < generic_params.length; i++) {
         const gp: GenericParamNode* = generic_params[i];
-        const param_ref: TypeRef = arena.create_generic_param(gp.name, i as u64);
         const gp_name: string = ctx.resolve_str(gp.name);
-        res_ctx.add_binding(gp_name, param_ref);
+        res_ctx.add_binding(gp_name, refs[i]);
     }
 }
 
@@ -269,6 +273,29 @@ function resolve_var_types_in_statement(stmt: ASTNode*,
 // ============================================================================
 
 type struct TypeResolutionPasses {
+
+    // ========================================================================
+    // Shared utility: GenericParamNode[] → TypeRef[]
+    // ========================================================================
+
+    /// Single source of truth for creating GenericParamType entries in the
+    /// arena from an array of GenericParamNode*.  Returns parallel TypeRef[]
+    /// where refs[i] is the GenericParamType for generic_params[i].
+    ///
+    /// Used by:
+    ///   - bind_generic_params() in this module (adds bindings to ResolutionContext)
+    ///   - SpecializationPasses::run_template_registration() (collects metadata)
+    static create_generic_param_types(generic_params: GenericParamNode*[],
+                                      arena: TypeArena*) -> TypeRef[] {
+        mut refs: TypeRef[] = [];
+        for (mut i: i64 = 0; i < generic_params.length; i++) {
+            const gp: GenericParamNode* = generic_params[i];
+            const param_ref: TypeRef = arena.create_generic_param(gp.name, i as u64);
+            refs = refs + [param_ref];
+        }
+        return refs;
+    }
+
 
     // ========================================================================
     // Pass 1: FunctionSignature (order 7)
