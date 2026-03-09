@@ -239,10 +239,12 @@ public:
         node.set_mutable(is_mutable);
         node.set_name_span(this.span_from_token(name_tok));
 
-        // Optional type annotation
+        // Required type annotation
         if (this.match_tok(TokenType::Colon)) {
             const type_ann: TypeAnnotation* = this.parse_type_annotation();
             node.set_type_annotation(type_ann);
+        } else {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE, "expected ':' and type annotation after variable name");
         }
 
         // Optional initializer
@@ -470,7 +472,8 @@ public:
             }
 
             // Constructor: ClassName(params) { body }
-            if (this.check(TokenType::Identifier) && this.current().lexeme == this.current_type_name &&
+            // Note: use strcmp() because string == string is pointer comparison in Cryo.
+            if (this.check(TokenType::Identifier) && strcmp(this.current().lexeme, this.current_type_name) == 0 &&
                 this.peek_at(1).kind == TokenType::LParen) {
                 const method: MethodNode* = this.parse_constructor(current_visibility);
                 if (method != null) {
@@ -1026,6 +1029,23 @@ public:
         this.current_type_name = type_tok.lexeme;
         this.in_impl_block = true;
 
+        // Optional generic parameters: implement enum Optional<T> { ... }
+        if (this.check(TokenType::LAngle)) {
+            this.advance(); // consume '<'
+            mut params: SymbolStr[] = [];
+            while (!this.check(TokenType::RAngle) && !this.is_at_end()) {
+                const param_tok: Token = this.consume(TokenType::Identifier, "type parameter name");
+                params.push(this.intern_lexeme(param_tok));
+                if (this.check(TokenType::Comma)) {
+                    this.advance();
+                } else {
+                    break;
+                }
+            }
+            this.consume(TokenType::RAngle, "'>'");
+            node.set_generic_params(params);
+        }
+
         this.consume(TokenType::LBrace, "'{'");
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
@@ -1482,14 +1502,54 @@ public:
     }
 
     /// Parse a match arm for a statement match: pattern => { body }
+    /// Match arm blocks don't require ';' after the last expression/statement.
     parse_match_arm() -> MatchArmNode* {
         const start: Token = this.current();
         mut arm: MatchArmNode* = this.parse_match_arm_patterns();
 
-        // Body: block statement
+        // Body: block statement (parsed specially — ';' is optional before '}')
         if (this.check(TokenType::LBrace)) {
-            const body: BlockStmtNode* = this.parse_block_statement();
-            arm.set_body(body);
+            const bstart: Token = this.advance(); // consume '{'
+            mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(bstart));
+
+            while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+                if (this.panic_mode) {
+                    // If we're at '}', the error was likely a missing ';' — recover gracefully
+                    if (this.check(TokenType::RBrace)) {
+                        this.panic_mode = false;
+                        break;
+                    }
+                    this.synchronize();
+                    if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
+                }
+
+                if (this.is_declaration_start()) {
+                    const decl: ASTNode* = this.parse_declaration(false, "");
+                    if (decl != null) {
+                        const decl_stmt: DeclStmtNode* = new DeclStmtNode(decl as DeclarationNode*, decl.span);
+                        block.add_statement(decl_stmt);
+                    }
+                } else if (this.is_statement_keyword()) {
+                    // Statement keywords (if/while/return/etc.) — parse as normal statement
+                    const stmt: StatementNode* = this.parse_statement();
+                    if (stmt != null) {
+                        block.add_statement(stmt);
+                    }
+                } else {
+                    // Expression — ';' is optional before '}'
+                    const expr: ExpressionNode* = this.parse_expression();
+                    if (expr != null) {
+                        const stmt: ExprStmtNode* = new ExprStmtNode(expr, expr.span);
+                        block.add_statement(stmt);
+                    }
+                    // Consume ';' if present, but don't require it
+                    this.match_tok(TokenType::Semicolon);
+                }
+            }
+
+            this.consume(TokenType::RBrace, "'}'");
+            block.span = this.span_from(bstart);
+            arm.set_body(block);
         } else {
             // Single statement/expression
             const stmt: StatementNode* = this.parse_statement();
