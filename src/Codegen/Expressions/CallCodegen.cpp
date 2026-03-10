@@ -6157,20 +6157,27 @@ namespace Cryo::Codegen
                 {
                     // Extract overload suffix from the resolved method's LLVM name.
                     // E.g., "ASTVisitor::visit(ProgramNode*)" → "(ProgramNode*)"
+                    //
+                    // IMPORTANT: Use find('(') on the full name, NOT rfind("::")
+                    // followed by find('(').  When parameter types contain '::'
+                    // (e.g., "Ns::Class::visit(Ns::ProgramNode*)"), rfind("::")
+                    // finds the '::' INSIDE the parameter type name, leaving
+                    // after_sep = "ProgramNode*)" with no '(' — so the suffix
+                    // comes out empty, vtable_index() returns -1, and virtual
+                    // dispatch is silently skipped (falling through to a direct
+                    // call to the base class stub).
+                    //
+                    // The first '(' in the function name is always the start of
+                    // the parameter list, since the format is:
+                    //   [Namespace::]ClassName::methodName(ParamType1,ParamType2,...)
                     std::string vtable_overload_suffix;
                     if (method)
                     {
                         std::string fn_name = method->getName().str();
-                        // Find the method name boundary — after the last "::"
-                        size_t last_sep2 = fn_name.rfind("::");
-                        if (last_sep2 != std::string::npos)
+                        size_t paren = fn_name.find('(');
+                        if (paren != std::string::npos)
                         {
-                            std::string after_sep = fn_name.substr(last_sep2 + 2);
-                            size_t paren = after_sep.find('(');
-                            if (paren != std::string::npos)
-                            {
-                                vtable_overload_suffix = after_sep.substr(paren);
-                            }
+                            vtable_overload_suffix = fn_name.substr(paren);
                         }
                     }
 
