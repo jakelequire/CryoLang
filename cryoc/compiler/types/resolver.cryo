@@ -31,7 +31,7 @@ type struct ResolutionContext {
     current_module:   string;
     source_file:      string;
     import_modules:   string[];     // Modules imported by this compilation unit
-    generic_bindings: string[];     // Parallel arrays: generic name → bound TypeRef
+    generic_bindings: SymbolStr[];   // Parallel arrays: generic name → bound TypeRef
     binding_refs:     TypeRef[];
 
     static new(current_module: string, source_file: string) -> ResolutionContext {
@@ -45,15 +45,15 @@ type struct ResolutionContext {
     }
 
     /// Add a generic binding (e.g., T → i32).
-    add_binding(mut &this, name: string, bound_type: TypeRef) -> void {
+    add_binding(mut &this, name: SymbolStr, bound_type: TypeRef) -> void {
         this.generic_bindings.push(name);
         this.binding_refs.push(bound_type);
     }
 
     /// Look up a generic binding by name.
-    lookup_binding(&this, name: string) -> TypeRef {
+    lookup_binding(&this, name: SymbolStr) -> TypeRef {
         for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
-            if (this.generic_bindings[i] == name) {
+            if (this.generic_bindings[i].equals(name)) {
                 return this.binding_refs[i];
             }
         }
@@ -193,14 +193,14 @@ private:
         const name_str: string = this.intern_table.resolve(name);
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_named() name='%s'", name_str);
 
-        // 1. Check generic bindings first
-        mut binding: TypeRef = ctx.lookup_binding(name_str);
+        // 1. Check generic bindings first (O(1) SymbolStr comparison)
+        mut binding: TypeRef = ctx.lookup_binding(name);
         if (binding.is_valid()) {
             return binding;
         }
 
         // 2. Direct arena lookup by bare name (fast path)
-        mut found: TypeRef = this.arena.lookup_by_name(name_str);
+        mut found: TypeRef = this.arena.lookup_by_name(name);
         if (found.is_valid()) {
             return found;
         }
@@ -209,8 +209,8 @@ private:
         //    The Resolver already has all type symbols from NameResolution,
         //    including imports.  It returns the qualified name for arena lookup.
         if (this.name_resolver != null) {
-            const qualified: string = this.name_resolver.resolve_type_qualified_name(name);
-            if (qualified != "") {
+            const qualified: SymbolStr = this.name_resolver.resolve_type_qualified_name(name);
+            if (qualified.is_valid()) {
                 found = this.arena.lookup_by_name(qualified);
                 if (found.is_valid()) {
                     return found;
@@ -220,7 +220,7 @@ private:
 
         // 4. Type alias resolution via ModuleTypeRegistry (last resort)
         if (this.module_registry != null) {
-            found = this.module_registry.lookup_alias(name_str);
+            found = this.module_registry.lookup_alias(name);
             if (found.is_valid()) {
                 return found;
             }

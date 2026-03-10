@@ -31,8 +31,8 @@ import std::collections::hashmap;
 /// All information needed to specialize a single generic type or function.
 type struct TemplateEntry {
     name:           SymbolStr;           // Unqualified: "Array"
-    qualified_name: string;              // "std::collections::Array"
-    module_name:    string;
+    qualified_name: SymbolStr;             // interned "std::collections::Array"
+    module_name:    SymbolStr;
     param_names:    SymbolStr[];         // [intern("T"), intern("E")]
     param_type_ids: u64[];              // TypeIDs of GenericParamType objects
     param_count:    i64;
@@ -42,7 +42,7 @@ type struct TemplateEntry {
     impl_blocks:    ImplBlockNode*[];   // Associated impl blocks
 
     /// Create a new template entry.
-    static new(name: SymbolStr, qualified_name: string, module_name: string,
+    static new(name: SymbolStr, qualified_name: SymbolStr, module_name: SymbolStr,
                param_names: SymbolStr[], param_type_ids: u64[],
                ast_node: ASTNode*, node_kind: NodeKind,
                base_type: TypeRef) -> TemplateEntry {
@@ -76,7 +76,7 @@ type struct GenericRegistry {
     tmpl_type_indices: i64[];
 
     // -- HashMap indices for O(1) lookup --
-    name_index: HashMap<string, i64>;   // qualified_name → entry index
+    name_index: HashMap<u32, i64>;      // qualified_name SymbolStr.id → entry index
     type_index: HashMap<u64, i64>;      // TypeID → entry index
 
     // -- Instantiation cache --
@@ -99,7 +99,7 @@ type struct GenericRegistry {
             entries:           [],
             tmpl_type_ids:     [],
             tmpl_type_indices: [],
-            name_index:        HashMap<string, i64>::new(),
+            name_index:        HashMap<u32, i64>::new(),
             type_index:        HashMap<u64, i64>::new(),
             cache_keys:        [],
             cache_refs:        [],
@@ -116,8 +116,8 @@ type struct GenericRegistry {
     /// Register a template entry.  Deduplicates by qualified_name —
     /// if an entry with the same name exists, it is overwritten.
     register_template(mut &this, entry: TemplateEntry) -> void {
-        const h: u64 = hash_str(entry.qualified_name);
-        const existing: Option<i64> = this.name_index.get(entry.qualified_name, h);
+        const h: u64 = hash_int(entry.qualified_name.id as u64);
+        const existing: Option<i64> = this.name_index.get(entry.qualified_name.id, h);
 
         if (existing.is_some()) {
             // Overwrite existing
@@ -132,7 +132,7 @@ type struct GenericRegistry {
         // New entry
         const idx: i64 = this.entries.length;
         this.entries = this.entries + [entry];
-        this.name_index.insert(entry.qualified_name, idx, h);
+        this.name_index.insert(entry.qualified_name.id, idx, h);
 
         if (entry.base_type.is_valid()) {
             this.tmpl_type_ids     = this.tmpl_type_ids + [entry.base_type.id];
@@ -143,17 +143,17 @@ type struct GenericRegistry {
 
     /// Associate an impl block with a registered template.
     /// Caller must provide the qualified name of the target type.
-    register_impl_block(mut &this, qualified_name: string, block: ImplBlockNode*) -> void {
-        const h: u64 = hash_str(qualified_name);
-        const opt: Option<i64> = this.name_index.get(qualified_name, h);
+    register_impl_block(mut &this, qualified_name: SymbolStr, block: ImplBlockNode*) -> void {
+        const h: u64 = hash_int(qualified_name.id as u64);
+        const opt: Option<i64> = this.name_index.get(qualified_name.id, h);
         if (opt.is_some()) {
             this.entries[opt.unwrap()].impl_blocks.push(block);
         }
     }
 
     /// Look up a template entry by qualified name.  The single lookup path.
-    get_template(&this, qualified_name: string) -> TemplateEntry* {
-        const opt: Option<i64> = this.name_index.get(qualified_name, hash_str(qualified_name));
+    get_template(&this, qualified_name: SymbolStr) -> TemplateEntry* {
+        const opt: Option<i64> = this.name_index.get(qualified_name.id, hash_int(qualified_name.id as u64));
         if (opt.is_some()) {
             return &this.entries[opt.unwrap()];
         }
