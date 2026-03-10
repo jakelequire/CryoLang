@@ -1168,13 +1168,12 @@ namespace Cryo::Codegen
                             }
                             else
                             {
-                                // Plain Named type (e.g., "NodeKind"). Check if it's a known
-                                // LLVM named struct; if not, it's likely an enum (i32).
-                                llvm::StructType *named_st =
-                                    llvm::StructType::getTypeByName(llvm_ctx(), ann_name);
-                                if (named_st)
+                                // Plain Named type — use TypeMapper::resolve_and_map which
+                                // handles plain structs, mangled generics, and instantiation.
+                                llvm::Type *resolved = types().resolve_and_map(ann_name);
+                                if (resolved && resolved->isSized())
                                 {
-                                    field_type = named_st;
+                                    field_type = resolved;
                                 }
                                 else
                                 {
@@ -1197,6 +1196,16 @@ namespace Cryo::Codegen
                         else if (ann->kind == Cryo::TypeAnnotationKind::Pointer)
                         {
                             field_type = llvm::PointerType::get(llvm_ctx(), 0);
+                        }
+                        // Case 4: Generic annotation (e.g., HashMap<u32, TypeRef>)
+                        // Use TypeMapper::resolve_and_map with the annotation's string form
+                        else if (ann->kind == Cryo::TypeAnnotationKind::Generic)
+                        {
+                            llvm::Type *resolved = types().resolve_and_map(ann->to_string());
+                            if (resolved && resolved->isSized())
+                            {
+                                field_type = resolved;
+                            }
                         }
 
                         if (field_type)
@@ -1284,6 +1293,15 @@ namespace Cryo::Codegen
                     {
                         field_llvm_type = llvm::PointerType::get(llvm_ctx(), 0);
                     }
+                    // Generic annotation (e.g., HashMap<u32, TypeRef>)
+                    else if (ann->kind == Cryo::TypeAnnotationKind::Generic)
+                    {
+                        llvm::Type *resolved = types().resolve_and_map(ann->to_string());
+                        if (resolved && resolved->isSized())
+                        {
+                            field_llvm_type = resolved;
+                        }
+                    }
                     if (field_llvm_type)
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
@@ -1298,39 +1316,27 @@ namespace Cryo::Codegen
                     auto *ann = field->type_annotation();
                     if (ann->kind == Cryo::TypeAnnotationKind::Named)
                     {
-                        // First try the type system lookups
-                        TypeRef resolved_ref = ctx().symbols().lookup_enum_type(ann->name);
-                        if (!resolved_ref.is_valid())
-                            resolved_ref = ctx().symbols().arena().lookup_type_by_name(ann->name);
-                        if (resolved_ref.is_valid() && resolved_ref->kind() == Cryo::TypeKind::Enum)
+                        // Use TypeMapper::resolve_and_map which handles plain structs,
+                        // mangled generics, and on-demand instantiation.
+                        llvm::Type *resolved = types().resolve_and_map(ann->name);
+                        if (resolved && resolved->isSized())
                         {
-                            field_llvm_type = llvm::Type::getInt32Ty(llvm_ctx());
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "Class field '{}' resolved as enum type '{}' -> i32",
-                                      field->name(), ann->name);
-                        }
-                        else if (resolved_ref.is_valid())
-                        {
-                            // Resolved to a non-enum type — try to map it
-                            field_llvm_type = types().map(resolved_ref);
+                            field_llvm_type = resolved;
                         }
                         else
                         {
-                            // Type system lookup failed entirely.
-                            // Check if there's an LLVM named struct for this type.
-                            llvm::StructType *named_st =
-                                llvm::StructType::getTypeByName(llvm_ctx(), ann->name);
-                            if (named_st)
+                            // Try arena lookup for enums
+                            TypeRef ref = ctx().symbols().arena().lookup_type_by_name(ann->name);
+                            if (ref.is_valid() && ref->kind() == Cryo::TypeKind::Enum)
                             {
-                                field_llvm_type = named_st;
-                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "Class field '{}' resolved to LLVM named struct '{}'",
-                                          field->name(), ann->name);
+                                field_llvm_type = llvm::Type::getInt32Ty(llvm_ctx());
+                            }
+                            else if (ref.is_valid())
+                            {
+                                field_llvm_type = types().map(ref);
                             }
                             else
                             {
-                                // No LLVM struct type found — likely an enum (i32) since
-                                // structs/classes create named LLVM types but enums don't.
                                 field_llvm_type = llvm::Type::getInt32Ty(llvm_ctx());
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                                           "Class field '{}': unresolved Named type '{}' — "
