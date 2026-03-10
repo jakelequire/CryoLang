@@ -1061,6 +1061,12 @@ namespace Cryo::Codegen
         bool needs_vtable = false;
         {
             TypeRef cryo_type = ctx().symbols().lookup_class_type(name);
+            // Try qualified name if unqualified lookup fails
+            if (!cryo_type.is_valid() && !ctx().namespace_context().empty())
+            {
+                std::string qualified = ctx().namespace_context() + "::" + name;
+                cryo_type = ctx().symbols().lookup_class_type(qualified);
+            }
             if (cryo_type.is_valid())
             {
                 auto *cryo_class = dynamic_cast<const Cryo::ClassType *>(cryo_type.get());
@@ -1084,6 +1090,10 @@ namespace Cryo::Codegen
 
         // Use the ClassType's resolved fields (which include inherited fields from base classes)
         TypeRef cryo_type_ref = ctx().symbols().lookup_class_type(name);
+        if (!cryo_type_ref.is_valid() && !ctx().namespace_context().empty())
+        {
+            cryo_type_ref = ctx().symbols().lookup_class_type(ctx().namespace_context() + "::" + name);
+        }
         const Cryo::ClassType *cryo_class = nullptr;
         if (cryo_type_ref.is_valid())
         {
@@ -1399,7 +1409,8 @@ namespace Cryo::Codegen
                     base_struct->setBody(base_fields);
                     ctx().register_type(base_name, base_struct);
                     types().register_struct(base_name, base_struct);
-                    ctx().register_struct_fields(base_name, base_field_names);
+                    unsigned base_vtable_offset = field_source->needs_vtable_pointer() ? 1 : 0;
+                    ctx().register_struct_fields(base_name, base_field_names, base_vtable_offset);
                 }
             }
 

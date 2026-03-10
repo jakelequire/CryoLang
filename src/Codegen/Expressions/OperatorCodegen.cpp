@@ -2612,6 +2612,19 @@ namespace Cryo::Codegen
                     elem_llvm_type = llvm::Type::getInt8Ty(ctx);
                 else if (elem_name == "void*")
                     elem_llvm_type = llvm::PointerType::get(ctx, 0);
+                else if (elem_name.size() >= 2
+                         && elem_name[elem_name.size() - 2] == '['
+                         && elem_name[elem_name.size() - 1] == ']')
+                {
+                    // Nested array element type (e.g., "SymbolID[]" → Array<SymbolID>)
+                    std::string base_name = elem_name.substr(0, elem_name.size() - 2);
+                    std::string inner_array_name = "Array<" + base_name + ">";
+                    llvm::StructType *inner_st = llvm::StructType::getTypeByName(ctx, inner_array_name);
+                    if (inner_st)
+                        elem_llvm_type = inner_st;
+                    else
+                        elem_llvm_type = resolve_type_by_name(elem_name);
+                }
                 else
                     elem_llvm_type = resolve_type_by_name(elem_name);
             }
@@ -3851,12 +3864,26 @@ namespace Cryo::Codegen
                             template_reg->get_struct_field_types(candidate);
                         if (field_info && !field_info->field_names.empty())
                         {
+                            // Detect vtable offset: if the LLVM struct has more elements
+                            // than the field list, the extra element(s) at the front are
+                            // vtable pointers (or inherited base layout).
+                            unsigned vtable_offset = 0;
+                            if (struct_type && !struct_type->isOpaque())
+                            {
+                                unsigned llvm_elems = struct_type->getNumElements();
+                                unsigned field_count = static_cast<unsigned>(field_info->field_names.size());
+                                if (llvm_elems > field_count)
+                                {
+                                    vtable_offset = llvm_elems - field_count;
+                                }
+                            }
+
                             for (size_t i = 0; i < field_info->field_names.size(); ++i)
                             {
                                 if (field_info->field_names[i] == member_name)
                                 {
-                                    field_idx_signed = static_cast<int>(i);
-                                    ctx().register_struct_fields(type_name, field_info->field_names);
+                                    field_idx_signed = static_cast<int>(i + vtable_offset);
+                                    ctx().register_struct_fields(type_name, field_info->field_names, vtable_offset);
                                     break;
                                 }
                             }
