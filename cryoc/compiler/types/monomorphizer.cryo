@@ -39,7 +39,7 @@ type struct MonomorphRequest {
 
 type struct SpecializationEntry {
     specialized_type: TypeRef;
-    specialized_name: string;
+    specialized_name: SymbolStr;
     ast_node:         ASTNode*;
     impl_nodes:       ASTNode*[];
 }
@@ -172,9 +172,10 @@ type struct Monomorphizer {
                           entry: TemplateEntry*) -> boolean {
         // Validate arg count
         if (request.type_args.length != entry.param_count) {
+            const qn_str: string = this.intern_table.resolve(entry.qualified_name);
             this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 sprintf("arg count mismatch for %s: expected %lld, got %lld",
-                        entry.qualified_name, entry.param_count, request.type_args.length)));
+                        qn_str, entry.param_count, request.type_args.length)));
             return false;
         }
 
@@ -194,17 +195,21 @@ type struct Monomorphizer {
             entry, request.type_args, type_arg_displays
         );
         if (!result.success) {
+            const qn_str: string = this.intern_table.resolve(entry.qualified_name);
             this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 sprintf("specialization failed for %s: %s",
-                        entry.qualified_name, result.error_message)));
+                        qn_str, result.error_message)));
             return false;
         }
+
+        // Intern the specialized name for type system use
+        const spec_name_sym: SymbolStr = this.intern_table.intern(result.spec_name);
 
         // Create concrete type in arena based on node kind
         const subst: TypeSubstitution = TypeSubstitution::from_params(
             entry.param_type_ids, request.type_args
         );
-        const concrete_type: TypeRef = this.create_concrete_type(entry, result.spec_name, &subst);
+        const concrete_type: TypeRef = this.create_concrete_type(entry, spec_name_sym, &subst);
 
         // Populate the concrete type's fields/variants from the original template AST.
         // The original AST's FieldDeclNodes have resolved_type set (with GenericParam
@@ -225,7 +230,7 @@ type struct Monomorphizer {
         // Cache the result
         const spec_entry: SpecializationEntry = SpecializationEntry {
             specialized_type: concrete_type,
-            specialized_name: result.spec_name,
+            specialized_name: spec_name_sym,
             ast_node:         result.specialized_ast,
             impl_nodes:       result.impl_asts,
         };
@@ -246,7 +251,7 @@ type struct Monomorphizer {
     // Concrete type creation
     // ----------------------------------------------------------------
 
-    create_concrete_type(mut &this, entry: TemplateEntry*, spec_name: string,
+    create_concrete_type(mut &this, entry: TemplateEntry*, spec_name: SymbolStr,
                          subst: TypeSubstitution*) -> TypeRef {
         return match (entry.node_kind) {
             NodeKind::StructDeclaration => {
@@ -368,8 +373,7 @@ type struct Monomorphizer {
 
                 // Not a generic param — try resolving as a concrete type name
                 if (!resolved.is_valid()) {
-                    const type_name: string = this.intern_table.resolve(type_sym);
-                    resolved = this.arena.lookup_by_name(type_name);
+                    resolved = this.arena.lookup_by_name(type_sym);
                 }
 
                 payload_types.push(resolved);
