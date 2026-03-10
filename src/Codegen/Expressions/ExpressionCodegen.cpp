@@ -2243,6 +2243,27 @@ namespace Cryo::Codegen
                             // In LLVM's opaque pointer model, all pointers are just `ptr`
                             element_type = llvm::PointerType::get(llvm_ctx(), 0);
                         }
+                        else if (elem_name.size() >= 2
+                                 && elem_name[elem_name.size() - 2] == '['
+                                 && elem_name[elem_name.size() - 1] == ']')
+                        {
+                            // Nested array element type (e.g., "SymbolID[]" → Array<SymbolID>)
+                            std::string base_name = elem_name.substr(0, elem_name.size() - 2);
+                            std::string inner_array_name = "Array<" + base_name + ">";
+                            llvm::StructType *inner_st = llvm::StructType::getTypeByName(llvm_ctx(), inner_array_name);
+                            if (inner_st)
+                            {
+                                element_type = inner_st;
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_array_access: Resolved nested array element type '{}' -> '{}'",
+                                          elem_name, inner_array_name);
+                            }
+                            else
+                            {
+                                // Fallback: try the raw name
+                                element_type = resolve_type_by_name(elem_name);
+                            }
+                        }
                         else
                         {
                             // Try named struct first, then resolve_type_by_name
@@ -5010,18 +5031,32 @@ namespace Cryo::Codegen
                     const TemplateRegistry::StructFieldInfo *field_info = template_reg->get_struct_field_types(candidate);
                     if (field_info && !field_info->field_names.empty())
                     {
+                        // Detect vtable offset: if the LLVM struct has more elements
+                        // than the field list, the extra element at index 0 is the vtable pointer.
+                        unsigned vtable_offset = 0;
+                        if (out_struct_type && !out_struct_type->isOpaque())
+                        {
+                            unsigned llvm_elems = out_struct_type->getNumElements();
+                            unsigned field_count = static_cast<unsigned>(field_info->field_names.size());
+                            if (llvm_elems > field_count)
+                            {
+                                // First element is vtable pointer — offset all field indices by 1
+                                vtable_offset = llvm_elems - field_count;
+                            }
+                        }
+
                         // Find the field index by name
                         for (size_t i = 0; i < field_info->field_names.size(); ++i)
                         {
                             if (field_info->field_names[i] == member_name)
                             {
-                                field_idx = static_cast<int>(i);
+                                field_idx = static_cast<int>(i + vtable_offset);
                                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                          "resolve_member_info: Found field '{}' at index {} via TemplateRegistry ({})",
-                                          member_name, field_idx, candidate);
+                                          "resolve_member_info: Found field '{}' at index {} via TemplateRegistry ({}) (vtable_offset={})",
+                                          member_name, field_idx, candidate, vtable_offset);
 
-                                // Register the field indices for future lookups
-                                ctx().register_struct_fields(type_name, field_info->field_names);
+                                // Register the field indices for future lookups (with vtable offset)
+                                ctx().register_struct_fields(type_name, field_info->field_names, vtable_offset);
                                 break;
                             }
                         }

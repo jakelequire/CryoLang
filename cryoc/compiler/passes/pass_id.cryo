@@ -35,13 +35,13 @@ type enum PassID {
     TypeResolution;
     StructFieldTypeSync;
 
-    // Stage 5: Semantic Analysis
+    // Stage 5: Specialization
     DirectiveProcessing;
-    FunctionBodyTypeCheck;
-
-    // Stage 6: Specialization
     Monomorphization;
     GenericExpressionResolution;
+
+    // Stage 6: Semantic Analysis
+    FunctionBodyTypeCheck;
 
     // Stage 7: Codegen Preparation
     TypeLowering;
@@ -98,10 +98,10 @@ implement enum PassID {
             PassID::TemplateRegistration        => { PassStage::DeclarationCollection }
             PassID::TypeResolution              => { PassStage::TypeResolution        }
             PassID::StructFieldTypeSync         => { PassStage::TypeResolution        }
-            PassID::DirectiveProcessing         => { PassStage::SemanticAnalysis      }
-            PassID::FunctionBodyTypeCheck       => { PassStage::SemanticAnalysis      }
+            PassID::DirectiveProcessing         => { PassStage::Specialization        }
             PassID::Monomorphization            => { PassStage::Specialization        }
             PassID::GenericExpressionResolution => { PassStage::Specialization        }
+            PassID::FunctionBodyTypeCheck       => { PassStage::SemanticAnalysis      }
             PassID::TypeLowering                => { PassStage::CodegenPreparation    }
             PassID::FunctionDeclaration         => { PassStage::CodegenPreparation    }
             PassID::IRGeneration                => { PassStage::IRGeneration          }
@@ -126,9 +126,9 @@ implement enum PassID {
             PassID::TypeResolution              => { 9  }
             PassID::StructFieldTypeSync         => { 10 }
             PassID::DirectiveProcessing         => { 11 }
-            PassID::FunctionBodyTypeCheck       => { 12 }
-            PassID::Monomorphization            => { 13 }
-            PassID::GenericExpressionResolution => { 14 }
+            PassID::Monomorphization            => { 12 }
+            PassID::GenericExpressionResolution => { 13 }
+            PassID::FunctionBodyTypeCheck       => { 14 }
             PassID::TypeLowering                => { 15 }
             PassID::FunctionDeclaration         => { 16 }
             PassID::IRGeneration                => { 17 }
@@ -141,13 +141,14 @@ implement enum PassID {
     /// Whether failure in this pass should abort the pipeline.
     fatal_on_failure(&this) -> boolean {
         return match (this) {
-            PassID::Lexing            => { true  }
-            PassID::Parsing           => { true  }
-            PassID::ASTValidation     => { true  }
-            PassID::NameResolution    => { true  }
-            PassID::TypeResolution    => { true  }
-            PassID::IRGeneration      => { true  }
-            _                         => { false }
+            PassID::Lexing                => { true  }
+            PassID::Parsing               => { true  }
+            PassID::ASTValidation         => { true  }
+            PassID::NameResolution        => { true  }
+            PassID::TypeResolution        => { true  }
+            PassID::FunctionBodyTypeCheck => { true  }
+            PassID::IRGeneration          => { true  }
+            _                             => { false }
         };
     }
 }
@@ -251,8 +252,8 @@ type enum PassStage {
     ModuleResolution;
     DeclarationCollection;
     TypeResolution;
-    SemanticAnalysis;
     Specialization;
+    SemanticAnalysis;
     CodegenPreparation;
     IRGeneration;
     Output;
@@ -265,8 +266,8 @@ implement enum PassStage {
             PassStage::ModuleResolution      => { "ModuleResolution"      }
             PassStage::DeclarationCollection => { "DeclarationCollection" }
             PassStage::TypeResolution        => { "TypeResolution"        }
-            PassStage::SemanticAnalysis      => { "SemanticAnalysis"      }
             PassStage::Specialization        => { "Specialization"        }
+            PassStage::SemanticAnalysis      => { "SemanticAnalysis"      }
             PassStage::CodegenPreparation    => { "CodegenPreparation"    }
             PassStage::IRGeneration          => { "IRGeneration"          }
             PassStage::Output                => { "Output"               }
@@ -280,8 +281,8 @@ implement enum PassStage {
             PassStage::ModuleResolution      => { 1 }
             PassStage::DeclarationCollection => { 2 }
             PassStage::TypeResolution        => { 3 }
-            PassStage::SemanticAnalysis      => { 4 }
-            PassStage::Specialization        => { 5 }
+            PassStage::Specialization        => { 4 }
+            PassStage::SemanticAnalysis      => { 5 }
             PassStage::CodegenPreparation    => { 6 }
             PassStage::IRGeneration          => { 7 }
             PassStage::Output                => { 8 }
@@ -490,24 +491,14 @@ function get_pass_metadata(id: PassID) -> PassMetadata {
                 provisions:       [Provision::DirectivesProcessed],
             }
         }
-        PassID::FunctionBodyTypeCheck => {
-            PassMetadata {
-                id:               PassID::FunctionBodyTypeCheck,
-                name:             "FunctionBodyTypeCheck",
-                stage:            PassStage::SemanticAnalysis,
-                order:            12,
-                requirements:     [PassRequirement::required(Provision::TypesResolved),
-                                   PassRequirement::optional(Provision::DirectivesProcessed)],
-                provisions:       [Provision::BodiesTypeChecked],
-            }
-        }
         PassID::Monomorphization => {
             PassMetadata {
                 id:               PassID::Monomorphization,
                 name:             "Monomorphization",
                 stage:            PassStage::Specialization,
-                order:            13,
-                requirements:     [PassRequirement::required(Provision::BodiesTypeChecked)],
+                order:            12,
+                requirements:     [PassRequirement::required(Provision::StructFieldsSynced),
+                                   PassRequirement::optional(Provision::DirectivesProcessed)],
                 provisions:       [Provision::MonomorphizationComplete],
             }
         }
@@ -516,9 +507,19 @@ function get_pass_metadata(id: PassID) -> PassMetadata {
                 id:               PassID::GenericExpressionResolution,
                 name:             "GenericExpressionResolution",
                 stage:            PassStage::Specialization,
-                order:            14,
+                order:            13,
                 requirements:     [PassRequirement::required(Provision::MonomorphizationComplete)],
                 provisions:       [Provision::GenericExpressionsResolved],
+            }
+        }
+        PassID::FunctionBodyTypeCheck => {
+            PassMetadata {
+                id:               PassID::FunctionBodyTypeCheck,
+                name:             "FunctionBodyTypeCheck",
+                stage:            PassStage::SemanticAnalysis,
+                order:            14,
+                requirements:     [PassRequirement::required(Provision::GenericExpressionsResolved)],
+                provisions:       [Provision::BodiesTypeChecked],
             }
         }
         PassID::TypeLowering => {

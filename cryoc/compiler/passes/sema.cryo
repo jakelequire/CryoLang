@@ -1,13 +1,16 @@
 /// Semantic Analysis Passes
 ///
-///   FunctionBodyTypeCheck (order 12) — Walks all function bodies and fills
+///   FunctionBodyTypeCheck (order 14) — Walks all function bodies and fills
 ///   resolved_type on every ExpressionNode.  Uses the TypeChecker for
 ///   operator validation and the TypeArena for type lookups.
 ///
-///   This pass runs AFTER TypeResolution (which resolves annotations on
-///   declarations) and BEFORE Monomorphization (which clones and specializes
-///   generic ASTs).  By the time codegen runs, every expression node will
-///   have a concrete resolved_type — no type inference needed in the backend.
+///   This pass runs AFTER Specialization (Monomorphization + GenericExpressionResolution),
+///   meaning all generic types have been fully instantiated and their specialized
+///   ASTs injected into the program.  Sema checks both original non-generic bodies
+///   and monomorphized concrete bodies in a single pass.  Generic templates are
+///   skipped (is_generic() guard) — only their specialized versions are checked.
+///   By the time codegen runs, every expression node will have a concrete
+///   resolved_type — no type inference needed in the backend.
 
 namespace Compiler::Passes::Sema;
 
@@ -324,6 +327,8 @@ public:
     // ================================================================
 
     override visit(node: ProgramNode*) -> void {
+        printf("[Sema] visit(ProgramNode*) called with %lld statements\n", node.statements.length);
+        printf("[Sema] NodeKind::FunctionDeclaration = %d\n", NodeKind::FunctionDeclaration as i32);
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             const stmt: ASTNode* = node.statements[i];
             if (stmt == null) { continue; }
@@ -332,6 +337,7 @@ public:
     }
 
     dispatch_top_level(mut &this, stmt: ASTNode*) -> void {
+        printf("[Sema] dispatch_top_level: stmt.kind = %d\n", stmt.kind as i32);
         match (stmt.kind) {
             NodeKind::FunctionDeclaration => { this.visit(stmt as FunctionDeclNode*); }
             NodeKind::StructDeclaration   => { this.visit(stmt as StructDeclNode*); }
@@ -344,6 +350,8 @@ public:
 
     override visit(node: FunctionDeclNode*) -> void {
         if (node.body == null || node.is_generic()) { return; }
+        const _fn_name: string = this.intern.resolve(node.name);
+        printf("[Sema] Visiting function body: '%s'\n", _fn_name);
         this.enter_function(node, TypeRef::invalid());
         this.visit(node.body);
         this.body_count = this.body_count + 1;
@@ -445,7 +453,27 @@ public:
         const var_node: VarDeclNode* = decl as VarDeclNode*;
         if (var_node.has_initializer()) {
             const init_type: TypeRef = this.resolve_expr(var_node.initializer);
-            if (!var_node.has_resolved_type() && init_type.is_valid()) {
+            const _dbg_name: string = this.intern.resolve(var_node.name);
+            printf("[Sema:DeclStmt] var '%s' has_resolved=%d init_valid=%d resolved_id=%llu init_id=%llu\n",
+                _dbg_name,
+                var_node.has_resolved_type() as i32,
+                init_type.is_valid() as i32,
+                var_node.resolved_type.id,
+                init_type.id);
+            if (var_node.has_resolved_type() && init_type.is_valid()) {
+                // Declared type exists — check that the initializer is compatible
+                if (!this.checker.can_assign(init_type, var_node.resolved_type)) {
+                    const decl_ty: Type* = this.arena.lookup(var_node.resolved_type.id);
+                    const init_ty: Type* = this.arena.lookup(init_type.id);
+                    const var_name: string = this.intern.resolve(var_node.name);
+                    const decl_name: string = if (decl_ty != null) { decl_ty.display_name() } else { "?" };
+                    const init_name: string = if (init_ty != null) { init_ty.display_name() } else { "?" };
+                    this.ctx.emit_error(ErrorCode::E0200_TYPE_MISMATCH,
+                        sprintf("cannot initialize '%s' of type '%s' with value of type '%s'",
+                            var_name, decl_name, init_name));
+                }
+            } else if (!var_node.has_resolved_type() && init_type.is_valid()) {
+                // No declared type — infer from initializer
                 var_node.set_resolved_type(init_type);
             }
         }
@@ -456,7 +484,18 @@ public:
 
     override visit(node: ReturnStmtNode*) -> void {
         if (node.has_expression()) {
-            this.resolve_expr(node.expression);
+            const expr_type: TypeRef = this.resolve_expr(node.expression);
+            if (expr_type.is_valid() && this.return_type.is_valid()) {
+                if (!this.checker.can_assign(expr_type, this.return_type)) {
+                    const ret_ty: Type* = this.arena.lookup(this.return_type.id);
+                    const expr_ty: Type* = this.arena.lookup(expr_type.id);
+                    const ret_name: string = if (ret_ty != null) { ret_ty.display_name() } else { "?" };
+                    const expr_name: string = if (expr_ty != null) { expr_ty.display_name() } else { "?" };
+                    this.ctx.emit_error(ErrorCode::E0200_TYPE_MISMATCH,
+                        sprintf("cannot return value of type '%s' from function returning '%s'",
+                            expr_name, ret_name));
+                }
+            }
         }
     }
 
@@ -848,10 +887,10 @@ type struct SemanticPasses {
 
     /// Walk all function bodies and fill resolved_type on every ExpressionNode.
     ///
-    /// By the time this pass completes, every expression in every non-generic
-    /// function body will have a concrete TypeRef.  Generic function bodies are
-    /// skipped — they are type-checked after monomorphization creates concrete
-    /// specializations.
+    /// By the time this pass completes, every expression in every function body
+    /// (both original and monomorphized) will have a concrete TypeRef.  Generic
+    /// templates are skipped — their specialized concrete versions (injected by
+    /// GenericExpressionResolution) are type-checked instead.
     static run_function_body_type_check(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
