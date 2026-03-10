@@ -7,6 +7,7 @@
 namespace Compiler::Types::UserDefined;
 
 import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
 
 
 // ============================================================================
@@ -86,16 +87,18 @@ type struct EnumVariantInfo {
 
 type class StructType : Type {
 public:
-    qualified_name: string;
-    module_name:    string;
+    qualified_name: SymbolStr;
+    module_name:    SymbolStr;
+    intern_table:   InternTable*;
     fields:         FieldInfo[];
     methods:        MethodInfo[];
     is_complete:    boolean;
 
-    StructType(id: u64, qualified_name: string, module_name: string)
+    StructType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
         : Type(id, TypeKind::Struct) {
         this.qualified_name = qualified_name;
         this.module_name    = module_name;
+        this.intern_table   = intern_table;
         this.fields         = [];
         this.methods        = [];
         this.is_complete    = false;
@@ -146,8 +149,8 @@ public:
     field_count(&this) -> i64   { return this.fields.length; }
     method_count(&this) -> i64  { return this.methods.length; }
 
-    override display_name(&this) -> string { return this.qualified_name; }
-    override mangled_name(&this) -> string { return sprintf("_CS%s", this.qualified_name); }
+    override display_name(&this) -> string { return this.intern_table.resolve(this.qualified_name); }
+    override mangled_name(&this) -> string { return sprintf("_CS%s", this.intern_table.resolve(this.qualified_name)); }
 
     override size_bytes(&this) -> u64 {
         // Sum of field sizes (simplified; real layout needs alignment padding)
@@ -164,8 +167,9 @@ public:
 
 type class ClassType : Type {
 public:
-    qualified_name:      string;
-    module_name:         string;
+    qualified_name:      SymbolStr;
+    module_name:         SymbolStr;
+    intern_table:        InternTable*;
     fields:              FieldInfo[];
     methods:             MethodInfo[];
     base_class:          TypeRef;
@@ -173,10 +177,11 @@ public:
     has_virtual_methods: boolean;
     is_complete:         boolean;
 
-    ClassType(id: u64, qualified_name: string, module_name: string)
+    ClassType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
         : Type(id, TypeKind::Class) {
         this.qualified_name      = qualified_name;
         this.module_name         = module_name;
+        this.intern_table        = intern_table;
         this.fields              = [];
         this.methods             = [];
         this.base_class          = TypeRef::invalid();
@@ -233,8 +238,8 @@ public:
         return null;
     }
 
-    override display_name(&this) -> string { return this.qualified_name; }
-    override mangled_name(&this) -> string { return sprintf("_CC%s", this.qualified_name); }
+    override display_name(&this) -> string { return this.intern_table.resolve(this.qualified_name); }
+    override mangled_name(&this) -> string { return sprintf("_CC%s", this.intern_table.resolve(this.qualified_name)); }
     override size_bytes(&this) -> u64      { return 0; }
     override alignment(&this) -> u64       { return 8; }
 }
@@ -246,15 +251,17 @@ public:
 
 type class EnumType : Type {
 public:
-    qualified_name: string;
-    module_name:    string;
+    qualified_name: SymbolStr;
+    module_name:    SymbolStr;
+    intern_table:   InternTable*;
     variants:       EnumVariantInfo[];
     methods:        MethodInfo[];
 
-    EnumType(id: u64, qualified_name: string, module_name: string)
+    EnumType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
         : Type(id, TypeKind::Enum) {
         this.qualified_name = qualified_name;
         this.module_name    = module_name;
+        this.intern_table   = intern_table;
         this.variants       = [];
         this.methods        = [];
     }
@@ -297,8 +304,8 @@ public:
 
     variant_count(&this) -> i64 { return this.variants.length; }
 
-    override display_name(&this) -> string { return this.qualified_name; }
-    override mangled_name(&this) -> string { return sprintf("_CE%s", this.qualified_name); }
+    override display_name(&this) -> string { return this.intern_table.resolve(this.qualified_name); }
+    override mangled_name(&this) -> string { return sprintf("_CE%s", this.intern_table.resolve(this.qualified_name)); }
     override size_bytes(&this) -> u64      { return 0; }  // Depends on largest variant
     override alignment(&this) -> u64       { return 8; }
 }
@@ -310,15 +317,17 @@ public:
 
 type class TraitType : Type {
 public:
-    qualified_name:   string;
-    module_name:      string;
+    qualified_name:   SymbolStr;
+    module_name:      SymbolStr;
+    intern_table:     InternTable*;
     required_methods: MethodInfo[];
     super_traits:     TypeRef[];
 
-    TraitType(id: u64, qualified_name: string, module_name: string)
+    TraitType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
         : Type(id, TypeKind::Trait) {
         this.qualified_name   = qualified_name;
         this.module_name      = module_name;
+        this.intern_table     = intern_table;
         this.required_methods = [];
         this.super_traits     = [];
     }
@@ -340,8 +349,8 @@ public:
         return null;
     }
 
-    override display_name(&this) -> string { return this.qualified_name; }
-    override mangled_name(&this) -> string { return sprintf("_CT%s", this.qualified_name); }
+    override display_name(&this) -> string { return this.intern_table.resolve(this.qualified_name); }
+    override mangled_name(&this) -> string { return sprintf("_CT%s", this.intern_table.resolve(this.qualified_name)); }
     override size_bytes(&this) -> u64      { return 0; }  // Traits have no size
     override alignment(&this) -> u64       { return 0; }
 }
@@ -353,13 +362,15 @@ public:
 
 type class TypeAliasType : Type {
 public:
-    alias_name: string;
-    target:     TypeRef;
+    alias_name:   SymbolStr;
+    intern_table: InternTable*;
+    target:       TypeRef;
 
-    TypeAliasType(id: u64, alias_name: string, target: TypeRef)
+    TypeAliasType(id: u64, alias_name: SymbolStr, intern_table: InternTable*, target: TypeRef)
         : Type(id, TypeKind::TypeAlias) {
-        this.alias_name = alias_name;
-        this.target     = target;
+        this.alias_name   = alias_name;
+        this.intern_table = intern_table;
+        this.target       = target;
     }
 
     has_target(&this) -> boolean {
@@ -370,8 +381,8 @@ public:
         this.target = target;
     }
 
-    override display_name(&this) -> string { return this.alias_name; }
-    override mangled_name(&this) -> string { return sprintf("_CA%s", this.alias_name); }
+    override display_name(&this) -> string { return this.intern_table.resolve(this.alias_name); }
+    override mangled_name(&this) -> string { return sprintf("_CA%s", this.intern_table.resolve(this.alias_name)); }
 
     override size_bytes(&this) -> u64 {
         return 0;  // Delegates to target once resolved
