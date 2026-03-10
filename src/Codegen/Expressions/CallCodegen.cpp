@@ -7298,7 +7298,12 @@ namespace Cryo::Codegen
             auto *enum_type = static_cast<const EnumType *>(sym->type.get());
             if (enum_type->variant_index(member_name).has_value())
                 return true;
-            return false;
+            // If the enum has registered variants but the member isn't one of them,
+            // it's a static method — return false definitively.
+            // Only fall through to TemplateRegistry when variant_count is 0
+            // (generic template placeholder that hasn't had variants populated).
+            if (enum_type->variant_count() > 0)
+                return false;
         }
 
         // Also try SRM lookup candidates (handles cross-module / qualified names)
@@ -7313,7 +7318,8 @@ namespace Cryo::Codegen
                 auto *enum_type = static_cast<const EnumType *>(csym->type.get());
                 if (enum_type->variant_index(member_name).has_value())
                     return true;
-                return false;
+                if (enum_type->variant_count() > 0)
+                    return false;
             }
         }
 
