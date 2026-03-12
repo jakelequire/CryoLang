@@ -51,7 +51,7 @@ function main() -> int {
 | **Module system** | Hierarchical namespaces with visibility control and a prelude |
 | **LLVM 20 backend** | Optimizing compilation to native x86-64, ARM64, and WebAssembly |
 | **Rich standard library** | `Option<T>`, `Result<T, E>`, `Array<T>`, `String`, allocators, I/O, and more |
-| **Self-hosting** | *(In development)* The compiler is written in Cryo itself, bootstrapped from C++ |
+| **Self-hosting** | *(In development)* Cryo written in itself bootstrapped from C++, located in [`./cryoc`](./cryoc/) |
 | **Integrated tooling** | LSP server, VS Code extension, code formatter, and a tiered test suite |
 
 ## Getting Started
