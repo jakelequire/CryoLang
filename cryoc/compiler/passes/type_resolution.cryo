@@ -14,6 +14,7 @@
 namespace Compiler::Passes::TypeResolution;
 
 import Compiler::Diag;
+import Compiler::DeclIndex;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Declaration;
@@ -350,12 +351,18 @@ type struct TypeResolutionPasses {
                         resolve_func_signature(func, resolver, &res_ctx, ctx);
                     }
                     sig_count++;
+
+                    // Register non-generic functions in the declaration index
+                    if (!func.is_generic() && func.resolved_return_type.is_valid()) {
+                        ctx.decl_index.register_function(func.name, func.resolved_return_type);
+                    }
                 }
                 NodeKind::StructDeclaration => {
                     const node: StructDeclNode* = stmt as StructDeclNode*;
                     // Skip generic structs — resolved during monomorphization
                     if (!node.is_generic()) {
                         resolve_method_signatures(node.methods, resolver, &res_ctx, ctx);
+                        ctx.decl_index.register_methods(node.name, node.methods);
                         sig_count = sig_count + node.methods.length;
                     } else {
                         // Still resolve signatures with generic bindings for the template
@@ -369,6 +376,7 @@ type struct TypeResolutionPasses {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (!node.is_generic()) {
                         resolve_method_signatures(node.methods, resolver, &res_ctx, ctx);
+                        ctx.decl_index.register_methods(node.name, node.methods);
                         sig_count = sig_count + node.methods.length;
                     } else {
                         mut gen_ctx: ResolutionContext = res_ctx;
@@ -397,6 +405,7 @@ type struct TypeResolutionPasses {
                         resolve_method_signatures(node.methods, resolver, &gen_ctx, ctx);
                     } else {
                         resolve_method_signatures(node.methods, resolver, &res_ctx, ctx);
+                        ctx.decl_index.register_methods(node.target_type, node.methods);
                     }
                     sig_count = sig_count + node.methods.length;
                 }
@@ -626,59 +635,80 @@ type struct TypeResolutionPasses {
             printf("[TypeResolution] Phase 3: Walked %lld function bodies\n", body_count);
         }
 
-        // ── Phase 4: Register types in ModuleTypeRegistry ───────────────
+        // ── Phase 4: Register types in ModuleTypeRegistry + DeclarationIndex ──
         mut reg_count: i64 = 0;
-        if (module_registry != null) {
-            for (mut i: i64 = 0; i < root.statements.length; i++) {
-                const stmt: ASTNode* = root.statements[i];
-                if (stmt == null) { continue; }
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
 
-                match (stmt.kind) {
-                    NodeKind::StructDeclaration => {
-                        const node: StructDeclNode* = stmt as StructDeclNode*;
-                        const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                        const ty: TypeRef = arena.lookup_by_name(qualified_sym);
-                        if (ty.is_valid()) {
-                            // Top-level type declarations default to Public visibility;
-                            // module-level public/private is controlled by `public module` directives
+            match (stmt.kind) {
+                NodeKind::StructDeclaration => {
+                    const node: StructDeclNode* = stmt as StructDeclNode*;
+                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                    if (ty.is_valid()) {
+                        if (module_registry != null) {
                             module_registry.register_type(module_name, node.name, ty, TypeVisibility::Public);
-                            reg_count++;
                         }
+                        ctx.decl_index.register_type(node.name, ty);
+                        reg_count++;
                     }
-                    NodeKind::ClassDeclaration => {
-                        const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                        const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                        const ty: TypeRef = arena.lookup_by_name(qualified_sym);
-                        if (ty.is_valid()) {
-                            module_registry.register_type(module_name, node.name, ty, TypeVisibility::Public);
-                            reg_count++;
-                        }
-                    }
-                    NodeKind::EnumDeclaration => {
-                        const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                        const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                        const ty: TypeRef = arena.lookup_by_name(qualified_sym);
-                        if (ty.is_valid()) {
-                            module_registry.register_type(module_name, node.name, ty, TypeVisibility::Public);
-                            reg_count++;
-                        }
-                    }
-                    NodeKind::TraitDeclaration => {
-                        const node: TraitDeclNode* = stmt as TraitDeclNode*;
-                        const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                        const ty: TypeRef = arena.lookup_by_name(qualified_sym);
-                        if (ty.is_valid()) {
-                            module_registry.register_type(module_name, node.name, ty, TypeVisibility::Public);
-                            reg_count++;
-                        }
-                    }
-                    _ => {}
                 }
+                NodeKind::ClassDeclaration => {
+                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                    if (ty.is_valid()) {
+                        if (module_registry != null) {
+                            module_registry.register_type(module_name, node.name, ty, TypeVisibility::Public);
+                        }
+                        ctx.decl_index.register_type(node.name, ty);
+                        reg_count++;
+                    }
+                }
+                NodeKind::EnumDeclaration => {
+                    const node: EnumDeclNode* = stmt as EnumDeclNode*;
+                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                    if (ty.is_valid()) {
+                        if (module_registry != null) {
+                            module_registry.register_type(module_name, node.name, ty, TypeVisibility::Public);
+                        }
+                        ctx.decl_index.register_type(node.name, ty);
+                        reg_count++;
+                    }
+                }
+                NodeKind::TraitDeclaration => {
+                    const node: TraitDeclNode* = stmt as TraitDeclNode*;
+                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                    if (ty.is_valid()) {
+                        if (module_registry != null) {
+                            module_registry.register_type(module_name, node.name, ty, TypeVisibility::Public);
+                        }
+                        ctx.decl_index.register_type(node.name, ty);
+                        reg_count++;
+                    }
+                }
+                NodeKind::VariableDeclaration => {
+                    // Resolve and register top-level global variables
+                    const var_node: VarDeclNode* = stmt as VarDeclNode*;
+                    if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
+                        const vtype: TypeRef = resolver.resolve(var_node.type_annotation, &res_ctx);
+                        if (vtype.is_valid()) {
+                            var_node.resolved_type = vtype;
+                        }
+                    }
+                    if (var_node.resolved_type.is_valid()) {
+                        ctx.decl_index.register_global(var_node.name, var_node.resolved_type);
+                    }
+                }
+                _ => {}
             }
         }
 
         if (ctx.debug_mode) {
-            printf("[TypeResolution] Phase 4: Registered %lld types in ModuleTypeRegistry\n", reg_count);
+            printf("[TypeResolution] Phase 4: Registered %lld types in ModuleTypeRegistry + DeclarationIndex\n", reg_count);
         }
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
