@@ -245,14 +245,14 @@ type struct Monomorphizer {
         // rewrote annotation strings (Named("T") → Named("i32")).  This step
         // walks the specialized AST and resolves those concrete annotations
         // back into TypeRefs, filling resolved_type on every declaration node.
-        this.resolve_specialized_ast(result.specialized_ast, entry.node_kind);
+        this.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry);
         for (mut ri: i64 = 0; ri < result.impl_asts.length; ri++) {
-            this.resolve_specialized_ast(result.impl_asts[ri], NodeKind::ImplementationBlock);
+            this.resolve_specialized_ast(result.impl_asts[ri], NodeKind::ImplementationBlock, entry);
         }
 
         // Populate the concrete type's fields/variants from the SPECIALIZED AST
         // (which now has concrete resolved_type fields from the re-resolution step).
-        this.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst);
+        this.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst, entry);
 
         // Set resolved_type on the InstantiatedType
         const inst_t: Type* = this.arena.lookup(request.generic_type.id);
@@ -316,14 +316,24 @@ type struct Monomorphizer {
     /// concrete TypeRefs.  After cloning + substitution, the AST has
     /// concrete type annotation strings (e.g., Named("i32")) but all
     /// resolved_type fields are invalid.  This step fills them.
-    resolve_specialized_ast(mut &this, ast_node: ASTNode*, node_kind: NodeKind) -> void {
+    ///
+    /// Uses the template entry's module name to build a proper resolution
+    /// context so that cross-module and user-defined types resolve correctly
+    /// through the Resolver's scope chain.
+    resolve_specialized_ast(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
+                            entry: TemplateEntry*) -> void {
         if (ast_node == null || this.type_resolver == null) { return; }
 
-        // Create a simple resolution context with no generic bindings
-        // (all types are concrete after substitution)
-        const module_name: string = "";
-        const source_file: string = "";
-        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, source_file);
+        // Build a resolution context rooted in the template's originating module.
+        // All types are concrete after substitution so no generic bindings are needed,
+        // but the module name is required for the Resolver's scope chain to qualify
+        // bare type names (e.g., "MyStruct" → "ModuleName::MyStruct") and for
+        // cross-module lookups via the ModuleTypeRegistry.
+        mut module_name: string = "";
+        if (entry != null && entry.module_name.is_valid()) {
+            module_name = this.intern_table.resolve(entry.module_name);
+        }
+        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
 
         match (node_kind) {
             NodeKind::StructDeclaration => {
@@ -409,7 +419,8 @@ type struct Monomorphizer {
     /// Populate the concrete arena type from the specialized AST node,
     /// which now has resolved_type fields filled by the re-resolution step.
     populate_concrete_type(mut &this, concrete_type: TypeRef, specialized_ast: ASTNode*,
-                           node_kind: NodeKind, subst: TypeSubstitution*) -> void {
+                           node_kind: NodeKind, subst: TypeSubstitution*,
+                           entry: TemplateEntry*) -> void {
         const concrete_t: Type* = this.arena.lookup(concrete_type.id);
         if (concrete_t == null || specialized_ast == null) { return; }
 
@@ -424,7 +435,7 @@ type struct Monomorphizer {
             }
             NodeKind::EnumDeclaration => {
                 this.populate_enum_variants(concrete_t as EnumType*,
-                    specialized_ast as EnumDeclNode*, subst);
+                    specialized_ast as EnumDeclNode*, subst, entry);
             }
             _ => {}
         }
@@ -462,11 +473,18 @@ type struct Monomorphizer {
     /// Populate a specialized EnumType's variants from the specialized AST.
     /// Enum variants store associated types as SymbolStr names (already
     /// substituted by ASTTypeSubstituter).  We resolve each name to a TypeRef
-    /// using the arena, falling back to the TypeSubstitution for any remaining
-    /// generic parameters.
+    /// using the arena, falling back to the TypeResolver for primitive and
+    /// cross-module type lookups.
     populate_enum_variants(mut &this, et: EnumType*, decl: EnumDeclNode*,
-                           subst: TypeSubstitution*) -> void {
+                           subst: TypeSubstitution*, entry: TemplateEntry*) -> void {
         if (decl == null) { return; }
+
+        // Build ResolutionContext once for all variants
+        mut module_str: string = "";
+        if (entry != null && entry.module_name.is_valid()) {
+            module_str = this.intern_table.resolve(entry.module_name);
+        }
+        mut res_ctx: ResolutionContext = ResolutionContext::new(module_str, "");
 
         for (mut i: i64 = 0; i < decl.variants.length; i++) {
             const variant: EnumVariantNode* = decl.variants[i];
@@ -480,15 +498,16 @@ type struct Monomorphizer {
                 // Try resolving as a concrete type name in the arena
                 resolved = this.arena.lookup_by_name(type_sym);
 
-                // Try as a primitive name via TypeResolver
+                // Try via TypeResolver — build a proper annotation from the
+                // SymbolStr name.  After substitution, names like "Option<int>"
+                // need a Generic annotation, not a flat Named annotation, so
+                // that the resolver can route through GenericRegistry and find
+                // the monomorphized concrete type.
                 if (!resolved.is_valid() && this.type_resolver != null) {
-                    mut res_ctx: ResolutionContext = ResolutionContext::new("", "");
-                    // Create a Named annotation for the resolver
-                    const named: NamedAnnotation* = malloc(sizeof(NamedAnnotation));
-                    *named = NamedAnnotation { name: type_sym, span: SourceSpan::none() };
-                    const ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
-                    *ann = TypeAnnotation::Named(named);
-                    resolved = this.type_resolver.resolve(ann, &res_ctx);
+                    const ann: TypeAnnotation* = this.build_annotation_from_name(type_sym);
+                    if (ann != null) {
+                        resolved = this.type_resolver.resolve(ann, &res_ctx);
+                    }
                 }
 
                 payload_types.push(resolved);
@@ -496,6 +515,117 @@ type struct Monomorphizer {
 
             et.add_variant(EnumVariantInfo::new(variant.name, payload_types, i as u64));
         }
+    }
+
+    /// Build a TypeAnnotation from a SymbolStr that may contain generic syntax.
+    ///
+    /// Simple names like "int" or "MyStruct" produce TypeAnnotation::Named.
+    /// Generic names like "Option<int>" or "Result<int,string>" produce
+    /// TypeAnnotation::Generic with recursively-built arg annotations.
+    /// This is necessary because enum variant associated_types are stored as
+    /// flat SymbolStr names, not structured TypeAnnotation trees.
+    build_annotation_from_name(&this, name_sym: SymbolStr) -> TypeAnnotation* {
+        const name_str: string = this.intern_table.resolve(name_sym);
+        return this.parse_type_string(name_str);
+    }
+
+    /// Parse a type string into a TypeAnnotation.
+    /// Handles: "int", "MyStruct", "Option<int>", "Result<int,string>",
+    ///          "HashMap<string,Option<int>>" (nested generics).
+    parse_type_string(&this, s: string) -> TypeAnnotation* {
+        if (s == null) { return null; }
+        const len: i64 = strlen(s);
+        if (len == 0) { return null; }
+
+        // Find first '<' — if none, this is a simple named type
+        mut angle_pos: i64 = -1;
+        for (mut i: i64 = 0; i < len; i++) {
+            if (s[i] == '<') {
+                angle_pos = i;
+                break;
+            }
+        }
+
+        if (angle_pos < 0) {
+            // Simple name — create Named annotation
+            const sym: SymbolStr = this.intern_table.intern(s);
+            const named: NamedAnnotation* = malloc(sizeof(NamedAnnotation));
+            *named = NamedAnnotation { name: sym, span: SourceSpan::none() };
+            const ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+            *ann = TypeAnnotation::Named(named);
+            return ann;
+        }
+
+        // Generic type: extract base name and arg strings
+        const base_str: string = substr(s, 0, angle_pos);
+        const base_sym: SymbolStr = this.intern_table.intern(base_str);
+        const base_named: NamedAnnotation* = malloc(sizeof(NamedAnnotation));
+        *base_named = NamedAnnotation { name: base_sym, span: SourceSpan::none() };
+        const base_ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+        *base_ann = TypeAnnotation::Named(base_named);
+
+        // Parse the args between '<' and the matching '>'
+        // Split by ',' at depth 0 (respecting nested <> pairs)
+        mut args: TypeAnnotation*[] = [];
+        mut depth: i64 = 0;
+        mut arg_start: i64 = angle_pos + 1;
+        // The last char should be '>' — iterate up to len-1
+        for (mut i: i64 = angle_pos + 1; i < len; i++) {
+            if (s[i] == '<') {
+                depth = depth + 1;
+            } else if (s[i] == '>') {
+                if (depth == 0) {
+                    // End of args — parse final arg
+                    if (i > arg_start) {
+                        const arg_str: string = substr(s, arg_start, i - arg_start);
+                        const trimmed: string = this.trim_whitespace(arg_str);
+                        if (strlen(trimmed) > 0) {
+                            const arg_ann: TypeAnnotation* = this.parse_type_string(trimmed);
+                            if (arg_ann != null) {
+                                args.push(arg_ann);
+                            }
+                        }
+                    }
+                    break;
+                } else {
+                    depth = depth - 1;
+                }
+            } else if (s[i] == ',' && depth == 0) {
+                // Arg separator at top level
+                if (i > arg_start) {
+                    const arg_str: string = substr(s, arg_start, i - arg_start);
+                    const trimmed: string = this.trim_whitespace(arg_str);
+                    if (strlen(trimmed) > 0) {
+                        const arg_ann: TypeAnnotation* = this.parse_type_string(trimmed);
+                        if (arg_ann != null) {
+                            args.push(arg_ann);
+                        }
+                    }
+                }
+                arg_start = i + 1;
+            }
+        }
+
+        const gen: GenericAnnotation* = malloc(sizeof(GenericAnnotation));
+        *gen = GenericAnnotation { base: base_ann, args: args, span: SourceSpan::none() };
+        const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+        *result = TypeAnnotation::Generic(gen);
+        return result;
+    }
+
+    /// Trim leading and trailing whitespace/spaces from a string.
+    trim_whitespace(&this, s: string) -> string {
+        const len: i64 = strlen(s);
+        mut start: i64 = 0;
+        mut end: i64 = len;
+        while (start < end && (s[start] == ' ' || s[start] == '\t')) {
+            start = start + 1;
+        }
+        while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t')) {
+            end = end - 1;
+        }
+        if (start == 0 && end == len) { return s; }
+        return substr(s, start, end - start);
     }
 
 
@@ -642,18 +772,34 @@ type struct Monomorphizer {
 
     /// Enqueue a monomorphization request from a TypeRef that is an InstantiatedType.
     /// Skips instantiations that cannot be monomorphized:
-    ///   - Type args containing unresolved GenericParamType or BoundedParamType
-    ///     (template-internal references like Pair<T> in a generic method return type)
+    ///   - Base type is not a registered template (e.g., void, primitives)
     ///   - Base type is a TypeAlias (generic aliases are expanded during type
     ///     resolution, not monomorphized — e.g., SomeResult<int> → Result<int, string>)
+    ///   - Type args containing unresolved GenericParamType or BoundedParamType
+    ///     (template-internal references like Pair<T> in a generic method return type)
     enqueue_from_type_ref(mut &this, ty: TypeRef) -> void {
         const t: Type* = this.arena.lookup(ty.id);
         if (t == null || t.kind != TypeKind::InstantiatedType) { return; }
         const inst: InstantiatedType* = t as InstantiatedType*;
 
-        // Skip if base type is a TypeAlias — aliases are resolved, not monomorphized
+        // Skip if base type is not a monomorphizable kind.
+        // Only Struct, Enum, Class, Trait, and Function types can be templates.
+        // This prevents non-generic types (void, primitives, etc.) from being
+        // spuriously fed into the monomorphizer.
         const base_t: Type* = this.arena.lookup(inst.generic_base.id);
-        if (base_t != null && base_t.kind == TypeKind::TypeAlias) {
+        if (base_t == null) { return; }
+        if (base_t.kind == TypeKind::TypeAlias) { return; }
+        if (base_t.kind != TypeKind::Struct &&
+            base_t.kind != TypeKind::Enum &&
+            base_t.kind != TypeKind::Class &&
+            base_t.kind != TypeKind::Trait &&
+            base_t.kind != TypeKind::Function) {
+            return;
+        }
+
+        // Double-check against the GenericRegistry — only enqueue types that
+        // were actually registered as templates during TemplateRegistration.
+        if (!this.generic_registry.is_template(inst.generic_base.id)) {
             return;
         }
 
