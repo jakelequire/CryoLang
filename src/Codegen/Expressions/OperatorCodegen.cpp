@@ -1927,6 +1927,26 @@ namespace Cryo::Codegen
                     is_string_literal_node(node->right()))
                     is_string_cmp = true;
             }
+            // Check resolved types on AST child expressions.
+            // This catches monomorphized generic code where K=string:
+            // the operand_type may be null or generic, but the child
+            // expressions' resolved_type is set to String after substitution.
+            if (!is_string_cmp && node)
+            {
+                auto has_string_resolved_type = [](Cryo::ASTNode *n) -> bool
+                {
+                    if (!n)
+                        return false;
+                    auto *expr = dynamic_cast<Cryo::ExpressionNode *>(n);
+                    if (!expr)
+                        return false;
+                    auto rt = expr->get_resolved_type();
+                    return rt && rt->kind() == Cryo::TypeKind::String;
+                };
+                if (has_string_resolved_type(node->left()) ||
+                    has_string_resolved_type(node->right()))
+                    is_string_cmp = true;
+            }
         }
 
         if (is_string_cmp)
@@ -2250,6 +2270,73 @@ namespace Cryo::Codegen
                                                               Cryo::BinaryExpressionNode *node)
     {
         llvm::IRBuilder<> &b = builder();
+
+        // In Cryo, raw pointer equality is only meaningful against null.
+        // When comparing two non-null pointers with == or !=, the operands
+        // are almost certainly strings (Cryo's string type is ptr/i8*).
+        // Use strcmp for value equality instead of pointer identity.
+        // This is critical for monomorphized generic code (e.g., HashMap<string, V>)
+        // where type information is lost during specialization.
+        //
+        // Null-safe: if either runtime pointer is null, fall back to pointer
+        // comparison (handles calloc'd/uninitialized entries in HashMap).
+        bool either_is_null_constant = llvm::isa<llvm::ConstantPointerNull>(lhs) ||
+                                       llvm::isa<llvm::ConstantPointerNull>(rhs);
+        if (!either_is_null_constant &&
+            (op == TokenKind::TK_EQUALEQUAL || op == TokenKind::TK_EXCLAIMEQUAL))
+        {
+            llvm::Value *null_ptr = llvm::ConstantPointerNull::get(
+                llvm::PointerType::get(llvm_ctx(), 0));
+            llvm::Value *lhs_is_null = b.CreateICmpEQ(lhs, null_ptr, "lhs.null");
+            llvm::Value *rhs_is_null = b.CreateICmpEQ(rhs, null_ptr, "rhs.null");
+            llvm::Value *any_null = b.CreateOr(lhs_is_null, rhs_is_null, "any.null");
+
+            // Build the strcmp path
+            llvm::FunctionCallee strcmp_fn = module()->getOrInsertFunction(
+                "strcmp",
+                llvm::FunctionType::get(
+                    llvm::Type::getInt32Ty(llvm_ctx()),
+                    {llvm::PointerType::get(llvm_ctx(), 0),
+                     llvm::PointerType::get(llvm_ctx(), 0)},
+                    false));
+
+            // Create basic blocks for the branch
+            llvm::Function *func = b.GetInsertBlock()->getParent();
+            llvm::BasicBlock *null_bb = llvm::BasicBlock::Create(llvm_ctx(), "ptr.cmp.null", func);
+            llvm::BasicBlock *str_bb = llvm::BasicBlock::Create(llvm_ctx(), "ptr.cmp.str", func);
+            llvm::BasicBlock *merge_bb = llvm::BasicBlock::Create(llvm_ctx(), "ptr.cmp.merge", func);
+
+            b.CreateCondBr(any_null, null_bb, str_bb);
+
+            // Null path: pointer comparison
+            b.SetInsertPoint(null_bb);
+            llvm::Value *ptr_result;
+            if (op == TokenKind::TK_EQUALEQUAL)
+                ptr_result = b.CreateICmpEQ(lhs, rhs, "ptr_eq");
+            else
+                ptr_result = b.CreateICmpNE(lhs, rhs, "ptr_ne");
+            b.CreateBr(merge_bb);
+            null_bb = b.GetInsertBlock(); // Update for PHI
+
+            // String path: strcmp
+            b.SetInsertPoint(str_bb);
+            llvm::Value *cmp_result = b.CreateCall(strcmp_fn, {lhs, rhs}, "strcmp.result");
+            llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0);
+            llvm::Value *str_result;
+            if (op == TokenKind::TK_EQUALEQUAL)
+                str_result = b.CreateICmpEQ(cmp_result, zero, "str_eq");
+            else
+                str_result = b.CreateICmpNE(cmp_result, zero, "str_ne");
+            b.CreateBr(merge_bb);
+            str_bb = b.GetInsertBlock(); // Update for PHI
+
+            // Merge
+            b.SetInsertPoint(merge_bb);
+            llvm::PHINode *phi = b.CreatePHI(llvm::Type::getInt1Ty(llvm_ctx()), 2, "ptr.str.cmp");
+            phi->addIncoming(ptr_result, null_bb);
+            phi->addIncoming(str_result, str_bb);
+            return phi;
+        }
 
         switch (op)
         {
