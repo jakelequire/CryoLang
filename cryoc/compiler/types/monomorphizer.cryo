@@ -526,10 +526,33 @@ type struct Monomorphizer {
     // ----------------------------------------------------------------
 
     /// Enqueue a monomorphization request from a TypeRef that is an InstantiatedType.
+    /// Skips instantiations that cannot be monomorphized:
+    ///   - Type args containing unresolved GenericParamType or BoundedParamType
+    ///     (template-internal references like Pair<T> in a generic method return type)
+    ///   - Base type is a TypeAlias (generic aliases are expanded during type
+    ///     resolution, not monomorphized — e.g., SomeResult<int> → Result<int, string>)
     enqueue_from_type_ref(mut &this, ty: TypeRef) -> void {
         const t: Type* = this.arena.lookup(ty.id);
         if (t == null || t.kind != TypeKind::InstantiatedType) { return; }
         const inst: InstantiatedType* = t as InstantiatedType*;
+
+        // Skip if base type is a TypeAlias — aliases are resolved, not monomorphized
+        const base_t: Type* = this.arena.lookup(inst.generic_base.id);
+        if (base_t != null && base_t.kind == TypeKind::TypeAlias) {
+            return;
+        }
+
+        // Skip if any type arg is an unresolved generic parameter
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            const arg_t: Type* = this.arena.lookup(inst.type_args[i].id);
+            if (arg_t != null) {
+                if (arg_t.kind == TypeKind::GenericParam ||
+                    arg_t.kind == TypeKind::BoundedParam) {
+                    return;
+                }
+            }
+        }
+
         this.enqueue_from_inst(ty, inst);
     }
 

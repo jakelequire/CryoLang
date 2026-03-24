@@ -64,6 +64,10 @@ type struct TypeArena {
     trait_cache:  HashMap<u32, TypeRef>;
     alias_cache:  HashMap<u32, TypeRef>;
 
+    // -- Generic parameter dedup cache (key: "name_id:index" → TypeRef) --
+    generic_param_cache:   HashMap<string, TypeRef>;
+    bounded_param_cache:   HashMap<string, TypeRef>;
+
 
     // ----------------------------------------------------------------
     // Construction
@@ -107,6 +111,8 @@ type struct TypeArena {
             enum_cache:      HashMap<u32, TypeRef>::new(),
             trait_cache:     HashMap<u32, TypeRef>::new(),
             alias_cache:     HashMap<u32, TypeRef>::new(),
+            generic_param_cache:  HashMap<string, TypeRef>::new(),
+            bounded_param_cache:  HashMap<string, TypeRef>::new(),
         };
 
         arena.init_primitives();
@@ -365,17 +371,36 @@ type struct TypeArena {
 
 
     // ----------------------------------------------------------------
-    // Generic type factories (not deduplicated — each instantiation is unique)
+    // Generic type factories (deduplicated by name + index)
     // ----------------------------------------------------------------
 
-    /// Create a generic parameter type.
+    /// Get or create a generic parameter type.
+    /// Deduplicated by (name.id, index) so that multiple passes resolving
+    /// the same generic parameter T at index 0 always get the same TypeRef.
     create_generic_param(mut &this, name: SymbolStr, index: u64) -> TypeRef {
-        return this.alloc_type(new GenericParamType(this.next_id, name, index));
+        mut key: string = sprintf("gp_%u_%lu", name.id, index);
+        const h: u64 = hash_str(key);
+
+        const cached: Option<TypeRef> = this.generic_param_cache.get(key, h);
+        if (cached.is_some()) { return cached.unwrap(); }
+
+        mut ref: TypeRef = this.alloc_type(new GenericParamType(this.next_id, name, index));
+        this.generic_param_cache.insert(key, ref, h);
+        return ref;
     }
 
-    /// Create a bounded generic parameter type.
+    /// Get or create a bounded generic parameter type.
+    /// Deduplicated by (name.id, index) — bounds are set on first creation.
     create_bounded_param(mut &this, name: SymbolStr, index: u64, bounds: TypeRef[]) -> TypeRef {
-        return this.alloc_type(new BoundedParamType(this.next_id, name, index, bounds));
+        mut key: string = sprintf("bp_%u_%lu", name.id, index);
+        const h: u64 = hash_str(key);
+
+        const cached: Option<TypeRef> = this.bounded_param_cache.get(key, h);
+        if (cached.is_some()) { return cached.unwrap(); }
+
+        mut ref: TypeRef = this.alloc_type(new BoundedParamType(this.next_id, name, index, bounds));
+        this.bounded_param_cache.insert(key, ref, h);
+        return ref;
     }
 
     /// Create a generic type instantiation.
@@ -457,6 +482,8 @@ type struct TypeArena {
         printf("Enum Cache: %lld entries\n", this.enum_cache.length());
         printf("Trait Cache: %lld entries\n", this.trait_cache.length());
         printf("Alias Cache: %lld entries\n", this.alias_cache.length());
+        printf("GenericParam Cache: %lld entries\n", this.generic_param_cache.length());
+        printf("BoundedParam Cache: %lld entries\n", this.bounded_param_cache.length());
 
     }
 }
