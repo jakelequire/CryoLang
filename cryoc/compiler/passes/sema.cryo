@@ -333,13 +333,15 @@ public:
         const var_node: VarDeclNode* = decl as VarDeclNode*;
         if (var_node.has_initializer()) {
             const init_type: TypeRef = this.resolve_expr(var_node.initializer);
-            const _dbg_name: string = this.intern.resolve(var_node.name);
-            printf("[Sema:DeclStmt] var '%s' has_resolved=%d init_valid=%d resolved_id=%llu init_id=%llu\n",
-                _dbg_name,
-                var_node.has_resolved_type() as i32,
-                init_type.is_valid() as i32,
-                var_node.resolved_type.id,
-                init_type.id);
+            if (this.ctx.debug_mode) {
+                const _dbg_name: string = this.intern.resolve(var_node.name);
+                printf("[Sema:DeclStmt] var '%s' has_resolved=%d init_valid=%d resolved_id=%llu init_id=%llu\n",
+                    _dbg_name,
+                    var_node.has_resolved_type() as i32,
+                    init_type.is_valid() as i32,
+                    var_node.resolved_type.id,
+                    init_type.id);
+            }
             if (var_node.has_resolved_type() && init_type.is_valid()) {
                 // Declared type exists — check that the initializer is compatible
                 if (!this.checker.can_assign(init_type, var_node.resolved_type)) {
@@ -513,7 +515,13 @@ public:
         }
         const local: TypeRef = this.lookup_local(ident.name);
         if (local.is_valid()) { return local; }
-        return this.lookup_global_var(ident.name);
+        const global: TypeRef = this.lookup_global_var(ident.name);
+        if (global.is_valid()) { return global; }
+
+        const name_str: string = this.intern.resolve(ident.name);
+        this.ctx.emit_error(ErrorCode::E0201_UNDEFINED_VARIABLE,
+            sprintf("use of undefined variable '%s'", name_str));
+        return TypeRef::invalid();
     }
 
     resolve_binary(mut &this, bin: BinaryExprNode*) -> TypeRef {
@@ -577,19 +585,34 @@ public:
         if (name == "printf" || name == "exit") { return this.arena.get_i32(); }
         if (name == "sprintf") { return this.arena.get_string(); }
 
+        this.ctx.emit_error(ErrorCode::E0202_UNDEFINED_FUNCTION,
+            sprintf("call to undefined function '%s'", name));
         return TypeRef::invalid();
     }
 
     resolve_method_call(mut &this, member: MemberAccessNode*) -> TypeRef {
         const obj_type: TypeRef = this.resolve_expr(member.object);
+        // Input invalid → upstream error already emitted, stay silent
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
 
         const type_sym: SymbolStr = this.lookup_type_sym(obj_type);
-        if (!type_sym.is_valid()) { return TypeRef::invalid(); }
+        if (!type_sym.is_valid()) {
+            // Valid type but no reverse mapping — internal gap, not user error
+            return TypeRef::invalid();
+        }
 
         const ret: TypeRef = this.lookup_method_return(type_sym, member.member);
-        if (ret.is_valid()) { member.set_resolved_type(ret); }
-        return ret;
+        if (ret.is_valid()) {
+            member.set_resolved_type(ret);
+            return ret;
+        }
+
+        // Inputs were valid but method not found — emit diagnostic
+        const type_name: string = this.intern.resolve(type_sym);
+        const method_name: string = this.intern.resolve(member.member);
+        this.ctx.emit_error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+            sprintf("no method '%s' found on type '%s'", method_name, type_name));
+        return TypeRef::invalid();
     }
 
     resolve_scope_call(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
@@ -608,11 +631,17 @@ public:
             return type_ref;
         }
 
+        const scope_str: string = this.intern.resolve(scope.scope_name);
+        const member_str: string = this.intern.resolve(scope.member_name);
+        this.ctx.emit_error(ErrorCode::E0233_UNDEFINED_SYMBOL,
+            sprintf("undefined '%s::%s' — no matching static method, variant, or type",
+                scope_str, member_str));
         return TypeRef::invalid();
     }
 
     resolve_member_access(mut &this, member: MemberAccessNode*) -> TypeRef {
         const obj_type: TypeRef = this.resolve_expr(member.object);
+        // Input invalid → upstream error already emitted, stay silent
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
 
         // Struct/class field access via TypeChecker
@@ -620,10 +649,17 @@ public:
             obj_type, member.member);
         if (result.success) { return result.result_type; }
 
-        // Fall back to method lookup
+        // Fall back to method lookup (for method-as-value or property patterns)
         const type_sym: SymbolStr = this.lookup_type_sym(obj_type);
         if (type_sym.is_valid()) {
-            return this.lookup_method_return(type_sym, member.member);
+            const method_ret: TypeRef = this.lookup_method_return(type_sym, member.member);
+            if (method_ret.is_valid()) { return method_ret; }
+
+            // Both field and method lookup failed on a valid object — emit
+            const type_name: string = this.intern.resolve(type_sym);
+            const member_name: string = this.intern.resolve(member.member);
+            this.ctx.emit_error(ErrorCode::E0204_UNDEFINED_FIELD,
+                sprintf("no field or method '%s' on type '%s'", member_name, type_name));
         }
 
         return TypeRef::invalid();
@@ -632,11 +668,17 @@ public:
     resolve_array_access(mut &this, access: ArrayAccessNode*) -> TypeRef {
         const array_type: TypeRef = this.resolve_expr(access.array);
         const index_type: TypeRef = this.resolve_expr(access.index);
+        // Input invalid → upstream error already emitted, stay silent
         if (!array_type.is_valid()) { return TypeRef::invalid(); }
 
         const result: TypeCheckResult = this.checker.check_index_access(
             array_type, index_type);
         if (result.success) { return result.result_type; }
+
+        // Valid array but index check failed — emit the TypeChecker's message
+        if (result.error_message != null && strlen(result.error_message) > 0) {
+            this.ctx.emit_error(ErrorCode::E0200_TYPE_MISMATCH, result.error_message);
+        }
         return TypeRef::invalid();
     }
 
