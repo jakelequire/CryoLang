@@ -15,6 +15,7 @@
 namespace Compiler::Passes::Sema;
 
 import Compiler::Diag;
+import Compiler::DeclIndex;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Expression;
@@ -41,23 +42,17 @@ import Utils::Logger;
 // ============================================================================
 
 /// Walks all function bodies, filling resolved_type on every ExpressionNode.
-/// Built once from top-level declarations, then driven through the AST via
-/// the visitor pattern.  Uses HashMap for O(1) lookups in all lookup tables.
+/// Queries the shared DeclarationIndex (populated by TypeResolution and
+/// Specialization passes) for O(1) declaration lookups.  Only per-function
+/// state (locals, scope undo log) lives on the visitor itself.
 type class TypeCheckVisitor : BaseASTVisitor {
 public:
 
-    // -- Shared environment (built once from top-level declarations) --
+    // -- Shared environment --
     arena:   TypeArena*;
     checker: TypeChecker;
     intern:  InternTable*;
     ctx:     CompilationContext*;
-
-    // Lookup maps (populated during build)
-    func_returns:   HashMap<u32, TypeRef>;    // SymbolStr.id → return type
-    method_returns: HashMap<u64, TypeRef>;    // packed(type_id, method_id) → return type
-    type_map:       HashMap<u32, TypeRef>;    // SymbolStr.id → TypeRef
-    global_vars:    HashMap<u32, TypeRef>;    // SymbolStr.id → TypeRef
-    type_reverse:   HashMap<u64, u32>;        // TypeRef.id  → SymbolStr.id
 
     // -- Per-function state (reset via enter_function for each body) --
     locals:      HashMap<u32, TypeRef>;    // local variable scope
@@ -79,11 +74,6 @@ public:
         this.checker        = TypeChecker::new(arena);
         this.intern         = intern;
         this.ctx            = ctx;
-        this.func_returns   = HashMap<u32, TypeRef>::new();
-        this.method_returns = HashMap<u64, TypeRef>::new();
-        this.type_map       = HashMap<u32, TypeRef>::new();
-        this.global_vars    = HashMap<u32, TypeRef>::new();
-        this.type_reverse   = HashMap<u64, u32>::new();
         this.locals         = HashMap<u32, TypeRef>::new();
         this.undo_keys      = [];
         this.undo_prev      = [];
@@ -93,143 +83,37 @@ public:
         this.body_count     = 0;
     }
 
-    /// Build a TypeCheckVisitor from the compilation context,
-    /// scanning all top-level declarations to populate lookup maps.
+    /// Build a TypeCheckVisitor from the compilation context.
+    /// Declaration lookups are served by ctx.decl_index (populated
+    /// incrementally by TypeResolution and Specialization passes),
+    /// so no AST scan is needed here.
     static build(ctx: CompilationContext*) -> TypeCheckVisitor {
-        const arena: TypeArena* = ctx.type_arena;
-        mut v: TypeCheckVisitor = TypeCheckVisitor(arena, ctx.get_intern_table(), ctx);
-
-        const root: ProgramNode* = ctx.artifacts.ast.root;
-        if (root == null) { return v; }
-
-        for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
-            if (stmt != null) {
-                v.register_top_level(stmt);
-            }
-        }
-
-        return v;
+        return TypeCheckVisitor(ctx.type_arena, ctx.get_intern_table(), ctx);
     }
 
 
     // ================================================================
-    // Top-Level Registration
-    // ================================================================
-
-    /// Register a single top-level declaration into the lookup maps.
-    register_top_level(mut &this, stmt: ASTNode*) -> void {
-        match (stmt.kind) {
-            NodeKind::FunctionDeclaration => {
-                const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                this.register_func(func.name, func.resolved_return_type);
-            }
-            NodeKind::VariableDeclaration => {
-                const var_node: VarDeclNode* = stmt as VarDeclNode*;
-                if (var_node.resolved_type.is_valid()) {
-                    this.register_global(var_node.name, var_node.resolved_type);
-                }
-            }
-            NodeKind::StructDeclaration => {
-                const node: StructDeclNode* = stmt as StructDeclNode*;
-                this.register_type_name(node.name, this.ctx.qualify_symbol_sym(node.name));
-                this.register_methods(node.name, node.methods);
-            }
-            NodeKind::ClassDeclaration => {
-                const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                this.register_type_name(node.name, this.ctx.qualify_symbol_sym(node.name));
-                this.register_methods(node.name, node.methods);
-            }
-            NodeKind::EnumDeclaration => {
-                const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                this.register_type_name(node.name, this.ctx.qualify_symbol_sym(node.name));
-            }
-            NodeKind::TraitDeclaration => {
-                const node: TraitDeclNode* = stmt as TraitDeclNode*;
-                this.register_type_name(node.name, this.ctx.qualify_symbol_sym(node.name));
-            }
-            NodeKind::ImplementationBlock => {
-                const node: ImplBlockNode* = stmt as ImplBlockNode*;
-                this.register_methods(node.target_type, node.methods);
-            }
-            _ => {}
-        }
-    }
-
-    register_func(mut &this, name: SymbolStr, ret: TypeRef) -> void {
-        const h: u64 = hash_int(name.id as u64);
-        this.func_returns.insert(name.id, ret, h);
-    }
-
-    register_global(mut &this, name: SymbolStr, ty: TypeRef) -> void {
-        const h: u64 = hash_int(name.id as u64);
-        this.global_vars.insert(name.id, ty, h);
-    }
-
-    register_type_name(mut &this, name: SymbolStr, qualified_sym: SymbolStr) -> void {
-        const ty: TypeRef = this.arena.lookup_by_name(qualified_sym);
-        if (ty.is_valid()) {
-            const h: u64 = hash_int(name.id as u64);
-            this.type_map.insert(name.id, ty, h);
-            const rh: u64 = hash_int(ty.id);
-            this.type_reverse.insert(ty.id, name.id, rh);
-        }
-    }
-
-    register_methods(mut &this, type_sym: SymbolStr, methods: MethodNode*[]) -> void {
-        for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
-            if (method == null || method.func == null) { continue; }
-            const key: u64 = pack_method_key(type_sym, method.func.name);
-            const h: u64 = hash_int(key);
-            this.method_returns.insert(key, method.func.resolved_return_type, h);
-        }
-    }
-
-
-    // ================================================================
-    // Lookup Helpers
+    // Lookup Helpers — delegate to ctx.decl_index
     // ================================================================
 
     lookup_func_return(&this, name: SymbolStr) -> TypeRef {
-        const h: u64 = hash_int(name.id as u64);
-        return match (this.func_returns.get(name.id, h)) {
-            Option::Some(val) => { val }
-            Option::None      => { TypeRef::invalid() }
-        };
+        return this.ctx.decl_index.lookup_func_return(name);
     }
 
     lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
-        const key: u64 = pack_method_key(type_sym, method_sym);
-        const h: u64 = hash_int(key);
-        return match (this.method_returns.get(key, h)) {
-            Option::Some(val) => { val }
-            Option::None      => { TypeRef::invalid() }
-        };
+        return this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
     }
 
     lookup_type_by_sym(&this, name: SymbolStr) -> TypeRef {
-        const h: u64 = hash_int(name.id as u64);
-        return match (this.type_map.get(name.id, h)) {
-            Option::Some(val) => { val }
-            Option::None      => { TypeRef::invalid() }
-        };
+        return this.ctx.decl_index.lookup_type(name);
     }
 
     lookup_global_var(&this, name: SymbolStr) -> TypeRef {
-        const h: u64 = hash_int(name.id as u64);
-        return match (this.global_vars.get(name.id, h)) {
-            Option::Some(val) => { val }
-            Option::None      => { TypeRef::invalid() }
-        };
+        return this.ctx.decl_index.lookup_global(name);
     }
 
     lookup_type_sym(&this, ty: TypeRef) -> SymbolStr {
-        const h: u64 = hash_int(ty.id);
-        return match (this.type_reverse.get(ty.id, h)) {
-            Option::Some(val) => { SymbolStr::from_id(val) }
-            Option::None      => { SymbolStr::empty() }
-        };
+        return this.ctx.decl_index.lookup_type_name(ty);
     }
 
     lookup_local(&this, name: SymbolStr) -> TypeRef {
@@ -860,18 +744,6 @@ public:
         }
         return this.arena.get_tuple(elem_types);
     }
-}
-
-
-// ============================================================================
-// Helper: Pack two SymbolStr IDs into a u64 for method lookup keys
-// ============================================================================
-
-/// Combines a type's SymbolStr.id and a method's SymbolStr.id into a single
-/// u64 key for the method_returns HashMap.  Uses the upper 32 bits for the
-/// type and lower 32 bits for the method name.
-function pack_method_key(type_sym: SymbolStr, method_sym: SymbolStr) -> u64 {
-    return (type_sym.id as u64) * 4294967296 + (method_sym.id as u64);
 }
 
 

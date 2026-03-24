@@ -1,0 +1,155 @@
+/// Declaration Index
+///
+/// Shared lookup tables for resolved declarations, populated incrementally
+/// by TypeResolution and Specialization passes.  Sema and future passes
+/// query these maps instead of rescanning the entire AST.
+///
+/// Each registration method is idempotent — re-registering a name with a
+/// new TypeRef simply overwrites the old entry.
+
+namespace Compiler::DeclIndex;
+
+import Compiler::AST::Declaration;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Types::TypeRef;
+import std::collections::hashmap;
+
+
+// ============================================================================
+// Helper: Pack two SymbolStr IDs into a u64 for method lookup keys
+// ============================================================================
+
+/// Combines a type's SymbolStr.id and a method's SymbolStr.id into a single
+/// u64 key.  Uses the upper 32 bits for the type and lower 32 bits for the
+/// method name.
+function pack_method_key(type_sym: SymbolStr, method_sym: SymbolStr) -> u64 {
+    return (type_sym.id as u64) * 4294967296 + (method_sym.id as u64);
+}
+
+
+// ============================================================================
+// DeclarationIndex
+// ============================================================================
+
+type struct DeclarationIndex {
+    // Function name → return type
+    func_returns:   HashMap<u32, TypeRef>;
+
+    // Packed(type_id, method_id) → return type
+    method_returns: HashMap<u64, TypeRef>;
+
+    // Type name → TypeRef (for struct, class, enum, trait lookups)
+    type_map:       HashMap<u32, TypeRef>;
+
+    // Global variable name → TypeRef
+    global_vars:    HashMap<u32, TypeRef>;
+
+    // Reverse: TypeRef.id → SymbolStr.id (for looking up a type's name)
+    type_reverse:   HashMap<u64, u32>;
+
+
+    static new() -> DeclarationIndex {
+        return DeclarationIndex {
+            func_returns:   HashMap<u32, TypeRef>::new(),
+            method_returns: HashMap<u64, TypeRef>::new(),
+            type_map:       HashMap<u32, TypeRef>::new(),
+            global_vars:    HashMap<u32, TypeRef>::new(),
+            type_reverse:   HashMap<u64, u32>::new(),
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Registration (called by TypeResolution & Specialization passes)
+    // ----------------------------------------------------------------
+
+    /// Register a function's return type.
+    register_function(mut &this, name: SymbolStr, return_type: TypeRef) -> void {
+        const h: u64 = hash_int(name.id as u64);
+        this.func_returns.insert(name.id, return_type, h);
+    }
+
+    /// Register a method's return type on a specific type.
+    register_method(mut &this, type_sym: SymbolStr, method_sym: SymbolStr,
+                    return_type: TypeRef) -> void {
+        const key: u64 = pack_method_key(type_sym, method_sym);
+        const h: u64 = hash_int(key);
+        this.method_returns.insert(key, return_type, h);
+    }
+
+    /// Register a named type (struct, class, enum, trait).
+    register_type(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        const h: u64 = hash_int(name.id as u64);
+        this.type_map.insert(name.id, ty, h);
+        // Also populate the reverse map
+        const rh: u64 = hash_int(ty.id);
+        this.type_reverse.insert(ty.id, name.id, rh);
+    }
+
+    /// Register a global variable's type.
+    register_global(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        const h: u64 = hash_int(name.id as u64);
+        this.global_vars.insert(name.id, ty, h);
+    }
+
+    /// Convenience: register all methods from a MethodNode*[] array on a type.
+    register_methods(mut &this, type_sym: SymbolStr, methods: MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+            this.register_method(type_sym, method.func.name,
+                                 method.func.resolved_return_type);
+        }
+    }
+
+
+    // ----------------------------------------------------------------
+    // Lookups (called by Sema and future passes)
+    // ----------------------------------------------------------------
+
+    /// Look up a function's return type by name.
+    lookup_func_return(&this, name: SymbolStr) -> TypeRef {
+        const h: u64 = hash_int(name.id as u64);
+        return match (this.func_returns.get(name.id, h)) {
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+    /// Look up a method's return type by (type, method) names.
+    lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
+        const key: u64 = pack_method_key(type_sym, method_sym);
+        const h: u64 = hash_int(key);
+        return match (this.method_returns.get(key, h)) {
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+    /// Look up a named type by its SymbolStr.
+    lookup_type(&this, name: SymbolStr) -> TypeRef {
+        const h: u64 = hash_int(name.id as u64);
+        return match (this.type_map.get(name.id, h)) {
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+    /// Look up a global variable's type by name.
+    lookup_global(&this, name: SymbolStr) -> TypeRef {
+        const h: u64 = hash_int(name.id as u64);
+        return match (this.global_vars.get(name.id, h)) {
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+    /// Reverse-lookup: get the SymbolStr for a TypeRef.
+    lookup_type_name(&this, ty: TypeRef) -> SymbolStr {
+        const h: u64 = hash_int(ty.id);
+        return match (this.type_reverse.get(ty.id, h)) {
+            Option::Some(val) => { SymbolStr::from_id(val) }
+            Option::None      => { SymbolStr::empty() }
+        };
+    }
+}
