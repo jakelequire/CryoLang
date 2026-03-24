@@ -11,10 +11,14 @@
 
 namespace Compiler::Types::Monomorphizer;
 
+import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Declaration;
+import Compiler::AST::Statement;
+import Compiler::AST::Expression;
 import Compiler::AST::Specializer;
 import Compiler::Types::Substitution;
+import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::SymbolStr;
@@ -54,6 +58,7 @@ type struct Monomorphizer {
     generic_registry:  GenericRegistry*;
     intern_table:      InternTable*;
     diagnostics:       DiagnosticSink*;
+    type_resolver:     TypeResolver*;
     specializer:       ASTSpecializer;
 
     // Worklist
@@ -80,12 +85,14 @@ type struct Monomorphizer {
     // ----------------------------------------------------------------
 
     static new(arena: TypeArena*, generic_registry: GenericRegistry*,
-               intern_table: InternTable*, diagnostics: DiagnosticSink*) -> Monomorphizer {
+               intern_table: InternTable*, diagnostics: DiagnosticSink*,
+               type_resolver: TypeResolver*) -> Monomorphizer {
         return Monomorphizer {
             arena:             arena,
             generic_registry:  generic_registry,
             intern_table:      intern_table,
             diagnostics:       diagnostics,
+            type_resolver:     type_resolver,
             specializer:       ASTSpecializer::new(arena, intern_table),
             pending:           [],
             pending_cursor:    0,
@@ -211,11 +218,19 @@ type struct Monomorphizer {
         );
         const concrete_type: TypeRef = this.create_concrete_type(entry, spec_name_sym, &subst);
 
-        // Populate the concrete type's fields/variants from the original template AST.
-        // The original AST's FieldDeclNodes have resolved_type set (with GenericParam
-        // TypeRefs) from the TypeResolution pass.  Applying the substitution maps those
-        // to concrete TypeRefs, giving the specialized type complete field info.
-        this.populate_concrete_type(concrete_type, entry, &subst);
+        // Re-resolve type annotations on the specialized AST.
+        // The cloner cleared all resolved_type fields and the substituter only
+        // rewrote annotation strings (Named("T") → Named("i32")).  This step
+        // walks the specialized AST and resolves those concrete annotations
+        // back into TypeRefs, filling resolved_type on every declaration node.
+        this.resolve_specialized_ast(result.specialized_ast, entry.node_kind);
+        for (mut ri: i64 = 0; ri < result.impl_asts.length; ri++) {
+            this.resolve_specialized_ast(result.impl_asts[ri], NodeKind::ImplementationBlock);
+        }
+
+        // Populate the concrete type's fields/variants from the SPECIALIZED AST
+        // (which now has concrete resolved_type fields from the re-resolution step).
+        this.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst);
 
         // Set resolved_type on the InstantiatedType
         const inst_t: Type* = this.arena.lookup(request.generic_type.id);
@@ -272,108 +287,186 @@ type struct Monomorphizer {
 
 
     // ----------------------------------------------------------------
-    // Concrete type population — bridge AST fields to type system
+    // Re-resolution — fill resolved_type on the specialized AST
     // ----------------------------------------------------------------
 
-    /// Walk the original template AST's fields/variants and apply the
-    /// TypeSubstitution to populate the concrete type in the arena.
-    populate_concrete_type(mut &this, concrete_type: TypeRef, entry: TemplateEntry*,
-                           subst: TypeSubstitution*) -> void {
-        const concrete_t: Type* = this.arena.lookup(concrete_type.id);
-        if (concrete_t == null) { return; }
+    /// Walk the specialized AST and resolve all type annotations into
+    /// concrete TypeRefs.  After cloning + substitution, the AST has
+    /// concrete type annotation strings (e.g., Named("i32")) but all
+    /// resolved_type fields are invalid.  This step fills them.
+    resolve_specialized_ast(mut &this, ast_node: ASTNode*, node_kind: NodeKind) -> void {
+        if (ast_node == null || this.type_resolver == null) { return; }
 
-        match (entry.node_kind) {
+        // Create a simple resolution context with no generic bindings
+        // (all types are concrete after substitution)
+        const module_name: string = "";
+        const source_file: string = "";
+        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, source_file);
+
+        match (node_kind) {
             NodeKind::StructDeclaration => {
-                this.populate_struct_fields(concrete_t as StructType*, entry, subst);
+                const decl: StructDeclNode* = ast_node as StructDeclNode*;
+                if (decl == null) { return; }
+                this.resolve_fields(decl.fields, &res_ctx);
+                this.resolve_methods(decl.methods, &res_ctx);
             }
             NodeKind::ClassDeclaration => {
-                this.populate_class_fields(concrete_t as ClassType*, entry, subst);
+                const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
+                if (decl == null) { return; }
+                this.resolve_fields(decl.fields, &res_ctx);
+                this.resolve_methods(decl.methods, &res_ctx);
             }
             NodeKind::EnumDeclaration => {
-                this.populate_enum_variants(concrete_t as EnumType*, entry, subst);
+                // Enum variants use SymbolStr names, not type annotations.
+                // Resolution handled in populate_enum_variants via name lookup.
+            }
+            NodeKind::FunctionDeclaration => {
+                const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
+                if (decl == null) { return; }
+                this.resolve_func_signature(decl, &res_ctx);
+            }
+            NodeKind::ImplementationBlock => {
+                const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
+                if (decl == null) { return; }
+                this.resolve_methods(decl.methods, &res_ctx);
             }
             _ => {}
         }
     }
 
-    /// Populate a specialized StructType's fields from the original template AST.
-    populate_struct_fields(mut &this, st: StructType*, entry: TemplateEntry*,
-                           subst: TypeSubstitution*) -> void {
-        const original: StructDeclNode* = entry.ast_node as StructDeclNode*;
-        if (original == null) { return; }
+    /// Resolve type annotations on an array of fields.
+    resolve_fields(mut &this, fields: FieldDeclNode*[], res_ctx: ResolutionContext*) -> void {
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const field: FieldDeclNode* = fields[i];
+            if (field == null) { continue; }
+            if (field.type_annotation != null && !field.resolved_type.is_valid()) {
+                const ty: TypeRef = this.type_resolver.resolve(field.type_annotation, res_ctx);
+                if (ty.is_valid()) {
+                    field.resolved_type = ty;
+                }
+            }
+        }
+    }
+
+    /// Resolve signatures on an array of methods.
+    resolve_methods(mut &this, methods: MethodNode*[], res_ctx: ResolutionContext*) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+            this.resolve_func_signature(method.func, res_ctx);
+        }
+    }
+
+    /// Resolve a single function's return type and parameter types.
+    resolve_func_signature(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*) -> void {
+        // Resolve return type
+        if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
+            const ret: TypeRef = this.type_resolver.resolve(func.return_type_annotation, res_ctx);
+            if (ret.is_valid()) {
+                func.resolved_return_type = ret;
+            }
+        }
+        // Resolve parameter types
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null) { continue; }
+            if (param.type_annotation != null && !param.resolved_type.is_valid()) {
+                const ptype: TypeRef = this.type_resolver.resolve(param.type_annotation, res_ctx);
+                if (ptype.is_valid()) {
+                    param.resolved_type = ptype;
+                }
+            }
+        }
+    }
+
+
+    // ----------------------------------------------------------------
+    // Concrete type population — read from specialized AST
+    // ----------------------------------------------------------------
+
+    /// Populate the concrete arena type from the specialized AST node,
+    /// which now has resolved_type fields filled by the re-resolution step.
+    populate_concrete_type(mut &this, concrete_type: TypeRef, specialized_ast: ASTNode*,
+                           node_kind: NodeKind, subst: TypeSubstitution*) -> void {
+        const concrete_t: Type* = this.arena.lookup(concrete_type.id);
+        if (concrete_t == null || specialized_ast == null) { return; }
+
+        match (node_kind) {
+            NodeKind::StructDeclaration => {
+                this.populate_struct_fields(concrete_t as StructType*,
+                    specialized_ast as StructDeclNode*);
+            }
+            NodeKind::ClassDeclaration => {
+                this.populate_class_fields(concrete_t as ClassType*,
+                    specialized_ast as ClassDeclNode*);
+            }
+            NodeKind::EnumDeclaration => {
+                this.populate_enum_variants(concrete_t as EnumType*,
+                    specialized_ast as EnumDeclNode*, subst);
+            }
+            _ => {}
+        }
+    }
+
+    /// Populate a specialized StructType's fields from the specialized AST.
+    /// resolved_type on each FieldDeclNode was filled by resolve_specialized_ast().
+    populate_struct_fields(mut &this, st: StructType*, decl: StructDeclNode*) -> void {
+        if (decl == null) { return; }
 
         mut field_infos: FieldInfo[] = [];
-        for (mut i: i64 = 0; i < original.fields.length; i++) {
-            const field: FieldDeclNode* = original.fields[i];
+        for (mut i: i64 = 0; i < decl.fields.length; i++) {
+            const field: FieldDeclNode* = decl.fields[i];
             if (field == null) { continue; }
-
             const is_pub: boolean = field.visibility == Visibility::Public;
-
-            // Apply substitution: GenericParam TypeRefs → concrete TypeRefs
-            mut field_type: TypeRef = TypeRef::invalid();
-            if (field.resolved_type.is_valid()) {
-                field_type = subst.apply(field.resolved_type, this.arena);
-            }
-
-            field_infos.push(FieldInfo::new(field.name, field_type, is_pub, true));
+            field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, true));
         }
         st.set_fields(field_infos);
     }
 
-    /// Populate a specialized ClassType's fields from the original template AST.
-    populate_class_fields(mut &this, ct: ClassType*, entry: TemplateEntry*,
-                          subst: TypeSubstitution*) -> void {
-        const original: ClassDeclNode* = entry.ast_node as ClassDeclNode*;
-        if (original == null) { return; }
+    /// Populate a specialized ClassType's fields from the specialized AST.
+    populate_class_fields(mut &this, ct: ClassType*, decl: ClassDeclNode*) -> void {
+        if (decl == null) { return; }
 
         mut field_infos: FieldInfo[] = [];
-        for (mut i: i64 = 0; i < original.fields.length; i++) {
-            const field: FieldDeclNode* = original.fields[i];
+        for (mut i: i64 = 0; i < decl.fields.length; i++) {
+            const field: FieldDeclNode* = decl.fields[i];
             if (field == null) { continue; }
-
             const is_pub: boolean = field.visibility == Visibility::Public;
-
-            mut field_type: TypeRef = TypeRef::invalid();
-            if (field.resolved_type.is_valid()) {
-                field_type = subst.apply(field.resolved_type, this.arena);
-            }
-
-            field_infos.push(FieldInfo::new(field.name, field_type, is_pub, true));
+            field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, true));
         }
         ct.set_fields(field_infos);
     }
 
-    /// Populate a specialized EnumType's variants from the original template AST.
-    /// Enum variants store associated types as SymbolStr names (not TypeRefs),
-    /// so we map each name through the param→arg substitution.
-    populate_enum_variants(mut &this, et: EnumType*, entry: TemplateEntry*,
+    /// Populate a specialized EnumType's variants from the specialized AST.
+    /// Enum variants store associated types as SymbolStr names (already
+    /// substituted by ASTTypeSubstituter).  We resolve each name to a TypeRef
+    /// using the arena, falling back to the TypeSubstitution for any remaining
+    /// generic parameters.
+    populate_enum_variants(mut &this, et: EnumType*, decl: EnumDeclNode*,
                            subst: TypeSubstitution*) -> void {
-        const original: EnumDeclNode* = entry.ast_node as EnumDeclNode*;
-        if (original == null) { return; }
+        if (decl == null) { return; }
 
-        for (mut i: i64 = 0; i < original.variants.length; i++) {
-            const variant: EnumVariantNode* = original.variants[i];
+        for (mut i: i64 = 0; i < decl.variants.length; i++) {
+            const variant: EnumVariantNode* = decl.variants[i];
             if (variant == null) { continue; }
 
-            // Resolve each associated type name to a concrete TypeRef
             mut payload_types: TypeRef[] = [];
             for (mut j: i64 = 0; j < variant.associated_types.length; j++) {
                 const type_sym: SymbolStr = variant.associated_types[j];
                 mut resolved: TypeRef = TypeRef::invalid();
 
-                // Check if this name is a generic parameter — O(1) SymbolStr comparison
-                for (mut k: i64 = 0; k < entry.param_names.length; k++) {
-                    if (type_sym.equals(entry.param_names[k])) {
-                        if (k < subst.replacements.length) {
-                            resolved = subst.replacements[k];
-                        }
-                        break;
-                    }
-                }
+                // Try resolving as a concrete type name in the arena
+                resolved = this.arena.lookup_by_name(type_sym);
 
-                // Not a generic param — try resolving as a concrete type name
-                if (!resolved.is_valid()) {
-                    resolved = this.arena.lookup_by_name(type_sym);
+                // Try as a primitive name via TypeResolver
+                if (!resolved.is_valid() && this.type_resolver != null) {
+                    mut res_ctx: ResolutionContext = ResolutionContext::new("", "");
+                    // Create a Named annotation for the resolver
+                    const named: NamedAnnotation* = malloc(sizeof(NamedAnnotation));
+                    *named = NamedAnnotation { name: type_sym, span: SourceSpan::none() };
+                    const ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+                    *ann = TypeAnnotation::Named(named);
+                    resolved = this.type_resolver.resolve(ann, &res_ctx);
                 }
 
                 payload_types.push(resolved);
