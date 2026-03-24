@@ -185,9 +185,10 @@ private:
     ///
     /// Fallback chain:
     ///   1. Generic bindings (T → i32 from enclosing generic context)
-    ///   2. Arena direct lookup by bare name (fast path for same-module types)
-    ///   3. Resolver scope chain + cross-module lookup → qualified arena lookup
-    ///   4. Module type registry alias resolution (last resort)
+    ///   2. Primitive name check (handles Named("i32") from generic substitution)
+    ///   3. Arena direct lookup by bare name (fast path for same-module types)
+    ///   4. Resolver scope chain + cross-module lookup → qualified arena lookup
+    ///   5. Module type registry alias resolution (last resort)
     resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*) -> TypeRef {
         const name_str: string = this.intern_table.resolve(name);
         LOG_DEBUG(LogComponent::TypeChecker, "resolve_named() name='%s'", name_str);
@@ -198,13 +199,22 @@ private:
             return binding;
         }
 
-        // 2. Direct arena lookup by bare name (fast path)
+        // 2. Check if this is a primitive type name.
+        //    After generic substitution, the ASTTypeSubstituter creates
+        //    Named("i32"), Named("string"), etc. instead of Primitive annotations.
+        //    This fallback ensures they resolve correctly.
+        const prim: TypeRef = this.resolve_primitive(name);
+        if (prim.is_valid()) {
+            return prim;
+        }
+
+        // 3. Direct arena lookup by bare name (fast path)
         mut found: TypeRef = this.arena.lookup_by_name(name);
         if (found.is_valid()) {
             return found;
         }
 
-        // 3. Delegate to Resolver for scope chain + cross-module lookup.
+        // 4. Delegate to Resolver for scope chain + cross-module lookup.
         //    The Resolver already has all type symbols from NameResolution,
         //    including imports.  It returns the qualified name for arena lookup.
         if (this.name_resolver != null) {
@@ -217,7 +227,7 @@ private:
             }
         }
 
-        // 4. Type alias resolution via ModuleTypeRegistry (last resort)
+        // 5. Type alias resolution via ModuleTypeRegistry (last resort)
         if (this.module_registry != null) {
             found = this.module_registry.lookup_alias(name);
             if (found.is_valid()) {

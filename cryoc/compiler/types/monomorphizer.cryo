@@ -115,7 +115,21 @@ type struct Monomorphizer {
     process_all(mut &this) -> boolean {
         // Import all unmonomorphized instantiations from the generic registry
         const unprocessed: TypeRef[] = this.generic_registry.collect_unmonomorphized();
+        printf("[Monomorphizer::process_all] %lld unmonomorphized instantiations\n", unprocessed.length);
         for (mut i: i64 = 0; i < unprocessed.length; i++) {
+            const _t: Type* = this.arena.lookup(unprocessed[i].id);
+            if (_t != null && _t.kind == TypeKind::InstantiatedType) {
+                const _inst: InstantiatedType* = _t as InstantiatedType*;
+                const _base_t: Type* = this.arena.lookup(_inst.generic_base.id);
+                if (_base_t != null) {
+                    printf("  [%lld] InstantiatedType(id=%llu) base_id=%llu base_kind=%s base_name='%s' args=%lld\n",
+                        i, unprocessed[i].id, _inst.generic_base.id,
+                        _base_t.kind.to_string(), _base_t.display_name(), _inst.type_args.length);
+                } else {
+                    printf("  [%lld] InstantiatedType(id=%llu) base_id=%llu (base lookup FAILED) args=%lld\n",
+                        i, unprocessed[i].id, _inst.generic_base.id, _inst.type_args.length);
+                }
+            }
             this.enqueue_from_type_ref(unprocessed[i]);
         }
 
@@ -165,6 +179,14 @@ type struct Monomorphizer {
     specialize_request(mut &this, request: MonomorphRequest, key: string) -> boolean {
         // Look up template by TypeID — the single source of truth.
         // If the type wasn't registered during TemplateRegistration, it's an error.
+        printf("[Monomorphizer::specialize_request] key='%s' base_type.id=%llu\n", key, request.base_type.id);
+        const _base_dbg: Type* = this.arena.lookup(request.base_type.id);
+        if (_base_dbg != null) {
+            printf("  base type: kind=%s display='%s'\n", _base_dbg.kind.to_string(), _base_dbg.display_name());
+        } else {
+            printf("  base type: LOOKUP FAILED for id=%llu\n", request.base_type.id);
+        }
+        printf("  registered templates: %lld\n", this.generic_registry.template_count());
         const entry: TemplateEntry* = this.generic_registry.get_template_by_type_id(request.base_type.id);
         if (entry == null) {
             this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
@@ -483,7 +505,7 @@ type struct Monomorphizer {
 
     /// Walk a type recursively, enqueuing any unmonomorphized InstantiatedTypes.
     request_nested_instantiations(mut &this, ty: TypeRef) -> void {
-        if (ty.is_invalid()) { return; }
+        if (ty.is_invalid() || ty.id == 0) { return; }
 
         const t: Type* = this.arena.lookup(ty.id);
         if (t == null) { return; }
