@@ -14,6 +14,7 @@
 namespace Compiler::Passes::Specialization;
 
 import Compiler::Diag;
+import Compiler::DeclIndex;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Declaration;
@@ -79,6 +80,53 @@ function register_generic_template(name: SymbolStr, generic_params: GenericParam
         base_type
     );
     registry.register_template(entry);
+}
+
+/// Register a newly injected specialized declaration into the DeclarationIndex
+/// so that sema can look it up without rescanning the AST.
+function register_injected_decl(stmt: ASTNode*, ctx: CompilationContext*) -> void {
+    if (stmt == null) { return; }
+    const arena: TypeArena* = ctx.type_arena;
+
+    match (stmt.kind) {
+        NodeKind::StructDeclaration => {
+            const node: StructDeclNode* = stmt as StructDeclNode*;
+            const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+            const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+            if (ty.is_valid()) {
+                ctx.decl_index.register_type(node.name, ty);
+            }
+            ctx.decl_index.register_methods(node.name, node.methods);
+        }
+        NodeKind::ClassDeclaration => {
+            const node: ClassDeclNode* = stmt as ClassDeclNode*;
+            const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+            const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+            if (ty.is_valid()) {
+                ctx.decl_index.register_type(node.name, ty);
+            }
+            ctx.decl_index.register_methods(node.name, node.methods);
+        }
+        NodeKind::EnumDeclaration => {
+            const node: EnumDeclNode* = stmt as EnumDeclNode*;
+            const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+            const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+            if (ty.is_valid()) {
+                ctx.decl_index.register_type(node.name, ty);
+            }
+        }
+        NodeKind::FunctionDeclaration => {
+            const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
+            if (func.resolved_return_type.is_valid()) {
+                ctx.decl_index.register_function(func.name, func.resolved_return_type);
+            }
+        }
+        NodeKind::ImplementationBlock => {
+            const node: ImplBlockNode* = stmt as ImplBlockNode*;
+            ctx.decl_index.register_methods(node.target_type, node.methods);
+        }
+        _ => {}
+    }
 }
 
 function register_impl_block(node: ImplBlockNode*, registry: GenericRegistry*,
@@ -282,6 +330,7 @@ type struct SpecializationPasses {
 
         for (mut i: i64 = 0; i < specialized_asts.length; i++) {
             root.add_statement(specialized_asts[i]);
+            register_injected_decl(specialized_asts[i], ctx);
         }
 
         LOG_DEBUG(LogComponent::General, "[GenericExpressionResolution] Injected %lld specialized declarations",
