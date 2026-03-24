@@ -158,6 +158,33 @@ namespace Cryo::Codegen
             return pointer_to_int(value, target_type);
         }
 
+        // Char (i8) to string (ptr): allocate a 2-byte null-terminated string.
+        // This handles `c as string` where c is a char value.
+        if (source_type->isIntegerTy(8) && is_pointer_type(target_type))
+        {
+            // Allocate 2 bytes: [char, '\0']
+            llvm::Value *buf = builder().CreateCall(
+                module()->getOrInsertFunction(
+                    "malloc",
+                    llvm::FunctionType::get(
+                        llvm::PointerType::get(llvm_ctx(), 0),
+                        {llvm::Type::getInt64Ty(llvm_ctx())},
+                        false)),
+                {llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 2)},
+                "char_to_str");
+            // Store the character
+            builder().CreateStore(value, buf);
+            // Store null terminator
+            llvm::Value *null_pos = builder().CreateGEP(
+                llvm::Type::getInt8Ty(llvm_ctx()), buf,
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 1),
+                "null_pos");
+            builder().CreateStore(
+                llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_ctx()), 0),
+                null_pos);
+            return buf;
+        }
+
         // Integer to pointer
         if (is_int_type(source_type) && is_pointer_type(target_type))
         {
