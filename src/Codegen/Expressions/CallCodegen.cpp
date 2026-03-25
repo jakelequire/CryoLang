@@ -6353,13 +6353,41 @@ namespace Cryo::Codegen
                                       llvm::isa<llvm::GlobalVariable>(receiver);
                     if (!is_address)
                     {
-                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                  "generate_instance_method: Materializing string receiver for &this method '{}'"
-                                  " (receiver is non-addressable ptr)",
-                                  fn_name);
-                        llvm::AllocaInst *tmp = create_entry_alloca(receiver->getType(), "string.this.tmp");
-                        builder().CreateStore(receiver, tmp);
-                        this_arg = tmp;
+                        // If the receiver was loaded from a local variable's alloca, pass the
+                        // alloca directly. This is critical for mut &this methods like append():
+                        // the method stores the new string pointer back through the &this param,
+                        // so it must point to the original variable's storage, not a temporary copy.
+                        if (auto *load_inst = llvm::dyn_cast<llvm::LoadInst>(receiver))
+                        {
+                            if (auto *source_alloca = llvm::dyn_cast<llvm::AllocaInst>(load_inst->getPointerOperand()))
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_instance_method: Using source alloca for string &this method '{}'"
+                                          " (preserves mutation semantics)",
+                                          fn_name);
+                                this_arg = source_alloca;
+                            }
+                            else
+                            {
+                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                          "generate_instance_method: Materializing string receiver for &this method '{}'"
+                                          " (receiver loaded from non-alloca)",
+                                          fn_name);
+                                llvm::AllocaInst *tmp = create_entry_alloca(receiver->getType(), "string.this.tmp");
+                                builder().CreateStore(receiver, tmp);
+                                this_arg = tmp;
+                            }
+                        }
+                        else
+                        {
+                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                      "generate_instance_method: Materializing string receiver for &this method '{}'"
+                                      " (receiver is non-addressable ptr)",
+                                      fn_name);
+                            llvm::AllocaInst *tmp = create_entry_alloca(receiver->getType(), "string.this.tmp");
+                            builder().CreateStore(receiver, tmp);
+                            this_arg = tmp;
+                        }
                     }
                 }
             }

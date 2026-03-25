@@ -872,21 +872,48 @@ namespace Cryo::Codegen
             return nullptr;
         }
 
-        // Check if we need to store through a pointer.
-        // When the variable is a pointer type (e.g., Expr*) but the value is a struct/aggregate
-        // type (e.g., %Expr from an enum constructor), we must load the pointer first and store
-        // the value through it into the heap-allocated memory, rather than overwriting the
-        // pointer alloca itself.
+        // Check if we need to store through a pointer (indirect store).
+        // Two cases require indirection:
+        //   1. Pointer alloca with struct value: the pointer targets a heap-allocated
+        //      struct, so we load the pointer and store the value through it.
+        //   2. Reference parameter (mut &this / mut &param): the alloca holds the
+        //      address of the caller's variable. Assignment must write through that
+        //      address so the caller sees the change.
         llvm::Type *alloc_type = nullptr;
         if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(var_ptr))
             alloc_type = alloca->getAllocatedType();
         else if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(var_ptr))
             alloc_type = global->getValueType();
 
+        bool store_through_ptr = false;
+
+        // Case 1: struct value through pointer (e.g., heap-allocated enum/class)
         if (alloc_type && alloc_type->isPointerTy() && value->getType()->isStructTy())
         {
+            store_through_ptr = true;
+        }
+
+        // Case 2: reference parameter — the variable's Cryo type is Reference,
+        // meaning the alloca holds an address we must write through, not overwrite.
+        // This handles `this = x` in mut &this methods on primitive types (string, etc.).
+        if (!store_through_ptr && alloc_type && alloc_type->isPointerTy())
+        {
+            auto &var_types = ctx().variable_types_map();
+            auto it = var_types.find(var_name);
+            if (it != var_types.end() && it->second.is_valid() &&
+                it->second->kind() == Cryo::TypeKind::Reference)
+            {
+                store_through_ptr = true;
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Assignment: Variable '{}' is a reference parameter, storing through indirection",
+                          var_name);
+            }
+        }
+
+        if (store_through_ptr)
+        {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                      "Assignment: Storing struct value through pointer for variable '{}'", var_name);
+                      "Assignment: Storing value through pointer for variable '{}'", var_name);
             llvm::Value *ptr_val = builder().CreateLoad(alloc_type, var_ptr, "ptr.deref");
             builder().CreateStore(value, ptr_val);
         }
