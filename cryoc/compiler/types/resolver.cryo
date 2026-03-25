@@ -14,6 +14,8 @@ namespace Compiler::Types::Resolver;
 
 import Compiler::Diag;
 import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::Resolver;
@@ -308,6 +310,27 @@ private:
                     "expected %d, got %d",
                     entry.param_count, args.length);
                 return TypeRef::invalid();
+            }
+
+            // Generic type alias expansion: instead of creating an
+            // InstantiatedType(alias, args) that the Monomorphizer cannot
+            // specialize, resolve the alias's target annotation with concrete
+            // args bound to its generic params.
+            //   e.g. type SomeResult<T> = Result<T, string>;
+            //        SomeResult<int> → resolve Result<T, string> with {T→int}
+            //                        → Result<int, string> (a real instantiation)
+            if (entry.node_kind == NodeKind::TypeAliasDeclaration) {
+                const alias_node: TypeAliasDeclNode* = entry.ast_node as TypeAliasDeclNode*;
+                if (alias_node != null && alias_node.target_annotation != null) {
+                    mut alias_ctx: ResolutionContext = *ctx;
+                    for (mut i: i64 = 0; i < entry.param_count; i++) {
+                        alias_ctx.add_binding(entry.param_names[i], args[i]);
+                    }
+                    LOG_DEBUG(LogComponent::TypeChecker,
+                        "[TypeResolver] expanding generic alias '%s' with %d args",
+                        this.intern_table.resolve(entry.name), args.length);
+                    return this.resolve(alias_node.target_annotation, &alias_ctx);
+                }
             }
         }
 
