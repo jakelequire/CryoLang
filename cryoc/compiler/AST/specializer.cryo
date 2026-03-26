@@ -100,13 +100,26 @@ type struct ASTSpecializer {
 
         // 2. Generate specialized name
         const base_name_str: string = this.intern_table.resolve(entry.name);
+        printf("[ASTSpecializer] base_name='%s' type_arg_displays.len=%lld\n",
+               base_name_str, type_arg_displays.length);
+        for (mut di: i64 = 0; di < type_arg_displays.length; di++) {
+            printf("[ASTSpecializer]   arg[%lld]='%s'\n", di, type_arg_displays[di]);
+        }
         const mangled: MangledName = MangledName::from_generic(
             this.intern_table, base_name_str, type_arg_displays
         );
         const spec_name: string = this.intern_table.resolve(mangled.value);
+        printf("[ASTSpecializer] mangled.value.id=%u spec_name='%s'\n",
+               mangled.value.id, spec_name);
 
-        // 3. Clone AST
-        mut cloner: ASTCloner = new ASTCloner();
+        // 3. Clone AST — using for_specialization() so the clone is
+        //    created with the specialized name and empty generic_params
+        //    from the start.  This avoids post-clone field writes (set_name,
+        //    generic_params = []) that the C++ codegen miscompiles on class
+        //    hierarchies with vtables.
+        const spec_sym: SymbolStr = this.intern_table.intern(spec_name);
+        printf("[ASTSpecializer] spec_sym.id=%u\n", spec_sym.id);
+        mut cloner: ASTCloner = ASTCloner::for_specialization(spec_sym);
         const cloned_ast: ASTNode* = cloner.clone_node(entry.ast_node);
         if (cloned_ast == null) {
             return SpecializationResult::fail("AST clone returned null");
@@ -114,8 +127,6 @@ type struct ASTSpecializer {
 
         // 4. Build SymbolStr arrays for the substituter.
         //    entry.name and entry.param_names are already SymbolStr — no re-interning.
-        const spec_sym: SymbolStr = this.intern_table.intern(spec_name);
-
         mut arg_syms: SymbolStr[] = [];
         for (mut ai: i64 = 0; ai < type_arg_displays.length; ai++) {
             arg_syms.push(this.intern_table.intern(type_arg_displays[ai]));
@@ -128,17 +139,25 @@ type struct ASTSpecializer {
         );
         cloned_ast.accept(&substituter);
 
-        // 5. Clone + substitute each impl block
+        // 5. Renaming is already done by the cloner (step 3).
+        //    No post-clone set_name() needed.
+
+        // 6. Clone + substitute each impl block
         mut impl_asts: ASTNode*[] = [];
         for (mut i: i64 = 0; i < entry.impl_blocks.length; i++) {
             const cloned_impl: ASTNode* = cloner.clone_node(entry.impl_blocks[i]);
             if (cloned_impl != null) {
                 cloned_impl.accept(&substituter);
+                // Rename impl block target to specialized name
+                const impl_node: ImplBlockNode* = cloned_impl as ImplBlockNode*;
+                impl_node.set_target_type(spec_sym);
                 impl_asts = impl_asts + [cloned_impl];
             }
         }
 
-        // 6. Return
+        // 7. Return
         return SpecializationResult::ok(cloned_ast, impl_asts, spec_name);
     }
+
+
 }

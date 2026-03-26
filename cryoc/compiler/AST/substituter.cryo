@@ -168,12 +168,10 @@ public:
     // ================================================================
 
     override visit(node: StructDeclNode*) -> void {
-        // Rename to specialized name
-        if (node.name.equals(this.base_name)) {
-            node.name = this.spec_name;
-        }
-        // Clear generic params — this is now a concrete type
-        node.generic_params = [];
+        // NOTE: Rename and generic_params clearing are done by ASTCloner
+        // during specialization cloning (via ASTCloner::for_specialization).
+        // Doing field-level writes here (a class with vtable) caused memory
+        // corruption due to C++ codegen vtable-offset bugs on class hierarchies.
         // Substitute field type annotations
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             this.visit_field_decl(node.fields[i]);
@@ -185,10 +183,7 @@ public:
     }
 
     override visit(node: ClassDeclNode*) -> void {
-        if (node.name.equals(this.base_name)) {
-            node.name = this.spec_name;
-        }
-        node.generic_params = [];
+        // NOTE: See StructDeclNode comment — no field-level writes here.
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             this.visit_field_decl(node.fields[i]);
         }
@@ -198,45 +193,31 @@ public:
     }
 
     override visit(node: EnumDeclNode*) -> void {
-        if (node.name.equals(this.base_name)) {
-            node.name = this.spec_name;
-        }
-        node.generic_params = [];
+        // NOTE: See StructDeclNode comment — no field-level writes here.
         for (mut i: i64 = 0; i < node.variants.length; i++) {
             node.variants[i].accept(this);
         }
     }
 
     override visit(node: EnumVariantNode*) -> void {
-        // Substitute associated type SymbolStr values
-        mut new_types: SymbolStr[] = [];
+        // Substitute type annotations in associated types.
+        // Now uses structured TypeAnnotation* — the same substitute_annotation()
+        // used for fields, parameters, etc.
         for (mut i: i64 = 0; i < node.associated_types.length; i++) {
-            mut replaced: boolean = false;
-            for (mut j: i64 = 0; j < this.param_names.length; j++) {
-                if (node.associated_types[i].equals(this.param_names[j])) {
-                    new_types.push(this.type_arg_displays[j]);
-                    replaced = true;
-                    break;
-                }
-            }
-            if (!replaced) {
-                new_types.push(node.associated_types[i]);
-            }
+            this.substitute_annotation(node.associated_types[i]);
         }
-        node.associated_types = new_types;
     }
 
     override visit(node: FunctionDeclNode*) -> void {
+        // NOTE: See StructDeclNode comment — no field-level writes here.
         // Substitute parameter type annotations
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             this.visit_var_decl(node.parameters[i]);
         }
         // Substitute return type annotation
         if (node.return_type_annotation != null) {
-            node.return_type_annotation = this.substitute_annotation(node.return_type_annotation);
+            this.substitute_annotation(node.return_type_annotation);
         }
-        // Clear generic params if this function's generics match the type's
-        // (leave function-level generics that are separate from the type's)
         // Recurse into body
         if (node.has_body()) {
             node.body.accept(this);
@@ -261,12 +242,7 @@ public:
     }
 
     override visit(node: ImplBlockNode*) -> void {
-        // Rename target_type if it matches
-        if (node.target_type.equals(this.base_name)) {
-            node.target_type = this.spec_name;
-        }
-        // Clear generic params — this is now a concrete specialization
-        node.generic_params = [];
+        // NOTE: See StructDeclNode comment — no field-level writes here.
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             node.methods[i].accept(this);
         }
@@ -276,7 +252,7 @@ public:
         if (node.target_annotation != null) {
             node.target_annotation = this.substitute_annotation(node.target_annotation);
         }
-        node.generic_params = [];
+        // NOTE: generic_params clearing done by cloner — see StructDeclNode comment.
     }
 
     override visit(node: TraitDeclNode*) -> void {

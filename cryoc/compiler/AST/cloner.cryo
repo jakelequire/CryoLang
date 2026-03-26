@@ -20,6 +20,58 @@ import Compiler::AST::Visitor;
 
 
 // ============================================================================
+// Module-level specialization state
+// ============================================================================
+//
+// The ASTCloner is a class (extends BaseASTVisitor), so reading its own
+// fields from within visit() methods is unreliable — the C++ compiler's
+// codegen miscalculates field offsets on class hierarchies with vtables.
+//
+// To work around this, specialization parameters are stored in module-level
+// globals that any code can read/write without going through `this`.
+// The specializer sets these before cloning, and the cloner's visit methods
+// read and clear them.  Not re-entrant, but cloning is always single-threaded.
+
+mut g_spec_name:     SymbolStr = SymbolStr::empty();
+mut g_skip_generics: boolean   = false;
+
+/// Set the module-level specialization name + skip_generics flag.
+/// Called by the specializer before each clone operation.
+function set_clone_specialization(name: SymbolStr) -> void {
+    g_spec_name     = name;
+    g_skip_generics = true;
+    printf("[CloneSpec] set_clone_specialization: spec_name.id=%u skip=%d\n",
+           name.id, 1);
+}
+
+/// Consume the one-shot specialization name.  Returns the spec_name
+/// if valid, otherwise falls back to `original`.  Clears both globals
+/// so child declarations are not affected.
+function consume_clone_spec_name(original: SymbolStr) -> SymbolStr {
+    printf("[CloneSpec] consume: g_spec_name.id=%u original.id=%u g_skip=%d\n",
+           g_spec_name.id, original.id, g_skip_generics as int);
+    if (g_spec_name.is_valid()) {
+        const name: SymbolStr = g_spec_name;
+        g_spec_name = SymbolStr::empty();
+        // NOTE: do NOT clear g_skip_generics here — consume_clone_skip_generics
+        // must read it after this function returns.
+        printf("[CloneSpec]   -> using spec_name.id=%u\n", name.id);
+        return name;
+    }
+    printf("[CloneSpec]   -> using original.id=%u\n", original.id);
+    return original;
+}
+
+/// Read and clear the skip_generics flag.  Called right after
+/// consume_clone_spec_name() in each visit() method.
+function consume_clone_skip_generics() -> boolean {
+    const skip: boolean = g_skip_generics;
+    g_skip_generics = false;
+    return skip;
+}
+
+
+// ============================================================================
 // ASTCloner — Deep-copy visitor
 // ============================================================================
 
@@ -31,6 +83,15 @@ public:
 
     ASTCloner() : BaseASTVisitor() {
         this.result = null;
+    }
+
+    /// Create a cloner configured for specialization.
+    /// Sets module-level globals (not class fields) to avoid the C++
+    /// codegen vtable-offset issue when reading from `this` inside
+    /// visit() methods.
+    static for_specialization(name: SymbolStr) -> ASTCloner {
+        set_clone_specialization(name);
+        return ASTCloner();
     }
 
 
@@ -493,7 +554,30 @@ public:
     }
 
     override visit(node: FunctionDeclNode*) -> void {
-        const c: FunctionDeclNode* = this.clone_func_decl(node);
+        const name: SymbolStr = consume_clone_spec_name(node.name);
+        const skip_gp: boolean = consume_clone_skip_generics();
+        mut c: FunctionDeclNode* = new FunctionDeclNode(name, node.span);
+        this.copy_decl_base(node, c);
+        c.is_public   = node.is_public;
+        c.is_static   = node.is_static;
+        c.is_inline   = node.is_inline;
+        c.is_variadic = node.is_variadic;
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            c.add_parameter(this.clone_var_decl(node.parameters[i]));
+        }
+        if (!skip_gp) {
+            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+            }
+        }
+        c.trait_bounds = node.trait_bounds;
+        if (node.return_type_annotation != null) {
+            c.set_return_type_annotation(this.clone_type_annotation(node.return_type_annotation));
+        }
+        if (node.has_body()) {
+            node.body.accept(this);
+            c.set_body(this.result as BlockStmtNode*);
+        }
         this.result = c;
     }
 
@@ -553,10 +637,17 @@ public:
     }
 
     override visit(node: StructDeclNode*) -> void {
-        mut c: StructDeclNode* = new StructDeclNode(node.name, node.span);
+        printf("[CloneSpec] StructDecl visit: node.name.id=%u\n", node.name.id);
+        const name: SymbolStr = consume_clone_spec_name(node.name);
+        const skip_gp: boolean = consume_clone_skip_generics();
+        printf("[CloneSpec] StructDecl after consume: name.id=%u skip_gp=%d\n", name.id, skip_gp as int);
+        mut c: StructDeclNode* = new StructDeclNode(name, node.span);
         this.copy_decl_base(node, c);
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+        printf("[CloneSpec] StructDecl created: c.name.id=%u\n", c.name.id);
+        if (!skip_gp) {
+            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+            }
         }
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             c.add_field(this.clone_field_decl(node.fields[i]));
@@ -565,15 +656,20 @@ public:
             node.methods[i].accept(this);
             c.add_method(this.result as MethodNode*);
         }
+        printf("[CloneSpec] StructDecl done: c.name.id=%u\n", c.name.id);
         this.result = c;
     }
 
     override visit(node: ClassDeclNode*) -> void {
-        mut c: ClassDeclNode* = new ClassDeclNode(node.name, node.span);
+        const name: SymbolStr = consume_clone_spec_name(node.name);
+        const skip_gp: boolean = consume_clone_skip_generics();
+        mut c: ClassDeclNode* = new ClassDeclNode(name, node.span);
         this.copy_decl_base(node, c);
         c.base_class = node.base_class;
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+        if (!skip_gp) {
+            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+            }
         }
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             c.add_field(this.clone_field_decl(node.fields[i]));
@@ -612,10 +708,14 @@ public:
     }
 
     override visit(node: EnumDeclNode*) -> void {
-        mut c: EnumDeclNode* = new EnumDeclNode(node.name, node.span);
+        const name: SymbolStr = consume_clone_spec_name(node.name);
+        const skip_gp: boolean = consume_clone_skip_generics();
+        mut c: EnumDeclNode* = new EnumDeclNode(name, node.span);
         this.copy_decl_base(node, c);
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+        if (!skip_gp) {
+            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+            }
         }
         for (mut i: i64 = 0; i < node.variants.length; i++) {
             c.add_variant(this.clone_enum_variant(node.variants[i]));
@@ -781,7 +881,10 @@ public:
     clone_enum_variant(node: EnumVariantNode*) -> EnumVariantNode* {
         mut c: EnumVariantNode* = new EnumVariantNode(node.name, node.span);
         this.copy_decl_base(node, c);
-        c.associated_types = node.associated_types;
+        // Deep-clone type annotations (not shallow copy)
+        for (mut i: i64 = 0; i < node.associated_types.length; i++) {
+            c.add_associated_type(this.clone_type_annotation(node.associated_types[i]));
+        }
         c.explicit_value   = node.explicit_value;
         c.has_value        = node.has_value;
         return c;
