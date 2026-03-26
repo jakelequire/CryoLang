@@ -547,10 +547,13 @@ type struct Monomorphizer {
         }
 
         if (angle_pos < 0) {
-            // Simple name — create Named annotation
+            // Simple name — create Named annotation.
+            // Set fields individually (not via struct-literal assignment
+            // through pointer) to work around C++ compiler codegen issue.
             const sym: SymbolStr = this.intern_table.intern(s);
             const named: NamedAnnotation* = malloc(sizeof(NamedAnnotation));
-            *named = NamedAnnotation { name: sym, span: SourceSpan::none() };
+            named.name = sym;
+            named.span = SourceSpan::none();
             const ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
             *ann = TypeAnnotation::Named(named);
             return ann;
@@ -560,7 +563,8 @@ type struct Monomorphizer {
         const base_str: string = substr(s, 0, angle_pos);
         const base_sym: SymbolStr = this.intern_table.intern(base_str);
         const base_named: NamedAnnotation* = malloc(sizeof(NamedAnnotation));
-        *base_named = NamedAnnotation { name: base_sym, span: SourceSpan::none() };
+        base_named.name = base_sym;
+        base_named.span = SourceSpan::none();
         const base_ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
         *base_ann = TypeAnnotation::Named(base_named);
 
@@ -607,7 +611,9 @@ type struct Monomorphizer {
         }
 
         const gen: GenericAnnotation* = malloc(sizeof(GenericAnnotation));
-        *gen = GenericAnnotation { base: base_ann, args: args, span: SourceSpan::none() };
+        gen.base = base_ann;
+        gen.args = args;
+        gen.span = SourceSpan::none();
         const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
         *result = TypeAnnotation::Generic(gen);
         return result;
@@ -634,6 +640,9 @@ type struct Monomorphizer {
     // ----------------------------------------------------------------
 
     /// Walk a type recursively, enqueuing any unmonomorphized InstantiatedTypes.
+    /// Uses enqueue_from_type_ref (not enqueue_from_inst) so that all requests
+    /// go through the same validation: base type must be a registered template,
+    /// args must not contain unresolved generic params, etc.
     request_nested_instantiations(mut &this, ty: TypeRef) -> void {
         if (ty.is_invalid() || ty.id == 0) { return; }
 
@@ -644,7 +653,7 @@ type struct Monomorphizer {
             TypeKind::InstantiatedType => {
                 const inst: InstantiatedType* = t as InstantiatedType*;
                 if (!inst.has_resolved_type()) {
-                    this.enqueue_from_inst(ty, inst);
+                    this.enqueue_from_type_ref(ty);
                 }
                 // Also recurse into type args
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) {
