@@ -71,44 +71,21 @@ public:
                 return ann;
             }
             TypeAnnotation::Pointer(ptr) => {
-                const new_inner: TypeAnnotation* = this.substitute_annotation(ptr.inner);
-                if (new_inner == ptr.inner) { return ann; }
-                const new_ptr: PointerAnnotation* = malloc(sizeof(PointerAnnotation));
-                *new_ptr = PointerAnnotation { inner: new_inner, span: ptr.span };
-                const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
-                *result = TypeAnnotation::Pointer(new_ptr);
-                return result;
+                // In-place: recurse into inner (cloned AST)
+                this.substitute_annotation(ptr.inner);
+                return ann;
             }
             TypeAnnotation::Reference(ref) => {
-                const new_inner: TypeAnnotation* = this.substitute_annotation(ref.inner);
-                if (new_inner == ref.inner) { return ann; }
-                const new_ref: ReferenceAnnotation* = malloc(sizeof(ReferenceAnnotation));
-                *new_ref = ReferenceAnnotation {
-                    inner: new_inner, is_mutable: ref.is_mutable, span: ref.span
-                };
-                const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
-                *result = TypeAnnotation::Reference(new_ref);
-                return result;
+                this.substitute_annotation(ref.inner);
+                return ann;
             }
             TypeAnnotation::Array(arr) => {
-                const new_elem: TypeAnnotation* = this.substitute_annotation(arr.element);
-                if (new_elem == arr.element) { return ann; }
-                const new_arr: ArrayAnnotation* = malloc(sizeof(ArrayAnnotation));
-                *new_arr = ArrayAnnotation {
-                    element: new_elem, size: arr.size, span: arr.span
-                };
-                const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
-                *result = TypeAnnotation::Array(new_arr);
-                return result;
+                this.substitute_annotation(arr.element);
+                return ann;
             }
             TypeAnnotation::Optional(opt) => {
-                const new_inner: TypeAnnotation* = this.substitute_annotation(opt.inner);
-                if (new_inner == opt.inner) { return ann; }
-                const new_opt: OptionalAnnotation* = malloc(sizeof(OptionalAnnotation));
-                *new_opt = OptionalAnnotation { inner: new_inner, span: opt.span };
-                const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
-                *result = TypeAnnotation::Optional(new_opt);
-                return result;
+                this.substitute_annotation(opt.inner);
+                return ann;
             }
             TypeAnnotation::Function(func) => {
                 return this.substitute_function_annotation(ann, func);
@@ -130,69 +107,43 @@ public:
     // ----------------------------------------------------------------
 
     substitute_named_annotation(ann: TypeAnnotation*, named: NamedAnnotation*) -> TypeAnnotation* {
-        // Check if this named annotation is one of our generic params
+        // Check if this named annotation is one of our generic params.
+        // Modify in-place (the AST was already cloned) to avoid malloc
+        // issues with the C++ compiler's codegen for struct-literal
+        // assignment through pointers.
         for (mut i: i64 = 0; i < this.param_names.length; i++) {
             if (named.name.equals(this.param_names[i])) {
-                // Replace with the concrete type display name
-                const concrete_name: SymbolStr = this.type_arg_displays[i];
-                // Create a new Named annotation with the concrete type name
-                const new_named: NamedAnnotation* = malloc(sizeof(NamedAnnotation));
-                *new_named = NamedAnnotation { name: concrete_name, span: named.span };
-                const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
-                *result = TypeAnnotation::Named(new_named);
-                return result;
+                named.name = this.type_arg_displays[i];
+                return ann;
             }
         }
         return ann;
     }
 
     substitute_function_annotation(ann: TypeAnnotation*, func: FunctionAnnotation*) -> TypeAnnotation* {
-        mut changed: boolean = false;
-        mut new_params: TypeAnnotation*[] = [];
+        // In-place: recurse into params and return type (cloned AST)
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const new_p: TypeAnnotation* = this.substitute_annotation(func.parameters[i]);
-            new_params = new_params + [new_p];
-            if (new_p != func.parameters[i]) { changed = true; }
+            this.substitute_annotation(func.parameters[i]);
         }
-        const new_ret: TypeAnnotation* = this.substitute_annotation(func.return_type);
-        if (new_ret != func.return_type) { changed = true; }
-        if (!changed) { return ann; }
-        const new_func: FunctionAnnotation* = malloc(sizeof(FunctionAnnotation));
-        *new_func = FunctionAnnotation {
-            parameters: new_params, return_type: new_ret, span: func.span
-        };
-        const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
-        *result = TypeAnnotation::Function(new_func);
-        return result;
+        this.substitute_annotation(func.return_type);
+        return ann;
     }
 
     substitute_tuple_annotation(ann: TypeAnnotation*, tup: TupleAnnotation*) -> TypeAnnotation* {
-        mut changed: boolean = false;
-        mut new_elems: TypeAnnotation*[] = [];
+        // In-place: recurse into elements (cloned AST)
         for (mut i: i64 = 0; i < tup.elements.length; i++) {
-            const new_e: TypeAnnotation* = this.substitute_annotation(tup.elements[i]);
-            new_elems = new_elems + [new_e];
-            if (new_e != tup.elements[i]) { changed = true; }
+            this.substitute_annotation(tup.elements[i]);
         }
-        if (!changed) { return ann; }
-        const new_tup: TupleAnnotation* = malloc(sizeof(TupleAnnotation));
-        *new_tup = TupleAnnotation { elements: new_elems, span: tup.span };
-        const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
-        *result = TypeAnnotation::Tuple(new_tup);
-        return result;
+        return ann;
     }
 
     substitute_generic_annotation(ann: TypeAnnotation*, gen: GenericAnnotation*) -> TypeAnnotation* {
-        const new_base: TypeAnnotation* = this.substitute_annotation(gen.base);
-        mut new_args: TypeAnnotation*[] = [];
+        // Modify in-place: recurse into base and args (the AST was cloned).
+        this.substitute_annotation(gen.base);
         for (mut i: i64 = 0; i < gen.args.length; i++) {
-            new_args = new_args + [this.substitute_annotation(gen.args[i])];
+            this.substitute_annotation(gen.args[i]);
         }
-        const new_gen: GenericAnnotation* = malloc(sizeof(GenericAnnotation));
-        *new_gen = GenericAnnotation { base: new_base, args: new_args, span: gen.span };
-        const result: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
-        *result = TypeAnnotation::Generic(new_gen);
-        return result;
+        return ann;
     }
 
 
