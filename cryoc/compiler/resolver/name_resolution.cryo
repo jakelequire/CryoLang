@@ -124,7 +124,7 @@ public:
                 if (var_node.is_global) {
                     const sym_id: SymbolID = this.resolver.declare_variable(
                         var_node.name, var_node.span, var_node.is_mutable);
-                    // Global variables are not exported by default
+                    this.resolver.record_resolution(var_node.span, sym_id);
                 }
             }
             NodeKind::ImportDeclaration => {
@@ -193,10 +193,11 @@ public:
         // Declare generic params
         this.declare_generics(node.generic_params);
 
-        // Declare parameters
+        // Declare parameters and record spans for type write-back
         for (mut i: int = 0; i < node.parameters.length; i++) {
             const param: VarDeclNode* = node.parameters[i];
-            this.resolver.declare_parameter(param.name, param.span);
+            const param_sym: SymbolID = this.resolver.declare_parameter(param.name, param.span);
+            this.resolver.record_resolution(param.span, param_sym);
         }
 
         // Visit body
@@ -319,7 +320,10 @@ public:
     override visit(node: VarDeclNode*) -> void {
         // Local variable declarations (globals handled in forward_declare)
         if (!node.is_global) {
-            this.resolver.declare_variable(node.name, node.span, node.is_mutable);
+            const sym_id: SymbolID = this.resolver.declare_variable(node.name, node.span, node.is_mutable);
+            // Record the declaration span so downstream passes (TypeResolution,
+            // Sema) can map VarDeclNode.span → SymbolID for type write-back.
+            this.resolver.record_resolution(node.span, sym_id);
         }
 
         // Visit initializer expression
@@ -350,7 +354,8 @@ public:
             this.resolver.enter_scope(ScopeKind::Function, node.name, node.span);
             for (mut i: int = 0; i < node.parameters.length; i++) {
                 const param: VarDeclNode* = node.parameters[i];
-                this.resolver.declare_parameter(param.name, param.span);
+                const param_sym: SymbolID = this.resolver.declare_parameter(param.name, param.span);
+                this.resolver.record_resolution(param.span, param_sym);
             }
             this.visit_block_contents(node.body);
             this.resolver.exit_scope();
