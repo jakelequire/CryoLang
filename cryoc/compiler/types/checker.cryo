@@ -128,8 +128,36 @@ type struct TypeChecker {
             return TypeCompatibility::Incompatible;
         }
 
+        // Dereference InstantiatedType → resolved_type on both sides.
+        // After monomorphization, InstantiatedType(base=Pair, args=[string])
+        // has resolved_type pointing to the concrete Pair_string StructType.
+        // Without this, the concrete type and the instantiation have different
+        // TypeIDs and would always compare as Incompatible.
+        mut effective_from: TypeRef = from;
+        mut effective_to:   TypeRef = to;
+
         mut from_type: Type* = this.arena.lookup(from.id);
         mut to_type: Type*   = this.arena.lookup(to.id);
+
+        if (from_type != null && from_type.kind == TypeKind::InstantiatedType) {
+            const from_inst: InstantiatedType* = from_type as InstantiatedType*;
+            if (from_inst.has_resolved_type()) {
+                effective_from = from_inst.resolved_type;
+                from_type = this.arena.lookup(effective_from.id);
+            }
+        }
+        if (to_type != null && to_type.kind == TypeKind::InstantiatedType) {
+            const to_inst: InstantiatedType* = to_type as InstantiatedType*;
+            if (to_inst.has_resolved_type()) {
+                effective_to = to_inst.resolved_type;
+                to_type = this.arena.lookup(effective_to.id);
+            }
+        }
+
+        // Re-check identity after dereferencing
+        if (effective_from.equals(effective_to)) {
+            return TypeCompatibility::Identical;
+        }
 
         if (from_type == null || to_type == null) {
             return TypeCompatibility::Incompatible;
@@ -173,6 +201,29 @@ type struct TypeChecker {
             mut inner_compat: TypeCompatibility = this.check_compatibility(from, opt.wrapped);
             if (inner_compat.is_assignable()) {
                 return TypeCompatibility::ImplicitConvert;
+            }
+        }
+
+        // Generic base ↔ instantiation compatibility:
+        // When an enum variant constructor like Optional::Some("Hello") returns
+        // the base enum type (Optional), but the expected type is a specialization
+        // (Optional_string), treat as compatible.  Check the ORIGINAL (pre-deref)
+        // TypeRefs: if one is an InstantiatedType whose generic_base matches the
+        // other's TypeRef, they're compatible.
+        {
+            mut orig_from: Type* = this.arena.lookup(from.id);
+            mut orig_to:   Type* = this.arena.lookup(to.id);
+            if (orig_to != null && orig_to.kind == TypeKind::InstantiatedType) {
+                const to_inst: InstantiatedType* = orig_to as InstantiatedType*;
+                if (to_inst.generic_base.equals(from)) {
+                    return TypeCompatibility::Compatible;
+                }
+            }
+            if (orig_from != null && orig_from.kind == TypeKind::InstantiatedType) {
+                const from_inst: InstantiatedType* = orig_from as InstantiatedType*;
+                if (from_inst.generic_base.equals(to)) {
+                    return TypeCompatibility::Compatible;
+                }
             }
         }
 
@@ -422,6 +473,18 @@ type struct TypeChecker {
             return TypeCheckResult::fail("Type lookup failed for field access");
         }
 
+        // Dereference InstantiatedType to its concrete resolved type
+        // so field lookups work on Pair<string> → Pair_string, etc.
+        if (base_type.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = base_type as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                base_type = this.arena.lookup(inst.resolved_type.id);
+                if (base_type == null) {
+                    return TypeCheckResult::fail("Type lookup failed for resolved instantiated type");
+                }
+            }
+        }
+
         if (base_type.kind == TypeKind::Struct) {
             mut st: StructType* = base_type as StructType*;
             mut field: FieldInfo* = st.get_field(field_name);
@@ -456,6 +519,17 @@ type struct TypeChecker {
         mut base_type: Type* = this.arena.lookup(base.id);
         if (base_type == null) {
             return TypeCheckResult::fail("Type lookup failed for index access");
+        }
+
+        // Dereference InstantiatedType to its concrete resolved type
+        if (base_type.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = base_type as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                base_type = this.arena.lookup(inst.resolved_type.id);
+                if (base_type == null) {
+                    return TypeCheckResult::fail("Type lookup failed for resolved instantiated type");
+                }
+            }
         }
 
         if (base_type.kind == TypeKind::Array) {
