@@ -252,7 +252,7 @@ public:
         if (node.body == null || node.is_generic()) { return; }
         const _fn_name: string = this.intern.resolve(node.name);
         this.enter_function(node, TypeRef::invalid());
-        this.visit(node.body);
+        this.visit_block(node.body);
         this.body_count = this.body_count + 1;
     }
 
@@ -276,7 +276,7 @@ public:
             const func: FunctionDeclNode* = node.methods[j];
             if (func != null && func.body != null) {
                 this.enter_function(func, TypeRef::invalid());
-                this.visit(func.body);
+                this.visit_block(func.body);
                 this.body_count = this.body_count + 1;
             }
         }
@@ -300,7 +300,7 @@ public:
                 owner_type
             };
             this.enter_function(method.func, method_this);
-            this.visit(method.func.body);
+            this.visit_block(method.func.body);
             this.body_count = this.body_count + 1;
         }
     }
@@ -331,13 +331,22 @@ public:
         }
     }
 
-    override visit(node: BlockStmtNode*) -> void {
-        if (node == null) { return; }
+    /// Non-overloaded block visitor.  All function-body and block visits
+    /// route through here instead of relying on overloaded virtual
+    /// dispatch (this.visit(BlockStmtNode*)), which may resolve to the
+    /// wrong visit() overload when the compiler sees BlockStmtNode* as
+    /// StatementNode*.
+    visit_block(mut &this, block: BlockStmtNode*) -> void {
+        if (block == null) { return; }
         const save: i64 = this.save_scope();
-        for (mut i: i64 = 0; i < node.statements.length; i++) {
-            this.dispatch_stmt(node.statements[i]);
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            this.dispatch_stmt(block.statements[i]);
         }
         this.restore_scope(save);
+    }
+
+    override visit(node: BlockStmtNode*) -> void {
+        this.visit_block(node);
     }
 
     override visit(node: ExprStmtNode*) -> void {
@@ -369,13 +378,11 @@ public:
                     const var_name: string = this.intern.resolve(var_node.name);
                     const decl_name: string = if (decl_ty != null) { decl_ty.display_name() } else { "?" };
                     const init_name: string = if (init_ty != null) { init_ty.display_name() } else { "?" };
-                    this.ctx.emit_error(ErrorCode::E0200_TYPE_MISMATCH,
+                    this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
                         sprintf("cannot initialize '%s' of type '%s' with value of type '%s'",
-                            var_name, decl_name, init_name));
+                            var_name, decl_name, init_name),
+                        var_node.span);
                 }
-            } else if (!var_node.has_resolved_type() && init_type.is_valid()) {
-                // No declared type — infer from initializer
-                var_node.set_resolved_type(init_type);
             }
         }
         if (var_node.resolved_type.is_valid()) {
@@ -395,9 +402,10 @@ public:
                     const expr_ty: Type* = this.arena.lookup(expr_type.id);
                     const ret_name: string = if (ret_ty != null) { ret_ty.display_name() } else { "?" };
                     const expr_name: string = if (expr_ty != null) { expr_ty.display_name() } else { "?" };
-                    this.ctx.emit_error(ErrorCode::E0200_TYPE_MISMATCH,
+                    this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
                         sprintf("cannot return value of type '%s' from function returning '%s'",
-                            expr_name, ret_name));
+                            expr_name, ret_name),
+                        node.span);
                 }
             }
         }
@@ -450,9 +458,7 @@ public:
     }
 
     override visit(node: UnsafeBlockStmtNode*) -> void {
-        if (node.block != null) {
-            this.visit(node.block);
-        }
+        this.visit_block(node.block);
     }
 
     override visit(node: SwitchStmtNode*) -> void {
@@ -461,7 +467,7 @@ public:
             const cs: CaseStmtNode* = node.cases[i];
             if (cs == null) { continue; }
             if (cs.value != null) { this.resolve_expr(cs.value); }
-            if (cs.body != null)  { this.visit(cs.body); }
+            if (cs.body != null)  { this.visit_block(cs.body); }
         }
     }
 
