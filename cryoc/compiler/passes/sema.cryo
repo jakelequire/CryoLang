@@ -33,7 +33,10 @@ import Compiler::Types::Checker;
 import Compiler::Resolver::SymbolID;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
+import Compiler::Resolver::MangledName;
 import Compiler::Resolver::Resolver;
+import Compiler::Types::Resolver;
+import Compiler::Types::GenericRegistry;
 import std::collections::hashmap;
 import Utils::Logger;
 
@@ -118,7 +121,21 @@ public:
     }
 
     lookup_type_sym(&this, ty: TypeRef) -> SymbolStr {
-        return this.ctx.decl_index.lookup_type_name(ty);
+        // First try the direct TypeRef
+        const direct: SymbolStr = this.ctx.decl_index.lookup_type_name(ty);
+        if (direct.is_valid()) { return direct; }
+
+        // If the TypeRef is an InstantiatedType with a resolved_type,
+        // dereference and try the concrete type instead.
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                return this.ctx.decl_index.lookup_type_name(inst.resolved_type);
+            }
+        }
+
+        return SymbolStr::empty();
     }
 
     lookup_local(&this, name: SymbolStr) -> TypeRef {
@@ -657,19 +674,47 @@ public:
     }
 
     resolve_scope_call(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
-        // Static method
+        // If the scope has generic args (e.g., Pair<int>::new), resolve them
+        // to build the specialized type name for method/type lookup.
+        mut lookup_sym: SymbolStr = scope.scope_name;
+        if (scope.scope_generic_args.length > 0) {
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(
+                scope.scope_name, scope.scope_generic_args);
+            if (spec_sym.is_valid()) {
+                lookup_sym = spec_sym;
+            }
+        }
+
+        // Static method (tries specialized name first, then base name)
         const method_ret: TypeRef = this.lookup_method_return(
-            scope.scope_name, scope.member_name);
+            lookup_sym, scope.member_name);
         if (method_ret.is_valid()) {
             scope.set_resolved_type(method_ret);
             return method_ret;
         }
+        // Fallback: try the base name if we used a specialized one
+        if (lookup_sym.id != scope.scope_name.id) {
+            const base_ret: TypeRef = this.lookup_method_return(
+                scope.scope_name, scope.member_name);
+            if (base_ret.is_valid()) {
+                scope.set_resolved_type(base_ret);
+                return base_ret;
+            }
+        }
 
-        // Enum variant constructor (e.g., Optional::Some(value))
-        const type_ref: TypeRef = this.lookup_type_by_sym(scope.scope_name);
+        // Enum variant constructor (e.g., Optional<string>::Some(value))
+        // Look up the specialized type first, then fallback to base.
+        const type_ref: TypeRef = this.lookup_type_by_sym(lookup_sym);
         if (type_ref.is_valid()) {
             scope.set_resolved_type(type_ref);
             return type_ref;
+        }
+        if (lookup_sym.id != scope.scope_name.id) {
+            const base_type_ref: TypeRef = this.lookup_type_by_sym(scope.scope_name);
+            if (base_type_ref.is_valid()) {
+                scope.set_resolved_type(base_type_ref);
+                return base_type_ref;
+            }
         }
 
         const scope_str: string = this.intern.resolve(scope.scope_name);
@@ -678,6 +723,36 @@ public:
             sprintf("undefined '%s::%s' — no matching static method, variant, or type",
                 scope_str, member_str));
         return TypeRef::invalid();
+    }
+
+    /// Resolve generic args on a scope name (e.g., Pair<int>) to build
+    /// the specialized type name (e.g., Pair_i32) for decl_index lookup.
+    resolve_generic_scope_name(&this, base_name: SymbolStr,
+                                generic_args: TypeAnnotation*[]) -> SymbolStr {
+        if (this.ctx.type_resolver == null) { return SymbolStr::empty(); }
+
+        mut res_ctx: ResolutionContext = ResolutionContext::new(
+            this.ctx.source_file, "");
+        mut arg_displays: string[] = [];
+        for (mut i: i64 = 0; i < generic_args.length; i++) {
+            const arg_ref: TypeRef = this.ctx.type_resolver.resolve(
+                generic_args[i], &res_ctx);
+            if (arg_ref.is_valid()) {
+                const arg_t: Type* = this.arena.lookup(arg_ref.id);
+                if (arg_t != null) {
+                    arg_displays = arg_displays + [arg_t.display_name()];
+                } else {
+                    return SymbolStr::empty();
+                }
+            } else {
+                return SymbolStr::empty();
+            }
+        }
+
+        const base_str: string = this.intern.resolve(base_name);
+        const mangled: MangledName = MangledName::from_generic(
+            this.intern, base_str, arg_displays);
+        return mangled.value;
     }
 
     resolve_member_access(mut &this, member: MemberAccessNode*) -> TypeRef {
