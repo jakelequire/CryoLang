@@ -1528,8 +1528,47 @@ namespace Cryo::Codegen
         // Register in value context
         values().set_value(name, nullptr, alloca);
 
-        // Register the variable type in variable_types_map for Array<T> detection
+        // Register the variable type in variable_types_map for member access resolution.
+        // The resolved_type from semantic analysis is the primary source.  When it's
+        // missing (e.g., cast expressions whose target type wasn't resolved by sema),
+        // fall back to the type annotation to ensure the variable_types_map has an
+        // entry — otherwise member access on the variable will fail and fall back to
+        // stale 'this' types from previous method bodies.
         TypeRef resolved_type = node->get_resolved_type();
+        if (!resolved_type.is_valid() && node->type_annotation())
+        {
+            // Try to resolve the type from the annotation via the arena
+            const Cryo::TypeAnnotation *ann = node->type_annotation();
+            if (ann)
+            {
+                std::string type_name = ann->name;
+                bool is_pointer = (ann->kind == Cryo::TypeAnnotationKind::Pointer);
+                if (!is_pointer && !type_name.empty() && type_name.back() == '*')
+                {
+                    is_pointer = true;
+                    type_name.pop_back();
+                }
+                // Look up the inner type by name
+                auto &arena = ctx().symbols().arena();
+                TypeRef inner = arena.lookup_type_by_name(type_name);
+                if (!inner.is_valid())
+                {
+                    // Try with namespace prefix
+                    std::string qualified = ctx().namespace_context().empty()
+                        ? type_name
+                        : ctx().namespace_context() + "::" + type_name;
+                    inner = arena.lookup_type_by_name(qualified);
+                }
+                if (inner.is_valid())
+                {
+                    resolved_type = is_pointer ? arena.get_pointer_to(inner) : inner;
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "DeclarationCodegen: Resolved variable type from annotation: {} -> {} (kind: {})",
+                              name, resolved_type.get()->display_name(),
+                              static_cast<int>(resolved_type->kind()));
+                }
+            }
+        }
         // Apply type substitution if we're in a generic instantiation scope
         if (resolved_type.is_valid() && _generics)
         {

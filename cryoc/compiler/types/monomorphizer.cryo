@@ -240,6 +240,28 @@ type struct Monomorphizer {
         );
         const concrete_type: TypeRef = this.create_concrete_type(entry, spec_name_sym, &subst);
 
+        // Set human-readable display name (e.g., "Pair<i32, string>") on the
+        // concrete type so debug output shows the generic form, not the mangled name.
+        if (concrete_type.is_valid()) {
+            const inst_for_name: Type* = this.arena.lookup(request.generic_type.id);
+            if (inst_for_name != null) {
+                const display: string = this.arena.format_display(inst_for_name);
+                const concrete_t: Type* = this.arena.lookup(concrete_type.id);
+                if (concrete_t != null) {
+                    if (concrete_t.kind == TypeKind::Struct) {
+                        const st: StructType* = concrete_t as StructType*;
+                        st.set_display_name(display);
+                    } else if (concrete_t.kind == TypeKind::Enum) {
+                        const et: EnumType* = concrete_t as EnumType*;
+                        et.set_display_name(display);
+                    } else if (concrete_t.kind == TypeKind::Class) {
+                        const ct: ClassType* = concrete_t as ClassType*;
+                        ct.set_display_name(display);
+                    }
+                }
+            }
+        }
+
         // Re-resolve type annotations on the specialized AST.
         // The cloner cleared all resolved_type fields and the substituter only
         // rewrote annotation strings (Named("T") → Named("i32")).  This step
@@ -349,13 +371,13 @@ type struct Monomorphizer {
             NodeKind::StructDeclaration => {
                 const decl: StructDeclNode* = ast_node as StructDeclNode*;
                 if (decl == null) { return; }
-                this.resolve_fields(decl.fields, &res_ctx);
+                this.type_resolver.resolve_fields(decl.fields, &res_ctx);
                 this.resolve_methods(decl.methods, &res_ctx);
             }
             NodeKind::ClassDeclaration => {
                 const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
                 if (decl == null) { return; }
-                this.resolve_fields(decl.fields, &res_ctx);
+                this.type_resolver.resolve_fields(decl.fields, &res_ctx);
                 this.resolve_methods(decl.methods, &res_ctx);
             }
             NodeKind::EnumDeclaration => {
@@ -365,7 +387,7 @@ type struct Monomorphizer {
             NodeKind::FunctionDeclaration => {
                 const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
                 if (decl == null) { return; }
-                this.resolve_func_signature(decl, &res_ctx);
+                this.resolve_func_and_body(decl, &res_ctx);
             }
             NodeKind::ImplementationBlock => {
                 const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
@@ -376,52 +398,24 @@ type struct Monomorphizer {
         }
     }
 
-    /// Resolve type annotations on an array of fields.
-    resolve_fields(mut &this, fields: FieldDeclNode*[], res_ctx: ResolutionContext*) -> void {
-        for (mut i: i64 = 0; i < fields.length; i++) {
-            const field: FieldDeclNode* = fields[i];
-            if (field == null) { continue; }
-            if (field.type_annotation != null && !field.resolved_type.is_valid()) {
-                const ty: TypeRef = this.type_resolver.resolve(field.type_annotation, res_ctx);
-                if (ty.is_valid()) {
-                    field.resolved_type = ty;
-                }
-            }
-        }
-    }
-
-    /// Resolve signatures on an array of methods.
+    /// Resolve signatures on an array of methods — delegates core signature
+    /// resolution to TypeResolver, then resolves body locals.
     resolve_methods(mut &this, methods: MethodNode*[], res_ctx: ResolutionContext*) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
-            this.resolve_func_signature(method.func, res_ctx);
+            this.resolve_func_and_body(method.func, res_ctx);
         }
     }
 
-    /// Resolve a single function's return type, parameter types, and
-    /// local variable types in the body.
-    resolve_func_signature(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*) -> void {
-        // Resolve return type
-        if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
-            const ret: TypeRef = this.type_resolver.resolve(func.return_type_annotation, res_ctx);
-            if (ret.is_valid()) {
-                func.resolved_return_type = ret;
-            }
-        }
-        // Resolve parameter types
-        for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const param: VarDeclNode* = func.parameters[i];
-            if (param == null) { continue; }
-            if (param.type_annotation != null && !param.resolved_type.is_valid()) {
-                const ptype: TypeRef = this.type_resolver.resolve(param.type_annotation, res_ctx);
-                if (ptype.is_valid()) {
-                    param.resolved_type = ptype;
-                }
-            }
-        }
-        // Resolve local variable types in the function body so that
-        // sema can register them during type checking.
+    /// Resolve a function's signature (via TypeResolver) and then resolve
+    /// local variable types in its body (monomorphizer-specific concern,
+    /// since cloned AST bodies have cleared resolved_type fields).
+    resolve_func_and_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*) -> void {
+        // Core signature resolution (shared with TypeResolution pass)
+        this.type_resolver.resolve_func_signature(func, res_ctx);
+        // Monomorphizer-specific: resolve local variable types in the
+        // cloned function body so sema can register them.
         if (func.body != null) {
             this.resolve_body_locals(func.body, res_ctx);
         }

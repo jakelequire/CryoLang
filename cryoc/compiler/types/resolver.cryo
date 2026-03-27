@@ -144,6 +144,97 @@ type struct TypeResolver {
         };
     }
 
+    // ----------------------------------------------------------------
+    // Batch resolution helpers (shared by TypeResolution & Monomorphizer)
+    // ----------------------------------------------------------------
+
+    /// Resolve a function's return type and parameter type annotations.
+    /// Sets resolved_return_type on the FunctionDeclNode and resolved_type
+    /// on each parameter VarDeclNode.
+    resolve_func_signature(&this, func: FunctionDeclNode*,
+                           res_ctx: ResolutionContext*) -> void {
+        if (func == null) { return; }
+
+        // Resolve return type
+        if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
+            const ret: TypeRef = this.resolve(func.return_type_annotation, res_ctx);
+            if (ret.is_valid()) {
+                func.resolved_return_type = ret;
+            }
+        }
+
+        // Resolve parameter types
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null) { continue; }
+            if (param.type_annotation != null && !param.resolved_type.is_valid()) {
+                const ptype: TypeRef = this.resolve(param.type_annotation, res_ctx);
+                if (ptype.is_valid()) {
+                    param.resolved_type = ptype;
+                }
+            }
+        }
+    }
+
+    /// Resolve type annotations on an array of FieldDeclNode.
+    resolve_fields(&this, fields: FieldDeclNode*[],
+                   res_ctx: ResolutionContext*) -> void {
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const field: FieldDeclNode* = fields[i];
+            if (field == null) { continue; }
+            if (field.type_annotation != null && !field.resolved_type.is_valid()) {
+                const ftype: TypeRef = this.resolve(field.type_annotation, res_ctx);
+                if (ftype.is_valid()) {
+                    field.resolved_type = ftype;
+                }
+            }
+        }
+    }
+
+    /// Resolve all method signatures (MethodNode*[]) on a struct/class/impl.
+    resolve_method_signatures(&this, methods: MethodNode*[],
+                              res_ctx: ResolutionContext*) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+
+            // If the method itself is generic, bind its own params
+            if (method.func.is_generic()) {
+                mut method_ctx: ResolutionContext = *res_ctx;
+                for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
+                    const gp: GenericParamNode* = method.func.generic_params[j];
+                    const gp_ref: TypeRef = this.arena.create_generic_param(gp.name, j as u64);
+                    method_ctx.add_binding(gp.name, gp_ref);
+                }
+                this.resolve_func_signature(method.func, &method_ctx);
+            } else {
+                this.resolve_func_signature(method.func, res_ctx);
+            }
+        }
+    }
+
+    /// Resolve all function signatures (FunctionDeclNode*[]) on a trait.
+    resolve_trait_method_signatures(&this, methods: FunctionDeclNode*[],
+                                    res_ctx: ResolutionContext*) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const func: FunctionDeclNode* = methods[i];
+            if (func == null) { continue; }
+
+            if (func.is_generic()) {
+                mut method_ctx: ResolutionContext = *res_ctx;
+                for (mut j: i64 = 0; j < func.generic_params.length; j++) {
+                    const gp: GenericParamNode* = func.generic_params[j];
+                    const gp_ref: TypeRef = this.arena.create_generic_param(gp.name, j as u64);
+                    method_ctx.add_binding(gp.name, gp_ref);
+                }
+                this.resolve_func_signature(func, &method_ctx);
+            } else {
+                this.resolve_func_signature(func, res_ctx);
+            }
+        }
+    }
+
+
 private:
     // ----------------------------------------------------------------
     // Dispatch helpers
