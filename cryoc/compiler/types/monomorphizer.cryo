@@ -399,7 +399,8 @@ type struct Monomorphizer {
         }
     }
 
-    /// Resolve a single function's return type and parameter types.
+    /// Resolve a single function's return type, parameter types, and
+    /// local variable types in the body.
     resolve_func_signature(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*) -> void {
         // Resolve return type
         if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
@@ -416,6 +417,77 @@ type struct Monomorphizer {
                 const ptype: TypeRef = this.type_resolver.resolve(param.type_annotation, res_ctx);
                 if (ptype.is_valid()) {
                     param.resolved_type = ptype;
+                }
+            }
+        }
+        // Resolve local variable types in the function body so that
+        // sema can register them during type checking.
+        if (func.body != null) {
+            this.resolve_body_locals(func.body, res_ctx);
+        }
+    }
+
+    /// Walk a block statement and resolve type annotations on all local
+    /// variable declarations.  Recurses into nested blocks.
+    resolve_body_locals(mut &this, block: BlockStmtNode*, res_ctx: ResolutionContext*) -> void {
+        if (block == null) { return; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            const stmt: StatementNode* = block.statements[i];
+            if (stmt == null) { continue; }
+            const node: ASTNode* = stmt as ASTNode*;
+
+            if (node.kind == NodeKind::DeclarationStatement) {
+                const decl_stmt: DeclStmtNode* = stmt as DeclStmtNode*;
+                const inner_decl: DeclarationNode* = decl_stmt.declaration;
+                if (inner_decl != null) {
+                    const inner_node: ASTNode* = inner_decl as ASTNode*;
+                    if (inner_node.kind == NodeKind::VariableDeclaration) {
+                        const var_decl: VarDeclNode* = inner_decl as VarDeclNode*;
+                        if (var_decl.type_annotation != null && !var_decl.resolved_type.is_valid()) {
+                            const vtype: TypeRef = this.type_resolver.resolve(
+                                var_decl.type_annotation, res_ctx);
+                            if (vtype.is_valid()) {
+                                var_decl.resolved_type = vtype;
+                            }
+                        }
+                    }
+                }
+            }
+            // Recurse into nested blocks
+            if (node.kind == NodeKind::BlockStatement) {
+                this.resolve_body_locals(stmt as BlockStmtNode*, res_ctx);
+            }
+            if (node.kind == NodeKind::IfStatement) {
+                const if_stmt: IfStmtNode* = stmt as IfStmtNode*;
+                if (if_stmt.then_stmt != null) {
+                    const then_node: ASTNode* = if_stmt.then_stmt as ASTNode*;
+                    if (then_node.kind == NodeKind::BlockStatement) {
+                        this.resolve_body_locals(if_stmt.then_stmt as BlockStmtNode*, res_ctx);
+                    }
+                }
+                if (if_stmt.has_else() && if_stmt.else_stmt != null) {
+                    const else_node: ASTNode* = if_stmt.else_stmt as ASTNode*;
+                    if (else_node.kind == NodeKind::BlockStatement) {
+                        this.resolve_body_locals(if_stmt.else_stmt as BlockStmtNode*, res_ctx);
+                    }
+                }
+            }
+            if (node.kind == NodeKind::WhileStatement) {
+                const while_stmt: WhileStmtNode* = stmt as WhileStmtNode*;
+                if (while_stmt.body != null) {
+                    const body_node: ASTNode* = while_stmt.body as ASTNode*;
+                    if (body_node.kind == NodeKind::BlockStatement) {
+                        this.resolve_body_locals(while_stmt.body as BlockStmtNode*, res_ctx);
+                    }
+                }
+            }
+            if (node.kind == NodeKind::ForStatement) {
+                const for_stmt: ForStmtNode* = stmt as ForStmtNode*;
+                if (for_stmt.body != null) {
+                    const body_node: ASTNode* = for_stmt.body as ASTNode*;
+                    if (body_node.kind == NodeKind::BlockStatement) {
+                        this.resolve_body_locals(for_stmt.body as BlockStmtNode*, res_ctx);
+                    }
                 }
             }
         }
