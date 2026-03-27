@@ -301,6 +301,9 @@ public:
 
     override visit(node: ImplBlockNode*) -> void {
         const impl_this: TypeRef = this.lookup_type_by_sym(node.target_type);
+        const _dbg_name: string = this.intern.resolve(node.target_type);
+        printf("[Sema:ImplBlock] target='%s' target_id=%u type_valid=%d type_id=%llu\n",
+            _dbg_name, node.target_type.id, impl_this.is_valid() as i32, impl_this.id);
         this.visit_methods(node.methods, impl_this);
     }
 
@@ -577,8 +580,9 @@ public:
         if (global.is_valid()) { return global; }
 
         const name_str: string = this.intern.resolve(ident.name);
-        this.ctx.emit_error(ErrorCode::E0201_UNDEFINED_VARIABLE,
-            sprintf("use of undefined variable '%s'", name_str));
+        this.ctx.emit_error_at(ErrorCode::E0201_UNDEFINED_VARIABLE,
+            sprintf("use of undefined variable '%s'", name_str),
+            ident.span);
         return TypeRef::invalid();
     }
 
@@ -618,6 +622,17 @@ public:
         const callee_node: ASTNode* = callee as ASTNode*;
 
         if (callee_node.kind == NodeKind::Identifier) {
+            // If the call has generic args (e.g., identity<int>(100)),
+            // resolve the specialized function name first.
+            if (call.generic_args.length > 0) {
+                const ident: IdentifierNode* = callee as IdentifierNode*;
+                const spec_sym: SymbolStr = this.resolve_generic_scope_name(
+                    ident.name, call.generic_args);
+                if (spec_sym.is_valid()) {
+                    const spec_ret: TypeRef = this.lookup_func_return(spec_sym);
+                    if (spec_ret.is_valid()) { return spec_ret; }
+                }
+            }
             return this.resolve_direct_call(callee as IdentifierNode*);
         }
         if (callee_node.kind == NodeKind::MemberAccess) {
@@ -659,7 +674,9 @@ public:
             return TypeRef::invalid();
         }
 
-        const ret: TypeRef = this.lookup_method_return(type_sym, member.member);
+        // Try direct method lookup, then walk class hierarchy
+        const ret: TypeRef = this.lookup_method_with_inheritance(
+            obj_type, type_sym, member.member);
         if (ret.is_valid()) {
             member.set_resolved_type(ret);
             return ret;
@@ -670,6 +687,39 @@ public:
         const method_name: string = this.intern.resolve(member.member);
         this.ctx.emit_error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
             sprintf("no method '%s' found on type '%s'", method_name, type_name));
+        return TypeRef::invalid();
+    }
+
+    /// Look up a method by walking the class inheritance chain.
+    /// Checks the immediate type first, then walks parent classes.
+    lookup_method_with_inheritance(&this, type_ref: TypeRef,
+                                   type_sym: SymbolStr,
+                                   method_name: SymbolStr) -> TypeRef {
+        // Try the immediate type
+        const direct: TypeRef = this.lookup_method_return(type_sym, method_name);
+        if (direct.is_valid()) { return direct; }
+
+        // Walk class hierarchy
+        mut current_ref: TypeRef = type_ref;
+        mut current_t: Type* = this.arena.lookup(current_ref.id);
+        if (current_t == null || current_t.kind != TypeKind::Class) {
+            return TypeRef::invalid();
+        }
+
+        mut current: ClassType* = current_t as ClassType*;
+        while (current.has_base && current.base_class.is_valid()) {
+            const parent_ref: TypeRef = current.base_class;
+            const parent_t: Type* = this.arena.lookup(parent_ref.id);
+            if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+            const parent_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(parent_ref);
+            if (parent_sym.is_valid()) {
+                const parent_ret: TypeRef = this.lookup_method_return(
+                    parent_sym, method_name);
+                if (parent_ret.is_valid()) { return parent_ret; }
+            }
+            current = parent_t as ClassType*;
+        }
+
         return TypeRef::invalid();
     }
 
@@ -765,10 +815,11 @@ public:
             obj_type, member.member);
         if (result.success) { return result.result_type; }
 
-        // Fall back to method lookup (for method-as-value or property patterns)
+        // Fall back to method lookup with inheritance chain
         const type_sym: SymbolStr = this.lookup_type_sym(obj_type);
         if (type_sym.is_valid()) {
-            const method_ret: TypeRef = this.lookup_method_return(type_sym, member.member);
+            const method_ret: TypeRef = this.lookup_method_with_inheritance(
+                obj_type, type_sym, member.member);
             if (method_ret.is_valid()) { return method_ret; }
 
             // Both field and method lookup failed on a valid object — emit
