@@ -200,28 +200,9 @@ public:
             } else if (this.check(TokenType::ColonColon)) {
                 // Scope resolution
                 this.advance();
-
-                // Accept identifiers and keywords that are valid as member names
-                // (e.g. `new`, `default`) after '::'.
-                const member_tok: Token = if (this.check(TokenType::Identifier) ||
-                                              this.check(TokenType::KwNew) ||
-                                              this.check(TokenType::KwDefault)) {
-                    this.advance()
-                } else {
-                    this.consume(TokenType::Identifier, "member name after '::'")
-                };
-                const scope_name: SymbolStr  = this.get_expr_name(expr);
-                const member_name: SymbolStr = this.intern_lexeme(member_tok);
-                const span: SourceSpan       = ParserBase::merge_spans(expr.span, this.span_from_token(member_tok));
-                mut sr: ScopeResolutionNode* = new ScopeResolutionNode(scope_name, member_name, span);
-
-                // Check for generic args on the scope-resolved member
-                if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
-                    const gen_args: TypeAnnotation*[] = this.parse_generic_args();
-                    sr.set_generic_args(gen_args);
-                }
-
-                expr = sr;
+                const scope_name: SymbolStr = this.get_expr_name(expr);
+                const no_gen_args: TypeAnnotation*[] = [];
+                expr = this.parse_scope_member(scope_name, no_gen_args, expr.span);
             } else if (this.check(TokenType::PlusPlus) || this.check(TokenType::MinusMinus)) {
                 // Postfix increment/decrement
                 const op: Token        = this.advance();
@@ -446,26 +427,7 @@ public:
             } else if (this.check(TokenType::ColonColon)) {
                 // Generic scope resolution: Name<T>::member
                 this.advance(); // consume '::'
-
-                const member_tok: Token = if (this.check(TokenType::Identifier) ||
-                                              this.check(TokenType::KwNew) ||
-                                              this.check(TokenType::KwDefault)) {
-                    this.advance()
-                } else {
-                    this.consume(TokenType::Identifier, "member name after '::'")
-                };
-                const member_name: SymbolStr = this.intern_lexeme(member_tok);
-                const span: SourceSpan = ParserBase::merge_spans(this.span_from_token(tok), this.span_from_token(member_tok));
-                mut sr: ScopeResolutionNode* = new ScopeResolutionNode(name, member_name, span);
-                sr.set_scope_generic_args(gen_args);
-
-                // Check for generic args on the member itself: Name<T>::member<U>
-                if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
-                    const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
-                    sr.set_generic_args(member_gen_args);
-                }
-
-                expr = sr;
+                expr = this.parse_scope_member(name, gen_args, this.span_from_token(tok));
             }
             // Generic args parsed but nothing useful follows — just continue with postfix
         }
@@ -473,25 +435,8 @@ public:
         // Check for scope resolution without generic args: Name::member
         if (this.check(TokenType::ColonColon)) {
             this.advance(); // consume '::'
-
-            const member_tok: Token = if (this.check(TokenType::Identifier) ||
-                                          this.check(TokenType::KwNew) ||
-                                          this.check(TokenType::KwDefault)) {
-                this.advance()
-            } else {
-                this.consume(TokenType::Identifier, "member name after '::'")
-            };
-            const member_name: SymbolStr = this.intern_lexeme(member_tok);
-            const span: SourceSpan = ParserBase::merge_spans(this.span_from_token(tok), this.span_from_token(member_tok));
-            mut sr: ScopeResolutionNode* = new ScopeResolutionNode(name, member_name, span);
-
-            // Check for generic args on the member itself: Name::member<U>
-            if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
-                const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
-                sr.set_generic_args(member_gen_args);
-            }
-
-            expr = sr;
+            const no_gen_args: TypeAnnotation*[] = [];
+            expr = this.parse_scope_member(name, no_gen_args, this.span_from_token(tok));
         }
 
         // Check for struct literal: Name { field: value }
@@ -649,25 +594,14 @@ public:
             lambda.add_parameter(params[i]);
         }
 
-        // Body can be a block or a single expression
-        if (this.check(TokenType::LBrace)) {
-            // Parsed as a block statement later — need forward reference
-            // For now just parse an expression
-            const body_expr: ExpressionNode* = this.parse_expression();
-            if (body_expr != null) {
-                const expr_stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
-                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
-                block.add_statement(expr_stmt);
-                lambda.set_body(block);
-            }
-        } else {
-            const body_expr: ExpressionNode* = this.parse_expression();
-            if (body_expr != null) {
-                const expr_stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
-                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
-                block.add_statement(expr_stmt);
-                lambda.set_body(block);
-            }
+        // Body: parse as expression and wrap in a block statement.
+        // TODO: support block bodies (parse_block) once forward refs are wired.
+        const body_expr: ExpressionNode* = this.parse_expression();
+        if (body_expr != null) {
+            const expr_stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
+            const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
+            block.add_statement(expr_stmt);
+            lambda.set_body(block);
         }
 
         lambda.span = this.span_from(start);
@@ -1091,6 +1025,43 @@ public:
 
 
     // ================================================================
+    // Scope Resolution Helper
+    // ================================================================
+
+    /// Consume a member name after '::' has already been consumed, create a
+    /// ScopeResolutionNode, and parse any generic args on the member.
+    /// `scope_name`       — the left-hand identifier (e.g. "Foo" in Foo::bar)
+    /// `scope_gen_args`   — generic args on the scope (e.g. <T> in Foo<T>::bar), empty if none
+    /// `start_span`       — span of the left-hand side (for merged span)
+    parse_scope_member(scope_name: SymbolStr, scope_gen_args: TypeAnnotation*[], start_span: SourceSpan) -> ScopeResolutionNode* {
+        // Accept identifiers and keywords valid as member names (e.g. `new`, `default`).
+        const member_tok: Token = if (this.check(TokenType::Identifier) ||
+                                      this.check(TokenType::KwNew) ||
+                                      this.check(TokenType::KwDefault)) {
+            this.advance()
+        } else {
+            this.consume(TokenType::Identifier, "member name after '::'")
+        };
+        const member_name: SymbolStr = this.intern_lexeme(member_tok);
+        const span: SourceSpan = ParserBase::merge_spans(start_span, this.span_from_token(member_tok));
+        mut sr: ScopeResolutionNode* = new ScopeResolutionNode(scope_name, member_name, span);
+
+        // Set scope-level generic args if present (e.g. Foo<T>::bar)
+        if (scope_gen_args.length > 0) {
+            sr.set_scope_generic_args(scope_gen_args);
+        }
+
+        // Check for generic args on the member itself: Foo::bar<U>
+        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+            const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
+            sr.set_generic_args(member_gen_args);
+        }
+
+        return sr;
+    }
+
+
+    // ================================================================
     // Generic Disambiguation
     // ================================================================
 
@@ -1259,20 +1230,7 @@ public:
                     }
                 );
 
-                mut type_args: TypeAnnotation*[] = [];
-                this.advance(); // consume '<'
-                while (!this.check(TokenType::RAngle) &&
-                       !this.check(TokenType::GreaterGreater) &&
-                       !this.is_at_end()) {
-                    const arg: TypeAnnotation* = this.parse_type_annotation();
-                    if (arg != null) {
-                        type_args.push(arg);
-                    }
-                    if (!this.match_tok(TokenType::Comma)) {
-                        break;
-                    }
-                }
-                this.consume_right_angle();
+                const type_args: TypeAnnotation*[] = this.parse_generic_args();
 
                 const gen_ann: GenericAnnotation* = new GenericAnnotation {
                     base: base_ann,
