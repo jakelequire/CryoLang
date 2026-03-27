@@ -396,8 +396,8 @@ public:
                     const decl_ty: Type* = this.arena.lookup(var_node.resolved_type.id);
                     const init_ty: Type* = this.arena.lookup(init_type.id);
                     const var_name: string = this.intern.resolve(var_node.name);
-                    const decl_name: string = if (decl_ty != null) { decl_ty.display_name() } else { "?" };
-                    const init_name: string = if (init_ty != null) { init_ty.display_name() } else { "?" };
+                    const decl_name: string = if (decl_ty != null) { this.arena.format_display(decl_ty) } else { "?" };
+                    const init_name: string = if (init_ty != null) { this.arena.format_display(init_ty) } else { "?" };
                     this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
                         sprintf("cannot initialize '%s' of type '%s' with value of type '%s'",
                             var_name, decl_name, init_name),
@@ -420,8 +420,8 @@ public:
                 if (!this.checker.can_assign(expr_type, this.return_type)) {
                     const ret_ty: Type* = this.arena.lookup(this.return_type.id);
                     const expr_ty: Type* = this.arena.lookup(expr_type.id);
-                    const ret_name: string = if (ret_ty != null) { ret_ty.display_name() } else { "?" };
-                    const expr_name: string = if (expr_ty != null) { expr_ty.display_name() } else { "?" };
+                    const ret_name: string = if (ret_ty != null) { this.arena.format_display(ret_ty) } else { "?" };
+                    const expr_name: string = if (expr_ty != null) { this.arena.format_display(expr_ty) } else { "?" };
                     this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
                         sprintf("cannot return value of type '%s' from function returning '%s'",
                             expr_name, ret_name),
@@ -450,9 +450,24 @@ public:
     }
 
     override visit(node: ForStmtNode*) -> void {
+        // For-loop init variable lives in its own scope so it's visible to
+        // condition, update, and body, but doesn't leak out.
+        const save: i64 = this.save_scope();
+
         if (node.init != null) {
             if (node.init.kind == NodeKind::DeclarationStatement) {
                 this.visit(node.init as DeclStmtNode*);
+            } else if (node.init.kind == NodeKind::VariableDeclaration) {
+                // Parser produces a raw VarDeclNode (not wrapped in DeclStmtNode)
+                // for C-style for-loop initializers: for (mut i: int = 0; ...)
+                const var_node: VarDeclNode* = node.init as VarDeclNode*;
+                if (var_node.has_initializer()) {
+                    this.resolve_expr(var_node.initializer);
+                }
+                if (var_node.resolved_type.is_valid()) {
+                    this.register_local(var_node.name, var_node.resolved_type);
+                    this.sync_to_resolver(var_node.span, var_node.resolved_type);
+                }
             } else if (node.init.kind == NodeKind::ExpressionStatement) {
                 const es: ExprStmtNode* = node.init as ExprStmtNode*;
                 this.resolve_expr(es.expression);
@@ -461,6 +476,8 @@ public:
         if (node.condition != null) { this.resolve_expr(node.condition); }
         if (node.update != null)    { this.resolve_expr(node.update); }
         this.dispatch_stmt(node.body);
+
+        this.restore_scope(save);
     }
 
     override visit(node: MatchStmtNode*) -> void {
@@ -790,7 +807,7 @@ public:
             if (arg_ref.is_valid()) {
                 const arg_t: Type* = this.arena.lookup(arg_ref.id);
                 if (arg_t != null) {
-                    arg_displays = arg_displays + [arg_t.display_name()];
+                    arg_displays = arg_displays + [this.arena.format_display(arg_t)];
                 } else {
                     return SymbolStr::empty();
                 }

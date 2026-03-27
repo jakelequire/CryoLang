@@ -2812,6 +2812,14 @@ namespace Cryo::Codegen
                 return nullptr;
             }
 
+            // Guard: if we've lost the insertion point (e.g., due to failed member
+            // access in a match arm body), bail out instead of crashing.
+            if (!builder.GetInsertBlock())
+            {
+                report_error("sprintf: no active basic block — insertion point lost");
+                return nullptr;
+            }
+
             // Allocate a stack buffer for the result
             llvm::Value *buffer = builder.CreateAlloca(
                 llvm::Type::getInt8Ty(context),
