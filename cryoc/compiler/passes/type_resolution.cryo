@@ -36,525 +36,445 @@ import Utils::Logger;
 
 
 // ============================================================================
-// Helper: bind generic params into a ResolutionContext
+// TypeResolutionRunner — holds shared resolution state for pass methods
 // ============================================================================
 
-/// For each GenericParamNode, creates a GenericParamType in the arena and
-/// adds a binding (e.g., T → GenericParamType(T, 0)) to the resolution context.
-///
-/// Delegates arena creation to TypeResolutionPasses::create_generic_param_types
-/// so there is a single source of truth for GenericParamNode → TypeRef creation.
-function bind_generic_params(generic_params: GenericParamNode*[],
-                             res_ctx: ResolutionContext*,
-                             arena: TypeArena*,
-                             ctx: CompilationContext*) -> void {
-    const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
-        generic_params, arena);
-    for (mut i: i64 = 0; i < generic_params.length; i++) {
-        const gp: GenericParamNode* = generic_params[i];
-        res_ctx.add_binding(gp.name, refs[i]);
-    }
-}
+/// Bundles the shared state needed by all type resolution helpers.
+/// Constructed once per pass invocation, then methods are called on it
+/// instead of threading (resolver, res_ctx, ctx) through every call.
+type struct TypeResolutionRunner {
+    arena:           TypeArena*;
+    resolver:        TypeResolver*;
+    name_resolver:   Resolver*;
+    ctx:             CompilationContext*;
+    module_registry: ModuleTypeRegistry*;
+    res_ctx:         ResolutionContext;
 
+    static new(ctx: CompilationContext*) -> TypeResolutionRunner {
+        const module_name: string = ctx.has_namespace()
+            ? ctx.namespace_display()
+            : ctx.source_file;
 
-// ============================================================================
-// Helper: create a resolution context with optional generic bindings
-// ============================================================================
-
-/// If `generic_params` is non-empty, creates a copy of `base_ctx` with
-/// generic param types bound.  Otherwise returns `base_ctx` as-is.
-/// Eliminates the if/else generic binding pattern repeated across passes.
-function make_generic_context(generic_params: GenericParamNode*[],
-                              base_ctx: ResolutionContext*,
-                              arena: TypeArena*,
-                              ctx: CompilationContext*) -> ResolutionContext {
-    mut result: ResolutionContext = *base_ctx;
-    if (generic_params.length > 0) {
-        bind_generic_params(generic_params, &result, arena, ctx);
-    }
-    return result;
-}
-
-
-// ============================================================================
-// Helper: register a declaration in the DeclarationIndex
-// ============================================================================
-
-/// Registers a top-level declaration (struct, class, enum, function, impl block)
-/// in the DeclarationIndex.  Looks up the type in the arena by qualified name,
-/// falling back to the bare name for monomorphized types (e.g. "Pair_i32").
-///
-/// Shared by TypeResolution (Phase 4) and Specialization (injected decl
-/// registration) so that both use the same registration logic.
-function register_decl_in_index(stmt: ASTNode*, ctx: CompilationContext*) -> void {
-    if (stmt == null) { return; }
-    const arena: TypeArena* = ctx.type_arena;
-
-    match (stmt.kind) {
-        NodeKind::StructDeclaration => {
-            const node: StructDeclNode* = stmt as StructDeclNode*;
-            const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-            mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
-            if (!ty.is_valid()) {
-                ty = arena.lookup_by_name(node.name);
-            }
-            if (ty.is_valid()) {
-                ctx.decl_index.register_type(node.name, qualified_sym, ty);
-            }
-            ctx.decl_index.register_methods(node.name, node.methods);
-        }
-        NodeKind::ClassDeclaration => {
-            const node: ClassDeclNode* = stmt as ClassDeclNode*;
-            const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-            mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
-            if (!ty.is_valid()) {
-                ty = arena.lookup_by_name(node.name);
-            }
-            if (ty.is_valid()) {
-                ctx.decl_index.register_type(node.name, qualified_sym, ty);
-            }
-            ctx.decl_index.register_methods(node.name, node.methods);
-        }
-        NodeKind::EnumDeclaration => {
-            const node: EnumDeclNode* = stmt as EnumDeclNode*;
-            const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-            mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
-            if (!ty.is_valid()) {
-                ty = arena.lookup_by_name(node.name);
-            }
-            if (ty.is_valid()) {
-                ctx.decl_index.register_type(node.name, qualified_sym, ty);
-            }
-        }
-        NodeKind::TraitDeclaration => {
-            const node: TraitDeclNode* = stmt as TraitDeclNode*;
-            const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-            mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
-            if (!ty.is_valid()) {
-                ty = arena.lookup_by_name(node.name);
-            }
-            if (ty.is_valid()) {
-                ctx.decl_index.register_type(node.name, qualified_sym, ty);
-            }
-        }
-        NodeKind::FunctionDeclaration => {
-            const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
-            if (func.resolved_return_type.is_valid()) {
-                ctx.decl_index.register_function(func.name, func.resolved_return_type);
-            }
-        }
-        NodeKind::ImplementationBlock => {
-            const node: ImplBlockNode* = stmt as ImplBlockNode*;
-            ctx.decl_index.register_methods(node.target_type, node.methods);
-        }
-        _ => {}
-    }
-}
-
-
-// ============================================================================
-// Helpers: resolve signatures/fields — delegates to TypeResolver, adds
-// error reporting and symbol write-back that are pass-specific concerns.
-// ============================================================================
-
-/// Resolves the return type annotation and all parameter type annotations
-/// on a FunctionDeclNode.  Delegates core resolution to TypeResolver, then
-/// emits diagnostics and writes back to the Resolver's symbol table.
-function resolve_func_signature(func: FunctionDeclNode*,
-                                resolver: TypeResolver*,
-                                res_ctx: ResolutionContext*,
-                                ctx: CompilationContext*) -> void {
-    if (func == null) { return; }
-
-    // Core resolution (return type + param types)
-    resolver.resolve_func_signature(func, res_ctx);
-
-    // Pass-specific: emit diagnostics for unresolved types
-    if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
-        ctx.emit_error(ErrorCode::E0203_UNDEFINED_TYPE,
-            sprintf("cannot resolve return type for function '%s'",
-                ctx.resolve_str(func.name)));
+        mut runner: TypeResolutionRunner;
+        runner.arena           = ctx.type_arena;
+        runner.resolver        = ctx.type_resolver;
+        runner.name_resolver   = ctx.get_resolver();
+        runner.ctx             = ctx;
+        runner.module_registry = ctx.module_type_registry;
+        runner.res_ctx         = ResolutionContext::new(module_name, ctx.source_file);
+        return runner;
     }
 
-    // Pass-specific: emit diagnostics + write back to Resolver's symbol table
-    const name_resolver: Resolver* = ctx.get_resolver();
-    for (mut i: i64 = 0; i < func.parameters.length; i++) {
-        const param: VarDeclNode* = func.parameters[i];
-        if (param == null) { continue; }
-        if (param.type_annotation != null && !param.resolved_type.is_valid()) {
-            ctx.emit_error(ErrorCode::E0203_UNDEFINED_TYPE,
-                sprintf("cannot resolve type for parameter '%s'",
-                    ctx.resolve_str(param.name)));
-        } else if (param.resolved_type.is_valid()) {
-            const sym_id: SymbolID = name_resolver.resolve(param.span);
-            if (sym_id.is_valid()) {
-                name_resolver.update_symbol_type(sym_id, param.resolved_type);
+
+    // ========================================================================
+    // Generic context helpers
+    // ========================================================================
+
+    /// For each GenericParamNode, creates a GenericParamType in the arena and
+    /// adds a binding (e.g., T -> GenericParamType(T, 0)) to the resolution context.
+    bind_generic_params(&this, generic_params: GenericParamNode*[],
+                        res_ctx: ResolutionContext*) -> void {
+        const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
+            generic_params, this.arena);
+        for (mut i: i64 = 0; i < generic_params.length; i++) {
+            const gp: GenericParamNode* = generic_params[i];
+            res_ctx.add_binding(gp.name, refs[i]);
+        }
+    }
+
+    /// If `generic_params` is non-empty, creates a copy of `base_ctx` with
+    /// generic param types bound.  Otherwise returns `base_ctx` as-is.
+    make_generic_context(&this, generic_params: GenericParamNode*[],
+                         base_ctx: ResolutionContext*) -> ResolutionContext {
+        mut result: ResolutionContext = *base_ctx;
+        if (generic_params.length > 0) {
+            this.bind_generic_params(generic_params, &result);
+        }
+        return result;
+    }
+
+
+    // ========================================================================
+    // Signature and field resolution helpers
+    // ========================================================================
+
+    /// Resolves the return type annotation and all parameter type annotations
+    /// on a FunctionDeclNode.  Delegates core resolution to TypeResolver, then
+    /// emits diagnostics and writes back to the Resolver's symbol table.
+    resolve_func_signature(&this, func: FunctionDeclNode*,
+                           res_ctx: ResolutionContext*) -> void {
+        if (func == null) { return; }
+
+        // Core resolution (return type + param types)
+        this.resolver.resolve_func_signature(func, res_ctx);
+
+        // Emit diagnostics for unresolved types
+        if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
+            this.ctx.emit_error(ErrorCode::E0203_UNDEFINED_TYPE,
+                sprintf("cannot resolve return type for function '%s'",
+                    this.ctx.resolve_str(func.name)));
+        }
+
+        // Emit diagnostics + write back to Resolver's symbol table
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null) { continue; }
+            if (param.type_annotation != null && !param.resolved_type.is_valid()) {
+                this.ctx.emit_error(ErrorCode::E0203_UNDEFINED_TYPE,
+                    sprintf("cannot resolve type for parameter '%s'",
+                        this.ctx.resolve_str(param.name)));
+            } else if (param.resolved_type.is_valid()) {
+                const sym_id: SymbolID = this.name_resolver.resolve(param.span);
+                if (sym_id.is_valid()) {
+                    this.name_resolver.update_symbol_type(sym_id, param.resolved_type);
+                }
             }
         }
     }
-}
 
-/// Resolves type annotations on an array of FieldDeclNode.
-/// Delegates to TypeResolver, adds error diagnostics.
-function resolve_fields(fields: FieldDeclNode*[],
-                        resolver: TypeResolver*,
-                        res_ctx: ResolutionContext*,
-                        ctx: CompilationContext*) -> void {
-    // Core resolution
-    resolver.resolve_fields(fields, res_ctx);
+    /// Resolves type annotations on an array of FieldDeclNode.
+    resolve_fields(&this, fields: FieldDeclNode*[],
+                   res_ctx: ResolutionContext*) -> void {
+        // Core resolution
+        this.resolver.resolve_fields(fields, res_ctx);
 
-    // Pass-specific: emit diagnostics for unresolved fields
-    for (mut i: i64 = 0; i < fields.length; i++) {
-        const field: FieldDeclNode* = fields[i];
-        if (field == null) { continue; }
-        if (field.type_annotation != null && !field.resolved_type.is_valid()) {
-            ctx.emit_error(ErrorCode::E0203_UNDEFINED_TYPE,
-                sprintf("cannot resolve type for field '%s'",
-                    ctx.resolve_str(field.name)));
+        // Emit diagnostics for unresolved fields
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const field: FieldDeclNode* = fields[i];
+            if (field == null) { continue; }
+            if (field.type_annotation != null && !field.resolved_type.is_valid()) {
+                this.ctx.emit_error(ErrorCode::E0203_UNDEFINED_TYPE,
+                    sprintf("cannot resolve type for field '%s'",
+                        this.ctx.resolve_str(field.name)));
+            }
         }
     }
-}
 
-/// Resolves all method signatures (MethodNode*[]) on a struct/class/impl.
-/// Delegates to TypeResolver::resolve_method_signatures.
-function resolve_method_signatures(methods: MethodNode*[],
-                                   resolver: TypeResolver*,
-                                   res_ctx: ResolutionContext*,
-                                   ctx: CompilationContext*) -> void {
-    resolver.resolve_method_signatures(methods, res_ctx);
-}
+    /// Resolves all method signatures (MethodNode*[]) on a struct/class/impl.
+    resolve_method_signatures(&this, methods: MethodNode*[],
+                              res_ctx: ResolutionContext*) -> void {
+        this.resolver.resolve_method_signatures(methods, res_ctx);
+    }
 
-/// Resolves all function signatures (FunctionDeclNode*[]) on a trait.
-/// Delegates to TypeResolver::resolve_trait_method_signatures.
-function resolve_trait_method_signatures(methods: FunctionDeclNode*[],
-                                         resolver: TypeResolver*,
-                                         res_ctx: ResolutionContext*,
-                                         ctx: CompilationContext*) -> void {
-    resolver.resolve_trait_method_signatures(methods, res_ctx);
-}
+    /// Resolves all function signatures (FunctionDeclNode*[]) on a trait.
+    resolve_trait_method_signatures(&this, methods: FunctionDeclNode*[],
+                                    res_ctx: ResolutionContext*) -> void {
+        this.resolver.resolve_trait_method_signatures(methods, res_ctx);
+    }
 
 
-// ============================================================================
-// Helper: recursive statement walker for variable/expression types
-// ============================================================================
+    // ========================================================================
+    // Recursive statement walker for variable/expression types
+    // ========================================================================
 
-/// Recursively walks a statement, resolving VarDeclNode.type_annotation and
-/// CastExprNode.target_annotation within function bodies.
-function resolve_var_types_in_statement(stmt: ASTNode*,
-                                        resolver: TypeResolver*,
-                                        res_ctx: ResolutionContext*,
-                                        ctx: CompilationContext*) -> void {
-    if (stmt == null) { return; }
+    /// Recursively walks a statement, resolving VarDeclNode.type_annotation and
+    /// CastExprNode.target_annotation within function bodies.
+    resolve_var_types_in_statement(&this, stmt: ASTNode*,
+                                   res_ctx: ResolutionContext*) -> void {
+        if (stmt == null) { return; }
 
-    match (stmt.kind) {
-        NodeKind::BlockStatement => {
-            const block: BlockStmtNode* = stmt as BlockStmtNode*;
-            for (mut i: i64 = 0; i < block.statements.length; i++) {
-                resolve_var_types_in_statement(block.statements[i] as ASTNode*, resolver, res_ctx, ctx);
+        match (stmt.kind) {
+            NodeKind::BlockStatement => {
+                const block: BlockStmtNode* = stmt as BlockStmtNode*;
+                for (mut i: i64 = 0; i < block.statements.length; i++) {
+                    this.resolve_var_types_in_statement(block.statements[i] as ASTNode*, res_ctx);
+                }
             }
-        }
-        NodeKind::UnsafeBlockStatement => {
-            const unsafe_block: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
-            if (unsafe_block.block != null) {
-                resolve_var_types_in_statement(unsafe_block.block as ASTNode*, resolver, res_ctx, ctx);
+            NodeKind::UnsafeBlockStatement => {
+                const unsafe_block: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+                if (unsafe_block.block != null) {
+                    this.resolve_var_types_in_statement(unsafe_block.block as ASTNode*, res_ctx);
+                }
             }
-        }
-        NodeKind::DeclarationStatement => {
-            const decl_stmt: DeclStmtNode* = stmt as DeclStmtNode*;
-            if (decl_stmt.declaration != null) {
-                const decl: DeclarationNode* = decl_stmt.declaration;
-                if (decl.kind == NodeKind::VariableDeclaration) {
-                    const var_node: VarDeclNode* = decl as VarDeclNode*;
-                    if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
-                        const vtype: TypeRef = resolver.resolve(var_node.type_annotation, res_ctx);
-                        if (vtype.is_valid()) {
-                            var_node.resolved_type = vtype;
-                            // Write back to the Resolver's Symbol so Sema and
-                            // codegen can find the type via the canonical store.
-                            const name_resolver: Resolver* = ctx.get_resolver();
-                            const sym_id: SymbolID = name_resolver.resolve(var_node.span);
-                            if (sym_id.is_valid()) {
-                                name_resolver.update_symbol_type(sym_id, vtype);
+            NodeKind::DeclarationStatement => {
+                const decl_stmt: DeclStmtNode* = stmt as DeclStmtNode*;
+                if (decl_stmt.declaration != null) {
+                    const decl: DeclarationNode* = decl_stmt.declaration;
+                    if (decl.kind == NodeKind::VariableDeclaration) {
+                        const var_node: VarDeclNode* = decl as VarDeclNode*;
+                        if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
+                            const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
+                            if (vtype.is_valid()) {
+                                var_node.resolved_type = vtype;
+                                // Write back to the Resolver's Symbol so Sema and
+                                // codegen can find the type via the canonical store.
+                                const sym_id: SymbolID = this.name_resolver.resolve(var_node.span);
+                                if (sym_id.is_valid()) {
+                                    this.name_resolver.update_symbol_type(sym_id, vtype);
+                                }
                             }
+                            // Don't emit error for local vars — type inference may resolve them later
                         }
-                        // Don't emit error for local vars — type inference may resolve them later
                     }
                 }
             }
-        }
-        NodeKind::VariableDeclaration => {
-            // Raw VarDeclNode (not wrapped in DeclStmtNode) — produced by
-            // the parser for C-style for-loop initializers: for (mut i: int = 0; ...)
-            const var_node: VarDeclNode* = stmt as VarDeclNode*;
-            if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
-                const vtype: TypeRef = resolver.resolve(var_node.type_annotation, res_ctx);
-                if (vtype.is_valid()) {
-                    var_node.resolved_type = vtype;
-                    const name_resolver: Resolver* = ctx.get_resolver();
-                    const sym_id: SymbolID = name_resolver.resolve(var_node.span);
-                    if (sym_id.is_valid()) {
-                        name_resolver.update_symbol_type(sym_id, vtype);
+            NodeKind::VariableDeclaration => {
+                // Raw VarDeclNode (not wrapped in DeclStmtNode) — produced by
+                // the parser for C-style for-loop initializers: for (mut i: int = 0; ...)
+                const var_node: VarDeclNode* = stmt as VarDeclNode*;
+                if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
+                    const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
+                    if (vtype.is_valid()) {
+                        var_node.resolved_type = vtype;
+                        const sym_id: SymbolID = this.name_resolver.resolve(var_node.span);
+                        if (sym_id.is_valid()) {
+                            this.name_resolver.update_symbol_type(sym_id, vtype);
+                        }
                     }
                 }
             }
-        }
-        NodeKind::IfStatement => {
-            const if_stmt: IfStmtNode* = stmt as IfStmtNode*;
-            resolve_var_types_in_statement(if_stmt.then_stmt as ASTNode*, resolver, res_ctx, ctx);
-            if (if_stmt.has_else()) {
-                resolve_var_types_in_statement(if_stmt.else_stmt as ASTNode*, resolver, res_ctx, ctx);
-            }
-        }
-        NodeKind::WhileStatement => {
-            const while_stmt: WhileStmtNode* = stmt as WhileStmtNode*;
-            resolve_var_types_in_statement(while_stmt.body as ASTNode*, resolver, res_ctx, ctx);
-        }
-        NodeKind::DoWhileStatement => {
-            const do_stmt: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
-            resolve_var_types_in_statement(do_stmt.body as ASTNode*, resolver, res_ctx, ctx);
-        }
-        NodeKind::ForStatement => {
-            const for_stmt: ForStmtNode* = stmt as ForStmtNode*;
-            // Resolve init if it's a var declaration
-            if (for_stmt.init != null) {
-                resolve_var_types_in_statement(for_stmt.init, resolver, res_ctx, ctx);
-            }
-            resolve_var_types_in_statement(for_stmt.body as ASTNode*, resolver, res_ctx, ctx);
-        }
-        NodeKind::MatchStatement => {
-            const match_stmt: MatchStmtNode* = stmt as MatchStmtNode*;
-            for (mut i: i64 = 0; i < match_stmt.arms.length; i++) {
-                const arm: MatchArmNode* = match_stmt.arms[i];
-                if (arm != null && arm.body != null) {
-                    resolve_var_types_in_statement(arm.body as ASTNode*, resolver, res_ctx, ctx);
+            NodeKind::IfStatement => {
+                const if_stmt: IfStmtNode* = stmt as IfStmtNode*;
+                this.resolve_var_types_in_statement(if_stmt.then_stmt as ASTNode*, res_ctx);
+                if (if_stmt.has_else()) {
+                    this.resolve_var_types_in_statement(if_stmt.else_stmt as ASTNode*, res_ctx);
                 }
             }
-        }
-        NodeKind::ExpressionStatement => {
-            const expr_stmt: ExprStmtNode* = stmt as ExprStmtNode*;
-            // Check for cast expressions
-            const _expr: ExpressionNode* = expr_stmt.expression;
-            const _expr_node: ASTNode* = _expr as ASTNode*;
-            if (_expr != null &&
-                _expr_node.kind == NodeKind::CastExpression) {
-                const cast: CastExprNode* = expr_stmt.expression as CastExprNode*;
-                if (cast.target_annotation != null && !cast.has_resolved_target()) {
-                    const target: TypeRef = resolver.resolve(cast.target_annotation, res_ctx);
-                    if (target.is_valid()) {
-                        cast.set_resolved_target(target);
+            NodeKind::WhileStatement => {
+                const while_stmt: WhileStmtNode* = stmt as WhileStmtNode*;
+                this.resolve_var_types_in_statement(while_stmt.body as ASTNode*, res_ctx);
+            }
+            NodeKind::DoWhileStatement => {
+                const do_stmt: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+                this.resolve_var_types_in_statement(do_stmt.body as ASTNode*, res_ctx);
+            }
+            NodeKind::ForStatement => {
+                const for_stmt: ForStmtNode* = stmt as ForStmtNode*;
+                // Resolve init if it's a var declaration
+                if (for_stmt.init != null) {
+                    this.resolve_var_types_in_statement(for_stmt.init, res_ctx);
+                }
+                this.resolve_var_types_in_statement(for_stmt.body as ASTNode*, res_ctx);
+            }
+            NodeKind::MatchStatement => {
+                const match_stmt: MatchStmtNode* = stmt as MatchStmtNode*;
+                for (mut i: i64 = 0; i < match_stmt.arms.length; i++) {
+                    const arm: MatchArmNode* = match_stmt.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.resolve_var_types_in_statement(arm.body as ASTNode*, res_ctx);
                     }
                 }
             }
+            NodeKind::ExpressionStatement => {
+                const expr_stmt: ExprStmtNode* = stmt as ExprStmtNode*;
+                // Check for cast expressions
+                const _expr: ExpressionNode* = expr_stmt.expression;
+                const _expr_node: ASTNode* = _expr as ASTNode*;
+                if (_expr != null &&
+                    _expr_node.kind == NodeKind::CastExpression) {
+                    const cast: CastExprNode* = expr_stmt.expression as CastExprNode*;
+                    if (cast.target_annotation != null && !cast.has_resolved_target()) {
+                        const target: TypeRef = this.resolver.resolve(cast.target_annotation, res_ctx);
+                        if (target.is_valid()) {
+                            cast.set_resolved_target(target);
+                        }
+                    }
+                }
+            }
+            NodeKind::ReturnStatement => {
+                // Return statements don't have type annotations to resolve
+            }
+            _ => {
+                // Other statement kinds (break, continue, switch, etc.) — no type annotations
+            }
         }
-        NodeKind::ReturnStatement => {
-            // Return statements don't have type annotations to resolve
+    }
+
+
+    // ========================================================================
+    // Generic function call instantiation collection
+    // ========================================================================
+
+    /// Scan a statement (recursively) for CallExprNodes with generic_args.
+    /// For each, resolve the args and register an instantiation in the
+    /// GenericRegistry so the Monomorphizer can discover and specialize it.
+    collect_generic_fn_calls_in_stmt(&this, stmt: ASTNode*,
+                                     res_ctx: ResolutionContext*) -> void {
+        if (stmt == null) { return; }
+
+        match (stmt.kind) {
+            NodeKind::BlockStatement => {
+                const block: BlockStmtNode* = stmt as BlockStmtNode*;
+                for (mut i: i64 = 0; i < block.statements.length; i++) {
+                    this.collect_generic_fn_calls_in_stmt(block.statements[i] as ASTNode*, res_ctx);
+                }
+            }
+            NodeKind::ExpressionStatement => {
+                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+                this.collect_generic_fn_calls_in_expr(es.expression, res_ctx);
+            }
+            NodeKind::DeclarationStatement => {
+                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                if (ds.declaration != null) {
+                    const decl_node: ASTNode* = ds.declaration as ASTNode*;
+                    if (decl_node.kind == NodeKind::VariableDeclaration) {
+                        const var_node: VarDeclNode* = ds.declaration as VarDeclNode*;
+                        if (var_node.has_initializer()) {
+                            this.collect_generic_fn_calls_in_expr(var_node.initializer, res_ctx);
+                        }
+                    }
+                }
+            }
+            NodeKind::ReturnStatement => {
+                const ret: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                if (ret.has_expression()) {
+                    this.collect_generic_fn_calls_in_expr(ret.expression, res_ctx);
+                }
+            }
+            NodeKind::IfStatement => {
+                const if_stmt: IfStmtNode* = stmt as IfStmtNode*;
+                this.collect_generic_fn_calls_in_expr(if_stmt.condition, res_ctx);
+                this.collect_generic_fn_calls_in_stmt(if_stmt.then_stmt as ASTNode*, res_ctx);
+                if (if_stmt.has_else()) {
+                    this.collect_generic_fn_calls_in_stmt(if_stmt.else_stmt as ASTNode*, res_ctx);
+                }
+            }
+            NodeKind::WhileStatement => {
+                const w: WhileStmtNode* = stmt as WhileStmtNode*;
+                this.collect_generic_fn_calls_in_expr(w.condition, res_ctx);
+                this.collect_generic_fn_calls_in_stmt(w.body as ASTNode*, res_ctx);
+            }
+            NodeKind::ForStatement => {
+                const f: ForStmtNode* = stmt as ForStmtNode*;
+                if (f.init != null) { this.collect_generic_fn_calls_in_stmt(f.init, res_ctx); }
+                if (f.condition != null) { this.collect_generic_fn_calls_in_expr(f.condition, res_ctx); }
+                if (f.update != null) { this.collect_generic_fn_calls_in_expr(f.update, res_ctx); }
+                this.collect_generic_fn_calls_in_stmt(f.body as ASTNode*, res_ctx);
+            }
+            NodeKind::MatchStatement => {
+                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+                this.collect_generic_fn_calls_in_expr(ms.subject, res_ctx);
+                for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                    const arm: MatchArmNode* = ms.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.collect_generic_fn_calls_in_stmt(arm.body as ASTNode*, res_ctx);
+                    }
+                }
+            }
+            NodeKind::LoopStatement => {
+                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+                this.collect_generic_fn_calls_in_stmt(ls.body as ASTNode*, res_ctx);
+            }
+            _ => {}
         }
-        _ => {
-            // Other statement kinds (break, continue, switch, etc.) — no type annotations
+    }
+
+    /// Scan an expression (recursively) for CallExprNodes with generic_args.
+    collect_generic_fn_calls_in_expr(&this, expr: ExpressionNode*,
+                                     res_ctx: ResolutionContext*) -> void {
+        if (expr == null) { return; }
+        const node: ASTNode* = expr as ASTNode*;
+
+        match (node.kind) {
+            NodeKind::CallExpression => {
+                const call: CallExprNode* = expr as CallExprNode*;
+                // Recurse into callee and arguments first
+                this.collect_generic_fn_calls_in_expr(call.callee, res_ctx);
+                for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                    this.collect_generic_fn_calls_in_expr(call.arguments[i], res_ctx);
+                }
+                // Check for generic_args on the call
+                if (call.generic_args.length > 0) {
+                    this.register_generic_fn_call(call, res_ctx);
+                }
+            }
+            NodeKind::BinaryExpression => {
+                const bin: BinaryExprNode* = expr as BinaryExprNode*;
+                this.collect_generic_fn_calls_in_expr(bin.left, res_ctx);
+                this.collect_generic_fn_calls_in_expr(bin.right, res_ctx);
+            }
+            NodeKind::UnaryExpression => {
+                const un: UnaryExprNode* = expr as UnaryExprNode*;
+                this.collect_generic_fn_calls_in_expr(un.operand, res_ctx);
+            }
+            NodeKind::TernaryExpression => {
+                const te: TernaryExprNode* = expr as TernaryExprNode*;
+                this.collect_generic_fn_calls_in_expr(te.condition, res_ctx);
+                this.collect_generic_fn_calls_in_expr(te.true_expr, res_ctx);
+                this.collect_generic_fn_calls_in_expr(te.false_expr, res_ctx);
+            }
+            NodeKind::IfExpression => {
+                const ie: IfExprNode* = expr as IfExprNode*;
+                this.collect_generic_fn_calls_in_expr(ie.condition, res_ctx);
+                this.collect_generic_fn_calls_in_expr(ie.then_expr, res_ctx);
+                this.collect_generic_fn_calls_in_expr(ie.else_expr, res_ctx);
+            }
+            NodeKind::MemberAccess => {
+                const ma: MemberAccessNode* = expr as MemberAccessNode*;
+                this.collect_generic_fn_calls_in_expr(ma.object, res_ctx);
+            }
+            NodeKind::ArrayAccess => {
+                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+                this.collect_generic_fn_calls_in_expr(aa.array, res_ctx);
+                this.collect_generic_fn_calls_in_expr(aa.index, res_ctx);
+            }
+            _ => {
+                // Literals, identifiers, scope resolution, etc. — no nested generic calls
+            }
         }
+    }
+
+    /// Register a generic function call instantiation.
+    /// Looks up the callee's template in GenericRegistry, resolves the
+    /// generic args to TypeRefs, and creates an InstantiatedType via
+    /// the registry's instantiate() method.
+    register_generic_fn_call(&this, call: CallExprNode*,
+                             res_ctx: ResolutionContext*) -> void {
+        // Get the function name from the callee
+        const callee_node: ASTNode* = call.callee as ASTNode*;
+        mut fn_name: SymbolStr = SymbolStr::empty();
+
+        if (callee_node.kind == NodeKind::Identifier) {
+            const ident: IdentifierNode* = call.callee as IdentifierNode*;
+            fn_name = ident.name;
+        } else if (callee_node.kind == NodeKind::ScopeResolution) {
+            // e.g., Module::identity<int>(...)
+            const scope: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+            fn_name = scope.member_name;
+        } else {
+            return; // Can't determine function name
+        }
+
+        if (!fn_name.is_valid()) { return; }
+
+        // Look up the template by qualified name
+        const registry: GenericRegistry* = this.ctx.generic_registry;
+        if (registry == null) { return; }
+
+        const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(fn_name);
+        const entry: TemplateEntry* = registry.get_template(qualified_sym);
+        if (entry == null) { return; }
+        if (entry.node_kind != NodeKind::FunctionDeclaration) { return; }
+        if (!entry.base_type.is_valid()) { return; }
+
+        // Resolve generic args
+        mut args: TypeRef[] = [];
+        for (mut i: i64 = 0; i < call.generic_args.length; i++) {
+            const arg: TypeRef = this.resolver.resolve(call.generic_args[i], res_ctx);
+            if (!arg.is_valid()) { return; }
+            args = args + [arg];
+        }
+
+        // Validate arg count
+        if (args.length != entry.param_count) { return; }
+
+        // Register instantiation — GenericRegistry deduplicates
+        registry.instantiate(entry.base_type, args);
+
+        LOG_DEBUG(LogComponent::General, "[TypeResolution] Registered generic function call '%s' with %lld args",
+            this.ctx.resolve_str(fn_name), args.length);
     }
 }
 
 
 // ============================================================================
-// Helper: collect generic function call instantiations
-// ============================================================================
-
-/// Scan a statement (recursively) for CallExprNodes with generic_args.
-/// For each, resolve the args and register an instantiation in the
-/// GenericRegistry so the Monomorphizer can discover and specialize it.
-function collect_generic_fn_calls_in_stmt(stmt: ASTNode*,
-                                          resolver: TypeResolver*,
-                                          res_ctx: ResolutionContext*,
-                                          ctx: CompilationContext*) -> void {
-    if (stmt == null) { return; }
-
-    match (stmt.kind) {
-        NodeKind::BlockStatement => {
-            const block: BlockStmtNode* = stmt as BlockStmtNode*;
-            for (mut i: i64 = 0; i < block.statements.length; i++) {
-                collect_generic_fn_calls_in_stmt(block.statements[i] as ASTNode*, resolver, res_ctx, ctx);
-            }
-        }
-        NodeKind::ExpressionStatement => {
-            const es: ExprStmtNode* = stmt as ExprStmtNode*;
-            collect_generic_fn_calls_in_expr(es.expression, resolver, res_ctx, ctx);
-        }
-        NodeKind::DeclarationStatement => {
-            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-            if (ds.declaration != null) {
-                const decl_node: ASTNode* = ds.declaration as ASTNode*;
-                if (decl_node.kind == NodeKind::VariableDeclaration) {
-                    const var_node: VarDeclNode* = ds.declaration as VarDeclNode*;
-                    if (var_node.has_initializer()) {
-                        collect_generic_fn_calls_in_expr(var_node.initializer, resolver, res_ctx, ctx);
-                    }
-                }
-            }
-        }
-        NodeKind::ReturnStatement => {
-            const ret: ReturnStmtNode* = stmt as ReturnStmtNode*;
-            if (ret.has_expression()) {
-                collect_generic_fn_calls_in_expr(ret.expression, resolver, res_ctx, ctx);
-            }
-        }
-        NodeKind::IfStatement => {
-            const if_stmt: IfStmtNode* = stmt as IfStmtNode*;
-            collect_generic_fn_calls_in_expr(if_stmt.condition, resolver, res_ctx, ctx);
-            collect_generic_fn_calls_in_stmt(if_stmt.then_stmt as ASTNode*, resolver, res_ctx, ctx);
-            if (if_stmt.has_else()) {
-                collect_generic_fn_calls_in_stmt(if_stmt.else_stmt as ASTNode*, resolver, res_ctx, ctx);
-            }
-        }
-        NodeKind::WhileStatement => {
-            const w: WhileStmtNode* = stmt as WhileStmtNode*;
-            collect_generic_fn_calls_in_expr(w.condition, resolver, res_ctx, ctx);
-            collect_generic_fn_calls_in_stmt(w.body as ASTNode*, resolver, res_ctx, ctx);
-        }
-        NodeKind::ForStatement => {
-            const f: ForStmtNode* = stmt as ForStmtNode*;
-            if (f.init != null) { collect_generic_fn_calls_in_stmt(f.init, resolver, res_ctx, ctx); }
-            if (f.condition != null) { collect_generic_fn_calls_in_expr(f.condition, resolver, res_ctx, ctx); }
-            if (f.update != null) { collect_generic_fn_calls_in_expr(f.update, resolver, res_ctx, ctx); }
-            collect_generic_fn_calls_in_stmt(f.body as ASTNode*, resolver, res_ctx, ctx);
-        }
-        NodeKind::MatchStatement => {
-            const ms: MatchStmtNode* = stmt as MatchStmtNode*;
-            collect_generic_fn_calls_in_expr(ms.subject, resolver, res_ctx, ctx);
-            for (mut i: i64 = 0; i < ms.arms.length; i++) {
-                const arm: MatchArmNode* = ms.arms[i];
-                if (arm != null && arm.body != null) {
-                    collect_generic_fn_calls_in_stmt(arm.body as ASTNode*, resolver, res_ctx, ctx);
-                }
-            }
-        }
-        NodeKind::LoopStatement => {
-            const ls: LoopStmtNode* = stmt as LoopStmtNode*;
-            collect_generic_fn_calls_in_stmt(ls.body as ASTNode*, resolver, res_ctx, ctx);
-        }
-        _ => {}
-    }
-}
-
-/// Scan an expression (recursively) for CallExprNodes with generic_args.
-function collect_generic_fn_calls_in_expr(expr: ExpressionNode*,
-                                          resolver: TypeResolver*,
-                                          res_ctx: ResolutionContext*,
-                                          ctx: CompilationContext*) -> void {
-    if (expr == null) { return; }
-    const node: ASTNode* = expr as ASTNode*;
-
-    match (node.kind) {
-        NodeKind::CallExpression => {
-            const call: CallExprNode* = expr as CallExprNode*;
-            // Recurse into callee and arguments first
-            collect_generic_fn_calls_in_expr(call.callee, resolver, res_ctx, ctx);
-            for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                collect_generic_fn_calls_in_expr(call.arguments[i], resolver, res_ctx, ctx);
-            }
-            // Check for generic_args on the call
-            if (call.generic_args.length > 0) {
-                register_generic_fn_call(call, resolver, res_ctx, ctx);
-            }
-        }
-        NodeKind::BinaryExpression => {
-            const bin: BinaryExprNode* = expr as BinaryExprNode*;
-            collect_generic_fn_calls_in_expr(bin.left, resolver, res_ctx, ctx);
-            collect_generic_fn_calls_in_expr(bin.right, resolver, res_ctx, ctx);
-        }
-        NodeKind::UnaryExpression => {
-            const un: UnaryExprNode* = expr as UnaryExprNode*;
-            collect_generic_fn_calls_in_expr(un.operand, resolver, res_ctx, ctx);
-        }
-        NodeKind::TernaryExpression => {
-            const te: TernaryExprNode* = expr as TernaryExprNode*;
-            collect_generic_fn_calls_in_expr(te.condition, resolver, res_ctx, ctx);
-            collect_generic_fn_calls_in_expr(te.true_expr, resolver, res_ctx, ctx);
-            collect_generic_fn_calls_in_expr(te.false_expr, resolver, res_ctx, ctx);
-        }
-        NodeKind::IfExpression => {
-            const ie: IfExprNode* = expr as IfExprNode*;
-            collect_generic_fn_calls_in_expr(ie.condition, resolver, res_ctx, ctx);
-            collect_generic_fn_calls_in_expr(ie.then_expr, resolver, res_ctx, ctx);
-            collect_generic_fn_calls_in_expr(ie.else_expr, resolver, res_ctx, ctx);
-        }
-        NodeKind::MemberAccess => {
-            const ma: MemberAccessNode* = expr as MemberAccessNode*;
-            collect_generic_fn_calls_in_expr(ma.object, resolver, res_ctx, ctx);
-        }
-        NodeKind::ArrayAccess => {
-            const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
-            collect_generic_fn_calls_in_expr(aa.array, resolver, res_ctx, ctx);
-            collect_generic_fn_calls_in_expr(aa.index, resolver, res_ctx, ctx);
-        }
-        _ => {
-            // Literals, identifiers, scope resolution, etc. — no nested generic calls
-        }
-    }
-}
-
-/// Register a generic function call instantiation.
-/// Looks up the callee's template in GenericRegistry, resolves the
-/// generic args to TypeRefs, and creates an InstantiatedType via
-/// the registry's instantiate() method.
-function register_generic_fn_call(call: CallExprNode*,
-                                  resolver: TypeResolver*,
-                                  res_ctx: ResolutionContext*,
-                                  ctx: CompilationContext*) -> void {
-    // Get the function name from the callee
-    const callee_node: ASTNode* = call.callee as ASTNode*;
-    mut fn_name: SymbolStr = SymbolStr::empty();
-
-    if (callee_node.kind == NodeKind::Identifier) {
-        const ident: IdentifierNode* = call.callee as IdentifierNode*;
-        fn_name = ident.name;
-    } else if (callee_node.kind == NodeKind::ScopeResolution) {
-        // e.g., Module::identity<int>(...)
-        const scope: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
-        fn_name = scope.member_name;
-    } else {
-        return; // Can't determine function name
-    }
-
-    if (!fn_name.is_valid()) { return; }
-
-    // Look up the template by qualified name
-    const registry: GenericRegistry* = ctx.generic_registry;
-    if (registry == null) { return; }
-
-    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(fn_name);
-    const entry: TemplateEntry* = registry.get_template(qualified_sym);
-    if (entry == null) { return; }
-    if (entry.node_kind != NodeKind::FunctionDeclaration) { return; }
-    if (!entry.base_type.is_valid()) { return; }
-
-    // Resolve generic args
-    mut args: TypeRef[] = [];
-    for (mut i: i64 = 0; i < call.generic_args.length; i++) {
-        const arg: TypeRef = resolver.resolve(call.generic_args[i], res_ctx);
-        if (!arg.is_valid()) { return; }
-        args = args + [arg];
-    }
-
-    // Validate arg count
-    if (args.length != entry.param_count) { return; }
-
-    // Register instantiation — GenericRegistry deduplicates
-    registry.instantiate(entry.base_type, args);
-
-    LOG_DEBUG(LogComponent::General, "[TypeResolution] Registered generic function call '%s' with %lld args",
-        ctx.resolve_str(fn_name), args.length);
-}
-
-
-// ============================================================================
-// TypeResolutionPasses — static methods for cross-module resolution
+// TypeResolutionPasses — static entry points for pass dispatch + cross-module API
 // ============================================================================
 
 type struct TypeResolutionPasses {
 
     // ========================================================================
-    // Shared utility: GenericParamNode[] → TypeRef[]
+    // Shared utility: GenericParamNode[] -> TypeRef[]
     // ========================================================================
 
     /// Single source of truth for creating GenericParamType entries in the
@@ -562,8 +482,8 @@ type struct TypeResolutionPasses {
     /// where refs[i] is the GenericParamType for generic_params[i].
     ///
     /// Used by:
-    ///   - bind_generic_params() in this module (adds bindings to ResolutionContext)
-    ///   - SpecializationPasses::run_template_registration() (collects metadata)
+    ///   - TypeResolutionRunner::bind_generic_params()
+    ///   - SpecializationPasses::run_template_registration()
     static create_generic_param_types(generic_params: GenericParamNode*[],
                                       arena: TypeArena*) -> TypeRef[] {
         mut refs: TypeRef[] = [];
@@ -573,6 +493,82 @@ type struct TypeResolutionPasses {
             refs = refs + [param_ref];
         }
         return refs;
+    }
+
+
+    // ========================================================================
+    // Shared utility: register a declaration in the DeclarationIndex
+    // ========================================================================
+
+    /// Registers a top-level declaration (struct, class, enum, function, impl block)
+    /// in the DeclarationIndex.  Looks up the type in the arena by qualified name,
+    /// falling back to the bare name for monomorphized types (e.g. "Pair_i32").
+    ///
+    /// Shared by TypeResolution (Phase 4) and Specialization (injected decl
+    /// registration) so that both use the same registration logic.
+    static register_decl_in_index(stmt: ASTNode*, ctx: CompilationContext*) -> void {
+        if (stmt == null) { return; }
+        const arena: TypeArena* = ctx.type_arena;
+
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                const node: StructDeclNode* = stmt as StructDeclNode*;
+                const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                if (!ty.is_valid()) {
+                    ty = arena.lookup_by_name(node.name);
+                }
+                if (ty.is_valid()) {
+                    ctx.decl_index.register_type(node.name, qualified_sym, ty);
+                }
+                ctx.decl_index.register_methods(node.name, node.methods);
+            }
+            NodeKind::ClassDeclaration => {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                if (!ty.is_valid()) {
+                    ty = arena.lookup_by_name(node.name);
+                }
+                if (ty.is_valid()) {
+                    ctx.decl_index.register_type(node.name, qualified_sym, ty);
+                }
+                ctx.decl_index.register_methods(node.name, node.methods);
+            }
+            NodeKind::EnumDeclaration => {
+                const node: EnumDeclNode* = stmt as EnumDeclNode*;
+                const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                if (!ty.is_valid()) {
+                    ty = arena.lookup_by_name(node.name);
+                }
+                if (ty.is_valid()) {
+                    ctx.decl_index.register_type(node.name, qualified_sym, ty);
+                }
+            }
+            NodeKind::TraitDeclaration => {
+                const node: TraitDeclNode* = stmt as TraitDeclNode*;
+                const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                if (!ty.is_valid()) {
+                    ty = arena.lookup_by_name(node.name);
+                }
+                if (ty.is_valid()) {
+                    ctx.decl_index.register_type(node.name, qualified_sym, ty);
+                }
+            }
+            NodeKind::FunctionDeclaration => {
+                const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                if (func.resolved_return_type.is_valid()) {
+                    ctx.decl_index.register_function(func.name, func.resolved_return_type);
+                }
+            }
+            NodeKind::ImplementationBlock => {
+                const node: ImplBlockNode* = stmt as ImplBlockNode*;
+                ctx.decl_index.register_methods(node.target_type, node.methods);
+            }
+            _ => {}
+        }
     }
 
 
@@ -604,12 +600,7 @@ type struct TypeResolutionPasses {
             return PassResult::ok();
         }
 
-        // Create resolution context
-        const module_name: string = ctx.has_namespace()
-            ? ctx.namespace_display()
-            : ctx.source_file;
-        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, ctx.source_file);
-
+        mut runner: TypeResolutionRunner = TypeResolutionRunner::new(ctx);
         mut sig_count: i64 = 0;
 
         // Walk top-level statements
@@ -620,9 +611,9 @@ type struct TypeResolutionPasses {
             match (stmt.kind) {
                 NodeKind::FunctionDeclaration => {
                     const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                    mut func_ctx: ResolutionContext = make_generic_context(
-                        func.generic_params, &res_ctx, arena, ctx);
-                    resolve_func_signature(func, resolver, &func_ctx, ctx);
+                    mut func_ctx: ResolutionContext = runner.make_generic_context(
+                        func.generic_params, &runner.res_ctx);
+                    runner.resolve_func_signature(func, &func_ctx);
                     sig_count++;
 
                     // Register non-generic functions in the declaration index
@@ -632,9 +623,9 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::StructDeclaration => {
                     const node: StructDeclNode* = stmt as StructDeclNode*;
-                    mut struct_ctx: ResolutionContext = make_generic_context(
-                        node.generic_params, &res_ctx, arena, ctx);
-                    resolve_method_signatures(node.methods, resolver, &struct_ctx, ctx);
+                    mut struct_ctx: ResolutionContext = runner.make_generic_context(
+                        node.generic_params, &runner.res_ctx);
+                    runner.resolve_method_signatures(node.methods, &struct_ctx);
                     if (!node.is_generic()) {
                         ctx.decl_index.register_methods(node.name, node.methods);
                     }
@@ -642,9 +633,9 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    mut class_ctx: ResolutionContext = make_generic_context(
-                        node.generic_params, &res_ctx, arena, ctx);
-                    resolve_method_signatures(node.methods, resolver, &class_ctx, ctx);
+                    mut class_ctx: ResolutionContext = runner.make_generic_context(
+                        node.generic_params, &runner.res_ctx);
+                    runner.resolve_method_signatures(node.methods, &class_ctx);
                     if (!node.is_generic()) {
                         ctx.decl_index.register_methods(node.name, node.methods);
                     }
@@ -652,16 +643,16 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::TraitDeclaration => {
                     const node: TraitDeclNode* = stmt as TraitDeclNode*;
-                    mut trait_ctx: ResolutionContext = make_generic_context(
-                        node.generic_params, &res_ctx, arena, ctx);
-                    resolve_trait_method_signatures(node.methods, resolver, &trait_ctx, ctx);
+                    mut trait_ctx: ResolutionContext = runner.make_generic_context(
+                        node.generic_params, &runner.res_ctx);
+                    runner.resolve_trait_method_signatures(node.methods, &trait_ctx);
                     sig_count = sig_count + node.methods.length;
                 }
                 NodeKind::ImplementationBlock => {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
-                    mut impl_ctx: ResolutionContext = make_generic_context(
-                        node.generic_params, &res_ctx, arena, ctx);
-                    resolve_method_signatures(node.methods, resolver, &impl_ctx, ctx);
+                    mut impl_ctx: ResolutionContext = runner.make_generic_context(
+                        node.generic_params, &runner.res_ctx);
+                    runner.resolve_method_signatures(node.methods, &impl_ctx);
                     if (!node.is_generic()) {
                         ctx.decl_index.register_methods(node.target_type, node.methods);
                     }
@@ -670,7 +661,7 @@ type struct TypeResolutionPasses {
                 NodeKind::ExternBlock => {
                     const node: ExternBlockNode* = stmt as ExternBlockNode*;
                     for (mut j: i64 = 0; j < node.functions.length; j++) {
-                        resolve_func_signature(node.functions[j], resolver, &res_ctx, ctx);
+                        runner.resolve_func_signature(node.functions[j], &runner.res_ctx);
                     }
                     sig_count = sig_count + node.functions.length;
                 }
@@ -682,7 +673,7 @@ type struct TypeResolutionPasses {
                         const param: VarDeclNode* = node.parameters[j];
                         if (param != null && param.type_annotation != null &&
                             !param.resolved_type.is_valid()) {
-                            const ptype: TypeRef = resolver.resolve(param.type_annotation, &res_ctx);
+                            const ptype: TypeRef = resolver.resolve(param.type_annotation, &runner.res_ctx);
                             if (ptype.is_valid()) {
                                 param.resolved_type = ptype;
                             }
@@ -733,14 +724,13 @@ type struct TypeResolutionPasses {
             return PassResult::ok();
         }
 
+        mut runner: TypeResolutionRunner = TypeResolutionRunner::new(ctx);
+        const module_registry: ModuleTypeRegistry* = runner.module_registry;
         const module_name: string = ctx.has_namespace()
             ? ctx.namespace_display()
             : ctx.source_file;
-        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, ctx.source_file);
 
-        const module_registry: ModuleTypeRegistry* = ctx.module_type_registry;
-
-        // ── Phase 1: Type alias resolution ──────────────────────────────
+        // -- Phase 1: Type alias resolution ----------------------------------
         mut alias_count: i64 = 0;
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
@@ -752,7 +742,7 @@ type struct TypeResolutionPasses {
                 if (node.is_generic()) { continue; }
 
                 if (node.target_annotation != null && !node.has_resolved_target()) {
-                    const target: TypeRef = resolver.resolve(node.target_annotation, &res_ctx);
+                    const target: TypeRef = resolver.resolve(node.target_annotation, &runner.res_ctx);
                     if (target.is_valid()) {
                         node.resolved_target = target;
                         // Register in module type registry
@@ -773,7 +763,7 @@ type struct TypeResolutionPasses {
             printf("[TypeResolution] Phase 1: Resolved %lld type aliases\n", alias_count);
         }
 
-        // ── Phase 2: Declaration field types ────────────────────────────
+        // -- Phase 2: Declaration field types --------------------------------
         mut field_count: i64 = 0;
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
@@ -782,23 +772,23 @@ type struct TypeResolutionPasses {
             match (stmt.kind) {
                 NodeKind::StructDeclaration => {
                     const node: StructDeclNode* = stmt as StructDeclNode*;
-                    mut struct_ctx: ResolutionContext = make_generic_context(
-                        node.generic_params, &res_ctx, arena, ctx);
-                    resolve_fields(node.fields, resolver, &struct_ctx, ctx);
+                    mut struct_ctx: ResolutionContext = runner.make_generic_context(
+                        node.generic_params, &runner.res_ctx);
+                    runner.resolve_fields(node.fields, &struct_ctx);
                     field_count = field_count + node.fields.length;
                 }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    mut class_ctx: ResolutionContext = make_generic_context(
-                        node.generic_params, &res_ctx, arena, ctx);
-                    resolve_fields(node.fields, resolver, &class_ctx, ctx);
+                    mut class_ctx: ResolutionContext = runner.make_generic_context(
+                        node.generic_params, &runner.res_ctx);
+                    runner.resolve_fields(node.fields, &class_ctx);
                     field_count = field_count + node.fields.length;
                 }
                 NodeKind::ImplementationBlock => {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
-                    mut impl_ctx: ResolutionContext = make_generic_context(
-                        node.generic_params, &res_ctx, arena, ctx);
-                    resolve_method_signatures(node.methods, resolver, &impl_ctx, ctx);
+                    mut impl_ctx: ResolutionContext = runner.make_generic_context(
+                        node.generic_params, &runner.res_ctx);
+                    runner.resolve_method_signatures(node.methods, &impl_ctx);
                 }
                 _ => {
                     // Enum variant associated types (now TypeAnnotation*) are resolved
@@ -812,7 +802,7 @@ type struct TypeResolutionPasses {
             printf("[TypeResolution] Phase 2: Resolved %lld field types\n", field_count);
         }
 
-        // ── Phase 3: Variable and expression types in function bodies ───
+        // -- Phase 3: Variable and expression types in function bodies -------
         mut body_count: i64 = 0;
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
@@ -822,7 +812,7 @@ type struct TypeResolutionPasses {
                 NodeKind::FunctionDeclaration => {
                     const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
                     if (func.body != null && !func.is_generic()) {
-                        resolve_var_types_in_statement(func.body as ASTNode*, resolver, &res_ctx, ctx);
+                        runner.resolve_var_types_in_statement(func.body as ASTNode*, &runner.res_ctx);
                         body_count++;
                     }
                 }
@@ -832,7 +822,7 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                resolve_var_types_in_statement(method.func.body as ASTNode*, resolver, &res_ctx, ctx);
+                                runner.resolve_var_types_in_statement(method.func.body as ASTNode*, &runner.res_ctx);
                                 body_count++;
                             }
                         }
@@ -844,7 +834,7 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                resolve_var_types_in_statement(method.func.body as ASTNode*, resolver, &res_ctx, ctx);
+                                runner.resolve_var_types_in_statement(method.func.body as ASTNode*, &runner.res_ctx);
                                 body_count++;
                             }
                         }
@@ -856,7 +846,7 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const func: FunctionDeclNode* = node.methods[j];
                             if (func != null && func.body != null) {
-                                resolve_var_types_in_statement(func.body as ASTNode*, resolver, &res_ctx, ctx);
+                                runner.resolve_var_types_in_statement(func.body as ASTNode*, &runner.res_ctx);
                                 body_count++;
                             }
                         }
@@ -868,7 +858,7 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                resolve_var_types_in_statement(method.func.body as ASTNode*, resolver, &res_ctx, ctx);
+                                runner.resolve_var_types_in_statement(method.func.body as ASTNode*, &runner.res_ctx);
                                 body_count++;
                             }
                         }
@@ -882,7 +872,7 @@ type struct TypeResolutionPasses {
             printf("[TypeResolution] Phase 3: Walked %lld function bodies\n", body_count);
         }
 
-        // ── Phase 3b: Collect generic function call instantiations ─────
+        // -- Phase 3b: Collect generic function call instantiations ----------
         // Scan non-generic function bodies for calls like identity<int>(100).
         // For each, resolve the generic args and register an InstantiatedType
         // so the Monomorphizer can discover and specialize the function.
@@ -894,7 +884,7 @@ type struct TypeResolutionPasses {
                 NodeKind::FunctionDeclaration => {
                     const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
                     if (func.body != null && !func.is_generic()) {
-                        collect_generic_fn_calls_in_stmt(func.body as ASTNode*, resolver, &res_ctx, ctx);
+                        runner.collect_generic_fn_calls_in_stmt(func.body as ASTNode*, &runner.res_ctx);
                     }
                 }
                 NodeKind::StructDeclaration => {
@@ -903,7 +893,7 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                collect_generic_fn_calls_in_stmt(method.func.body as ASTNode*, resolver, &res_ctx, ctx);
+                                runner.collect_generic_fn_calls_in_stmt(method.func.body as ASTNode*, &runner.res_ctx);
                             }
                         }
                     }
@@ -914,7 +904,7 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                collect_generic_fn_calls_in_stmt(method.func.body as ASTNode*, resolver, &res_ctx, ctx);
+                                runner.collect_generic_fn_calls_in_stmt(method.func.body as ASTNode*, &runner.res_ctx);
                             }
                         }
                     }
@@ -925,7 +915,7 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                collect_generic_fn_calls_in_stmt(method.func.body as ASTNode*, resolver, &res_ctx, ctx);
+                                runner.collect_generic_fn_calls_in_stmt(method.func.body as ASTNode*, &runner.res_ctx);
                             }
                         }
                     }
@@ -934,14 +924,14 @@ type struct TypeResolutionPasses {
             }
         }
 
-        // ── Phase 4: Register types in ModuleTypeRegistry + DeclarationIndex ──
+        // -- Phase 4: Register types in ModuleTypeRegistry + DeclarationIndex
         mut reg_count: i64 = 0;
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
 
             // Register in DeclarationIndex (shared logic with Specialization)
-            register_decl_in_index(stmt, ctx);
+            TypeResolutionPasses::register_decl_in_index(stmt, ctx);
 
             // Phase 4-specific: also register types in ModuleTypeRegistry
             // for cross-module visibility, and handle global variables.
@@ -986,7 +976,7 @@ type struct TypeResolutionPasses {
                     // Phase 4-specific: resolve and register top-level global variables
                     const var_node: VarDeclNode* = stmt as VarDeclNode*;
                     if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
-                        const vtype: TypeRef = resolver.resolve(var_node.type_annotation, &res_ctx);
+                        const vtype: TypeRef = resolver.resolve(var_node.type_annotation, &runner.res_ctx);
                         if (vtype.is_valid()) {
                             var_node.resolved_type = vtype;
                         }
