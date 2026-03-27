@@ -2855,7 +2855,7 @@ namespace Cryo::Codegen
                 llvm::Value *disc_ptr = builder().CreateStructGEP(struct_ty, enum_alloca, 0, "disc_ptr");
                 llvm::Value *disc_val = disc_const;
                 if (disc_val->getType() != struct_ty->getElementType(0))
-                    disc_val = builder().CreateIntCast(disc_val, struct_ty->getElementType(0), true, "disc.cast");
+                    disc_val = builder().CreateIntCast(disc_val, struct_ty->getElementType(0), false, "disc.cast");
                 builder().CreateStore(disc_val, disc_ptr);
 
                 // Store payload fields

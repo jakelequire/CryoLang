@@ -3414,7 +3414,7 @@ namespace Cryo::Codegen
             Cryo::PatternNode *first_pattern = arm->pattern();
             if (first_pattern)
             {
-                _control_flow->bind_enum_pattern_variables(match_value, first_pattern);
+                _control_flow->bind_enum_pattern_variables(match_value, first_pattern, node->expression());
             }
 
             llvm::Value *arm_value = nullptr;
@@ -6622,7 +6622,7 @@ namespace Cryo::Codegen
                         llvm::Value *disc_gep = builder().CreateStructGEP(enum_struct, heap_ptr, 0, "disc_ptr");
                         llvm::Value *disc_cast = disc_val;
                         if (disc_val->getType() != enum_struct->getElementType(0))
-                            disc_cast = builder().CreateIntCast(disc_val, enum_struct->getElementType(0), true, "disc.cast");
+                            disc_cast = builder().CreateIntCast(disc_val, enum_struct->getElementType(0), false, "disc.cast");
                         builder().CreateStore(disc_cast, disc_gep);
 
                         // Store payload
@@ -7564,7 +7564,7 @@ namespace Cryo::Codegen
         if (discriminant->getType() != disc_field_type)
         {
             if (discriminant->getType()->isIntegerTy() && disc_field_type->isIntegerTy())
-                cast_disc = builder().CreateIntCast(discriminant, disc_field_type, true, "disc.cast");
+                cast_disc = builder().CreateIntCast(discriminant, disc_field_type, false, "disc.cast");
             else
                 return discriminant; // Can't cast — return original
         }

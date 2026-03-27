@@ -1191,6 +1191,25 @@ namespace Cryo::Codegen
         }
 
         // Regular assignment for non-struct types or when types don't match
+        // Apply truncation/extension if the value type doesn't match the field type
+        // (e.g. i32 enum stored into i64 field needs zero-extension)
+        if (member_field_type && member_field_type != value->getType())
+        {
+            if (member_field_type->isIntegerTy() && value->getType()->isIntegerTy())
+            {
+                unsigned target_bits = member_field_type->getIntegerBitWidth();
+                unsigned val_bits = value->getType()->getIntegerBitWidth();
+                if (val_bits > target_bits)
+                {
+                    value = builder().CreateTrunc(value, member_field_type, "member.trunc");
+                }
+                else if (val_bits < target_bits)
+                {
+                    value = builder().CreateZExt(value, member_field_type, "member.zext");
+                }
+            }
+        }
+
         if (_memory)
         {
             _memory->create_store(value, member_ptr);
