@@ -214,6 +214,70 @@ public:
 
 
     // ================================================================
+    // Match Pattern Binding
+    // ================================================================
+
+    /// Register pattern bindings from a match arm as local variables.
+    /// For enum patterns, each binding's type is inferred from the
+    /// corresponding payload position in the enum variant definition.
+    bind_arm_patterns(mut &this, arm: MatchArmNode*, subject_type: TypeRef) -> void {
+        for (mut i: i64 = 0; i < arm.patterns.length; i++) {
+            const pat: PatternNode* = arm.patterns[i];
+            if (pat == null) { continue; }
+
+            // Simple identifier pattern — binds the entire subject
+            if (pat.pattern_kind == PatternKind::Identifier) {
+                if (subject_type.is_valid()) {
+                    this.register_local(pat.binding_name, subject_type);
+                }
+                continue;
+            }
+
+            if (pat.pattern_kind != PatternKind::Enum) { continue; }
+
+            const enum_pat: EnumPatternNode* = pat as EnumPatternNode*;
+
+            // Look up variant payload types from the enum's type info.
+            // Try two paths: (1) decl_index by enum name, (2) subject_type directly.
+            mut payload_types: TypeRef[] = [];
+            mut enum_ty: Type* = null;
+
+            // Path 1: look up by pattern's enum name
+            const enum_type_ref: TypeRef = this.lookup_type_by_sym(enum_pat.enum_name);
+            if (enum_type_ref.is_valid()) {
+                enum_ty = this.arena.lookup(enum_type_ref.id);
+            }
+
+            // Path 2: fall back to the match subject's type
+            if (enum_ty == null && subject_type.is_valid()) {
+                enum_ty = this.arena.lookup(subject_type.id);
+            }
+
+            if (enum_ty != null && enum_ty.kind == TypeKind::Enum) {
+                const et: EnumType* = enum_ty as EnumType*;
+                const variant: EnumVariantInfo* = et.get_variant(enum_pat.variant_name);
+                if (variant != null) {
+                    payload_types = variant.payload_types;
+                }
+            }
+
+            // Register each binding using the precomputed arrays.
+            // If variant payload types are available, use the positional type.
+            // Otherwise fall back to subject_type (the binding exists but the
+            // exact payload type is unknown — better than "undefined variable").
+            for (mut j: i64 = 0; j < enum_pat.binding_names.length; j++) {
+                const pos: i64 = enum_pat.binding_positions[j];
+                if (pos < payload_types.length) {
+                    this.register_local(enum_pat.binding_names[j], payload_types[pos]);
+                } else if (subject_type.is_valid()) {
+                    this.register_local(enum_pat.binding_names[j], subject_type);
+                }
+            }
+        }
+    }
+
+
+    // ================================================================
     // Per-Function Setup
     // ================================================================
 
@@ -301,9 +365,6 @@ public:
 
     override visit(node: ImplBlockNode*) -> void {
         const impl_this: TypeRef = this.lookup_type_by_sym(node.target_type);
-        const _dbg_name: string = this.intern.resolve(node.target_type);
-        printf("[Sema:ImplBlock] target='%s' target_id=%u type_valid=%d type_id=%llu\n",
-            _dbg_name, node.target_type.id, impl_this.is_valid() as i32, impl_this.id);
         this.visit_methods(node.methods, impl_this);
     }
 
@@ -481,12 +542,17 @@ public:
     }
 
     override visit(node: MatchStmtNode*) -> void {
-        this.resolve_expr(node.subject);
+        const subject_type: TypeRef = this.resolve_expr(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             const arm: MatchArmNode* = node.arms[i];
-            if (arm != null && arm.body != null) {
+            if (arm == null) { continue; }
+
+            const save: i64 = this.save_scope();
+            this.bind_arm_patterns(arm, subject_type);
+            if (arm.body != null) {
                 this.dispatch_stmt(arm.body);
             }
+            this.restore_scope(save);
         }
     }
 
@@ -890,12 +956,15 @@ public:
     }
 
     resolve_match_expr(mut &this, match_expr: MatchExprNode*) -> TypeRef {
-        this.resolve_expr(match_expr.subject);
+        const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
 
         mut result_type: TypeRef = TypeRef::invalid();
         for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
             const arm: MatchArmNode* = match_expr.arms[i];
             if (arm == null || arm.body == null) { continue; }
+
+            const save: i64 = this.save_scope();
+            this.bind_arm_patterns(arm, subject_type);
 
             const body_node: ASTNode* = arm.body as ASTNode*;
             if (body_node.kind == NodeKind::BlockStatement) {
@@ -919,6 +988,8 @@ public:
             } else {
                 this.dispatch_stmt(arm.body);
             }
+
+            this.restore_scope(save);
         }
 
         return result_type;
