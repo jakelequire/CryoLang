@@ -21,6 +21,7 @@ import Compiler::Resolver::InternTable;
 import Compiler::Resolver::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Registry;
+import Compiler::DeclIndex;
 import Utils::Logger;
 
 
@@ -74,6 +75,7 @@ type struct TypeResolver {
     generic_registry: GenericRegistry*;
     module_registry:  ModuleTypeRegistry*;
     name_resolver:    Resolver*;
+    decl_index:       DeclarationIndex*;
 
     /// Construct with all required dependencies.
     ///
@@ -83,13 +85,15 @@ type struct TypeResolver {
     static new(arena: TypeArena*, intern_table: InternTable*,
                generic_registry: GenericRegistry*,
                module_registry: ModuleTypeRegistry*,
-               name_resolver: Resolver*) -> TypeResolver {
+               name_resolver: Resolver*,
+               decl_index: DeclarationIndex*) -> TypeResolver {
         return TypeResolver {
             arena:            arena,
             intern_table:     intern_table,
             generic_registry: generic_registry,
             module_registry:  module_registry,
             name_resolver:    name_resolver,
+            decl_index:       decl_index,
         };
     }
 
@@ -301,9 +305,33 @@ private:
             return prim;
         }
 
-        // 3. Direct arena lookup by bare name (fast path)
+        // 3. DeclarationIndex lookup (canonical post-population path).
+        //    After TypeResolution (order 9) populates the index, this is the
+        //    primary lookup path.  Falls through to arena for types not yet
+        //    registered (e.g., during early resolution phases).
+        if (this.decl_index != null) {
+            // Try qualified name first
+            if (this.name_resolver != null) {
+                const qualified: SymbolStr = this.name_resolver.resolve_type_qualified_name(name);
+                if (qualified.is_valid()) {
+                    const di_found: TypeRef = this.decl_index.lookup_type(qualified);
+                    if (di_found.is_valid()) {
+                        return di_found;
+                    }
+                }
+            }
+            // Try bare name
+            const di_bare: TypeRef = this.decl_index.lookup_type(name);
+            if (di_bare.is_valid()) {
+                return di_bare;
+            }
+        }
+
+        // 4. Arena lookup (fallback for types not yet in DeclarationIndex).
+        //    During early passes (TypeResolution populating the index),
+        //    types exist in the arena but aren't registered yet.
         //    For TypeAliasType: if the target is resolved, return it directly;
-        //    if unresolved, fall through to step 5 (alias registry).
+        //    if unresolved, fall through to step 6 (alias registry).
         mut found: TypeRef = this.arena.lookup_by_name(name);
         if (found.is_valid()) {
             const found_t: Type* = this.arena.lookup(found.id);
@@ -318,7 +346,7 @@ private:
             }
         }
 
-        // 4. Delegate to Resolver for scope chain + cross-module lookup.
+        // 5. Delegate to Resolver for scope chain + cross-module lookup.
         //    The Resolver already has all type symbols from NameResolution,
         //    including imports.  It returns the qualified name for arena lookup.
         if (this.name_resolver != null) {
