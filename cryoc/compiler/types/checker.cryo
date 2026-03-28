@@ -204,6 +204,18 @@ type struct TypeChecker {
             }
         }
 
+        // Reference structural equality: &T ≡ &T, &mut T ≡ &mut T
+        // Needed because the arena may allocate duplicate ReferenceType objects
+        // with different TypeRef IDs for the same logical type.
+        if (from_type.kind == TypeKind::Reference && to_type.kind == TypeKind::Reference) {
+            const from_ref: ReferenceType* = from_type as ReferenceType*;
+            const to_ref: ReferenceType* = to_type as ReferenceType*;
+            if (from_ref.referent.equals(to_ref.referent) &&
+                from_ref.is_mutable() == to_ref.is_mutable()) {
+                return TypeCompatibility::Identical;
+            }
+        }
+
         // Pointer/reference conversions
         if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::Pointer) {
             return TypeCompatibility::ExplicitCast;
@@ -437,12 +449,17 @@ type struct TypeChecker {
                 mut ptr: PointerType* = op_type as PointerType*;
                 return TypeCheckResult::ok(ptr.pointee);
             }
-            return TypeCheckResult::fail("Dereference requires pointer operand");
+            if (op_type.kind == TypeKind::Reference) {
+                mut ref_type: ReferenceType* = op_type as ReferenceType*;
+                return TypeCheckResult::ok(ref_type.referent);
+            }
+            return TypeCheckResult::fail("Dereference requires pointer or reference operand");
         }
 
-        // Address-of: &
+        // Address-of: & produces an immutable reference (&T), not a raw pointer (T*)
         if (op == "&") {
-            return TypeCheckResult::ok(this.arena.get_pointer_to(operand));
+            return TypeCheckResult::ok(
+                this.arena.get_reference_to(operand, RefMutability::Immutable));
         }
 
         return TypeCheckResult::fail(sprintf("Unknown unary operator '%s'", op));
