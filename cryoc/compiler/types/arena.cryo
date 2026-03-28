@@ -501,31 +501,36 @@ type struct TypeArena {
         return t.display_name();
     }
 
+    /// Format a human-readable display name for any type.
+    /// Uses string concatenation instead of nested sprintf to avoid
+    /// static buffer aliasing (sprintf uses a shared buffer, so nested
+    /// calls overwrite the previous result).
     format_display(&this, ty: Type*) -> string {
         if (ty == null) { return "?"; }
 
         if (ty.kind == TypeKind::Pointer) {
             const p: PointerType* = ty as PointerType*;
-            return sprintf("%s*", this.resolve_display_name(p.pointee.id));
+            return this.resolve_display_name(p.pointee.id) + "*";
         }
 
         if (ty.kind == TypeKind::Reference) {
             const r: ReferenceType* = ty as ReferenceType*;
             const inner_name: string = this.resolve_display_name(r.referent.id);
-            if (r.is_mutable()) { return sprintf("&mut %s", inner_name); }
-            return sprintf("&%s", inner_name);
+            if (r.is_mutable()) { return "&mut " + inner_name; }
+            return "&" + inner_name;
         }
 
         if (ty.kind == TypeKind::Array) {
             const a: ArrayType* = ty as ArrayType*;
             const elem_name: string = this.resolve_display_name(a.element.id);
-            if (a.is_dynamic()) { return sprintf("%s[]", elem_name); }
-            return sprintf("%s[%ld]", elem_name, a.size);
+            if (a.is_dynamic()) { return elem_name + "[]"; }
+            const size_str: string = sprintf("%ld", a.size);
+            return elem_name + "[" + size_str + "]";
         }
 
         if (ty.kind == TypeKind::Optional) {
             const o: OptionalType* = ty as OptionalType*;
-            return sprintf("%s?", this.resolve_display_name(o.wrapped.id));
+            return this.resolve_display_name(o.wrapped.id) + "?";
         }
 
         if (ty.kind == TypeKind::Function) {
@@ -533,13 +538,14 @@ type struct TypeArena {
             mut result: string = "(";
             for (mut i: i64 = 0; i < f.param_types.length; i++) {
                 if (i > 0) { result = result + ", "; }
-                result = sprintf("%s%s", result, this.resolve_display_name(f.param_types[i].id));
+                result = result + this.resolve_display_name(f.param_types[i].id);
             }
             if (f.is_variadic) {
                 if (f.param_types.length > 0) { result = result + ", "; }
                 result = result + "...";
             }
-            return sprintf("%s) -> %s", result, this.resolve_display_name(f.return_type.id));
+            const ret_name: string = this.resolve_display_name(f.return_type.id);
+            return result + ") -> " + ret_name;
         }
 
         if (ty.kind == TypeKind::Tuple) {
@@ -547,18 +553,17 @@ type struct TypeArena {
             mut result: string = "(";
             for (mut i: i64 = 0; i < t.elements.length; i++) {
                 if (i > 0) { result = result + ", "; }
-                result = sprintf("%s%s", result, this.resolve_display_name(t.elements[i].id));
+                result = result + this.resolve_display_name(t.elements[i].id);
             }
             return result + ")";
         }
 
         if (ty.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = ty as InstantiatedType*;
-            const base_name: string = this.resolve_display_name(inst.generic_base.id);
-            mut result: string = sprintf("%s<", base_name);
+            mut result: string = this.resolve_display_name(inst.generic_base.id) + "<";
             for (mut i: i64 = 0; i < inst.type_args.length; i++) {
                 if (i > 0) { result = result + ", "; }
-                result = sprintf("%s%s", result, this.resolve_display_name(inst.type_args[i].id));
+                result = result + this.resolve_display_name(inst.type_args[i].id);
             }
             return result + ">";
         }
@@ -584,8 +589,13 @@ type struct TypeArena {
         printf("------+--------------------+--------------------------------+--------------------------------+--------+-------\n");
         for (mut i: int = 0; i < this.types.length; i++) {
             const ty: Type* = this.types[i];
+            // Capture each string to a local before printf to avoid
+            // sprintf static buffer aliasing between arguments.
+            const kind_str: string = ty.kind.to_string();
+            const display: string = this.format_display(ty);
+            const mangled: string = ty.mangled_name();
             printf("%-6llu | %-18s | %-30s | %-30s | %-6llu | %-6llu\n",
-                ty.id, ty.kind.to_string(), this.format_display(ty), ty.mangled_name(), ty.size_bytes(), ty.alignment());
+                ty.id, kind_str, display, mangled, ty.size_bytes(), ty.alignment());
         }
         printf("------+--------------------+--------------------------------+--------------------------------+--------+-------\n");
 

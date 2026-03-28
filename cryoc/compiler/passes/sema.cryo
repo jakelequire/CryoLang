@@ -68,6 +68,9 @@ public:
     this_sym:    SymbolStr;                // interned "this"
     body_count:  i64;                      // counter for debug output
 
+    // -- Expected type hint (set by DeclStmt for initializer resolution) --
+    expected_type: TypeRef;
+
 
     // ================================================================
     // Construction
@@ -88,6 +91,7 @@ public:
         this.this_type      = TypeRef::invalid();
         this.this_sym       = intern.intern("this");
         this.body_count     = 0;
+        this.expected_type  = TypeRef::invalid();
     }
 
     /// Build a TypeCheckVisitor from the compilation context.
@@ -443,7 +447,15 @@ public:
 
         const var_node: VarDeclNode* = decl as VarDeclNode*;
         if (var_node.has_initializer()) {
+            // Set expected_type hint so generic calls can resolve to concrete types.
+            // E.g. `const x: Result<int, string> = Result::ok(42)` —
+            // the declared type guides resolve_scope_call to find the specialization.
+            const saved_expected: TypeRef = this.expected_type;
+            if (var_node.has_resolved_type()) {
+                this.expected_type = var_node.resolved_type;
+            }
             const init_type: TypeRef = this.resolve_expr(var_node.initializer);
+            this.expected_type = saved_expected;
             if (this.ctx.debug_mode) {
                 const _dbg_name: string = this.intern.resolve(var_node.name);
                 printf("[Sema:DeclStmt] var '%s' has_resolved=%d init_valid=%d resolved_id=%llu init_id=%llu\n",
@@ -835,16 +847,22 @@ public:
         const method_ret: TypeRef = this.lookup_method_return(
             lookup_sym, scope.member_name);
         if (method_ret.is_valid()) {
-            scope.set_resolved_type(method_ret);
-            return method_ret;
+            // If the return type is an unresolved generic (e.g., Result<T, E>),
+            // try to resolve to the concrete specialization using expected_type.
+            const resolved_ret: TypeRef = this.try_resolve_generic_return(
+                method_ret, scope.scope_name, scope.member_name);
+            scope.set_resolved_type(resolved_ret);
+            return resolved_ret;
         }
         // Fallback: try the base name if we used a specialized one
         if (lookup_sym.id != scope.scope_name.id) {
             const base_ret: TypeRef = this.lookup_method_return(
                 scope.scope_name, scope.member_name);
             if (base_ret.is_valid()) {
-                scope.set_resolved_type(base_ret);
-                return base_ret;
+                const resolved_base: TypeRef = this.try_resolve_generic_return(
+                    base_ret, scope.scope_name, scope.member_name);
+                scope.set_resolved_type(resolved_base);
+                return resolved_base;
             }
         }
 
@@ -899,6 +917,56 @@ public:
         const mangled: MangledName = MangledName::from_generic(
             this.intern, base_str, arg_displays);
         return mangled.value;
+    }
+
+    /// When a scope call (e.g. Result::ok) returns a generic InstantiatedType
+    /// (Result<T, E>), try to resolve it to the concrete specialized return
+    /// type using the expected_type hint from the enclosing variable declaration.
+    ///
+    /// E.g. `const x: Result<int, string> = Result::ok(42)` — expected_type
+    /// is Result<i32, string>, so we build "Result_i32_string" and look up
+    /// the concrete method return type from decl_index.
+    try_resolve_generic_return(&this, ret: TypeRef,
+                                scope_name: SymbolStr,
+                                member_name: SymbolStr) -> TypeRef {
+        // Only applies when expected_type is set and return type is generic
+        if (!this.expected_type.is_valid()) { return ret; }
+
+        // Check that the return type is an unresolved InstantiatedType
+        const ret_t: Type* = this.arena.lookup(ret.id);
+        if (ret_t == null || ret_t.kind != TypeKind::InstantiatedType) { return ret; }
+        const ret_inst: InstantiatedType* = ret_t as InstantiatedType*;
+        if (ret_inst.is_resolved()) { return ret; }
+
+        // Check that expected_type is a concrete InstantiatedType with the same base
+        const exp_t: Type* = this.arena.lookup(this.expected_type.id);
+        if (exp_t == null || exp_t.kind != TypeKind::InstantiatedType) { return ret; }
+        const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
+
+        // Same generic base type? (e.g., both Result)
+        if (ret_inst.generic_base.id != exp_inst.generic_base.id) { return ret; }
+
+        // Build the specialized type name from expected_type's concrete args
+        mut arg_displays: string[] = [];
+        for (mut i: i64 = 0; i < exp_inst.type_args.length; i++) {
+            const arg_t: Type* = this.arena.lookup(exp_inst.type_args[i].id);
+            if (arg_t == null) { return ret; }
+            arg_displays = arg_displays + [this.arena.format_display(arg_t)];
+        }
+
+        const scope_str: string = this.intern.resolve(scope_name);
+        const mangled: MangledName = MangledName::from_generic(
+            this.intern, scope_str, arg_displays);
+        const spec_sym: SymbolStr = mangled.value;
+
+        // Look up the specialized method return type
+        const spec_ret: TypeRef = this.lookup_method_return(spec_sym, member_name);
+        if (spec_ret.is_valid()) { return spec_ret; }
+
+        // Fallback: return the expected type itself if the base matches.
+        // The specialized struct exists (it was monomorphized) but the method
+        // might not be registered yet — use the expected type directly.
+        return this.expected_type;
     }
 
     resolve_member_access(mut &this, member: MemberAccessNode*) -> TypeRef {
