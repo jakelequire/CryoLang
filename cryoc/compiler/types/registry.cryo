@@ -62,9 +62,15 @@ type struct TypeRegistryEntry {
 // ============================================================================
 
 type struct ModuleTypeRegistry {
-    // module_name → list of TypeRegistryEntry (parallel arrays for iteration)
-    module_names:    string[];
-    module_entries:  TypeRegistryEntry[][];
+    // Flat list of all registered type entries with a module key per entry.
+    // NOTE: Cannot use TypeRegistryEntry[][] — C++ codegen mishandles T[][]
+    // (inner array descriptor lowered to ptr instead of {ptr,i64,i64}).
+    entry_list:       TypeRegistryEntry[];  // all entries flat
+    entry_module_ids: i64[];                // parallel: module index per entry
+
+    // Module name registry (module_name → index)
+    module_names:     string[];
+    module_index:     HashMap<string, i64>;
 
     // Type aliases: alias SymbolStr.id → target TypeRef (parallel arrays)
     alias_names:    SymbolStr[];
@@ -75,19 +81,19 @@ type struct ModuleTypeRegistry {
     alias_base_refs:  SymbolStr[];
 
     // HashMap indices for O(1) lookup
-    module_index:     HashMap<string, i64>;  // module_name → index
     alias_index:      HashMap<u32, i64>;     // alias SymbolStr.id → index
     alias_base_index: HashMap<u32, i64>;     // alias base SymbolStr.id → index
 
     static new() -> ModuleTypeRegistry {
         return ModuleTypeRegistry {
+            entry_list:       [],
+            entry_module_ids: [],
             module_names:     [],
-            module_entries:   [],
+            module_index:     HashMap<string, i64>::new(),
             alias_names:      [],
             alias_targets:    [],
             alias_base_names: [],
             alias_base_refs:  [],
-            module_index:     HashMap<string, i64>::new(),
             alias_index:      HashMap<u32, i64>::new(),
             alias_base_index: HashMap<u32, i64>::new(),
         };
@@ -100,20 +106,23 @@ type struct ModuleTypeRegistry {
 
     /// Register a type in a module with the given visibility.
     register_type(mut &this, module: string, name: SymbolStr, ty: TypeRef, vis: TypeVisibility) -> void {
-        mut entry: TypeRegistryEntry = TypeRegistryEntry::new(ty, vis, name);
+        const entry: TypeRegistryEntry = TypeRegistryEntry::new(ty, vis, name);
 
+        // Ensure module is registered
         const h: u64 = hash_str(module);
         const opt: Option<i64> = this.module_index.get(module, h);
+        mut mod_idx: i64 = 0;
         if (opt.is_some()) {
-            this.module_entries[opt.unwrap()].push(entry);
-            return;
+            mod_idx = opt.unwrap();
+        } else {
+            mod_idx = this.module_names.length;
+            this.module_names.push(module);
+            this.module_index.insert(module, mod_idx, h);
         }
 
-        // New module
-        const idx: i64 = this.module_names.length;
-        this.module_names.push(module);
-        this.module_entries.push([entry]);
-        this.module_index.insert(module, idx, h);
+        // Append entry with its module id
+        this.entry_list.push(entry);
+        this.entry_module_ids.push(mod_idx);
     }
 
 
@@ -125,10 +134,11 @@ type struct ModuleTypeRegistry {
     lookup_type(&this, module: string, name: SymbolStr) -> TypeRef {
         const opt: Option<i64> = this.module_index.get(module, hash_str(module));
         if (opt.is_some()) {
-            mut entries: TypeRegistryEntry[] = this.module_entries[opt.unwrap()];
-            for (mut j: i64 = 0; j < entries.length; j++) {
-                if (entries[j].local_name.equals(name)) {
-                    return entries[j].entry_type;
+            const mod_idx: i64 = opt.unwrap();
+            for (mut j: i64 = 0; j < this.entry_list.length; j++) {
+                if (this.entry_module_ids[j] == mod_idx &&
+                    this.entry_list[j].local_name.equals(name)) {
+                    return this.entry_list[j].entry_type;
                 }
             }
         }
@@ -140,10 +150,12 @@ type struct ModuleTypeRegistry {
         for (mut i: i64 = 0; i < imports.length; i++) {
             const opt: Option<i64> = this.module_index.get(imports[i], hash_str(imports[i]));
             if (opt.is_some()) {
-                mut entries: TypeRegistryEntry[] = this.module_entries[opt.unwrap()];
-                for (mut k: i64 = 0; k < entries.length; k++) {
-                    if (entries[k].local_name.equals(name) && entries[k].visibility.is_public()) {
-                        return entries[k].entry_type;
+                const mod_idx: i64 = opt.unwrap();
+                for (mut k: i64 = 0; k < this.entry_list.length; k++) {
+                    if (this.entry_module_ids[k] == mod_idx &&
+                        this.entry_list[k].local_name.equals(name) &&
+                        this.entry_list[k].visibility.is_public()) {
+                        return this.entry_list[k].entry_type;
                     }
                 }
             }
@@ -153,11 +165,17 @@ type struct ModuleTypeRegistry {
 
     /// Get all types registered in a module.
     get_module_types(&this, module: string) -> TypeRegistryEntry[] {
+        mut result: TypeRegistryEntry[] = [];
         const opt: Option<i64> = this.module_index.get(module, hash_str(module));
         if (opt.is_some()) {
-            return this.module_entries[opt.unwrap()];
+            const mod_idx: i64 = opt.unwrap();
+            for (mut j: i64 = 0; j < this.entry_list.length; j++) {
+                if (this.entry_module_ids[j] == mod_idx) {
+                    result.push(this.entry_list[j]);
+                }
+            }
         }
-        return [];
+        return result;
     }
 
     /// Get all public types registered in a module.
@@ -165,10 +183,11 @@ type struct ModuleTypeRegistry {
         mut result: TypeRegistryEntry[] = [];
         const opt: Option<i64> = this.module_index.get(module, hash_str(module));
         if (opt.is_some()) {
-            mut entries: TypeRegistryEntry[] = this.module_entries[opt.unwrap()];
-            for (mut j: i64 = 0; j < entries.length; j++) {
-                if (entries[j].visibility.is_public()) {
-                    result.push(entries[j]);
+            const mod_idx: i64 = opt.unwrap();
+            for (mut j: i64 = 0; j < this.entry_list.length; j++) {
+                if (this.entry_module_ids[j] == mod_idx &&
+                    this.entry_list[j].visibility.is_public()) {
+                    result.push(this.entry_list[j]);
                 }
             }
         }
