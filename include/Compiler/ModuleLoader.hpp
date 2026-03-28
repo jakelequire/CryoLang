@@ -42,6 +42,7 @@ namespace Cryo
         std::string _stdlib_root;                                      // Root directory for standard library
         std::string _current_file_dir;                                 // Directory of currently compiling file
         std::string _project_root;                                     // Root directory of the project (contains cryoconfig)
+        std::string _entry_dir;                                        // Directory of the entry point file (stable search root)
         bool _last_resolve_was_local = false;                          // Whether the last resolve_import_path found a local file
         std::unordered_map<std::string, ImportResult> _loaded_modules; // Cache of loaded modules
         std::unordered_set<std::string> _loading_modules;              // Track modules currently being loaded (cycle detection)
@@ -116,6 +117,13 @@ namespace Cryo
          * @param project_root Path to the project root (directory containing cryoconfig)
          */
         void set_project_root(const std::string &project_root);
+
+        /**
+         * @brief Set the entry point directory as a stable search root.
+         * When entry_point is in a subdirectory (e.g. src/main.cryo), imports
+         * resolve relative to this directory in addition to the project root.
+         */
+        void set_entry_dir(const std::string &entry_dir);
 
         // Temporary debug getter for LSP
         const std::string &current_file_dir() const { return _current_file_dir; }

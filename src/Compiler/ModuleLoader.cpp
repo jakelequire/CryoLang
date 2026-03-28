@@ -187,6 +187,15 @@ namespace Cryo
         _project_root = project_root;
     }
 
+    void ModuleLoader::set_entry_dir(const std::string &entry_dir)
+    {
+        // Only store if it differs from project root (avoids redundant searches)
+        if (entry_dir != _project_root)
+        {
+            _entry_dir = entry_dir;
+        }
+    }
+
     ModuleLoader::ImportResult ModuleLoader::load_import(const ImportDeclarationNode &import_node)
     {
         std::string import_path = import_node.path();
@@ -664,6 +673,81 @@ namespace Cryo
             // (e.g., import Compiler::AST::Node → compiler/AST/node.cryo)
             {
                 std::string ci_path = resolve_path_case_insensitive(_project_root, file_path);
+                if (!ci_path.empty())
+                {
+                    result = resolve_module_file_path(ci_path, ImportDeclarationNode::ImportStyle::WildcardImport);
+                    if (std::filesystem::exists(result))
+                    {
+                        _last_resolve_was_local = true;
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // 1b. Try entry point directory (when entry_point is in a subdirectory like src/main.cryo)
+        if (!_entry_dir.empty())
+        {
+            // Exact case
+            std::string entry_resolved = os.join_path(_entry_dir, file_path);
+            std::string result = resolve_module_file_path(entry_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+            if (std::filesystem::exists(result))
+            {
+                _last_resolve_was_local = true;
+                return result;
+            }
+
+            // Last-segment lowercase
+            if (has_last_seg_lower)
+            {
+                entry_resolved = os.join_path(_entry_dir, last_seg_lower_path);
+                result = resolve_module_file_path(entry_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
+
+            // Last-segment snake_case
+            if (has_last_seg_snake)
+            {
+                entry_resolved = os.join_path(_entry_dir, last_seg_snake_path);
+                result = resolve_module_file_path(entry_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
+
+            // Fully lowercase
+            if (has_lower_variant)
+            {
+                entry_resolved = os.join_path(_entry_dir, lower_file_path);
+                result = resolve_module_file_path(entry_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
+
+            // Fully snake_cased
+            if (has_snake_variant)
+            {
+                entry_resolved = os.join_path(_entry_dir, snake_file_path);
+                result = resolve_module_file_path(entry_resolved, ImportDeclarationNode::ImportStyle::WildcardImport);
+                if (std::filesystem::exists(result))
+                {
+                    _last_resolve_was_local = true;
+                    return result;
+                }
+            }
+
+            // Case-insensitive filesystem walk
+            {
+                std::string ci_path = resolve_path_case_insensitive(_entry_dir, file_path);
                 if (!ci_path.empty())
                 {
                     result = resolve_module_file_path(ci_path, ImportDeclarationNode::ImportStyle::WildcardImport);

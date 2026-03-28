@@ -1133,6 +1133,10 @@ namespace Cryo::CLI::Commands
             // Set project root for module resolution (directory containing cryoconfig)
             compiler->module_loader()->set_project_root(
                 std::filesystem::absolute(config_path).parent_path().string());
+            // Set entry point directory as additional search root (for when entry_point
+            // is in a subdirectory like src/main.cryo — imports resolve relative to it)
+            compiler->module_loader()->set_entry_dir(
+                std::filesystem::absolute(main_file).parent_path().string());
             if (use_verbose)
             {
                 std::cout << "Compiling " << main_file << " -> " << output_path << std::endl;
