@@ -38,9 +38,14 @@ type struct Resolver {
     // Resolution map
     resolution_map:     ResolutionMap;
 
-    // Cross-module state (parallel arrays)
-    export_module_names:  SymbolStr[];
-    export_symbol_lists:  SymbolID[][];
+    // Cross-module exports — flat parallel arrays.
+    // NOTE: Cannot use SymbolID[][] or HashMap<K, SymbolID[]> — the C++
+    // codegen mishandles T[] as a generic type argument (inner array
+    // descriptor is corrupted on store/load).  Flat arrays with a module
+    // key per entry avoid all generic-over-array codegen paths.
+    export_sym_ids:       SymbolID[];   // exported symbol
+    export_module_keys:   u64[];        // which module it belongs to (SymbolStr.id)
+
     import_alias_names:   SymbolStr[];
     import_alias_ids:     SymbolID[];
 
@@ -70,8 +75,8 @@ type struct Resolver {
             global_scope:         global_id,
             current_scope:        global_id,
             resolution_map:       ResolutionMap::new(),
-            export_module_names:  [],
-            export_symbol_lists:  [],
+            export_sym_ids:       [],
+            export_module_keys:   [],
             import_alias_names:   [],
             import_alias_ids:     [],
             current_module:       SymbolStr::empty(),
@@ -303,38 +308,31 @@ type struct Resolver {
 
     /// Register a symbol as exported from the current module.
     export_symbol(mut &this, sym_id: SymbolID) -> void {
-        const mod: SymbolStr = this.current_module;
-
-        // Find existing export list for this module
-        for (mut i: i64 = 0; i < this.export_module_names.length; i++) {
-            if (this.export_module_names[i].equals(mod)) {
-                this.export_symbol_lists[i].push(sym_id);
-                return;
-            }
-        }
-
-        // Create new export list
-        this.export_module_names.push(mod);
-        this.export_symbol_lists.push([sym_id]);
+        this.export_sym_ids.push(sym_id);
+        this.export_module_keys.push(this.current_module.id as u64);
     }
 
     /// Get all exported symbols from a module.
     get_exports(&this, module: SymbolStr) -> SymbolID[] {
-        for (mut i: i64 = 0; i < this.export_module_names.length; i++) {
-            if (this.export_module_names[i].equals(module)) {
-                return this.export_symbol_lists[i];
+        const mod_key: u64 = module.id as u64;
+        mut result: SymbolID[] = [];
+        for (mut i: i64 = 0; i < this.export_sym_ids.length; i++) {
+            if (this.export_module_keys[i] == mod_key) {
+                result.push(this.export_sym_ids[i]);
             }
         }
-        return [];
+        return result;
     }
 
     /// Look up a specific name in a module's exports.
     lookup_in_module(&this, module: SymbolStr, name: SymbolStr) -> SymbolID {
-        const exports: SymbolID[] = this.get_exports(module);
-        for (mut i: i64 = 0; i < exports.length; i++) {
-            const sym: Symbol = this.get_symbol(exports[i]);
-            if (sym.name.equals(name) && sym.visibility.is_public()) {
-                return exports[i];
+        const mod_key: u64 = module.id as u64;
+        for (mut i: i64 = 0; i < this.export_sym_ids.length; i++) {
+            if (this.export_module_keys[i] == mod_key) {
+                const sym: Symbol = this.get_symbol(this.export_sym_ids[i]);
+                if (sym.name.equals(name) && sym.visibility.is_public()) {
+                    return this.export_sym_ids[i];
+                }
             }
         }
         return SymbolID::invalid();
@@ -490,17 +488,7 @@ type struct Resolver {
                 sym.id.id, name, sym.scope_id.id, sym.source_module);
         }
 
-        printf("Exports:\n");
-        for (mut i: i64 = 0; i < this.export_module_names.length; i++) {
-            const mod: string = this.intern_table.resolve(this.export_module_names[i]);
-            printf("  %s:\n", mod);
-            const exports: SymbolID[] = this.export_symbol_lists[i];
-            for (mut j: i64 = 0; j < exports.length; j++) {
-                const sym: Symbol = this.get_symbol(exports[j]);
-                const name: string = this.intern_table.resolve(sym.name);
-                printf("    [%lu] %s (scope %u)\n", sym.id.id, name, sym.scope_id.id);
-            }
-        }
+        printf("Exports: %lld symbols\n", this.export_sym_ids.length);
 
         printf("Import Aliases:\n");
         for (mut i: i64 = 0; i < this.import_alias_names.length; i++) {
