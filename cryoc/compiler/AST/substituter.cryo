@@ -117,6 +117,15 @@ public:
                 return ann;
             }
         }
+
+        // Rewrite the base type name to the specialized name.
+        // e.g. `&this` on `Pair<T>` has annotation Reference(Named("Pair"))
+        // which must become Reference(Named("Pair_string")) after substitution.
+        if (named.name.equals(this.base_name)) {
+            named.name = this.spec_name;
+            return ann;
+        }
+
         return ann;
     }
 
@@ -138,12 +147,39 @@ public:
     }
 
     substitute_generic_annotation(ann: TypeAnnotation*, gen: GenericAnnotation*) -> TypeAnnotation* {
-        // Modify in-place: recurse into base and args (the AST was cloned).
+        // Check BEFORE substitution whether the base is our type being specialized.
+        mut is_self_type: boolean = this.is_named_matching_base(gen.base);
+
+        // Normal recursion: substitute base and args.
+        // For the base, this rewrites Named("Pair") → Named("Pair_string")
+        // via substitute_named_annotation.  Args get T → i32 etc.
         this.substitute_annotation(gen.base);
         for (mut i: i64 = 0; i < gen.args.length; i++) {
             this.substitute_annotation(gen.args[i]);
         }
+
+        // If the base was our type, collapse Generic(Named("Pair_string"), [string])
+        // down to just Named("Pair_string").  The type args are already baked into
+        // the specialized name, so keeping the Generic wrapper would cause the
+        // resolver to create a spurious Pair_string<string> instantiation.
+        if (is_self_type) {
+            *ann = *gen.base;
+            return ann;
+        }
+
         return ann;
+    }
+
+    /// Helper: returns true if the annotation is Named(base_name).
+    is_named_matching_base(ann: TypeAnnotation*) -> boolean {
+        if (ann == null) { return false; }
+        match (*ann) {
+            TypeAnnotation::Named(named) => {
+                return named.name.equals(this.base_name);
+            }
+            _ => { return false; }
+        }
+        return false;
     }
 
 
