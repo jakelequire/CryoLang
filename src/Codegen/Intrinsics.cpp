@@ -2820,10 +2820,17 @@ namespace Cryo::Codegen
                 return nullptr;
             }
 
-            // Allocate a stack buffer for the result
-            llvm::Value *buffer = builder.CreateAlloca(
-                llvm::Type::getInt8Ty(context),
-                llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 4096),
+            // Allocate a heap buffer for the result so the string outlives
+            // the current stack frame.  The old alloca-based approach returned
+            // a dangling pointer once the caller returned, which silently
+            // corrupted HashMap keys and any other code that stored the result.
+            llvm::Type *char_ptr_type = llvm::PointerType::get(context, 0);
+            llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+                char_ptr_type, {llvm::Type::getInt64Ty(context)}, false);
+            llvm::Function *malloc_func = get_or_create_libc_function("malloc", malloc_type);
+            llvm::Value *buffer = builder.CreateCall(
+                malloc_func,
+                {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 4096)},
                 "sprintf.buf");
 
             // Build args: buffer, format, variadic args...
@@ -2854,7 +2861,7 @@ namespace Cryo::Codegen
 
             builder.CreateCall(sprintf_func, converted_args, "sprintf.result");
 
-            // Return the buffer pointer (the formatted string)
+            // Return the heap-allocated buffer (the formatted string)
             return buffer;
         }
     }
