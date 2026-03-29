@@ -7,6 +7,7 @@
 namespace Compiler::ModuleGraph;
 
 import Compiler::Resolver::SymbolStr;
+import Compiler::AST::Node;
 
 
 // ============================================================================
@@ -130,17 +131,63 @@ type struct ModuleGraph {
     topo_order:       u32[];
     cross_module_fns: CrossModuleFnDescriptor[];
 
+    // Per-module AST storage — raw pointer array to avoid array[i]=x codegen bug
+    module_ast_buf: void*;       // malloc'd buffer of ProgramNode* pointers
+    module_ast_cap: u32;         // capacity (== modules.length)
+    module_sources: string[];
+
+    // Module name -> index lookup (SymbolStr.id -> module index)
+    name_index_keys: u32[];
+    name_index_vals: u32[];
+
+    // Saved resolver scope per module — raw pointer to avoid array[i]=x codegen bug
+    // Parallel with modules[]. 0 means "not saved yet".
+    module_scope_buf: void*;    // malloc'd buffer of u64 scope IDs
+    module_scope_cap: u32;
+
     static new() -> ModuleGraph {
         return ModuleGraph {
             modules:          [],
             topo_order:       [],
             cross_module_fns: [],
+            module_ast_buf:   null,
+            module_ast_cap:   0,
+            module_sources:   [],
+            name_index_keys:  [],
+            name_index_vals:  [],
+            module_scope_buf: null,
+            module_scope_cap: 0,
         };
     }
 
     /// Register a module for compilation.
     add_module(mut &this, info: ModuleInfo) -> void {
+        const idx: u32 = this.modules.length;
+        const new_cap: u32 = idx + 1;
+        this.name_index_keys.push(info.name.id);
+        this.name_index_vals.push(idx);
         this.modules = this.modules + [info];
+        this.module_sources.push(info.file_path);
+
+        // Grow AST pointer buffer (raw memory to avoid array[i]=x codegen bug)
+        const new_ast_buf: void* = malloc(new_cap as u64 * 8);
+        memset(new_ast_buf, 0, new_cap as u64 * 8);
+        if (this.module_ast_buf != null && this.module_ast_cap > 0) {
+            memcpy(new_ast_buf, this.module_ast_buf, this.module_ast_cap as u64 * 8);
+            free(this.module_ast_buf);
+        }
+        this.module_ast_buf = new_ast_buf;
+        this.module_ast_cap = new_cap;
+
+        // Grow scope ID buffer (same raw memory approach)
+        const new_scope_buf: void* = malloc(new_cap as u64 * 8);
+        memset(new_scope_buf, 0, new_cap as u64 * 8);
+        if (this.module_scope_buf != null && this.module_scope_cap > 0) {
+            memcpy(new_scope_buf, this.module_scope_buf, this.module_scope_cap as u64 * 8);
+            free(this.module_scope_buf);
+        }
+        this.module_scope_buf = new_scope_buf;
+        this.module_scope_cap = new_cap;
     }
 
     /// Number of registered modules.
@@ -148,7 +195,58 @@ type struct ModuleGraph {
         return this.modules.length;
     }
 
-    /// Compute topological order from dependency edges.
+    /// Find a module's index by its name SymbolStr.  Returns -1 if not found.
+    find_module_index(&this, name: SymbolStr) -> i64 {
+        const key: u32 = name.id;
+        for (mut i: i64 = 0; i < this.name_index_keys.length; i++) {
+            if (this.name_index_keys[i] == key) {
+                return this.name_index_vals[i] as i64;
+            }
+        }
+        return -1;
+    }
+
+    /// Find a module's index by its file path.  Returns -1 if not found.
+    find_module_by_path(&this, path: string) -> i64 {
+        for (mut i: i64 = 0; i < this.modules.length; i++) {
+            if (strcmp(this.modules[i].file_path, path) == 0) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /// Get the parsed AST for a module by index.
+    get_module_ast(&this, index: u32) -> ProgramNode* {
+        if (index >= this.module_ast_cap || this.module_ast_buf == null) { return null; }
+        const slot: ProgramNode** = ptr_add(this.module_ast_buf, (index * 8) as i64) as ProgramNode**;
+        return *slot;
+    }
+
+    /// Store a parsed AST for a module by index.
+    set_module_ast(mut &this, index: u32, ast: ProgramNode*) -> void {
+        if (index >= this.module_ast_cap || this.module_ast_buf == null) { return; }
+        const slot: ProgramNode** = ptr_add(this.module_ast_buf, (index * 8) as i64) as ProgramNode**;
+        *slot = ast;
+    }
+
+    /// Save the resolver's current scope for a module (called after NameResolution).
+    save_module_scope(mut &this, index: u32, scope_id: u64) -> void {
+        if (index >= this.module_scope_cap || this.module_scope_buf == null) { return; }
+        const slot: u64* = ptr_add(this.module_scope_buf, (index * 8) as i64) as u64*;
+        *slot = scope_id;
+    }
+
+    /// Get the saved scope for a module (0 if not saved).
+    get_module_scope(mut &this, index: u32) -> u64 {
+        if (index >= this.module_scope_cap || this.module_scope_buf == null) { return 0; }
+        const slot: u64* = ptr_add(this.module_scope_buf, (index * 8) as i64) as u64*;
+        return *slot;
+    }
+
+    /// Compute topological order using simple iterative selection.
+    /// Each round finds a module whose dependencies are all already placed.
+    /// O(n^2) which is fine for project-scale module counts.
     /// Returns false if a cycle is detected.
     compute_order(mut &this) -> boolean {
         const n: u32 = this.modules.length;
@@ -156,12 +254,51 @@ type struct ModuleGraph {
             return true;
         }
 
-        // Simple linear order for now (dependencies not yet wired).
-        // Full Kahn's algorithm will be added when import resolution populates deps.
+        // Track which modules have been placed (raw i8* avoids array[i] = x codegen issues)
+        const placed: i8* = malloc(n as u64);
+        memset(placed as void*, 0, n as u64);
+
         mut order: u32[] = [];
-        for (mut i: u32 = 0; i < n; i++) {
-            order = order + [i];
+
+        // Each iteration must place at least one module.
+        // If an iteration places zero, we have a cycle.
+        mut progress: boolean = true;
+        while (order.length < n && progress) {
+            progress = false;
+
+            for (mut i: u32 = 0; i < n; i++) {
+                // Check if already placed
+                const placed_i: i8* = ptr_add(placed as void*, i as i64) as i8*;
+                if (*placed_i != 0) { continue; }
+
+                // Check if all dependencies of module i are already placed
+                const deps: SymbolStr[] = this.modules[i].dependencies;
+                mut all_ready: boolean = true;
+                for (mut d: i64 = 0; d < deps.length; d++) {
+                    const dep_idx: i64 = this.find_module_index(deps[d]);
+                    if (dep_idx >= 0) {
+                        const placed_dep: i8* = ptr_add(placed as void*, dep_idx) as i8*;
+                        if (*placed_dep == 0) {
+                            all_ready = false;
+                        }
+                    }
+                }
+
+                if (all_ready) {
+                    order.push(i);
+                    *placed_i = 1;
+                    progress = true;
+                }
+            }
         }
+
+        free(placed as void*);
+
+        // If not all modules placed, there's a cycle
+        if (order.length != n) {
+            return false;
+        }
+
         this.topo_order = order;
         return true;
     }

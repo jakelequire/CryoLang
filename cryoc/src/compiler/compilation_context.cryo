@@ -26,6 +26,7 @@ import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::QualifiedName;
 import Compiler::Resolver::Resolver;
+import Compiler::ProjectConfig;
 import Utils::Logger;
 
 
@@ -65,6 +66,11 @@ public:
     // -- Type system (initialized lazily by TypeDeclaration pass) --
     type_arena: TypeArena*;
 
+    // -- Project configuration (multi-module mode) --
+    project_config:      ProjectConfig*;
+    project_no_std:      boolean;
+    active_module_index: i64;
+
 private:
     // Owned components (initialized lazily by passes that need them).
     resolver:             Resolver*;
@@ -102,6 +108,10 @@ public:
             intern_table:  InternTable::new(),
             decl_index:    DeclarationIndex::new(),
             type_arena:    null,
+
+            project_config:      null,
+            project_no_std:      false,
+            active_module_index: -1,
 
             resolver:             null,
             type_resolver:        null,
@@ -379,6 +389,68 @@ public:
         // Reset resolver cursor (preserves cross-module state)
         if (this.resolver != null) {
             this.resolver.reset_for_next_module();
+        }
+    }
+
+
+    // ----------------------------------------------------------------
+    // Multi-module: switch active module
+    // ----------------------------------------------------------------
+
+    /// Switch the context to a different module by index.
+    /// Updates source_file, namespace, AST, and resolver module.
+    /// Used by the whole-program multi-pass orchestrator.
+    switch_to_module(mut &this, index: i64) -> void {
+        if (index < 0 || index >= this.module_graph.module_count() as i64) {
+            this.ice(sprintf("switch_to_module: index %lld out of range (have %u modules)",
+                index, this.module_graph.module_count()));
+            return;
+        }
+
+        this.active_module_index = index;
+        const info: ModuleInfo = this.module_graph.modules[index];
+        this.source_file = info.file_path;
+
+        // Set namespace from module info
+        const ns_str: string = this.intern_table.resolve(info.namespace_name);
+        if (strlen(ns_str) > 0) {
+            this.current_namespace = QualifiedName::parse(&this.intern_table, ns_str);
+        } else {
+            this.current_namespace = QualifiedName::empty();
+        }
+
+        // NOTE: AST swap is handled by the orchestrator (compile_project) because
+        // nested struct assignment (this.artifacts.ast = ...) through mut &this
+        // doesn't work reliably in the C++ codegen.  The orchestrator calls
+        // set_active_ast() separately after switch_to_module().
+
+        // Update resolver's active module, restoring saved scope if available
+        if (this.resolver != null) {
+            const saved_scope: u64 = this.module_graph.get_module_scope(index as u32);
+            this.resolver.set_module_with_scope(info.name, saved_scope);
+        }
+
+        if (this.debug_mode) {
+            LOG_DEBUG(LogComponent::General,
+                "[CompilationContext] switch_to_module(%lld) -> '%s' ns='%s'",
+                index, info.file_path, ns_str);
+        }
+    }
+
+    /// Save the resolver's current scope for the active module.
+    /// Call this after NameResolution completes for each module.
+    save_module_scope(mut &this) -> void {
+        if (this.active_module_index >= 0 && this.resolver != null) {
+            const scope_id: u64 = this.resolver.get_current_scope_id();
+            this.module_graph.save_module_scope(this.active_module_index as u32, scope_id);
+        }
+    }
+
+    /// Set up the project configuration for multi-module compilation.
+    set_project_config(mut &this, config: ProjectConfig*) -> void {
+        this.project_config = config;
+        if (config != null) {
+            this.project_no_std = config.no_std;
         }
     }
 }
