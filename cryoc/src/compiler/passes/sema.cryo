@@ -113,6 +113,11 @@ public:
     }
 
     lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
+        // Try qualified name first (decl_index stores methods under qualified type names)
+        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(type_sym);
+        const q_ret: TypeRef = this.ctx.decl_index.lookup_method_return(qualified, method_sym);
+        if (q_ret.is_valid()) { return q_ret; }
+        // Fallback to bare name (e.g., monomorphized types registered without namespace)
         return this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
     }
 
@@ -883,18 +888,23 @@ public:
             }
         }
 
-        // Enum variant constructor (e.g., Optional<string>::Some(value))
+        // Enum variant constructor (e.g., Optional::Some("hello"))
         // Look up the specialized type first, then fallback to base.
+        // When the found type is the uninstantiated base (e.g., Optional) but
+        // expected_type is a specialization (e.g., Optional<string>), promote
+        // to the specialized type so codegen sees the concrete instantiation.
         const type_ref: TypeRef = this.lookup_type_by_sym(lookup_sym);
         if (type_ref.is_valid()) {
-            scope.set_resolved_type(type_ref);
-            return type_ref;
+            const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
+            scope.set_resolved_type(promoted);
+            return promoted;
         }
         if (lookup_sym.id != scope.scope_name.id) {
             const base_type_ref: TypeRef = this.lookup_type_by_sym(scope.scope_name);
             if (base_type_ref.is_valid()) {
-                scope.set_resolved_type(base_type_ref);
-                return base_type_ref;
+                const promoted_base: TypeRef = this.promote_to_expected_instantiation(base_type_ref);
+                scope.set_resolved_type(promoted_base);
+                return promoted_base;
             }
         }
 
@@ -955,8 +965,17 @@ public:
         const ret_inst: InstantiatedType* = ret_t as InstantiatedType*;
         if (ret_inst.is_resolved()) { return ret; }
 
-        // Check that expected_type is a concrete InstantiatedType with the same base
-        const exp_t: Type* = this.arena.lookup(this.expected_type.id);
+        // Check that expected_type is a concrete InstantiatedType with the same base.
+        // Dereference TypeAlias first (e.g., StringPair → Pair<string>).
+        mut exp_ref: TypeRef = this.expected_type;
+        mut exp_t: Type* = this.arena.lookup(exp_ref.id);
+        if (exp_t != null && exp_t.kind == TypeKind::TypeAlias) {
+            const alias: TypeAliasType* = exp_t as TypeAliasType*;
+            if (alias.has_target()) {
+                exp_ref = alias.target;
+                exp_t = this.arena.lookup(exp_ref.id);
+            }
+        }
         if (exp_t == null || exp_t.kind != TypeKind::InstantiatedType) { return ret; }
         const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
 
@@ -984,6 +1003,33 @@ public:
         // The specialized struct exists (it was monomorphized) but the method
         // might not be registered yet — use the expected type directly.
         return this.expected_type;
+    }
+
+    /// When an enum variant constructor returns the base type (e.g., Optional)
+    /// but expected_type is a specialization (e.g., Optional<string>), promote
+    /// to the specialized type.  This lets codegen see the concrete instantiation.
+    promote_to_expected_instantiation(&this, found: TypeRef) -> TypeRef {
+        if (!this.expected_type.is_valid()) { return found; }
+
+        // Dereference TypeAlias on expected_type (e.g., MyOptional → Optional<string>)
+        mut exp_ref: TypeRef = this.expected_type;
+        mut exp_t: Type* = this.arena.lookup(exp_ref.id);
+        if (exp_t != null && exp_t.kind == TypeKind::TypeAlias) {
+            const alias: TypeAliasType* = exp_t as TypeAliasType*;
+            if (alias.has_target()) {
+                exp_ref = alias.target;
+                exp_t = this.arena.lookup(exp_ref.id);
+            }
+        }
+        if (exp_t == null || exp_t.kind != TypeKind::InstantiatedType) { return found; }
+
+        // Check that the expected type's generic base matches what we found
+        const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
+        if (exp_inst.generic_base.equals(found)) {
+            return exp_ref;
+        }
+
+        return found;
     }
 
     resolve_member_access(mut &this, member: MemberAccessNode*) -> TypeRef {
@@ -1032,6 +1078,18 @@ public:
 
     resolve_cast(mut &this, cast: CastExprNode*) -> TypeRef {
         this.resolve_expr(cast.expression);
+        // Resolve the target type annotation if TypeResolution didn't reach it
+        // (e.g., cast used as an initializer rather than a standalone expression).
+        if (!cast.has_resolved_target() && cast.target_annotation != null
+                && this.ctx.type_resolver != null) {
+            mut res_ctx: ResolutionContext = ResolutionContext::new(
+                this.ctx.source_file, "");
+            const target: TypeRef = this.ctx.type_resolver.resolve(
+                cast.target_annotation, &res_ctx);
+            if (target.is_valid()) {
+                cast.set_resolved_target(target);
+            }
+        }
         return cast.resolved_target;
     }
 
@@ -1101,7 +1159,11 @@ public:
     }
 
     resolve_scope_resolution(&this, scope: ScopeResolutionNode*) -> TypeRef {
-        return this.lookup_type_by_sym(scope.scope_name);
+        const found: TypeRef = this.lookup_type_by_sym(scope.scope_name);
+        if (found.is_valid()) {
+            return this.promote_to_expected_instantiation(found);
+        }
+        return found;
     }
 
     resolve_new_expr(mut &this, new_expr: NewExprNode*) -> TypeRef {

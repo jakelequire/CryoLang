@@ -30,6 +30,7 @@ import Compiler::Passes::ASTValidation;
 import Compiler::Passes::Specialization;
 import Compiler::Passes::TypeResolution;
 import Compiler::Passes::Sema;
+import Compiler::Passes::TypeLowering;
 import Utils;
 import Utils::File;
 import Utils::Logger;
@@ -272,8 +273,8 @@ type struct PassRegistry {
             PassID::DirectiveProcessing,
             PassID::Monomorphization,
             PassID::GenericExpressionResolution,
-            PassID::FunctionBodyTypeCheck,
             PassID::TypeLowering,
+            PassID::FunctionBodyTypeCheck,
             PassID::FunctionDeclaration,
             PassID::IRGeneration,
             PassID::Optimization,
@@ -301,6 +302,7 @@ type struct PassRegistry {
             PassID::DirectiveProcessing,
             PassID::Monomorphization,
             PassID::GenericExpressionResolution,
+            PassID::TypeLowering,
             PassID::FunctionBodyTypeCheck,
         ]);
         return reg;
@@ -322,8 +324,8 @@ type struct PassRegistry {
             PassID::DirectiveProcessing,
             PassID::Monomorphization,
             PassID::GenericExpressionResolution,
-            PassID::FunctionBodyTypeCheck,
             PassID::TypeLowering,
+            PassID::FunctionBodyTypeCheck,
             PassID::FunctionDeclaration,
             PassID::IRGeneration,
             PassID::Optimization,
@@ -348,8 +350,8 @@ type struct PassRegistry {
             PassID::DirectiveProcessing,
             PassID::Monomorphization,
             PassID::GenericExpressionResolution,
-            PassID::FunctionBodyTypeCheck,
             PassID::TypeLowering,
+            PassID::FunctionBodyTypeCheck,
             PassID::FunctionDeclaration,
             PassID::IRGeneration,
             PassID::Optimization,
@@ -408,6 +410,9 @@ function run_pass(id: PassID, ctx: CompilationContext*) -> PassResult {
         }
         PassID::FunctionBodyTypeCheck => {
             SemanticPasses::run_function_body_type_check(ctx)
+        }
+        PassID::TypeLowering => {
+            TypeLoweringPasses::run(ctx)
         }
         _ => {
             printf("[Pipeline] STUB: %s (not yet implemented)\n", meta.name);
@@ -627,9 +632,15 @@ function run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
             }
             NodeKind::TypeAliasDeclaration => {
                 const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
+                const qualified_alias: SymbolStr = ctx.qualify_symbol_sym(node.alias_name);
                 // Use qualified name (consistent with struct/enum/class/trait);
                 // target resolved in TypeResolution pass
-                arena.create_type_alias(ctx.qualify_symbol_sym(node.alias_name), TypeRef::invalid());
+                const alias_ref: TypeRef = arena.create_type_alias(qualified_alias, TypeRef::invalid());
+                // Register in DeclarationIndex so resolve_named() can find
+                // aliases by qualified name during TypeResolution Phase 3
+                // (before Phase 4 populates the index for other types).
+                ctx.decl_index.register_type(qualified_alias, alias_ref);
+                ctx.decl_index.register_type(node.alias_name, alias_ref);
                 type_count++;
             }
             _ => {
