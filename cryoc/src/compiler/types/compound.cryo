@@ -79,12 +79,16 @@ public:
 
 type class ArrayType : Type {
 public:
-    element: TypeRef;
-    size:    i64;       // -1 = dynamic/unsized
+    element:        TypeRef;
+    size:           i64;       // -1 = dynamic/unsized
+    computed_size:  u64;       // Computed by TypeLowering pass for fixed arrays
+    computed_align: u64;
 
     ArrayType(id: u64, element: TypeRef, size: i64) : Type(id, TypeKind::Array) {
-        this.element = element;
-        this.size    = size;
+        this.element        = element;
+        this.size           = size;
+        this.computed_size  = 0;
+        this.computed_align = 0;
     }
 
     is_dynamic(&this) -> boolean { return this.size < 0; }
@@ -104,18 +108,19 @@ public:
         return sprintf("_Carray_%lu_%ld", this.element.id, this.size);
     }
 
+    set_layout(mut &this, size: u64, align: u64) -> void {
+        this.computed_size  = size;
+        this.computed_align = align;
+    }
+
     override size_bytes(&this) -> u64 {
-        if (this.is_dynamic()) {
-            return 16;  // ptr + len (fat pointer)
-        }
-        return 0;  // Depends on element type * size
+        if (this.is_dynamic()) { return 16; }
+        return this.computed_size;
     }
 
     override alignment(&this) -> u64 {
-        if (this.is_dynamic()) {
-            return 8;
-        }
-        return 0;  // Depends on element type alignment
+        if (this.is_dynamic()) { return 8; }
+        return this.computed_align;
     }
 }
 
@@ -179,10 +184,14 @@ public:
 
 type class TupleType : Type {
 public:
-    elements: TypeRef[];
+    elements:       TypeRef[];
+    computed_size:  u64;
+    computed_align: u64;
 
     TupleType(id: u64, elements: TypeRef[]) : Type(id, TypeKind::Tuple) {
-        this.elements = elements;
+        this.elements       = elements;
+        this.computed_size  = 0;
+        this.computed_align = 0;
     }
 
     element_count(&this) -> i64 {
@@ -209,8 +218,13 @@ public:
         return result;
     }
 
-    override size_bytes(&this) -> u64 { return 0; }  // Depends on elements
-    override alignment(&this) -> u64  { return 0; }
+    set_layout(mut &this, size: u64, align: u64) -> void {
+        this.computed_size  = size;
+        this.computed_align = align;
+    }
+
+    override size_bytes(&this) -> u64 { return this.computed_size; }
+    override alignment(&this) -> u64  { return this.computed_align; }
 }
 
 
@@ -220,10 +234,14 @@ public:
 
 type class OptionalType : Type {
 public:
-    wrapped: TypeRef;
+    wrapped:        TypeRef;
+    computed_size:  u64;
+    computed_align: u64;
 
     OptionalType(id: u64, wrapped: TypeRef) : Type(id, TypeKind::Optional) {
-        this.wrapped = wrapped;
+        this.wrapped        = wrapped;
+        this.computed_size  = 0;
+        this.computed_align = 0;
     }
 
     override display_name(&this) -> string {
@@ -234,6 +252,11 @@ public:
         return sprintf("_Copt_%lu", this.wrapped.id);
     }
 
-    override size_bytes(&this) -> u64 { return 0; }  // Depends on wrapped + tag
-    override alignment(&this) -> u64  { return 0; }
+    set_layout(mut &this, size: u64, align: u64) -> void {
+        this.computed_size  = size;
+        this.computed_align = align;
+    }
+
+    override size_bytes(&this) -> u64 { return this.computed_size; }
+    override alignment(&this) -> u64  { return this.computed_align; }
 }
