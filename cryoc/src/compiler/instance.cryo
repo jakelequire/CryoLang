@@ -18,10 +18,13 @@ import Compiler::Artifacts;
 import Compiler::Passes::PassID;
 import Compiler::Passes::PassRegistry;
 import Compiler::ModuleGraph;
+import Compiler::ModuleLoader;
+import Compiler::ProjectConfig;
 import Compiler::Lex;
 import Compiler::Lex::Lexer;
 import Compiler::AST::Node;
 import Compiler::AST::Dumper;
+import Compiler::Resolver::InternTable;
 import Utils;
 import Utils::File;
 import Utils::Logger;
@@ -220,6 +223,259 @@ type struct CompilerInstance {
         ctx.artifacts.tokens = TokenStream::new([], virtual_path, content);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
         return this.run_pipeline(&ctx, &pipeline, "");
+    }
+
+    /// Switch to a module AND load its AST.  Works around the codegen bug
+    /// where nested struct assignment through mut &this doesn't persist.
+    /// This sets ctx.artifacts.ast directly on the ctx pointer.
+    static load_module(ctx: CompilationContext*, graph: ModuleGraph*, intern: InternTable*, mod_idx: u32) -> void {
+        ctx.switch_to_module(mod_idx as i64);
+        const ast: ProgramNode* = graph.get_module_ast(mod_idx);
+        if (ast != null) {
+            const info: ModuleInfo = graph.modules[mod_idx];
+            const ns: string = intern.resolve(info.namespace_name);
+            ctx.artifacts.ast = ASTOutput {
+                root: ast,
+                namespace_name: ns,
+            };
+        }
+    }
+
+    /// Compile a multi-module project using whole-program multi-pass.
+    /// Parses cryoconfig, discovers all modules, then runs each pipeline
+    /// stage across ALL modules before advancing to the next stage.
+    compile_project(&this, config_path: string) -> CompilationResult {
+        LOG_DEBUG(LogComponent::General, "[Compiler] compile_project: %s", config_path);
+
+        // Phase 0: Parse project configuration
+        const config: ProjectConfig = ProjectConfig::parse(config_path);
+        const entry_path: string = config.entry_point_path();
+
+        if (this.config.debug) {
+            printf("[Compiler] Project: %s (target: %s, entry: %s)\n",
+                config.project_name, config.target_type.label(), entry_path);
+        }
+
+        if (!File::exists(entry_path)) {
+            printf("[Compiler] Error: Entry point not found: %s\n", entry_path);
+            return CompilationResult::failed(1, 0);
+        }
+
+        // Phase 1: Create context and discover modules
+        mut ctx: CompilationContext = CompilationContext::new(CompileMode::MultiModule, entry_path);
+        ctx.debug_mode = this.config.debug;
+
+        const _box_config: Box<ProjectConfig> = Box<ProjectConfig>::new(config);
+        ctx.set_project_config(_box_config.leak());
+
+        // Create module loader and discover all modules recursively
+        const stdlib_root: string = "";  // TODO: resolve stdlib root from install path
+        mut loader: ModuleLoader = ModuleLoader::new(
+            config.project_root, entry_path, stdlib_root, config.no_std);
+
+        const discovery_ok: boolean = loader.discover_project(
+            &ctx.intern_table, &ctx.module_graph, &ctx.diagnostics,
+            entry_path, this.config.debug);
+
+        if (!discovery_ok) {
+            printf("[Compiler] Module discovery failed\n");
+            return CompilationResult::failed(ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+        }
+
+        if (ctx.module_graph.module_count() == 0) {
+            printf("[Compiler] No modules discovered\n");
+            return CompilationResult::failed(1, 0);
+        }
+
+        // Compute topological order
+        if (!ctx.module_graph.compute_order()) {
+            ctx.emit_error(ErrorCode::E0501_CIRCULAR_IMPORT,
+                "circular module dependency detected — cannot determine compilation order");
+            return CompilationResult::failed(ctx.diagnostics.error_count, 0);
+        }
+
+        const order: u32[] = ctx.module_graph.topo_order;
+        const n: u32 = order.length;
+
+        if (this.config.debug) {
+            printf("[Compiler] Discovered %u modules, compilation order:\n", n);
+            for (mut i: u32 = 0; i < n; i++) {
+                const info: ModuleInfo = ctx.module_graph.modules[order[i]];
+                printf("  [%u] %s (%s)\n", i,
+                    ctx.intern_table.resolve(info.name), info.file_path);
+            }
+        }
+
+        // Phase 2: Frontend — lex, parse, validate all modules in topo order
+        mut pipeline: PassRegistry = PassRegistry::new();
+        pipeline.set_verbose(this.config.verbose_passes);
+        pipeline.set_passes([PassID::Lexing, PassID::Parsing, PassID::ASTValidation]);
+        pipeline.validate();
+
+        for (mut i: u32 = 0; i < n; i++) {
+            const mod_idx: u32 = order[i];
+            ctx.switch_to_module(mod_idx as i64);
+            if (!pipeline.run_all(&ctx)) {
+                return this.project_failure(&ctx);
+            }
+            // Save the parsed AST into the module graph
+            ctx.module_graph.set_module_ast(mod_idx, ctx.artifacts.ast.root);
+            pipeline.reset();
+            ctx.provisions.clear();
+        }
+
+        // Phase 3: Module Resolution — auto-import, import resolution, name resolution
+        pipeline.set_passes([PassID::AutoImport, PassID::ImportResolution, PassID::NameResolution]);
+        {
+            mut initial3: ProvisionSet = ProvisionSet::empty();
+            initial3.mark(Provision::ASTValidated);
+            pipeline.validate_with_initial(initial3);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module(&ctx, &ctx.module_graph, &ctx.intern_table, order[i]);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            if (!pipeline.run_all(&ctx)) {
+                return this.project_failure(&ctx);
+            }
+            // Save the resolver's scope so we can restore it for later passes
+            ctx.save_module_scope();
+            pipeline.reset();
+        }
+
+        // Phase 4: Declaration Collection — type declarations, function signatures, templates
+        pipeline.set_passes([PassID::TypeDeclaration, PassID::FunctionSignature, PassID::TemplateRegistration]);
+        {
+            mut initial4: ProvisionSet = ProvisionSet::empty();
+            initial4.mark(Provision::ASTValidated);
+            initial4.mark(Provision::NamesResolved);
+            pipeline.validate_with_initial(initial4);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module(&ctx, &ctx.module_graph, &ctx.intern_table, order[i]);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::ImportsDiscovered);
+            ctx.provisions.mark(Provision::ModulesLoaded);
+            ctx.provisions.mark(Provision::ModuleOrder);
+            ctx.provisions.mark(Provision::NamesResolved);
+            if (!pipeline.run_all(&ctx)) {
+                return this.project_failure(&ctx);
+            }
+            pipeline.reset();
+        }
+
+        // Phase 5: Type Resolution
+        pipeline.set_passes([PassID::TypeResolution, PassID::StructFieldTypeSync]);
+        {
+            mut initial5: ProvisionSet = ProvisionSet::empty();
+            initial5.mark(Provision::ASTValidated);
+            initial5.mark(Provision::NamesResolved);
+            initial5.mark(Provision::TypeDeclarations);
+            initial5.mark(Provision::FunctionSignatures);
+            initial5.mark(Provision::TemplatesRegistered);
+            pipeline.validate_with_initial(initial5);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module(&ctx, &ctx.module_graph, &ctx.intern_table, order[i]);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            ctx.provisions.mark(Provision::FunctionSignatures);
+            ctx.provisions.mark(Provision::TemplatesRegistered);
+            if (!pipeline.run_all(&ctx)) {
+                return this.project_failure(&ctx);
+            }
+            pipeline.reset();
+        }
+
+        // Phase 6: Specialization + Semantic Analysis
+        pipeline.set_passes([
+            PassID::DirectiveProcessing,
+            PassID::Monomorphization,
+            PassID::GenericExpressionResolution,
+            PassID::TypeLowering,
+            PassID::FunctionBodyTypeCheck,
+        ]);
+        {
+            mut initial6: ProvisionSet = ProvisionSet::empty();
+            initial6.mark(Provision::ASTValidated);
+            initial6.mark(Provision::NamesResolved);
+            initial6.mark(Provision::TypesResolved);
+            initial6.mark(Provision::StructFieldsSynced);
+            pipeline.validate_with_initial(initial6);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module(&ctx, &ctx.module_graph, &ctx.intern_table, order[i]);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            ctx.provisions.mark(Provision::FunctionSignatures);
+            ctx.provisions.mark(Provision::TemplatesRegistered);
+            ctx.provisions.mark(Provision::TypesResolved);
+            ctx.provisions.mark(Provision::StructFieldsSynced);
+            if (!pipeline.run_all(&ctx)) {
+                return this.project_failure(&ctx);
+            }
+            pipeline.reset();
+        }
+
+        // Dump ASTs if requested
+        if (this.config.show_ast) {
+            for (mut i: u32 = 0; i < n; i++) {
+                const ast: ProgramNode* = ctx.module_graph.get_module_ast(order[i]);
+                if (ast != null) {
+                    const mod_info: ModuleInfo = ctx.module_graph.modules[order[i]];
+                    printf("\n=== AST: %s ===\n", mod_info.file_path);
+                    ASTDumper::dump(ast, &ctx.intern_table);
+                }
+            }
+        }
+
+        if (this.config.debug) {
+            ctx.type_arena.debug_dump();
+        }
+
+        // Phase 7: Codegen (not yet implemented for multi-module)
+        // TODO: Merge all module ASTs and run codegen passes
+
+        // Print diagnostic summary
+        if (ctx.diagnostics.has_errors() || this.config.debug) {
+            if (ctx.diag_renderer != null) {
+                ctx.diag_renderer.print_summary(
+                    ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+            }
+        }
+
+        if (ctx.diagnostics.has_errors()) {
+            return CompilationResult::failed(
+                ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+        }
+        return CompilationResult::ok("");
+    }
+
+    /// Helper: build a failure result from context diagnostics.
+    project_failure(&this, ctx: CompilationContext*) -> CompilationResult {
+        if (ctx.diag_renderer != null) {
+            ctx.diag_renderer.print_summary(
+                ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+        }
+        return CompilationResult::failed(
+            ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
     }
 
     /// Batch-compile the stdlib: iterate modules in dependency order,
