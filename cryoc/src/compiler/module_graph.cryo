@@ -245,8 +245,8 @@ type struct ModuleGraph {
     }
 
     /// Compute topological order using simple iterative selection.
-    /// Each round finds a module whose dependencies are all already placed.
-    /// O(n^2) which is fine for project-scale module counts.
+    /// No raw pointers — uses array scanning for "is placed" checks.
+    /// O(n^3) which is fine for project-scale module counts (<100).
     /// Returns false if a cycle is detected.
     compute_order(mut &this) -> boolean {
         const n: u32 = this.modules.length;
@@ -254,53 +254,42 @@ type struct ModuleGraph {
             return true;
         }
 
-        // Track which modules have been placed (raw i8* avoids array[i] = x codegen issues)
-        const placed: i8* = malloc(n as u64);
-        memset(placed as void*, 0, n as u64);
-
         mut order: u32[] = [];
+        mut max_iters: u32 = n + 1;
 
-        // Each iteration must place at least one module.
-        // If an iteration places zero, we have a cycle.
-        mut progress: boolean = true;
-        while (order.length < n && progress) {
-            progress = false;
+        while (order.length < n && max_iters > 0) {
+            max_iters = max_iters - 1;
+            mut placed_any: boolean = false;
 
             for (mut i: u32 = 0; i < n; i++) {
-                // Check if already placed
-                const placed_i: i8* = ptr_add(placed as void*, i as i64) as i8*;
-                if (*placed_i != 0) { continue; }
+                // Skip if already in order
+                if (topo_contains(order, i)) { continue; }
 
-                // Check if all dependencies of module i are already placed
+                // Check if all dependencies are already placed
                 const deps: SymbolStr[] = this.modules[i].dependencies;
                 mut all_ready: boolean = true;
                 for (mut d: i64 = 0; d < deps.length; d++) {
                     const dep_idx: i64 = this.find_module_index(deps[d]);
-                    if (dep_idx >= 0) {
-                        const placed_dep: i8* = ptr_add(placed as void*, dep_idx) as i8*;
-                        if (*placed_dep == 0) {
-                            all_ready = false;
-                        }
+                    if (dep_idx >= 0 && !topo_contains(order, dep_idx as u32)) {
+                        all_ready = false;
                     }
                 }
 
                 if (all_ready) {
                     order.push(i);
-                    *placed_i = 1;
-                    progress = true;
+                    placed_any = true;
                 }
+            }
+
+            if (!placed_any) {
+                // No progress — cycle detected
+                this.topo_order = order;
+                return false;
             }
         }
 
-        free(placed as void*);
-
-        // If not all modules placed, there's a cycle
-        if (order.length != n) {
-            return false;
-        }
-
         this.topo_order = order;
-        return true;
+        return order.length == n;
     }
 
     /// Register a cross-module function descriptor.
@@ -317,4 +306,19 @@ type struct ModuleGraph {
         }
         return null;
     }
+}
+
+
+// ============================================================================
+// Free helper for topological sort (avoids method-in-complex-function issues)
+// ============================================================================
+
+/// Check if a value is in the order array (linear scan).
+function topo_contains(order: u32[], val: u32) -> boolean {
+    for (mut i: u32 = 0; i < order.length; i++) {
+        if (order[i] == val) {
+            return true;
+        }
+    }
+    return false;
 }
