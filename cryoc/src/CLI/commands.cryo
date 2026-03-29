@@ -1,6 +1,7 @@
 namespace CLI::Commands;
 
 import Compiler::Instance;
+import Compiler::ProjectConfig;
 import Utils;
 import Utils::File;
 import Utils::Logger;
@@ -15,6 +16,7 @@ type enum CommandKind {
     Build;
     Check;
     Raw;
+    Project;
     Unknown;
 }
 
@@ -26,28 +28,31 @@ implement enum CommandKind {
             CommandKind::Build   => { "build"   }
             CommandKind::Check   => { "check"   }
             CommandKind::Raw     => { "raw"     }
+            CommandKind::Project => { "project" }
             _ => { "" }
         };
     }
 
     description(&this) -> string {
         return match (this) {
-            CommandKind::Help    => { "Display help information"              }
-            CommandKind::Version => { "Display version information"           }
-            CommandKind::Build   => { "Build a source file (single-file)"    }
-            CommandKind::Check   => { "Check a file for errors (no codegen)" }
-            CommandKind::Raw     => { "Compile without stdlib or prelude"    }
+            CommandKind::Help    => { "Display help information"                      }
+            CommandKind::Version => { "Display version information"                   }
+            CommandKind::Build   => { "Build a source file (single-file)"            }
+            CommandKind::Check   => { "Check a file for errors (no codegen)"         }
+            CommandKind::Raw     => { "Compile without stdlib or prelude"            }
+            CommandKind::Project => { "Build a multi-module project from cryoconfig" }
             _ => { "" }
         };
     }
 
     usage(&this) -> string {
         return match (this) {
-            CommandKind::Help    => { "cryoc help [command]"       }
-            CommandKind::Version => { "cryoc version"              }
-            CommandKind::Build   => { "cryoc build <file> [flags]" }
-            CommandKind::Check   => { "cryoc check <file> [flags]" }
-            CommandKind::Raw     => { "cryoc raw <file> [flags]"   }
+            CommandKind::Help    => { "cryoc help [command]"              }
+            CommandKind::Version => { "cryoc version"                     }
+            CommandKind::Build   => { "cryoc build <file> [flags]"       }
+            CommandKind::Check   => { "cryoc check <file> [flags]"       }
+            CommandKind::Raw     => { "cryoc raw <file> [flags]"         }
+            CommandKind::Project => { "cryoc project [dir] [flags]"      }
             _ => { "" }
         };
     }
@@ -74,6 +79,9 @@ type struct Executor {
 
         const raw: CommandKind = CommandKind::Raw;
         runner.add_command(Command::new(raw.name(), raw.description(), raw.usage()));
+
+        const project: CommandKind = CommandKind::Project;
+        runner.add_command(Command::new(project.name(), project.description(), project.usage()));
     }
 
     /// Resolves a command name string to a CommandKind.
@@ -83,6 +91,7 @@ type struct Executor {
         if (name == "build")   { return CommandKind::Build; }
         if (name == "check")   { return CommandKind::Check; }
         if (name == "raw")     { return CommandKind::Raw; }
+        if (name == "project") { return CommandKind::Project; }
         return CommandKind::Unknown;
     }
 
@@ -100,6 +109,7 @@ type struct Executor {
             CommandKind::Build   => { return Executor::cmd_build(args); }
             CommandKind::Check   => { return Executor::cmd_check(args); }
             CommandKind::Raw     => { return Executor::cmd_raw(args); }
+            CommandKind::Project => { return Executor::cmd_project(args); }
             CommandKind::Unknown => {
                 printf("Error: Unknown command. Run 'cryoc help' for usage.\n");
                 return 1;
@@ -112,15 +122,25 @@ type struct Executor {
     // Command Implementations
     // ================================================================
 
-    /// `cryoc build <file>` — full single-file compilation with stdlib.
+    /// `cryoc build [file]` — single-file or project compilation.
+    /// If no file is given, looks for a cryoconfig in the current directory.
+    /// If a cryoconfig is found, runs project compilation; otherwise errors.
     static cmd_build(args: ParsedArgs) -> int {
         if (args.has_flag("debug")) {
             Logger::enable_debug();
         }
 
         const file: string = args.input_file();
-        if (file == "") {
-            printf("Error: No input file specified.\nUsage: cryoc build <file> [flags]\n");
+        if (file == "" || strlen(file) == 0) {
+            // No file specified — check for cryoconfig in current directory
+            const config_path: string = find_cryoconfig(".");
+            if (strlen(config_path) > 0) {
+                // Found a project config — delegate to project compilation
+                return Executor::cmd_project(args);
+            }
+            printf("Error: No input file specified and no cryoconfig found.\n");
+            printf("Usage: cryoc build <file> [flags]\n");
+            printf("   or: run from a directory containing a cryoconfig\n");
             return 1;
         }
         return Executor::compile_file(file, args);
@@ -188,6 +208,53 @@ type struct Executor {
         }
 
         printf("Compilation failed (%u errors, %u warnings)\n",
+            result.error_count, result.warning_count);
+        return 1;
+    }
+
+    /// `cryoc project [dir]` — multi-module project compilation.
+    /// Looks for a cryoconfig file in the given directory (or CWD).
+    static cmd_project(args: ParsedArgs) -> int {
+        if (args.has_flag("debug")) {
+            Logger::enable_debug();
+        }
+
+        // Determine project directory: first positional arg, or "."
+        const dir: string = if (args.positional_count() > 0) {
+            args.input_file()
+        } else {
+            "."
+        };
+
+        // Find cryoconfig in the directory
+        const config_path: string = find_cryoconfig(dir);
+        if (strcmp(config_path, "") == 0) {
+            printf("Error: No cryoconfig found in '%s' or parent directories.\n", dir);
+            printf("Usage: cryoc project [directory] [flags]\n");
+            return 1;
+        }
+
+        if (args.has_flag("debug")) {
+            printf("[Project] Found cryoconfig: %s\n", config_path);
+        }
+
+        mut config: CompilerConfig = CompilerConfig::default();
+        if (args.has_flag("debug")) {
+            config = CompilerConfig::debug_config();
+        }
+        if (args.has_flag("ast")) {
+            config.show_ast = true;
+        }
+
+        mut compiler: CompilerInstance = CompilerInstance::new(config);
+        const result: CompilationResult = compiler.compile_project(config_path);
+
+        if (result.success) {
+            printf("Project compilation succeeded.\n");
+            return 0;
+        }
+
+        printf("Project compilation failed (%u errors, %u warnings)\n",
             result.error_count, result.warning_count);
         return 1;
     }

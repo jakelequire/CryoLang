@@ -1,0 +1,248 @@
+///! Project Configuration
+///!
+///! Parses `cryoconfig` INI-like project files to configure multi-module
+///! compilation.  Provides target type policies and project root discovery.
+
+namespace Compiler::ProjectConfig;
+
+import Utils::File;
+
+
+// ============================================================================
+// TargetType
+// ============================================================================
+
+/// What kind of output the project produces.
+type enum TargetType {
+    /// Produces an executable with a main() entry point.
+    Executable;
+    /// Produces a library (no main, exports public API).
+    Library;
+    /// Batch-compiles stdlib modules (no auto-imports).
+    Stdlib;
+}
+
+implement enum TargetType {
+    label(&this) -> string {
+        return match (this) {
+            TargetType::Executable => { "executable" }
+            TargetType::Library    => { "library"    }
+            TargetType::Stdlib     => { "stdlib"     }
+        };
+    }
+}
+
+/// Parse a target type from a string.  Free function to avoid unsized enum
+/// return in impl block (C++ codegen limitation).
+function parse_target_type(s: string) -> int {
+    if (strcmp(s, "library") == 0) { return 1; }
+    if (strcmp(s, "stdlib") == 0)  { return 2; }
+    return 0;  // executable
+}
+
+
+// ============================================================================
+// ProjectConfig
+// ============================================================================
+
+/// Parsed representation of a `cryoconfig` file.
+type struct ProjectConfig {
+    project_name: string;
+    output_dir:   string;
+    target_type:  TargetType;
+    entry_point:  string;      // relative path from project root
+    debug:        boolean;
+    optimize:     boolean;
+    no_std:       boolean;
+    project_root: string;      // directory containing cryoconfig
+
+    /// Create a default configuration.
+    static default() -> ProjectConfig {
+        return ProjectConfig {
+            project_name: "unnamed",
+            output_dir:   "build",
+            target_type:  TargetType::Executable,
+            entry_point:  "main.cryo",
+            debug:        false,
+            optimize:     false,
+            no_std:       false,
+            project_root: ".",
+        };
+    }
+
+    /// Parse a cryoconfig file at the given path.
+    static parse(path: string) -> ProjectConfig {
+        if (!File::exists(path)) {
+            printf("[ProjectConfig] Warning: cryoconfig not found at '%s', using defaults\n", path);
+            return ProjectConfig::default();
+        }
+
+        mut file: File = File::new(path);
+        file.load();
+        const content: string = file.content();
+
+        // Extract project root from the config file path
+        const project_root: string = extract_directory(path);
+
+        mut config: ProjectConfig = ProjectConfig::default();
+        config.project_root = project_root;
+
+        // Parse INI-like format line by line
+        mut current_section: string = "";
+        mut pos: i64 = 0;
+        const len: i64 = strlen(content) as i64;
+
+        while (pos < len) {
+            // Extract one line
+            const line_start: i64 = pos;
+            while (pos < len && content[pos] != 10) {  // 10 = '\n'
+                pos = pos + 1;
+            }
+            const line: string = substr(content, line_start, pos - line_start);
+            if (pos < len) { pos = pos + 1; }  // skip '\n'
+
+            // Skip empty lines and comments
+            const trimmed: string = trim_whitespace(line);
+            if (strlen(trimmed) == 0) { continue; }
+            if (trimmed[0] == 35) { continue; }  // 35 = '#'
+
+            // Check for section header [section]
+            if (trimmed[0] == 91) {  // 91 = '['
+                const close: i64 = find_char(trimmed, 93);  // 93 = ']'
+                if (close > 1) {
+                    current_section = substr(trimmed, 1, close - 1);
+                }
+                continue;
+            }
+
+            // Parse key = value
+            const eq_pos: i64 = find_char(trimmed, 61);  // 61 = '='
+            if (eq_pos < 0) { continue; }
+
+            const key: string   = trim_whitespace(substr(trimmed, 0, eq_pos));
+            const raw_val: string = trim_whitespace(substr(trimmed, eq_pos + 1, strlen(trimmed) as i64 - eq_pos - 1));
+            const val: string   = strip_quotes(raw_val);
+
+            // Apply to config based on section + key
+            if (strcmp(current_section, "project") == 0) {
+                if (strcmp(key, "project_name") == 0) { config.project_name = val; }
+                else if (strcmp(key, "output_dir") == 0) { config.output_dir = val; }
+                else if (strcmp(key, "target_type") == 0) {
+                    const tt: int = parse_target_type(val);
+                    if (tt == 1) { config.target_type = TargetType::Library; }
+                    else if (tt == 2) { config.target_type = TargetType::Stdlib; }
+                }
+                else if (strcmp(key, "entry_point") == 0) { config.entry_point = val; }
+            } else if (strcmp(current_section, "compiler") == 0) {
+                if (strcmp(key, "debug") == 0)    { config.debug    = parse_bool(val); }
+                else if (strcmp(key, "optimize") == 0) { config.optimize = parse_bool(val); }
+                else if (strcmp(key, "no_std") == 0)   { config.no_std   = parse_bool(val); }
+            }
+        }
+
+        return config;
+    }
+
+    /// Build the absolute path to the entry point file.
+    entry_point_path(&this) -> string {
+        if (this.project_root == "" || strcmp(this.project_root, ".") == 0) {
+            return this.entry_point;
+        }
+        return sprintf("%s/%s", this.project_root, this.entry_point);
+    }
+}
+
+
+// ============================================================================
+// cryoconfig Discovery
+// ============================================================================
+
+/// Search for a cryoconfig file starting from `start_dir` and walking upward.
+/// Returns the path to the cryoconfig file, or "" if not found.
+function find_cryoconfig(start_dir: string) -> string {
+    // Try start_dir itself
+    const candidate: string = sprintf("%s/cryoconfig", start_dir);
+    if (File::exists(candidate)) {
+        return candidate;
+    }
+
+    // Walk upward by stripping the last path component
+    const parent: string = extract_directory(start_dir);
+    if (strlen(parent) == 0 || strcmp(parent, start_dir) == 0) {
+        return "";  // reached root, not found
+    }
+    return find_cryoconfig(parent);
+}
+
+
+// ============================================================================
+// String Helpers (internal)
+// ============================================================================
+
+/// Extract directory from a path (everything before last '/').
+function extract_directory(path: string) -> string {
+    const len: i64 = strlen(path) as i64;
+    mut last_sep: i64 = -1;
+    for (mut i: i64 = 0; i < len; i++) {
+        if (path[i] == 47 || path[i] == 92) {  // '/' or '\'
+            last_sep = i;
+        }
+    }
+    if (last_sep <= 0) { return "."; }
+    return substr(path, 0, last_sep);
+}
+
+/// Trim leading and trailing whitespace (spaces and tabs).
+function trim_whitespace(s: string) -> string {
+    const len: i64 = strlen(s) as i64;
+    if (len == 0) { return s; }
+
+    mut start: i64 = 0;
+    while (start < len && (s[start] == 32 || s[start] == 9 || s[start] == 13)) {
+        start = start + 1;  // 32=space, 9=tab, 13=CR
+    }
+
+    mut end: i64 = len - 1;
+    while (end >= start && (s[end] == 32 || s[end] == 9 || s[end] == 13)) {
+        end = end - 1;
+    }
+
+    if (start > end) { return ""; }
+    return substr(s, start, end - start + 1);
+}
+
+/// Strip surrounding double quotes from a string value.
+function strip_quotes(s: string) -> string {
+    const len: i64 = strlen(s) as i64;
+    if (len >= 2 && s[0] == 34 && s[len - 1] == 34) {  // 34 = '"'
+        return substr(s, 1, len - 2);
+    }
+    return s;
+}
+
+/// Parse a boolean value from a string.
+function parse_bool(s: string) -> boolean {
+    if (strcmp(s, "true") == 0)  { return true;  }
+    if (strcmp(s, "yes") == 0)   { return true;  }
+    if (strcmp(s, "1") == 0)     { return true;  }
+    return false;
+}
+
+/// Find the first occurrence of a character in a string. Returns -1 if not found.
+function find_char(s: string, ch: i8) -> i64 {
+    const len: i64 = strlen(s) as i64;
+    for (mut i: i64 = 0; i < len; i++) {
+        if (s[i] == ch) { return i; }
+    }
+    return -1;
+}
+
+/// Extract a substring from start with given length.
+function substr(s: string, start: i64, length: i64) -> string {
+    if (length <= 0) { return ""; }
+    const buf: i8* = malloc(length as u64 + 1);
+    memcpy(buf as void*, ptr_add(s as void*, start) as void*, length as u64);
+    const term: i8* = ptr_add(buf as void*, length) as i8*;
+    memset(term as void*, 0, 1);
+    return buf as string;
+}

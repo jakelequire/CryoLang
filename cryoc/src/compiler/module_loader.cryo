@@ -1,0 +1,527 @@
+///! Module Loader
+///!
+///! Discovers and resolves modules for multi-module compilation.
+///! Handles import path -> filesystem path resolution with case variations,
+///! recursive module discovery from an entry point, and circular dependency
+///! detection.
+
+namespace Compiler::ModuleLoader;
+
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::ModuleGraph;
+import Compiler::Diag;
+import Compiler::Lex;
+import Compiler::Lex::Lexer;
+import Compiler::ProjectConfig;
+import Utils::File;
+import Utils::Logger;
+
+
+// ============================================================================
+// ModuleLoader
+// ============================================================================
+
+type struct ModuleLoader {
+    project_root: string;
+    entry_dir:    string;
+    stdlib_root:  string;
+    no_std:       boolean;
+
+    // Circular dependency detection: parallel arrays
+    // loading_paths[i] is currently being loaded if loading_flags[i] is true
+    loading_paths: string[];
+    loading_flags: boolean[];
+
+    // Already-loaded file paths (dedup)
+    loaded_paths: string[];
+
+    static new(project_root: string, entry_point: string,
+               stdlib_root: string, no_std: boolean) -> ModuleLoader {
+        return ModuleLoader {
+            project_root:  project_root,
+            entry_dir:     extract_directory(entry_point),
+            stdlib_root:   stdlib_root,
+            no_std:        no_std,
+            loading_paths: [],
+            loading_flags: [],
+            loaded_paths:  [],
+        };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Public API
+    // ----------------------------------------------------------------
+
+    /// Discover all modules starting from the entry point.
+    /// Populates the module graph with ModuleInfo entries and dependency edges.
+    discover_project(mut &this, intern: InternTable*,
+                     graph: ModuleGraph*, sink: DiagnosticSink*,
+                     entry_path: string, debug: boolean) -> boolean {
+        if (debug) {
+            printf("[ModuleLoader] Discovering project from: %s\n", entry_path);
+            printf("[ModuleLoader] Project root: %s\n", this.project_root);
+        }
+
+        return this.discover_module(intern, graph, sink, entry_path, debug);
+    }
+
+
+    /// Resolve an import path (e.g., "BattleTest" or "Compiler::AST")
+    /// to a filesystem path.  Returns "" if not found.
+    resolve_import_path(&this, import_path: string) -> string {
+        // Convert :: to /
+        const fs_path: string = replace_separator(import_path);
+
+        // Search locations in priority order
+        // 1. Project root
+        const from_root: string = this.search_location(this.project_root, fs_path);
+        if (strlen(from_root) > 0) { return from_root; }
+
+        // 2. Entry point directory (if different from root)
+        if (strcmp(this.entry_dir, this.project_root) != 0 && strlen(this.entry_dir) > 0) {
+            const from_entry: string = this.search_location(this.entry_dir, fs_path);
+            if (strlen(from_entry) > 0) { return from_entry; }
+        }
+
+        // 3. Stdlib (unless no_std)
+        if (!this.no_std && strlen(this.stdlib_root) > 0) {
+            const from_stdlib: string = this.search_location(this.stdlib_root, fs_path);
+            if (strlen(from_stdlib) > 0) { return from_stdlib; }
+        }
+
+        return "";
+    }
+
+
+    // ----------------------------------------------------------------
+    // Internal: Recursive Discovery
+    // ----------------------------------------------------------------
+
+    /// Recursively discover a module and its imports.
+    discover_module(mut &this, intern: InternTable*,
+                    graph: ModuleGraph*, sink: DiagnosticSink*,
+                    file_path: string, debug: boolean) -> boolean {
+        // Check if already loaded
+        if (this.is_loaded(file_path)) { return true; }
+
+        // Check circular dependency
+        if (this.is_loading(file_path)) {
+            const msg: string = sprintf("circular module dependency: '%s' is already being loaded", file_path);
+            sink.emit(Diagnostic::error(ErrorCode::E0501_CIRCULAR_IMPORT, msg));
+            return false;
+        }
+
+        // Verify file exists
+        if (!File::exists(file_path)) {
+            const msg: string = sprintf("module file not found: '%s'", file_path);
+            sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, msg));
+            return false;
+        }
+
+        // Mark as loading
+        this.push_loading(file_path);
+
+        if (debug) {
+            printf("[ModuleLoader] Discovering: %s\n", file_path);
+        }
+
+        // Quick-scan the file: lex only, extract namespace and import paths
+        mut scan_sink: DiagnosticSink = DiagnosticSink::new();
+        const file: File = File::new(file_path);
+        const lexer: Lexer = Lexer::new(file, &scan_sink);
+        const tokens: Token[] = lexer.lex();
+
+        // Extract namespace and imports from token stream
+        const scan: ModuleScanResult = scan_tokens(tokens);
+
+        if (debug) {
+            printf("[ModuleLoader]   namespace: '%s', imports: %d\n",
+                scan.namespace_name, scan.import_count);
+        }
+
+        // Create ModuleInfo
+        const mod_name_str: string = if (strlen(scan.namespace_name) > 0) {
+            scan.namespace_name
+        } else {
+            extract_module_name(file_path)
+        };
+        const mod_name: SymbolStr = intern.intern(mod_name_str);
+        mut info: ModuleInfo = ModuleInfo::with_namespace(
+            mod_name, file_path, mod_name);
+
+        // Process imports: discover dependencies recursively
+        mut success: boolean = true;
+        for (mut i: i64 = 0; i < scan.import_count; i++) {
+            const import_path: string = scan.import_paths[i];
+
+            // Resolve to filesystem path
+            const resolved: string = this.resolve_import_path(import_path);
+            if (strlen(resolved) == 0) {
+                const msg: string = sprintf("module '%s' not found (imported from '%s')",
+                    import_path, file_path);
+                sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, msg));
+                success = false;
+                continue;
+            }
+
+            // Add dependency edge
+            const dep_name_str: string = import_path;
+            const dep_name: SymbolStr = intern.intern(dep_name_str);
+            info.add_dependency(dep_name);
+
+            // Recursively discover the dependency
+            if (!this.discover_module(intern, graph, sink, resolved, debug)) {
+                success = false;
+            }
+        }
+
+        // Register this module in the graph
+        graph.add_module(info);
+
+        // Mark as loaded, remove from loading set
+        this.mark_loaded(file_path);
+        this.pop_loading(file_path);
+
+        return success;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Internal: Path Resolution
+    // ----------------------------------------------------------------
+
+    /// Search a single directory for a module with case variations.
+    search_location(&this, base_dir: string, fs_path: string) -> string {
+        // 1. Directory module: base_dir/fs_path/_module.cryo
+        const dir_module: string = sprintf("%s/%s/_module.cryo", base_dir, fs_path);
+        if (File::exists(dir_module)) { return dir_module; }
+
+        // 2. Exact case: base_dir/fs_path.cryo
+        const exact: string = sprintf("%s/%s.cryo", base_dir, fs_path);
+        if (File::exists(exact)) { return exact; }
+
+        // 3. Lowercase: base_dir/lowercase.cryo
+        const lower: string = sprintf("%s/%s.cryo", base_dir, to_lowercase(fs_path));
+        if (File::exists(lower)) { return lower; }
+
+        // 4. Snake case: base_dir/snake_case.cryo
+        const snake: string = sprintf("%s/%s.cryo", base_dir, to_snake_case(fs_path));
+        if (File::exists(snake)) { return snake; }
+
+        // 5. Lowercase directory module
+        const lower_dir: string = sprintf("%s/%s/_module.cryo", base_dir, to_lowercase(fs_path));
+        if (File::exists(lower_dir)) { return lower_dir; }
+
+        return "";
+    }
+
+
+    // ----------------------------------------------------------------
+    // Loading set management
+    // ----------------------------------------------------------------
+
+    is_loading(&this, path: string) -> boolean {
+        for (mut i: i64 = 0; i < this.loading_paths.length; i++) {
+            if (this.loading_flags[i] && strcmp(this.loading_paths[i], path) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    push_loading(mut &this, path: string) -> void {
+        this.loading_paths.push(path);
+        this.loading_flags.push(true);
+    }
+
+    pop_loading(mut &this, path: string) -> void {
+        for (mut i: i64 = 0; i < this.loading_paths.length; i++) {
+            if (this.loading_flags[i] && strcmp(this.loading_paths[i], path) == 0) {
+                this.loading_flags[i] = false;
+                return;
+            }
+        }
+    }
+
+    is_loaded(&this, path: string) -> boolean {
+        for (mut i: i64 = 0; i < this.loaded_paths.length; i++) {
+            if (strcmp(this.loaded_paths[i], path) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    mark_loaded(mut &this, path: string) -> void {
+        this.loaded_paths.push(path);
+    }
+}
+
+
+// ============================================================================
+// ModuleScanResult — lightweight token-level scan
+// ============================================================================
+
+/// Result of scanning a file's tokens for namespace and import declarations.
+/// This avoids needing a full parse during discovery.
+type struct ModuleScanResult {
+    namespace_name: string;
+    import_paths:   string[];
+    import_count:   i64;
+}
+
+
+/// Scan a token stream for `namespace` and `import` declarations.
+/// Does NOT build an AST — just extracts the module-level metadata
+/// needed for dependency discovery.
+function scan_tokens(tokens: Token[]) -> ModuleScanResult {
+    mut ns: string = "";
+    mut imports: string[] = [];
+    const len: i64 = tokens.length;
+    mut i: i64 = 0;
+
+    while (i < len) {
+        const tok: Token = tokens[i];
+
+        // namespace Foo::Bar;
+        if (tok.kind == TokenType::KwNamespace) {
+            i = i + 1;
+            const path: string = collect_qualified_name(tokens, &i, len);
+            ns = path;
+            // Skip semicolon if present
+            if (i < len && tokens[i].kind == TokenType::Semicolon) {
+                i = i + 1;
+            }
+            continue;
+        }
+
+        // import Foo::Bar;
+        if (tok.kind == TokenType::KwImport) {
+            i = i + 1;
+            const path: string = collect_qualified_name(tokens, &i, len);
+            if (strlen(path) > 0) {
+                imports.push(path);
+            }
+            // Skip semicolon if present
+            if (i < len && tokens[i].kind == TokenType::Semicolon) {
+                i = i + 1;
+            }
+            continue;
+        }
+
+        // Stop scanning at the first non-import/namespace top-level declaration
+        // to avoid scanning into function bodies.  Module declarations and imports
+        // always appear at the top of a file.
+        if (is_declaration_keyword(tok.kind)) {
+            break;
+        }
+
+        i = i + 1;
+    }
+
+    return ModuleScanResult {
+        namespace_name: ns,
+        import_paths:   imports,
+        import_count:   imports.length,
+    };
+}
+
+/// Collect a qualified name like "Foo::Bar::Baz" from the token stream.
+/// Advances *pos past the name tokens.
+function collect_qualified_name(tokens: Token[], pos: i64*, len: i64) -> string {
+    mut result: string = "";
+    mut p: i64 = *pos;
+
+    while (p < len) {
+        const tok: Token = tokens[p];
+        // Accept identifiers
+        if (tok.kind == TokenType::Identifier) {
+            if (strlen(result) > 0) {
+                result = sprintf("%s::%s", result, tok.lexeme);
+            } else {
+                result = tok.lexeme;
+            }
+            p = p + 1;
+
+            // Check for :: separator
+            if (p < len && tokens[p].kind == TokenType::ColonColon) {
+                p = p + 1;  // skip ::
+                continue;
+            }
+            break;
+        }
+        break;
+    }
+
+    *pos = p;
+    return result;
+}
+
+/// Check if a token kind starts a declaration (stop scanning point).
+function is_declaration_keyword(kind: TokenType) -> boolean {
+    if (kind == TokenType::KwFunction)  { return true; }
+    if (kind == TokenType::KwType)      { return true; }
+    if (kind == TokenType::KwConst)     { return true; }
+    if (kind == TokenType::KwStatic)    { return true; }
+    if (kind == TokenType::KwExtern)    { return true; }
+    if (kind == TokenType::KwImplement) { return true; }
+    if (kind == TokenType::KwPublic)    { return true; }
+    if (kind == TokenType::KwPrivate)   { return true; }
+    return false;
+}
+
+
+// ============================================================================
+// String helpers
+// ============================================================================
+
+/// Replace :: with / in an import path.
+function replace_separator(path: string) -> string {
+    const len: i64 = strlen(path) as i64;
+    if (len == 0) { return path; }
+
+    const buf: i8* = malloc(len as u64 + 1);
+    mut j: i64 = 0;
+
+    for (mut i: i64 = 0; i < len; i++) {
+        if (path[i] == 58 && i + 1 < len && path[i + 1] == 58) {  // '::'
+            const p: i8* = ptr_add(buf as void*, j) as i8*;
+            *p = 47;  // '/'
+            j = j + 1;
+            i = i + 1;  // skip second ':'
+        } else {
+            const p: i8* = ptr_add(buf as void*, j) as i8*;
+            *p = path[i];
+            j = j + 1;
+        }
+    }
+
+    const term: i8* = ptr_add(buf as void*, j) as i8*;
+    *term = 0;
+    return buf as string;
+}
+
+/// Convert a string to lowercase using raw memcpy + in-place mutation.
+function to_lowercase(s: string) -> string {
+    const len: u64 = strlen(s);
+    if (len == 0) { return s; }
+
+    const out: i8* = malloc(len + 1);
+    memcpy(out as void*, s as void*, len);
+    const term: i8* = ptr_add(out as void*, len as i64) as i8*;
+    *term = 0;
+
+    // In-place lowercase each byte
+    for (mut i: u64 = 0; i < len; i++) {
+        const p: i8* = ptr_add(out as void*, i as i64) as i8*;
+        const ch: i8 = *p;
+        // A=65, Z=90: add 32 to make lowercase
+        const lower: i8 = ch + 32;
+        const use_lower: boolean = ch >= 65 && ch <= 90;
+        // Branchless: write lower if uppercase, else write original
+        if (use_lower) { *p = lower; }
+    }
+    return out as string;
+}
+
+/// Convert PascalCase/camelCase to snake_case.
+/// Two-pass: first compute length, then fill.
+function to_snake_case(s: string) -> string {
+    const len: u64 = strlen(s);
+    if (len == 0) { return s; }
+
+    // Pass 1: compute output length
+    mut out_len: u64 = 0;
+    for (mut i: u64 = 0; i < len; i++) {
+        const ch: i8 = s[i];
+        const is_upper: boolean = ch >= 65 && ch <= 90;
+        if (is_upper && i > 0) {
+            const prev: i8 = s[i - 1];
+            if (prev != 47 && prev != 95) {
+                out_len = out_len + 1;  // underscore
+            }
+        }
+        out_len = out_len + 1;
+    }
+
+    // Pass 2: fill output
+    const out: i8* = malloc(out_len + 1);
+    mut j: u64 = 0;
+    for (mut i: u64 = 0; i < len; i++) {
+        const ch: i8 = s[i];
+        const is_upper: boolean = ch >= 65 && ch <= 90;
+
+        // Insert underscore before uppercase (not at start, not after / or _)
+        if (is_upper && i > 0) {
+            const prev: i8 = s[i - 1];
+            if (prev != 47 && prev != 95) {
+                const pu: i8* = ptr_add(out as void*, j as i64) as i8*;
+                *pu = 95;
+                j = j + 1;
+            }
+        }
+
+        const pc: i8* = ptr_add(out as void*, j as i64) as i8*;
+        if (is_upper) {
+            *pc = ch + 32;
+        } else {
+            *pc = ch;
+        }
+        j = j + 1;
+    }
+
+    const term: i8* = ptr_add(out as void*, j as i64) as i8*;
+    *term = 0;
+    return out as string;
+}
+
+/// Extract a module name from a file path (filename without extension).
+function extract_module_name(path: string) -> string {
+    // Find last / or \
+    const len: i64 = strlen(path) as i64;
+    mut last_sep: i64 = -1;
+    for (mut i: i64 = 0; i < len; i++) {
+        if (path[i] == 47 || path[i] == 92) {  // '/' or '\'
+            last_sep = i;
+        }
+    }
+
+    const name_start: i64 = last_sep + 1;
+
+    // Find last '.'
+    mut last_dot: i64 = -1;
+    for (mut i: i64 = name_start; i < len; i++) {
+        if (path[i] == 46) {  // '.'
+            last_dot = i;
+        }
+    }
+
+    const name_end: i64 = if (last_dot > name_start) { last_dot } else { len };
+    const name_len: i64 = name_end - name_start;
+
+    const buf: i8* = malloc(name_len as u64 + 1);
+    memcpy(buf as void*, ptr_add(path as void*, name_start) as void*, name_len as u64);
+    const term: i8* = ptr_add(buf as void*, name_len) as i8*;
+    *term = 0;
+    return buf as string;
+}
+
+/// Extract directory from a path.
+function extract_directory(path: string) -> string {
+    const len: i64 = strlen(path) as i64;
+    mut last_sep: i64 = -1;
+    for (mut i: i64 = 0; i < len; i++) {
+        if (path[i] == 47 || path[i] == 92) {
+            last_sep = i;
+        }
+    }
+    if (last_sep <= 0) { return "."; }
+
+    const buf: i8* = malloc(last_sep as u64 + 1);
+    memcpy(buf as void*, path as void*, last_sep as u64);
+    const term: i8* = ptr_add(buf as void*, last_sep) as i8*;
+    *term = 0;
+    return buf as string;
+}
