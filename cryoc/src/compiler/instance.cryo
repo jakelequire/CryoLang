@@ -225,19 +225,40 @@ type struct CompilerInstance {
         return this.run_pipeline(&ctx, &pipeline, "");
     }
 
-    /// Switch to a module AND load its AST.  Works around the codegen bug
-    /// where nested struct assignment through mut &this doesn't persist.
-    /// This sets ctx.artifacts.ast directly on the ctx pointer.
-    static load_module(ctx: CompilationContext*, graph: ModuleGraph*, intern: InternTable*, mod_idx: u32) -> void {
+    /// Switch to a module AND load its AST from the local buffers.
+    /// Also restores the saved resolver scope if available.
+    static load_module(ctx: CompilationContext*, intern: InternTable*,
+                       ast_buf: void*, mod_idx: u32, mod_count: u32) -> void {
+        // Set source file, namespace, resolver module
         ctx.switch_to_module(mod_idx as i64);
-        const ast: ProgramNode* = graph.get_module_ast(mod_idx);
-        if (ast != null) {
-            const info: ModuleInfo = graph.modules[mod_idx];
-            const ns: string = intern.resolve(info.namespace_name);
-            ctx.artifacts.ast = ASTOutput {
-                root: ast,
-                namespace_name: ns,
-            };
+        // Load AST from local buffer
+        if (ast_buf != null && mod_idx < mod_count) {
+            const slot: void** = ptr_add(ast_buf, (mod_idx * 8) as i64) as void**;
+            const ast: ProgramNode* = *slot as ProgramNode*;
+            if (ast != null) {
+                const info: ModuleInfo = ctx.module_graph.modules[mod_idx];
+                const ns: string = intern.resolve(info.namespace_name);
+                ctx.artifacts.ast = ASTOutput {
+                    root: ast,
+                    namespace_name: ns,
+                };
+            }
+        }
+    }
+
+    /// Like load_module but also restores saved scope from scope_buf.
+    static load_module_with_scope(ctx: CompilationContext*, intern: InternTable*,
+                                   ast_buf: void*, scope_buf: void*,
+                                   mod_idx: u32, mod_count: u32) -> void {
+        CompilerInstance::load_module(ctx, intern, ast_buf, mod_idx, mod_count);
+        // Restore saved scope
+        if (scope_buf != null && mod_idx < mod_count && ctx.resolver != null) {
+            const sc_slot: u64* = ptr_add(scope_buf, (mod_idx * 8) as i64) as u64*;
+            const saved_scope: u64 = *sc_slot;
+            if (saved_scope > 0) {
+                const info: ModuleInfo = ctx.module_graph.modules[mod_idx];
+                ctx.resolver.set_module_with_scope(info.name, saved_scope);
+            }
         }
     }
 
@@ -282,12 +303,17 @@ type struct CompilerInstance {
             return CompilationResult::failed(ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
 
+        printf("[Compiler] After discovery: module_count=%u, modules.length=%u\n",
+            ctx.module_graph.module_count(), ctx.module_graph.modules.length);
+        printf("[Compiler] name_index_keys.length=%u\n", ctx.module_graph.name_index_keys.length);
+
         if (ctx.module_graph.module_count() == 0) {
             printf("[Compiler] No modules discovered\n");
             return CompilationResult::failed(1, 0);
         }
 
         // Compute topological order
+        printf("[Compiler] Calling compute_order()...\n");
         if (!ctx.module_graph.compute_order()) {
             ctx.emit_error(ErrorCode::E0501_CIRCULAR_IMPORT,
                 "circular module dependency detected — cannot determine compilation order");
@@ -306,6 +332,15 @@ type struct CompilerInstance {
             }
         }
 
+        // Allocate local buffers for per-module ASTs and scopes.
+        // Using local variables avoids deep nested struct field assignment
+        // (ctx.module_graph.field = x) which the codegen may not persist.
+        const buf_size: u64 = n as u64 * 8;
+        const ast_buf: void* = malloc(buf_size);
+        memset(ast_buf, 0, buf_size);
+        const scope_buf: void* = malloc(buf_size);
+        memset(scope_buf, 0, buf_size);
+
         // Phase 2: Frontend — lex, parse, validate all modules in topo order
         mut pipeline: PassRegistry = PassRegistry::new();
         pipeline.set_verbose(this.config.verbose_passes);
@@ -318,8 +353,9 @@ type struct CompilerInstance {
             if (!pipeline.run_all(&ctx)) {
                 return this.project_failure(&ctx);
             }
-            // Save the parsed AST into the module graph
-            ctx.module_graph.set_module_ast(mod_idx, ctx.artifacts.ast.root);
+            // Save the parsed AST using local buffer
+            const ast_slot: void** = ptr_add(ast_buf, (mod_idx * 8) as i64) as void**;
+            *ast_slot = ctx.artifacts.ast.root as void*;
             pipeline.reset();
             ctx.provisions.clear();
         }
@@ -333,7 +369,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module(&ctx, &ctx.module_graph, &ctx.intern_table, order[i]);
+            CompilerInstance::load_module(&ctx, &ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -341,8 +377,15 @@ type struct CompilerInstance {
             if (!pipeline.run_all(&ctx)) {
                 return this.project_failure(&ctx);
             }
-            // Save the resolver's scope so we can restore it for later passes
-            ctx.save_module_scope();
+            // Save the resolver's scope to local buffer
+            if (ctx.resolver != null && ctx.active_module_index >= 0) {
+                const scope_val: u64 = ctx.resolver.get_current_scope_id();
+                const sc_idx: u32 = ctx.active_module_index as u32;
+                if (sc_idx < n) {
+                    const sc_slot: u64* = ptr_add(scope_buf, (sc_idx * 8) as i64) as u64*;
+                    *sc_slot = scope_val;
+                }
+            }
             pipeline.reset();
         }
 
@@ -356,7 +399,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module(&ctx, &ctx.module_graph, &ctx.intern_table, order[i]);
+            CompilerInstance::load_module_with_scope(&ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -384,7 +427,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module(&ctx, &ctx.module_graph, &ctx.intern_table, order[i]);
+            CompilerInstance::load_module_with_scope(&ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -417,7 +460,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module(&ctx, &ctx.module_graph, &ctx.intern_table, order[i]);
+            CompilerInstance::load_module_with_scope(&ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -437,11 +480,15 @@ type struct CompilerInstance {
         // Dump ASTs if requested
         if (this.config.show_ast) {
             for (mut i: u32 = 0; i < n; i++) {
-                const ast: ProgramNode* = ctx.module_graph.get_module_ast(order[i]);
-                if (ast != null) {
-                    const mod_info: ModuleInfo = ctx.module_graph.modules[order[i]];
-                    printf("\n=== AST: %s ===\n", mod_info.file_path);
-                    ASTDumper::dump(ast, &ctx.intern_table);
+                const mi: u32 = order[i];
+                if (mi < n && ast_buf != null) {
+                    const dump_slot: void** = ptr_add(ast_buf, (mi * 8) as i64) as void**;
+                    const dump_ast: ProgramNode* = *dump_slot as ProgramNode*;
+                    if (dump_ast != null) {
+                        const mod_info: ModuleInfo = ctx.module_graph.modules[mi];
+                        printf("\n=== AST: %s ===\n", mod_info.file_path);
+                        ASTDumper::dump(dump_ast, &ctx.intern_table);
+                    }
                 }
             }
         }
