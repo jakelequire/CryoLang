@@ -1,0 +1,471 @@
+/// Type Lowering Pass
+///
+/// Computes concrete memory layouts (size, alignment, field offsets) for all
+/// types in the arena.  Runs after all generics are monomorphized and all type
+/// annotations resolved, so every type has its fields/variants fully populated.
+///
+/// Layout rules follow C/LLVM conventions:
+///   - Struct/Class: sequential fields with alignment padding; total size
+///     rounded up to struct alignment (max field alignment).
+///   - Class with virtual methods: 8-byte vtable pointer at offset 0.
+///   - Enum (simple): i32 tag only (4 bytes, align 4).
+///   - Enum (ADT): i32 tag + padding + largest variant payload; total aligned.
+///   - Tuple: sequential elements like struct fields.
+///   - Optional: wrapped type + 1-byte has_value tag; total aligned.
+///   - Fixed Array: element_size * count, element alignment.
+///   - TypeAlias: delegates to target type.
+///   - InstantiatedType: delegates to resolved concrete type.
+
+namespace Compiler::Passes::TypeLowering;
+
+import Compiler::Passes::PassID;
+import Compiler::CompilationContext;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Arena;
+import Utils::Logger;
+
+
+// ============================================================================
+// Alignment helper
+// ============================================================================
+
+/// Round `value` up to the next multiple of `align`.
+/// Returns `value` unchanged if already aligned or if align is 0.
+function align_up(value: u64, align: u64) -> u64 {
+    if (align <= 1) { return value; }
+    const remainder: u64 = value % align;
+    if (remainder == 0) { return value; }
+    return value + (align - remainder);
+}
+
+
+// ============================================================================
+// TypeLoweringPasses — public entry point
+// ============================================================================
+
+type struct TypeLoweringPasses {
+
+    /// Entry point called by run_pass().
+    static run(ctx: CompilationContext*) -> PassResult {
+        const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+        const arena: TypeArena* = ctx.type_arena;
+        if (arena == null) {
+            printf("[TypeLowering] No TypeArena available, skipping\n");
+            return PassResult::ok();
+        }
+
+        if (ctx.debug_mode) {
+            printf("[TypeLowering] Computing layouts for %lld types\n", arena.type_count());
+        }
+
+        mut computed: i64 = 0;
+
+        // Fixpoint iteration: keep passing over all types until no more
+        // layouts can be computed.  Types may depend on other types that
+        // are allocated later in the arena (e.g., Result<i32,string> has
+        // fields of type Optional<i32> whose concrete enum is allocated
+        // after it).  Each pass lays out types whose dependencies are
+        // already resolved, and we repeat until stable.
+        mut progress: boolean = true;
+        mut passes: i64 = 0;
+        const max_passes: i64 = arena.type_count() + 1;
+        while (progress && passes < max_passes) {
+            progress = false;
+            passes++;
+
+            for (mut i: i64 = 0; i < arena.type_count(); i++) {
+                const ty: Type* = arena.types[i];
+                if (ty == null) { continue; }
+
+                // Skip types that don't need layout computation.
+                // The compute_* functions internally guard against double-computation
+                // via computed_align > 0, so we just skip non-applicable types here.
+                if (!needs_layout(ty)) { continue; }
+
+                const did_compute: boolean = compute_layout(ty, arena);
+                if (did_compute) {
+                    computed++;
+                    progress = true;
+                }
+            }
+        }
+
+        if (ctx.debug_mode) {
+            printf("[TypeLowering] Computed layouts for %lld types\n", computed);
+        }
+
+        return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+}
+
+
+// ============================================================================
+// Layout computation dispatch
+// ============================================================================
+
+/// Returns true if this type kind should have a non-zero layout computed.
+function needs_layout(ty: Type*) -> boolean {
+    if (ty.kind == TypeKind::Struct)           { return true; }
+    if (ty.kind == TypeKind::Class)            { return true; }
+    if (ty.kind == TypeKind::Enum)             { return true; }
+    if (ty.kind == TypeKind::Tuple)            { return true; }
+    if (ty.kind == TypeKind::Optional)         { return true; }
+    if (ty.kind == TypeKind::TypeAlias)        { return true; }
+    if (ty.kind == TypeKind::InstantiatedType) { return true; }
+    if (ty.kind == TypeKind::Array) {
+        const arr: ArrayType* = ty as ArrayType*;
+        return arr.is_fixed();
+    }
+    return false;
+}
+
+/// Dispatch layout computation based on TypeKind.
+/// Returns true if a layout was computed (size changed from 0 to non-zero).
+function compute_layout(ty: Type*, arena: TypeArena*) -> boolean {
+    if (ty.kind == TypeKind::Struct) {
+        return compute_struct_layout(ty as StructType*, arena);
+    }
+    if (ty.kind == TypeKind::Class) {
+        return compute_class_layout(ty as ClassType*, arena);
+    }
+    if (ty.kind == TypeKind::Enum) {
+        return compute_enum_layout(ty as EnumType*, arena);
+    }
+    if (ty.kind == TypeKind::Tuple) {
+        return compute_tuple_layout(ty as TupleType*, arena);
+    }
+    if (ty.kind == TypeKind::Optional) {
+        return compute_optional_layout(ty as OptionalType*, arena);
+    }
+    if (ty.kind == TypeKind::Array) {
+        const arr: ArrayType* = ty as ArrayType*;
+        if (arr.is_fixed()) {
+            return compute_fixed_array_layout(arr, arena);
+        }
+    }
+    if (ty.kind == TypeKind::TypeAlias) {
+        return compute_alias_layout(ty as TypeAliasType*, arena);
+    }
+    if (ty.kind == TypeKind::InstantiatedType) {
+        return compute_instantiated_layout(ty as InstantiatedType*, arena);
+    }
+    return false;
+}
+
+
+// ============================================================================
+// Struct layout — C-style sequential with alignment padding
+// ============================================================================
+
+function compute_struct_layout(st: StructType*, arena: TypeArena*) -> boolean {
+    if (st.computed_align > 0) { return false; }
+    if (st.fields.length == 0) {
+        // Zero-field struct: size 0, align 1 (like C empty struct)
+        st.set_layout(0, 1);
+        return true;
+    }
+
+    mut offset: u64 = 0;
+    mut max_align: u64 = 1;
+
+    for (mut i: i64 = 0; i < st.fields.length; i++) {
+        const field_ty: Type* = arena.lookup(st.fields[i].field_type.id);
+        if (field_ty == null) { continue; }
+
+        const f_size:  u64 = field_ty.size_bytes();
+        const f_align: u64 = field_ty.alignment();
+
+        // Skip fields whose types haven't been laid out yet
+        if (f_size == 0 && needs_layout(field_ty)) { return false; }
+
+        if (f_align > 0) {
+            offset = align_up(offset, f_align);
+            if (f_align > max_align) { max_align = f_align; }
+        }
+
+        st.set_field_offset(i, offset);
+        offset = offset + f_size;
+    }
+
+    // Pad total size to struct alignment
+    const total: u64 = align_up(offset, max_align);
+    st.set_layout(total, max_align);
+    return true;
+}
+
+
+// ============================================================================
+// Class layout — like struct but with vtable pointer if virtual
+// ============================================================================
+
+function compute_class_layout(cl: ClassType*, arena: TypeArena*) -> boolean {
+    if (cl.computed_align > 0) { return false; }
+
+    mut offset: u64 = 0;
+    mut max_align: u64 = 8;  // Classes always at least pointer-aligned
+
+    // If this class has virtual methods, reserve 8 bytes for vtable pointer
+    if (cl.has_virtual_methods) {
+        offset = 8;
+    }
+
+    // If there's a base class, include its size first
+    if (cl.has_base && cl.base_class.is_valid()) {
+        const base_ty: Type* = arena.lookup(cl.base_class.id);
+        if (base_ty != null) {
+            const base_size:  u64 = base_ty.size_bytes();
+            const base_align: u64 = base_ty.alignment();
+            if (base_size == 0 && needs_layout(base_ty)) { return false; }
+            // Base class fields start after vtable pointer (if any)
+            // For simplicity, we add base size directly (base already has its own vptr accounted for)
+            if (base_align > max_align) { max_align = base_align; }
+            offset = align_up(offset, base_align) + base_size;
+        }
+    }
+
+    // Lay out own fields
+    for (mut i: i64 = 0; i < cl.fields.length; i++) {
+        const field_ty: Type* = arena.lookup(cl.fields[i].field_type.id);
+        if (field_ty == null) { continue; }
+
+        const f_size:  u64 = field_ty.size_bytes();
+        const f_align: u64 = field_ty.alignment();
+
+        if (f_size == 0 && needs_layout(field_ty)) { return false; }
+
+        if (f_align > 0) {
+            offset = align_up(offset, f_align);
+            if (f_align > max_align) { max_align = f_align; }
+        }
+
+        cl.set_field_offset(i, offset);
+        offset = offset + f_size;
+    }
+
+    if (cl.fields.length == 0 && !cl.has_base) {
+        // Empty class with no base: just vtable or minimum size
+        if (cl.has_virtual_methods) {
+            cl.set_layout(8, 8);
+        } else {
+            cl.set_layout(0, 1);
+        }
+        return true;
+    }
+
+    const total: u64 = align_up(offset, max_align);
+    cl.set_layout(total, max_align);
+    return true;
+}
+
+
+// ============================================================================
+// Enum layout — tag + largest variant payload
+// ============================================================================
+
+/// Tag is always i32 (4 bytes).
+const ENUM_TAG_SIZE:  u64 = 4;
+const ENUM_TAG_ALIGN: u64 = 4;
+
+function compute_enum_layout(en: EnumType*, arena: TypeArena*) -> boolean {
+    if (en.computed_align > 0) { return false; }
+
+    if (en.variants.length == 0) {
+        en.set_layout(ENUM_TAG_SIZE, ENUM_TAG_ALIGN);
+        return true;
+    }
+
+    // Simple enum (no payloads): just the tag
+    if (en.is_simple_enum()) {
+        en.set_layout(ENUM_TAG_SIZE, ENUM_TAG_ALIGN);
+        return true;
+    }
+
+    // ADT enum: tag + payload
+    // Find the largest variant payload
+    mut max_payload_size:  u64 = 0;
+    mut max_payload_align: u64 = 1;
+
+    for (mut i: i64 = 0; i < en.variants.length; i++) {
+        const variant: EnumVariantInfo* = &en.variants[i];
+        if (!variant.has_payload()) { continue; }
+
+        // Compute this variant's payload size (like a tuple of its associated types)
+        mut v_offset: u64 = 0;
+        mut v_align:  u64 = 1;
+
+        for (mut j: i64 = 0; j < variant.payload_types.length; j++) {
+            const pt: Type* = arena.lookup(variant.payload_types[j].id);
+            if (pt == null) { continue; }
+
+            const p_size:  u64 = pt.size_bytes();
+            const p_align: u64 = pt.alignment();
+
+            if (p_size == 0 && needs_layout(pt)) { return false; }
+
+            if (p_align > 0) {
+                v_offset = align_up(v_offset, p_align);
+                if (p_align > v_align) { v_align = p_align; }
+            }
+            v_offset = v_offset + p_size;
+        }
+
+        const v_total: u64 = align_up(v_offset, v_align);
+        if (v_total > max_payload_size)  { max_payload_size  = v_total; }
+        if (v_align > max_payload_align) { max_payload_align = v_align; }
+    }
+
+    // Overall layout: tag | padding | payload
+    // Alignment is max of tag alignment and payload alignment
+    mut overall_align: u64 = ENUM_TAG_ALIGN;
+    if (max_payload_align > overall_align) { overall_align = max_payload_align; }
+
+    // Payload starts after tag, aligned to payload alignment
+    const payload_offset: u64 = align_up(ENUM_TAG_SIZE, max_payload_align);
+    const total: u64 = align_up(payload_offset + max_payload_size, overall_align);
+
+    en.set_layout(total, overall_align);
+    return true;
+}
+
+
+// ============================================================================
+// Tuple layout — sequential elements like struct fields
+// ============================================================================
+
+function compute_tuple_layout(tup: TupleType*, arena: TypeArena*) -> boolean {
+    if (tup.computed_align > 0) { return false; }
+    if (tup.elements.length == 0) {
+        tup.set_layout(0, 1);
+        return true;
+    }
+
+    mut offset: u64 = 0;
+    mut max_align: u64 = 1;
+
+    for (mut i: i64 = 0; i < tup.elements.length; i++) {
+        const elem_ty: Type* = arena.lookup(tup.elements[i].id);
+        if (elem_ty == null) { continue; }
+
+        const e_size:  u64 = elem_ty.size_bytes();
+        const e_align: u64 = elem_ty.alignment();
+
+        if (e_size == 0 && needs_layout(elem_ty)) { return false; }
+
+        if (e_align > 0) {
+            offset = align_up(offset, e_align);
+            if (e_align > max_align) { max_align = e_align; }
+        }
+        offset = offset + e_size;
+    }
+
+    const total: u64 = align_up(offset, max_align);
+    tup.set_layout(total, max_align);
+    return true;
+}
+
+
+// ============================================================================
+// Optional layout — wrapped type + 1-byte tag
+// ============================================================================
+
+function compute_optional_layout(opt: OptionalType*, arena: TypeArena*) -> boolean {
+    if (opt.computed_align > 0) { return false; }
+
+    const inner: Type* = arena.lookup(opt.wrapped.id);
+    if (inner == null) {
+        // Wrapped type not found; give it a minimal layout (tag only)
+        opt.set_layout(1, 1);
+        return true;
+    }
+
+    const inner_size:  u64 = inner.size_bytes();
+    const inner_align: u64 = inner.alignment();
+
+    if (inner_size == 0 && needs_layout(inner)) { return false; }
+
+    // Layout: [wrapped_value] [padding] [has_value: u8]
+    // Alignment is max of inner alignment and 1 (tag alignment)
+    mut max_align: u64 = inner_align;
+    if (max_align < 1) { max_align = 1; }
+
+    // Tag goes after wrapped value (1 byte, align 1)
+    const tag_offset: u64 = inner_size;
+    const total: u64 = align_up(tag_offset + 1, max_align);
+
+    opt.set_layout(total, max_align);
+    return true;
+}
+
+
+// ============================================================================
+// Fixed Array layout — element_size * count
+// ============================================================================
+
+function compute_fixed_array_layout(arr: ArrayType*, arena: TypeArena*) -> boolean {
+    if (arr.computed_align > 0) { return false; }
+
+    const elem: Type* = arena.lookup(arr.element.id);
+    if (elem == null) {
+        arr.set_layout(0, 1);
+        return true;
+    }
+
+    const elem_size:  u64 = elem.size_bytes();
+    const elem_align: u64 = elem.alignment();
+
+    if (elem_size == 0 && needs_layout(elem)) { return false; }
+
+    // Each element is naturally aligned, so element size must be a multiple of alignment
+    const padded_elem_size: u64 = align_up(elem_size, elem_align);
+    const total: u64 = padded_elem_size * (arr.size as u64);
+
+    mut align: u64 = elem_align;
+    if (align < 1) { align = 1; }
+
+    arr.set_layout(total, align);
+    return true;
+}
+
+
+// ============================================================================
+// TypeAlias layout — delegates to target
+// ============================================================================
+
+function compute_alias_layout(alias: TypeAliasType*, arena: TypeArena*) -> boolean {
+    if (alias.computed_align > 0) { return false; }
+    if (!alias.has_target()) { return false; }
+
+    const target: Type* = arena.lookup(alias.target.id);
+    if (target == null) { return false; }
+
+    const t_size:  u64 = target.size_bytes();
+    const t_align: u64 = target.alignment();
+
+    if (t_size == 0 && needs_layout(target)) { return false; }
+
+    alias.set_layout(t_size, t_align);
+    return true;
+}
+
+
+// ============================================================================
+// InstantiatedType layout — delegates to resolved concrete type
+// ============================================================================
+
+function compute_instantiated_layout(inst: InstantiatedType*, arena: TypeArena*) -> boolean {
+    if (inst.computed_align > 0) { return false; }
+    if (!inst.has_resolved_type()) { return false; }
+
+    const resolved: Type* = arena.lookup(inst.resolved_type.id);
+    if (resolved == null) { return false; }
+
+    const r_size:  u64 = resolved.size_bytes();
+    const r_align: u64 = resolved.alignment();
+
+    if (r_size == 0 && needs_layout(resolved)) { return false; }
+
+    inst.set_layout(r_size, r_align);
+    return true;
+}

@@ -94,6 +94,8 @@ public:
     methods:        MethodInfo[];
     is_complete:    boolean;
     custom_display: string;     // Set by monomorphizer for human-readable generic form
+    computed_size:  u64;        // Computed by TypeLowering pass (0 = not yet computed)
+    computed_align: u64;        // Computed by TypeLowering pass (0 = not yet computed)
 
     StructType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
         : Type(id, TypeKind::Struct) {
@@ -104,6 +106,8 @@ public:
         this.methods        = [];
         this.is_complete    = false;
         this.custom_display = "";
+        this.computed_size  = 0;
+        this.computed_align = 0;
     }
 
     /// Populate fields for a previously forward-declared struct.
@@ -153,18 +157,26 @@ public:
 
     set_display_name(mut &this, name: string) -> void { this.custom_display = name; }
 
+    set_layout(mut &this, size: u64, align: u64) -> void {
+        this.computed_size  = size;
+        this.computed_align = align;
+    }
+
+    set_field_offset(mut &this, index: i64, offset: u64) -> void {
+        this.fields[index].offset = offset;
+    }
+
     override display_name(&this) -> string {
         if (this.custom_display.length() > 0) { return this.custom_display; }
         return this.intern_table.resolve(this.qualified_name);
     }
     override mangled_name(&this) -> string { return sprintf("_CS%s", this.intern_table.resolve(this.qualified_name)); }
 
-    override size_bytes(&this) -> u64 {
-        // Sum of field sizes (simplified; real layout needs alignment padding)
-        return 0;
+    override size_bytes(&this) -> u64 { return this.computed_size; }
+    override alignment(&this) -> u64  {
+        if (this.computed_align > 0) { return this.computed_align; }
+        return 1;
     }
-
-    override alignment(&this) -> u64 { return 8; }
 }
 
 
@@ -184,6 +196,8 @@ public:
     has_virtual_methods: boolean;
     is_complete:         boolean;
     custom_display:      string;
+    computed_size:       u64;
+    computed_align:      u64;
 
     ClassType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
         : Type(id, TypeKind::Class) {
@@ -197,6 +211,8 @@ public:
         this.has_virtual_methods = false;
         this.is_complete         = false;
         this.custom_display      = "";
+        this.computed_size       = 0;
+        this.computed_align      = 0;
     }
 
     set_fields(fields: FieldInfo[]) -> void {
@@ -249,13 +265,25 @@ public:
 
     set_display_name(mut &this, name: string) -> void { this.custom_display = name; }
 
+    set_layout(mut &this, size: u64, align: u64) -> void {
+        this.computed_size  = size;
+        this.computed_align = align;
+    }
+
+    set_field_offset(mut &this, index: i64, offset: u64) -> void {
+        this.fields[index].offset = offset;
+    }
+
     override display_name(&this) -> string {
         if (this.custom_display.length() > 0) { return this.custom_display; }
         return this.intern_table.resolve(this.qualified_name);
     }
     override mangled_name(&this) -> string { return sprintf("_CC%s", this.intern_table.resolve(this.qualified_name)); }
-    override size_bytes(&this) -> u64      { return 0; }
-    override alignment(&this) -> u64       { return 8; }
+    override size_bytes(&this) -> u64 { return this.computed_size; }
+    override alignment(&this) -> u64  {
+        if (this.computed_align > 0) { return this.computed_align; }
+        return 1;
+    }
 }
 
 
@@ -272,6 +300,8 @@ public:
     methods:        MethodInfo[];
 
     custom_display: string;
+    computed_size:  u64;
+    computed_align: u64;
 
     EnumType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
         : Type(id, TypeKind::Enum) {
@@ -281,6 +311,8 @@ public:
         this.variants       = [];
         this.methods        = [];
         this.custom_display = "";
+        this.computed_size  = 0;
+        this.computed_align = 0;
     }
 
     add_variant(variant: EnumVariantInfo) -> void {
@@ -323,13 +355,21 @@ public:
 
     set_display_name(mut &this, name: string) -> void { this.custom_display = name; }
 
+    set_layout(mut &this, size: u64, align: u64) -> void {
+        this.computed_size  = size;
+        this.computed_align = align;
+    }
+
     override display_name(&this) -> string {
         if (this.custom_display.length() > 0) { return this.custom_display; }
         return this.intern_table.resolve(this.qualified_name);
     }
     override mangled_name(&this) -> string { return sprintf("_CE%s", this.intern_table.resolve(this.qualified_name)); }
-    override size_bytes(&this) -> u64      { return 0; }  // Depends on largest variant
-    override alignment(&this) -> u64       { return 8; }
+    override size_bytes(&this) -> u64 { return this.computed_size; }
+    override alignment(&this) -> u64  {
+        if (this.computed_align > 0) { return this.computed_align; }
+        return 1;
+    }
 }
 
 
@@ -388,11 +428,16 @@ public:
     intern_table: InternTable*;
     target:       TypeRef;
 
+    computed_size:  u64;
+    computed_align: u64;
+
     TypeAliasType(id: u64, alias_name: SymbolStr, intern_table: InternTable*, target: TypeRef)
         : Type(id, TypeKind::TypeAlias) {
-        this.alias_name   = alias_name;
-        this.intern_table = intern_table;
-        this.target       = target;
+        this.alias_name    = alias_name;
+        this.intern_table  = intern_table;
+        this.target        = target;
+        this.computed_size  = 0;
+        this.computed_align = 0;
     }
 
     has_target(&this) -> boolean {
@@ -406,13 +451,13 @@ public:
     override display_name(&this) -> string { return this.intern_table.resolve(this.alias_name); }
     override mangled_name(&this) -> string { return sprintf("_CA%s", this.intern_table.resolve(this.alias_name)); }
 
-    override size_bytes(&this) -> u64 {
-        return 0;  // Delegates to target once resolved
+    set_layout(mut &this, size: u64, align: u64) -> void {
+        this.computed_size  = size;
+        this.computed_align = align;
     }
 
-    override alignment(&this) -> u64 {
-        return 0;  // Delegates to target once resolved
-    }
+    override size_bytes(&this) -> u64 { return this.computed_size; }
+    override alignment(&this) -> u64  { return this.computed_align; }
 }
 
 

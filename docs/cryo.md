@@ -3,7 +3,7 @@
 > **Version:** 0.1.0 (In Development)
 > **Specification Date:** March 2026
 
-Cryo is a statically-typed, compiled systems programming language with monomorphic generics, single-inheritance classes, algebraic data types, exhaustive pattern matching, and an LLVM backend. It is designed to give programmers explicit, low-level control over memory and data layout while providing modern high-level constructs -- generics, pattern matching, algebraic enums -- that compile down to efficient native code with no runtime overhead.
+Cryo is a statically-typed, compiled systems programming language with monomorphic generics, single-inheritance classes, algebraic data types, exhaustive pattern matching, and an LLVM backend. It is designed to give programmers explicit, low-level control over memory and data layout while providing modern high-level constructs  generics, pattern matching, algebraic enums  that compile down to efficient native code with no runtime overhead.
 
 Two principles shape the language:
 
@@ -15,99 +15,109 @@ Two principles shape the language:
 
 ## Table of Contents
 
-- [1. Lexical Structure](#1-lexical-structure)
-  - [1.1 Identifiers](#11-identifiers)
-  - [1.2 Keywords](#12-keywords)
-  - [1.3 Comments](#13-comments)
-  - [1.4 Literals](#14-literals)
-- [2. Type System](#2-type-system)
-  - [2.1 Primitive Types](#21-primitive-types)
-  - [2.2 Pointer Types](#22-pointer-types)
-  - [2.3 Reference Types](#23-reference-types)
-  - [2.4 Array Types](#24-array-types)
-  - [2.5 Function Types](#25-function-types)
-  - [2.6 Tuple Types](#26-tuple-types)
-  - [2.7 The Unit Type](#27-the-unit-type)
-  - [2.8 Type Aliases](#28-type-aliases)
-  - [2.9 Type Casting](#29-type-casting)
-- [3. Variables and Constants](#3-variables-and-constants)
-- [4. Functions](#4-functions)
-  - [4.1 Function Declarations](#41-function-declarations)
-  - [4.2 Generic Functions](#42-generic-functions)
-  - [4.3 Variadic Functions](#43-variadic-functions)
-  - [4.4 Extern Functions](#44-extern-functions)
-  - [4.5 Intrinsic Functions](#45-intrinsic-functions)
-- [5. Operators](#5-operators)
-  - [5.1 Arithmetic Operators](#51-arithmetic-operators)
-  - [5.2 Comparison Operators](#52-comparison-operators)
-  - [5.3 Logical Operators](#53-logical-operators)
-  - [5.4 Bitwise Operators](#54-bitwise-operators)
-  - [5.5 Assignment Operators](#55-assignment-operators)
-  - [5.6 Other Operators](#56-other-operators)
-  - [5.7 Operator Precedence](#57-operator-precedence)
-- [6. Control Flow](#6-control-flow)
-  - [6.1 If / Else](#61-if--else)
-  - [6.2 If Expressions](#62-if-expressions)
-  - [6.3 While Loops](#63-while-loops)
-  - [6.4 For Loops](#64-for-loops)
-  - [6.5 Loop](#65-loop)
-  - [6.6 Break and Continue](#66-break-and-continue)
-  - [6.7 Match Statements](#67-match-statements)
-  - [6.8 Match Expressions](#68-match-expressions)
-  - [6.9 Switch Statements](#69-switch-statements)
-  - [6.10 Ternary Operator](#610-ternary-operator)
-  - [6.11 Return](#611-return)
-  - [6.12 Unsafe Blocks](#612-unsafe-blocks)
-- [7. Structs](#7-structs)
-  - [7.1 Struct Declaration](#71-struct-declaration)
-  - [7.2 Fields and Visibility](#72-fields-and-visibility)
-  - [7.3 Methods](#73-methods)
-  - [7.4 Static Methods](#74-static-methods)
-  - [7.5 Struct Literals](#75-struct-literals)
-  - [7.6 Generic Structs](#76-generic-structs)
-- [8. Classes](#8-classes)
-  - [8.1 Class Declaration](#81-class-declaration)
-  - [8.2 Constructors and Destructors](#82-constructors-and-destructors)
-  - [8.3 Inheritance](#83-inheritance)
-  - [8.4 Virtual Methods and Override](#84-virtual-methods-and-override)
-  - [8.5 Polymorphic Dispatch](#85-polymorphic-dispatch)
-  - [8.6 Structs vs. Classes](#86-structs-vs-classes)
-- [9. Enums](#9-enums)
-  - [9.1 Unit Enums](#91-unit-enums)
-  - [9.2 Data Enums (Algebraic Data Types)](#92-data-enums-algebraic-data-types)
-  - [9.3 Generic Enums](#93-generic-enums)
-  - [9.4 Implement Blocks on Enums](#94-implement-blocks-on-enums)
-- [10. Pattern Matching](#10-pattern-matching)
-  - [10.1 Patterns](#101-patterns)
-  - [10.2 Enum Destructuring](#102-enum-destructuring)
-  - [10.3 Wildcard Pattern](#103-wildcard-pattern)
-  - [10.4 Range Patterns](#104-range-patterns)
-- [11. Generics](#11-generics)
-  - [11.1 Generic Type Parameters](#111-generic-type-parameters)
-  - [11.2 Generic Structs](#112-generic-structs)
-  - [11.3 Generic Enums](#113-generic-enums)
-  - [11.4 Generic Functions](#114-generic-functions)
-  - [11.5 Generic Implement Blocks](#115-generic-implement-blocks)
-  - [11.6 Where Clauses](#116-where-clauses)
-  - [11.7 Monomorphization](#117-monomorphization)
-- [12. Implement Blocks](#12-implement-blocks)
-- [13. Modules and Imports](#13-modules-and-imports)
-  - [13.1 Namespaces](#131-namespaces)
-  - [13.2 Imports](#132-imports)
-  - [13.3 Module Declarations](#133-module-declarations)
-  - [13.4 Visibility](#134-visibility)
-- [14. Pointers and Memory](#14-pointers-and-memory)
-  - [14.1 Address-of and Dereference](#141-address-of-and-dereference)
-  - [14.2 Heap Allocation](#142-heap-allocation)
-  - [14.3 Null](#143-null)
-- [15. Directives](#15-directives)
-- [16. Foreign Function Interface (FFI)](#16-foreign-function-interface-ffi)
-  - [16.1 Extern Blocks](#161-extern-blocks)
-  - [16.2 C Header Import](#162-c-header-import)
-- [17. Standard Library](#17-standard-library)
-  - [17.1 Prelude](#171-prelude)
-  - [17.2 Core Modules](#172-core-modules)
-- [18. Appendix: Grammar Summary](#18-appendix-grammar-summary)
+- [Cryo Language Reference](#cryo-language-reference)
+  - [Table of Contents](#table-of-contents)
+  - [1. Lexical Structure](#1-lexical-structure)
+    - [1.1 Identifiers](#11-identifiers)
+    - [1.2 Keywords](#12-keywords)
+    - [1.3 Comments](#13-comments)
+    - [1.4 Literals](#14-literals)
+      - [Numeric Literals](#numeric-literals)
+      - [String Literals](#string-literals)
+      - [Character Literals](#character-literals)
+      - [Boolean Literals](#boolean-literals)
+      - [Null Literal](#null-literal)
+  - [2. Type System](#2-type-system)
+    - [2.1 Primitive Types](#21-primitive-types)
+    - [2.2 Pointer Types](#22-pointer-types)
+    - [2.3 Reference Types](#23-reference-types)
+    - [2.4 Array Types](#24-array-types)
+    - [2.5 Function Types](#25-function-types)
+    - [2.6 Tuple Types](#26-tuple-types)
+    - [2.7 The Unit Type](#27-the-unit-type)
+    - [2.8 Type Aliases](#28-type-aliases)
+    - [2.9 Type Casting](#29-type-casting)
+  - [3. Variables and Constants](#3-variables-and-constants)
+  - [4. Functions](#4-functions)
+    - [4.1 Function Declarations](#41-function-declarations)
+    - [4.2 Generic Functions](#42-generic-functions)
+    - [4.3 Variadic Functions](#43-variadic-functions)
+    - [4.4 Extern Functions](#44-extern-functions)
+    - [4.5 Intrinsic Functions](#45-intrinsic-functions)
+  - [5. Operators](#5-operators)
+    - [5.1 Arithmetic Operators](#51-arithmetic-operators)
+    - [5.2 Comparison Operators](#52-comparison-operators)
+    - [5.3 Logical Operators](#53-logical-operators)
+    - [5.4 Bitwise Operators](#54-bitwise-operators)
+    - [5.5 Assignment Operators](#55-assignment-operators)
+    - [5.6 Other Operators](#56-other-operators)
+    - [5.7 Operator Precedence](#57-operator-precedence)
+  - [6. Control Flow](#6-control-flow)
+    - [6.1 If / Else](#61-if--else)
+    - [6.2 If Expressions](#62-if-expressions)
+    - [6.3 While Loops](#63-while-loops)
+    - [6.4 For Loops](#64-for-loops)
+    - [6.5 Loop](#65-loop)
+    - [6.6 Break and Continue](#66-break-and-continue)
+    - [6.7 Match Statements](#67-match-statements)
+    - [6.8 Match Expressions](#68-match-expressions)
+    - [6.9 Switch Statements](#69-switch-statements)
+    - [6.10 Ternary Operator](#610-ternary-operator)
+    - [6.11 Return](#611-return)
+    - [6.12 Unsafe Blocks](#612-unsafe-blocks)
+  - [7. Structs](#7-structs)
+    - [7.1 Struct Declaration](#71-struct-declaration)
+    - [7.2 Fields and Visibility](#72-fields-and-visibility)
+    - [7.3 Methods](#73-methods)
+    - [7.4 Static Methods](#74-static-methods)
+    - [7.5 Struct Literals](#75-struct-literals)
+    - [7.6 Generic Structs](#76-generic-structs)
+  - [8. Classes](#8-classes)
+    - [8.1 Class Declaration](#81-class-declaration)
+    - [8.2 Constructors and Destructors](#82-constructors-and-destructors)
+    - [8.3 Inheritance](#83-inheritance)
+    - [8.4 Virtual Methods and Override](#84-virtual-methods-and-override)
+    - [8.5 Polymorphic Dispatch](#85-polymorphic-dispatch)
+    - [8.6 Structs vs. Classes](#86-structs-vs-classes)
+  - [9. Enums](#9-enums)
+    - [9.1 Unit Enums](#91-unit-enums)
+    - [9.2 Data Enums (Algebraic Data Types)](#92-data-enums-algebraic-data-types)
+    - [9.3 Generic Enums](#93-generic-enums)
+    - [9.4 Implement Blocks on Enums](#94-implement-blocks-on-enums)
+  - [10. Pattern Matching](#10-pattern-matching)
+    - [10.1 Patterns](#101-patterns)
+    - [10.2 Enum Destructuring](#102-enum-destructuring)
+    - [10.3 Wildcard Pattern](#103-wildcard-pattern)
+    - [10.4 Range Patterns](#104-range-patterns)
+  - [11. Generics](#11-generics)
+    - [11.1 Generic Type Parameters](#111-generic-type-parameters)
+    - [11.2 Generic Structs](#112-generic-structs)
+    - [11.3 Generic Enums](#113-generic-enums)
+    - [11.4 Generic Functions](#114-generic-functions)
+    - [11.5 Generic Implement Blocks](#115-generic-implement-blocks)
+    - [11.6 Where Clauses](#116-where-clauses)
+    - [11.7 Monomorphization](#117-monomorphization)
+  - [12. Implement Blocks](#12-implement-blocks)
+  - [13. Modules and Imports](#13-modules-and-imports)
+    - [13.1 Namespaces](#131-namespaces)
+    - [13.2 Imports](#132-imports)
+    - [13.3 Module Declarations](#133-module-declarations)
+    - [13.4 Visibility](#134-visibility)
+  - [14. Pointers and Memory](#14-pointers-and-memory)
+    - [14.1 Address-of and Dereference](#141-address-of-and-dereference)
+    - [14.2 Heap Allocation](#142-heap-allocation)
+    - [14.3 Null](#143-null)
+  - [15. Directives](#15-directives)
+  - [16. Foreign Function Interface (FFI)](#16-foreign-function-interface-ffi)
+    - [16.1 Extern Blocks](#161-extern-blocks)
+    - [16.2 C Header Import](#162-c-header-import)
+  - [17. Standard Library](#17-standard-library)
+    - [17.1 Prelude](#171-prelude)
+    - [17.2 Core Modules](#172-core-modules)
+  - [18. Appendix: Grammar Summary](#18-appendix-grammar-summary)
+    - [Program Structure](#program-structure)
+    - [Statements](#statements)
+    - [Expression Hierarchy](#expression-hierarchy)
 
 ---
 
@@ -125,9 +135,9 @@ identifier = letter { letter | digit | "_" }
 
 Cryo does not enforce naming conventions at the compiler level, but the standard library and ecosystem follow these conventions consistently:
 
-- **`snake_case`** for variables, functions, and methods -- `my_variable`, `parse_input`.
-- **`PascalCase`** for types (structs, classes, enums, type aliases) -- `HashMap`, `FileReader`.
-- **`SCREAMING_SNAKE_CASE`** for compile-time constants -- `MAX_BUFFER_SIZE`, `VERSION`.
+- **`snake_case`** for variables, functions, and methods  `my_variable`, `parse_input`.
+- **`PascalCase`** for types (structs, classes, enums, type aliases)  `HashMap`, `FileReader`.
+- **`SCREAMING_SNAKE_CASE`** for compile-time constants  `MAX_BUFFER_SIZE`, `VERSION`.
 
 These conventions also affect syntax highlighting: the TextMate grammar treats `PascalCase` identifiers as types and `SCREAMING_SNAKE_CASE` identifiers as constants, so following the conventions gives you better editor support out of the box.
 
@@ -157,9 +167,9 @@ Note that some keywords like `trait`, `yield`, `async`, and `await` are reserved
 Cryo supports four styles of comments. The first two are familiar from C-family languages, while the doc-comment forms are inspired by Rust and Javadoc.
 
 ```cryo
-// Line comment -- everything from // to end of line is ignored.
+// Line comment  everything from // to end of line is ignored.
 
-/* Block comment -- can span multiple lines.
+/* Block comment  can span multiple lines.
    Useful for temporarily disabling chunks of code. */
 
 /// Documentation comment (line form).
@@ -178,11 +188,11 @@ Literals are values written directly in source code. Cryo provides literal synta
 
 #### Numeric Literals
 
-Integer literals support four bases. Underscores can appear between digits as visual separators -- the compiler ignores them entirely, so `1_000_000` is identical to `1000000`. An optional type suffix pins the literal to a specific integer type; without a suffix, the compiler infers the type from context (defaulting to `int`/`i32` for integers and `f64` for floats).
+Integer literals support four bases. Underscores can appear between digits as visual separators  the compiler ignores them entirely, so `1_000_000` is identical to `1000000`. An optional type suffix pins the literal to a specific integer type; without a suffix, the compiler infers the type from context (defaulting to `int`/`i32` for integers and `f64` for floats).
 
 ```cryo
 42                // decimal integer
-1_000_000         // digit separators -- purely visual, ignored by compiler
+1_000_000         // digit separators  purely visual, ignored by compiler
 0xFF              // hexadecimal (prefix 0x or 0X)
 0b1010            // binary (prefix 0b or 0B)
 0o77              // octal (prefix 0o or 0O)
@@ -205,7 +215,7 @@ The suffix is attached directly to the digits with no space. This is particularl
 
 #### String Literals
 
-Strings are enclosed in double quotes. Inside a regular string, backslash escape sequences are interpreted. Raw strings, prefixed with `r`, treat backslashes as literal characters -- useful for file paths and regular expressions.
+Strings are enclosed in double quotes. Inside a regular string, backslash escape sequences are interpreted. Raw strings, prefixed with `r`, treat backslashes as literal characters  useful for file paths and regular expressions.
 
 ```cryo
 "Hello, world!"           // regular string
@@ -222,12 +232,12 @@ Character literals are enclosed in single quotes and represent a single byte val
 ```cryo
 'A'               // ASCII letter
 '\n'              // newline character
-'\x41'            // hex escape -- same as 'A'
+'\x41'            // hex escape  same as 'A'
 ```
 
 #### Boolean Literals
 
-The two boolean values. There is no implicit conversion between booleans and integers -- `if (1)` is a type error.
+The two boolean values. There is no implicit conversion between booleans and integers  `if (1)` is a type error.
 
 ```cryo
 true
@@ -246,7 +256,7 @@ null
 
 ## 2. Type System
 
-Cryo's type system is built around a core design decision: **every value has a known type at compile time, and the programmer must state that type explicitly.** There is no type inference on variable declarations. This is a deliberate trade-off -- it makes code more verbose, but also more readable. When you see `const x: i32 = compute()`, you know immediately what `x` is without needing to chase through function return types.
+Cryo's type system is built around a core design decision: **every value has a known type at compile time, and the programmer must state that type explicitly.** There is no type inference on variable declarations. This is a deliberate trade-off  it makes code more verbose, but also more readable. When you see `const x: i32 = compute()`, you know immediately what `x` is without needing to chase through function return types.
 
 The type system has no implicit conversions. An `i32` does not silently promote to `i64`, and a `boolean` is not secretly an integer. When you need a conversion, you write it with `as`. This eliminates an entire class of subtle bugs common in C, where an unsigned-to-signed conversion or a narrowing cast can silently corrupt data.
 
@@ -254,21 +264,21 @@ The type system has no implicit conversions. An `i32` does not silently promote 
 
 These are the built-in scalar types provided by the language. They map directly to machine types and have a fixed size on all platforms (except `usize`/`isize`, which match the pointer width).
 
-| Type | Description | Size |
-|------|-------------|------|
-| `void` | No value; used as a return type for side-effecting functions | 0 |
-| `boolean` | `true` or `false`; not interchangeable with integers | 1 byte |
-| `char` | 8-bit character (byte) | 1 byte |
-| `string` | Null-terminated string, equivalent to `char*` under the hood | pointer |
-| `int` | Default signed integer, alias for `i32` | 4 bytes |
-| `i8` `i16` `i32` `i64` `i128` | Signed integers of explicit width | 1/2/4/8/16 bytes |
-| `uint` | Default unsigned integer, alias for `u32` | 4 bytes |
-| `u8` `u16` `u32` `u64` `u128` | Unsigned integers of explicit width | 1/2/4/8/16 bytes |
-| `float` | Default float, alias for `f32` | 4 bytes |
-| `f32` `f64` | IEEE 754 floating-point numbers | 4/8 bytes |
-| `double` | Alias for `f64`, provided for C familiarity | 8 bytes |
-| `usize` `isize` | Pointer-sized unsigned/signed integers; 8 bytes on 64-bit platforms | platform |
-| `never` | The bottom type; a function returning `never` does not return (e.g., `panic`) | N/A |
+| Type                          | Description                                                                   | Size             |
+| ----------------------------- | ----------------------------------------------------------------------------- | ---------------- |
+| `void`                        | No value; used as a return type for side-effecting functions                  | 0                |
+| `boolean`                     | `true` or `false`; not interchangeable with integers                          | 1 byte           |
+| `char`                        | 8-bit character (byte)                                                        | 1 byte           |
+| `string`                      | Null-terminated string, equivalent to `char*` under the hood                  | pointer          |
+| `int`                         | Default signed integer, alias for `i32`                                       | 4 bytes          |
+| `i8` `i16` `i32` `i64` `i128` | Signed integers of explicit width                                             | 1/2/4/8/16 bytes |
+| `uint`                        | Default unsigned integer, alias for `u32`                                     | 4 bytes          |
+| `u8` `u16` `u32` `u64` `u128` | Unsigned integers of explicit width                                           | 1/2/4/8/16 bytes |
+| `float`                       | Default float, alias for `f32`                                                | 4 bytes          |
+| `f32` `f64`                   | IEEE 754 floating-point numbers                                               | 4/8 bytes        |
+| `double`                      | Alias for `f64`, provided for C familiarity                                   | 8 bytes          |
+| `usize` `isize`               | Pointer-sized unsigned/signed integers; 8 bytes on 64-bit platforms           | platform         |
+| `never`                       | The bottom type; a function returning `never` does not return (e.g., `panic`) | N/A              |
 
 The shorthand types `int`, `uint`, `float`, and `double` exist for convenience and readability. In performance-critical or cross-platform code, prefer the explicit-width types (`i32`, `u64`, `f64`) so the data layout is unambiguous.
 
@@ -282,7 +292,7 @@ const pp: int** = &p;         // pointer to pointer to int
 const vp: void* = malloc(64); // void pointer (type-erased)
 ```
 
-Pointers are the primary mechanism for heap allocation, FFI with C libraries, and building data structures like linked lists and trees. Unlike references (`&this`), raw pointers carry no compiler-enforced guarantees about validity or aliasing -- it is the programmer's responsibility to ensure they point to valid memory. See [Section 14](#14-pointers-and-memory) for a deeper discussion.
+Pointers are the primary mechanism for heap allocation, FFI with C libraries, and building data structures like linked lists and trees. Unlike references (`&this`), raw pointers carry no compiler-enforced guarantees about validity or aliasing  it is the programmer's responsibility to ensure they point to valid memory. See [Section 14](#14-pointers-and-memory) for a deeper discussion.
 
 ### 2.3 Reference Types
 
@@ -325,7 +335,7 @@ function apply(f: (int) -> int, x: int) -> int {
 }
 ```
 
-This is how the standard library's `Option::map` and `Result::and_then` work under the hood -- they accept a function and apply it to the contained value.
+This is how the standard library's `Option::map` and `Result::and_then` work under the hood  they accept a function and apply it to the contained value.
 
 ### 2.6 Tuple Types
 
@@ -342,7 +352,7 @@ The unit type `()` represents "no meaningful value." It is distinct from `void`:
 
 ### 2.8 Type Aliases
 
-Type aliases introduce a new name for an existing type. They do not create a distinct type -- the alias and the original are fully interchangeable. Aliases are useful for shortening long generic types and giving domain-specific names to primitive types.
+Type aliases introduce a new name for an existing type. They do not create a distinct type  the alias and the original are fully interchangeable. Aliases are useful for shortening long generic types and giving domain-specific names to primitive types.
 
 ```cryo
 type Byte = u8;
@@ -364,7 +374,7 @@ Cryo has no implicit type conversions. When you need to convert between types, y
 
 ```cryo
 const a: i64 = 42;
-const b: i32 = a as i32;             // narrowing cast -- programmer takes responsibility
+const b: i32 = a as i32;             // narrowing cast  programmer takes responsibility
 const p: u8* = some_string as u8*;   // reinterpret pointer type
 ```
 
@@ -382,7 +392,7 @@ mut counter: int = 0;              // mutable binding
 counter = counter + 1;             // reassignment (only allowed on mut)
 ```
 
-**Immutable by default.** `const` is the default and the most common qualifier. An immutable binding cannot be reassigned after initialization. This is not just a stylistic preference -- it makes code easier to reason about because you can see a `const` binding and know its value will never change for the rest of its scope.
+**Immutable by default.** `const` is the default and the most common qualifier. An immutable binding cannot be reassigned after initialization. This is not just a stylistic preference  it makes code easier to reason about because you can see a `const` binding and know its value will never change for the rest of its scope.
 
 **Explicit mutability.** When you do need a value to change, you mark it `mut`. This makes mutation visible at the declaration site. Anyone reading the code can immediately see which variables are "live wires" that might change and which are fixed.
 
@@ -399,7 +409,7 @@ const VERSION: string = "0.1.0";
 mut g_counter: u64 = 0;
 ```
 
-> **Important:** The type annotation is always required. Writing `const x = 10;` without a type is a syntax error. This is intentional -- Cryo favors explicitness so that the type of every binding is immediately visible without any inference.
+> **Important:** The type annotation is always required. Writing `const x = 10;` without a type is a syntax error. This is intentional  Cryo favors explicitness so that the type of every binding is immediately visible without any inference.
 
 ---
 
@@ -426,7 +436,7 @@ function main() -> int {
 }
 ```
 
-Each parameter requires a name and a type annotation, separated by `:`. This is consistent with variable declarations and makes function signatures self-documenting -- you can read the parameter list and understand what the function expects without looking at its body.
+Each parameter requires a name and a type annotation, separated by `:`. This is consistent with variable declarations and makes function signatures self-documenting  you can read the parameter list and understand what the function expects without looking at its body.
 
 Functions can be recursive. There is no forward-declaration requirement: the compiler's multi-pass pipeline collects all function signatures before type-checking any bodies, so functions can call each other regardless of source order.
 
@@ -460,21 +470,21 @@ const n: int = identity<int>(42);
 const s: string = identity<string>("hello");
 ```
 
-Each call above produces a different machine-code function -- one that operates on `int` and one that operates on `string`. There is no boxing, no vtable, and no runtime type information involved.
+Each call above produces a different machine-code function  one that operates on `int` and one that operates on `string`. There is no boxing, no vtable, and no runtime type information involved.
 
 ### 4.3 Variadic Functions
 
 Some functions (particularly those bridging to C) accept a variable number of arguments. The last parameter uses the `...` suffix to indicate variadic arguments.
 
 ```cryo
-function printf(format: string, args: int...) -> i32;
+function printf(format: string, args: ...) -> i32;
 ```
 
 Variadic functions are primarily used for FFI interop with C's `printf`, `sprintf`, and similar APIs. User-defined variadic functions follow the same convention.
 
 ### 4.4 Extern Functions
 
-Extern functions declare the signature of a function defined elsewhere -- typically in a C library. They have no body; the linker resolves them.
+Extern functions declare the signature of a function defined elsewhere  typically in a C library. They have no body; the linker resolves them.
 
 ```cryo
 extern function puts(s: string) -> int;
@@ -512,15 +522,15 @@ Cryo provides a rich set of operators that will be familiar to C, C++, and Rust 
 
 These operate on numeric types. Integer division truncates toward zero. The modulo operator `%` returns the remainder.
 
-| Operator | Description |
-|----------|-------------|
-| `+` | Addition |
-| `-` | Subtraction (binary) or negation (unary) |
-| `*` | Multiplication |
-| `/` | Division |
-| `%` | Modulo (remainder) |
-| `++` | Increment by one (prefix and postfix) |
-| `--` | Decrement by one (prefix and postfix) |
+| Operator | Description                              |
+| -------- | ---------------------------------------- |
+| `+`      | Addition                                 |
+| `-`      | Subtraction (binary) or negation (unary) |
+| `*`      | Multiplication                           |
+| `/`      | Division                                 |
+| `%`      | Modulo (remainder)                       |
+| `++`     | Increment by one (prefix and postfix)    |
+| `--`     | Decrement by one (prefix and postfix)    |
 
 The prefix forms (`++x`, `--x`) modify the value and evaluate to the new value. The postfix forms (`x++`, `x--`) modify the value and evaluate to the old value, matching C semantics.
 
@@ -528,15 +538,15 @@ The prefix forms (`++x`, `--x`) modify the value and evaluate to the new value. 
 
 Comparison operators return a `boolean`. They work on numeric types and pointers.
 
-| Operator | Description |
-|----------|-------------|
-| `==` | Equal |
-| `!=` | Not equal |
-| `<` | Less than |
-| `>` | Greater than |
-| `<=` | Less than or equal |
-| `>=` | Greater than or equal |
-| `<=>` | Three-way comparison (spaceship); returns negative, zero, or positive |
+| Operator | Description                                                           |
+| -------- | --------------------------------------------------------------------- |
+| `==`     | Equal                                                                 |
+| `!=`     | Not equal                                                             |
+| `<`      | Less than                                                             |
+| `>`      | Greater than                                                          |
+| `<=`     | Less than or equal                                                    |
+| `>=`     | Greater than or equal                                                 |
+| `<=>`    | Three-way comparison (spaceship); returns negative, zero, or positive |
 
 The spaceship operator `<=>` is borrowed from C++20. It performs a single comparison and returns a value that indicates whether the left operand is less than, equal to, or greater than the right operand, which is useful for implementing custom sort orders.
 
@@ -544,56 +554,56 @@ The spaceship operator `<=>` is borrowed from C++20. It performs a single compar
 
 Logical operators work on `boolean` values. `&&` and `||` use short-circuit evaluation: if the left operand determines the result, the right operand is not evaluated.
 
-| Operator | Description |
-|----------|-------------|
-| `&&` | Logical AND -- evaluates right side only if left is `true` |
-| `\|\|` | Logical OR -- evaluates right side only if left is `false` |
-| `!` | Logical NOT (unary) |
+| Operator | Description                                              |
+| -------- | -------------------------------------------------------- |
+| `&&`     | Logical AND  evaluates right side only if left is `true` |
+| `\|\|`   | Logical OR  evaluates right side only if left is `false` |
+| `!`      | Logical NOT (unary)                                      |
 
 ### 5.4 Bitwise Operators
 
 Bitwise operators work on integer types at the bit level. They are essential for low-level systems programming: flag manipulation, protocol encoding, and hardware register access.
 
-| Operator | Description |
-|----------|-------------|
-| `&` | Bitwise AND |
-| `\|` | Bitwise OR |
-| `^` | Bitwise XOR |
-| `~` | Bitwise NOT (unary; flips all bits) |
-| `<<` | Left shift |
-| `>>` | Right shift (arithmetic for signed types, logical for unsigned) |
+| Operator | Description                                                     |
+| -------- | --------------------------------------------------------------- |
+| `&`      | Bitwise AND                                                     |
+| `\|`     | Bitwise OR                                                      |
+| `^`      | Bitwise XOR                                                     |
+| `~`      | Bitwise NOT (unary; flips all bits)                             |
+| `<<`     | Left shift                                                      |
+| `>>`     | Right shift (arithmetic for signed types, logical for unsigned) |
 
 ### 5.5 Assignment Operators
 
 The simple assignment `=` stores a value. Compound assignment operators combine an arithmetic or bitwise operation with assignment, so `x += 1` is equivalent to `x = x + 1`. Only `mut` bindings can be assigned to.
 
-| Operator | Description |
-|----------|-------------|
-| `=` | Simple assignment |
-| `+=` `-=` `*=` `/=` `%=` | Compound arithmetic assignment |
-| `&=` `\|=` `^=` `<<=` `>>=` | Compound bitwise assignment |
+| Operator                    | Description                    |
+| --------------------------- | ------------------------------ |
+| `=`                         | Simple assignment              |
+| `+=` `-=` `*=` `/=` `%=`    | Compound arithmetic assignment |
+| `&=` `\|=` `^=` `<<=` `>>=` | Compound bitwise assignment    |
 
 ### 5.6 Other Operators
 
 These operators serve specialized purposes unique to Cryo's syntax:
 
-| Operator | Description |
-|----------|-------------|
-| `->` | Return type annotation in function signatures; also pointer member access |
-| `=>` | Separates pattern from body in a `match` arm |
-| `::` | Scope resolution -- accesses static methods, enum variants, and module members |
-| `\|>` | Pipe -- passes the left-hand value as an argument to the right-hand function |
-| `??` | Null coalescing -- returns the left side if non-null, otherwise the right side |
-| `?.` | Optional chaining -- accesses a member only if the receiver is non-null |
-| `..` | Range -- creates a range value between two bounds |
-| `...` | Spread / variadic marker |
-| `as` | Type cast -- explicit type conversion (see [Section 2.9](#29-type-casting)) |
-| `?` `:` | Ternary conditional -- `condition ? if_true : if_false` |
-| `.` | Member access -- field or method on a value |
-| `&` | Address-of (unary) -- takes a pointer to a value |
-| `*` | Dereference (unary) -- follows a pointer to its target value |
-| `sizeof(T)` | Evaluates to the size of type `T` in bytes at compile time |
-| `alignof(T)` | Evaluates to the alignment requirement of type `T` in bytes |
+| Operator     | Description                                                                  |
+| ------------ | ---------------------------------------------------------------------------- |
+| `->`         | Return type annotation in function signatures; also pointer member access    |
+| `=>`         | Separates pattern from body in a `match` arm                                 |
+| `::`         | Scope resolution  accesses static methods, enum variants, and module members |
+| `\|>`        | Pipe  passes the left-hand value as an argument to the right-hand function   |
+| `??`         | Null coalescing  returns the left side if non-null, otherwise the right side |
+| `?.`         | Optional chaining  accesses a member only if the receiver is non-null        |
+| `..`         | Range  creates a range value between two bounds                              |
+| `...`        | Spread / variadic marker                                                     |
+| `as`         | Type cast  explicit type conversion (see [Section 2.9](#29-type-casting))    |
+| `?` `:`      | Ternary conditional  `condition ? if_true : if_false`                        |
+| `.`          | Member access  field or method on a value                                    |
+| `&`          | Address-of (unary)  takes a pointer to a value                               |
+| `*`          | Dereference (unary)  follows a pointer to its target value                   |
+| `sizeof(T)`  | Evaluates to the size of type `T` in bytes at compile time                   |
+| `alignof(T)` | Evaluates to the alignment requirement of type `T` in bytes                  |
 
 ### 5.7 Operator Precedence
 
@@ -601,25 +611,25 @@ When multiple operators appear in a single expression, precedence determines the
 
 From **lowest** to **highest** precedence:
 
-| Level | Operators | Associativity |
-|-------|-----------|---------------|
-| 1 | `=` `+=` `-=` `*=` `/=` `&=` `\|=` | Right |
-| 2 | `? :` (ternary) | Right |
-| 3 | `\|\|` | Left |
-| 4 | `&&` | Left |
-| 5 | `\|` | Left |
-| 6 | `^` | Left |
-| 7 | `&` | Left |
-| 8 | `==` `!=` | Left |
-| 9 | `<` `>` `<=` `>=` `<=>` | Left |
-| 10 | `<<` `>>` | Left |
-| 11 | `+` `-` | Left |
-| 12 | `*` `/` `%` | Left |
-| 13 | `as` | Left |
-| 14 | `-` `!` `&` `*` `~` `++` `--` (unary prefix) | Right |
-| 15 | `()` `[]` `.` `->` `?.` `++` `--` (postfix) | Left |
+| Level | Operators                                    | Associativity |
+| ----- | -------------------------------------------- | ------------- |
+| 1     | `=` `+=` `-=` `*=` `/=` `&=` `\|=`           | Right         |
+| 2     | `? :` (ternary)                              | Right         |
+| 3     | `\|\|`                                       | Left          |
+| 4     | `&&`                                         | Left          |
+| 5     | `\|`                                         | Left          |
+| 6     | `^`                                          | Left          |
+| 7     | `&`                                          | Left          |
+| 8     | `==` `!=`                                    | Left          |
+| 9     | `<` `>` `<=` `>=` `<=>`                      | Left          |
+| 10    | `<<` `>>`                                    | Left          |
+| 11    | `+` `-`                                      | Left          |
+| 12    | `*` `/` `%`                                  | Left          |
+| 13    | `as`                                         | Left          |
+| 14    | `-` `!` `&` `*` `~` `++` `--` (unary prefix) | Right         |
+| 15    | `()` `[]` `.` `->` `?.` `++` `--` (postfix)  | Left          |
 
-This precedence table follows C conventions, so expressions like `a + b * c` work as expected (`*` binds tighter than `+`). The `as` cast operator sits between multiplicative and unary, so `x * y as i64` casts `y`, not the product -- use parentheses if you mean `(x * y) as i64`.
+This precedence table follows C conventions, so expressions like `a + b * c` work as expected (`*` binds tighter than `+`). The `as` cast operator sits between multiplicative and unary, so `x * y as i64` casts `y`, not the product  use parentheses if you mean `(x * y) as i64`.
 
 ---
 
@@ -675,7 +685,7 @@ for (mut i: int = 0; i < 10; i++) {
 }
 ```
 
-The loop variable is scoped to the loop body -- it does not leak into the surrounding scope. Note that the initializer requires a type annotation, consistent with Cryo's "no inference on variable declarations" rule.
+The loop variable is scoped to the loop body  it does not leak into the surrounding scope. Note that the initializer requires a type annotation, consistent with Cryo's "no inference on variable declarations" rule.
 
 ### 6.5 Loop
 
@@ -789,7 +799,7 @@ unsafe {
 }
 ```
 
-`unsafe` does not disable all checking -- it specifically permits operations that would otherwise be rejected by the type system or the safety analysis. The intent is to quarantine dangerous code into clearly-marked blocks so that the rest of the codebase can be reasoned about with stronger guarantees.
+`unsafe` does not disable all checking  it specifically permits operations that would otherwise be rejected by the type system or the safety analysis. The intent is to quarantine dangerous code into clearly-marked blocks so that the rest of the codebase can be reasoned about with stronger guarantees.
 
 ---
 
@@ -836,8 +846,8 @@ type struct Config {
 
 Methods are functions defined inside a struct body. They receive the struct instance through a special first parameter that declares how the method borrows the instance:
 
-- **`&this`** -- the method receives an immutable reference. It can read fields but not modify them. This is the default for "getter" methods, computations, and queries.
-- **`mut &this`** -- the method receives a mutable reference. It can read and write fields. This is required for methods that change the struct's state.
+- **`&this`**  the method receives an immutable reference. It can read fields but not modify them. This is the default for "getter" methods, computations, and queries.
+- **`mut &this`**  the method receives a mutable reference. It can read and write fields. This is required for methods that change the struct's state.
 
 ```cryo
 type struct Rect {
@@ -878,7 +888,7 @@ type struct Point {
 const p: Point = Point::new(10, 20);
 ```
 
-The `static new(...)` pattern is Cryo's idiomatic constructor for structs. Since structs are value types (not heap-allocated), there is no `new` keyword involved -- the static method simply returns a struct literal. This gives the programmer full control over initialization logic.
+The `static new(...)` pattern is Cryo's idiomatic constructor for structs. Since structs are value types (not heap-allocated), there is no `new` keyword involved  the static method simply returns a struct literal. This gives the programmer full control over initialization logic.
 
 ### 7.5 Struct Literals
 
@@ -918,7 +928,7 @@ const ints: Pair<int> = Pair<int>::new(1, 2);
 const strs: Pair<string> = Pair<string>::new("hello", "world");
 ```
 
-`Pair<int>` and `Pair<string>` are completely independent types with no runtime relationship -- the compiler generates separate code for each. This is the monomorphization model described in [Section 11.7](#117-monomorphization).
+`Pair<int>` and `Pair<string>` are completely independent types with no runtime relationship  the compiler generates separate code for each. This is the monomorphization model described in [Section 11.7](#117-monomorphization).
 
 ---
 
@@ -926,7 +936,7 @@ const strs: Pair<string> = Pair<string>::new("hello", "world");
 
 While structs are stack-allocated value types, classes are **heap-allocated reference types** designed for situations that require single inheritance, virtual method dispatch, and polymorphism. If you come from C++ or Java, Cryo's class system will feel familiar.
 
-Classes exist because some problems genuinely benefit from object hierarchies and runtime polymorphism -- GUI frameworks, interpreters with heterogeneous AST nodes, plugin systems. Cryo provides classes for these cases while keeping structs as the default for everything else.
+Classes exist because some problems genuinely benefit from object hierarchies and runtime polymorphism  GUI frameworks, interpreters with heterogeneous AST nodes, plugin systems. Cryo provides classes for these cases while keeping structs as the default for everything else.
 
 ### 8.1 Class Declaration
 
@@ -1029,7 +1039,7 @@ To enable **runtime polymorphism**, a base class marks methods as `virtual`. Der
 type class Shape {
 public:
     Shape() {}
-    virtual area(&this) -> f64;        // pure virtual -- no body, must be overridden
+    virtual area(&this) -> f64;        // pure virtual  no body, must be overridden
     virtual name(&this) -> string {    // virtual with default implementation
         return "Shape";
     }
@@ -1053,7 +1063,7 @@ public:
 }
 ```
 
-A `virtual` method without a body is a **pure virtual** method -- any concrete derived class must override it. A `virtual` method with a body provides a default that derived classes may optionally override. The `override` keyword is required on the derived class (not optional as in C++) to make the programmer's intent explicit and to catch typos that would silently create a new method instead of overriding an existing one.
+A `virtual` method without a body is a **pure virtual** method  any concrete derived class must override it. A `virtual` method with a body provides a default that derived classes may optionally override. The `override` keyword is required on the derived class (not optional as in C++) to make the programmer's intent explicit and to catch typos that would silently create a new method instead of overriding an existing one.
 
 ### 8.5 Polymorphic Dispatch
 
@@ -1095,13 +1105,13 @@ function make_speak(animal: Animal*) -> void {
 
 Understanding when to use each is important:
 
-| | Struct | Class |
-|---|---|---|
-| **Allocation** | Stack (value type) | Heap via `new` (reference type) |
-| **Inheritance** | No | Single inheritance |
-| **Virtual dispatch** | No | `virtual` / `override` |
-| **Receivers** | `&this` / `mut &this` | `&this` / `mut &this` |
-| **Use when** | Plain data, small types, generics | Polymorphism, object hierarchies |
+|                      | Struct                            | Class                            |
+| -------------------- | --------------------------------- | -------------------------------- |
+| **Allocation**       | Stack (value type)                | Heap via `new` (reference type)  |
+| **Inheritance**      | No                                | Single inheritance               |
+| **Virtual dispatch** | No                                | `virtual` / `override`           |
+| **Receivers**        | `&this` / `mut &this`             | `&this` / `mut &this`            |
+| **Use when**         | Plain data, small types, generics | Polymorphism, object hierarchies |
 
 **Default to structs.** They are simpler, faster (no heap allocation or pointer indirection), and work with generics and monomorphization. Only reach for classes when you genuinely need inheritance and virtual dispatch.
 
@@ -1109,7 +1119,7 @@ Understanding when to use each is important:
 
 ## 9. Enums
 
-Enums in Cryo go far beyond simple integer constants. They are **algebraic data types** -- each variant can carry its own data payload, making them ideal for representing values that can be "one of several things, each with different associated data."
+Enums in Cryo go far beyond simple integer constants. They are **algebraic data types**  each variant can carry its own data payload, making them ideal for representing values that can be "one of several things, each with different associated data."
 
 If you're familiar with Rust's `enum` or Haskell's algebraic data types, Cryo's enums work the same way. If you're coming from C or Java, think of them as a type-safe tagged union with compiler-enforced exhaustive handling.
 
@@ -1127,7 +1137,7 @@ enum Color {
 const c: Color = Color::Red;
 ```
 
-Variants are accessed through the enum name using `::`. This prevents name collisions -- `Color::Red` and `TrafficLight::Red` are distinct values.
+Variants are accessed through the enum name using `::`. This prevents name collisions  `Color::Red` and `TrafficLight::Red` are distinct values.
 
 Variants may have explicit integer values for FFI compatibility or protocol encoding:
 
@@ -1173,7 +1183,7 @@ enum Result<T, E> {
 }
 ```
 
-`Option<T>` represents a value that may or may not be present -- it replaces null in most contexts. `Result<T, E>` represents an operation that may succeed with a value of type `T` or fail with an error of type `E`.
+`Option<T>` represents a value that may or may not be present  it replaces null in most contexts. `Result<T, E>` represents an operation that may succeed with a value of type `T` or fail with an error of type `E`.
 
 ```cryo
 const val: Option<int> = Option::Some(42);
@@ -1232,14 +1242,14 @@ Pattern matching is one of Cryo's most powerful features. It lets you branch on 
 
 A pattern describes the shape of a value. When a value matches a pattern, any variables in the pattern are bound to the corresponding parts of the value.
 
-| Pattern Kind | Syntax | What It Matches |
-|---|---|---|
-| Literal | `42`, `"hello"`, `true` | Exactly that value |
-| Identifier | `x` | Any value; binds it to the name `x` |
-| Wildcard | `_` | Any value; discards it (no binding) |
-| Enum variant | `Color::Red` | That specific variant (no payload) |
-| Enum destructure | `Shape::Circle(r)` | That variant; binds the payload to `r` |
-| Range | `1..10` | Any value in the range |
+| Pattern Kind     | Syntax                  | What It Matches                        |
+| ---------------- | ----------------------- | -------------------------------------- |
+| Literal          | `42`, `"hello"`, `true` | Exactly that value                     |
+| Identifier       | `x`                     | Any value; binds it to the name `x`    |
+| Wildcard         | `_`                     | Any value; discards it (no binding)    |
+| Enum variant     | `Color::Red`            | That specific variant (no payload)     |
+| Enum destructure | `Shape::Circle(r)`      | That variant; binds the payload to `r` |
+| Range            | `1..10`                 | Any value in the range                 |
 
 ### 10.2 Enum Destructuring
 
@@ -1297,7 +1307,7 @@ match (ch) {
 
 Generics let you write code that works across multiple types without sacrificing type safety. Instead of duplicating a `Pair_int` and a `Pair_string`, you write `Pair<T>` once, and the compiler generates specialized versions for each type you actually use.
 
-Cryo's generics model is **monomorphization** -- the same approach used by Rust and C++ templates. At compile time, each generic instantiation produces a dedicated copy of the code, specialized for the concrete types. This means generics have **zero runtime overhead**: there are no vtables, no boxing, and no type erasure.
+Cryo's generics model is **monomorphization**  the same approach used by Rust and C++ templates. At compile time, each generic instantiation produces a dedicated copy of the code, specialized for the concrete types. This means generics have **zero runtime overhead**: there are no vtables, no boxing, and no type erasure.
 
 ### 11.1 Generic Type Parameters
 
@@ -1313,7 +1323,7 @@ By convention, type parameters use single uppercase letters: `T` for a general t
 
 ### 11.2 Generic Structs
 
-A generic struct works exactly like a regular struct, except that one or more field types are parameterized. The standard library's `Box<T>` is a canonical example -- a heap-allocated container for a single value:
+A generic struct works exactly like a regular struct, except that one or more field types are parameterized. The standard library's `Box<T>` is a canonical example  a heap-allocated container for a single value:
 
 ```cryo
 type struct Box<T> {
@@ -1426,7 +1436,7 @@ const a: Pair<int> = Pair<int>::new(1, 2);
 const b: Pair<string> = Pair<string>::new("x", "y");
 ```
 
-It generates two completely independent types and function bodies -- conceptually equivalent to:
+It generates two completely independent types and function bodies  conceptually equivalent to:
 
 ```
 // Compiler-generated (not actual source code):
@@ -1437,7 +1447,7 @@ Pair_string { first: string, second: string }
 Pair_string::new(a: string, b: string) -> Pair_string { ... }
 ```
 
-The trade-off: monomorphization can increase binary size because each instantiation produces its own code. But it eliminates all runtime overhead -- no vtables, no type checks, no boxing allocations. For a systems language where performance predictability matters, this is the right default.
+The trade-off: monomorphization can increase binary size because each instantiation produces its own code. But it eliminates all runtime overhead  no vtables, no type checks, no boxing allocations. For a systems language where performance predictability matters, this is the right default.
 
 ---
 
@@ -1486,7 +1496,7 @@ implement boolean {
 }
 ```
 
-This means you can call `my_bool.to_i32()` on any boolean value. The method is resolved at compile time and inlined -- there is no dynamic dispatch.
+This means you can call `my_bool.to_i32()` on any boolean value. The method is resolved at compile time and inlined  there is no dynamic dispatch.
 
 ---
 
@@ -1540,11 +1550,11 @@ When another file imports `std::collections`, it sees only the modules declared 
 
 Visibility modifiers control what is accessible outside a module:
 
-| Modifier | Meaning |
-|----------|---------|
-| *(none)* | Private -- only accessible within the same module |
-| `public` | Accessible to any module that imports this one |
-| `private` | Explicitly private (same as the default) |
+| Modifier    | Meaning                                                           |
+| ----------- | ----------------------------------------------------------------- |
+| *(none)*    | Private  only accessible within the same module                   |
+| `public`    | Accessible to any module that imports this one                    |
+| `private`   | Explicitly private (same as the default)                          |
 | `protected` | Accessible to the current class and its subclasses (classes only) |
 
 The default of private-by-default encourages good API design: only the things you explicitly choose to expose become part of your module's public interface.
@@ -1607,7 +1617,7 @@ if (p == null) {
 }
 ```
 
-Dereferencing a null pointer is undefined behavior. For optional values, prefer `Option<T>` over nullable pointers -- it forces explicit handling of the "absent" case at compile time.
+Dereferencing a null pointer is undefined behavior. For optional values, prefer `Option<T>` over nullable pointers  it forces explicit handling of the "absent" case at compile time.
 
 ---
 
@@ -1638,22 +1648,22 @@ type struct AlignedData {
 
 **Available directives:**
 
-| Directive | Description |
-|-----------|-------------|
-| `deprecated` | Marks a declaration as deprecated; the compiler emits a warning on use |
-| `inline` | Suggests the compiler inline the function at call sites |
-| `noinline` | Prevents inlining even if the optimizer would normally inline it |
-| `pure` | Asserts the function has no side effects (enables aggressive optimization) |
-| `const` | Marks a function as evaluable at compile time |
-| `noreturn` | Indicates the function never returns normally (e.g., `panic`, `exit`) |
-| `packed` | Removes padding between struct fields (useful for binary protocols, FFI) |
-| `aligned(N)` | Sets the minimum alignment of a type to N bytes |
-| `section(name)` | Places the symbol in a specific object-file section |
-| `weak` | Declares weak linkage (can be overridden by a strong symbol) |
-| `constructor` | Runs the function automatically before `main` |
-| `destructor` | Runs the function automatically after `main` returns |
+| Directive       | Description                                                                |
+| --------------- | -------------------------------------------------------------------------- |
+| `deprecated`    | Marks a declaration as deprecated; the compiler emits a warning on use     |
+| `inline`        | Suggests the compiler inline the function at call sites                    |
+| `noinline`      | Prevents inlining even if the optimizer would normally inline it           |
+| `pure`          | Asserts the function has no side effects (enables aggressive optimization) |
+| `const`         | Marks a function as evaluable at compile time                              |
+| `noreturn`      | Indicates the function never returns normally (e.g., `panic`, `exit`)      |
+| `packed`        | Removes padding between struct fields (useful for binary protocols, FFI)   |
+| `aligned(N)`    | Sets the minimum alignment of a type to N bytes                            |
+| `section(name)` | Places the symbol in a specific object-file section                        |
+| `weak`          | Declares weak linkage (can be overridden by a strong symbol)               |
+| `constructor`   | Runs the function automatically before `main`                              |
+| `destructor`    | Runs the function automatically after `main` returns                       |
 
-Directives are metadata that guide the compiler and linker. They do not change the semantics of the code itself -- `#[inline]` does not guarantee inlining, it only hints at it. The compiler is free to ignore hints when they would not improve performance.
+Directives are metadata that guide the compiler and linker. They do not change the semantics of the code itself  `#[inline]` does not guarantee inlining, it only hints at it. The compiler is free to ignore hints when they would not improve performance.
 
 ---
 
@@ -1678,7 +1688,7 @@ Standalone extern declarations are also supported:
 extern function exit(code: int) -> void;
 ```
 
-These declarations tell the compiler the function's type signature without providing a body. It is the programmer's responsibility to ensure the Cryo signature matches the actual C signature -- the compiler cannot verify this across the language boundary.
+These declarations tell the compiler the function's type signature without providing a body. It is the programmer's responsibility to ensure the Cryo signature matches the actual C signature  the compiler cannot verify this across the language boundary.
 
 ### 16.2 C Header Import
 
@@ -1713,45 +1723,45 @@ The **prelude** is a special module that is automatically imported into every Cr
 
 **Functions:** `print`, `println`, `panic`, `assert`, `assert_eq`, `min`, `max`, `clamp`, `swap`, `identity`
 
-The prelude is deliberately small -- it includes only the types and functions that are so universally useful that requiring an import would be noise. Everything else lives in explicit modules that you import as needed.
+The prelude is deliberately small  it includes only the types and functions that are so universally useful that requiring an import would be noise. Everything else lives in explicit modules that you import as needed.
 
 ### 17.2 Core Modules
 
 The standard library is organized into domain-specific modules. Each module focuses on a single concern and can be imported independently.
 
-| Module | Contents |
-|--------|----------|
-| `core::option` | `Option<T>` with methods: `is_some`, `is_none`, `unwrap`, `unwrap_or`, `map`, `and_then`, `filter`, `take` |
-| `core::result` | `Result<T, E>` with methods: `is_ok`, `is_err`, `unwrap`, `map`, `map_err`, `and_then` |
-| `core::primitives` | Methods on built-in types (`boolean.to_i32()`, etc.) |
-| `core::intrinsics` | Compiler intrinsics: `malloc`, `free`, `memcpy`, `strlen`, `printf`, and more |
-| `core::mem` | Memory utilities: `size_of`, `align_of`, `zeroed` |
-| `core::ptr` | `NonNull<T>` smart pointer, pointer utilities |
-| `core::ops` | `Range<T>`, `RangeInclusive<T>` |
-| `core::convert` | Type conversion functions between numeric types |
-| `alloc::heap` | `Box<T>` (single-value heap allocation), `RawVec<T>`, `HeapArray<T>` |
-| `alloc::arena` | Arena allocator for bulk allocation with single-point deallocation |
-| `collections::array` | `Array<T>` -- growable, heap-backed dynamic array with `push`, `pop`, `insert`, `remove`, `get`, `set`, `len`, `clear` |
-| `collections::string` | `String` -- heap-allocated, growable UTF-8 string with `push_char`, `append`, `len`, `substr`, `split` |
-| `collections::hashmap` | `HashMap<K, V>` -- hash table with `insert`, `get`, `remove`, `contains_key`, `len` |
-| `collections::hashset` | `HashSet<T>` -- set backed by a hash table |
-| `collections::deque` | `Deque<T>` -- double-ended queue |
-| `collections::btree` | `BTreeMap<K, V>` -- ordered map backed by a B-tree |
-| `collections::linkedlist` | `LinkedList<T>` -- doubly-linked list |
-| `collections::pair` | `Pair<T, U>` -- a simple two-element tuple struct |
-| `io::stdio` | `stdin`, `stdout`, `stderr` handles; `print`, `println` functions |
-| `io::file` | File I/O: open, read, write, close |
-| `io::reader` / `io::writer` | Buffered I/O abstractions |
-| `fs` | File system operations: paths, metadata, directory listing, `FileType` enum |
-| `math` | Mathematical functions and constants (`sqrt`, `sin`, `cos`, `PI`, `E`) |
-| `fmt` | String formatting utilities |
-| `ffi` | C type aliases (`c_int`, `c_char`, `c_size_t`), `CString` |
-| `env` | Environment variables, command-line arguments |
-| `process` | Process spawning, exit codes |
-| `time` | Time measurement, `Duration`, `sleep` |
-| `os` | OS abstractions |
-| `sync` | Synchronization primitives (mutexes, etc.) |
-| `thread` | Threading support |
+| Module                      | Contents                                                                                                             |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `core::option`              | `Option<T>` with methods: `is_some`, `is_none`, `unwrap`, `unwrap_or`, `map`, `and_then`, `filter`, `take`           |
+| `core::result`              | `Result<T, E>` with methods: `is_ok`, `is_err`, `unwrap`, `map`, `map_err`, `and_then`                               |
+| `core::primitives`          | Methods on built-in types (`boolean.to_i32()`, etc.)                                                                 |
+| `core::intrinsics`          | Compiler intrinsics: `malloc`, `free`, `memcpy`, `strlen`, `printf`, and more                                        |
+| `core::mem`                 | Memory utilities: `size_of`, `align_of`, `zeroed`                                                                    |
+| `core::ptr`                 | `NonNull<T>` smart pointer, pointer utilities                                                                        |
+| `core::ops`                 | `Range<T>`, `RangeInclusive<T>`                                                                                      |
+| `core::convert`             | Type conversion functions between numeric types                                                                      |
+| `alloc::heap`               | `Box<T>` (single-value heap allocation), `RawVec<T>`, `HeapArray<T>`                                                 |
+| `alloc::arena`              | Arena allocator for bulk allocation with single-point deallocation                                                   |
+| `collections::array`        | `Array<T>`  growable, heap-backed dynamic array with `push`, `pop`, `insert`, `remove`, `get`, `set`, `len`, `clear` |
+| `collections::string`       | `String`  heap-allocated, growable UTF-8 string with `push_char`, `append`, `len`, `substr`, `split`                 |
+| `collections::hashmap`      | `HashMap<K, V>`  hash table with `insert`, `get`, `remove`, `contains_key`, `len`                                    |
+| `collections::hashset`      | `HashSet<T>`  set backed by a hash table                                                                             |
+| `collections::deque`        | `Deque<T>`  double-ended queue                                                                                       |
+| `collections::btree`        | `BTreeMap<K, V>`  ordered map backed by a B-tree                                                                     |
+| `collections::linkedlist`   | `LinkedList<T>`  doubly-linked list                                                                                  |
+| `collections::pair`         | `Pair<T, U>`  a simple two-element tuple struct                                                                      |
+| `io::stdio`                 | `stdin`, `stdout`, `stderr` handles; `print`, `println` functions                                                    |
+| `io::file`                  | File I/O: open, read, write, close                                                                                   |
+| `io::reader` / `io::writer` | Buffered I/O abstractions                                                                                            |
+| `fs`                        | File system operations: paths, metadata, directory listing, `FileType` enum                                          |
+| `math`                      | Mathematical functions and constants (`sqrt`, `sin`, `cos`, `PI`, `E`)                                               |
+| `fmt`                       | String formatting utilities                                                                                          |
+| `ffi`                       | C type aliases (`c_int`, `c_char`, `c_size_t`), `CString`                                                            |
+| `env`                       | Environment variables, command-line arguments                                                                        |
+| `process`                   | Process spawning, exit codes                                                                                         |
+| `time`                      | Time measurement, `Duration`, `sleep`                                                                                |
+| `os`                        | OS abstractions                                                                                                      |
+| `sync`                      | Synchronization primitives (mutexes, etc.)                                                                           |
+| `thread`                    | Threading support                                                                                                    |
 
 ---
 
