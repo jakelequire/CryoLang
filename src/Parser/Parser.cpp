@@ -2409,8 +2409,23 @@ namespace Cryo
             }
 
             // Handle pointer types like int* or char**
+            // BUT: disambiguate from multiplication — `n as u64 * 8` is a cast
+            // to u64 followed by multiply-by-8, NOT a cast to u64*.
+            // Only consume '*' as a pointer suffix if the NEXT token is NOT
+            // a valid expression start (number, identifier, '(', etc.).
             while (_current_token.is(TokenKind::TK_STAR))
             {
+                // Peek ahead: if the token after '*' could start an expression,
+                // this '*' is the binary multiplication operator, not a pointer suffix.
+                Token next = peek_next();
+                if (next.is(TokenKind::TK_NUMERIC_CONSTANT) ||
+                    next.is(TokenKind::TK_IDENTIFIER) ||
+                    next.is(TokenKind::TK_L_PAREN) ||
+                    next.is(TokenKind::TK_KW_THIS) ||
+                    next.is(TokenKind::TK_STRING_LITERAL))
+                {
+                    break; // Leave '*' for binary expression parsing
+                }
                 target_type += "*";
                 advance();
             }
