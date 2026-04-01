@@ -585,24 +585,27 @@ type struct TypeArena {
 
     debug_dump(&this) -> void {
         printf("\n=== TypeArena Dump: %lld types ===\n", this.types.length);
-        printf("%-6s | %-18s | %-30s | %-6s | %-6s | %s\n",
-            "ID", "Kind", "Display Name", "Size", "Align", "Details");
-        printf("-------+--------------------+--------------------------------+--------+--------+----------------------------------\n");
+        printf("%-5s | %-16s | %-26s | %-5s | %-5s | %-16s | %-10s | %-12s | %s\n",
+            "ID", "Kind", "Display Name", "Size", "Align",
+            "Module", "Members", "Status", "Refs");
+        printf("------+------------------+----------------------------+-------+-------+------------------+------------+--------------+--------------------\n");
 
         for (mut i: int = 0; i < this.types.length; i++) {
             const ty: Type* = this.types[i];
             if (ty == null) { continue; }
 
-            // Capture each string to a local before printf to avoid
-            // sprintf static buffer aliasing between arguments.
-            const kind_str: string = ty.kind.to_string();
-            const display: string = this.format_display(ty);
-            const details: string = this.format_type_details(ty);
+            const kind_str: string    = ty.kind.to_string();
+            const display: string     = this.format_display(ty);
+            const module_str: string  = this.get_type_module(ty);
+            const members_str: string = this.get_type_members(ty);
+            const status_str: string  = this.get_type_status(ty);
+            const refs_str: string    = this.get_type_refs(ty);
 
-            printf("%-6llu | %-18s | %-30s | %-6llu | %-6llu | %s\n",
-                ty.id, kind_str, display, ty.size_bytes(), ty.alignment(), details);
+            printf("%-5llu | %-16s | %-26s | %-5llu | %-5llu | %-16s | %-10s | %-12s | %s\n",
+                ty.id, kind_str, display, ty.size_bytes(), ty.alignment(),
+                module_str, members_str, status_str, refs_str);
         }
-        printf("-------+--------------------+--------------------------------+--------+--------+----------------------------------\n");
+        printf("------+------------------+----------------------------+-------+-------+------------------+------------+--------------+--------------------\n");
 
         // Summary by category
         printf("\n=== Type Summary ===\n");
@@ -660,149 +663,195 @@ type struct TypeArena {
             this.alias_cache.length());
     }
 
-    /// Build a kind-specific detail string for a type.  Uses if-chains
-    /// (not match/virtual) for C++ codegen compatibility.
-    format_type_details(&this, ty: Type*) -> string {
-        if (ty == null) { return ""; }
 
-        // --- User-defined types: module, fields, methods, completeness ---
+    // ----------------------------------------------------------------
+    // Per-column helpers for debug_dump
+    // ----------------------------------------------------------------
 
+    /// Module column: owning module name for user-defined types.
+    get_type_module(&this, ty: Type*) -> string {
         if (ty.kind == TypeKind::Struct) {
             const st: StructType* = ty as StructType*;
-            const mod_str: string = this.intern_table.resolve(st.module_name);
-            const qual_str: string = this.intern_table.resolve(st.qualified_name);
-            const complete_str: string = if (st.is_complete) { "complete" } else { "forward" };
-            return sprintf("mod=%s qual=%s %lld fields %lld methods [%s]",
-                mod_str, qual_str, st.fields.length, st.methods.length, complete_str);
+            return this.intern_table.resolve(st.module_name);
         }
-
         if (ty.kind == TypeKind::Class) {
             const cl: ClassType* = ty as ClassType*;
-            const mod_str: string = this.intern_table.resolve(cl.module_name);
-            const qual_str: string = this.intern_table.resolve(cl.qualified_name);
-            const complete_str: string = if (cl.is_complete) { "complete" } else { "forward" };
-            mut extra: string = "";
-            if (cl.has_base) {
-                const base_name: string = this.resolve_display_name(cl.base_class.id);
-                extra = sprintf(" base=%s", base_name);
-            }
-            if (cl.has_virtual_methods) {
-                extra = extra + " vtable";
-            }
-            return sprintf("mod=%s qual=%s %lld fields %lld methods [%s]%s",
-                mod_str, qual_str, cl.fields.length, cl.methods.length, complete_str, extra);
+            return this.intern_table.resolve(cl.module_name);
         }
-
         if (ty.kind == TypeKind::Enum) {
             const en: EnumType* = ty as EnumType*;
-            const mod_str: string = this.intern_table.resolve(en.module_name);
-            const qual_str: string = this.intern_table.resolve(en.qualified_name);
-            const style: string = if (en.is_simple_enum()) { "simple" } else { "ADT" };
-            return sprintf("mod=%s qual=%s %lld variants %lld methods [%s]",
-                mod_str, qual_str, en.variants.length, en.methods.length, style);
+            return this.intern_table.resolve(en.module_name);
         }
-
         if (ty.kind == TypeKind::Trait) {
             const tr: TraitType* = ty as TraitType*;
-            const mod_str: string = this.intern_table.resolve(tr.module_name);
-            const qual_str: string = this.intern_table.resolve(tr.qualified_name);
-            return sprintf("mod=%s qual=%s %lld required methods %lld super",
-                mod_str, qual_str, tr.required_methods.length, tr.super_traits.length);
+            return this.intern_table.resolve(tr.module_name);
         }
-
-        if (ty.kind == TypeKind::TypeAlias) {
-            const al: TypeAliasType* = ty as TypeAliasType*;
-            if (al.has_target()) {
-                const target_name: string = this.resolve_display_name(al.target.id);
-                return sprintf("-> %s (id=%lu)", target_name, al.target.id);
-            }
-            return "-> <unresolved>";
-        }
-
         if (ty.kind == TypeKind::FunctionTemplate) {
             const ft: FunctionTemplateType* = ty as FunctionTemplateType*;
-            const qual_str: string = this.intern_table.resolve(ft.qualified_name);
-            return sprintf("qual=%s (template placeholder)", qual_str);
+            return this.intern_table.resolve(ft.qualified_name);
         }
+        return "";
+    }
 
-        // --- Generic types ---
-
-        if (ty.kind == TypeKind::GenericParam) {
-            const gp: GenericParamType* = ty as GenericParamType*;
-            const name_str: string = this.intern_table.resolve(gp.param_name);
-            return sprintf("param '%s' index=%lu", name_str, gp.param_index);
+    /// Members column: compact field/method/variant/param/element counts.
+    ///   Struct/Class: "3f 2m"  (fields, methods)
+    ///   Enum:         "4v 1m"  (variants, methods)
+    ///   Trait:        "2m 1s"  (required methods, super traits)
+    ///   Function:     "3p"     (params)
+    ///   Tuple:        "2e"     (elements)
+    ///   InstType:     "2a"     (type args)
+    ///   BoundedParam: "1b"     (bounds)
+    get_type_members(&this, ty: Type*) -> string {
+        if (ty.kind == TypeKind::Struct) {
+            const st: StructType* = ty as StructType*;
+            return sprintf("%lldf %lldm", st.fields.length, st.methods.length);
         }
-
-        if (ty.kind == TypeKind::BoundedParam) {
-            const bp: BoundedParamType* = ty as BoundedParamType*;
-            const name_str: string = this.intern_table.resolve(bp.param_name);
-            return sprintf("param '%s' index=%lu %lld bounds",
-                name_str, bp.param_index, bp.bounds.length);
+        if (ty.kind == TypeKind::Class) {
+            const cl: ClassType* = ty as ClassType*;
+            return sprintf("%lldf %lldm", cl.fields.length, cl.methods.length);
         }
-
+        if (ty.kind == TypeKind::Enum) {
+            const en: EnumType* = ty as EnumType*;
+            return sprintf("%lldv %lldm", en.variants.length, en.methods.length);
+        }
+        if (ty.kind == TypeKind::Trait) {
+            const tr: TraitType* = ty as TraitType*;
+            return sprintf("%lldm %llds", tr.required_methods.length, tr.super_traits.length);
+        }
+        if (ty.kind == TypeKind::Function) {
+            const f: FunctionType* = ty as FunctionType*;
+            return sprintf("%lldp", f.param_types.length);
+        }
+        if (ty.kind == TypeKind::Tuple) {
+            const t: TupleType* = ty as TupleType*;
+            return sprintf("%llde", t.elements.length);
+        }
         if (ty.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = ty as InstantiatedType*;
-            const base_name: string = this.resolve_display_name(inst.generic_base.id);
-            mut status: string = "";
-            if (inst.resolved_type.is_valid()) {
-                const resolved_name: string = this.resolve_display_name(inst.resolved_type.id);
-                status = sprintf("resolved -> %s (id=%lu)", resolved_name, inst.resolved_type.id);
-            } else {
-                status = "UNRESOLVED";
-            }
-            return sprintf("base=%s args=%lld %s", base_name, inst.type_args.length, status);
+            return sprintf("%llda", inst.type_args.length);
         }
+        if (ty.kind == TypeKind::BoundedParam) {
+            const bp: BoundedParamType* = ty as BoundedParamType*;
+            return sprintf("%lldb", bp.bounds.length);
+        }
+        return "";
+    }
 
-        // --- Compound types: show inner type references ---
+    /// Status column: resolution, completeness, flags.
+    get_type_status(&this, ty: Type*) -> string {
+        if (ty.kind == TypeKind::Struct) {
+            const st: StructType* = ty as StructType*;
+            return if (st.is_complete) { "complete" } else { "forward" };
+        }
+        if (ty.kind == TypeKind::Class) {
+            const cl: ClassType* = ty as ClassType*;
+            mut s: string = if (cl.is_complete) { "complete" } else { "forward" };
+            if (cl.has_virtual_methods) { s = s + " vt"; }
+            return s;
+        }
+        if (ty.kind == TypeKind::Enum) {
+            const en: EnumType* = ty as EnumType*;
+            return if (en.is_simple_enum()) { "simple" } else { "ADT" };
+        }
+        if (ty.kind == TypeKind::TypeAlias) {
+            const al: TypeAliasType* = ty as TypeAliasType*;
+            return if (al.has_target()) { "resolved" } else { "unresolved" };
+        }
+        if (ty.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = ty as InstantiatedType*;
+            return if (inst.resolved_type.is_valid()) { "resolved" } else { "UNRESOLVED" };
+        }
+        if (ty.kind == TypeKind::GenericParam) {
+            const gp: GenericParamType* = ty as GenericParamType*;
+            return sprintf("idx=%lu", gp.param_index);
+        }
+        if (ty.kind == TypeKind::BoundedParam) {
+            const bp: BoundedParamType* = ty as BoundedParamType*;
+            return sprintf("idx=%lu", bp.param_index);
+        }
+        if (ty.kind == TypeKind::Reference) {
+            const r: ReferenceType* = ty as ReferenceType*;
+            return r.mutability.to_string();
+        }
+        if (ty.kind == TypeKind::Array) {
+            const a: ArrayType* = ty as ArrayType*;
+            return if (a.is_dynamic()) { "dynamic" } else { "fixed" };
+        }
+        if (ty.kind == TypeKind::Function) {
+            const f: FunctionType* = ty as FunctionType*;
+            return if (f.is_variadic) { "variadic" } else { "" };
+        }
+        return "";
+    }
 
+    /// Refs column: type references (targets, inner types, resolved types).
+    get_type_refs(&this, ty: Type*) -> string {
         if (ty.kind == TypeKind::Pointer) {
             const p: PointerType* = ty as PointerType*;
             const inner: string = this.resolve_display_name(p.pointee.id);
-            return sprintf("-> %s (id=%lu)", inner, p.pointee.id);
+            return sprintf("-> %s (#%lu)", inner, p.pointee.id);
         }
-
         if (ty.kind == TypeKind::Reference) {
             const r: ReferenceType* = ty as ReferenceType*;
             const inner: string = this.resolve_display_name(r.referent.id);
-            const mut_str: string = r.mutability.to_string();
-            return sprintf("-> %s (id=%lu) [%s]", inner, r.referent.id, mut_str);
+            return sprintf("-> %s (#%lu)", inner, r.referent.id);
         }
-
         if (ty.kind == TypeKind::Array) {
             const a: ArrayType* = ty as ArrayType*;
             const elem: string = this.resolve_display_name(a.element.id);
-            if (a.is_dynamic()) {
-                return sprintf("elem=%s (id=%lu) [dynamic]", elem, a.element.id);
-            }
-            return sprintf("elem=%s (id=%lu) [%lld]", elem, a.element.id, a.size);
+            return sprintf("elem: %s (#%lu)", elem, a.element.id);
         }
-
         if (ty.kind == TypeKind::Optional) {
             const o: OptionalType* = ty as OptionalType*;
             const inner: string = this.resolve_display_name(o.wrapped.id);
-            return sprintf("-> %s (id=%lu)", inner, o.wrapped.id);
+            return sprintf("-> %s (#%lu)", inner, o.wrapped.id);
         }
-
         if (ty.kind == TypeKind::Function) {
             const f: FunctionType* = ty as FunctionType*;
             const ret: string = this.resolve_display_name(f.return_type.id);
-            mut variadic_str: string = "";
-            if (f.is_variadic) { variadic_str = " variadic"; }
-            return sprintf("%lld params ret=%s (id=%lu)%s",
-                f.param_types.length, ret, f.return_type.id, variadic_str);
+            return sprintf("ret: %s (#%lu)", ret, f.return_type.id);
         }
-
         if (ty.kind == TypeKind::Tuple) {
             const t: TupleType* = ty as TupleType*;
-            return sprintf("%lld elements", t.elements.length);
+            if (t.elements.length == 0) { return "()"; }
+            // Show first few element type IDs
+            mut result: string = "(";
+            const limit: i64 = if (t.elements.length < 4) { t.elements.length } else { 3 };
+            for (mut i: i64 = 0; i < limit; i++) {
+                if (i > 0) { result = result + ", "; }
+                result = result + sprintf("#%lu", t.elements[i].id);
+            }
+            if (t.elements.length > 3) { result = result + ", ..."; }
+            return result + ")";
         }
-
+        if (ty.kind == TypeKind::TypeAlias) {
+            const al: TypeAliasType* = ty as TypeAliasType*;
+            if (al.has_target()) {
+                const target: string = this.resolve_display_name(al.target.id);
+                return sprintf("-> %s (#%lu)", target, al.target.id);
+            }
+            return "-> ?";
+        }
+        if (ty.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = ty as InstantiatedType*;
+            const base: string = this.resolve_display_name(inst.generic_base.id);
+            if (inst.resolved_type.is_valid()) {
+                const resolved: string = this.resolve_display_name(inst.resolved_type.id);
+                return sprintf("base: %s => %s (#%lu)", base, resolved, inst.resolved_type.id);
+            }
+            return sprintf("base: %s => ?", base);
+        }
+        if (ty.kind == TypeKind::Class) {
+            const cl: ClassType* = ty as ClassType*;
+            if (cl.has_base) {
+                const base_name: string = this.resolve_display_name(cl.base_class.id);
+                return sprintf("extends %s (#%lu)", base_name, cl.base_class.id);
+            }
+        }
         if (ty.kind == TypeKind::Error) {
             const e: ErrorType* = ty as ErrorType*;
-            return sprintf("reason='%s'", e.reason);
+            return e.reason;
         }
-
-        // Primitives — no extra detail needed
         return "";
     }
 }
