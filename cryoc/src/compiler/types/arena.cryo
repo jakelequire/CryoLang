@@ -585,35 +585,224 @@ type struct TypeArena {
 
     debug_dump(&this) -> void {
         printf("\n=== TypeArena Dump: %lld types ===\n", this.types.length);
-        printf("%-6s | %-18s | %-30s | %-30s | %-6s | %-6s\n",
-            "ID", "Kind", "Display Name", "Mangled Name", "Size", "Align");
-        printf("------+--------------------+--------------------------------+--------------------------------+--------+-------\n");
+        printf("%-6s | %-18s | %-30s | %-6s | %-6s | %s\n",
+            "ID", "Kind", "Display Name", "Size", "Align", "Details");
+        printf("-------+--------------------+--------------------------------+--------+--------+----------------------------------\n");
+
         for (mut i: int = 0; i < this.types.length; i++) {
             const ty: Type* = this.types[i];
+            if (ty == null) { continue; }
+
             // Capture each string to a local before printf to avoid
             // sprintf static buffer aliasing between arguments.
             const kind_str: string = ty.kind.to_string();
             const display: string = this.format_display(ty);
-            const mangled: string = ty.mangled_name();
-            printf("%-6llu | %-18s | %-30s | %-30s | %-6llu | %-6llu\n",
-                ty.id, kind_str, display, mangled, ty.size_bytes(), ty.alignment());
+            const details: string = this.format_type_details(ty);
+
+            printf("%-6llu | %-18s | %-30s | %-6llu | %-6llu | %s\n",
+                ty.id, kind_str, display, ty.size_bytes(), ty.alignment(), details);
         }
-        printf("------+--------------------+--------------------------------+--------------------------------+--------+-------\n");
+        printf("-------+--------------------+--------------------------------+--------+--------+----------------------------------\n");
 
-        printf("=== Type Caches ===\n");
-        printf("Pointer Cache: %lld entries\n", this.pointer_cache.length());
-        printf("Reference Cache: %lld entries\n", this.reference_cache.length());
-        printf("Array Cache: %lld entries\n", this.array_cache.length());
-        printf("Optional Cache: %lld entries\n", this.optional_cache.length());
-        printf("Function Cache: %lld entries\n", this.function_cache.length());
-        printf("Tuple Cache: %lld entries\n", this.tuple_cache.length());
-        printf("Struct Cache: %lld entries\n", this.struct_cache.length());
-        printf("Class Cache: %lld entries\n", this.class_cache.length());
-        printf("Enum Cache: %lld entries\n", this.enum_cache.length());
-        printf("Trait Cache: %lld entries\n", this.trait_cache.length());
-        printf("Alias Cache: %lld entries\n", this.alias_cache.length());
-        printf("GenericParam Cache: %lld entries\n", this.generic_param_cache.length());
-        printf("BoundedParam Cache: %lld entries\n", this.bounded_param_cache.length());
+        // Summary by category
+        printf("\n=== Type Summary ===\n");
+        mut n_primitives: i64 = 0;
+        mut n_compound: i64 = 0;
+        mut n_user: i64 = 0;
+        mut n_generic: i64 = 0;
+        mut n_instantiated: i64 = 0;
+        mut n_resolved_inst: i64 = 0;
 
+        for (mut j: int = 0; j < this.types.length; j++) {
+            const t: Type* = this.types[j];
+            if (t == null) { continue; }
+            if (t.kind.is_primitive()) { n_primitives = n_primitives + 1; }
+            if (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference ||
+                t.kind == TypeKind::Array || t.kind == TypeKind::Function ||
+                t.kind == TypeKind::Tuple || t.kind == TypeKind::Optional) {
+                n_compound = n_compound + 1;
+            }
+            if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class ||
+                t.kind == TypeKind::Enum || t.kind == TypeKind::Trait ||
+                t.kind == TypeKind::TypeAlias) {
+                n_user = n_user + 1;
+            }
+            if (t.kind == TypeKind::GenericParam || t.kind == TypeKind::BoundedParam ||
+                t.kind == TypeKind::FunctionTemplate) {
+                n_generic = n_generic + 1;
+            }
+            if (t.kind == TypeKind::InstantiatedType) {
+                n_instantiated = n_instantiated + 1;
+                const inst_t: InstantiatedType* = t as InstantiatedType*;
+                if (inst_t.resolved_type.is_valid()) {
+                    n_resolved_inst = n_resolved_inst + 1;
+                }
+            }
+        }
+
+        printf("  Primitives:    %lld\n", n_primitives);
+        printf("  Compound:      %lld  (ptr, ref, array, fn, tuple, optional)\n", n_compound);
+        printf("  User-defined:  %lld  (struct, class, enum, trait, alias)\n", n_user);
+        printf("  Generic:       %lld  (params + function templates)\n", n_generic);
+        printf("  Instantiated:  %lld  (%lld resolved)\n", n_instantiated, n_resolved_inst);
+        printf("  Total:         %lld\n", this.types.length);
+
+        printf("\n=== Dedup Caches ===\n");
+        printf("  Pointer: %lld | Reference: %lld | Array: %lld | Optional: %lld\n",
+            this.pointer_cache.length(), this.reference_cache.length(),
+            this.array_cache.length(), this.optional_cache.length());
+        printf("  Function: %lld | Tuple: %lld | GenericParam: %lld | BoundedParam: %lld\n",
+            this.function_cache.length(), this.tuple_cache.length(),
+            this.generic_param_cache.length(), this.bounded_param_cache.length());
+        printf("  Struct: %lld | Class: %lld | Enum: %lld | Trait: %lld | Alias: %lld\n",
+            this.struct_cache.length(), this.class_cache.length(),
+            this.enum_cache.length(), this.trait_cache.length(),
+            this.alias_cache.length());
+    }
+
+    /// Build a kind-specific detail string for a type.  Uses if-chains
+    /// (not match/virtual) for C++ codegen compatibility.
+    format_type_details(&this, ty: Type*) -> string {
+        if (ty == null) { return ""; }
+
+        // --- User-defined types: module, fields, methods, completeness ---
+
+        if (ty.kind == TypeKind::Struct) {
+            const st: StructType* = ty as StructType*;
+            const mod_str: string = this.intern_table.resolve(st.module_name);
+            const qual_str: string = this.intern_table.resolve(st.qualified_name);
+            const complete_str: string = if (st.is_complete) { "complete" } else { "forward" };
+            return sprintf("mod=%s qual=%s %lld fields %lld methods [%s]",
+                mod_str, qual_str, st.fields.length, st.methods.length, complete_str);
+        }
+
+        if (ty.kind == TypeKind::Class) {
+            const cl: ClassType* = ty as ClassType*;
+            const mod_str: string = this.intern_table.resolve(cl.module_name);
+            const qual_str: string = this.intern_table.resolve(cl.qualified_name);
+            const complete_str: string = if (cl.is_complete) { "complete" } else { "forward" };
+            mut extra: string = "";
+            if (cl.has_base) {
+                const base_name: string = this.resolve_display_name(cl.base_class.id);
+                extra = sprintf(" base=%s", base_name);
+            }
+            if (cl.has_virtual_methods) {
+                extra = extra + " vtable";
+            }
+            return sprintf("mod=%s qual=%s %lld fields %lld methods [%s]%s",
+                mod_str, qual_str, cl.fields.length, cl.methods.length, complete_str, extra);
+        }
+
+        if (ty.kind == TypeKind::Enum) {
+            const en: EnumType* = ty as EnumType*;
+            const mod_str: string = this.intern_table.resolve(en.module_name);
+            const qual_str: string = this.intern_table.resolve(en.qualified_name);
+            const style: string = if (en.is_simple_enum()) { "simple" } else { "ADT" };
+            return sprintf("mod=%s qual=%s %lld variants %lld methods [%s]",
+                mod_str, qual_str, en.variants.length, en.methods.length, style);
+        }
+
+        if (ty.kind == TypeKind::Trait) {
+            const tr: TraitType* = ty as TraitType*;
+            const mod_str: string = this.intern_table.resolve(tr.module_name);
+            const qual_str: string = this.intern_table.resolve(tr.qualified_name);
+            return sprintf("mod=%s qual=%s %lld required methods %lld super",
+                mod_str, qual_str, tr.required_methods.length, tr.super_traits.length);
+        }
+
+        if (ty.kind == TypeKind::TypeAlias) {
+            const al: TypeAliasType* = ty as TypeAliasType*;
+            if (al.has_target()) {
+                const target_name: string = this.resolve_display_name(al.target.id);
+                return sprintf("-> %s (id=%lu)", target_name, al.target.id);
+            }
+            return "-> <unresolved>";
+        }
+
+        if (ty.kind == TypeKind::FunctionTemplate) {
+            const ft: FunctionTemplateType* = ty as FunctionTemplateType*;
+            const qual_str: string = this.intern_table.resolve(ft.qualified_name);
+            return sprintf("qual=%s (template placeholder)", qual_str);
+        }
+
+        // --- Generic types ---
+
+        if (ty.kind == TypeKind::GenericParam) {
+            const gp: GenericParamType* = ty as GenericParamType*;
+            const name_str: string = this.intern_table.resolve(gp.param_name);
+            return sprintf("param '%s' index=%lu", name_str, gp.param_index);
+        }
+
+        if (ty.kind == TypeKind::BoundedParam) {
+            const bp: BoundedParamType* = ty as BoundedParamType*;
+            const name_str: string = this.intern_table.resolve(bp.param_name);
+            return sprintf("param '%s' index=%lu %lld bounds",
+                name_str, bp.param_index, bp.bounds.length);
+        }
+
+        if (ty.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = ty as InstantiatedType*;
+            const base_name: string = this.resolve_display_name(inst.generic_base.id);
+            mut status: string = "";
+            if (inst.resolved_type.is_valid()) {
+                const resolved_name: string = this.resolve_display_name(inst.resolved_type.id);
+                status = sprintf("resolved -> %s (id=%lu)", resolved_name, inst.resolved_type.id);
+            } else {
+                status = "UNRESOLVED";
+            }
+            return sprintf("base=%s args=%lld %s", base_name, inst.type_args.length, status);
+        }
+
+        // --- Compound types: show inner type references ---
+
+        if (ty.kind == TypeKind::Pointer) {
+            const p: PointerType* = ty as PointerType*;
+            const inner: string = this.resolve_display_name(p.pointee.id);
+            return sprintf("-> %s (id=%lu)", inner, p.pointee.id);
+        }
+
+        if (ty.kind == TypeKind::Reference) {
+            const r: ReferenceType* = ty as ReferenceType*;
+            const inner: string = this.resolve_display_name(r.referent.id);
+            const mut_str: string = r.mutability.to_string();
+            return sprintf("-> %s (id=%lu) [%s]", inner, r.referent.id, mut_str);
+        }
+
+        if (ty.kind == TypeKind::Array) {
+            const a: ArrayType* = ty as ArrayType*;
+            const elem: string = this.resolve_display_name(a.element.id);
+            if (a.is_dynamic()) {
+                return sprintf("elem=%s (id=%lu) [dynamic]", elem, a.element.id);
+            }
+            return sprintf("elem=%s (id=%lu) [%lld]", elem, a.element.id, a.size);
+        }
+
+        if (ty.kind == TypeKind::Optional) {
+            const o: OptionalType* = ty as OptionalType*;
+            const inner: string = this.resolve_display_name(o.wrapped.id);
+            return sprintf("-> %s (id=%lu)", inner, o.wrapped.id);
+        }
+
+        if (ty.kind == TypeKind::Function) {
+            const f: FunctionType* = ty as FunctionType*;
+            const ret: string = this.resolve_display_name(f.return_type.id);
+            mut variadic_str: string = "";
+            if (f.is_variadic) { variadic_str = " variadic"; }
+            return sprintf("%lld params ret=%s (id=%lu)%s",
+                f.param_types.length, ret, f.return_type.id, variadic_str);
+        }
+
+        if (ty.kind == TypeKind::Tuple) {
+            const t: TupleType* = ty as TupleType*;
+            return sprintf("%lld elements", t.elements.length);
+        }
+
+        if (ty.kind == TypeKind::Error) {
+            const e: ErrorType* = ty as ErrorType*;
+            return sprintf("reason='%s'", e.reason);
+        }
+
+        // Primitives — no extra detail needed
+        return "";
     }
 }
