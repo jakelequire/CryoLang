@@ -88,6 +88,13 @@ type struct GenericRegistry {
     // -- Monomorphization tracking --
     mono_set: HashMap<string, boolean>; // cache_key → true
 
+    // -- Per-module instantiation demand tracking --
+    // Records which modules requested each instantiation.
+    // Parallel arrays: demand_keys[i] is the cache_key, demand_modules[i]
+    // is the SymbolStr.id of the requesting module.
+    demand_keys:    string[];
+    demand_modules: u32[];
+
 
     // ----------------------------------------------------------------
     // Construction
@@ -105,6 +112,8 @@ type struct GenericRegistry {
             cache_refs:        [],
             cache_index:       HashMap<string, i64>::new(),
             mono_set:          HashMap<string, boolean>::new(),
+            demand_keys:       [],
+            demand_modules:    [],
         };
     }
 
@@ -208,6 +217,41 @@ type struct GenericRegistry {
         this.cache_refs = this.cache_refs + [inst];
         this.cache_index.insert(key, idx, h);
         return inst;
+    }
+
+
+    /// Like instantiate(), but also records which module requested it.
+    /// Used by TypeResolution to track per-module demand for codegen.
+    instantiate_for_module(mut &this, base: TypeRef, args: TypeRef[],
+                           module: SymbolStr) -> TypeRef {
+        const result: TypeRef = this.instantiate(base, args);
+        // Record the demand regardless of cache hit — a module that uses
+        // an already-cached instantiation still needs it available at codegen.
+        const key: string = this.make_cache_key(base, args);
+        this.demand_keys.push(key);
+        this.demand_modules.push(module.id);
+        return result;
+    }
+
+    /// Get all modules that requested a specific instantiation.
+    get_modules_using(&this, cache_key: string) -> SymbolStr[] {
+        mut result: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < this.demand_keys.length; i++) {
+            if (strcmp(this.demand_keys[i], cache_key) == 0) {
+                const sym: SymbolStr = SymbolStr::from_id(this.demand_modules[i]);
+                // Deduplicate: skip if already in result
+                mut found: boolean = false;
+                for (mut j: i64 = 0; j < result.length; j++) {
+                    if (result[j].id == sym.id) {
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    result.push(sym);
+                }
+            }
+        }
+        return result;
     }
 
 
