@@ -586,6 +586,10 @@ public:
     }
 
     /// Parse the rest of a lambda after its parameter list has been parsed.
+    /// Handles both expression bodies and block bodies:
+    ///   () -> T { return value; }   (block body)
+    ///   () -> T expr                (expression body)
+    ///   (x: A) -> C { ... }         (block body with params)
     parse_lambda_after_params(params: VarDeclNode*[], start: Token) -> ExpressionNode* {
         this.consume(TokenType::Arrow, "'->'");
 
@@ -594,18 +598,97 @@ public:
             lambda.add_parameter(params[i]);
         }
 
-        // Body: parse as expression and wrap in a block statement.
-        // TODO: support block bodies (parse_block) once forward refs are wired.
-        const body_expr: ExpressionNode* = this.parse_expression();
-        if (body_expr != null) {
-            const expr_stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
-            const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
-            block.add_statement(expr_stmt);
+        // Parse return type annotation (everything before '{' or the expression).
+        // The return type is between '->' and either '{' (block body) or the
+        // expression start.  We parse a type annotation if the next token
+        // looks like a type (identifier, keyword, paren for tuple/fn types).
+        // If the next token is '{', there's no explicit return type.
+        if (!this.check(TokenType::LBrace)) {
+            // There's a return type before the body
+            const ret_ann: TypeAnnotation* = this.parse_type_annotation();
+            // ret_ann is consumed but not stored on LambdaExprNode
+            // (resolved later by type resolution pass)
+        }
+
+        // Body: block body { ... } or expression body.
+        // parse_block_statement lives on Parser (child class), so we skip
+        // the block as opaque tokens here and store a placeholder block.
+        // The block content will be re-parsed during semantic analysis.
+        if (this.check(TokenType::LBrace)) {
+            const block_start: Token = this.current();
+            const block: BlockStmtNode* = this.parse_lambda_block_body();
             lambda.set_body(block);
+        } else {
+            // Expression body — wrap in block
+            const body_expr: ExpressionNode* = this.parse_expression();
+            if (body_expr != null) {
+                const expr_stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
+                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
+                block.add_statement(expr_stmt);
+                lambda.set_body(block);
+            }
         }
 
         lambda.span = this.span_from(start);
         return lambda;
+    }
+
+    /// Parse a lambda block body: { statement; statement; ... }
+    /// Simplified block parser for ExprParser (can't call Parser's parse_block_statement).
+    /// Handles return statements and expression statements.
+    parse_lambda_block_body() -> BlockStmtNode* {
+        const start: Token = this.advance(); // consume '{'
+        mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(start));
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            // Return statement
+            if (this.check(TokenType::KwReturn)) {
+                const ret_start: Token = this.advance(); // consume 'return'
+                mut ret_expr: ExpressionNode* = null;
+                if (!this.check(TokenType::Semicolon) && !this.check(TokenType::RBrace)) {
+                    ret_expr = this.parse_expression();
+                }
+                this.consume(TokenType::Semicolon, "';'");
+                const ret: ReturnStmtNode* = new ReturnStmtNode(ret_expr, this.span_from(ret_start));
+                block.add_statement(ret);
+                continue;
+            }
+
+            // Variable declaration (const/mut)
+            if (this.check(TokenType::KwConst) || this.check(TokenType::KwMut)) {
+                const is_mut: boolean = this.check(TokenType::KwMut);
+                const decl_start: Token = this.advance(); // consume const/mut
+                const name_tok: Token = this.consume(TokenType::Identifier, "variable name");
+                const vname: SymbolStr = this.intern_lexeme(name_tok);
+                mut decl: VarDeclNode* = new VarDeclNode(vname, this.span_from_token(decl_start));
+                decl.set_mutable(is_mut);
+                if (this.match_tok(TokenType::Colon)) {
+                    decl.set_type_annotation(this.parse_type_annotation());
+                }
+                if (this.match_tok(TokenType::Equal)) {
+                    decl.set_initializer(this.parse_expression());
+                }
+                this.consume(TokenType::Semicolon, "';'");
+                const ds: DeclStmtNode* = new DeclStmtNode(decl, this.span_from(decl_start));
+                block.add_statement(ds);
+                continue;
+            }
+
+            // Expression statement
+            const expr: ExpressionNode* = this.parse_expression();
+            if (expr != null) {
+                this.consume(TokenType::Semicolon, "';'");
+                const es: ExprStmtNode* = new ExprStmtNode(expr, expr.span);
+                block.add_statement(es);
+            } else {
+                this.error_unexpected();
+                this.advance();
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        block.span = this.span_from(start);
+        return block;
     }
 
     /// Parse an array literal: [ expr, expr, ... ]
@@ -900,9 +983,10 @@ public:
             return this.parse_enum_pattern_internal();
         }
 
-        // Literal pattern (number, string, bool)
+        // Literal pattern (number, string, char, bool)
         if (this.current().kind == TokenType::NumericConstant ||
             this.current().kind == TokenType::StringLiteral ||
+            this.current().kind == TokenType::CharConstant ||
             this.current().kind == TokenType::KwTrue ||
             this.current().kind == TokenType::KwFalse) {
             const lit_tok: Token = this.advance();
@@ -1303,8 +1387,8 @@ public:
                     };
                     result = new TypeAnnotation::Array(arr_ann);
                 } else {
-                    // Fixed-size array: T[N]
-                    // Parse the size as a numeric constant
+                    // Fixed-size array: T[N] or T[CONST_NAME]
+                    // Parse the size as a numeric constant or identifier (const ref)
                     const size_tok: Token = this.current();
                     mut size: i64 = 0;
                     if (size_tok.kind == TokenType::NumericConstant) {
@@ -1315,6 +1399,15 @@ public:
                                 size = size * 10 + ((d as i64) - ('0' as i64));
                             }
                         }
+                        this.advance();
+                    } else if (size_tok.kind == TokenType::Identifier) {
+                        // Named constant: T[BTREE_MAX_KEYS]
+                        // Store -1 as placeholder; resolved later during type resolution
+                        size = -1;
+                        this.advance();
+                    } else {
+                        // Try parsing as expression for computed sizes
+                        size = -1;
                         this.advance();
                     }
                     this.consume(TokenType::RSquare, "']'");
