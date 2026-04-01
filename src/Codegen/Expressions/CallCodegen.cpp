@@ -1,5 +1,6 @@
 #include "Codegen/Expressions/CallCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
+#include "Codegen/Expressions/ExpressionCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
 #include "Codegen/Intrinsics.hpp"
@@ -583,38 +584,72 @@ namespace Cryo::Codegen
                     return nullptr;
                 }
 
+                // Track whether we need to write back a modified struct value
+                // to the original array element after the method call.
+                llvm::Value *array_elem_writeback_ptr = nullptr;
+                llvm::Type *array_elem_writeback_type = nullptr;
+                llvm::AllocaInst *writeback_temp = nullptr;
+
                 // Ensure receiver is a pointer type (methods expect ptr to self)
                 if (!receiver->getType()->isPointerTy())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "Method receiver is not a pointer, creating temporary storage");
 
-                    // Safety check: if receiver type is void (from unresolved generic),
-                    // we can't create an alloca with void type - use opaque pointer instead
                     llvm::Type *receiver_type = receiver->getType();
                     if (receiver_type->isVoidTy())
                     {
                         LOG_ERROR(Cryo::LogComponent::CODEGEN,
                                   "Method receiver has void type (likely from unresolved generic). "
                                   "Using opaque pointer as fallback.");
-                        // This is a workaround - the real fix is proper generic substitution
-                        // For now, create a pointer-sized alloca and proceed
                         llvm::Type *ptr_type = llvm::PointerType::get(llvm_ctx(), 0);
                         llvm::AllocaInst *temp = create_entry_alloca(ptr_type, "method.receiver.tmp");
-                        // Store null pointer as placeholder - the actual value handling needs work
                         builder().CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::get(llvm_ctx(), 0)), temp);
                         receiver = temp;
                     }
                     else
                     {
-                        // Create an alloca to store the value and pass the pointer
                         llvm::AllocaInst *temp = create_entry_alloca(receiver_type, "method.receiver.tmp");
                         builder().CreateStore(receiver, temp);
+
+                        // If the receiver was an array element (struct value, not pointer),
+                        // set up write-back: after the method call, copy the modified
+                        // struct from the temp back to the original array element.
+                        if (auto *array_access = dynamic_cast<ArrayAccessNode *>(member->object()))
+                        {
+                            // The last GEP before the load is the element pointer.
+                            // We can recover it by re-generating the index address.
+                            // Only do this if the receiver is a struct (non-pointer) type,
+                            // meaning the method might modify it in-place.
+                            CodegenVisitor *vis = ctx().visitor();
+                            if (vis && vis->expressions())
+                            {
+                                llvm::Value *elem_ptr = vis->expressions()->generate_index_address(array_access);
+                                if (elem_ptr)
+                                {
+                                    array_elem_writeback_ptr = elem_ptr;
+                                    array_elem_writeback_type = receiver_type;
+                                    writeback_temp = temp;
+                                }
+                            }
+                        }
+
                         receiver = temp;
                     }
                 }
 
-                return generate_instance_method(node, member, receiver, member->member());
+                llvm::Value *result = generate_instance_method(node, member, receiver, member->member());
+
+                // Write back: if the receiver was a struct-typed array element stored
+                // in a temp, copy the (potentially modified) value back to the original
+                // array element so mutations persist.
+                if (array_elem_writeback_ptr && writeback_temp && array_elem_writeback_type)
+                {
+                    llvm::Value *modified = create_load(writeback_temp, array_elem_writeback_type, "writeback.load");
+                    builder().CreateStore(modified, array_elem_writeback_ptr);
+                }
+
+                return result;
             }
             report_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, node,
                          "Invalid instance method call");

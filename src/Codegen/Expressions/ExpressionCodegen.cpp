@@ -2380,10 +2380,14 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN, "Detected Array<{}> address access for variable: {}", element_type_name, array_name);
 
                 // This is an Array<T> type (like u64[] which is Array<u64>)
-                // We need to access the 'elements' field first: arr[index] becomes arr.elements[index]
-
-                // Generate the Array<T> instance
-                llvm::Value *array_instance = generate(node->array());
+                // We need the POINTER to the Array<T> struct (not a loaded copy)
+                // so that GEP can index into it.
+                llvm::Value *array_instance = values().get_alloca(array_name);
+                if (!array_instance)
+                {
+                    // Fallback: try generating the expression (may return a value, not pointer)
+                    array_instance = generate(node->array());
+                }
                 if (!array_instance)
                 {
                     report_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR, node,
@@ -2703,7 +2707,60 @@ namespace Cryo::Codegen
             }
         }
 
-        // If we didn't find a stack array, use the standard path
+        // If the member access path didn't resolve, try using the Cryo type system
+        // to determine the Array<T> element type from the array expression's resolved type.
+        // This handles cases like node.arms[i] where 'arms' is an Array<MatchArmNode*>.
+        if (!array_ptr && !element_type)
+        {
+            TypeRef arr_resolved = node->array()->get_resolved_type();
+            if (arr_resolved && arr_resolved->kind() == TypeKind::Array)
+            {
+                auto *cryo_arr = static_cast<const Cryo::ArrayType *>(arr_resolved.get());
+                element_type = get_llvm_type(cryo_arr->element());
+
+                if (element_type)
+                {
+                    // We know the element type from Cryo.  Now get the Array<T> struct
+                    // pointer and GEP to the element.
+                    llvm::Type *array_struct_type = get_llvm_type(arr_resolved);
+
+                    // Try to get a pointer to the array struct (not a loaded copy)
+                    llvm::Value *arr_struct_ptr = nullptr;
+                    if (auto *identifier = dynamic_cast<Cryo::IdentifierNode *>(node->array()))
+                    {
+                        arr_struct_ptr = values().get_alloca(identifier->name());
+                    }
+                    if (!arr_struct_ptr)
+                    {
+                        // For member access, generate_member_address gives us a pointer
+                        if (auto *ma = dynamic_cast<Cryo::MemberAccessNode *>(node->array()))
+                            arr_struct_ptr = generate_member_address(ma);
+                    }
+
+                    if (arr_struct_ptr && array_struct_type && array_struct_type->isStructTy())
+                    {
+                        llvm::Value *index_val = generate(node->index());
+                        if (!index_val)
+                            return nullptr;
+                        if (!index_val->getType()->isIntegerTy())
+                            index_val = cast_if_needed(index_val, llvm::Type::getInt64Ty(llvm_ctx()));
+
+                        llvm::Value *elements_ptr = builder().CreateStructGEP(
+                            llvm::cast<llvm::StructType>(array_struct_type),
+                            arr_struct_ptr, 0, "arr.addr.elements.ptr");
+
+                        llvm::Value *elements_array = create_load(
+                            elements_ptr, llvm::PointerType::get(llvm_ctx(), 0),
+                            "arr.addr.elements.load");
+
+                        return builder().CreateGEP(
+                            element_type, elements_array, index_val, "elem.addr.ptr");
+                    }
+                }
+            }
+        }
+
+        // Final fallback: use the standard path
         if (!array_ptr)
         {
             // Generate array expression

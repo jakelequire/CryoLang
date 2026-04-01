@@ -777,11 +777,6 @@ type struct NameResolutionPass {
             return PassResult::failure(1);
         }
 
-        // Set current module from context if already set
-        if (ctx.has_namespace()) {
-            ctx.resolver.set_module(ctx.intern(ctx.namespace_display()));
-        }
-
         // Get AST root from artifacts
         const root: ProgramNode* = ctx.artifacts.ast.root;
         if (root == null) {
@@ -789,11 +784,18 @@ type struct NameResolutionPass {
             return PassResult::ok();
         }
 
-        // Bridge namespace from parsed AST into the compilation context.
-        // ProgramNode.namespace_name flows into the visitor's set_module() call,
-        // but was never wired into ctx.current_namespace — fix that here.
-        if (root.namespace_name != "" && !ctx.has_namespace()) {
-            ctx.current_namespace = QualifiedName::parse(&ctx.intern_table, root.namespace_name);
+        // Set module name on the resolver.  In multi-module mode,
+        // switch_to_module tries to set it but the Resolver may not exist yet.
+        // Use the module graph as the source of truth for the current module name.
+        if (ctx.active_module_index >= 0
+            && ctx.active_module_index < ctx.module_graph.modules.length as i64) {
+            const mod_info: ModuleInfo = ctx.module_graph.modules[ctx.active_module_index];
+            const mod_name: SymbolStr = mod_info.namespace_name;
+            if (mod_name.is_valid()) {
+                ctx.resolver.set_module(mod_name);
+            }
+        } else if (root.namespace_name != "") {
+            ctx.resolver.set_module(ctx.intern(root.namespace_name));
         }
 
         // Create and run the visitor

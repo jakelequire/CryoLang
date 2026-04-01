@@ -60,6 +60,9 @@ namespace Cryo::Codegen
 
         ~CodegenVisitor();
 
+        /// Access the ExpressionCodegen component (for generate_index_address etc.)
+        ExpressionCodegen *expressions() { return _expressions.get(); }
+
         // Non-copyable, non-movable
         CodegenVisitor(const CodegenVisitor &) = delete;
         CodegenVisitor &operator=(const CodegenVisitor &) = delete;
