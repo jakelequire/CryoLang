@@ -10,6 +10,10 @@
 ///
 ///   3. GenericExpressionResolution — Injects specialized ASTs into the
 ///      ProgramNode so codegen sees only concrete declarations.
+///
+///   4. GenericValidation — Walks all types in the arena and asserts that
+///      every InstantiatedType has a resolved concrete type.  Catches
+///      missed monomorphizations before they reach codegen or type lowering.
 
 namespace Compiler::Passes::Specialization;
 
@@ -329,4 +333,79 @@ type struct SpecializationPasses {
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
+
+
+    // ========================================================================
+    // Pass 4: Generic Validation
+    // ========================================================================
+
+    /// Walks all types in the arena and asserts that every InstantiatedType
+    /// has a valid resolved_type.  Delegates to free functions to avoid
+    /// vtable offset issues with class-method field access in the C++ codegen.
+    static run_generic_validation(ctx: CompilationContext*) -> PassResult {
+        return run_generic_validation_impl(ctx);
+    }
+}
+
+
+// ============================================================================
+// Generic Validation — free function implementation
+//
+// Uses a free function (not class method) and avoids ALL virtual method
+// calls on Type* pointers.  The C++ codegen has a known vtable offset bug
+// that causes SIGSEGV when dispatching virtual methods on Type subclass
+// pointers in certain compilation units.
+//
+// Only non-virtual access is used:
+//   - ty.kind        (plain field, TypeKind enum, no vtable)
+//   - inst.resolved_type.is_valid()  (TypeRef is a plain struct, no vtable)
+//   - inst.generic_base.id           (plain u64 field)
+//   - inst.type_args.length          (array length, no vtable)
+// ============================================================================
+
+function run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {
+    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+    const arena: TypeArena* = ctx.type_arena;
+    if (arena == null) {
+        return PassResult::ok();
+    }
+
+    const count: i64 = arena.type_count();
+    LOG_DEBUG(LogComponent::General, "[GenericValidation] Validating %lld types in arena", count);
+
+    mut unresolved_count: i64 = 0;
+
+    for (mut i: i64 = 0; i < count; i++) {
+        const ty: Type* = arena.types[i];
+        if (ty == null) { continue; }
+
+        // Non-virtual field access only — ty.kind is a plain enum field.
+        if (ty.kind != TypeKind::InstantiatedType) { continue; }
+
+        const inst: InstantiatedType* = ty as InstantiatedType*;
+
+        // resolved_type is a TypeRef (plain struct) — is_valid() is non-virtual.
+        if (inst.resolved_type.is_valid()) { continue; }
+
+        // This InstantiatedType was never monomorphized.
+        unresolved_count = unresolved_count + 1;
+
+        // All fields accessed below are plain data (u64, i64), no vtable dispatch.
+        const base_id: u64 = inst.generic_base.id;
+        const n_args: i64 = inst.type_args.length;
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            sprintf("unresolved generic instantiation after monomorphization: "
+                    "InstantiatedType (id=%lu, base=%lu, %lld type args)",
+                    inst.id, base_id, n_args));
+    }
+
+    if (unresolved_count > 0) {
+        LOG_DEBUG(LogComponent::General, "[GenericValidation] FAILED: %lld unresolved types found",
+            unresolved_count);
+    } else {
+        LOG_DEBUG(LogComponent::General, "[GenericValidation] All generic types fully resolved");
+    }
+
+    return PassResult::from_snapshot(ctx.diagnostics, snap);
 }
