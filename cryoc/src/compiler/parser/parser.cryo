@@ -464,8 +464,18 @@ public:
     }
 
     /// Parse the body of a struct or class declaration (fields, methods, visibility).
+    ///
+    /// Visibility rules:
+    ///   Struct — all members default to public.  `public:` and `private:` blocks
+    ///            are allowed but optional.  `protected:` is an error (no inheritance).
+    ///   Class  — no default visibility.  Every member MUST appear inside an explicit
+    ///            `public:`, `private:`, or `protected:` block.
     parse_type_body(struct_node: StructDeclNode*, class_node: ClassDeclNode*) -> void {
-        mut current_visibility: Visibility = Visibility::Private;
+        const is_struct: boolean = (struct_node != null);
+
+        // Structs default to public; classes have no default (sentinel).
+        mut current_visibility: Visibility = Visibility::Public;
+        mut has_visibility_block: boolean = is_struct;  // structs implicitly "have" one
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             this.collect_doc_comments();
@@ -475,18 +485,33 @@ public:
             // Visibility labels: public: / private: / protected:
             if (this.check(TokenType::KwPublic) && this.peek_at(1).kind == TokenType::Colon) {
                 current_visibility = Visibility::Public;
+                has_visibility_block = true;
                 this.advance(); this.advance(); // consume 'public' ':'
                 continue;
             }
             if (this.check(TokenType::KwPrivate) && this.peek_at(1).kind == TokenType::Colon) {
                 current_visibility = Visibility::Private;
+                has_visibility_block = true;
                 this.advance(); this.advance();
                 continue;
             }
             if (this.check(TokenType::KwProtected) && this.peek_at(1).kind == TokenType::Colon) {
+                if (is_struct) {
+                    this.report_error(ErrorCode::E0359_PROTECTED_IN_STRUCT,
+                        "'protected:' is not allowed in structs (structs do not support inheritance)");
+                    this.advance(); this.advance();
+                    continue;
+                }
                 current_visibility = Visibility::Protected;
+                has_visibility_block = true;
                 this.advance(); this.advance();
                 continue;
+            }
+
+            // For classes, every member must be inside a visibility block.
+            if (!has_visibility_block) {
+                this.report_error(ErrorCode::E0360_MISSING_VISIBILITY_BLOCK,
+                    "class members must be inside a visibility block (public:, private:, or protected:)");
             }
 
             // Constructor: ClassName(params) { body }
