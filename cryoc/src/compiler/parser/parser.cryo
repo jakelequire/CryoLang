@@ -211,8 +211,14 @@ public:
             return func;
         }
 
-        // Intrinsic declaration
+        // Intrinsic declaration or intrinsic const
         if (tok.kind == TokenType::KwIntrinsic) {
+            // Peek ahead: intrinsic const → IntrinsicConstDecl
+            if (this.peek_at(1).kind == TokenType::KwConst) {
+                const ic: IntrinsicConstDeclNode* = this.parse_intrinsic_const_declaration();
+                if (ic != null && doc != "") { ic.set_documentation(doc); }
+                return ic;
+            }
             const intr: IntrinsicDeclNode* = this.parse_intrinsic_declaration();
             if (intr != null && doc != "") { intr.set_documentation(doc); }
             return intr;
@@ -378,10 +384,27 @@ public:
             return param;
         }
 
-        const name_tok: Token = this.consume(TokenType::Identifier, "parameter name");
+        // Accept keywords as parameter names (e.g., this, default, type, value).
+        // Keywords like 'this' for pass-by-value self, 'default' for fallback values, etc.
+        // are common parameter names that shouldn't be reserved.
+        mut name_tok: Token = this.current();
+        if (name_tok.kind == TokenType::Identifier || name_tok.kind.is_keyword()) {
+            this.advance();
+        } else {
+            name_tok = this.consume(TokenType::Identifier, "parameter name");
+        }
         const pname: SymbolStr = this.intern_lexeme(name_tok);
         mut param: VarDeclNode* = new VarDeclNode(pname, this.span_from_token(name_tok));
         param.set_mutable(is_mutable);
+
+        // Variadic parameter: name... (e.g., args...)
+        // Return the param as-is (no type annotation) — the caller
+        // will see the Ellipsis and mark the function as variadic.
+        if (this.check(TokenType::Ellipsis)) {
+            this.advance(); // consume '...'
+            param.set_mutable(false);
+            return param;
+        }
 
         // Type annotation
         if (this.match_tok(TokenType::Colon)) {
@@ -945,8 +968,14 @@ public:
         const start: Token = this.advance(); // consume 'import'
 
         // Build module path incrementally: A::B::C
+        // Accept keywords as path segments (e.g., import collections::string)
         mut qn: QualifiedName = QualifiedName::empty();
-        const first_tok: Token = this.consume(TokenType::Identifier, "module name");
+        mut first_tok: Token = this.current();
+        if (first_tok.kind == TokenType::Identifier || first_tok.kind.is_keyword()) {
+            this.advance();
+        } else {
+            first_tok = this.consume(TokenType::Identifier, "module name");
+        }
         qn.push(this.ctx.get_intern_table(), first_tok.lexeme);
 
         while (this.check(TokenType::ColonColon)) {
@@ -997,15 +1026,27 @@ public:
     }
 
     /// Parse a namespace declaration: namespace A::B;
+    /// Accepts keywords as path segments (e.g., std::collections::string).
     parse_namespace_declaration() -> ASTNode* {
         const start: Token = this.advance(); // consume 'namespace'
         mut qn: QualifiedName = QualifiedName::empty();
-        const first_tok: Token = this.consume(TokenType::Identifier, "namespace name");
+        // Accept identifiers or keywords as namespace segments
+        mut first_tok: Token = this.current();
+        if (first_tok.kind == TokenType::Identifier || first_tok.kind.is_keyword()) {
+            this.advance();
+        } else {
+            first_tok = this.consume(TokenType::Identifier, "namespace name");
+        }
         qn.push(this.ctx.get_intern_table(), first_tok.lexeme);
 
         while (this.check(TokenType::ColonColon)) {
             this.advance();
-            const next: Token = this.consume(TokenType::Identifier, "namespace segment");
+            mut next: Token = this.current();
+            if (next.kind == TokenType::Identifier || next.kind.is_keyword()) {
+                this.advance();
+            } else {
+                next = this.consume(TokenType::Identifier, "namespace segment");
+            }
             qn.push(this.ctx.get_intern_table(), next.lexeme);
         }
 
@@ -1017,6 +1058,7 @@ public:
     }
 
     /// Parse a module declaration: public module Name;
+    /// Accepts keywords as path segments (e.g., public module collections::string;).
     parse_module_declaration() -> ModuleDeclNode* {
         const start: Token = this.current();
         mut is_public: boolean = false;
@@ -1025,14 +1067,24 @@ public:
             this.advance();
         }
         this.consume(TokenType::KwModule, "'module'");
-        const name_tok: Token = this.consume(TokenType::Identifier, "module name");
+        mut name_tok: Token = this.current();
+        if (name_tok.kind == TokenType::Identifier || name_tok.kind.is_keyword()) {
+            this.advance();
+        } else {
+            name_tok = this.consume(TokenType::Identifier, "module name");
+        }
 
         // Handle qualified module names: A::B
         mut qn: QualifiedName = QualifiedName::empty();
         qn.push(this.ctx.get_intern_table(), name_tok.lexeme);
         while (this.check(TokenType::ColonColon)) {
             this.advance();
-            const next: Token = this.consume(TokenType::Identifier, "module name segment");
+            mut next: Token = this.current();
+            if (next.kind == TokenType::Identifier || next.kind.is_keyword()) {
+                this.advance();
+            } else {
+                next = this.consume(TokenType::Identifier, "module name segment");
+            }
             qn.push(this.ctx.get_intern_table(), next.lexeme);
         }
 
@@ -1042,6 +1094,7 @@ public:
     }
 
     /// Parse an implementation block: implement enum/struct Name { methods }
+    /// Also handles: implement boolean { ... }, implement i32 { ... }, etc.
     parse_implementation_block() -> ImplBlockNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_implementation_block()");
         const start: Token = this.advance(); // consume 'implement'
@@ -1051,7 +1104,14 @@ public:
             this.advance();
         }
 
-        const type_tok: Token = this.consume(TokenType::Identifier, "type name");
+        // Accept identifier OR primitive type keywords as the target type name.
+        // The stdlib implements methods on primitives: implement boolean { ... }
+        mut type_tok: Token = this.current();
+        if (type_tok.kind == TokenType::Identifier || type_tok.kind.is_keyword()) {
+            this.advance();
+        } else {
+            type_tok = this.consume(TokenType::Identifier, "type name");
+        }
         const type_name: SymbolStr = this.intern_lexeme(type_tok);
         mut node: ImplBlockNode* = new ImplBlockNode(type_name, this.span_from_token(start));
         this.current_type_name = type_tok.lexeme;
@@ -1152,9 +1212,15 @@ public:
         return func;
     }
 
-    /// Parse an intrinsic declaration: intrinsic name(params) -> RetType { body }
+    /// Parse an intrinsic declaration:
+    ///   intrinsic name(params) -> RetType { body }
+    ///   intrinsic function name(params) -> RetType;    (stdlib form)
     parse_intrinsic_declaration() -> IntrinsicDeclNode* {
         const start: Token = this.advance(); // consume 'intrinsic'
+        // Allow optional 'function' keyword: intrinsic function malloc(...)
+        if (this.check(TokenType::KwFunction)) {
+            this.advance(); // consume 'function'
+        }
         const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
         mut node: IntrinsicDeclNode* = new IntrinsicDeclNode(name, this.span_from_token(start));
@@ -1184,6 +1250,24 @@ public:
             this.consume(TokenType::Semicolon, "';'");
         }
 
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse an intrinsic const declaration: intrinsic const NAME: Type;
+    parse_intrinsic_const_declaration() -> IntrinsicConstDeclNode* {
+        const start: Token = this.advance(); // consume 'intrinsic'
+        this.advance(); // consume 'const'
+        const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic const name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut node: IntrinsicConstDeclNode* = new IntrinsicConstDeclNode(name, this.span_from_token(start));
+
+        // Type annotation: : Type
+        if (this.match_tok(TokenType::Colon)) {
+            this.parse_type_annotation(); // consumed but not stored (resolved later)
+        }
+
+        this.consume(TokenType::Semicolon, "';'");
         node.span = this.span_from(start);
         return node;
     }
