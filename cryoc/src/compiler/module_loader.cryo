@@ -110,6 +110,12 @@ type struct ModuleLoader {
         if (this.is_loading(file_path)) {
             const msg: string = sprintf("circular module dependency: '%s' is already being loaded", file_path);
             sink.emit(Diagnostic::error(ErrorCode::E0501_CIRCULAR_IMPORT, msg));
+            printf("[ModuleLoader] CIRCULAR: loading stack has %d entries:\n", this.loading_paths.length);
+            for (mut k: i64 = 0; k < this.loading_paths.length; k++) {
+                if (this.loading_flags[k]) {
+                    printf("[ModuleLoader]   [%d] %s\n", k, this.loading_paths[k]);
+                }
+            }
             return false;
         }
 
@@ -158,6 +164,9 @@ type struct ModuleLoader {
 
             // Resolve to filesystem path
             const resolved: string = this.resolve_import_path(import_path);
+            if (debug) {
+                printf("[ModuleLoader]   import '%s' -> '%s'\n", import_path, resolved);
+            }
             if (strlen(resolved) == 0) {
                 const msg: string = sprintf("module '%s' not found (imported from '%s')",
                     import_path, file_path);
@@ -357,14 +366,19 @@ function scan_tokens(tokens: Token[]) -> ModuleScanResult {
 
 /// Collect a qualified name like "Foo::Bar::Baz" from the token stream.
 /// Advances *pos past the name tokens.
+/// Accepts both identifiers and keywords as path segments, since module
+/// names like "string", "process", "thread" etc. are valid Cryo keywords.
 function collect_qualified_name(tokens: Token[], pos: i64*, len: i64) -> string {
     mut result: string = "";
     mut p: i64 = *pos;
 
     while (p < len) {
         const tok: Token = tokens[p];
-        // Accept identifiers
-        if (tok.kind == TokenType::Identifier) {
+        // Accept identifiers AND keywords as path segments.
+        // Module names often collide with keywords (e.g., "collections::string",
+        // "core::option", "core::result", "thread", "process", "env").
+        // Use the token's lexeme directly — it contains the original text.
+        if (tok.kind == TokenType::Identifier || tok.kind.is_keyword()) {
             if (strlen(result) > 0) {
                 result = sprintf("%s::%s", result, tok.lexeme);
             } else {
