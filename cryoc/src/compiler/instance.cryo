@@ -467,6 +467,7 @@ type struct CompilerInstance {
             pipeline.validate_with_initial(initial6);
         }
 
+        mut phase6_failed: boolean = false;
         for (mut i: u32 = 0; i < n; i++) {
             CompilerInstance::load_module_with_scope(&ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
             ctx.provisions.clear();
@@ -480,12 +481,12 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::TypesResolved);
             ctx.provisions.mark(Provision::StructFieldsSynced);
             if (!pipeline.run_all(&ctx)) {
-                return this.project_failure(&ctx);
+                phase6_failed = true;
             }
             pipeline.reset();
         }
 
-        // Dump ASTs if requested
+        // Dump ASTs if requested (even on errors, for debugging)
         if (this.config.show_ast) {
             for (mut i: u32 = 0; i < n; i++) {
                 const mi: u32 = order[i];
@@ -505,8 +506,21 @@ type struct CompilerInstance {
             ctx.type_arena.debug_dump();
         }
 
+        // Build cross-module function descriptors from front-end data.
+        // This populates ModuleGraph.cross_module_fns so codegen can create
+        // extern declarations without re-scanning ASTs or type arenas.
+        if (!phase6_failed) {
+            for (mut i: u32 = 0; i < n; i++) {
+                const mod_idx: u32 = order[i];
+                const mod_info: ModuleInfo = ctx.module_graph.modules[mod_idx];
+                const mod_sym: SymbolStr = ctx.intern(mod_info.file_path);
+                build_cross_module_descriptors(
+                    &ctx.module_graph, mod_sym, &ctx.decl_index);
+            }
+        }
+
         // Phase 7: Codegen (not yet implemented for multi-module)
-        // TODO: Merge all module ASTs and run codegen passes
+        // TODO: Per-module codegen with cross-module linking
 
         // Print diagnostic summary
         if (ctx.diagnostics.has_errors() || this.config.debug) {

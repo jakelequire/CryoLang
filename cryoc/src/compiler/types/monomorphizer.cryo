@@ -42,10 +42,11 @@ type struct MonomorphRequest {
 // ============================================================================
 
 type struct SpecializationEntry {
-    specialized_type: TypeRef;
-    specialized_name: SymbolStr;
-    ast_node:         ASTNode*;
-    impl_nodes:       ASTNode*[];
+    specialized_type:  TypeRef;
+    specialized_name:  SymbolStr;
+    ast_node:          ASTNode*;
+    impl_nodes:        ASTNode*[];
+    origin_module:     SymbolStr;      // Module that first triggered this specialization
 }
 
 
@@ -79,6 +80,16 @@ type struct Monomorphizer {
     // Incremental injection tracking (for batch compilation)
     injection_cursor:  i64;
 
+    // Current module being processed (set by pass before calling process_all)
+    current_module:    SymbolStr;
+
+    // Per-module consumption tracking (flat parallel arrays).
+    // Records which modules consumed (had injected) each specialization.
+    // consumer_spec_indices[i] is the spec_entries index,
+    // consumer_modules[i] is the SymbolStr.id of the consuming module.
+    consumer_spec_indices: i64[];
+    consumer_modules:      u32[];
+
 
     // ----------------------------------------------------------------
     // Construction
@@ -101,7 +112,10 @@ type struct Monomorphizer {
             spec_index:        HashMap<string, i64>::new(),
             in_progress:       HashMap<string, boolean>::new(),
             error_count:       0,
-            injection_cursor:  0,
+            injection_cursor:      0,
+            current_module:        SymbolStr::empty(),
+            consumer_spec_indices: [],
+            consumer_modules:      [],
         };
     }
 
@@ -109,6 +123,11 @@ type struct Monomorphizer {
     // ----------------------------------------------------------------
     // Main worklist loop
     // ----------------------------------------------------------------
+
+    /// Set the current module context for origin tracking.
+    set_current_module(mut &this, module: SymbolStr) -> void {
+        this.current_module = module;
+    }
 
     /// Process all pending monomorphization requests.
     /// Returns true if all succeeded, false if any errors occurred.
@@ -286,10 +305,11 @@ type struct Monomorphizer {
 
         // Cache the result
         const spec_entry: SpecializationEntry = SpecializationEntry {
-            specialized_type: concrete_type,
-            specialized_name: spec_name_sym,
-            ast_node:         result.specialized_ast,
-            impl_nodes:       result.impl_asts,
+            specialized_type:  concrete_type,
+            specialized_name:  spec_name_sym,
+            ast_node:          result.specialized_ast,
+            impl_nodes:        result.impl_asts,
+            origin_module:     this.current_module,
         };
         const idx: i64 = this.spec_entries.length;
         this.spec_keys    = this.spec_keys + [key];
@@ -705,6 +725,26 @@ type struct Monomorphizer {
     /// Number of specializations completed.
     specialization_count(&this) -> i64 {
         return this.spec_entries.length;
+    }
+
+    /// Record that a module consumes (has injected) a specialization.
+    /// Uses flat parallel arrays to avoid push-through-pointer codegen issues.
+    record_consuming_module(mut &this, spec_index: i64, module: SymbolStr) -> void {
+        if (spec_index >= 0 && spec_index < this.spec_entries.length) {
+            this.consumer_spec_indices.push(spec_index);
+            this.consumer_modules.push(module.id);
+        }
+    }
+
+    /// Get all modules that consume a specific specialization.
+    get_consuming_modules(&this, spec_index: i64) -> SymbolStr[] {
+        mut result: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < this.consumer_spec_indices.length; i++) {
+            if (this.consumer_spec_indices[i] == spec_index) {
+                result.push(SymbolStr::from_id(this.consumer_modules[i]));
+            }
+        }
+        return result;
     }
 
 
