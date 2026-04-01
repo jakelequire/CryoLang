@@ -585,10 +585,10 @@ type struct TypeArena {
 
     debug_dump(&this) -> void {
         printf("\n=== TypeArena Dump: %lld types ===\n", this.types.length);
-        printf("%-5s | %-16s | %-26s | %-5s | %-5s | %-16s | %-10s | %-12s | %s\n",
+        printf("%-5s | %-16s | %-28s | %5s | %5s | %-20s | %-6s | %-17s | %s\n",
             "ID", "Kind", "Display Name", "Size", "Align",
-            "Module", "Members", "Status", "Refs");
-        printf("------+------------------+----------------------------+-------+-------+------------------+------------+--------------+--------------------\n");
+            "Module", "Mbrs", "Status", "Refs");
+        printf("------+------------------+------------------------------+-------+-------+----------------------+--------+-------------------+---------------------------\n");
 
         for (mut i: int = 0; i < this.types.length; i++) {
             const ty: Type* = this.types[i];
@@ -601,11 +601,11 @@ type struct TypeArena {
             const status_str: string  = this.get_type_status(ty);
             const refs_str: string    = this.get_type_refs(ty);
 
-            printf("%-5llu | %-16s | %-26s | %-5llu | %-5llu | %-16s | %-10s | %-12s | %s\n",
+            printf("%-5llu | %-16.16s | %-28.28s | %5llu | %5llu | %-20.20s | %-6.6s | %-17.17s | %.40s\n",
                 ty.id, kind_str, display, ty.size_bytes(), ty.alignment(),
                 module_str, members_str, status_str, refs_str);
         }
-        printf("------+------------------+----------------------------+-------+-------+------------------+------------+--------------+--------------------\n");
+        printf("------+------------------+------------------------------+-------+-------+----------------------+--------+-------------------+---------------------------\n");
 
         // Summary by category
         printf("\n=== Type Summary ===\n");
@@ -755,11 +755,28 @@ type struct TypeArena {
         }
         if (ty.kind == TypeKind::TypeAlias) {
             const al: TypeAliasType* = ty as TypeAliasType*;
-            return if (al.has_target()) { "resolved" } else { "unresolved" };
+            if (al.has_target()) { return "resolved"; }
+            return if (al.is_generic) { "generic template" } else { "UNRESOLVED" };
         }
         if (ty.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = ty as InstantiatedType*;
-            return if (inst.resolved_type.is_valid()) { "resolved" } else { "UNRESOLVED" };
+            if (inst.resolved_type.is_valid()) { return "resolved"; }
+            // Check if any type arg is a generic param — template-internal ref
+            for (mut j: i64 = 0; j < inst.type_args.length; j++) {
+                const arg_ty: Type* = this.lookup(inst.type_args[j].id);
+                if (arg_ty != null) {
+                    if (arg_ty.kind == TypeKind::GenericParam ||
+                        arg_ty.kind == TypeKind::BoundedParam) {
+                        return "template-internal";
+                    }
+                }
+            }
+            // Check if base is a function template
+            const base_ty: Type* = this.lookup(inst.generic_base.id);
+            if (base_ty != null && base_ty.kind == TypeKind::FunctionTemplate) {
+                return "fn-template";
+            }
+            return "UNRESOLVED";
         }
         if (ty.kind == TypeKind::GenericParam) {
             const gp: GenericParamType* = ty as GenericParamType*;

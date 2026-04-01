@@ -643,10 +643,11 @@ function run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
         ctx.set_namespace(ns);
     }
 
-    // Determine the module name for qualified type names
-    const module_name: string = ctx.has_namespace()
-        ? ctx.namespace_display()
-        : ctx.source_file;
+    // Determine the module name for qualified type names.
+    // Use the raw namespace string directly (ctx.namespace_display() relies on
+    // QualifiedName::display() which has a codegen issue with string.append()).
+    const ns_raw: string = ctx.artifacts.ast.namespace_name;
+    const module_name: string = if (ns_raw != "") { ns_raw } else { ctx.source_file };
     const module_sym: SymbolStr = ctx.intern(module_name);
 
     // Walk top-level statements and create types for declarations
@@ -689,6 +690,15 @@ function run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
                 // Use qualified name (consistent with struct/enum/class/trait);
                 // target resolved in TypeResolution pass
                 const alias_ref: TypeRef = arena.create_type_alias(qualified_alias, TypeRef::invalid());
+                // Mark generic aliases so the arena dump can distinguish
+                // "unresolved because generic template" from "unresolved because broken"
+                if (node.is_generic()) {
+                    const alias_ty: Type* = arena.lookup(alias_ref.id);
+                    if (alias_ty != null && alias_ty.kind == TypeKind::TypeAlias) {
+                        const alias_obj: TypeAliasType* = alias_ty as TypeAliasType*;
+                        alias_obj.is_generic = true;
+                    }
+                }
                 // Register in DeclarationIndex so resolve_named() can find
                 // aliases by qualified name during TypeResolution Phase 3
                 // (before Phase 4 populates the index for other types).

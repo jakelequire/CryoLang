@@ -388,6 +388,30 @@ function run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {
         // resolved_type is a TypeRef (plain struct) — is_valid() is non-virtual.
         if (inst.resolved_type.is_valid()) { continue; }
 
+        // Skip template-internal references whose type args are still generic
+        // parameters (e.g., Pair<T>, Optional<E>).  These are created when a
+        // generic declaration references itself with its own params and are
+        // never meant to be monomorphized.
+        mut has_generic_arg: boolean = false;
+        for (mut j: i64 = 0; j < inst.type_args.length; j++) {
+            const arg_ty: Type* = arena.lookup(inst.type_args[j].id);
+            if (arg_ty != null) {
+                if (arg_ty.kind == TypeKind::GenericParam ||
+                    arg_ty.kind == TypeKind::BoundedParam) {
+                    has_generic_arg = true;
+                }
+            }
+        }
+        if (has_generic_arg) { continue; }
+
+        // Skip function template instantiations — generic functions produce
+        // specialized AST declarations, not arena types, so resolved_type
+        // is intentionally left invalid.
+        const base_ty: Type* = arena.lookup(inst.generic_base.id);
+        if (base_ty != null && base_ty.kind == TypeKind::FunctionTemplate) {
+            continue;
+        }
+
         // This InstantiatedType was never monomorphized.
         unresolved_count = unresolved_count + 1;
 
