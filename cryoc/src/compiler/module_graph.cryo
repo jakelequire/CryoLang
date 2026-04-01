@@ -1,13 +1,15 @@
 ///! Module Graph
 ///!
 ///! Manages multi-module compilation state: module discovery, topological
-///! ordering, and cross-module function descriptors.  Replaces the ad-hoc
-///! SimpleTypeDesc / CrossModuleFnEntry maps on the C++ CompilerInstance.
+///! ordering, and cross-module function descriptors.
 
 namespace Compiler::ModuleGraph;
 
 import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
 import Compiler::AST::Node;
+import Compiler::Types::TypeRef;
+import Compiler::DeclIndex;
 
 
 // ============================================================================
@@ -22,23 +24,38 @@ type struct ModuleInfo {
     dependencies:   SymbolStr[];
     processed:      boolean;
 
+    // Per-module export tracking (populated during Declaration Collection).
+    // Used by codegen to enumerate what a module defines.
+    exports_functions: SymbolStr[];   // qualified names of public functions
+    exports_types:     SymbolStr[];   // qualified names of public types
+
+    // Indices into Monomorphizer.spec_entries for specializations injected
+    // into this module's AST (populated during GenericExpressionResolution).
+    specializations:   i64[];
+
     static new(name: SymbolStr, path: string) -> ModuleInfo {
         return ModuleInfo {
-            name:           name,
-            file_path:      path,
-            namespace_name: SymbolStr::empty(),
-            dependencies:   [],
-            processed:      false,
+            name:               name,
+            file_path:          path,
+            namespace_name:     SymbolStr::empty(),
+            dependencies:       [],
+            processed:          false,
+            exports_functions:  [],
+            exports_types:      [],
+            specializations:    [],
         };
     }
 
     static with_namespace(name: SymbolStr, path: string, ns: SymbolStr) -> ModuleInfo {
         return ModuleInfo {
-            name:           name,
-            file_path:      path,
-            namespace_name: ns,
-            dependencies:   [],
-            processed:      false,
+            name:               name,
+            file_path:          path,
+            namespace_name:     ns,
+            dependencies:       [],
+            processed:          false,
+            exports_functions:  [],
+            exports_types:      [],
+            specializations:    [],
         };
     }
 
@@ -46,75 +63,43 @@ type struct ModuleInfo {
         this.dependencies = this.dependencies + [dep];
     }
 
+    add_export_function(mut &this, name: SymbolStr) -> void {
+        this.exports_functions.push(name);
+    }
+
+    add_export_type(mut &this, name: SymbolStr) -> void {
+        this.exports_types.push(name);
+    }
+
+    add_specialization(mut &this, spec_index: i64) -> void {
+        this.specializations.push(spec_index);
+    }
+
     mark_processed(mut &this) -> void {
         this.processed = true;
     }
 }
 
-// TODO: This will be replaced when the type system is fully implemented and cross-module
-// function re-declaration can reference actual type descriptors instead of SimpleTypeKind.
-// ============================================================================
-// SimpleTypeKind — Lightweight cross-module type representation
-// ============================================================================
-
-/// Simplified type descriptors for cross-module function declarations.
-/// Avoids depending on the full type system for function re-declaration.
-type enum SimpleTypeKind {
-    Void;
-    Int8;
-    Int16;
-    Int32;
-    Int64;
-    Float;
-    Double;
-    Boolean;
-    Ptr;
-    NamedStruct;
-    Other;
-}
-
-implement enum SimpleTypeKind {
-    label(&this) -> string {
-        return match (this) {
-            SimpleTypeKind::Void        => { "void"    }
-            SimpleTypeKind::Int8        => { "i8"      }
-            SimpleTypeKind::Int16       => { "i16"     }
-            SimpleTypeKind::Int32       => { "i32"     }
-            SimpleTypeKind::Int64       => { "i64"     }
-            SimpleTypeKind::Float       => { "float"   }
-            SimpleTypeKind::Double      => { "double"  }
-            SimpleTypeKind::Boolean     => { "boolean" }
-            SimpleTypeKind::Ptr         => { "ptr"     }
-            SimpleTypeKind::NamedStruct => { "struct"  }
-            SimpleTypeKind::Other       => { "other"   }
-        };
-    }
-}
-
-
-// TODO: This will be replaced when the module system and import resolution are implemented 
-// and the graph can be populated with actual dependencies instead of a simple linear order.
 // ============================================================================
 // CrossModuleFnDescriptor
 // ============================================================================
 
-/// Lightweight function descriptor saved between compilation units.
-/// Enough information to re-declare a function in a downstream module's
-/// LLVM IR without access to the original AST or type arena.
+/// Function descriptor saved between compilation units.
+/// Uses TypeRefs directly from the shared TypeArena — no lossy conversion
+/// to a simplified type representation.  The TypeArena is global and
+/// persists across all modules, so these refs remain valid.
 type struct CrossModuleFnDescriptor {
     name:        SymbolStr;
-    return_type: SimpleTypeKind;
-    param_types: SimpleTypeKind[];
+    return_type: TypeRef;
+    param_types: TypeRef[];
     is_var_arg:  boolean;
-    struct_name: SymbolStr;    // Non-empty for NamedStruct return types
 
-    static new(name: SymbolStr, ret: SimpleTypeKind) -> CrossModuleFnDescriptor {
+    static new(name: SymbolStr, ret: TypeRef) -> CrossModuleFnDescriptor {
         return CrossModuleFnDescriptor {
             name:        name,
             return_type: ret,
             param_types: [],
             is_var_arg:  false,
-            struct_name: SymbolStr::empty(),
         };
     }
 }
@@ -321,4 +306,26 @@ function topo_contains(order: u32[], val: u32) -> boolean {
         }
     }
     return false;
+}
+
+
+// ============================================================================
+// Cross-module function descriptor helpers
+// ============================================================================
+
+/// Build cross-module function descriptors for a specific module.
+/// Iterates functions defined in the module (from DeclarationIndex) and
+/// creates CrossModuleFnDescriptor entries using TypeRefs directly.
+function build_cross_module_descriptors(
+    graph: ModuleGraph*, module_sym: SymbolStr,
+    decl_index: DeclarationIndex*) -> void {
+    if (graph == null || decl_index == null) { return; }
+
+    const funcs: SymbolStr[] = decl_index.get_functions_in_module(module_sym);
+    for (mut i: i64 = 0; i < funcs.length; i++) {
+        const fn_name: SymbolStr = funcs[i];
+        const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
+        const desc: CrossModuleFnDescriptor = CrossModuleFnDescriptor::new(fn_name, ret_type);
+        graph.register_cross_module_fn(desc);
+    }
 }

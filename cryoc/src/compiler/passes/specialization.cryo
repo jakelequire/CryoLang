@@ -21,6 +21,7 @@ import Compiler::AST::Declaration;
 import Compiler::Passes::PassID;
 import Compiler::Passes::TypeResolution;
 import Compiler::CompilationContext;
+import Compiler::ModuleGraph;
 import Compiler::Types;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Arena;
@@ -242,15 +243,18 @@ type struct SpecializationPasses {
         // Reuse existing monomorphizer across modules (batch compilation),
         // or create one on first use.
         mut mono_ptr: Monomorphizer* = ctx.monomorphizer;
+        const module_sym: SymbolStr = ctx.intern(ctx.source_file);
         if (mono_ptr != null) {
             // Subsequent module: clear transient state, keep specialization cache
             mono_ptr.reset_for_next_module();
+            mono_ptr.set_current_module(module_sym);
         } else {
             // First module: allocate and store on context
             const _box_mono: Box<Monomorphizer> = Box<Monomorphizer>::new(
                 Monomorphizer::new(arena, generic_reg, &ctx.intern_table, &ctx.diagnostics,
                                    ctx.type_resolver));
             mono_ptr = _box_mono.leak();
+            mono_ptr.set_current_module(module_sym);
             ctx.monomorphizer = mono_ptr;
         }
 
@@ -279,11 +283,14 @@ type struct SpecializationPasses {
 
         LOG_DEBUG(LogComponent::General, "[GenericExpressionResolution] Injecting specialized ASTs");
 
-        const mono: Monomorphizer* = ctx.monomorphizer;
+        mut mono: Monomorphizer* = ctx.monomorphizer;
         if (mono == null) {
             // No monomorphizer means no generics were used — that's OK
             return PassResult::ok();
         }
+
+        // Capture the injection range BEFORE get_new_specialized_asts advances the cursor.
+        const inject_start: i64 = mono.injection_cursor;
 
         // Get only specializations new since the last module (incremental injection)
         const specialized_asts: ASTNode*[] = mono.get_new_specialized_asts();
@@ -304,6 +311,17 @@ type struct SpecializationPasses {
         for (mut i: i64 = 0; i < specialized_asts.length; i++) {
             root.add_statement(specialized_asts[i]);
             register_injected_decl(specialized_asts[i], ctx);
+        }
+
+        // Record module-to-specialization bidirectional mapping.
+        // This tells codegen which specializations each module needs,
+        // and which modules consume each specialization.
+        // Uses flat parallel arrays on the Monomorphizer to avoid
+        // push-through-pointer codegen issues with struct fields.
+        const module_sym: SymbolStr = ctx.intern(ctx.source_file);
+        const inject_end: i64 = mono.injection_cursor;
+        for (mut si: i64 = inject_start; si < inject_end; si++) {
+            mono.record_consuming_module(si, module_sym);
         }
 
         LOG_DEBUG(LogComponent::General, "[GenericExpressionResolution] Injected %lld specialized declarations",

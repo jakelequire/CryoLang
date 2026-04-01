@@ -54,14 +54,27 @@ type struct DeclarationIndex {
     // Reverse: TypeRef.id → SymbolStr.id (for looking up a type's name)
     type_reverse:   HashMap<u64, u32>;
 
+    // Per-module declaration ownership (parallel arrays).
+    // Used by codegen to enumerate "all functions/types defined in Module X".
+    // The global maps above remain the fast-path for lookup during sema;
+    // these arrays are the slow-path for per-module enumeration.
+    module_func_keys:    u32[];       // SymbolStr.id of function
+    module_func_modules: u32[];       // SymbolStr.id of defining module
+    module_type_keys:    u32[];       // SymbolStr.id of type
+    module_type_modules: u32[];       // SymbolStr.id of defining module
+
 
     static new() -> DeclarationIndex {
         return DeclarationIndex {
-            func_returns:   HashMap<u32, TypeRef>::new(),
-            method_returns: HashMap<u64, TypeRef>::new(),
-            type_map:       HashMap<u32, TypeRef>::new(),
-            global_vars:    HashMap<u32, TypeRef>::new(),
-            type_reverse:   HashMap<u64, u32>::new(),
+            func_returns:        HashMap<u32, TypeRef>::new(),
+            method_returns:      HashMap<u64, TypeRef>::new(),
+            type_map:            HashMap<u32, TypeRef>::new(),
+            global_vars:         HashMap<u32, TypeRef>::new(),
+            type_reverse:        HashMap<u64, u32>::new(),
+            module_func_keys:    [],
+            module_func_modules: [],
+            module_type_keys:    [],
+            module_type_modules: [],
         };
     }
 
@@ -161,5 +174,84 @@ type struct DeclarationIndex {
             Option::Some(val) => { SymbolStr::from_id(val) }
             Option::None      => { SymbolStr::empty() }
         };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Per-module registration (called alongside global registration)
+    // ----------------------------------------------------------------
+
+    /// Register a function with its defining module for per-module enumeration.
+    register_function_with_module(mut &this, name: SymbolStr, return_type: TypeRef,
+                                  module: SymbolStr) -> void {
+        this.register_function(name, return_type);
+        this.module_func_keys.push(name.id);
+        this.module_func_modules.push(module.id);
+    }
+
+    /// Register a type with its defining module for per-module enumeration.
+    register_type_with_module(mut &this, qualified_name: SymbolStr, ty: TypeRef,
+                              module: SymbolStr) -> void {
+        this.register_type(qualified_name, ty);
+        this.module_type_keys.push(qualified_name.id);
+        this.module_type_modules.push(module.id);
+    }
+
+
+    // ----------------------------------------------------------------
+    // Per-module queries (used by codegen to enumerate module exports)
+    // ----------------------------------------------------------------
+
+    /// Get all function names defined in a specific module.
+    get_functions_in_module(&this, module: SymbolStr) -> SymbolStr[] {
+        mut result: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < this.module_func_keys.length; i++) {
+            if (this.module_func_modules[i] == module.id) {
+                result.push(SymbolStr::from_id(this.module_func_keys[i]));
+            }
+        }
+        return result;
+    }
+
+    /// Get all type names defined in a specific module.
+    get_types_in_module(&this, module: SymbolStr) -> SymbolStr[] {
+        mut result: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < this.module_type_keys.length; i++) {
+            if (this.module_type_modules[i] == module.id) {
+                result.push(SymbolStr::from_id(this.module_type_keys[i]));
+            }
+        }
+        return result;
+    }
+
+    /// Check if a function is defined in a specific module.
+    is_function_in_module(&this, name: SymbolStr, module: SymbolStr) -> boolean {
+        for (mut i: i64 = 0; i < this.module_func_keys.length; i++) {
+            if (this.module_func_keys[i] == name.id &&
+                this.module_func_modules[i] == module.id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Get the defining module for a function. Returns empty SymbolStr if not found.
+    get_function_module(&this, name: SymbolStr) -> SymbolStr {
+        for (mut i: i64 = 0; i < this.module_func_keys.length; i++) {
+            if (this.module_func_keys[i] == name.id) {
+                return SymbolStr::from_id(this.module_func_modules[i]);
+            }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Get the defining module for a type. Returns empty SymbolStr if not found.
+    get_type_module(&this, name: SymbolStr) -> SymbolStr {
+        for (mut i: i64 = 0; i < this.module_type_keys.length; i++) {
+            if (this.module_type_keys[i] == name.id) {
+                return SymbolStr::from_id(this.module_type_modules[i]);
+            }
+        }
+        return SymbolStr::empty();
     }
 }
