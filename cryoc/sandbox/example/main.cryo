@@ -1,9 +1,420 @@
 namespace Main;
 
+// --- Flat module (no _module.cryo) ---
 import BattleTest;
 
+// --- Aggregated modules via _module.cryo ---
+import Math;
+import Collections;
+import Shapes;
+import Engine;
+
+// --- Direct sub-module imports (depth 2) ---
+import Math::Vec2;
+import Math::Vec3;
+import Math::Matrix;
+import Math::Transform;
+import Collections::Stack;
+import Collections::Pair;
+import Shapes::Geometry;
+import Shapes::Renderer;
+import Engine::Entity;
+import Engine::World;
+
+// --- Depth 2: core utilities ---
+import Core;
+import Core::Types;
+
+// --- Depth 3: core/memory, engine/physics, engine/ai ---
+import Core::Memory;
+import Core::Memory::Pool;
+import Core::Memory::Arena;
+import Engine::Physics;
+import Engine::Physics::Body;
+import Engine::Physics::Collision;
+import Engine::AI;
+import Engine::AI::State;
+import Engine::AI::Behavior;
+import Engine::Scene;
+import Engine::Scene::SceneGraph;
+
+// --- Depth 4: engine/physics/collision sub-modules ---
+import Engine::Physics::Collision::Broadphase;
+import Engine::Physics::Collision::Narrowphase;
+
+// ============================================================================
+// Test Functions — each exercises a different cross-module pattern
+// ============================================================================
+
+/// Basic math sub-module usage.
+function test_vec2() -> void {
+    const a: Vec2 = Vec2::new(1.0, 2.0);
+    const b: Vec2 = Vec2::new(3.0, 4.0);
+    const c: Vec2 = a.add(b);
+    const d: Vec2 = a.scale(2.5);
+    const dot: f64 = a.dot(b);
+    const len: f64 = c.length_squared();
+    const zero: Vec2 = Vec2::zero();
+}
+
+/// Vec3 depends on Vec2 (cross-sub-module within same tree).
+function test_vec3() -> void {
+    const a: Vec3 = Vec3::new(1.0, 2.0, 3.0);
+    const b: Vec3 = Vec3::new(4.0, 5.0, 6.0);
+    const c: Vec3 = a.add(b);
+    const d: Vec3 = a.sub(b);
+    const s: Vec3 = a.scale(0.5);
+    const dot: f64 = a.dot(b);
+    const cross: Vec3 = a.cross(b);
+    const v2: Vec2 = a.to_vec2();
+
+    // Vec3 from Vec2 — tests cross-sub-module type passing
+    const origin: Vec2 = Vec2::zero();
+    const v3: Vec3 = Vec3::from_vec2(origin, 10.0);
+}
+
+/// Matrix tests — uses Vec2 for transforms.
+function test_matrix() -> void {
+    const id: Mat2 = Mat2::identity();
+    const det: f64 = id.determinant();
+
+    const rot: Mat2 = Mat2::rotation(0.1);
+    const v: Vec2 = Vec2::new(1.0, 0.0);
+    const rotated: Vec2 = rot.transform_vec2(v);
+
+    const m2: Mat2 = rot.mul(id);
+    const t: Mat2 = rot.transpose();
+}
+
+/// Transform uses Vec2 (deeper dependency chain).
+function test_transform() -> void {
+    const t: Transform2D = Transform2D::identity();
+    const offset: Vec2 = Vec2::new(10.0, 20.0);
+    const moved: Transform2D = t.translate(offset);
+}
+
+/// Collections — basic stack.
+function test_stack() -> void {
+    mut stack: IntStack = IntStack::new();
+    stack.push(42);
+    stack.push(99);
+    const sz: i64 = stack.size();
+    const empty: boolean = stack.is_empty();
+}
+
+/// Collections — generics across module boundaries.
+function test_generics() -> void {
+    // Instantiate Pair<i32>
+    const int_pair: Pair<i32> = Pair<i32>::new(10, 20);
+    const first: i32 = int_pair.get_first();
+    const second: i32 = int_pair.get_second();
+    const swapped: Pair<i32> = int_pair.swap();
+
+    // Instantiate Pair<f64>
+    const float_pair: Pair<f64> = Pair<f64>::new(1.5, 2.5);
+
+    // Instantiate Pair<string>
+    const str_pair: Pair<string> = Pair<string>::new("hello", "world");
+
+    // Multi-param generic: Triple<i32, string>
+    const t: Triple<i32, string> = Triple<i32, string>::new(1, "middle", 3);
+
+    // Generic function across modules
+    const pair: Pair<i32> = make_pair<i32>(100, 200);
+}
+
+/// Shapes — enums, structs, classes across module trees.
+function test_shapes() -> void {
+    // Enum from another module tree
+    const k: ShapeKind = ShapeKind::Circle;
+    const label: string = k.label();
+    const closed: boolean = k.is_closed();
+
+    // Struct using Vec2 from yet another module tree
+    const center: Vec2 = Vec2::new(5.0, 5.0);
+    const circle: Circle2D = Circle2D::new(center, 3.0);
+    const area: f64 = circle.area();
+    const inside: boolean = circle.contains(Vec2::new(6.0, 6.0));
+
+    // AABB rect
+    const r: Rect2D = Rect2D::new(Vec2::zero(), Vec2::new(100.0, 100.0));
+    const rw: f64 = r.width();
+    const rh: f64 = r.height();
+    const ra: f64 = r.area();
+    const r_contains: boolean = r.contains(Vec2::new(50.0, 50.0));
+
+    // From center
+    const r2: Rect2D = Rect2D::from_center_size(center, 10.0, 5.0);
+    const overlap: boolean = r.overlaps(r2);
+
+    // Triangle
+    const tri: Triangle2D = Triangle2D::new(
+        Vec2::new(0.0, 0.0),
+        Vec2::new(1.0, 0.0),
+        Vec2::new(0.0, 1.0)
+    );
+    const signed_area: f64 = tri.signed_area_2x();
+
+    // Class hierarchy (virtual dispatch)
+    const cs: CircleShape = CircleShape(center, 5.0);
+    const rs: RectShape   = RectShape(Vec2::zero(), 10.0, 20.0);
+    const ca: f64 = cs.get_area();
+    const rak: ShapeKind = rs.get_kind();
+}
+
+/// Renderer — tests cross-tree enum + struct composition.
+function test_renderer() -> void {
+    mut q: RenderQueue = RenderQueue::new();
+    const empty: boolean = q.is_empty();
+
+    q.submit(DrawCommand::circle(Vec2::new(10.0, 10.0), 5.0, Color::red()));
+    q.submit(DrawCommand::rect(Vec2::zero(), 100.0, 50.0, Color::blue()));
+    q.submit(DrawCommand::circle(Vec2::new(50.0, 50.0), 20.0, Color::green()));
+
+    const count: i64 = q.count;
+    q.clear();
+}
+
+/// Entity — deep dependency chain (Entity → Vec3 → Vec2, Entity → ShapeKind).
+function test_entity() -> void {
+    const id1: EntityId = EntityId::new(1);
+    const id2: EntityId = EntityId::new(2);
+    const eq: boolean = id1.equals(id2);
+
+    mut e: Entity = Entity::new(id1, "player", Vec3::new(10.0, 20.0, 0.0));
+    const active: boolean = e.is_active();
+    e.set_active(false);
+    e.set_layer(5);
+    const pos2d: Vec2 = e.get_position_2d();
+
+    mut list: EntityList = EntityList::new();
+    const spawn1: EntityId = list.spawn("enemy_a", Vec3::new(0.0, 0.0, 0.0));
+    const spawn2: EntityId = list.spawn("enemy_b", Vec3::new(5.0, 5.0, 0.0));
+    const sz: i64 = list.size();
+}
+
+/// World — the deepest integration test.
+/// Dependency chain: World → Entity → Vec3 → Vec2
+///                   World → RenderQueue → DrawCommand → ShapeKind
+///                   World → Rect2D → Vec2
+function test_world() -> void {
+    mut w: World = World::new("test_level", 800.0, 600.0);
+    const e1: EntityId = w.spawn_entity("hero", 100.0, 200.0, 0.0);
+    const e2: EntityId = w.spawn_entity("npc", 300.0, 400.0, 0.0);
+
+    w.submit_circle(Vec2::new(100.0, 200.0), 16.0);
+    w.submit_rect(Vec2::new(0.0, 0.0), 32.0, 32.0);
+
+    w.tick();
+    w.tick();
+    w.tick();
+
+    const ec: i64 = w.entity_count();
+    const rc: i64 = w.render_count();
+    const in_bounds: boolean = w.is_point_in_bounds(Vec2::new(400.0, 300.0));
+}
+
+
+/// Core::Types — enum + struct from core utilities.
+function test_core_types() -> void {
+    const s: Status = Status::Ok;
+    const is_ok: boolean = s.is_ok();
+    const label: string = s.label();
+
+    const err: Status = Status::Error;
+    const is_err: boolean = err.is_error();
+
+    // Handle — generational index
+    const h1: Handle = Handle::new(0, 1);
+    const h2: Handle = Handle::new(1, 1);
+    const valid: boolean = h1.is_valid();
+    const eq: boolean = h1.equals(h2);
+    const inv: Handle = Handle::invalid();
+    const not_valid: boolean = inv.is_valid();
+
+    // Flags — bitfield
+    mut flags: Flags = Flags::none();
+    const empty: boolean = flags.is_empty();
+    flags.set(1);
+    flags.set(4);
+    const has1: boolean = flags.has(1);
+    const has2: boolean = flags.has(2);
+    flags.clear(1);
+}
+
+/// Core::Memory — 3-level deep: pool allocator and arena stats.
+function test_core_memory() -> void {
+    // IndexPool — allocate and release handles
+    mut pool: IndexPool = IndexPool::new(8);
+    const h1: Handle = pool.allocate();
+    const h2: Handle = pool.allocate();
+    const h3: Handle = pool.allocate();
+    const count: u32 = pool.active_count();
+    const valid: boolean = pool.is_valid(h1);
+    const release_status: Status = pool.release(h2);
+    const ok: boolean = release_status.is_ok();
+    const count2: u32 = pool.active_count();
+
+    // ArenaStats — allocation tracking
+    mut stats: ArenaStats = ArenaStats::new();
+    stats.record_alloc(1024);
+    stats.record_alloc(512);
+    stats.record_free(256);
+    const healthy: boolean = stats.is_healthy();
+    stats.reset();
+}
+
+/// Engine::Physics::Body — 3-level deep, imports from math + core + shapes.
+function test_physics() -> void {
+    const handle: Handle = Handle::new(0, 1);
+    mut body: PhysicsBody = PhysicsBody::new(handle, Vec3::new(0.0, 0.0, 0.0), 10.0);
+
+    // Apply force and integrate
+    body.apply_force(Vec3::new(100.0, 0.0, 0.0));
+    body.integrate(0.016);
+    const pos: Vec2 = body.get_position_2d();
+
+    // Static body
+    const static_handle: Handle = Handle::new(1, 1);
+    mut wall: PhysicsBody = PhysicsBody::new_static(static_handle, Vec3::new(50.0, 0.0, 0.0));
+    wall.apply_force(Vec3::new(999.0, 0.0, 0.0));  // should be no-op
+    wall.integrate(0.016);  // should be no-op
+
+    // BodyType enum
+    const bt: BodyType = BodyType::Dynamic;
+    const movable: boolean = bt.is_movable();
+}
+
+/// Engine::Physics::Collision — 4-level deep broadphase + narrowphase.
+function test_collision() -> void {
+    // Broadphase
+    mut broad: BroadphaseResult = BroadphaseResult::new();
+    const h1: Handle = Handle::new(0, 1);
+    const h2: Handle = Handle::new(1, 1);
+    const h3: Handle = Handle::new(2, 1);
+    broad.add_pair(h1, h2);
+    broad.add_pair(h2, h3);
+    const pair_count: i64 = broad.count;
+
+    // AABB overlap test using shapes::Rect2D
+    const a: Rect2D = Rect2D::new(Vec2::zero(), Vec2::new(10.0, 10.0));
+    const b: Rect2D = Rect2D::new(Vec2::new(5.0, 5.0), Vec2::new(15.0, 15.0));
+    const overlap: boolean = test_aabb_overlap(a, b);
+
+    // Narrowphase
+    mut narrow: NarrowphaseResult = NarrowphaseResult::new();
+    const contact: ContactPoint = circle_vs_circle(
+        Vec2::new(0.0, 0.0), 5.0, h1,
+        Vec2::new(8.0, 0.0), 5.0, h2
+    );
+    narrow.add_contact(contact);
+    const has: boolean = narrow.has_contacts();
+    narrow.clear();
+}
+
+/// Engine::AI — state machine and behavior evaluation.
+function test_ai() -> void {
+    // AIState enum
+    const idle: AIState = AIState::Idle;
+    const chase: AIState = AIState::Chase;
+    const active: boolean = idle.is_active();
+    const aggressive: boolean = chase.is_aggressive();
+    const prio: i32 = chase.priority();
+
+    // StateHistory
+    mut history: StateHistory = StateHistory::new();
+    history.push(AIState::Idle, 0, "spawn");
+    history.push(AIState::Patrol, 100, "timer");
+    history.push(AIState::Chase, 200, "spotted_player");
+    const current: AIState = history.current_state();
+
+    // AIAgent — links entity system with AI
+    const eid: EntityId = EntityId::new(42);
+    mut agent: AIAgent = AIAgent::new(eid);
+    agent.transition(AIState::Patrol, 100, "start_patrol");
+    agent.set_target(Vec3::new(50.0, 50.0, 0.0));
+    const alive: boolean = agent.is_alive();
+    const state_prio: i32 = agent.get_state_priority();
+
+    // BehaviorResult enum
+    const result: BehaviorResult = BehaviorResult::Running;
+    const done: boolean = result.is_done();
+
+    // Proximity evaluation — cross-module function using Vec3
+    const new_state: AIState = evaluate_proximity(
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(15.0, 0.0, 0.0),
+        100.0, 20.0
+    );
+}
+
+/// Scene — the deepest integration test. Imports from every module tree.
+function test_scene() -> void {
+    mut scene: Scene = Scene::new("stress_test", 1920.0, 1080.0);
+    const ok: boolean = scene.is_healthy();
+
+    // Add scene nodes
+    const n1: Handle = scene.add_node("player", Vec3::new(100.0, 200.0, 0.0));
+    const n2: Handle = scene.add_node("enemy_1", Vec3::new(300.0, 400.0, 0.0));
+    const n3: Handle = scene.add_node("wall", Vec3::new(500.0, 0.0, 0.0));
+
+    // Add physics bodies
+    scene.add_physics_body(n1, Vec3::new(100.0, 200.0, 0.0), 75.0);
+    scene.add_physics_body(n2, Vec3::new(300.0, 400.0, 0.0), 50.0);
+
+    // Add AI agent (links to entity system)
+    const eid: EntityId = EntityId::new(1);
+    scene.add_ai_agent(eid);
+
+    // Submit draw commands (links to renderer)
+    scene.submit_draw(DrawCommand::circle(Vec2::new(100.0, 200.0), 16.0, Color::red()));
+    scene.submit_draw(DrawCommand::rect(Vec2::new(300.0, 400.0), 32.0, 32.0, Color::green()));
+
+    // Simulate a few ticks
+    scene.step(0.016);
+    scene.step(0.016);
+    scene.step(0.016);
+
+    const still_healthy: boolean = scene.is_healthy();
+}
+
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
 function main() -> int {
-    printf("Hello, World!\n");
+    printf("=== Multi-Module Stress Test ===\n");
+
+    // Depth 2 tests
+    test_vec2();
+    test_vec3();
+    test_matrix();
+    test_transform();
+    test_stack();
+    test_generics();
+    test_shapes();
+    test_renderer();
+    test_entity();
+    test_world();
+
+    // Depth 2-3 tests
+    test_core_types();
+    test_core_memory();
+
+    // Depth 3 tests
+    test_physics();
+    test_ai();
+
+    // Depth 4 tests
+    test_collision();
+
+    // Full integration (all depths)
+    test_scene();
+
+    // Flat module (no _module.cryo)
     run_battle_tests();
+
+    printf("=== All tests complete ===\n");
     return 0;
 }

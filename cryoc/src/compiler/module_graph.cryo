@@ -131,48 +131,63 @@ type struct ModuleGraph {
     module_scope_cap: u32;
 
     static new() -> ModuleGraph {
+        // Pre-allocate raw buffers for up to 128 modules to avoid
+        // per-module reallocation (which causes heap corruption from
+        // repeated malloc/free cycles on raw pointers).
+        const initial_cap: u32 = 128;
+        const buf_size: u64 = initial_cap as u64 * 8;
+        const ast_buf: void* = malloc(buf_size);
+        memset(ast_buf, 0, buf_size);
+        const scope_buf: void* = malloc(buf_size);
+        memset(scope_buf, 0, buf_size);
+
         return ModuleGraph {
             modules:          [],
             topo_order:       [],
             cross_module_fns: [],
-            module_ast_buf:   null,
-            module_ast_cap:   0,
+            module_ast_buf:   ast_buf,
+            module_ast_cap:   initial_cap,
             module_sources:   [],
             name_index_keys:  [],
             name_index_vals:  [],
-            module_scope_buf: null,
-            module_scope_cap: 0,
+            module_scope_buf: scope_buf,
+            module_scope_cap: initial_cap,
         };
     }
 
     /// Register a module for compilation.
     add_module(mut &this, info: ModuleInfo) -> void {
         const idx: u32 = this.modules.length;
-        const new_cap: u32 = idx + 1;
         this.name_index_keys.push(info.name.id);
         this.name_index_vals.push(idx);
         this.modules = this.modules + [info];
         this.module_sources.push(info.file_path);
 
-        // Grow AST pointer buffer (raw memory to avoid array[i]=x codegen bug)
-        const new_ast_buf: void* = malloc(new_cap as u64 * 8);
-        memset(new_ast_buf, 0, new_cap as u64 * 8);
-        if (this.module_ast_buf != null && this.module_ast_cap > 0) {
-            memcpy(new_ast_buf, this.module_ast_buf, this.module_ast_cap as u64 * 8);
-            free(this.module_ast_buf);
-        }
-        this.module_ast_buf = new_ast_buf;
-        this.module_ast_cap = new_cap;
+        // If we exceed pre-allocated capacity, grow the raw buffers.
+        // This should be rare (>128 modules).
+        if (idx >= this.module_ast_cap) {
+            const new_cap: u32 = this.module_ast_cap * 2;
+            const new_size: u64 = new_cap as u64 * 8;
 
-        // Grow scope ID buffer (same raw memory approach)
-        const new_scope_buf: void* = malloc(new_cap as u64 * 8);
-        memset(new_scope_buf, 0, new_cap as u64 * 8);
-        if (this.module_scope_buf != null && this.module_scope_cap > 0) {
-            memcpy(new_scope_buf, this.module_scope_buf, this.module_scope_cap as u64 * 8);
-            free(this.module_scope_buf);
+            const new_ast_buf: void* = malloc(new_size);
+            memset(new_ast_buf, 0, new_size);
+            if (this.module_ast_buf != null) {
+                memcpy(new_ast_buf, this.module_ast_buf, this.module_ast_cap as u64 * 8);
+                free(this.module_ast_buf);
+            }
+            this.module_ast_buf = new_ast_buf;
+
+            const new_scope_buf: void* = malloc(new_size);
+            memset(new_scope_buf, 0, new_size);
+            if (this.module_scope_buf != null) {
+                memcpy(new_scope_buf, this.module_scope_buf, this.module_scope_cap as u64 * 8);
+                free(this.module_scope_buf);
+            }
+            this.module_scope_buf = new_scope_buf;
+
+            this.module_ast_cap   = new_cap;
+            this.module_scope_cap = new_cap;
         }
-        this.module_scope_buf = new_scope_buf;
-        this.module_scope_cap = new_cap;
     }
 
     /// Number of registered modules.

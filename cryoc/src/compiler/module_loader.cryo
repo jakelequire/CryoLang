@@ -291,8 +291,10 @@ function scan_tokens(tokens: Token[]) -> ModuleScanResult {
             const path: string = collect_qualified_name(tokens, &i, len);
             ns = path;
             // Skip semicolon if present
-            if (i < len && tokens[i].kind == TokenType::Semicolon) {
-                i = i + 1;
+            if (i < len) {
+                if (tokens[i].kind == TokenType::Semicolon) {
+                    i = i + 1;
+                }
             }
             continue;
         }
@@ -305,15 +307,40 @@ function scan_tokens(tokens: Token[]) -> ModuleScanResult {
                 imports.push(path);
             }
             // Skip semicolon if present
-            if (i < len && tokens[i].kind == TokenType::Semicolon) {
-                i = i + 1;
+            if (i < len) {
+                if (tokens[i].kind == TokenType::Semicolon) {
+                    i = i + 1;
+                }
             }
             continue;
         }
 
-        // Stop scanning at the first non-import/namespace top-level declaration
-        // to avoid scanning into function bodies.  Module declarations and imports
-        // always appear at the top of a file.
+        // public module Math::Vec2;  — sub-module declaration in _module.cryo files.
+        // The module path is used as-is for dependency resolution (same as an
+        // import).  Convention: always use the fully-qualified path, e.g.
+        //   namespace Math;
+        //   public module Math::Vec2;    // NOT just "Vec2"
+        if (tok.kind == TokenType::KwPublic) {
+            if ((i + 1) < len) {
+                if (tokens[i + 1].kind == TokenType::KwModule) {
+                    i = i + 2;  // consume 'public' 'module'
+                    const mod_path: string = collect_qualified_name(tokens, &i, len);
+                    if (strlen(mod_path) > 0) {
+                        imports.push(mod_path);
+                    }
+                    // Skip semicolon if present
+                    if (i < len) {
+                        if (tokens[i].kind == TokenType::Semicolon) {
+                            i = i + 1;
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Stop scanning at the first non-import/namespace/module top-level
+        // declaration to avoid scanning into function bodies.
         if (is_declaration_keyword(tok.kind)) {
             break;
         }
@@ -346,9 +373,11 @@ function collect_qualified_name(tokens: Token[], pos: i64*, len: i64) -> string 
             p = p + 1;
 
             // Check for :: separator
-            if (p < len && tokens[p].kind == TokenType::ColonColon) {
-                p = p + 1;  // skip ::
-                continue;
+            if (p < len) {
+                if (tokens[p].kind == TokenType::ColonColon) {
+                    p = p + 1;  // skip ::
+                    continue;
+                }
             }
             break;
         }
@@ -399,7 +428,7 @@ function replace_separator(path: string) -> string {
     }
 
     const term: i8* = ptr_add(buf as void*, j) as i8*;
-    *term = 0;
+    *term = 0 as i8;
     return buf as string;
 }
 
@@ -411,7 +440,7 @@ function to_lowercase(s: string) -> string {
     const out: i8* = malloc(len + 1);
     memcpy(out as void*, s as void*, len);
     const term: i8* = ptr_add(out as void*, len as i64) as i8*;
-    *term = 0;
+    *term = 0 as i8;
 
     // In-place lowercase each byte
     for (mut i: u64 = 0; i < len; i++) {
@@ -420,7 +449,6 @@ function to_lowercase(s: string) -> string {
         // A=65, Z=90: add 32 to make lowercase
         const lower: i8 = ch + 32;
         const use_lower: boolean = ch >= 65 && ch <= 90;
-        // Branchless: write lower if uppercase, else write original
         if (use_lower) { *p = lower; }
     }
     return out as string;
@@ -473,7 +501,7 @@ function to_snake_case(s: string) -> string {
     }
 
     const term: i8* = ptr_add(out as void*, j as i64) as i8*;
-    *term = 0;
+    *term = 0 as i8;
     return out as string;
 }
 
@@ -504,7 +532,7 @@ function extract_module_name(path: string) -> string {
     const buf: i8* = malloc(name_len as u64 + 1);
     memcpy(buf as void*, ptr_add(path as void*, name_start) as void*, name_len as u64);
     const term: i8* = ptr_add(buf as void*, name_len) as i8*;
-    *term = 0;
+    *term = 0 as i8;
     return buf as string;
 }
 
@@ -522,6 +550,6 @@ function extract_directory(path: string) -> string {
     const buf: i8* = malloc(last_sep as u64 + 1);
     memcpy(buf as void*, path as void*, last_sep as u64);
     const term: i8* = ptr_add(buf as void*, last_sep) as i8*;
-    *term = 0;
+    *term = 0 as i8;
     return buf as string;
 }
