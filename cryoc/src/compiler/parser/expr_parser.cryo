@@ -686,7 +686,8 @@ public:
         return node;
     }
 
-    /// Parse sizeof(Type)
+    /// Parse sizeof(Type) — supports qualified names and generic args.
+    /// sizeof(Foo), sizeof(Foo::Bar), sizeof(RcControlBlock<T>)
     parse_sizeof_expression() -> ExpressionNode* {
         const start: Token = this.advance(); // consume 'sizeof'
         this.consume(TokenType::LParen, "'('");
@@ -701,11 +702,16 @@ public:
             this.advance();  // consume member name
         }
 
+        // Handle generic type args: sizeof(RcControlBlock<T>)
+        if (this.check(TokenType::LAngle)) {
+            this.parse_generic_args();  // consumes <...> including >> splitting
+        }
+
         this.consume(TokenType::RParen, "')'");
         return new SizeofExprNode(type_name, type_span, this.span_from(start));
     }
 
-    /// Parse alignof(Type)
+    /// Parse alignof(Type) — supports qualified names and generic args.
     parse_alignof_expression() -> ExpressionNode* {
         const start: Token = this.advance(); // consume 'alignof'
         this.consume(TokenType::LParen, "'('");
@@ -713,6 +719,18 @@ public:
         const type_name: SymbolStr = this.intern_lexeme(type_tok);
         const type_span: SourceSpan = this.span_from_token(type_tok);
         this.advance();
+
+        // Handle qualified names
+        while (this.check(TokenType::ColonColon)) {
+            this.advance();
+            this.advance();
+        }
+
+        // Handle generic type args
+        if (this.check(TokenType::LAngle)) {
+            this.parse_generic_args();
+        }
+
         this.consume(TokenType::RParen, "')'");
         return new AlignofExprNode(type_name, type_span, this.span_from(start));
     }
@@ -1098,12 +1116,15 @@ public:
                         return true;
                     }
                     // Also allow > at end of type annotation context (e.g., in parameter lists)
-                    if (next.kind == TokenType::Comma ||
-                        next.kind == TokenType::RParen ||
-                        next.kind == TokenType::Semicolon ||
-                        next.kind == TokenType::Equal) {
-                        return true;
-                    }
+                    // or before type suffixes (*, [], ?)
+                    if (next.kind == TokenType::Comma)     { return true; }
+                    if (next.kind == TokenType::RParen)    { return true; }
+                    if (next.kind == TokenType::Semicolon) { return true; }
+                    if (next.kind == TokenType::Equal)     { return true; }
+                    if (next.kind == TokenType::Star)      { return true; }
+                    if (next.kind == TokenType::LSquare)   { return true; }
+                    if (next.kind == TokenType::Question)  { return true; }
+                    if (next.kind == TokenType::Arrow)     { return true; }
                     return false;
                 }
             } else if (tok.kind == TokenType::GreaterGreater) {
