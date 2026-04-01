@@ -268,7 +268,13 @@ public:
     parse_function_declaration(is_public: boolean) -> FunctionDeclNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_function_declaration()");
         const start: Token = this.advance(); // consume 'function'
-        const name_tok: Token = this.consume(TokenType::Identifier, "function name");
+        // Accept keywords as function names (e.g., any, type, default)
+        mut name_tok: Token = this.current();
+        if (name_tok.kind == TokenType::Identifier || name_tok.kind.is_keyword()) {
+            this.advance();
+        } else {
+            name_tok = this.consume(TokenType::Identifier, "function name");
+        }
         const name: SymbolStr = this.intern_lexeme(name_tok);
         mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
         func.set_public(is_public);
@@ -661,6 +667,12 @@ public:
                 if (!this.match_tok(TokenType::Comma)) { break; }
             }
             this.consume(TokenType::RParen, "')'");
+        }
+
+        // Optional return type: -> Type (allowed on constructors for factory patterns)
+        if (this.match_tok(TokenType::Arrow)) {
+            const ret_ann: TypeAnnotation* = this.parse_type_annotation();
+            func.set_return_type_annotation(ret_ann);
         }
 
         // Body
@@ -1725,7 +1737,17 @@ public:
             expr = this.parse_expression();
         }
 
-        this.consume(TokenType::Semicolon, "';'");
+        // Semicolon is required, but optional after expressions that end
+        // with '}' (struct literals, match expressions, blocks).
+        // This allows: return ArenaChunk { field: value }
+        if (!this.match_tok(TokenType::Semicolon)) {
+            // Only error if we're not at a '}' (which means the expression
+            // was a struct/match/block that consumed the '}' already, and
+            // the next token is the function's closing brace).
+            if (!this.check(TokenType::RBrace)) {
+                this.consume(TokenType::Semicolon, "';'");
+            }
+        }
         return new ReturnStmtNode(expr, this.span_from(start));
     }
 
