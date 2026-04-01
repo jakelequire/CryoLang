@@ -270,21 +270,35 @@ type struct CompilerInstance {
 
         // Phase 0: Parse project configuration
         const config: ProjectConfig = ProjectConfig::parse(config_path);
-        const entry_path: string = config.entry_point_path();
+        const root_path: string = config.discovery_root_path();
 
         if (this.config.debug) {
-            printf("[Compiler] Project: %s (target: %s, entry: %s)\n",
-                config.project_name, config.target_type.label(), entry_path);
+            printf("[Compiler] Project: %s (target: %s, root: %s, no_std: %d)\n",
+                config.project_name, config.target_type.label(), root_path, config.no_std as int);
         }
 
-        if (!File::exists(entry_path)) {
-            printf("[Compiler] Error: Entry point not found: %s\n", entry_path);
+        if (!File::exists(root_path)) {
+            if (config.requires_entry_point()) {
+                printf("[Compiler] Error: Entry point not found: %s\n", root_path);
+            } else {
+                printf("[Compiler] Error: Library root not found: %s\n", root_path);
+                printf("[Compiler] Expected lib.cryo in source_dir '%s'\n", config.source_dir);
+            }
             return CompilationResult::failed(1, 0);
         }
 
         // Phase 1: Create context and discover modules
-        mut ctx: CompilationContext = CompilationContext::new(CompileMode::MultiModule, entry_path);
+        // Select compile mode based on target type:
+        //   Executable → MultiModule (auto-imports, stdlib linking, main transform)
+        //   Library    → MultiModule (auto-imports, stdlib linking, no main transform)
+        //   Stdlib     → StdlibBatch (no auto-imports, no stdlib linking, no main transform)
+        const mode: CompileMode = match (config.target_type) {
+            TargetType::Stdlib  => { CompileMode::StdlibBatch }
+            _                   => { CompileMode::MultiModule }
+        };
+        mut ctx: CompilationContext = CompilationContext::new(mode, root_path);
         ctx.debug_mode = this.config.debug;
+        ctx.project_no_std = config.no_std;
 
         const _box_config: Box<ProjectConfig> = Box<ProjectConfig>::new(config);
         ctx.set_project_config(_box_config.leak());
@@ -292,11 +306,11 @@ type struct CompilerInstance {
         // Create module loader and discover all modules recursively
         const stdlib_root: string = "";  // TODO: resolve stdlib root from install path
         mut loader: ModuleLoader = ModuleLoader::new(
-            config.project_root, entry_path, stdlib_root, config.no_std);
+            config.project_root, root_path, stdlib_root, config.no_std);
 
         const discovery_ok: boolean = loader.discover_project(
             &ctx.intern_table, &ctx.module_graph, &ctx.diagnostics,
-            entry_path, this.config.debug);
+            root_path, this.config.debug);
 
         if (!discovery_ok) {
             printf("[Compiler] Module discovery failed\n");
