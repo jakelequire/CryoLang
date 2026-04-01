@@ -2829,14 +2829,37 @@ namespace Cryo::Codegen
         // Allocate new buffer for combined elements
         llvm::Value *new_data = b.CreateCall(malloc_fn, {alloc_bytes}, "concat.data");
 
-        // Copy LHS elements to new buffer
+        // Copy LHS elements to new buffer (guard against null data pointer
+        // from empty array literals — memcpy(dst, NULL, 0) is UB in C)
         llvm::Value *lhs_bytes = b.CreateMul(lhs_len, elem_size_val, "lhs.bytes");
-        b.CreateCall(memcpy_fn, {new_data, lhs_data, lhs_bytes});
+        {
+            llvm::Value *lhs_not_null = b.CreateICmpNE(lhs_data,
+                llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)), "lhs.not.null");
+            llvm::Function *func = b.GetInsertBlock()->getParent();
+            llvm::BasicBlock *copy_lhs_bb = llvm::BasicBlock::Create(ctx, "concat.copy.lhs", func);
+            llvm::BasicBlock *after_lhs_bb = llvm::BasicBlock::Create(ctx, "concat.after.lhs", func);
+            b.CreateCondBr(lhs_not_null, copy_lhs_bb, after_lhs_bb);
+            b.SetInsertPoint(copy_lhs_bb);
+            b.CreateCall(memcpy_fn, {new_data, lhs_data, lhs_bytes});
+            b.CreateBr(after_lhs_bb);
+            b.SetInsertPoint(after_lhs_bb);
+        }
 
-        // Copy RHS elements after LHS elements
+        // Copy RHS elements after LHS elements (same null guard)
         llvm::Value *rhs_offset = b.CreateGEP(llvm::Type::getInt8Ty(ctx), new_data, lhs_bytes, "rhs.dst");
         llvm::Value *rhs_bytes = b.CreateMul(rhs_len, elem_size_val, "rhs.bytes");
-        b.CreateCall(memcpy_fn, {rhs_offset, rhs_data, rhs_bytes});
+        {
+            llvm::Value *rhs_not_null = b.CreateICmpNE(rhs_data,
+                llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx, 0)), "rhs.not.null");
+            llvm::Function *func = b.GetInsertBlock()->getParent();
+            llvm::BasicBlock *copy_rhs_bb = llvm::BasicBlock::Create(ctx, "concat.copy.rhs", func);
+            llvm::BasicBlock *after_rhs_bb = llvm::BasicBlock::Create(ctx, "concat.after.rhs", func);
+            b.CreateCondBr(rhs_not_null, copy_rhs_bb, after_rhs_bb);
+            b.SetInsertPoint(copy_rhs_bb);
+            b.CreateCall(memcpy_fn, {rhs_offset, rhs_data, rhs_bytes});
+            b.CreateBr(after_rhs_bb);
+            b.SetInsertPoint(after_rhs_bb);
+        }
 
         // Build new Array<T> struct: { ptr, len, cap }
         llvm::AllocaInst *result = create_entry_alloca(struct_type, "concat.result");

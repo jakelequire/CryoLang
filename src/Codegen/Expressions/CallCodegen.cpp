@@ -8776,10 +8776,25 @@ namespace Cryo::Codegen
         {
             // sprintf(format, args) → vsprintf(buffer, format, va_list)
             // User called sprintf(msg, args) with only format + va_list,
-            // so we need to allocate a temp buffer
-            llvm::Value *buffer = builder().CreateAlloca(
-                llvm::Type::getInt8Ty(llvm_ctx()),
-                llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 4096),
+            // so we need to allocate a temp buffer.
+            // Use malloc instead of alloca: alloca buffers accumulate in the
+            // caller's stack frame and are never freed until the function returns.
+            // In recursive functions with many sprintf calls (e.g., module discovery
+            // with 30+ modules), the cumulative alloca can exhaust the stack and
+            // overwrite heap metadata, causing heap corruption.
+            llvm::Function *malloc_fn = module()->getFunction("malloc");
+            if (!malloc_fn)
+            {
+                llvm::FunctionType *malloc_type = llvm::FunctionType::get(
+                    llvm::PointerType::get(llvm_ctx(), 0),
+                    {llvm::Type::getInt64Ty(llvm_ctx())},
+                    false);
+                malloc_fn = llvm::Function::Create(
+                    malloc_type, llvm::Function::ExternalLinkage, "malloc", module());
+            }
+            llvm::Value *buffer = builder().CreateCall(
+                malloc_fn,
+                {llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_ctx()), 4096)},
                 "sprintf.buf");
             v_args = {buffer, args[0], va_list_ptr};
         }

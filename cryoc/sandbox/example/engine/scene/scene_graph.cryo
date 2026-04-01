@@ -1,0 +1,117 @@
+namespace Engine::Scene::SceneGraph;
+
+import Math::Vec2;
+import Math::Vec3;
+import Core::Types;
+import Core::Memory::Pool;
+import Engine::Entity;
+import Engine::AI::State;
+import Engine::AI::Behavior;
+import Engine::Physics::Body;
+import Engine::Physics::Collision::Broadphase;
+import Engine::Physics::Collision::Narrowphase;
+import Shapes::Geometry;
+import Shapes::Renderer;
+
+// ============================================================================
+// Struct: SceneNode — a single node in the scene graph
+// ============================================================================
+
+type struct SceneNode {
+    handle:   Handle;
+    name:     string;
+    position: Vec3;
+    active:   boolean;
+
+    static new(handle: Handle, name: string, position: Vec3) -> SceneNode {
+        mut n: SceneNode;
+        n.handle   = handle;
+        n.name     = name;
+        n.position = position;
+        n.active   = true;
+        return n;
+    }
+
+    get_position_2d(&this) -> Vec2 {
+        return this.position.to_vec2();
+    }
+}
+
+
+// ============================================================================
+// Struct: Scene — top-level container using types from ALL module trees
+// ============================================================================
+
+type struct Scene {
+    name:         string;
+    nodes:        SceneNode[];
+    node_count:   i64;
+    node_pool:    IndexPool;
+    bodies:       PhysicsBody[];
+    body_count:   i64;
+    agents:       AIAgent[];
+    agent_count:  i64;
+    render_queue: RenderQueue;
+    broad_result: BroadphaseResult;
+    bounds:       Rect2D;
+    arena_stats:  ArenaStats;
+    tick_count:   u64;
+
+    static new(name: string, width: f64, height: f64) -> Scene {
+        mut s: Scene;
+        s.name         = name;
+        s.nodes        = [];
+        s.node_count   = 0;
+        s.node_pool    = IndexPool::new(1024);
+        s.bodies       = [];
+        s.body_count   = 0;
+        s.agents       = [];
+        s.agent_count  = 0;
+        s.render_queue = RenderQueue::new();
+        s.broad_result = BroadphaseResult::new();
+        s.bounds       = Rect2D::new(Vec2::zero(), Vec2::new(width, height));
+        s.arena_stats  = ArenaStats::new();
+        s.tick_count   = 0;
+        return s;
+    }
+
+    add_node(mut &this, name: string, position: Vec3) -> Handle {
+        const handle: Handle = this.node_pool.allocate();
+        const node: SceneNode = SceneNode::new(handle, name, position);
+        this.nodes.push(node);
+        this.node_count = this.node_count + 1;
+        this.arena_stats.record_alloc(64);
+        return handle;
+    }
+
+    add_physics_body(mut &this, handle: Handle, position: Vec3, mass: f64) -> void {
+        const body: PhysicsBody = PhysicsBody::new(handle, position, mass);
+        this.bodies.push(body);
+        this.body_count = this.body_count + 1;
+        this.arena_stats.record_alloc(128);
+    }
+
+    add_ai_agent(mut &this, entity_id: EntityId) -> void {
+        const agent: AIAgent = AIAgent::new(entity_id);
+        this.agents.push(agent);
+        this.agent_count = this.agent_count + 1;
+        this.arena_stats.record_alloc(96);
+    }
+
+    submit_draw(mut &this, cmd: DrawCommand) -> void {
+        this.render_queue.submit(cmd);
+    }
+
+    step(mut &this, dt: f64) -> void {
+        this.tick_count = this.tick_count + 1;
+
+        // Integrate physics bodies
+        for (mut i: i64 = 0; i < this.body_count; i++) {
+            this.bodies[i].integrate(dt);
+        }
+    }
+
+    is_healthy(&this) -> boolean {
+        return this.arena_stats.is_healthy();
+    }
+}
