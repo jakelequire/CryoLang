@@ -1141,13 +1141,21 @@ namespace Cryo::Codegen
             }
             if (types_match)
             {
-                // Check if the struct type is fully defined (sized) before attempting memcpy
-                if (!member_field_type->isSized())
+                // Determine struct size for memcpy.  Prefer the destination (field) type,
+                // but fall back to the source (value) type if the destination is reported
+                // as unsized (can happen when the element type of a nested array struct
+                // hasn't been fully materialized yet).
+                auto &dl = module()->getDataLayout();
+                llvm::Type *sized_type = member_field_type;
+                if (!sized_type->isSized())
+                {
+                    sized_type = value_pointed_type;
+                }
+
+                if (!sized_type || !sized_type->isSized())
                 {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "Member assignment: Struct type is not sized, falling back to regular store");
-
-                    // Fall back to regular store for unsized struct types
+                              "Member assignment: Neither dest nor src struct type is sized, falling back to regular store");
                     if (_memory)
                     {
                         _memory->create_store(value, member_ptr);
@@ -1159,12 +1167,10 @@ namespace Cryo::Codegen
                     return value;
                 }
 
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "Member assignment: Struct value assignment detected, using memcpy");
+                uint64_t struct_size = dl.getTypeAllocSize(sized_type);
 
-                // Use memcpy to copy the struct value instead of storing pointer
-                auto &dl = module()->getDataLayout();
-                uint64_t struct_size = dl.getTypeAllocSize(member_field_type);
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "Member assignment: Struct value assignment detected, using memcpy ({} bytes)", struct_size);
 
                 // Create memcpy call
                 llvm::Type *i8_ptr_type = llvm::PointerType::get(llvm::Type::getInt8Ty(llvm_ctx()), 0);
@@ -1182,9 +1188,6 @@ namespace Cryo::Codegen
                     {i8_ptr_type, i8_ptr_type, size_type});
 
                 builder().CreateCall(memcpy_fn, {dest, src, size_val, llvm::ConstantInt::get(llvm::Type::getInt1Ty(llvm_ctx()), false)});
-
-                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                          "Member assignment: Memcpy complete for struct of size {} bytes", struct_size);
 
                 return value;
             }

@@ -42,6 +42,7 @@ public:
     include_paths:     string[];
     debug_mode:        boolean;
     current_namespace: QualifiedName;
+    namespace_str:     SymbolStr;        // interned display form of current_namespace (e.g., "Math::Vec2")
 
     // -- Phase outputs (populated by passes) --
     artifacts: PhaseArtifacts;
@@ -98,6 +99,7 @@ public:
             include_paths:     [],
             debug_mode:        false,
             current_namespace: QualifiedName::empty(),
+            namespace_str:     SymbolStr::empty(),
 
             artifacts:     PhaseArtifacts::new(),
             diagnostics:   DiagnosticSink::new(),
@@ -177,28 +179,27 @@ public:
 
     /// Whether a namespace has been set for this compilation unit.
     has_namespace(&this) -> boolean {
-        return !this.current_namespace.is_empty();
+        return !this.namespace_str.is_empty();
     }
 
     /// Set the namespace for this compilation unit from a dotted/scoped string.
     set_namespace(mut &this, ns: string) -> void {
         this.current_namespace = QualifiedName::parse(&this.intern_table, ns);
+        this.namespace_str = this.intern_table.intern(ns);
     }
 
     /// The namespace as a display string (for APIs that need strings).
     namespace_display(&this) -> string {
-        return this.current_namespace.display(&this.intern_table);
+        return this.intern_table.resolve(this.namespace_str);
     }
 
     /// Build a qualified display string: "Namespace::leaf" or just "leaf".
-    /// Replaces the repeated ternary pattern:
-    ///   ctx.current_namespace != "" ? ctx.current_namespace + "::" + leaf : leaf
     qualify_name(&this, leaf: string) -> string {
-        if (this.current_namespace.is_empty()) {
+        if (this.namespace_str.is_empty()) {
             return leaf;
         }
-        return this.current_namespace.child(&this.intern_table, leaf)
-            .display(&this.intern_table);
+        const ns: string = this.intern_table.resolve(this.namespace_str);
+        return ns + "::" + leaf;
     }
 
     /// Resolve an interned symbol and qualify it in one step.
@@ -209,22 +210,25 @@ public:
 
     /// Like qualify_symbol() but returns an interned SymbolStr instead of a raw string.
     /// Use this when the result feeds into the type system (arena, registries).
+    /// Returns "Namespace::name" for types within a namespace, or bare name if
+    /// no namespace is set.
     qualify_symbol_sym(mut &this, sym: SymbolStr) -> SymbolStr {
-        // In the current compilation model, types are registered and looked up
-        // within the same module context using bare names.  The full
-        // qualify_name path uses QualifiedName::child().display() which has
-        // codegen issues (empty string output).  Use bare names for now —
-        // cross-module qualification will be handled by the Resolver's
-        // source_module field on each Symbol.
-        return sym;
+        if (this.namespace_str.is_empty()) {
+            return sym;
+        }
+        const ns: string = this.intern_table.resolve(this.namespace_str);
+        const bare: string = this.intern_table.resolve(sym);
+        return this.intern_table.intern(ns + "::" + bare);
     }
 
     /// Build a structured QualifiedName: namespace + leaf.
     qualify(&this, leaf: string) -> QualifiedName {
-        if (this.current_namespace.is_empty()) {
+        if (this.namespace_str.is_empty()) {
             return QualifiedName::single(&this.intern_table, leaf);
         }
-        return this.current_namespace.child(&this.intern_table, leaf);
+        // Build from the interned namespace string to avoid QualifiedName method chaining
+        const full: string = this.intern_table.resolve(this.namespace_str) + "::" + leaf;
+        return QualifiedName::parse(&this.intern_table, full);
     }
 
 
@@ -391,6 +395,7 @@ public:
         this.provisions.clear();
         this.source_file = next_source;
         this.current_namespace = QualifiedName::empty();
+        this.namespace_str = SymbolStr::empty();
 
         // Reset resolver cursor (preserves cross-module state)
         if (this.resolver != null) {
@@ -421,8 +426,10 @@ public:
         const ns_str: string = this.intern_table.resolve(info.namespace_name);
         if (strlen(ns_str) > 0) {
             this.current_namespace = QualifiedName::parse(&this.intern_table, ns_str);
+            this.namespace_str = info.namespace_name;
         } else {
             this.current_namespace = QualifiedName::empty();
+            this.namespace_str = SymbolStr::empty();
         }
 
         // NOTE: AST swap is handled by the orchestrator (compile_project) because
