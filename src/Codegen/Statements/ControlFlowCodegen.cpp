@@ -144,7 +144,7 @@ namespace Cryo::Codegen
             // Remove it from the function to avoid LLVM verification errors
             merge_block->eraseFromParent();
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                     "ControlFlowCodegen: Removed unreachable merge block (both branches terminate)");
+                      "ControlFlowCodegen: Removed unreachable merge block (both branches terminate)");
         }
 
         LOG_DEBUG(Cryo::LogComponent::CODEGEN, "ControlFlowCodegen: If statement complete");
@@ -457,8 +457,8 @@ namespace Cryo::Codegen
     }
 
     void ControlFlowCodegen::generate_integer_switch(Cryo::SwitchStatementNode *node,
-                                                      llvm::Value *switch_value,
-                                                      llvm::BasicBlock *end_block)
+                                                     llvm::Value *switch_value,
+                                                     llvm::BasicBlock *end_block)
     {
         // Check for valid insertion context
         llvm::BasicBlock *int_switch_block = builder().GetInsertBlock();
@@ -484,7 +484,7 @@ namespace Cryo::Codegen
 
         // Generate case blocks
         std::vector<llvm::BasicBlock *> case_blocks;
-        
+
         // Pre-create all case blocks for fallthrough references
         for (size_t i = 0; i < node->cases().size(); ++i)
         {
@@ -499,7 +499,7 @@ namespace Cryo::Codegen
                 case_blocks.push_back(nullptr); // Placeholder for default case
             }
         }
-        
+
         // Generate case blocks
         for (size_t i = 0; i < node->cases().size(); ++i)
         {
@@ -548,7 +548,7 @@ namespace Cryo::Codegen
                         break;
                     }
                 }
-                
+
                 // If no more cases, fall through to default if it exists, otherwise end
                 if (fallthrough_target == end_block)
                 {
@@ -562,7 +562,7 @@ namespace Cryo::Codegen
                         }
                     }
                 }
-                
+
                 builder().CreateBr(fallthrough_target);
             }
         }
@@ -598,8 +598,8 @@ namespace Cryo::Codegen
     }
 
     void ControlFlowCodegen::generate_string_switch(Cryo::SwitchStatementNode *node,
-                                                     llvm::Value *switch_value,
-                                                     llvm::BasicBlock *end_block)
+                                                    llvm::Value *switch_value,
+                                                    llvm::BasicBlock *end_block)
     {
         // Check for valid insertion context
         llvm::BasicBlock *str_switch_block = builder().GetInsertBlock();
@@ -644,8 +644,8 @@ namespace Cryo::Codegen
             // Compare strings
             llvm::Value *cmp_result = builder().CreateCall(strcmp_fn, {switch_value, case_val}, "strcmp.result");
             llvm::Value *is_equal = builder().CreateICmpEQ(cmp_result,
-                                                            llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
-                                                            "str.eq");
+                                                           llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0),
+                                                           "str.eq");
 
             // Create blocks for this case
             llvm::BasicBlock *case_block = create_block("switch.case." + std::to_string(i), function);
@@ -742,7 +742,7 @@ namespace Cryo::Codegen
         if (!match_value)
             return;
 
-        // If match_value is an alloca storing a pointer (e.g., from match (&this)
+        // If match_value is an alloca storing a pointer (e.g., from match (this)
         // where this is a reference parameter), load the pointer to get the
         // actual struct pointer for pattern matching.
         if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(match_value))
@@ -1094,7 +1094,7 @@ namespace Cryo::Codegen
                 }
                 else if (resolved_type && resolved_type->isIntegerTy())
                 {
-                    // Simple integer enum accessed via pointer (e.g., match (&this) on a C-style enum)
+                    // Simple integer enum accessed via pointer (e.g., match (this) on a C-style enum)
                     discriminant_value = builder().CreateLoad(resolved_type, value, "enum.discriminant");
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "generate_pattern_match: Loaded simple integer enum discriminant through pointer");
@@ -1600,22 +1600,38 @@ namespace Cryo::Codegen
                     if (!field_ref.is_valid())
                     {
                         // Try common primitive types
-                        if (field_type_name == "i8") field_ref = arena.get_i8();
-                        else if (field_type_name == "i16") field_ref = arena.get_i16();
-                        else if (field_type_name == "i32" || field_type_name == "int") field_ref = arena.get_i32();
-                        else if (field_type_name == "i64") field_ref = arena.get_i64();
-                        else if (field_type_name == "i128") field_ref = arena.get_i128();
-                        else if (field_type_name == "u8") field_ref = arena.get_u8();
-                        else if (field_type_name == "u16") field_ref = arena.get_u16();
-                        else if (field_type_name == "u32") field_ref = arena.get_u32();
-                        else if (field_type_name == "u64") field_ref = arena.get_u64();
-                        else if (field_type_name == "u128") field_ref = arena.get_u128();
-                        else if (field_type_name == "f32" || field_type_name == "float") field_ref = arena.get_f32();
-                        else if (field_type_name == "f64" || field_type_name == "double") field_ref = arena.get_f64();
-                        else if (field_type_name == "bool" || field_type_name == "boolean") field_ref = arena.get_bool();
-                        else if (field_type_name == "string") field_ref = arena.get_string();
-                        else if (field_type_name == "char") field_ref = arena.get_char();
-                        else if (field_type_name == "void") field_ref = arena.get_void();
+                        if (field_type_name == "i8")
+                            field_ref = arena.get_i8();
+                        else if (field_type_name == "i16")
+                            field_ref = arena.get_i16();
+                        else if (field_type_name == "i32" || field_type_name == "int")
+                            field_ref = arena.get_i32();
+                        else if (field_type_name == "i64")
+                            field_ref = arena.get_i64();
+                        else if (field_type_name == "i128")
+                            field_ref = arena.get_i128();
+                        else if (field_type_name == "u8")
+                            field_ref = arena.get_u8();
+                        else if (field_type_name == "u16")
+                            field_ref = arena.get_u16();
+                        else if (field_type_name == "u32")
+                            field_ref = arena.get_u32();
+                        else if (field_type_name == "u64")
+                            field_ref = arena.get_u64();
+                        else if (field_type_name == "u128")
+                            field_ref = arena.get_u128();
+                        else if (field_type_name == "f32" || field_type_name == "float")
+                            field_ref = arena.get_f32();
+                        else if (field_type_name == "f64" || field_type_name == "double")
+                            field_ref = arena.get_f64();
+                        else if (field_type_name == "bool" || field_type_name == "boolean")
+                            field_ref = arena.get_bool();
+                        else if (field_type_name == "string")
+                            field_ref = arena.get_string();
+                        else if (field_type_name == "char")
+                            field_ref = arena.get_char();
+                        else if (field_type_name == "void")
+                            field_ref = arena.get_void();
                         else if (field_type_name == "void*" || field_type_name == "voidp")
                             field_ref = arena.get_pointer_to(arena.get_void());
                         // Handle pointer types to user-defined types (e.g., "BinaryExpr*")
@@ -1722,7 +1738,8 @@ namespace Cryo::Codegen
                                  "attempting explicit generic substitution",
                                  var_name,
                                  llvm::cast<llvm::StructType>(field_type)->hasName()
-                                     ? llvm::cast<llvm::StructType>(field_type)->getName().str() : "<anon>");
+                                     ? llvm::cast<llvm::StructType>(field_type)->getName().str()
+                                     : "<anon>");
 
                         auto *visitor_g = ctx().visitor();
                         if (visitor_g)
@@ -1914,7 +1931,7 @@ namespace Cryo::Codegen
                     if (expected_ret_type->isVoidTy())
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                "Return type is void but expression produced a value. Using void return.");
+                                  "Return type is void but expression produced a value. Using void return.");
                         builder().CreateRetVoid();
                         return;
                     }
@@ -1923,14 +1940,14 @@ namespace Cryo::Codegen
                     if (expected_ret_type->isStructTy() && ret_val->getType()->isVoidTy())
                     {
                         LOG_WARN(Cryo::LogComponent::CODEGEN,
-                                "Return type mismatch: expected struct but got void. Using null struct.");
+                                 "Return type mismatch: expected struct but got void. Using null struct.");
                         ret_val = llvm::Constant::getNullValue(expected_ret_type);
                     }
                     // Special case: if function expects struct but we have a pointer, load the struct
                     else if (expected_ret_type->isStructTy() && ret_val->getType()->isPointerTy())
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                 "Return value is pointer but function expects struct by value. Loading struct.");
+                                  "Return value is pointer but function expects struct by value. Loading struct.");
                         ret_val = builder().CreateLoad(expected_ret_type, ret_val, "ret.load");
                     }
                     // Special case: both are struct types but different named structs
@@ -1953,8 +1970,8 @@ namespace Cryo::Codegen
                         else
                         {
                             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                     "Return type mismatch: both are structs but different named types. "
-                                     "Reinterpreting via memory store/load.");
+                                      "Return type mismatch: both are structs but different named types. "
+                                      "Reinterpreting via memory store/load.");
                             llvm::AllocaInst *tmp = create_entry_alloca(ret_val->getType(), "ret.reinterpret.tmp");
                             builder().CreateStore(ret_val, tmp);
                             ret_val = builder().CreateLoad(expected_ret_type, tmp, "ret.reinterpret");
@@ -1963,9 +1980,9 @@ namespace Cryo::Codegen
                     else
                     {
                         LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                 "Return type mismatch: expected {}, got {}. Attempting cast.",
-                                 expected_ret_type->isVoidTy() ? "void" : "non-void",
-                                 ret_val->getType()->isStructTy() ? "struct" : "non-struct");
+                                  "Return type mismatch: expected {}, got {}. Attempting cast.",
+                                  expected_ret_type->isVoidTy() ? "void" : "non-void",
+                                  ret_val->getType()->isStructTy() ? "struct" : "non-struct");
 
                         ret_val = cast_if_needed(ret_val, expected_ret_type);
 
@@ -1973,7 +1990,7 @@ namespace Cryo::Codegen
                         if (!ret_val)
                         {
                             LOG_WARN(Cryo::LogComponent::CODEGEN,
-                                    "Cast failed in return statement, using default return value");
+                                     "Cast failed in return statement, using default return value");
                             ret_val = llvm::Constant::getNullValue(expected_ret_type);
                         }
                     }
@@ -2051,8 +2068,8 @@ namespace Cryo::Codegen
     //===================================================================
 
     void ControlFlowCodegen::push_breakable(llvm::BasicBlock *cond, llvm::BasicBlock *body,
-                                             llvm::BasicBlock *inc, llvm::BasicBlock *exit,
-                                             bool is_switch)
+                                            llvm::BasicBlock *inc, llvm::BasicBlock *exit,
+                                            bool is_switch)
     {
         _breakable_stack.emplace(cond, body, inc, exit, is_switch);
     }
@@ -2066,7 +2083,7 @@ namespace Cryo::Codegen
     }
 
     llvm::Value *ControlFlowCodegen::generate_condition(Cryo::ExpressionNode *condition,
-                                                         Cryo::ASTNode *node)
+                                                        Cryo::ASTNode *node)
     {
         if (!condition)
         {
@@ -2129,7 +2146,7 @@ namespace Cryo::Codegen
     }
 
     void ControlFlowCodegen::generate_statement_in_block(Cryo::StatementNode *stmt,
-                                                          llvm::BasicBlock *block)
+                                                         llvm::BasicBlock *block)
     {
         if (!stmt || !block)
             return;

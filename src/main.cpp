@@ -14,7 +14,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Initialize logger with default configuration (will be overridden by CLI flags if provided)
     Cryo::Logger::instance().initialize(Cryo::Logger::create_default_config());
 
     auto cli = Cryo::CLI::create_cli();

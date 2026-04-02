@@ -29,9 +29,10 @@ import Compiler::Types::TypeRef;
 import Compiler::Types::Arena;
 import Compiler::Types::Registry;
 import Compiler::Types::Resolver;
-import Compiler::Resolver::SymbolID;
 import Compiler::Resolver::InternTable;
+import Compiler::Resolver::SymbolID;
 import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::Symbol;
 import Compiler::Resolver::Resolver;
 import Utils::Logger;
 
@@ -116,7 +117,10 @@ type struct TypeResolutionRunner {
                     this.ctx.resolve_str(func.name)));
         }
 
-        // Emit diagnostics + write back to Resolver's symbol table
+        // Emit diagnostics for unresolved parameter types.
+        // NOTE: We no longer write param types back to Resolver Symbol.type_ref.
+        // Sema reads param types directly from the AST node (param.resolved_type)
+        // via enter_function() → register_local().
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
@@ -124,11 +128,6 @@ type struct TypeResolutionRunner {
                 this.ctx.emit_error(ErrorCode::E0203_UNDEFINED_TYPE,
                     sprintf("cannot resolve type for parameter '%s'",
                         this.ctx.resolve_str(param.name)));
-            } else if (param.resolved_type.is_valid()) {
-                const sym_id: SymbolID = this.name_resolver.resolve(param.span);
-                if (sym_id.is_valid()) {
-                    this.name_resolver.update_symbol_type(sym_id, param.resolved_type);
-                }
             }
         }
     }
@@ -197,12 +196,6 @@ type struct TypeResolutionRunner {
                             const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
                             if (vtype.is_valid()) {
                                 var_node.resolved_type = vtype;
-                                // Write back to the Resolver's Symbol so Sema and
-                                // codegen can find the type via the canonical store.
-                                const sym_id: SymbolID = this.name_resolver.resolve(var_node.span);
-                                if (sym_id.is_valid()) {
-                                    this.name_resolver.update_symbol_type(sym_id, vtype);
-                                }
                             }
                             // Don't emit error for local vars — type inference may resolve them later
                         }
@@ -217,10 +210,6 @@ type struct TypeResolutionRunner {
                     const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
                     if (vtype.is_valid()) {
                         var_node.resolved_type = vtype;
-                        const sym_id: SymbolID = this.name_resolver.resolve(var_node.span);
-                        if (sym_id.is_valid()) {
-                            this.name_resolver.update_symbol_type(sym_id, vtype);
-                        }
                     }
                 }
             }
@@ -438,12 +427,32 @@ type struct TypeResolutionRunner {
 
         if (!fn_name.is_valid()) { return; }
 
-        // Look up the template by qualified name
+        // Look up the template by qualified name.
+        // First try the current module's namespace (e.g., "Main::make_pair"),
+        // then fall back to the Resolver's scope chain which knows about
+        // cross-module imports (e.g., "Collections::Pair::make_pair").
         const registry: GenericRegistry* = this.ctx.generic_registry;
         if (registry == null) { return; }
 
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(fn_name);
-        const entry: TemplateEntry* = registry.get_template(qualified_sym);
+        mut entry: TemplateEntry* = registry.get_template(qualified_sym);
+        if (entry == null) {
+            // Cross-module fallback: resolve_type_qualified_name handles
+            // Type/TypeAlias/Import symbols but not Function symbols.
+            // In multi-module mode the global scope already has the Function
+            // symbol from the declaring module, so look it up directly and
+            // build the qualified name from its source_module.
+            const sym_id: SymbolID = this.name_resolver.lookup(fn_name, this.name_resolver.current_scope);
+            if (sym_id.is_valid()) {
+                const sym: Symbol = this.name_resolver.get_symbol(sym_id);
+                if ((sym.kind == SymbolKind::Function || sym.kind == SymbolKind::Import)
+                    && sym.source_module != "") {
+                    const bare: string = this.ctx.resolve_str(fn_name);
+                    const cross_sym: SymbolStr = this.ctx.intern(sym.source_module + "::" + bare);
+                    entry = registry.get_template(cross_sym);
+                }
+            }
+        }
         if (entry == null) { return; }
         if (entry.node_kind != NodeKind::FunctionDeclaration) { return; }
         if (!entry.base_type.is_valid()) { return; }
@@ -517,7 +526,14 @@ type struct TypeResolutionPasses {
             NodeKind::StructDeclaration => {
                 const node: StructDeclNode* = stmt as StructDeclNode*;
                 const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                // Fallback: monomorphized types injected from another module
+                // live in the arena under the originating module's namespace
+                // (e.g. "Collections::Pair::Pair_i32"), not the current one
+                // ("Main::Pair_i32").  Try the bare name (which has an alias).
+                if (!ty.is_valid()) {
+                    ty = arena.lookup_by_name(node.name);
+                }
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
@@ -526,7 +542,10 @@ type struct TypeResolutionPasses {
             NodeKind::ClassDeclaration => {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
                 const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                if (!ty.is_valid()) {
+                    ty = arena.lookup_by_name(node.name);
+                }
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
@@ -535,7 +554,10 @@ type struct TypeResolutionPasses {
             NodeKind::EnumDeclaration => {
                 const node: EnumDeclNode* = stmt as EnumDeclNode*;
                 const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                if (!ty.is_valid()) {
+                    ty = arena.lookup_by_name(node.name);
+                }
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
@@ -982,12 +1004,6 @@ type struct TypeResolutionPasses {
                     }
                     if (var_node.resolved_type.is_valid()) {
                         ctx.decl_index.register_global(var_node.name, var_node.resolved_type);
-                        // Write back to the Resolver's Symbol
-                        const name_resolver: Resolver* = ctx.get_resolver();
-                        const sym_id: SymbolID = name_resolver.resolve(var_node.span);
-                        if (sym_id.is_valid()) {
-                            name_resolver.update_symbol_type(sym_id, var_node.resolved_type);
-                        }
                     }
                 }
                 _ => {}
