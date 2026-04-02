@@ -253,11 +253,17 @@ type struct Monomorphizer {
         // Intern the specialized name for type system use
         const spec_name_sym: SymbolStr = this.intern_table.intern(result.spec_name);
 
+        // Build the *qualified* specialized name for the arena.
+        // Regular types live in the arena under qualified names (e.g. "BattleTest::Pair"),
+        // so monomorphized types must too (e.g. "BattleTest::Pair_string").
+        // Extract the namespace prefix from the template's qualified name.
+        const qualified_spec_sym: SymbolStr = this.qualify_spec_name(entry, result.spec_name);
+
         // Create concrete type in arena based on node kind
         const subst: TypeSubstitution = TypeSubstitution::from_params(
             entry.param_type_ids, request.type_args
         );
-        const concrete_type: TypeRef = this.create_concrete_type(entry, spec_name_sym, &subst);
+        const concrete_type: TypeRef = this.create_concrete_type(entry, qualified_spec_sym, &subst);
 
         // Set human-readable display name (e.g., "Pair<i32, string>") on the
         // concrete type so debug output shows the generic form, not the mangled name.
@@ -352,6 +358,35 @@ type struct Monomorphizer {
                 this.arena.create_struct(spec_name, entry.module_name)
             }
         };
+    }
+
+
+    // ----------------------------------------------------------------
+    // Name qualification
+    // ----------------------------------------------------------------
+
+    /// Build a qualified specialized name from the template's qualified name
+    /// and the bare specialized name.
+    /// E.g. template qualified "BattleTest::Pair" + spec "Pair_string" → "BattleTest::Pair_string"
+    /// If the template has no namespace prefix, returns the bare spec name.
+    qualify_spec_name(&this, entry: TemplateEntry*, spec_name: string) -> SymbolStr {
+        const qualified_str: string = this.intern_table.resolve(entry.qualified_name);
+        const bare_str: string = this.intern_table.resolve(entry.name);
+
+        // Find the namespace prefix by locating the bare name at the end
+        // of the qualified name.  If qualified == bare, there is no namespace.
+        const q_len: i64 = strlen(qualified_str) as i64;
+        const b_len: i64 = strlen(bare_str) as i64;
+        if (q_len <= b_len) {
+            // No namespace prefix — return bare spec name
+            return this.intern_table.intern(spec_name);
+        }
+
+        // Extract prefix including the "::" separator
+        // qualified = "BattleTest::Pair" → prefix = "BattleTest::"
+        const prefix_len: i64 = q_len - b_len;
+        const prefix: string = substr(qualified_str, 0, prefix_len);
+        return this.intern_table.intern(prefix + spec_name);
     }
 
 
