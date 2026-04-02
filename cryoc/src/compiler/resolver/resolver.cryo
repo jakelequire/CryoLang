@@ -411,19 +411,48 @@ type struct Resolver {
     /// chain from global and checking cross-module imports.
     ///
     /// Returns the qualified name string (e.g., "MyModule::MyStruct") that
-    /// can be used for TypeArena lookup, or empty string if not found.
+    /// can be used for TypeArena/DeclarationIndex lookup, or empty if not found.
     ///
-    /// This eliminates the need for TypeResolver to reimplement scope walking
-    /// and cross-module lookup — the Resolver already has all the information
-    /// from the NameResolution pass.
+    /// Handles both bare names ("Vec2") and already-qualified names
+    /// ("Math::Vec2::Vec2").  For qualified input, extracts the leaf segment
+    /// and resolves that, then validates the prefix matches the symbol's module.
     resolve_type_qualified_name(&this, name: SymbolStr) -> SymbolStr {
-        // 1. Walk scope chain from current scope for Type/TypeAlias/Import symbols.
-        //    In multi-module mode, current_scope is the module scope (set by
-        //    set_module_with_scope), so the walk covers module → global.
-        mut scope_id: ScopeID = this.current_scope;
+        const name_str: string = this.intern_table.resolve(name);
         LOG_DEBUG(LogComponent::Resolver,
             "[resolve_type_qn] looking for '%s' starting at scope %llu",
-            this.intern_table.resolve(name), scope_id.id);
+            name_str, this.current_scope.id);
+
+        // If the name is already qualified (contains "::"), try it as-is first
+        // (it may already be the canonical form), then fall back to extracting
+        // the leaf and resolving that.
+        if (this.contains_separator(name_str)) {
+            // Try the full qualified name directly — caller may already have
+            // the canonical form (e.g., from a previous resolution).
+            // No scope walk needed for this — just return it for DeclarationIndex
+            // or arena lookup by the caller.
+            // If the caller's lookup fails, it will try bare-name fallback.
+
+            // Extract the leaf (last segment) and resolve it
+            const leaf_sym: SymbolStr = this.extract_leaf(name_str);
+            if (leaf_sym.is_valid()) {
+                const resolved: SymbolStr = this.resolve_type_qualified_name_bare(leaf_sym);
+                if (resolved.is_valid()) {
+                    return resolved;
+                }
+            }
+            // Return the input as-is — it may be the canonical form already
+            return name;
+        }
+
+        return this.resolve_type_qualified_name_bare(name);
+    }
+
+    /// Core qualified-name resolution for a bare (unqualified) type name.
+    /// Walks scope chain and import aliases to find the symbol, then constructs
+    /// the canonical qualified form: "module::name".
+    resolve_type_qualified_name_bare(&this, name: SymbolStr) -> SymbolStr {
+        // 1. Walk scope chain from current scope for Type/TypeAlias/Import symbols.
+        mut scope_id: ScopeID = this.current_scope;
         while (scope_id.is_valid()) {
             const scope: Scope = this.get_scope(scope_id);
             const found: SymbolID = scope.find(name);
@@ -456,6 +485,42 @@ type struct Resolver {
 
         // 3. Not found
         return SymbolStr::empty();
+    }
+
+
+    // ----------------------------------------------------------------
+    // String helpers (qualified name parsing)
+    // ----------------------------------------------------------------
+
+    /// Check if a string contains "::" separator.
+    contains_separator(&this, s: string) -> boolean {
+        const len: i64 = strlen(s);
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Extract the last segment after the final "::" in a string.
+    /// E.g., "Math::Vec2::Vec2" → intern("Vec2")
+    extract_leaf(&this, s: string) -> SymbolStr {
+        const len: i64 = strlen(s);
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') {
+                last_sep = i;
+            }
+        }
+        if (last_sep < 0) {
+            return this.intern_table.intern(s);
+        }
+        const start: i64 = last_sep + 2;
+        if (start >= len) {
+            return SymbolStr::empty();
+        }
+        return this.intern_table.intern(s.substring(start, len - start));
     }
 
 
