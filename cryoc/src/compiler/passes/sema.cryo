@@ -30,7 +30,6 @@ import Compiler::Types;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Arena;
 import Compiler::Types::Checker;
-import Compiler::Resolver::SymbolID;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::MangledName;
@@ -57,7 +56,6 @@ public:
     checker:  TypeChecker;
     intern:   InternTable*;
     ctx:      CompilationContext*;
-    resolver: Resolver*;            // canonical symbol store — write-through on type inference
 
     // -- Per-function state (reset via enter_function for each body) --
     locals:      HashMap<u32, TypeRef>;    // local variable scope (fast path)
@@ -77,13 +75,11 @@ public:
     // ================================================================
 
     TypeCheckVisitor(arena: TypeArena*, intern: InternTable*,
-                     resolver: Resolver*,
                      ctx: CompilationContext*) : BaseASTVisitor() {
         this.arena          = arena;
         this.checker        = TypeChecker::new(arena);
         this.intern         = intern;
         this.ctx            = ctx;
-        this.resolver       = resolver;
         this.locals         = HashMap<u32, TypeRef>::new();
         this.undo_keys      = [];
         this.undo_prev      = [];
@@ -95,12 +91,10 @@ public:
     }
 
     /// Build a TypeCheckVisitor from the compilation context.
-    /// Declaration lookups are served by ctx.decl_index (populated
-    /// incrementally by TypeResolution and Specialization passes),
-    /// so no AST scan is needed here.
+    /// Declaration lookups are served by ctx.decl_index (the single source
+    /// of truth for declaration-level types), so no AST scan is needed here.
     static build(ctx: CompilationContext*) -> TypeCheckVisitor {
-        return TypeCheckVisitor(ctx.type_arena, ctx.get_intern_table(),
-                                ctx.get_resolver(), ctx);
+        return TypeCheckVisitor(ctx.type_arena, ctx.get_intern_table(), ctx);
     }
 
 
@@ -118,13 +112,37 @@ public:
         const q_ret: TypeRef = this.ctx.decl_index.lookup_method_return(qualified, method_sym);
         if (q_ret.is_valid()) { return q_ret; }
         // Fallback to bare name (e.g., monomorphized types registered without namespace)
-        return this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
+        const bare_ret: TypeRef = this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
+        if (bare_ret.is_valid()) { return bare_ret; }
+        // Cross-module fallback: resolve through the Resolver's scope chain
+        // to find the type's original module (e.g. "Vec2" → "Math::Vec2::Vec2").
+        const cross_sym: SymbolStr = this.resolve_cross_module_name(type_sym);
+        if (cross_sym.is_valid()) {
+            return this.ctx.decl_index.lookup_method_return(cross_sym, method_sym);
+        }
+        return TypeRef::invalid();
     }
 
     lookup_type_by_sym(&this, name: SymbolStr) -> TypeRef {
-        // Always qualify: decl_index stores only qualified names.
+        // Try current module's qualified name first.
         const qualified: SymbolStr = this.ctx.qualify_symbol_sym(name);
-        return this.ctx.decl_index.lookup_type(qualified);
+        const q_ty: TypeRef = this.ctx.decl_index.lookup_type(qualified);
+        if (q_ty.is_valid()) { return q_ty; }
+        // Cross-module fallback: resolve through scope chain.
+        const cross_sym: SymbolStr = this.resolve_cross_module_name(name);
+        if (cross_sym.is_valid()) {
+            return this.ctx.decl_index.lookup_type(cross_sym);
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Resolve a bare name to its original module-qualified form by looking
+    /// up the symbol in the Resolver's scope chain.  Returns the qualified
+    /// name (e.g. "Math::Vec2::Vec2") or empty if not found.
+    resolve_cross_module_name(&this, name: SymbolStr) -> SymbolStr {
+        const resolver: Resolver* = this.ctx.get_resolver();
+        if (resolver == null) { return SymbolStr::empty(); }
+        return resolver.resolve_type_qualified_name(name);
     }
 
     lookup_global_var(&this, name: SymbolStr) -> TypeRef {
@@ -184,16 +202,11 @@ public:
         this.locals.insert(key, ty, h);
     }
 
-    /// Write a resolved type back to the Resolver's Symbol using the
-    /// ResolutionMap (span → SymbolID).  This keeps the Resolver as the
-    /// canonical source of truth for every symbol's type.
-    sync_to_resolver(mut &this, span: SourceSpan, ty: TypeRef) -> void {
-        if (!ty.is_valid()) { return; }
-        const sym_id: SymbolID = this.resolver.resolve(span);
-        if (sym_id.is_valid()) {
-            this.resolver.update_symbol_type(sym_id, ty);
-        }
-    }
+    // NOTE: sync_to_resolver() was removed.  The DeclarationIndex is now the
+    // single source of truth for declaration-level type lookups (functions,
+    // methods, named types, globals).  Per-function types (params, locals)
+    // are tracked exclusively through the locals HashMap on this visitor.
+    // There is no longer a dual-write to Resolver Symbol.type_ref.
 
     /// Roll back local variable bindings to a previous checkpoint,
     /// restoring any shadowed outer-scope variables.
@@ -305,8 +318,6 @@ public:
             if (param == null) { continue; }
             if (param.resolved_type.is_valid()) {
                 this.register_local(param.name, param.resolved_type);
-                // Write back to the Resolver so the Symbol has the canonical type
-                this.sync_to_resolver(param.span, param.resolved_type);
             }
         }
 
@@ -494,9 +505,6 @@ public:
         }
         if (var_node.resolved_type.is_valid()) {
             this.register_local(var_node.name, var_node.resolved_type);
-            // Write back to the Resolver — covers both annotated types
-            // (already set by TypeResolution) and inferred types (just set above).
-            this.sync_to_resolver(var_node.span, var_node.resolved_type);
         }
     }
 
@@ -557,7 +565,6 @@ public:
                 }
                 if (var_node.resolved_type.is_valid()) {
                     this.register_local(var_node.name, var_node.resolved_type);
-                    this.sync_to_resolver(var_node.span, var_node.resolved_type);
                 }
             } else if (node.init.kind == NodeKind::ExpressionStatement) {
                 const es: ExprStmtNode* = node.init as ExprStmtNode*;
@@ -687,21 +694,14 @@ public:
         if (ident.name.equals(this.this_sym) && this.this_type.is_valid()) {
             return this.this_type;
         }
-        // Fast path: check the local scope HashMap (covers params + locals
-        // registered during this function's type-check walk).
+        // Check the local scope HashMap (covers params + locals registered
+        // during this function's type-check walk via enter_function and
+        // visit(DeclStmtNode*)).
         const local: TypeRef = this.lookup_local(ident.name);
         if (local.is_valid()) { return local; }
 
-        // Resolver fallback: if NameResolution recorded this identifier's
-        // span → SymbolID, check whether TypeResolution already filled the
-        // Symbol's type_ref (e.g., a variable with an explicit annotation
-        // that Sema hasn't walked through register_local yet).
-        const sym_id: SymbolID = this.resolver.resolve(ident.span);
-        if (sym_id.is_valid()) {
-            const sym_type: TypeRef = this.resolver.get_symbol_type(sym_id);
-            if (sym_type.is_valid()) { return sym_type; }
-        }
-
+        // Global variables are stored in the DeclarationIndex (single source
+        // of truth for declaration-level type lookups).
         const global: TypeRef = this.lookup_global_var(ident.name);
         if (global.is_valid()) { return global; }
 

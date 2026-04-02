@@ -1199,14 +1199,14 @@ Since enums in Cryo cannot contain methods inline (unlike structs), you add meth
 ```cryo
 implement enum Option<T> {
     is_some(&this) -> boolean {
-        match (&this) {
+        match (this) {
             Option::Some(_) => { return true; }
             Option::None    => { return false; }
         }
     }
 
     unwrap(&this) -> T {
-        match (&this) {
+        match (this) {
             Option::Some(value) => { return value; }
             Option::None => {
                 panic("called unwrap() on None", FILE, LINE);
@@ -1215,14 +1215,14 @@ implement enum Option<T> {
     }
 
     unwrap_or(&this, default_value: T) -> T {
-        match (&this) {
+        match (this) {
             Option::Some(value) => { return value; }
             Option::None        => { return default_value; }
         }
     }
 
     map<U>(&this, f: (T) -> U) -> Option<U> {
-        match (&this) {
+        match (this) {
             Option::Some(value) => { return Option::Some(f(value)); }
             Option::None        => { return Option::None; }
         }
@@ -1390,21 +1390,21 @@ When you add methods to a generic type via an `implement` block, the block itsel
 ```cryo
 implement enum Result<T, E> {
     is_ok(&this) -> boolean {
-        match (&this) {
+        match (this) {
             Result::Ok(_)  => { return true; }
             Result::Err(_) => { return false; }
         }
     }
 
     map<U>(&this, op: (T) -> U) -> Result<U, E> {
-        match (&this) {
+        match (this) {
             Result::Ok(value)  => { return Result::Ok(op(value)); }
             Result::Err(err)   => { return Result::Err(err); }
         }
     }
 
     and_then<U>(&this, op: (T) -> Result<U, E>) -> Result<U, E> {
-        match (&this) {
+        match (this) {
             Result::Ok(value) => { return op(value); }
             Result::Err(err)  => { return Result::Err(err); }
         }
@@ -1458,7 +1458,7 @@ Implement blocks let you add methods to a type without modifying its original de
 ```cryo
 implement enum Color {
     to_string(&this) -> string {
-        match (&this) {
+        match (this) {
             Color::Red   => { return "red"; }
             Color::Green => { return "green"; }
             Color::Blue  => { return "blue"; }

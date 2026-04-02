@@ -285,8 +285,8 @@ namespace Cryo
         if (contains_generic_params(expected_type))
         {
             LOG_DEBUG(LogComponent::GENERAL,
-                "TypeResolutionPass: Skipping propagation of generic type '{}' (contains unresolved params)",
-                expected_type->display_name());
+                      "TypeResolutionPass: Skipping propagation of generic type '{}' (contains unresolved params)",
+                      expected_type->display_name());
             return;
         }
 
@@ -295,8 +295,8 @@ namespace Cryo
         resolved_count++;
 
         LOG_DEBUG(LogComponent::GENERAL,
-            "TypeResolutionPass: Propagated type '{}' to expression (kind={})",
-            expected_type->display_name(), static_cast<int>(expr->kind()));
+                  "TypeResolutionPass: Propagated type '{}' to expression (kind={})",
+                  expected_type->display_name(), static_cast<int>(expr->kind()));
     }
 
     // ========================================================================
@@ -346,8 +346,8 @@ namespace Cryo
             if (current_name == ann->name || current_name == ann_name)
             {
                 LOG_DEBUG(LogComponent::GENERAL,
-                    "TypeResolutionPass: Type '{}' appears to be a placeholder for annotation '{}', needs resolution",
-                    current_name, ann->to_string());
+                          "TypeResolutionPass: Type '{}' appears to be a placeholder for annotation '{}', needs resolution",
+                          current_name, ann->to_string());
                 return true;
             }
         }
@@ -393,8 +393,8 @@ namespace Cryo
                     var_decl->set_resolved_type(resolved);
                     resolved_count++;
                     LOG_DEBUG(LogComponent::GENERAL,
-                        "TypeResolutionPass: Resolved local variable '{}' type to '{}'",
-                        var_decl->name(), resolved->display_name());
+                              "TypeResolutionPass: Resolved local variable '{}' type to '{}'",
+                              var_decl->name(), resolved->display_name());
                 }
                 else
                 {
@@ -424,8 +424,8 @@ namespace Cryo
                         var_decl->set_resolved_type(resolved);
                         resolved_count++;
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Resolved local variable '{}' type to '{}'",
-                            var_decl->name(), resolved->display_name());
+                                  "TypeResolutionPass: Resolved local variable '{}' type to '{}'",
+                                  var_decl->name(), resolved->display_name());
                     }
                     else
                     {
@@ -517,7 +517,7 @@ namespace Cryo
         TypeResolver resolver(arena, module_registry, generic_registry, ctx.diagnostics());
 
         LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: GenericRegistry has {} templates",
-            generic_registry.template_count());
+                  generic_registry.template_count());
 
         // Set up resolution context with the actual module identity
         ResolutionContext res_ctx;
@@ -527,8 +527,8 @@ namespace Cryo
         {
             res_ctx.current_module = symbols->current_module();
             LOG_DEBUG(LogComponent::GENERAL,
-                "TypeResolutionPass: Using module ID {} from SymbolTable",
-                res_ctx.current_module.id);
+                      "TypeResolutionPass: Using module ID {} from SymbolTable",
+                      res_ctx.current_module.id);
         }
 
         // Register all imported type symbols from the SymbolTable into the
@@ -540,7 +540,8 @@ namespace Cryo
         if (symbols && res_ctx.current_module.is_valid())
         {
             size_t registered_imports = 0;
-            symbols->for_each_symbol([&](const Symbol &sym) {
+            symbols->for_each_symbol([&](const Symbol &sym)
+                                     {
                 if (sym.kind == SymbolKind::Type && sym.type.is_valid() && !sym.type.is_error())
                 {
                     // Skip types that are generic templates — those are handled
@@ -551,11 +552,10 @@ namespace Cryo
 
                     module_registry.register_type(res_ctx.current_module, sym.name, sym.type);
                     registered_imports++;
-                }
-            });
+                } });
             LOG_DEBUG(LogComponent::GENERAL,
-                "TypeResolutionPass: Registered {} imported type symbols in module {}",
-                registered_imports, res_ctx.current_module.id);
+                      "TypeResolutionPass: Registered {} imported type symbols in module {}",
+                      registered_imports, res_ctx.current_module.id);
         }
 
         size_t resolved_count = 0;
@@ -574,8 +574,8 @@ namespace Cryo
                 {
                     module_registry.register_type(res_ctx.current_module, struct_decl->name(), struct_type);
                     LOG_DEBUG(LogComponent::GENERAL,
-                        "TypeResolutionPass: Pre-registered struct '{}' in module registry",
-                        struct_decl->name());
+                              "TypeResolutionPass: Pre-registered struct '{}' in module registry",
+                              struct_decl->name());
                 }
             }
             // Pre-register class types
@@ -586,8 +586,8 @@ namespace Cryo
                 {
                     module_registry.register_type(res_ctx.current_module, class_decl->name(), class_type);
                     LOG_DEBUG(LogComponent::GENERAL,
-                        "TypeResolutionPass: Pre-registered class '{}' in module registry",
-                        class_decl->name());
+                              "TypeResolutionPass: Pre-registered class '{}' in module registry",
+                              class_decl->name());
                 }
             }
             // Pre-register enum types
@@ -598,8 +598,8 @@ namespace Cryo
                 {
                     module_registry.register_type(res_ctx.current_module, enum_decl->name(), enum_type);
                     LOG_DEBUG(LogComponent::GENERAL,
-                        "TypeResolutionPass: Pre-registered enum '{}' in module registry",
-                        enum_decl->name());
+                              "TypeResolutionPass: Pre-registered enum '{}' in module registry",
+                              enum_decl->name());
                 }
             }
             // Pre-register type aliases
@@ -641,13 +641,13 @@ namespace Cryo
                 {
                     module_registry.register_type_alias_base(alias_name, base_type_name);
                     LOG_DEBUG(LogComponent::GENERAL,
-                        "TypeResolutionPass: Registered type alias base '{}' -> '{}'",
-                        alias_name, base_type_name);
+                              "TypeResolutionPass: Registered type alias base '{}' -> '{}'",
+                              alias_name, base_type_name);
                 }
 
                 LOG_DEBUG(LogComponent::GENERAL,
-                    "TypeResolutionPass: Found type alias '{}' (will resolve in phase 2)",
-                    alias_decl->alias_name());
+                          "TypeResolutionPass: Found type alias '{}' (will resolve in phase 2)",
+                          alias_decl->alias_name());
             }
         }
         LOG_DEBUG(LogComponent::GENERAL, "TypeResolutionPass: Phase 1 complete - all types pre-registered");
@@ -676,8 +676,8 @@ namespace Cryo
                             TypeRef param_type = arena.create_generic_param(generic_params[i], i);
                             alias_ctx.bind_generic(generic_params[i], param_type);
                             LOG_DEBUG(LogComponent::GENERAL,
-                                "TypeResolutionPass: (2a) Bound generic param '{}' (index {}) for type alias '{}'",
-                                generic_params[i], i, alias_decl->alias_name());
+                                      "TypeResolutionPass: (2a) Bound generic param '{}' (index {}) for type alias '{}'",
+                                      generic_params[i], i, alias_decl->alias_name());
                         }
                     }
 
@@ -687,8 +687,8 @@ namespace Cryo
                         alias_decl->set_resolved_target_type(resolved);
                         resolved_count++;
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: (2a) Resolved type alias '{}' target to '{}'",
-                            alias_decl->alias_name(), resolved->display_name());
+                                  "TypeResolutionPass: (2a) Resolved type alias '{}' target to '{}'",
+                                  alias_decl->alias_name(), resolved->display_name());
 
                         // Only register non-generic type aliases in the module registry
                         // Generic type aliases are handled by the GenericRegistry
@@ -701,8 +701,8 @@ namespace Cryo
                     {
                         error_count++;
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: (2a) Failed to resolve type alias '{}' target: {}",
-                            alias_decl->alias_name(), resolved->display_name());
+                                  "TypeResolutionPass: (2a) Failed to resolve type alias '{}' target: {}",
+                                  alias_decl->alias_name(), resolved->display_name());
                     }
                 }
                 // Handle already-resolved type aliases (register in module registry)
@@ -713,8 +713,8 @@ namespace Cryo
                         TypeRef target_type = alias_decl->get_resolved_target_type();
                         module_registry.register_type(res_ctx.current_module, alias_decl->alias_name(), target_type);
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: (2a) Registered pre-resolved type alias '{}' -> '{}'",
-                            alias_decl->alias_name(), target_type->display_name());
+                                  "TypeResolutionPass: (2a) Registered pre-resolved type alias '{}' -> '{}'",
+                                  alias_decl->alias_name(), target_type->display_name());
                     }
                 }
             }
@@ -762,8 +762,8 @@ namespace Cryo
                         TypeRef param_type = arena.create_generic_param(param_names[i], i);
                         impl_ctx.bind_generic(param_names[i], param_type);
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Bound generic param '{}' (index {}) for impl block '{}'",
-                            param_names[i], i, target);
+                                  "TypeResolutionPass: Bound generic param '{}' (index {}) for impl block '{}'",
+                                  param_names[i], i, target);
                     }
                 }
 
@@ -787,8 +787,8 @@ namespace Cryo
                             TypeRef param_type = arena.create_generic_param(param_name, impl_param_count + i);
                             method_ctx.bind_generic(param_name, param_type);
                             LOG_DEBUG(LogComponent::GENERAL,
-                                "TypeResolutionPass: Bound impl method generic param '{}' (index {}) for '{}::{}'",
-                                param_name, impl_param_count + i, target, method->name());
+                                      "TypeResolutionPass: Bound impl method generic param '{}' (index {}) for '{}::{}'",
+                                      param_name, impl_param_count + i, target, method->name());
                         }
                     }
 
@@ -802,15 +802,15 @@ namespace Cryo
                             method->set_resolved_return_type(resolved);
                             resolved_count++;
                             LOG_DEBUG(LogComponent::GENERAL,
-                                "TypeResolutionPass: Resolved method '{}' return type to '{}'",
-                                method->name(), resolved->display_name());
+                                      "TypeResolutionPass: Resolved method '{}' return type to '{}'",
+                                      method->name(), resolved->display_name());
                         }
                         else
                         {
                             error_count++;
                             LOG_DEBUG(LogComponent::GENERAL,
-                                "TypeResolutionPass: Could not resolve method '{}' return type: {}",
-                                method->name(), resolved->display_name());
+                                      "TypeResolutionPass: Could not resolve method '{}' return type: {}",
+                                      method->name(), resolved->display_name());
                         }
                     }
 
@@ -844,8 +844,8 @@ namespace Cryo
                                 {
                                     needs_reconstruction = true;
                                     LOG_DEBUG(LogComponent::GENERAL,
-                                        "TypeResolutionPass: 'this' type '{}' for generic impl '{}::{}' needs reconstruction",
-                                        current_type->display_name(), impl->target_type(), method->name());
+                                              "TypeResolutionPass: 'this' type '{}' for generic impl '{}::{}' needs reconstruction",
+                                              current_type->display_name(), impl->target_type(), method->name());
                                 }
                             }
 
@@ -902,14 +902,14 @@ namespace Cryo
                                         param->set_resolved_type(this_type);
                                         resolved_count++;
                                         LOG_DEBUG(LogComponent::GENERAL,
-                                            "TypeResolutionPass: Resolved generic 'this' param for impl '{}::{}' to '{}'",
-                                            target, method->name(), this_type->display_name());
+                                                  "TypeResolutionPass: Resolved generic 'this' param for impl '{}::{}' to '{}'",
+                                                  target, method->name(), this_type->display_name());
                                     }
                                     else
                                     {
                                         LOG_DEBUG(LogComponent::GENERAL,
-                                            "TypeResolutionPass: Could not resolve generic 'this' type for impl '{}::{}' (resolved to error: {})",
-                                            target, method->name(), resolved_type.is_valid() ? resolved_type->display_name() : "<invalid>");
+                                                  "TypeResolutionPass: Could not resolve generic 'this' type for impl '{}::{}' (resolved to error: {})",
+                                                  target, method->name(), resolved_type.is_valid() ? resolved_type->display_name() : "<invalid>");
                                     }
                                 }
                                 else
@@ -927,7 +927,7 @@ namespace Cryo
                                         if (base_type.is_valid() && !base_type.is_error())
                                         {
                                             LOG_DEBUG(LogComponent::GENERAL,
-                                                "TypeResolutionPass: Found '{}' via symbol table enum lookup", base_name);
+                                                      "TypeResolutionPass: Found '{}' via symbol table enum lookup", base_name);
                                         }
                                     }
 
@@ -938,7 +938,7 @@ namespace Cryo
                                         if (base_type.is_valid() && !base_type.is_error())
                                         {
                                             LOG_DEBUG(LogComponent::GENERAL,
-                                                "TypeResolutionPass: Found '{}' via symbol table struct lookup", base_name);
+                                                      "TypeResolutionPass: Found '{}' via symbol table struct lookup", base_name);
                                         }
                                     }
 
@@ -949,7 +949,7 @@ namespace Cryo
                                         if (base_type.is_valid() && !base_type.is_error())
                                         {
                                             LOG_DEBUG(LogComponent::GENERAL,
-                                                "TypeResolutionPass: Found '{}' via symbol table class lookup", base_name);
+                                                      "TypeResolutionPass: Found '{}' via symbol table class lookup", base_name);
                                         }
                                     }
 
@@ -961,7 +961,7 @@ namespace Cryo
                                         {
                                             base_type = sym->type;
                                             LOG_DEBUG(LogComponent::GENERAL,
-                                                "TypeResolutionPass: Found '{}' via direct symbol lookup", base_name);
+                                                      "TypeResolutionPass: Found '{}' via direct symbol lookup", base_name);
                                         }
                                     }
 
@@ -972,14 +972,14 @@ namespace Cryo
                                         param->set_resolved_type(this_type);
                                         resolved_count++;
                                         LOG_DEBUG(LogComponent::GENERAL,
-                                            "TypeResolutionPass: Resolved 'this' param for impl '{}::{}' to '{}'",
-                                            target, method->name(), this_type->display_name());
+                                                  "TypeResolutionPass: Resolved 'this' param for impl '{}::{}' to '{}'",
+                                                  target, method->name(), this_type->display_name());
                                     }
                                     else
                                     {
                                         LOG_DEBUG(LogComponent::GENERAL,
-                                            "TypeResolutionPass: Could not resolve 'this' type for impl '{}::{}' (base '{}' not found in arena or symbol table)",
-                                            target, method->name(), base_name);
+                                                  "TypeResolutionPass: Could not resolve 'this' type for impl '{}::{}' (base '{}' not found in arena or symbol table)",
+                                                  target, method->name(), base_name);
                                     }
                                 }
                             }
@@ -995,8 +995,8 @@ namespace Cryo
                                     param->set_resolved_type(resolved);
                                     resolved_count++;
                                     LOG_DEBUG(LogComponent::GENERAL,
-                                        "TypeResolutionPass: Resolved impl param '{}::{}' type to '{}'",
-                                        method->name(), param->name(), resolved->display_name());
+                                              "TypeResolutionPass: Resolved impl param '{}::{}' type to '{}'",
+                                              method->name(), param->name(), resolved->display_name());
                                 }
                             }
                         }
@@ -1020,8 +1020,8 @@ namespace Cryo
                         TypeRef param_type = arena.create_generic_param(param_name, i);
                         struct_ctx.bind_generic(param_name, param_type);
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Bound generic param '{}' (index {}) for struct '{}'",
-                            param_name, i, struct_decl->name());
+                                  "TypeResolutionPass: Bound generic param '{}' (index {}) for struct '{}'",
+                                  param_name, i, struct_decl->name());
                     }
                 }
 
@@ -1037,8 +1037,8 @@ namespace Cryo
                         // during method return type resolution (for self-referential types)
                         module_registry.register_type(struct_ctx.current_module, struct_decl->name(), struct_type);
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Registered struct '{}' in module registry for self-reference",
-                            struct_decl->name());
+                                  "TypeResolutionPass: Registered struct '{}' in module registry for self-reference",
+                                  struct_decl->name());
                     }
                 }
 
@@ -1060,8 +1060,8 @@ namespace Cryo
                             TypeRef param_type = arena.create_generic_param(param_name, base_index + i);
                             method_ctx.bind_generic(param_name, param_type);
                             LOG_DEBUG(LogComponent::GENERAL,
-                                "TypeResolutionPass: Bound method generic param '{}' (index {}) for '{}::{}'",
-                                param_name, base_index + i, struct_decl->name(), method->name());
+                                      "TypeResolutionPass: Bound method generic param '{}' (index {}) for '{}::{}'",
+                                      param_name, base_index + i, struct_decl->name(), method->name());
                         }
                     }
 
@@ -1070,23 +1070,23 @@ namespace Cryo
                     if (ann && type_needs_resolution(method->get_resolved_return_type(), ann))
                     {
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Attempting to resolve '{}::{}' annotation='{}' kind={}",
-                            struct_decl->name(), method->name(), ann->to_string(), static_cast<int>(ann->kind));
+                                  "TypeResolutionPass: Attempting to resolve '{}::{}' annotation='{}' kind={}",
+                                  struct_decl->name(), method->name(), ann->to_string(), static_cast<int>(ann->kind));
                         TypeRef resolved = resolver.resolve(*ann, method_ctx);
                         if (!resolved.is_error())
                         {
                             method->set_resolved_return_type(resolved);
                             resolved_count++;
                             LOG_DEBUG(LogComponent::GENERAL,
-                                "TypeResolutionPass: Resolved struct method '{}::{}' return type to '{}'",
-                                struct_decl->name(), method->name(), resolved->display_name());
+                                      "TypeResolutionPass: Resolved struct method '{}::{}' return type to '{}'",
+                                      struct_decl->name(), method->name(), resolved->display_name());
                         }
                         else
                         {
                             error_count++;
                             LOG_DEBUG(LogComponent::GENERAL,
-                                "TypeResolutionPass: Failed to resolve '{}::{}' annotation='{}': {}",
-                                struct_decl->name(), method->name(), ann->to_string(), resolved->display_name());
+                                      "TypeResolutionPass: Failed to resolve '{}::{}' annotation='{}': {}",
+                                      struct_decl->name(), method->name(), ann->to_string(), resolved->display_name());
                         }
                     }
 
@@ -1102,15 +1102,15 @@ namespace Cryo
                                 param->set_resolved_type(resolved);
                                 resolved_count++;
                                 LOG_DEBUG(LogComponent::GENERAL,
-                                    "TypeResolutionPass: Resolved param '{}::{}::{}' type to '{}'",
-                                    struct_decl->name(), method->name(), param->name(), resolved->display_name());
+                                          "TypeResolutionPass: Resolved param '{}::{}::{}' type to '{}'",
+                                          struct_decl->name(), method->name(), param->name(), resolved->display_name());
                             }
                             else
                             {
                                 error_count++;
                                 LOG_DEBUG(LogComponent::GENERAL,
-                                    "TypeResolutionPass: Failed to resolve param '{}::{}::{}' type",
-                                    struct_decl->name(), method->name(), param->name());
+                                          "TypeResolutionPass: Failed to resolve param '{}::{}::{}' type",
+                                          struct_decl->name(), method->name(), param->name());
                             }
                         }
                     }
@@ -1123,23 +1123,23 @@ namespace Cryo
                     if (ann && (!field->has_resolved_type() || field->get_resolved_type().is_error()))
                     {
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Attempting to resolve field '{}::{}' annotation='{}' kind={}",
-                            struct_decl->name(), field->name(), ann->to_string(), static_cast<int>(ann->kind));
+                                  "TypeResolutionPass: Attempting to resolve field '{}::{}' annotation='{}' kind={}",
+                                  struct_decl->name(), field->name(), ann->to_string(), static_cast<int>(ann->kind));
                         TypeRef resolved = resolver.resolve(*ann, struct_ctx);
                         if (!resolved.is_error())
                         {
                             field->set_resolved_type(resolved);
                             resolved_count++;
                             LOG_DEBUG(LogComponent::GENERAL,
-                                "TypeResolutionPass: Resolved struct field '{}::{}' type to '{}'",
-                                struct_decl->name(), field->name(), resolved->display_name());
+                                      "TypeResolutionPass: Resolved struct field '{}::{}' type to '{}'",
+                                      struct_decl->name(), field->name(), resolved->display_name());
                         }
                         else
                         {
                             error_count++;
                             LOG_DEBUG(LogComponent::GENERAL,
-                                "TypeResolutionPass: Failed to resolve field '{}::{}' annotation='{}': {}",
-                                struct_decl->name(), field->name(), ann->to_string(), resolved->display_name());
+                                      "TypeResolutionPass: Failed to resolve field '{}::{}' annotation='{}': {}",
+                                      struct_decl->name(), field->name(), ann->to_string(), resolved->display_name());
                         }
                     }
                 }
@@ -1161,8 +1161,8 @@ namespace Cryo
                         TypeRef param_type = arena.create_generic_param(param_name, i);
                         func_ctx.bind_generic(param_name, param_type);
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Bound generic param '{}' (index {}) for function '{}'",
-                            param_name, i, func->name());
+                                  "TypeResolutionPass: Bound generic param '{}' (index {}) for function '{}'",
+                                  param_name, i, func->name());
                     }
                 }
 
@@ -1176,8 +1176,8 @@ namespace Cryo
                         func->set_resolved_return_type(resolved);
                         resolved_count++;
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Resolved function '{}' return type to '{}'",
-                            func->name(), resolved->display_name());
+                                  "TypeResolutionPass: Resolved function '{}' return type to '{}'",
+                                  func->name(), resolved->display_name());
                     }
                     else
                     {
@@ -1197,8 +1197,8 @@ namespace Cryo
                             param->set_resolved_type(resolved);
                             resolved_count++;
                             LOG_DEBUG(LogComponent::GENERAL,
-                                "TypeResolutionPass: Resolved func param '{}::{}' type to '{}'",
-                                func->name(), param->name(), resolved->display_name());
+                                      "TypeResolutionPass: Resolved func param '{}::{}' type to '{}'",
+                                      func->name(), param->name(), resolved->display_name());
                         }
                     }
                 }
@@ -1215,15 +1215,15 @@ namespace Cryo
                         var_decl->set_resolved_type(resolved);
                         resolved_count++;
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Resolved global variable '{}' type to '{}'",
-                            var_decl->name(), resolved->display_name());
+                                  "TypeResolutionPass: Resolved global variable '{}' type to '{}'",
+                                  var_decl->name(), resolved->display_name());
                     }
                     else
                     {
                         error_count++;
                         LOG_DEBUG(LogComponent::GENERAL,
-                            "TypeResolutionPass: Failed to resolve global variable '{}' type annotation '{}'",
-                            var_decl->name(), ann->to_string());
+                                  "TypeResolutionPass: Failed to resolve global variable '{}' type annotation '{}'",
+                                  var_decl->name(), ann->to_string());
                     }
                 }
             }
@@ -1361,8 +1361,8 @@ namespace Cryo
             if (!imported_asts.empty() && !local_names.empty())
             {
                 LOG_DEBUG(LogComponent::GENERAL,
-                    "TypeResolutionPass: Phase 4 - Resolving types in {} imported local module ASTs",
-                    local_names.size());
+                          "TypeResolutionPass: Phase 4 - Resolving types in {} imported local module ASTs",
+                          local_names.size());
 
                 for (const auto &[mod_name, ast_ptr] : imported_asts)
                 {
@@ -1388,7 +1388,7 @@ namespace Cryo
                         continue;
 
                     LOG_DEBUG(LogComponent::GENERAL,
-                        "TypeResolutionPass: Phase 4 - Processing imported module '{}'", mod_name);
+                              "TypeResolutionPass: Phase 4 - Processing imported module '{}'", mod_name);
 
                     // --- Phase 2b equivalent: resolve type annotations ---
                     for (auto &stmt : ast_ptr->statements())
@@ -1728,15 +1728,15 @@ namespace Cryo
                                     var_decl->set_resolved_type(resolved);
                                     resolved_count++;
                                     LOG_DEBUG(LogComponent::GENERAL,
-                                        "TypeResolutionPass: Phase 4 - Resolved global variable '{}' type to '{}' in module '{}'",
-                                        var_decl->name(), resolved->display_name(), mod_name);
+                                              "TypeResolutionPass: Phase 4 - Resolved global variable '{}' type to '{}' in module '{}'",
+                                              var_decl->name(), resolved->display_name(), mod_name);
                                 }
                                 else
                                 {
                                     error_count++;
                                     LOG_DEBUG(LogComponent::GENERAL,
-                                        "TypeResolutionPass: Phase 4 - Failed to resolve global variable '{}' type in module '{}'",
-                                        var_decl->name(), mod_name);
+                                              "TypeResolutionPass: Phase 4 - Failed to resolve global variable '{}' type in module '{}'",
+                                              var_decl->name(), mod_name);
                                 }
                             }
                         }
@@ -1744,13 +1744,13 @@ namespace Cryo
                 }
 
                 LOG_DEBUG(LogComponent::GENERAL,
-                    "TypeResolutionPass: Phase 4 complete - resolved {} types total, {} errors total",
-                    resolved_count, error_count);
+                          "TypeResolutionPass: Phase 4 complete - resolved {} types total, {} errors total",
+                          resolved_count, error_count);
             }
         }
 
         LOG_DEBUG(LogComponent::GENERAL,
-            "TypeResolutionPass: Resolved {} types, {} errors", resolved_count, error_count);
+                  "TypeResolutionPass: Resolved {} types, {} errors", resolved_count, error_count);
 
         return PassResult::ok({PassProvides::TYPES_RESOLVED});
     }
@@ -1894,9 +1894,9 @@ namespace Cryo
                 {
                     has_changes = true;
                     LOG_DEBUG(LogComponent::GENERAL,
-                        "StructFieldTypeSyncPass: Updated field '{}::{}' type to '{}' (TypeID={})",
-                        struct_decl->name(), field->name(), resolved_type->display_name(),
-                        resolved_type.id().id);
+                              "StructFieldTypeSyncPass: Updated field '{}::{}' type to '{}' (TypeID={})",
+                              struct_decl->name(), field->name(), resolved_type->display_name(),
+                              resolved_type.id().id);
                 }
             }
             else
@@ -1906,8 +1906,8 @@ namespace Cryo
                 if (existing_field && existing_field->type.is_valid())
                 {
                     new_fields.emplace_back(existing_field->name, existing_field->type,
-                                           existing_field->offset, existing_field->is_public,
-                                           existing_field->is_mutable);
+                                            existing_field->offset, existing_field->is_public,
+                                            existing_field->is_mutable);
                 }
                 else
                 {
@@ -1917,8 +1917,8 @@ namespace Cryo
                     new_fields.emplace_back(field->name(), TypeRef{}, 0, true, field->is_mutable());
                     has_changes = true;
                     LOG_WARN(LogComponent::GENERAL,
-                        "StructFieldTypeSyncPass: Field '{}::{}' still unresolved after TypeResolutionPass (kept with placeholder)",
-                        struct_decl->name(), field->name());
+                             "StructFieldTypeSyncPass: Field '{}::{}' still unresolved after TypeResolutionPass (kept with placeholder)",
+                             struct_decl->name(), field->name());
                 }
             }
         }
@@ -1928,8 +1928,8 @@ namespace Cryo
         {
             struct_ptr->set_fields(std::move(new_fields));
             LOG_DEBUG(LogComponent::GENERAL,
-                "StructFieldTypeSyncPass: Updated StructType '{}' with {} fields",
-                struct_decl->name(), struct_decl->fields().size());
+                      "StructFieldTypeSyncPass: Updated StructType '{}' with {} fields",
+                      struct_decl->name(), struct_decl->fields().size());
         }
     }
 
@@ -1999,9 +1999,9 @@ namespace Cryo
                 {
                     has_changes = true;
                     LOG_DEBUG(LogComponent::GENERAL,
-                        "StructFieldTypeSyncPass: Updated field '{}::{}' type to '{}' (TypeID={})",
-                        class_decl->name(), field->name(), resolved_type->display_name(),
-                        resolved_type.id().id);
+                              "StructFieldTypeSyncPass: Updated field '{}::{}' type to '{}' (TypeID={})",
+                              class_decl->name(), field->name(), resolved_type->display_name(),
+                              resolved_type.id().id);
                 }
             }
             else
@@ -2011,8 +2011,8 @@ namespace Cryo
                 if (existing_field && existing_field->type.is_valid())
                 {
                     new_fields.emplace_back(existing_field->name, existing_field->type,
-                                           existing_field->offset, existing_field->is_public,
-                                           existing_field->is_mutable);
+                                            existing_field->offset, existing_field->is_public,
+                                            existing_field->is_mutable);
                 }
                 else
                 {
@@ -2022,8 +2022,8 @@ namespace Cryo
                     new_fields.emplace_back(field->name(), TypeRef{}, 0, true, field->is_mutable());
                     has_changes = true;
                     LOG_WARN(LogComponent::GENERAL,
-                        "StructFieldTypeSyncPass: Field '{}::{}' still unresolved after TypeResolutionPass (kept with placeholder)",
-                        class_decl->name(), field->name());
+                             "StructFieldTypeSyncPass: Field '{}::{}' still unresolved after TypeResolutionPass (kept with placeholder)",
+                             class_decl->name(), field->name());
                 }
             }
         }
@@ -2033,8 +2033,8 @@ namespace Cryo
         {
             class_ptr->set_fields(std::move(new_fields));
             LOG_DEBUG(LogComponent::GENERAL,
-                "StructFieldTypeSyncPass: Updated ClassType '{}' with {} fields",
-                class_decl->name(), class_decl->fields().size());
+                      "StructFieldTypeSyncPass: Updated ClassType '{}' with {} fields",
+                      class_decl->name(), class_decl->fields().size());
         }
     }
 
@@ -2287,7 +2287,7 @@ namespace Cryo
             {
                 TypeRef match_type = match_expr->get_resolved_type();
 
-                // Unwrap reference types (e.g., match (&this) where &this is &Maybe<T>)
+                // Unwrap reference types (e.g., match (this) where &this is &Maybe<T>)
                 if (match_type.is_valid() && match_type->kind() == TypeKind::Reference)
                 {
                     auto *ref_type = static_cast<const ReferenceType *>(match_type.get());
