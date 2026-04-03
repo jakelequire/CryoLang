@@ -981,14 +981,19 @@ public:
 
         // Build module path incrementally: A::B::C
         // Accept keywords as path segments (e.g., import collections::string)
-        mut qn: QualifiedName = QualifiedName::empty();
+        //
+        // NOTE: We build the path string via intern() at each step to pin
+        // intermediate results on the heap.  QualifiedName::display() uses
+        // string::append() + InternTable::resolve(), which share a static
+        // sprintf buffer and corrupt multi-segment paths via aliasing.
         mut first_tok: Token = this.current();
         if (first_tok.kind == TokenType::Identifier || first_tok.kind.is_keyword()) {
             this.advance();
         } else {
             first_tok = this.consume(TokenType::Identifier, "module name");
         }
-        qn.push(this.ctx.get_intern_table(), first_tok.lexeme);
+        // Intern the first segment to get a heap-pinned copy
+        mut path_sym: SymbolStr = this.ctx.intern(first_tok.lexeme);
 
         while (this.check(TokenType::ColonColon)) {
             this.advance();
@@ -997,8 +1002,9 @@ public:
             if (next.kind == TokenType::Star) {
                 // Wildcard import: import A::B::*
                 this.advance();
-                const path: string = qn.display(this.ctx.get_intern_table()) + "::*";
-                mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Wildcard, this.span_from_token(start));
+                const pinned: string = this.ctx.resolve_str(path_sym);
+                const star_path: string = sprintf("%s::*", pinned);
+                mut imp: ImportDeclNode* = new ImportDeclNode(star_path, ImportStyle::Wildcard, this.span_from_token(start));
                 this.consume(TokenType::Semicolon, "';'");
                 imp.span = this.span_from(start);
                 return imp;
@@ -1006,7 +1012,7 @@ public:
             if (next.kind == TokenType::LBrace) {
                 // Selective import: import A::B::{X, Y}
                 this.advance(); // consume '{'
-                const path: string = qn.display(this.ctx.get_intern_table());
+                const path: string = this.ctx.resolve_str(path_sym);
                 mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Specific, this.span_from_token(start));
                 while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
                     const item_tok: Token = this.consume(TokenType::Identifier, "import name");
@@ -1018,11 +1024,13 @@ public:
                 imp.span = this.span_from(start);
                 return imp;
             }
-            qn.push(this.ctx.get_intern_table(), next.lexeme);
+            // Append "::segment" and intern to pin on the heap
+            const prev: string = this.ctx.resolve_str(path_sym);
+            path_sym = this.ctx.intern(sprintf("%s::%s", prev, next.lexeme));
             this.advance();
         }
 
-        const path: string = qn.display(this.ctx.get_intern_table());
+        const path: string = this.ctx.resolve_str(path_sym);
         mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Wildcard, this.span_from_token(start));
 
         // Optional alias: import A::B as C

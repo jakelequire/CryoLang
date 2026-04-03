@@ -319,13 +319,24 @@ type struct Monomorphizer {
         // Mark as monomorphized
         this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
 
-        // Cache the result
+        // Cache the result.
+        // origin_module is the first module that REQUESTED this instantiation
+        // (via instantiate_for_module), so GenericExpressionResolution injects
+        // each spec into the module that needs it.  Falls back to the
+        // template's module if no demand was recorded (single-file mode).
+        mut origin: SymbolStr = this.current_module;
+        const demand_modules: SymbolStr[] = this.generic_registry.get_modules_using(key);
+        if (demand_modules.length > 0) {
+            origin = demand_modules[0];
+        } else if (entry.module_name.is_valid()) {
+            origin = entry.module_name;
+        }
         const spec_entry: SpecializationEntry = SpecializationEntry {
             specialized_type:  concrete_type,
             specialized_name:  spec_name_sym,
             ast_node:          result.specialized_ast,
             impl_nodes:        result.impl_asts,
-            origin_module:     this.current_module,
+            origin_module:     origin,
         };
         const idx: i64 = this.spec_entries.length;
         this.spec_keys    = this.spec_keys + [key];
@@ -733,6 +744,7 @@ type struct Monomorphizer {
     /// method (or since construction).  Advances the injection cursor so
     /// each module receives only its new specializations, avoiding duplicate
     /// declarations in the ProgramNode during batch compilation.
+    ///
     get_new_specialized_asts(mut &this) -> ASTNode*[] {
         mut result: ASTNode*[] = [];
         for (mut i: i64 = this.injection_cursor; i < this.spec_entries.length; i++) {
