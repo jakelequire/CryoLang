@@ -124,14 +124,22 @@ public:
     }
 
     lookup_type_by_sym(&this, name: SymbolStr) -> TypeRef {
-        // Try current module's qualified name first.
+        // Try the name as-is first (handles already-qualified names from
+        // specialized impl blocks whose target_type was rewritten to the
+        // arena's qualified name during GenericExpressionResolution).
+        const direct: TypeRef = this.ctx.decl_index.lookup_type(name);
+        if (direct.is_valid()) { return direct; }
+        // Try current module's qualified name.
         const qualified: SymbolStr = this.ctx.qualify_symbol_sym(name);
-        const q_ty: TypeRef = this.ctx.decl_index.lookup_type(qualified);
-        if (q_ty.is_valid()) { return q_ty; }
+        if (!qualified.equals(name)) {
+            const q_ty: TypeRef = this.ctx.decl_index.lookup_type(qualified);
+            if (q_ty.is_valid()) { return q_ty; }
+        }
         // Cross-module fallback: resolve through scope chain.
         const cross_sym: SymbolStr = this.resolve_cross_module_name(name);
         if (cross_sym.is_valid()) {
-            return this.ctx.decl_index.lookup_type(cross_sym);
+            const cross_ty: TypeRef = this.ctx.decl_index.lookup_type(cross_sym);
+            if (cross_ty.is_valid()) { return cross_ty; }
         }
         return TypeRef::invalid();
     }
@@ -244,6 +252,39 @@ public:
     /// Register pattern bindings from a match arm as local variables.
     /// For enum patterns, each binding's type is inferred from the
     /// corresponding payload position in the enum variant definition.
+    /// Peel through Reference and InstantiatedType wrappers to find the
+    /// underlying concrete enum type.  e.g., &Option_string → Option_string,
+    /// InstantiatedType(Option, [string]) → Option_string (via resolved_type).
+    unwrap_to_enum(&this, ty: TypeRef) -> Type* {
+        if (!ty.is_valid()) { return null; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return null; }
+
+        // Peel references: &T → T
+        if (t.kind == TypeKind::Reference) {
+            const ref_t: ReferenceType* = t as ReferenceType*;
+            return this.unwrap_to_enum(ref_t.referent);
+        }
+
+        // Peel pointers: T* → T
+        if (t.kind == TypeKind::Pointer) {
+            const ptr_t: PointerType* = t as PointerType*;
+            return this.unwrap_to_enum(ptr_t.pointee);
+        }
+
+        // Dereference InstantiatedType → resolved concrete type
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                return this.unwrap_to_enum(inst.resolved_type);
+            }
+            return null;
+        }
+
+        // Already a concrete type — return it (caller checks for Enum kind)
+        return t;
+    }
+
     bind_arm_patterns(mut &this, arm: MatchArmNode*, subject_type: TypeRef) -> void {
         for (mut i: i64 = 0; i < arm.patterns.length; i++) {
             const pat: PatternNode* = arm.patterns[i];
@@ -262,19 +303,23 @@ public:
             const enum_pat: EnumPatternNode* = pat as EnumPatternNode*;
 
             // Look up variant payload types from the enum's type info.
-            // Try two paths: (1) decl_index by enum name, (2) subject_type directly.
+            // Unwrap the subject type through references and instantiations
+            // to find the concrete EnumType with resolved payload types.
             mut payload_types: TypeRef[] = [];
             mut enum_ty: Type* = null;
 
-            // Path 1: look up by pattern's enum name
-            const enum_type_ref: TypeRef = this.lookup_type_by_sym(enum_pat.enum_name);
-            if (enum_type_ref.is_valid()) {
-                enum_ty = this.arena.lookup(enum_type_ref.id);
-            }
+            // Primary path: unwrap the subject type to find the concrete enum.
+            // This handles &Option_string → Option_string, and
+            // InstantiatedType(Option, [string]) → Option_string.
+            enum_ty = this.unwrap_to_enum(subject_type);
 
-            // Path 2: fall back to the match subject's type
-            if (enum_ty == null && subject_type.is_valid()) {
-                enum_ty = this.arena.lookup(subject_type.id);
+            // Fallback: look up by pattern's enum name (works for non-generic
+            // enums where the pattern name matches the type name exactly).
+            if (enum_ty == null || enum_ty.kind != TypeKind::Enum) {
+                const enum_type_ref: TypeRef = this.lookup_type_by_sym(enum_pat.enum_name);
+                if (enum_type_ref.is_valid()) {
+                    enum_ty = this.unwrap_to_enum(enum_type_ref);
+                }
             }
 
             if (enum_ty != null && enum_ty.kind == TypeKind::Enum) {
@@ -386,6 +431,7 @@ public:
     }
 
     override visit(node: ImplBlockNode*) -> void {
+        if (node.is_generic()) { return; }
         const impl_this: TypeRef = this.lookup_type_by_sym(node.target_type);
         this.visit_methods(node.methods, impl_this);
     }
@@ -418,7 +464,7 @@ public:
         if (stmt == null) { return; }
         const n: ASTNode* = stmt as ASTNode*;
         match (n.kind) {
-            NodeKind::BlockStatement       => { this.visit(stmt as BlockStmtNode*); }
+            NodeKind::BlockStatement       => { this.visit_block(stmt as BlockStmtNode*); }
             NodeKind::ExpressionStatement  => { this.visit(stmt as ExprStmtNode*); }
             NodeKind::DeclarationStatement => { this.visit(stmt as DeclStmtNode*); }
             NodeKind::ReturnStatement      => { this.visit(stmt as ReturnStmtNode*); }

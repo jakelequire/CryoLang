@@ -175,14 +175,26 @@ type struct ModuleLoader {
                 continue;
             }
 
-            // Add dependency edge
-            const dep_name_str: string = import_path;
-            const dep_name: SymbolStr = intern.intern(dep_name_str);
-            info.add_dependency(dep_name);
-
-            // Recursively discover the dependency
+            // Recursively discover the dependency (must happen before
+            // add_dependency so the target module's namespace is known)
             if (!this.discover_module(intern, graph, sink, resolved, debug)) {
                 success = false;
+            }
+
+            // Add dependency edge using the target module's actual namespace
+            // name (from its source file), not the raw import path.
+            // e.g., `import core::option` resolves to file core/option.cryo
+            // whose namespace is `std::core::option`.  We must record the
+            // dependency under that namespace name so that get_exports() and
+            // topological sort can find the module by its registered name.
+            const dep_idx: i64 = graph.find_module_by_path(resolved);
+            if (dep_idx >= 0) {
+                info.add_dependency(graph.modules[dep_idx].name);
+            } else {
+                // Fallback: use raw import path (should not happen if
+                // discover_module succeeded)
+                const dep_name: SymbolStr = intern.intern(import_path);
+                info.add_dependency(dep_name);
             }
         }
 
