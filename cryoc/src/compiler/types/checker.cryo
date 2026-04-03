@@ -216,9 +216,85 @@ type struct TypeChecker {
             }
         }
 
-        // Pointer/reference conversions
+        // Pointer conversions
         if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::Pointer) {
+            const from_ptr: PointerType* = from_type as PointerType*;
+            const to_ptr: PointerType* = to_type as PointerType*;
+            // void* → T* and T* → void* are implicit (C-style universal pointer)
+            const from_inner: Type* = this.arena.lookup(from_ptr.pointee.id);
+            const to_inner: Type* = this.arena.lookup(to_ptr.pointee.id);
+            if ((from_inner != null && from_inner.kind == TypeKind::Void) ||
+                (to_inner != null && to_inner.kind == TypeKind::Void)) {
+                return TypeCompatibility::ImplicitConvert;
+            }
+            // Same pointee type after deref
+            if (from_ptr.pointee.equals(to_ptr.pointee)) {
+                return TypeCompatibility::Identical;
+            }
             return TypeCompatibility::ExplicitCast;
+        }
+
+        // void → T* (null literal): void value used as null pointer
+        if (from_type.kind == TypeKind::Void && to_type.kind == TypeKind::Pointer) {
+            return TypeCompatibility::ImplicitConvert;
+        }
+
+        // u64 ↔ pointer: pointer-sized integer conversions
+        if (from_type.kind == TypeKind::Int && to_type.kind == TypeKind::Pointer) {
+            const from_int: IntType* = from_type as IntType*;
+            if (from_int.bit_width() == 64) {
+                return TypeCompatibility::ImplicitConvert;
+            }
+        }
+        if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::Int) {
+            const to_int: IntType* = to_type as IntType*;
+            if (to_int.bit_width() == 64) {
+                return TypeCompatibility::ImplicitConvert;
+            }
+        }
+
+        // &T → T* (reference to pointer coercion)
+        if (from_type.kind == TypeKind::Reference && to_type.kind == TypeKind::Pointer) {
+            const from_ref: ReferenceType* = from_type as ReferenceType*;
+            const to_ptr: PointerType* = to_type as PointerType*;
+            if (from_ref.referent.equals(to_ptr.pointee)) {
+                return TypeCompatibility::ImplicitConvert;
+            }
+            // &T → void* is also valid
+            const to_inner: Type* = this.arena.lookup(to_ptr.pointee.id);
+            if (to_inner != null && to_inner.kind == TypeKind::Void) {
+                return TypeCompatibility::ImplicitConvert;
+            }
+        }
+
+        // T → &T / T → &mut T (auto-referencing for method chaining)
+        if (to_type.kind == TypeKind::Reference) {
+            const to_ref: ReferenceType* = to_type as ReferenceType*;
+            if (effective_from.equals(to_ref.referent)) {
+                return TypeCompatibility::ImplicitConvert;
+            }
+        }
+
+        // Bool coercion: integers, chars, floats, pointers, enums → boolean
+        // Mirrors C-style truthiness: any scalar/enum can be tested for truth.
+        if (to_type.kind == TypeKind::Bool) {
+            if (from_type.kind == TypeKind::Int ||
+                from_type.kind == TypeKind::Float ||
+                from_type.kind == TypeKind::Char ||
+                from_type.kind == TypeKind::Pointer ||
+                from_type.kind == TypeKind::Enum ||
+                from_type.kind == TypeKind::Struct ||
+                from_type.kind == TypeKind::Class) {
+                return TypeCompatibility::ImplicitConvert;
+            }
+        }
+
+        // Char ↔ integer conversions
+        if (from_type.kind == TypeKind::Char && to_type.kind == TypeKind::Int) {
+            return TypeCompatibility::ImplicitConvert;
+        }
+        if (from_type.kind == TypeKind::Int && to_type.kind == TypeKind::Char) {
+            return TypeCompatibility::ImplicitConvert;
         }
 
         // Optional wrapping: T → T?
