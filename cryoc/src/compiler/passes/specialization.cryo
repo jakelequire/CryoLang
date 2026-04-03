@@ -99,6 +99,65 @@ function register_injected_decl(stmt: ASTNode*, ctx: CompilationContext*) -> voi
     TypeResolutionPasses::register_decl_in_index(stmt, ctx);
 }
 
+/// Register a specialized type declaration using the arena type's actual
+/// qualified name for method keys.  Uses the SpecializationEntry's
+/// specialized_name as the key instead of ctx.qualify_symbol_sym to prevent
+/// cross-module specs with the same bare name from overwriting each other.
+/// This is a static method (not a free function) to avoid C++ codegen
+/// issues with parameter visibility in free functions.
+type struct SpecInjector {
+    /// Register a specialized type using the arena type's ACTUAL qualified
+    /// name for method keys.  This prevents cross-module specs with the
+    /// same bare name (e.g. BattleTest::Pair_i32 vs Collections::Pair::Pair_i32)
+    /// from overwriting each other's methods in the DI.
+    static register(node: ASTNode*, spec_name: SymbolStr,
+                    spec_type: TypeRef, ctx: CompilationContext*) -> void {
+        if (node == null) { return; }
+        // For function declarations, use the standard path (no naming conflict)
+        if (node.kind == NodeKind::FunctionDeclaration) {
+            register_injected_decl(node, ctx);
+            return;
+        }
+        if (!spec_type.is_valid()) {
+            register_injected_decl(node, ctx);
+            return;
+        }
+
+        // Get the arena type's actual qualified name (e.g. "Collections::Pair::Pair_i32")
+        // via TypeArena method that safely handles the pointer cast internally.
+        const arena: TypeArena* = ctx.type_arena;
+        const arena_qname: SymbolStr = arena.get_qualified_name(spec_type);
+        if (!arena_qname.is_valid()) {
+            register_injected_decl(node, ctx);
+            return;
+        }
+
+        const module_sym: SymbolStr = ctx.intern(ctx.source_file);
+        const local_sym: SymbolStr = ctx.qualify_symbol_sym(spec_name);
+
+        // Register type under BOTH local and arena qualified names.
+        // Local name (e.g. "BattleTest::Pair_i32") for same-module lookups.
+        // Arena name (e.g. "Collections::Pair::Pair_i32") for cross-module lookups.
+        ctx.decl_index.register_type_with_module(local_sym, spec_type, module_sym);
+        if (!arena_qname.equals(local_sym)) {
+            ctx.decl_index.register_type_with_module(arena_qname, spec_type, module_sym);
+        }
+
+        // Methods registered ONLY under the arena qualified name.
+        // This is the key fix: two specs with the same bare name get
+        // different method keys, so they can't overwrite each other.
+        if (node.kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = node as StructDeclNode*;
+            ctx.decl_index.register_methods(arena_qname, sn.methods);
+        } else if (node.kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = node as ClassDeclNode*;
+            ctx.decl_index.register_methods(arena_qname, cn.methods);
+        } else {
+            register_injected_decl(node, ctx);
+        }
+    }
+}
+
 function register_impl_block(node: ImplBlockNode*, registry: GenericRegistry*,
                              ctx: CompilationContext*) -> void {
     // Qualify the target name so impl blocks use the same key as templates.
@@ -293,18 +352,18 @@ type struct SpecializationPasses {
             return PassResult::ok();
         }
 
-        // Capture the injection range BEFORE get_new_specialized_asts advances the cursor.
+        const module_sym: SymbolStr = ctx.intern(ctx.source_file);
+        mono.set_current_module(module_sym);
+
         const inject_start: i64 = mono.injection_cursor;
+        const inject_end: i64 = mono.spec_entries.length;
 
-        // Get only specializations new since the last module (incremental injection)
-        const specialized_asts: ASTNode*[] = mono.get_new_specialized_asts();
-
-        if (specialized_asts.length == 0) {
+        if (inject_start >= inject_end) {
             LOG_DEBUG(LogComponent::General, "[GenericExpressionResolution] No specialized ASTs to inject");
+            mono.injection_cursor = inject_end;
             return PassResult::ok();
         }
 
-        // Inject into ProgramNode
         const root: ProgramNode* = ctx.artifacts.ast.root;
         if (root == null) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
@@ -312,24 +371,41 @@ type struct SpecializationPasses {
             return PassResult::failure(1);
         }
 
-        for (mut i: i64 = 0; i < specialized_asts.length; i++) {
-            root.add_statement(specialized_asts[i]);
-            register_injected_decl(specialized_asts[i], ctx);
+        const arena: TypeArena* = ctx.type_arena;
+        mut inject_count: i64 = 0;
+
+        for (mut i: i64 = inject_start; i < inject_end; i++) {
+            const entry: SpecializationEntry = mono.spec_entries[i];
+
+            // Inject main AST
+            if (entry.ast_node != null) {
+                root.add_statement(entry.ast_node);
+            }
+            // Inject impl blocks
+            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+                root.add_statement(entry.impl_nodes[j]);
+            }
+
+            // Register in DeclarationIndex using the arena type's ACTUAL
+            // qualified name for method keys.  This prevents two specs with
+            // the same bare name (e.g. BattleTest::Pair_i32 and
+            // Collections::Pair::Pair_i32) from overwriting each other.
+            if (entry.ast_node != null) {
+                SpecInjector::register(entry.ast_node, entry.specialized_name,
+                                       entry.specialized_type, ctx);
+            }
+            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+                register_injected_decl(entry.impl_nodes[j], ctx);
+            }
+
+            mono.record_consuming_module(i, module_sym);
+            inject_count = inject_count + 1;
         }
 
-        // Record module-to-specialization bidirectional mapping.
-        // This tells codegen which specializations each module needs,
-        // and which modules consume each specialization.
-        // Uses flat parallel arrays on the Monomorphizer to avoid
-        // push-through-pointer codegen issues with struct fields.
-        const module_sym: SymbolStr = ctx.intern(ctx.source_file);
-        const inject_end: i64 = mono.injection_cursor;
-        for (mut si: i64 = inject_start; si < inject_end; si++) {
-            mono.record_consuming_module(si, module_sym);
-        }
+        mono.injection_cursor = inject_end;
 
         LOG_DEBUG(LogComponent::General, "[GenericExpressionResolution] Injected %lld specialized declarations",
-            specialized_asts.length);
+            inject_count);
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }

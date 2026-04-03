@@ -112,6 +112,15 @@ type struct Scope {
     // Child scopes
     child_scope_ids: ScopeID[];
 
+    // Ambiguous imports — tracks names that were imported from multiple
+    // modules.  When two imports define the same bare name from different
+    // modules (e.g. "Pair" from BattleTest and Collections::Pair),
+    // the name is recorded here so the resolver can emit an ambiguity error.
+    // Uses SymbolStr (interned) to avoid dangling string pointers.
+    ambig_name_ids:   u32[];      // SymbolStr.id of ambiguous names
+    ambig_module_a:   u32[];      // SymbolStr.id of first module's path
+    ambig_module_b:   u32[];      // SymbolStr.id of conflicting module's path
+
     static new(id: ScopeID, kind: ScopeKind, parent: ScopeID,
                module: string, owner: string, span: SourceSpan) -> Scope {
         return Scope {
@@ -127,6 +136,9 @@ type struct Scope {
             overload_sym_ids:   [],
             overload_name_keys: [],
             child_scope_ids: [],
+            ambig_name_ids:  [],
+            ambig_module_a:  [],
+            ambig_module_b:  [],
         };
     }
 
@@ -167,6 +179,57 @@ type struct Scope {
         this.symbol_ids.push(sym_id);
         this.symbol_index.insert(name.id, idx, h);
         return true;
+    }
+
+    /// Insert an import symbol.  If the name already exists from a DIFFERENT
+    /// module, mark it as ambiguous (the user must qualify with the module name).
+    /// If it exists from the SAME module (re-import), silently skip.
+    /// Local declarations (Type, Function) are not overwritten.
+    /// module_a_id and module_b_id are SymbolStr IDs (interned, heap-safe).
+    insert_import(mut &this, name: SymbolStr, sym_id: SymbolID,
+                  new_module_id: u32, existing_module_id: u32) -> boolean {
+        const h: u64 = hash_int(name.id as u64);
+        const existing: Option<i64> = this.symbol_index.get(name.id, h);
+        if (existing.is_some()) {
+            // Same module re-import — skip silently
+            if (new_module_id == existing_module_id) {
+                return true;
+            }
+            // Different module — mark as ambiguous, keep the first import
+            // so lookups still find SOMETHING, but the ambiguity flag
+            // tells the resolver to emit an error.
+            this.ambig_name_ids.push(name.id);
+            this.ambig_module_a.push(existing_module_id);
+            this.ambig_module_b.push(new_module_id);
+            return true;
+        }
+        // No existing entry — insert normally
+        const idx: i64 = this.symbol_ids.length;
+        this.symbol_names.push(name);
+        this.symbol_ids.push(sym_id);
+        this.symbol_index.insert(name.id, idx, h);
+        return true;
+    }
+
+    /// Check if a name is ambiguous (imported from multiple modules).
+    is_ambiguous(&this, name: SymbolStr) -> boolean {
+        for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
+            if (this.ambig_name_ids[i] == name.id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Get the two conflicting module SymbolStr IDs for an ambiguous name.
+    /// Returns [module_a_id, module_b_id] as u32 pair, or [0, 0] if not ambiguous.
+    get_ambiguous_module_ids(&this, name: SymbolStr) -> u32[] {
+        for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
+            if (this.ambig_name_ids[i] == name.id) {
+                return [this.ambig_module_a[i], this.ambig_module_b[i]];
+            }
+        }
+        return [];
     }
 
     /// Add a symbol to the overload set for the given name.
