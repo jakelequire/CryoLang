@@ -387,16 +387,16 @@ public:
 
     dispatch_top_level(mut &this, stmt: ASTNode*) -> void {
         match (stmt.kind) {
-            NodeKind::FunctionDeclaration => { this.visit(stmt as FunctionDeclNode*); }
-            NodeKind::StructDeclaration   => { this.visit(stmt as StructDeclNode*); }
-            NodeKind::ClassDeclaration    => { this.visit(stmt as ClassDeclNode*); }
-            NodeKind::TraitDeclaration    => { this.visit(stmt as TraitDeclNode*); }
-            NodeKind::ImplementationBlock => { this.visit(stmt as ImplBlockNode*); }
+            NodeKind::FunctionDeclaration => { this.visit_function_decl(stmt as FunctionDeclNode*); }
+            NodeKind::StructDeclaration   => { this.visit_struct_decl(stmt as StructDeclNode*); }
+            NodeKind::ClassDeclaration    => { this.visit_class_decl(stmt as ClassDeclNode*); }
+            NodeKind::TraitDeclaration    => { this.visit_trait_decl(stmt as TraitDeclNode*); }
+            NodeKind::ImplementationBlock => { this.visit_impl_block(stmt as ImplBlockNode*); }
             _ => {}
         }
     }
 
-    override visit(node: FunctionDeclNode*) -> void {
+    visit_function_decl(node: FunctionDeclNode*) -> void {
         if (node.body == null || node.is_generic()) { return; }
         const _fn_name: string = this.intern.resolve(node.name);
         this.enter_function(node, TypeRef::invalid());
@@ -404,21 +404,21 @@ public:
         this.body_count = this.body_count + 1;
     }
 
-    override visit(node: StructDeclNode*) -> void {
+    visit_struct_decl(node: StructDeclNode*) -> void {
         if (node.is_generic()) { return; }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
         const st_type: TypeRef = this.ctx.decl_index.lookup_type(qualified_sym);
         this.visit_methods(node.methods, st_type);
     }
 
-    override visit(node: ClassDeclNode*) -> void {
+    visit_class_decl(node: ClassDeclNode*) -> void {
         if (node.is_generic()) { return; }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
         const cl_type: TypeRef = this.ctx.decl_index.lookup_type(qualified_sym);
         this.visit_methods(node.methods, cl_type);
     }
 
-    override visit(node: TraitDeclNode*) -> void {
+    visit_trait_decl(node: TraitDeclNode*) -> void {
         if (node.is_generic()) { return; }
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             const func: FunctionDeclNode* = node.methods[j];
@@ -430,7 +430,7 @@ public:
         }
     }
 
-    override visit(node: ImplBlockNode*) -> void {
+    visit_impl_block(node: ImplBlockNode*) -> void {
         if (node.is_generic()) { return; }
         const impl_this: TypeRef = this.lookup_type_by_sym(node.target_type);
         this.visit_methods(node.methods, impl_this);
@@ -460,22 +460,25 @@ public:
     // ================================================================
 
     /// Route a StatementNode* to the correct typed visitor override.
+    /// Uses non-overloaded helper methods instead of this.visit() to avoid
+    /// the C++ codegen vtable bug where overloaded visit() calls may
+    /// dispatch to the wrong overload.
     dispatch_stmt(mut &this, stmt: StatementNode*) -> void {
         if (stmt == null) { return; }
         const n: ASTNode* = stmt as ASTNode*;
         match (n.kind) {
             NodeKind::BlockStatement       => { this.visit_block(stmt as BlockStmtNode*); }
-            NodeKind::ExpressionStatement  => { this.visit(stmt as ExprStmtNode*); }
-            NodeKind::DeclarationStatement => { this.visit(stmt as DeclStmtNode*); }
-            NodeKind::ReturnStatement      => { this.visit(stmt as ReturnStmtNode*); }
-            NodeKind::IfStatement          => { this.visit(stmt as IfStmtNode*); }
-            NodeKind::WhileStatement       => { this.visit(stmt as WhileStmtNode*); }
-            NodeKind::DoWhileStatement     => { this.visit(stmt as DoWhileStmtNode*); }
-            NodeKind::ForStatement         => { this.visit(stmt as ForStmtNode*); }
-            NodeKind::MatchStatement       => { this.visit(stmt as MatchStmtNode*); }
-            NodeKind::LoopStatement        => { this.visit(stmt as LoopStmtNode*); }
-            NodeKind::UnsafeBlockStatement => { this.visit(stmt as UnsafeBlockStmtNode*); }
-            NodeKind::SwitchStatement      => { this.visit(stmt as SwitchStmtNode*); }
+            NodeKind::ExpressionStatement  => { this.visit_expr_stmt(stmt as ExprStmtNode*); }
+            NodeKind::DeclarationStatement => { this.visit_decl_stmt(stmt as DeclStmtNode*); }
+            NodeKind::ReturnStatement      => { this.visit_return_stmt(stmt as ReturnStmtNode*); }
+            NodeKind::IfStatement          => { this.visit_if_stmt(stmt as IfStmtNode*); }
+            NodeKind::WhileStatement       => { this.visit_while_stmt(stmt as WhileStmtNode*); }
+            NodeKind::DoWhileStatement     => { this.visit_do_while_stmt(stmt as DoWhileStmtNode*); }
+            NodeKind::ForStatement         => { this.visit_for_stmt(stmt as ForStmtNode*); }
+            NodeKind::MatchStatement       => { this.visit_match_stmt(stmt as MatchStmtNode*); }
+            NodeKind::LoopStatement        => { this.visit_loop_stmt(stmt as LoopStmtNode*); }
+            NodeKind::UnsafeBlockStatement => { this.visit_unsafe_block(stmt as UnsafeBlockStmtNode*); }
+            NodeKind::SwitchStatement      => { this.visit_switch_stmt(stmt as SwitchStmtNode*); }
             _ => {}
         }
     }
@@ -494,15 +497,11 @@ public:
         this.restore_scope(save);
     }
 
-    override visit(node: BlockStmtNode*) -> void {
-        this.visit_block(node);
-    }
-
-    override visit(node: ExprStmtNode*) -> void {
+    visit_expr_stmt(node: ExprStmtNode*) -> void {
         this.resolve_expr(node.expression);
     }
 
-    override visit(node: DeclStmtNode*) -> void {
+    visit_decl_stmt(node: DeclStmtNode*) -> void {
         if (node.declaration == null) { return; }
         const decl: ASTNode* = node.declaration;
         if (decl.kind != NodeKind::VariableDeclaration) { return; }
@@ -549,14 +548,33 @@ public:
                 }
             }
         }
+        // Register the local variable.  Prefer the declared type annotation;
+        // fall back to the initializer's inferred type so that variables
+        // with unresolved annotations (e.g., cross-module types not yet in
+        // the arena) still get registered and don't cause cascading
+        // "undefined variable" errors in downstream usage.
         if (var_node.resolved_type.is_valid()) {
             this.register_local(var_node.name, var_node.resolved_type);
+        } else if (var_node.has_initializer()) {
+            const init_type: TypeRef = var_node.initializer.resolved_type;
+            if (init_type.is_valid()) {
+                this.register_local(var_node.name, init_type);
+            }
         }
     }
 
-    override visit(node: ReturnStmtNode*) -> void {
+    visit_return_stmt(node: ReturnStmtNode*) -> void {
         if (node.has_expression()) {
+            // Set expected_type to the function's return type so that
+            // integer literals adopt the correct type (e.g., `return 8`
+            // in a function returning u32 resolves the literal as u32,
+            // not the default i32).
+            const saved_expected: TypeRef = this.expected_type;
+            if (this.return_type.is_valid()) {
+                this.expected_type = this.return_type;
+            }
             const expr_type: TypeRef = this.resolve_expr(node.expression);
+            this.expected_type = saved_expected;
             if (expr_type.is_valid() && this.return_type.is_valid()) {
                 if (!this.checker.can_assign(expr_type, this.return_type)) {
                     const ret_ty: Type* = this.arena.lookup(this.return_type.id);
@@ -576,7 +594,7 @@ public:
         }
     }
 
-    override visit(node: IfStmtNode*) -> void {
+    visit_if_stmt(node: IfStmtNode*) -> void {
         this.resolve_expr(node.condition);
         this.dispatch_stmt(node.then_stmt);
         if (node.has_else()) {
@@ -584,24 +602,24 @@ public:
         }
     }
 
-    override visit(node: WhileStmtNode*) -> void {
+    visit_while_stmt(node: WhileStmtNode*) -> void {
         this.resolve_expr(node.condition);
         this.dispatch_stmt(node.body);
     }
 
-    override visit(node: DoWhileStmtNode*) -> void {
+    visit_do_while_stmt(node: DoWhileStmtNode*) -> void {
         this.dispatch_stmt(node.body);
         this.resolve_expr(node.condition);
     }
 
-    override visit(node: ForStmtNode*) -> void {
+    visit_for_stmt(node: ForStmtNode*) -> void {
         // For-loop init variable lives in its own scope so it's visible to
         // condition, update, and body, but doesn't leak out.
         const save: i64 = this.save_scope();
 
         if (node.init != null) {
             if (node.init.kind == NodeKind::DeclarationStatement) {
-                this.visit(node.init as DeclStmtNode*);
+                this.visit_decl_stmt(node.init as DeclStmtNode*);
             } else if (node.init.kind == NodeKind::VariableDeclaration) {
                 // Parser produces a raw VarDeclNode (not wrapped in DeclStmtNode)
                 // for C-style for-loop initializers: for (mut i: int = 0; ...)
@@ -624,7 +642,7 @@ public:
         this.restore_scope(save);
     }
 
-    override visit(node: MatchStmtNode*) -> void {
+    visit_match_stmt(node: MatchStmtNode*) -> void {
         const subject_type: TypeRef = this.resolve_expr(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             const arm: MatchArmNode* = node.arms[i];
@@ -639,15 +657,15 @@ public:
         }
     }
 
-    override visit(node: LoopStmtNode*) -> void {
+    visit_loop_stmt(node: LoopStmtNode*) -> void {
         this.dispatch_stmt(node.body);
     }
 
-    override visit(node: UnsafeBlockStmtNode*) -> void {
+    visit_unsafe_block(node: UnsafeBlockStmtNode*) -> void {
         this.visit_block(node.block);
     }
 
-    override visit(node: SwitchStmtNode*) -> void {
+    visit_switch_stmt(node: SwitchStmtNode*) -> void {
         this.resolve_expr(node.expression);
         for (mut i: i64 = 0; i < node.cases.length; i++) {
             const cs: CaseStmtNode* = node.cases[i];
@@ -715,7 +733,7 @@ public:
     resolve_literal(&this, lit: LiteralNode*) -> TypeRef {
         return match (lit.literal_kind) {
             LiteralKind::Integer => { this.resolve_integer_literal(lit) }
-            LiteralKind::Float   => { this.arena.get_f64() }
+            LiteralKind::Float   => { this.resolve_float_literal(lit) }
             LiteralKind::String  => { this.arena.get_string() }
             LiteralKind::Char    => { this.arena.get_char() }
             LiteralKind::Boolean => { this.arena.get_bool() }
@@ -734,6 +752,19 @@ public:
             }
         }
         return this.arena.get_i32();
+    }
+
+    /// Resolve the type of a float literal.
+    /// If an expected_type hint is a float type, adopt it.
+    /// Otherwise default to f64.
+    resolve_float_literal(&this, lit: LiteralNode*) -> TypeRef {
+        if (this.expected_type.is_valid()) {
+            const exp: Type* = this.arena.lookup(this.expected_type.id);
+            if (exp != null && exp.kind == TypeKind::Float) {
+                return this.expected_type;
+            }
+        }
+        return this.arena.get_f64();
     }
 
     resolve_identifier(&this, ident: IdentifierNode*) -> TypeRef {

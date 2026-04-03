@@ -5889,7 +5889,62 @@ namespace Cryo::Codegen
             }
         }
 
-        // Fall back to generic resolution (handles non-overloaded methods)
+        // Fall back: for overloaded methods, scan all functions in the module
+        // for one whose name ends with "::method_name(ParamTypes...)".
+        // This handles cases where the type candidates don't include the correct
+        // namespace prefix (e.g., the function is registered as
+        // "Compiler::AST::Visitor::BaseASTVisitor::visit(MatchStmtNode*)" but
+        // the type candidates only tried "BaseASTVisitor::visit(MatchStmtNode*)").
+        if (!method && !node->arguments().empty())
+        {
+            // Rebuild overload suffix from argument types
+            std::string suffix = "(";
+            bool first = true;
+            bool all_resolved = true;
+            for (size_t i = 0; i < node->arguments().size(); ++i)
+            {
+                if (!first) suffix += ",";
+                first = false;
+                TypeRef arg_type = node->arguments()[i]->get_resolved_type();
+                if (arg_type.is_valid())
+                {
+                    suffix += arg_type->display_name();
+                }
+                else
+                {
+                    auto *id_node = dynamic_cast<Cryo::IdentifierNode *>(node->arguments()[i].get());
+                    if (id_node && id_node->name() == "this" && !ctx().current_type_name().empty())
+                    {
+                        suffix += ctx().current_type_name() + "*";
+                    }
+                    else
+                    {
+                        all_resolved = false;
+                        break;
+                    }
+                }
+            }
+            suffix += ")";
+
+            if (all_resolved)
+            {
+                std::string target_suffix = "::" + method_name + suffix;
+                for (auto &fn : module()->functions())
+                {
+                    std::string fn_name = fn.getName().str();
+                    if (fn_name.size() >= target_suffix.size() &&
+                        fn_name.compare(fn_name.size() - target_suffix.size(),
+                                        target_suffix.size(), target_suffix) == 0)
+                    {
+                        method = &fn;
+                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                  "generate_instance_method: Found overloaded method via module scan '{}'",
+                                  fn_name);
+                        break;
+                    }
+                }
+            }
+        }
         if (!method)
             method = resolve_method(type_name, method_name);
         if (!method)
