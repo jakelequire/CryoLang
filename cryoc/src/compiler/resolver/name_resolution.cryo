@@ -138,6 +138,15 @@ public:
                     this.resolver.current_scope, intr_node.span);
                 this.resolver.declare(sym);
             }
+            NodeKind::IntrinsicConstDeclaration => {
+                const ic_node: IntrinsicConstDeclNode* = node as IntrinsicConstDeclNode*;
+                const ic_id: SymbolID = this.resolver.alloc_symbol_id();
+                const mod_str: string = this.resolver.intern_table.resolve(this.resolver.current_module);
+                const ic_sym: Symbol = Symbol::constant(ic_id, ic_node.name,
+                    this.resolver.current_scope, ic_node.span, mod_str);
+                const declared_id: SymbolID = this.resolver.declare(ic_sym);
+                this.resolver.export_symbol(declared_id);
+            }
             NodeKind::ExternBlock => {
                 const extern_node: ExternBlockNode* = node as ExternBlockNode*;
                 for (mut j: int = 0; j < extern_node.functions.length; j++) {
@@ -711,8 +720,52 @@ public:
     process_import(node: ImportDeclNode*) -> void {
         const module_path: string = node.module_path;
         LOG_DEBUG(LogComponent::General, "[NameResolver] process_import() module='%s'", module_path);
-        const module_sym: SymbolStr = this.resolver.intern_table.intern(module_path);
+
+        // Resolve import path to actual module namespace name.
+        // Import paths (e.g. "core::option") may differ from the target
+        // module's namespace (e.g. "std::core::option").  The module graph
+        // stores dependencies by namespace name (after the module_loader fix),
+        // so we look up by dependency name first, then fall back to raw path.
+        mut module_sym: SymbolStr = this.resolver.intern_table.intern(module_path);
+
+        // Try to find the module in the graph by its actual registered name.
+        // ModuleGraph::find_module_index uses the module's namespace-based name,
+        // which matches dependencies recorded by the loader.
+        const graph_idx: i64 = this.ctx.module_graph.find_module_index(module_sym);
+        if (graph_idx < 0) {
+            // The raw import path didn't match — try resolving through the
+            // module graph's file path lookup.  The ImportResolution pass
+            // may have stored the resolved path; search all modules for one
+            // whose import-path suffix matches.
+            for (mut k: i64 = 0; k < this.ctx.module_graph.modules.length; k++) {
+                const candidate: ModuleInfo = this.ctx.module_graph.modules[k];
+                const cand_name: string = this.resolver.intern_table.resolve(candidate.name);
+                // Check if the candidate's name ends with the import path.
+                // e.g., "std::core::option" ends with "core::option".
+                const cand_len: i64 = strlen(cand_name) as i64;
+                const path_len: i64 = strlen(module_path) as i64;
+                if (cand_len >= path_len) {
+                    const suffix: string = cand_name + (cand_len - path_len);
+                    if (strcmp(suffix, module_path) == 0) {
+                        // Verify it's either an exact match or preceded by "::"
+                        if (cand_len == path_len || cand_name[cand_len - path_len - 2] == ':') {
+                            module_sym = candidate.name;
+                            LOG_DEBUG(LogComponent::General,
+                                "[NameResolver] resolved import '%s' -> '%s'",
+                                module_path, cand_name);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         const exports: SymbolID[] = this.resolver.get_exports(module_sym);
+
+        // Use the resolved namespace name for source_module on import symbols
+        // so that resolve_type_qualified_name_bare() constructs correct
+        // qualified names (e.g., "std::core::option::Option" not "core::option::Option").
+        const resolved_module: string = this.resolver.intern_table.resolve(module_sym);
 
         if (node.style == ImportStyle::Wildcard) {
             // Bring all public exports into scope as Import-kind symbols.
@@ -724,7 +777,7 @@ public:
                     const id: SymbolID = this.resolver.alloc_symbol_id();
                     const import_sym: Symbol = Symbol::import_sym(
                         id, export_sym.name, this.resolver.current_scope,
-                        node.span, module_path);
+                        node.span, resolved_module);
                     this.resolver.declare_import(import_sym);
                 }
             }
@@ -737,7 +790,7 @@ public:
                     const id: SymbolID = this.resolver.alloc_symbol_id();
                     const import_sym: Symbol = Symbol::import_sym(
                         id, name, this.resolver.current_scope,
-                        node.span, module_path);
+                        node.span, resolved_module);
                     this.resolver.declare_import(import_sym);
                 }
             }
@@ -750,7 +803,7 @@ public:
             const alias_id: SymbolID = this.resolver.alloc_symbol_id();
             const alias_sym: Symbol = Symbol::import_sym(
                 alias_id, node.alias, this.resolver.current_scope,
-                node.span, module_path);
+                node.span, resolved_module);
             this.resolver.declare(alias_sym);
             this.resolver.register_import_alias(node.alias, alias_id);
         }

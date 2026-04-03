@@ -686,6 +686,17 @@ type struct TypeResolutionPasses {
                     }
                     sig_count++;
                 }
+                NodeKind::IntrinsicConstDeclaration => {
+                    const ic_node: IntrinsicConstDeclNode* = stmt as IntrinsicConstDeclNode*;
+                    if (ic_node.type_annotation != null && !ic_node.has_resolved_type()) {
+                        const ic_type: TypeRef = resolver.resolve(ic_node.type_annotation, &runner.res_ctx);
+                        if (ic_type.is_valid()) {
+                            ic_node.set_resolved_type(ic_type);
+                            // Register as a global so sema's lookup_global_var finds it
+                            ctx.decl_index.register_global(ic_node.name, ic_type);
+                        }
+                    }
+                }
                 _ => {
                     // Not a declaration with function signatures
                 }
@@ -1099,6 +1110,50 @@ type struct TypeResolutionPasses {
                         }
                     }
                     class_count++;
+                }
+                NodeKind::EnumDeclaration => {
+                    const node: EnumDeclNode* = stmt as EnumDeclNode*;
+                    if (node.is_generic()) { continue; }
+
+                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    mut type_ref: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
+                    if (!type_ref.is_valid()) {
+                        type_ref = arena.lookup_by_name(qualified_sym);
+                    }
+                    if (!type_ref.is_valid()) {
+                        type_ref = arena.lookup_by_name(node.name);
+                    }
+                    if (!type_ref.is_valid()) { continue; }
+
+                    const base_type: Type* = arena.lookup(type_ref.id);
+                    if (base_type == null || base_type.kind != TypeKind::Enum) { continue; }
+
+                    mut et: EnumType* = base_type as EnumType*;
+                    // Only populate if not already populated (avoid double-populating)
+                    if (et.variants.length > 0) { continue; }
+
+                    // Resolve variant associated types and populate
+                    const module_name: string = ctx.has_namespace()
+                        ? ctx.namespace_display() : ctx.source_file;
+                    mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, ctx.source_file);
+
+                    for (mut j: i64 = 0; j < node.variants.length; j++) {
+                        const variant: EnumVariantNode* = node.variants[j];
+                        if (variant == null) { continue; }
+
+                        mut payload_types: TypeRef[] = [];
+                        for (mut k: i64 = 0; k < variant.associated_types.length; k++) {
+                            const ann: TypeAnnotation* = variant.associated_types[k];
+                            mut resolved: TypeRef = TypeRef::invalid();
+                            if (ann != null && ctx.type_resolver != null) {
+                                resolved = ctx.type_resolver.resolve(ann, &res_ctx);
+                            }
+                            payload_types.push(resolved);
+                        }
+
+                        et.add_variant(EnumVariantInfo::new(
+                            variant.name, payload_types, j as u64));
+                    }
                 }
                 _ => {}
             }
