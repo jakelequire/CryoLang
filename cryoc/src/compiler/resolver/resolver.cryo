@@ -160,6 +160,33 @@ type struct Resolver {
         return id;
     }
 
+    /// Declare an import symbol with ambiguity detection.
+    /// If the name already exists from a DIFFERENT module, the name is
+    /// marked ambiguous and the resolver will emit an error when it's used
+    /// without qualification (e.g. "use Pair" when both BattleTest::Pair
+    /// and Collections::Pair::Pair are imported).
+    declare_import(mut &this, sym: Symbol) -> SymbolID {
+        const id: SymbolID = sym.id;
+        // Intern the module path to get a heap-safe SymbolStr ID
+        const new_module_sym: SymbolStr = this.intern_table.intern(sym.source_module);
+        const new_module_id: u32 = new_module_sym.id;
+        this.symbols.push(sym);
+
+        // Get the existing symbol's module ID (if any) so the scope
+        // can detect cross-module name conflicts.
+        mut existing_module_id: u32 = 0;
+        const existing_id: SymbolID = this.scopes[this.current_scope.id - 1].find(sym.name);
+        if (existing_id.is_valid()) {
+            const ex_mod: string = this.symbols[existing_id.id - 1].source_module;
+            const ex_mod_sym: SymbolStr = this.intern_table.intern(ex_mod);
+            existing_module_id = ex_mod_sym.id;
+        }
+
+        this.scopes[this.current_scope.id - 1]
+            .insert_import(sym.name, id, new_module_id, existing_module_id);
+        return id;
+    }
+
     declare_variable(mut &this, name: SymbolStr, span: SourceSpan, is_mutable: boolean) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
         const mod_str: string = this.intern_table.resolve(this.current_module);
@@ -229,6 +256,40 @@ type struct Resolver {
                 mod_str);
             this.declare(sym);
         }
+    }
+
+
+    // ----------------------------------------------------------------
+    // Ambiguity detection
+    // ----------------------------------------------------------------
+
+    /// Check if a name is ambiguous in the current scope chain.
+    /// Returns true if the name was imported from multiple modules.
+    /// NOTE: Accesses scopes via array index directly (not by-value copy)
+    /// to ensure the ambiguity arrays added during import processing are visible.
+    is_ambiguous(&this, name: SymbolStr) -> boolean {
+        mut scope_id: ScopeID = this.current_scope;
+        while (scope_id.is_valid()) {
+            if (this.scopes[scope_id.id - 1].is_ambiguous(name)) {
+                return true;
+            }
+            scope_id = this.scopes[scope_id.id - 1].parent_id;
+        }
+        return false;
+    }
+
+    /// Get the conflicting module paths for an ambiguous name.
+    /// Returns two interned SymbolStr values: [module_a, module_b].
+    get_ambiguous_modules(&this, name: SymbolStr) -> SymbolStr[] {
+        mut scope_id: ScopeID = this.current_scope;
+        while (scope_id.is_valid()) {
+            const ids: u32[] = this.scopes[scope_id.id - 1].get_ambiguous_module_ids(name);
+            if (ids.length >= 2) {
+                return [SymbolStr::from_id(ids[0]), SymbolStr::from_id(ids[1])];
+            }
+            scope_id = this.scopes[scope_id.id - 1].parent_id;
+        }
+        return [];
     }
 
 
@@ -541,11 +602,17 @@ type struct Resolver {
         this.import_alias_ids = [];
     }
 
-    /// Switch to a specific module.  Resets scope to global and
-    /// clears per-module import aliases.  Used by NameResolution.
+    /// Switch to a specific module.  Creates a fresh Module scope
+    /// parented to global so that each module's declarations live in
+    /// their own scope and bare names cannot collide across modules.
+    /// Used by NameResolution (Phase 3).  Later phases restore the
+    /// saved scope via set_module_with_scope().
     set_module(mut &this, name: SymbolStr) -> void {
         this.current_module = name;
-        this.current_scope = this.global_scope;
+        const mod_str: string = this.intern_table.resolve(name);
+        this.current_scope = this.create_scope(
+            ScopeKind::Module, this.global_scope,
+            mod_str, mod_str, SourceSpan::none());
         this.import_alias_names = [];
         this.import_alias_ids = [];
     }
