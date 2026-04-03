@@ -227,12 +227,25 @@ type struct Monomorphizer {
             return false;
         }
 
-        // Build display names for type args
+        // Build display names for type args.
+        // Use the qualified name for user-defined types so that
+        // resolve_func_signature can find cross-module types in the arena.
+        // e.g., Option<Layout> where Layout is from alloc::global — the
+        // substituted annotation becomes Named("std::alloc::global::Layout")
+        // which resolves via arena lookup regardless of the template's module.
         mut type_arg_displays: string[] = [];
         for (mut i: i64 = 0; i < request.type_args.length; i++) {
             const arg_t: Type* = this.arena.lookup(request.type_args[i].id);
             if (arg_t != null) {
-                type_arg_displays = type_arg_displays + [arg_t.display_name()];
+                // For user-defined types, use the qualified name from the arena
+                // so that cross-module resolution works.  For primitives,
+                // display_name() already returns the correct name.
+                const qname: SymbolStr = this.arena.get_qualified_name(request.type_args[i]);
+                if (qname.is_valid()) {
+                    type_arg_displays = type_arg_displays + [this.intern_table.resolve(qname)];
+                } else {
+                    type_arg_displays = type_arg_displays + [arg_t.display_name()];
+                }
             } else {
                 type_arg_displays = type_arg_displays + [sprintf("unknown_%llu", request.type_args[i].id)];
             }
