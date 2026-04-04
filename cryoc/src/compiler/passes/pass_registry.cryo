@@ -776,11 +776,51 @@ function run_auto_import_pass(ctx: CompilationContext*) -> PassResult {
         return PassResult::ok();
     }
 
-    // TODO: Inject synthetic ImportDeclNode for "std::prelude" as first statement
-    // when stdlib is available.  For now, this pass is a no-op until the stdlib
-    // prelude module is set up for the self-hosted compiler.
+    // Skip if the current file is itself part of the stdlib (namespace starts
+    // with "std::").  This prevents circular imports when compiling the prelude
+    // or any module the prelude re-exports.  StdlibBatch mode already returns
+    // early above via auto_imports_enabled(), but this guards single-file and
+    // multi-module compilations of stdlib sources.
+    const ns: string = root.namespace_name;
+    if (strlen(ns) >= 5 && strncmp(ns, "std::", 5) == 0) {
+        if (ctx.debug_mode) {
+            printf("[AutoImport] Skipped: stdlib module '%s'\n", ns);
+        }
+        return PassResult::ok();
+    }
+
+    // Check whether the user already has an explicit `import std::prelude`.
+    // If so, skip injection to avoid a duplicate import.
+    const prelude_path: string = "std::prelude";
+    for (mut i: i64 = 0; i < root.statements.length; i++) {
+        const stmt: ASTNode* = root.statements[i];
+        if (stmt != null && stmt.kind == NodeKind::ImportDeclaration) {
+            const imp: ImportDeclNode* = stmt as ImportDeclNode*;
+            if (strcmp(imp.module_path, prelude_path) == 0) {
+                if (ctx.debug_mode) {
+                    printf("[AutoImport] Skipped: explicit 'import std::prelude' already present\n");
+                }
+                return PassResult::ok();
+            }
+        }
+    }
+
+    // Inject a synthetic `import std::prelude;` (wildcard) as the first statement.
+    const prelude_import: ImportDeclNode* = new ImportDeclNode(
+        prelude_path, ImportStyle::Wildcard, SourceSpan::none());
+
+    // Build a new statement list with the prelude import at position 0.
+    const old_len: i64 = root.statements.length;
+    mut new_stmts: ASTNode*[] = [];
+    new_stmts.push(prelude_import as ASTNode*);
+    for (mut i: i64 = 0; i < old_len; i++) {
+        new_stmts.push(root.statements[i]);
+    }
+    root.statements = new_stmts;
+
     if (ctx.debug_mode) {
-        printf("[AutoImport] Pass complete (prelude injection not yet active)\n");
+        printf("[AutoImport] Injected 'import std::prelude' (%lld statements total)\n",
+            root.statements.length);
     }
 
     return PassResult::from_snapshot(ctx.diagnostics, snap);
