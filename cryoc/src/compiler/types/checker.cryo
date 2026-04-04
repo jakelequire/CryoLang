@@ -253,7 +253,38 @@ type struct TypeChecker {
             if (from_ptr.pointee.equals(to_ptr.pointee)) {
                 return TypeCompatibility::Identical;
             }
+            // Recursive pointee compatibility (e.g., i8** → string*
+            // follows from i8* → string).
+            const pointee_compat: TypeCompatibility = this.check_compatibility(
+                from_ptr.pointee, to_ptr.pointee);
+            if (pointee_compat.is_assignable()) {
+                return TypeCompatibility::ImplicitConvert;
+            }
             return TypeCompatibility::ExplicitCast;
+        }
+
+        // i8* → string: C string to Cryo string (string is i8* at LLVM level)
+        if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::String) {
+            const from_ptr: PointerType* = from_type as PointerType*;
+            const pointee: Type* = this.arena.lookup(from_ptr.pointee.id);
+            if (pointee != null && pointee.kind == TypeKind::Int) {
+                const int_t: IntType* = pointee as IntType*;
+                if (int_t.bit_width() == 8) {
+                    return TypeCompatibility::ImplicitConvert;
+                }
+            }
+        }
+
+        // string → i8*: Cryo string to C string
+        if (from_type.kind == TypeKind::String && to_type.kind == TypeKind::Pointer) {
+            const to_ptr: PointerType* = to_type as PointerType*;
+            const pointee: Type* = this.arena.lookup(to_ptr.pointee.id);
+            if (pointee != null && pointee.kind == TypeKind::Int) {
+                const int_t: IntType* = pointee as IntType*;
+                if (int_t.bit_width() == 8) {
+                    return TypeCompatibility::ImplicitConvert;
+                }
+            }
         }
 
         // void → T* (null literal): void value used as null pointer
@@ -297,17 +328,20 @@ type struct TypeChecker {
             }
         }
 
-        // Bool coercion: integers, chars, floats, pointers, enums → boolean
-        // Mirrors C-style truthiness: any scalar/enum can be tested for truth.
+        // Bool coercion: integers, chars, pointers, enums → boolean (implicit)
+        // Mirrors C-style truthiness: any integer/char/pointer/enum can be tested for truth.
+        // Floats → boolean require explicit cast (prevents silent `const z: boolean = 3.14;`).
         if (to_type.kind == TypeKind::Bool) {
             if (from_type.kind == TypeKind::Int ||
-                from_type.kind == TypeKind::Float ||
                 from_type.kind == TypeKind::Char ||
                 from_type.kind == TypeKind::Pointer ||
                 from_type.kind == TypeKind::Enum ||
                 from_type.kind == TypeKind::Struct ||
                 from_type.kind == TypeKind::Class) {
                 return TypeCompatibility::ImplicitConvert;
+            }
+            if (from_type.kind == TypeKind::Float) {
+                return TypeCompatibility::ExplicitCast;
             }
         }
 

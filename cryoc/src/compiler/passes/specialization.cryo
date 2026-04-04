@@ -106,6 +106,36 @@ function register_injected_decl(stmt: ASTNode*, ctx: CompilationContext*) -> voi
     TypeResolutionPasses::register_decl_in_index(stmt, ctx);
 }
 
+/// Tag an AST node's source_module field with the template's module name.
+/// Uses concrete-type casts to avoid C++ codegen vtable offset bugs
+/// when writing fields through base class (DeclarationNode*) pointers.
+function tag_decl_source_module(node: ASTNode*, module: string) -> void {
+    if (node == null) { return; }
+    match (node.kind) {
+        NodeKind::StructDeclaration => {
+            const sn: StructDeclNode* = node as StructDeclNode*;
+            sn.source_module = module;
+        }
+        NodeKind::ClassDeclaration => {
+            const cn: ClassDeclNode* = node as ClassDeclNode*;
+            cn.source_module = module;
+        }
+        NodeKind::EnumDeclaration => {
+            const en: EnumDeclNode* = node as EnumDeclNode*;
+            en.source_module = module;
+        }
+        NodeKind::FunctionDeclaration => {
+            const fn_node: FunctionDeclNode* = node as FunctionDeclNode*;
+            fn_node.source_module = module;
+        }
+        NodeKind::ImplementationBlock => {
+            const impl_node: ImplBlockNode* = node as ImplBlockNode*;
+            impl_node.source_module = module;
+        }
+        _ => {}
+    }
+}
+
 /// Register a specialized type declaration using the arena type's actual
 /// qualified name for method keys.  Uses the SpecializationEntry's
 /// specialized_name as the key instead of ctx.qualify_symbol_sym to prevent
@@ -159,6 +189,9 @@ type struct SpecInjector {
         } else if (node.kind == NodeKind::ClassDeclaration) {
             const cn: ClassDeclNode* = node as ClassDeclNode*;
             ctx.decl_index.register_methods(arena_qname, cn.methods);
+        } else if (node.kind == NodeKind::EnumDeclaration) {
+            // Enum methods come from implement blocks, not inline.
+            // Type registration above already covers the enum itself.
         } else {
             register_injected_decl(node, ctx);
         }
@@ -384,12 +417,34 @@ type struct SpecializationPasses {
         for (mut i: i64 = inject_start; i < inject_end; i++) {
             const entry: SpecializationEntry = mono.spec_entries[i];
 
-            // Inject main AST
+            // Tag injected ASTs with the template's module name so that
+            // sema can switch to the correct scope when type-checking
+            // method bodies (which may reference types imported by the
+            // template's module, not the consuming module).
+            // Uses template_module from the SpecializationEntry (set from
+            // the TemplateEntry's module_name), which works for ALL template
+            // kinds including function templates that have no arena type.
+            mut template_module_str: string = "";
+            if (entry.template_module.is_valid()) {
+                template_module_str = ctx.intern_table.resolve(entry.template_module);
+            }
+
+            // Inject main AST and register its template module origin
+            // in the CompilationContext's side table (not on the AST node
+            // itself, to avoid C++ codegen vtable field-write bugs).
             if (entry.ast_node != null) {
+                if (entry.template_module.is_valid()) {
+                    ctx.register_injected_origin(
+                        entry.ast_node as u64, entry.template_module);
+                }
                 root.add_statement(entry.ast_node);
             }
             // Inject impl blocks
             for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+                if (entry.template_module.is_valid()) {
+                    ctx.register_injected_origin(
+                        entry.impl_nodes[j] as u64, entry.template_module);
+                }
                 root.add_statement(entry.impl_nodes[j]);
             }
 
