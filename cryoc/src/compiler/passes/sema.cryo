@@ -107,13 +107,16 @@ public:
     }
 
     lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
-        // Try qualified name first (decl_index stores methods under qualified type names)
-        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(type_sym);
-        const q_ret: TypeRef = this.ctx.decl_index.lookup_method_return(qualified, method_sym);
-        if (q_ret.is_valid()) { return q_ret; }
-        // Fallback to bare name (e.g., monomorphized types registered without namespace)
+        // Try the name as-is first (handles already-qualified names from
+        // monomorphized types whose arena qualified name was used directly).
         const bare_ret: TypeRef = this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
         if (bare_ret.is_valid()) { return bare_ret; }
+        // Try qualified name (for local/same-module types registered under qualified names)
+        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(type_sym);
+        if (!qualified.equals(type_sym)) {
+            const q_ret: TypeRef = this.ctx.decl_index.lookup_method_return(qualified, method_sym);
+            if (q_ret.is_valid()) { return q_ret; }
+        }
         // Cross-module fallback: resolve through the Resolver's scope chain
         // to find the type's original module (e.g. "Vec2" → "Math::Vec2::Vec2").
         const cross_sym: SymbolStr = this.resolve_cross_module_name(type_sym);
@@ -155,6 +158,15 @@ public:
 
     lookup_global_var(&this, name: SymbolStr) -> TypeRef {
         return this.ctx.decl_index.lookup_global(name);
+    }
+
+
+    /// Look up the template module for an injected specialization by
+    /// checking the CompilationContext's side table (populated during
+    /// GenericExpressionResolution injection).
+    find_template_module(&this, node: ASTNode*) -> SymbolStr {
+        if (node == null) { return SymbolStr::empty(); }
+        return this.ctx.lookup_injected_origin(node as u64);
     }
 
     lookup_type_sym(&this, ty: TypeRef) -> SymbolStr {
@@ -397,6 +409,33 @@ public:
     }
 
     dispatch_top_level(mut &this, stmt: ASTNode*) -> void {
+        // If this declaration was injected from a specialized template
+        // (source_module is set), temporarily switch the Resolver AND
+        // the CompilationContext's namespace to the template's module
+        // so that both scope-chain lookups and qualify_symbol_sym()
+        // produce the correct qualified names.
+        mut saved_scope: u64 = 0;
+        mut saved_namespace: SymbolStr = SymbolStr::empty();
+        mut needs_restore: boolean = false;
+        // Check if this statement is an injected specialization by scanning
+        // the Monomorphizer's spec_entries for a matching AST node pointer.
+        // Direct field writes to source_module don't survive C++ codegen
+        // vtable offset issues, so we use the Monomorphizer as a side channel.
+        const template_mod: SymbolStr = this.find_template_module(stmt);
+        if (template_mod.is_valid()) {
+            const resolver: Resolver* = this.ctx.get_resolver();
+            if (resolver != null) {
+                saved_scope = resolver.get_current_scope_id();
+                const mod_str: string = this.intern.resolve(template_mod);
+                const template_scope: u64 = resolver.find_module_scope(mod_str);
+                if (template_scope > 0) {
+                    resolver.set_module_with_scope(template_mod, template_scope);
+                    saved_namespace = this.ctx.swap_namespace(template_mod);
+                    needs_restore = true;
+                }
+            }
+        }
+
         match (stmt.kind) {
             NodeKind::FunctionDeclaration => { this.visit_function_decl(stmt as FunctionDeclNode*); }
             NodeKind::StructDeclaration   => { this.visit_struct_decl(stmt as StructDeclNode*); }
@@ -404,6 +443,16 @@ public:
             NodeKind::TraitDeclaration    => { this.visit_trait_decl(stmt as TraitDeclNode*); }
             NodeKind::ImplementationBlock => { this.visit_impl_block(stmt as ImplBlockNode*); }
             _ => {}
+        }
+
+        // Restore scope and namespace after processing injected specialization
+        if (needs_restore) {
+            const resolver: Resolver* = this.ctx.get_resolver();
+            if (resolver != null) {
+                const current_mod: SymbolStr = this.intern.intern(this.ctx.source_file);
+                resolver.set_module_with_scope(current_mod, saved_scope);
+            }
+            this.ctx.swap_namespace(saved_namespace);
         }
     }
 
@@ -1027,6 +1076,21 @@ public:
                 const promoted_base: TypeRef = this.promote_to_expected_instantiation(base_type_ref);
                 scope.set_resolved_type(promoted_base);
                 return promoted_base;
+            }
+        }
+
+        // Module-qualified function call (e.g., intrinsics::isinf).
+        // The scope_name may be a module qualifier, not a type.  Only try
+        // this if the scope_name is NOT a known type (to avoid matching
+        // wrong functions for enum variant calls like IoResult::Ok).
+        {
+            const scope_as_type: TypeRef = this.lookup_type_by_sym(scope.scope_name);
+            if (!scope_as_type.is_valid()) {
+                const fn_ret: TypeRef = this.lookup_func_return(scope.member_name);
+                if (fn_ret.is_valid()) {
+                    scope.set_resolved_type(fn_ret);
+                    return fn_ret;
+                }
             }
         }
 

@@ -64,6 +64,13 @@ public:
     // -- Declaration index (populated incrementally by TypeResolution & Specialization) --
     decl_index: DeclarationIndex;
 
+    // -- Injected specialization origin tracking --
+    // Maps ASTNode pointer (as u64) → template module SymbolStr.id.
+    // Populated by GenericExpressionResolution when injecting specialized ASTs;
+    // queried by sema to switch to the template's module scope.
+    injected_ast_ptrs:    u64[];
+    injected_ast_modules: u32[];
+
     // -- Type system (initialized lazily by TypeDeclaration pass) --
     type_arena: TypeArena*;
 
@@ -109,6 +116,8 @@ public:
             module_graph:  ModuleGraph::new(),
             intern_table:  InternTable::new(),
             decl_index:    DeclarationIndex::new(),
+            injected_ast_ptrs:    [],
+            injected_ast_modules: [],
             type_arena:    null,
 
             project_config:      null,
@@ -172,6 +181,23 @@ public:
         return this.resolver;
     }
 
+    /// Record that an injected AST node came from a specific template module.
+    register_injected_origin(mut &this, node_ptr: u64, module: SymbolStr) -> void {
+        this.injected_ast_ptrs.push(node_ptr);
+        this.injected_ast_modules.push(module.id);
+    }
+
+    /// Look up the template module for an injected AST node.
+    /// Returns empty SymbolStr if the node wasn't injected.
+    lookup_injected_origin(&this, node_ptr: u64) -> SymbolStr {
+        for (mut i: i64 = 0; i < this.injected_ast_ptrs.length; i++) {
+            if (this.injected_ast_ptrs[i] == node_ptr) {
+                return SymbolStr::from_id(this.injected_ast_modules[i]);
+            }
+        }
+        return SymbolStr::empty();
+    }
+
 
     // ----------------------------------------------------------------
     // Namespace helpers
@@ -191,6 +217,14 @@ public:
     /// The namespace as a display string (for APIs that need strings).
     namespace_display(&this) -> string {
         return this.intern_table.resolve(this.namespace_str);
+    }
+
+    /// Temporarily override namespace_str (e.g., for scope switching in sema).
+    /// Returns the previous value so it can be restored.
+    swap_namespace(mut &this, new_ns: SymbolStr) -> SymbolStr {
+        const old: SymbolStr = this.namespace_str;
+        this.namespace_str = new_ns;
+        return old;
     }
 
     /// Build a qualified display string: "Namespace::leaf" or just "leaf".

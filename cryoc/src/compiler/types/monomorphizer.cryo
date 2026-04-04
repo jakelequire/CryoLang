@@ -23,6 +23,7 @@ import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::Resolver;
 import Compiler::Diag;
 
 
@@ -48,6 +49,7 @@ type struct SpecializationEntry {
     ast_node:          ASTNode*;
     impl_nodes:        ASTNode*[];
     origin_module:     SymbolStr;      // Module that first triggered this specialization
+    template_module:   SymbolStr;      // Module where the template is defined
 }
 
 
@@ -315,6 +317,22 @@ type struct Monomorphizer {
             }
         }
 
+        // Temporarily switch the Resolver to the template's module scope
+        // so that names imported by the template's module (e.g. Option,
+        // Result, AllocError) can be resolved through the scope chain.
+        // This wraps BOTH AST resolution AND type population so that
+        // enum variant payload types also resolve in the correct scope.
+        mut saved_scope: u64 = 0;
+        if (this.type_resolver.name_resolver != null && entry.module_name.is_valid()) {
+            const mod_name: string = this.intern_table.resolve(entry.module_name);
+            saved_scope = this.type_resolver.name_resolver.get_current_scope_id();
+            const template_scope: u64 = this.type_resolver.name_resolver.find_module_scope(mod_name);
+            if (template_scope > 0) {
+                this.type_resolver.name_resolver.set_module_with_scope(
+                    entry.module_name, template_scope);
+            }
+        }
+
         // Re-resolve type annotations on the specialized AST.
         this.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry);
         for (mut ri: i64 = 0; ri < result.impl_asts.length; ri++) {
@@ -332,6 +350,12 @@ type struct Monomorphizer {
                 const inst: InstantiatedType* = inst_t as InstantiatedType*;
                 inst.set_resolved_type(concrete_type);
             }
+        }
+
+        // Restore the Resolver's scope.
+        if (saved_scope > 0 && this.type_resolver.name_resolver != null) {
+            this.type_resolver.name_resolver.set_module_with_scope(
+                this.current_module, saved_scope);
         }
 
         // Mark as monomorphized
@@ -355,6 +379,7 @@ type struct Monomorphizer {
             ast_node:          result.specialized_ast,
             impl_nodes:        result.impl_asts,
             origin_module:     origin,
+            template_module:   entry.module_name,
         };
         const idx: i64 = this.spec_entries.length;
         this.spec_keys    = this.spec_keys + [key];
