@@ -368,6 +368,12 @@ public:
             if (param == null) { continue; }
             if (param.resolved_type.is_valid()) {
                 this.register_local(param.name, param.resolved_type);
+            } else {
+                // Register with void as fallback so the parameter is at
+                // least visible — prevents cascading "undefined variable"
+                // errors in the body when type resolution failed earlier
+                // (e.g., cross-module generics with unresolved annotations).
+                this.register_local(param.name, this.arena.get_void());
             }
         }
 
@@ -567,7 +573,15 @@ public:
             const init_type: TypeRef = var_node.initializer.resolved_type;
             if (init_type.is_valid()) {
                 this.register_local(var_node.name, init_type);
+            } else {
+                // Neither declared type nor initializer type resolved.
+                // Register with void to prevent cascading "undefined variable" errors.
+                this.register_local(var_node.name, this.arena.get_void());
             }
+        } else {
+            // No type annotation resolved and no initializer — register with void
+            // to keep the variable visible in scope.
+            this.register_local(var_node.name, this.arena.get_void());
         }
     }
 
@@ -880,6 +894,16 @@ public:
         // Constructor call (e.g., Dog("Buddy"))
         const type_ref: TypeRef = this.lookup_type_by_sym(ident.name);
         if (type_ref.is_valid()) { return type_ref; }
+
+        // Function pointer call: local variable with FunctionType (e.g., `default_fn()`)
+        const local_type: TypeRef = this.lookup_local(ident.name);
+        if (local_type.is_valid()) {
+            const local_t: Type* = this.arena.lookup(local_type.id);
+            if (local_t != null && local_t.kind == TypeKind::Function) {
+                const fn_t: FunctionType* = local_t as FunctionType*;
+                return fn_t.return_type;
+            }
+        }
 
         // TODO: Replace with proper builtin/extern resolution
         const name: string = this.intern.resolve(ident.name);
@@ -1287,7 +1311,17 @@ public:
             this.resolve_expr(arr.repeat_count_expr);
         }
         if (elem_type.is_valid()) {
-            return this.arena.get_array_of(elem_type, arr.elements.length);
+            // Fill expression [value; count]: use the repeat count for the
+            // array size.  A static count (e.g. [0; 5]) uses repeat_count;
+            // a dynamic count (e.g. [0; n]) has repeat_count_expr and the
+            // size is unknown at compile time, so treat as dynamic (-1).
+            mut size: i64 = arr.elements.length;
+            if (arr.repeat_count > 0) {
+                size = arr.repeat_count;
+            } else if (arr.repeat_count_expr != null) {
+                size = -1;  // dynamic size
+            }
+            return this.arena.get_array_of(elem_type, size);
         }
         return TypeRef::invalid();
     }

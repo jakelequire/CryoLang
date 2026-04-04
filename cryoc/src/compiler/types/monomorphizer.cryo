@@ -17,6 +17,7 @@ import Compiler::AST::Declaration;
 import Compiler::AST::Statement;
 import Compiler::AST::Expression;
 import Compiler::AST::Specializer;
+import Compiler::AST::Pattern;
 import Compiler::Types::Substitution;
 import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
@@ -244,7 +245,11 @@ type struct Monomorphizer {
                 if (qname.is_valid()) {
                     type_arg_displays = type_arg_displays + [this.intern_table.resolve(qname)];
                 } else {
-                    type_arg_displays = type_arg_displays + [arg_t.display_name()];
+                    // Use format_display() instead of display_name() so that
+                    // compound types (InstantiatedType, Pointer, etc.) get
+                    // properly resolved through the arena instead of falling
+                    // back to raw TypeRef IDs.
+                    type_arg_displays = type_arg_displays + [this.arena.format_display(arg_t)];
                 }
             } else {
                 type_arg_displays = type_arg_displays + [sprintf("unknown_%llu", request.type_args[i].id)];
@@ -557,6 +562,27 @@ type struct Monomorphizer {
                     const body_node: ASTNode* = for_stmt.body as ASTNode*;
                     if (body_node.kind == NodeKind::BlockStatement) {
                         this.resolve_body_locals(for_stmt.body as BlockStmtNode*, res_ctx);
+                    }
+                }
+            }
+            if (node.kind == NodeKind::MatchStatement) {
+                const match_stmt: MatchStmtNode* = stmt as MatchStmtNode*;
+                for (mut mi: i64 = 0; mi < match_stmt.arms.length; mi++) {
+                    const arm: MatchArmNode* = match_stmt.arms[mi];
+                    if (arm != null && arm.body != null) {
+                        const arm_body: ASTNode* = arm.body as ASTNode*;
+                        if (arm_body.kind == NodeKind::BlockStatement) {
+                            this.resolve_body_locals(arm.body as BlockStmtNode*, res_ctx);
+                        }
+                    }
+                }
+            }
+            if (node.kind == NodeKind::LoopStatement) {
+                const loop_stmt: LoopStmtNode* = stmt as LoopStmtNode*;
+                if (loop_stmt.body != null) {
+                    const loop_body: ASTNode* = loop_stmt.body as ASTNode*;
+                    if (loop_body.kind == NodeKind::BlockStatement) {
+                        this.resolve_body_locals(loop_stmt.body as BlockStmtNode*, res_ctx);
                     }
                 }
             }

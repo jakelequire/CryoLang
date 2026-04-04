@@ -202,6 +202,28 @@ type struct TypeChecker {
                     return TypeCompatibility::Compatible;
                 }
             }
+            // Different element types but both integer/char: allow coercion
+            // for patterns like `char[] = [0; N]` where 0 is i32.
+            if (to_arr.is_dynamic() || from_arr.is_dynamic()) {
+                const from_elem: Type* = this.arena.lookup(from_arr.element.id);
+                const to_elem: Type* = this.arena.lookup(to_arr.element.id);
+                if (from_elem != null && to_elem != null &&
+                    from_elem.kind == TypeKind::Int && to_elem.kind == TypeKind::Int) {
+                    return TypeCompatibility::ImplicitConvert;
+                }
+                // i32[] → char[] (char is integer-compatible)
+                if (from_elem != null && to_elem != null &&
+                    from_elem.kind == TypeKind::Int && to_elem.kind == TypeKind::Char) {
+                    return TypeCompatibility::ImplicitConvert;
+                }
+            }
+        }
+
+        // Array → string coercion: [0; N] buffer allocation pattern.
+        // In Cryo, `string` is a raw char pointer — initializing it from
+        // an integer/char array fill expression is a standard buffer allocation.
+        if (from_type.kind == TypeKind::Array && to_type.kind == TypeKind::String) {
+            return TypeCompatibility::ImplicitConvert;
         }
 
         // Reference structural equality: &T ≡ &T, &mut T ≡ &mut T
@@ -662,6 +684,17 @@ type struct TypeChecker {
                 return TypeCheckResult::ok(arr.element);
             }
             return TypeCheckResult::fail("Array index must be an integer");
+        }
+
+        // Pointer indexing: T*[i] → T (pointer arithmetic)
+        if (base_type.kind == TypeKind::Pointer) {
+            const ptr_type: PointerType* = base_type as PointerType*;
+            return TypeCheckResult::ok(ptr_type.pointee);
+        }
+
+        // String indexing: string[i] → char
+        if (base_type.kind == TypeKind::String) {
+            return TypeCheckResult::ok(this.arena.get_char());
         }
 
         return TypeCheckResult::fail(sprintf("Cannot index into type %s",
