@@ -86,8 +86,17 @@ type struct ModuleLoader {
         }
 
         // 3. Stdlib (unless no_std)
+        // Strip "std/" prefix from fs_path since the stdlib_root already
+        // points to the stdlib directory (e.g., "../stdlib").
+        // Import "std::collections::hashmap" → fs_path "std/collections/hashmap"
+        // → search for "collections/hashmap" under stdlib_root.
         if (!this.no_std && strlen(this.stdlib_root) > 0) {
-            const from_stdlib: string = this.search_location(this.stdlib_root, fs_path);
+            mut stdlib_fs_path: string = fs_path;
+            if (strlen(fs_path) > 4 && fs_path[0] == 's' && fs_path[1] == 't' &&
+                fs_path[2] == 'd' && fs_path[3] == '/') {
+                stdlib_fs_path = fs_path + 4;  // skip "std/"
+            }
+            const from_stdlib: string = this.search_location(this.stdlib_root, stdlib_fs_path);
             if (strlen(from_stdlib) > 0) { return from_stdlib; }
         }
 
@@ -103,15 +112,21 @@ type struct ModuleLoader {
     discover_module(mut &this, intern: InternTable*,
                     graph: ModuleGraph*, sink: DiagnosticSink*,
                     file_path: string, debug: boolean) -> boolean {
-        // Check if already loaded
-        if (this.is_loaded(file_path)) { return true; }
+        // Check if already loaded (case-insensitive on Windows).
+        // Different import paths can resolve to the same file with different
+        // casing (e.g., "src/Compiler/Passes/Sema.cryo" vs
+        // "src/compiler/passes/sema.cryo").  Lowercasing ensures we only
+        // load and register each physical file once.
+        const norm_path: string = to_lowercase(file_path);
+
+        if (this.is_loaded(norm_path)) { return true; }
 
         // Circular dependency: this module is already being loaded
         // (i.e., we are inside its own import subtree).  This is expected
         // for mutually-referencing modules (e.g., AST::Node ↔ AST::Expression).
         // During *discovery* we only need to know that the file exists and
         // will be registered — the topological sort handles actual ordering.
-        if (this.is_loading(file_path)) {
+        if (this.is_loading(norm_path)) {
             return true;
         }
 
@@ -122,8 +137,8 @@ type struct ModuleLoader {
             return false;
         }
 
-        // Mark as loading
-        this.push_loading(file_path);
+        // Mark as loading (use normalized path for dedup)
+        this.push_loading(norm_path);
 
         if (debug) {
             printf("[ModuleLoader] Discovering: %s\n", file_path);
@@ -143,7 +158,7 @@ type struct ModuleLoader {
                 scan.namespace_name, scan.import_count);
         }
 
-        // Create ModuleInfo
+        // Create ModuleInfo (store original path so the lexer can open the file)
         const mod_name_str: string = if (strlen(scan.namespace_name) > 0) {
             scan.namespace_name
         } else {
@@ -204,12 +219,34 @@ type struct ModuleLoader {
             }
         }
 
+        // Discover submodules (public module declarations) WITHOUT adding
+        // dependency edges.  Aggregator _module.cryo files re-export their
+        // children, but this isn't a real data dependency — the parent doesn't
+        // need its children compiled first.  Treating these as dependencies
+        // creates false cycles (e.g., AST → Specializer → Types → AST).
+        for (mut s: i64 = 0; s < scan.submodule_count; s++) {
+            const sub_path: string = scan.submodule_paths[s];
+            mut sub_resolved: string = this.resolve_import_path(sub_path);
+            if (strlen(sub_resolved) == 0) {
+                sub_resolved = this.search_location(file_dir, replace_separator(sub_path));
+            }
+            if (debug) {
+                printf("[ModuleLoader]   submodule '%s' -> '%s'\n", sub_path, sub_resolved);
+            }
+            if (strlen(sub_resolved) > 0) {
+                if (!this.discover_module(intern, graph, sink, sub_resolved, debug)) {
+                    success = false;
+                }
+                // NO add_dependency here — submodules are not real deps
+            }
+        }
+
         // Register this module in the graph
         graph.add_module(info);
 
-        // Mark as loaded, remove from loading set
-        this.mark_loaded(file_path);
-        this.pop_loading(file_path);
+        // Mark as loaded, remove from loading set (use normalized path)
+        this.mark_loaded(norm_path);
+        this.pop_loading(norm_path);
 
         return success;
     }
@@ -294,9 +331,11 @@ type struct ModuleLoader {
 /// Result of scanning a file's tokens for namespace and import declarations.
 /// This avoids needing a full parse during discovery.
 type struct ModuleScanResult {
-    namespace_name: string;
-    import_paths:   string[];
-    import_count:   i64;
+    namespace_name:  string;
+    import_paths:    string[];    // real `import` statements (create dependency edges)
+    import_count:    i64;
+    submodule_paths: string[];    // `public module` declarations (discover only, no dep edge)
+    submodule_count: i64;
 }
 
 
@@ -306,6 +345,7 @@ type struct ModuleScanResult {
 function scan_tokens(tokens: Token[]) -> ModuleScanResult {
     mut ns: string = "";
     mut imports: string[] = [];
+    mut submodules: string[] = [];
     const len: i64 = tokens.length;
     mut i: i64 = 0;
 
@@ -353,7 +393,7 @@ function scan_tokens(tokens: Token[]) -> ModuleScanResult {
                     i = i + 2;  // consume 'public' 'module'
                     const mod_path: string = collect_qualified_name(tokens, &i, len);
                     if (strlen(mod_path) > 0) {
-                        imports.push(mod_path);
+                        submodules.push(mod_path);
                     }
                     // Skip semicolon if present
                     if (i < len) {
@@ -376,9 +416,11 @@ function scan_tokens(tokens: Token[]) -> ModuleScanResult {
     }
 
     return ModuleScanResult {
-        namespace_name: ns,
-        import_paths:   imports,
-        import_count:   imports.length,
+        namespace_name:  ns,
+        import_paths:    imports,
+        import_count:    imports.length,
+        submodule_paths: submodules,
+        submodule_count: submodules.length,
     };
 }
 
