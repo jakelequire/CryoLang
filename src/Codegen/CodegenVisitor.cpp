@@ -1030,7 +1030,10 @@ namespace Cryo::Codegen
                 }
             }
 
-            // Generate vtable after method declarations are available
+            // Generate vtable after method declarations are available.
+            // This creates the vtable type and global (possibly with stub function
+            // pointers).  It will be regenerated after method bodies are compiled
+            // to fill in the real function pointers.
             {
                 TypeRef cryo_type = _ctx->symbols().lookup_class_type(node.name());
                 if (cryo_type.is_valid())

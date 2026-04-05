@@ -30,9 +30,53 @@ public:
 
     Parser(tokens: Token[], source_file: string, ctx: CompilationContext*)
         : ExprParser(tokens, source_file, ctx) {
-        // Install the full block parser callback so that ExprParser's
-        // parse_inner_block() delegates to parse_block_statement().
-        this.block_parser_fn = parser_block_trampoline;
+    }
+
+    /// Override ExprParser's limited block parser with full statement support.
+    /// This allows match expression arms and lambda bodies to contain any
+    /// statement (for, if, while, etc.), not just const/return/expressions.
+    /// Unlike parse_block_statement(), semicolons are optional before '}'
+    /// (the last expression in the block is the arm's return value).
+    override parse_inner_block() -> BlockStmtNode* {
+        const bstart: Token = this.advance(); // consume '{'
+        mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(bstart));
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            if (this.panic_mode) {
+                if (this.check(TokenType::RBrace)) {
+                    this.panic_mode = false;
+                    break;
+                }
+                this.synchronize();
+                if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
+            }
+
+            if (this.is_declaration_start()) {
+                const decl: ASTNode* = this.parse_declaration(false, "");
+                if (decl != null) {
+                    const decl_stmt: DeclStmtNode* = new DeclStmtNode(
+                        decl as DeclarationNode*, decl.span);
+                    block.add_statement(decl_stmt);
+                }
+            } else if (this.is_statement_keyword()) {
+                const stmt: StatementNode* = this.parse_statement();
+                if (stmt != null) {
+                    block.add_statement(stmt);
+                }
+            } else {
+                // Expression — semicolon optional before '}'
+                const expr: ExpressionNode* = this.parse_expression();
+                if (expr != null) {
+                    const stmt: ExprStmtNode* = new ExprStmtNode(expr, expr.span);
+                    block.add_statement(stmt);
+                }
+                this.match_tok(TokenType::Semicolon);
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        block.span = this.span_from(bstart);
+        return block;
     }
 
     /// Create a parser from the compilation context's token stream.
@@ -1803,12 +1847,4 @@ public:
         }
         return this.parse_statement();
     }
-}
-
-
-/// Trampoline: casts void* back to Parser* and calls parse_block_statement().
-/// Used as the block_parser_fn callback installed by Parser's constructor.
-function parser_block_trampoline(self: void*) -> void* {
-    const parser: Parser* = self as Parser*;
-    return parser.parse_block_statement() as void*;
 }
