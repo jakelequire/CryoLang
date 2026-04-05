@@ -36,6 +36,7 @@ import Compiler::Resolver::MangledName;
 import Compiler::Resolver::Resolver;
 import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
+import Compiler::ModuleGraph;
 import std::collections::hashmap;
 import Utils::Logger;
 
@@ -158,6 +159,49 @@ public:
 
     lookup_global_var(&this, name: SymbolStr) -> TypeRef {
         return this.ctx.decl_index.lookup_global(name);
+    }
+
+    /// Resolve a module-qualified function call (e.g., intrinsics::frexp).
+    /// Searches the module graph for a module whose namespace ends with
+    /// scope_name, then looks up "namespace::member_name" in the DeclarationIndex.
+    /// Returns invalid TypeRef if no match found.
+    resolve_module_qualified_function(&this, scope_name: SymbolStr,
+                                      member_name: SymbolStr) -> TypeRef {
+        const scope_str: string = this.intern.resolve(scope_name);
+        const member_str: string = this.intern.resolve(member_name);
+        const scope_len: i64 = strlen(scope_str) as i64;
+        if (scope_len == 0) { return TypeRef::invalid(); }
+
+        // Search the module graph for a module whose namespace ends with
+        // "::scope_name" (e.g., scope_name="intrinsics" matches namespace
+        // "std::core::intrinsics").  Functions are registered under their
+        // full namespace during type resolution.
+        const modules: ModuleInfo[] = this.ctx.module_graph.modules;
+        for (mut i: i64 = 0; i < modules.length; i++) {
+            const ns_str: string = this.intern.resolve(modules[i].namespace_name);
+            const ns_len: i64 = strlen(ns_str) as i64;
+
+            // Check if namespace ends with "::scope_name" or equals scope_name
+            mut is_match: boolean = false;
+            if (ns_len == scope_len) {
+                is_match = strcmp(ns_str, scope_str) == 0;
+            } else if (ns_len > scope_len + 1) {
+                const suffix_start: i64 = ns_len - scope_len;
+                if (ns_str[suffix_start - 1] == ':' && ns_str[suffix_start - 2] == ':') {
+                    is_match = strcmp(ns_str + suffix_start, scope_str) == 0;
+                }
+            }
+
+            if (is_match) {
+                const qualified: string = ns_str + "::" + member_str;
+                const q_sym: SymbolStr = this.ctx.intern(qualified);
+                const ret: TypeRef = this.lookup_func_return(q_sym);
+                if (ret.is_valid()) {
+                    return ret;
+                }
+            }
+        }
+        return TypeRef::invalid();
     }
 
 
@@ -983,11 +1027,70 @@ public:
             return ret;
         }
 
+        // Before giving up, check if the member is a field with function type.
+        // This handles patterns like `this.read_fn(args)` where read_fn is a
+        // function pointer field, not a method.
+        const field_ret: TypeRef = this.try_field_function_call(obj_type, member.member);
+        if (field_ret.is_valid()) {
+            member.set_resolved_type(field_ret);
+            return field_ret;
+        }
+
         // Inputs were valid but method not found — emit diagnostic
         const type_name: string = this.intern.resolve(type_sym);
         const method_name: string = this.intern.resolve(member.member);
         this.ctx.emit_error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
             sprintf("no method '%s' found on type '%s'", method_name, type_name));
+        return TypeRef::invalid();
+    }
+
+    /// Check if a member is a field with function type on a struct/class.
+    /// Returns the function's return type if found, invalid otherwise.
+    /// Handles patterns like `this.read_fn(args)` where read_fn is a
+    /// function pointer field.
+    try_field_function_call(&this, obj_type: TypeRef, field_name: SymbolStr) -> TypeRef {
+        // Dereference through references to get the underlying type
+        const t: Type* = this.arena.lookup(obj_type.id);
+        if (t == null) { return TypeRef::invalid(); }
+
+        mut check_t: Type* = t;
+        if (check_t.kind == TypeKind::Reference) {
+            const ref_t: ReferenceType* = check_t as ReferenceType*;
+            const inner: TypeRef = ref_t.referent;
+            check_t = this.arena.lookup(inner.id);
+            if (check_t == null) { return TypeRef::invalid(); }
+        }
+
+        // Search fields on struct or class
+        if (check_t.kind == TypeKind::Struct) {
+            const st: StructType* = check_t as StructType*;
+            for (mut i: i64 = 0; i < st.fields.length; i++) {
+                const f_name: SymbolStr = st.fields[i].name;
+                if (f_name.id == field_name.id) {
+                    const f_type: TypeRef = st.fields[i].field_type;
+                    const ft: Type* = this.arena.lookup(f_type.id);
+                    if (ft != null && ft.kind == TypeKind::Function) {
+                        const fn_t: FunctionType* = ft as FunctionType*;
+                        return fn_t.return_type;
+                    }
+                    return TypeRef::invalid();
+                }
+            }
+        } else if (check_t.kind == TypeKind::Class) {
+            const ct: ClassType* = check_t as ClassType*;
+            for (mut i: i64 = 0; i < ct.fields.length; i++) {
+                const f_name: SymbolStr = ct.fields[i].name;
+                if (f_name.id == field_name.id) {
+                    const f_type: TypeRef = ct.fields[i].field_type;
+                    const ft: Type* = this.arena.lookup(f_type.id);
+                    if (ft != null && ft.kind == TypeKind::Function) {
+                        const fn_t: FunctionType* = ft as FunctionType*;
+                        return fn_t.return_type;
+                    }
+                    return TypeRef::invalid();
+                }
+            }
+        }
         return TypeRef::invalid();
     }
 
@@ -1079,13 +1182,24 @@ public:
             }
         }
 
-        // Module-qualified function call (e.g., intrinsics::isinf).
+        // Module-qualified function call (e.g., intrinsics::frexp).
         // The scope_name may be a module qualifier, not a type.  Only try
         // this if the scope_name is NOT a known type (to avoid matching
         // wrong functions for enum variant calls like IoResult::Ok).
         {
             const scope_as_type: TypeRef = this.lookup_type_by_sym(scope.scope_name);
             if (!scope_as_type.is_valid()) {
+                // Try qualified lookup first: find a module whose namespace
+                // ends with scope_name, then look up "namespace::member_name".
+                // This disambiguates when multiple modules export functions
+                // with the same bare name (e.g., intrinsics::frexp vs math::frexp).
+                const q_ret: TypeRef = this.resolve_module_qualified_function(
+                    scope.scope_name, scope.member_name);
+                if (q_ret.is_valid()) {
+                    scope.set_resolved_type(q_ret);
+                    return q_ret;
+                }
+                // Fall back to bare name lookup
                 const fn_ret: TypeRef = this.lookup_func_return(scope.member_name);
                 if (fn_ret.is_valid()) {
                     scope.set_resolved_type(fn_ret);

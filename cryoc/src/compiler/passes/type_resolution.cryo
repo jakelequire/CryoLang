@@ -584,12 +584,26 @@ type struct TypeResolutionPasses {
                 if (func.resolved_return_type.is_valid()) {
                     ctx.decl_index.register_function_with_module(
                         func.name, func.resolved_return_type, module_sym);
+                    // Also register under qualified name so module-qualified
+                    // calls (e.g., intrinsics::frexp) resolve correctly when
+                    // multiple modules export functions with the same bare name.
+                    const q_name: SymbolStr = ctx.qualify_symbol_sym(func.name);
+                    if (!q_name.equals(func.name)) {
+                        ctx.decl_index.register_function(q_name, func.resolved_return_type);
+                    }
                 }
             }
             NodeKind::ImplementationBlock => {
                 const node: ImplBlockNode* = stmt as ImplBlockNode*;
                 const qualified_impl: SymbolStr = ctx.qualify_symbol_sym(node.target_type);
                 ctx.decl_index.register_methods(qualified_impl, node.methods);
+                // Also register under bare target name so methods are findable
+                // without full qualification.  This handles implement blocks on
+                // primitives (e.g., `implement f64 { ... }`) where the reverse
+                // type map returns "f64", not "std::core::primitives::f64".
+                if (!qualified_impl.equals(node.target_type)) {
+                    ctx.decl_index.register_methods(node.target_type, node.methods);
+                }
             }
             NodeKind::TypeAliasDeclaration => {
                 const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
@@ -705,6 +719,11 @@ type struct TypeResolutionPasses {
                     }
                     if (node.has_resolved_return_type()) {
                         ctx.decl_index.register_function(node.name, node.resolved_return_type);
+                        // Also register under qualified name (same as FunctionDeclaration)
+                        const q_name: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                        if (!q_name.equals(node.name)) {
+                            ctx.decl_index.register_function(q_name, node.resolved_return_type);
+                        }
                     }
                     sig_count++;
                 }
