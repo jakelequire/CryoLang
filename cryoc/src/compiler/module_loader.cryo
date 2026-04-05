@@ -106,17 +106,13 @@ type struct ModuleLoader {
         // Check if already loaded
         if (this.is_loaded(file_path)) { return true; }
 
-        // Check circular dependency
+        // Circular dependency: this module is already being loaded
+        // (i.e., we are inside its own import subtree).  This is expected
+        // for mutually-referencing modules (e.g., AST::Node ↔ AST::Expression).
+        // During *discovery* we only need to know that the file exists and
+        // will be registered — the topological sort handles actual ordering.
         if (this.is_loading(file_path)) {
-            const msg: string = sprintf("circular module dependency: '%s' is already being loaded", file_path);
-            sink.emit(Diagnostic::error(ErrorCode::E0501_CIRCULAR_IMPORT, msg));
-            printf("[ModuleLoader] CIRCULAR: loading stack has %d entries:\n", this.loading_paths.length);
-            for (mut k: i64 = 0; k < this.loading_paths.length; k++) {
-                if (this.loading_flags[k]) {
-                    printf("[ModuleLoader]   [%d] %s\n", k, this.loading_paths[k]);
-                }
-            }
-            return false;
+            return true;
         }
 
         // Verify file exists
@@ -157,13 +153,23 @@ type struct ModuleLoader {
         mut info: ModuleInfo = ModuleInfo::with_namespace(
             mod_name, file_path, mod_name);
 
+        // Directory of the current file — used to resolve bare sub-module
+        // names (e.g., `public module Commands;` in src/CLI/_module.cryo
+        // should find src/CLI/Commands.cryo).
+        const file_dir: string = extract_directory(file_path);
+
         // Process imports: discover dependencies recursively
         mut success: boolean = true;
         for (mut i: i64 = 0; i < scan.import_count; i++) {
             const import_path: string = scan.import_paths[i];
 
-            // Resolve to filesystem path
-            const resolved: string = this.resolve_import_path(import_path);
+            // Resolve to filesystem path.  First try global resolution, then
+            // fall back to searching relative to the declaring file's directory
+            // (handles bare `public module X;` declarations in _module.cryo).
+            mut resolved: string = this.resolve_import_path(import_path);
+            if (strlen(resolved) == 0) {
+                resolved = this.search_location(file_dir, replace_separator(import_path));
+            }
             if (debug) {
                 printf("[ModuleLoader]   import '%s' -> '%s'\n", import_path, resolved);
             }
@@ -480,11 +486,18 @@ function to_lowercase(s: string) -> string {
     return out as string;
 }
 
-/// Convert PascalCase/camelCase to snake_case.
+/// Convert PascalCase/camelCase to snake_case, handling acronyms.
+/// "PassID" → "pass_id", "ASTValidation" → "ast_validation".
 /// Two-pass: first compute length, then fill.
 function to_snake_case(s: string) -> string {
     const len: u64 = strlen(s);
     if (len == 0) { return s; }
+
+    // Helper: insert underscore before uppercase char at position i when:
+    //   (a) previous char is lowercase (new word after lowercase run), OR
+    //   (b) previous char is uppercase AND next char is lowercase
+    //       (transition from acronym to word, e.g. the 'V' in "ASTValidation")
+    // Never insert after '/' or '_', or at position 0.
 
     // Pass 1: compute output length
     mut out_len: u64 = 0;
@@ -494,7 +507,11 @@ function to_snake_case(s: string) -> string {
         if (is_upper && i > 0) {
             const prev: i8 = s[i - 1];
             if (prev != 47 && prev != 95) {
-                out_len = out_len + 1;  // underscore
+                const prev_lower: boolean = prev >= 97 && prev <= 122;
+                const next_lower: boolean = (i + 1 < len) && s[i + 1] >= 97 && s[i + 1] <= 122;
+                if (prev_lower || next_lower) {
+                    out_len = out_len + 1;  // underscore
+                }
             }
         }
         out_len = out_len + 1;
@@ -507,13 +524,17 @@ function to_snake_case(s: string) -> string {
         const ch: i8 = s[i];
         const is_upper: boolean = ch >= 65 && ch <= 90;
 
-        // Insert underscore before uppercase (not at start, not after / or _)
+        // Insert underscore using the same rule as pass 1
         if (is_upper && i > 0) {
             const prev: i8 = s[i - 1];
             if (prev != 47 && prev != 95) {
-                const pu: i8* = ptr_add(out as void*, j as i64) as i8*;
-                *pu = 95;
-                j = j + 1;
+                const prev_lower: boolean = prev >= 97 && prev <= 122;
+                const next_lower: boolean = (i + 1 < len) && s[i + 1] >= 97 && s[i + 1] <= 122;
+                if (prev_lower || next_lower) {
+                    const pu: i8* = ptr_add(out as void*, j as i64) as i8*;
+                    *pu = 95;
+                    j = j + 1;
+                }
             }
         }
 
