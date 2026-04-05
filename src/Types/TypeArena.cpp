@@ -1009,6 +1009,7 @@ namespace Cryo
             _has_virtual_methods = true;
         }
         _methods.push_back(std::move(method));
+        invalidate_vtable_cache();
     }
 
     void ClassType::set_methods(std::vector<MethodInfo> methods)
@@ -1022,6 +1023,7 @@ namespace Cryo
                 break;
             }
         }
+        invalidate_vtable_cache();
     }
 
     std::optional<size_t> ClassType::field_index(const std::string &name) const
@@ -1083,6 +1085,11 @@ namespace Cryo
 
     std::vector<MethodInfo> ClassType::build_vtable() const
     {
+        // Return cached result if available.  The cache is invalidated
+        // whenever methods change (add_method / set_methods).
+        if (_vtable_cached)
+            return _cached_vtable;
+
         std::vector<MethodInfo> vtable;
 
         // Start with base class vtable entries
@@ -1121,6 +1128,8 @@ namespace Cryo
             }
         }
 
+        _cached_vtable = vtable;
+        _vtable_cached = true;
         return vtable;
     }
 

@@ -173,6 +173,8 @@ namespace Cryo
         size_t _computed_alignment = 1;
         bool _has_virtual_methods = false;
         bool _is_abstract = false;
+        mutable bool _vtable_cached = false;
+        mutable std::vector<MethodInfo> _cached_vtable;
 
     public:
         ClassType(TypeID id, QualifiedTypeName name)
@@ -215,8 +217,10 @@ namespace Cryo
         bool is_abstract() const { return _is_abstract; }
         void set_abstract(bool v) { _is_abstract = v; }
 
-        // Build the ordered vtable method list (base class methods first, overrides replace)
+        // Build the ordered vtable method list (base class methods first, overrides replace).
+        // Result is cached; invalidated when methods change.
         std::vector<MethodInfo> build_vtable() const;
+        void invalidate_vtable_cache() const { _vtable_cached = false; _cached_vtable.clear(); }
         // Get the vtable index for a given method name + overload suffix, or -1 if not found
         int vtable_index(const std::string &method_name,
                          const std::string &overload_suffix = "") const;

@@ -2332,21 +2332,30 @@ namespace Cryo::Codegen
             }
         }
 
-        // If vtable already exists, replace its initializer with updated values
+        // If vtable already exists, update it — but only if the size matches.
+        // A size mismatch means the vtable layout changed (e.g., a virtual method
+        // was added to an intermediate class), requiring a full recreation.
         llvm::GlobalVariable *existing_vtable = module()->getGlobalVariable(vtable_name, /*AllowInternal=*/true);
         if (existing_vtable)
         {
-            // Reuse the existing vtable type (already named) and update the initializer
-            llvm::StructType *vtable_type = llvm::dyn_cast<llvm::StructType>(existing_vtable->getValueType());
-            if (vtable_type)
+            llvm::StructType *old_vtable_type = llvm::dyn_cast<llvm::StructType>(existing_vtable->getValueType());
+            if (old_vtable_type && old_vtable_type->getNumElements() == vtable_values.size())
             {
-                llvm::Constant *vtable_init = llvm::ConstantStruct::get(vtable_type, vtable_values);
+                // Same size — safe to update initializer in place
+                llvm::Constant *vtable_init = llvm::ConstantStruct::get(old_vtable_type, vtable_values);
                 existing_vtable->setInitializer(vtable_init);
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "DeclarationCodegen: Updated existing vtable '{}' with {} entries for class '{}'",
                           vtable_name, vtable_entries.size(), class_name);
                 return;
             }
+            // Size mismatch — erase old vtable and recreate with correct type below
+            LOG_WARN(Cryo::LogComponent::CODEGEN,
+                     "DeclarationCodegen: Vtable '{}' size changed ({} -> {}), recreating for class '{}'",
+                     vtable_name,
+                     old_vtable_type ? old_vtable_type->getNumElements() : 0,
+                     vtable_values.size(), class_name);
+            existing_vtable->eraseFromParent();
         }
 
         // Create the vtable struct type
