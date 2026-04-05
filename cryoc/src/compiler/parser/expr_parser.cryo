@@ -27,9 +27,26 @@ import Utils::Logger;
 
 type class ExprParser : ParserBase {
 public:
+    // Callback for full block parsing.  Set by Parser's constructor to
+    // point at a trampoline that calls parse_block_statement().  This lets
+    // ExprParser parse full statement blocks (for/if/while inside match
+    // arms and lambdas) without adding virtual methods to the class
+    // (which breaks the C++ codegen's vtable layout).
+    block_parser_fn: (void*) -> void*;
 
     ExprParser(tokens: Token[], source_file: string, ctx: CompilationContext*)
         : ParserBase(tokens, source_file, ctx) {
+        this.block_parser_fn = null;
+    }
+
+    /// Parse a brace-delimited block.  If Parser installed its callback,
+    /// delegates to the full statement parser; otherwise falls back to the
+    /// limited lambda-style block parser.
+    parse_inner_block() -> BlockStmtNode* {
+        if (this.block_parser_fn != null) {
+            return this.block_parser_fn(this as void*) as BlockStmtNode*;
+        }
+        return this.parse_lambda_block_body();
     }
 
 
@@ -936,23 +953,11 @@ public:
         const start: Token = this.current();
         mut arm: MatchArmNode* = this.parse_match_arm_patterns();
 
-        // Body is either a block or a single expression wrapped in an expression statement
+        // Body is either a block or a single expression.
+        // Block bodies are parsed via parse_inner_block(), which Parser
+        // overrides to support full statements (for, if, while, etc.).
         if (this.check(TokenType::LBrace)) {
-            const bstart: Token = this.advance();
-            mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(bstart));
-
-            // Parse body as expression(s) — match arm bodies are expressions
-            const body_expr: ExpressionNode* = this.parse_expression();
-            if (body_expr != null) {
-                const stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
-                block.add_statement(stmt);
-            }
-
-            // Allow optional semicolons inside
-            this.match_tok(TokenType::Semicolon);
-
-            this.consume(TokenType::RBrace, "'}'");
-            block.span = this.span_from(bstart);
+            const block: BlockStmtNode* = this.parse_inner_block();
             arm.set_body(block);
         } else {
             const body_expr: ExpressionNode* = this.parse_expression();
@@ -966,6 +971,35 @@ public:
 
         arm.span = this.span_from(start);
         return arm;
+    }
+
+    /// Parse a variable declaration inside a match expression arm block.
+    /// Handles: const name: Type = expr;  /  mut name = expr;
+    /// Lightweight version that doesn't need full Parser::parse_declaration.
+    parse_match_arm_var_decl() -> VarDeclNode* {
+        const start: Token = this.current();
+        const is_mutable: boolean = this.check(TokenType::KwMut);
+        this.advance(); // consume const/mut
+
+        const name_tok: Token = this.consume(TokenType::Identifier, "variable name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut node: VarDeclNode* = new VarDeclNode(name, this.span_from_token(start));
+        node.set_mutable(is_mutable);
+        node.set_name_span(this.span_from_token(name_tok));
+
+        // Optional type annotation: `: Type`
+        if (this.match_tok(TokenType::Colon)) {
+            node.set_type_annotation(this.parse_type_annotation());
+        }
+
+        // Optional initializer: `= expr`
+        if (this.match_tok(TokenType::Equal)) {
+            node.set_initializer(this.parse_expression());
+        }
+
+        this.match_tok(TokenType::Semicolon);
+        node.span = this.span_from(start);
+        return node;
     }
 
     /// Parse a pattern (internal, used by match expressions and statements).
