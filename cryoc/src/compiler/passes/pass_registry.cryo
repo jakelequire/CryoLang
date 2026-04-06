@@ -10,6 +10,9 @@
 namespace Compiler::Passes::PassRegistry;
 
 import Compiler::Passes::PassID;
+import Compiler::Diag::Snapshot;
+import Compiler::Diag::Sink;
+import Compiler::Diag::SourceSpan;
 import Compiler::Diag;
 import Compiler::Artifacts;
 import Compiler::CompilationContext;
@@ -519,6 +522,7 @@ function run_lexing_pass(ctx: CompilationContext*) -> PassResult {
     // Diagnostics were already emitted by the Lexer via the DiagnosticSink.
     // Doc comments (DocCommentLine, DocCommentBlock) are kept for the parser
     // to collect as documentation on declarations.
+    // Also merge adjacent string literals ("foo" "bar" → "foobar") like C.
     mut clean_tokens: Token[] = [];
     mut had_errors: boolean = false;
     mut had_comments: boolean = false;
@@ -532,8 +536,57 @@ function run_lexing_pass(ctx: CompilationContext*) -> PassResult {
         }
     }
 
-    const needs_filter: boolean = had_errors || had_comments;
-    const final_tokens: Token[] = if (needs_filter) { clean_tokens } else { tokens };
+    // Merge adjacent string literals: "abc" "def" → "abcdef" (C-style).
+    // The lexeme includes quotes: "abc" has lexeme `"abc"`.
+    // To merge: strip trailing " from first, strip leading " from second.
+    mut merged_tokens: Token[] = [];
+    {
+        mut j: int = 0;
+        while (j < clean_tokens.length) {
+            if (clean_tokens[j].kind == TokenType::StringLiteral) {
+                mut combined: string = clean_tokens[j].lexeme;
+                const start_line: int = clean_tokens[j].line;
+                const start_col: int = clean_tokens[j].column;
+                while (j + 1 < clean_tokens.length &&
+                       clean_tokens[j + 1].kind == TokenType::StringLiteral) {
+                    j = j + 1;
+                    const next: string = clean_tokens[j].lexeme;
+                    const clen: i64 = strlen(combined);
+                    const nlen: i64 = strlen(next);
+                    if (clen >= 2 && nlen >= 2) {
+                        // Build: combined[0..clen-1] + next[1..nlen]
+                        // combined without trailing ", next without leading "
+                        const buf_size: i64 = clen + nlen;
+                        const buf: i8* = malloc(buf_size as u64) as i8*;
+                        // Copy combined without trailing quote
+                        memcpy(buf as void*, combined as void*, (clen - 1) as u64);
+                        // Copy next without leading quote (includes trailing quote + null)
+                        memcpy(ptr_add(buf as void*, clen - 1) as void*,
+                               ptr_add(next as void*, 1) as void*,
+                               (nlen - 1) as u64);
+                        // Null terminate
+                        const term: i8* = ptr_add(buf as void*, clen - 1 + nlen - 1) as i8*;
+                        *term = 0 as i8;
+                        combined = buf as string;
+                    }
+                }
+                const merged: Token = Token {
+                    kind:   TokenType::StringLiteral,
+                    lexeme: combined,
+                    line:   start_line,
+                    column: start_col,
+                };
+                merged_tokens.push(merged);
+            } else {
+                merged_tokens.push(clean_tokens[j]);
+            }
+            j = j + 1;
+        }
+    }
+
+    const had_merges: boolean = merged_tokens.length < clean_tokens.length;
+    const needs_filter: boolean = had_errors || had_comments || had_merges;
+    const final_tokens: Token[] = if (needs_filter) { merged_tokens } else { tokens };
 
     // Store results in artifacts
     ctx.artifacts.tokens = TokenStream::new(final_tokens, source_path, "");
