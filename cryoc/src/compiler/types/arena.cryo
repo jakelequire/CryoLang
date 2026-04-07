@@ -79,6 +79,12 @@ type struct TypeArena {
     generic_param_cache:   HashMap<string, TypeRef>;
     bounded_param_cache:   HashMap<string, TypeRef>;
 
+    // -- Reverse index: bare leaf name → qualified name --
+    // Populated by create_struct/class/enum/trait/alias.
+    // Used by TypeResolver as a clean O(1) fallback for cross-module
+    // type references that can't be resolved through the scope chain.
+    leaf_index: HashMap<u32, u32>;   // bare SymbolStr.id → qualified SymbolStr.id
+
 
     // ----------------------------------------------------------------
     // Construction
@@ -111,20 +117,21 @@ type struct TypeArena {
             f32_type:  TypeRef::invalid(),
             f64_type:  TypeRef::invalid(),
 
-            pointer_cache:   HashMap<string, TypeRef>::new(),
-            reference_cache: HashMap<string, TypeRef>::new(),
-            array_cache:     HashMap<string, TypeRef>::new(),
-            optional_cache:  HashMap<string, TypeRef>::new(),
-            function_cache:  HashMap<string, TypeRef>::new(),
-            tuple_cache:     HashMap<string, TypeRef>::new(),
-            struct_cache:    HashMap<u32, TypeRef>::new(),
-            class_cache:     HashMap<u32, TypeRef>::new(),
-            enum_cache:      HashMap<u32, TypeRef>::new(),
-            trait_cache:     HashMap<u32, TypeRef>::new(),
-            alias_cache:     HashMap<u32, TypeRef>::new(),
-            func_template_cache:  HashMap<u32, TypeRef>::new(),
-            generic_param_cache:  HashMap<string, TypeRef>::new(),
-            bounded_param_cache:  HashMap<string, TypeRef>::new(),
+            pointer_cache:       HashMap<string, TypeRef>::new(),
+            reference_cache:     HashMap<string, TypeRef>::new(),
+            array_cache:         HashMap<string, TypeRef>::new(),
+            optional_cache:      HashMap<string, TypeRef>::new(),
+            function_cache:      HashMap<string, TypeRef>::new(),
+            tuple_cache:         HashMap<string, TypeRef>::new(),
+            struct_cache:        HashMap<u32, TypeRef>::new(),
+            class_cache:         HashMap<u32, TypeRef>::new(),
+            enum_cache:          HashMap<u32, TypeRef>::new(),
+            trait_cache:         HashMap<u32, TypeRef>::new(),
+            alias_cache:         HashMap<u32, TypeRef>::new(),
+            func_template_cache: HashMap<u32, TypeRef>::new(),
+            generic_param_cache: HashMap<string, TypeRef>::new(),
+            bounded_param_cache: HashMap<string, TypeRef>::new(),
+            leaf_index:          HashMap<u32, u32>::new(),
         };
 
         arena.init_primitives();
@@ -329,6 +336,7 @@ type struct TypeArena {
 
         mut ref: TypeRef = this.alloc_type(new StructType(this.next_id, qualified_name, module_name, this.intern_table));
         this.struct_cache.insert(qualified_name.id, ref, h);
+        this.register_leaf_name(qualified_name);
         return ref;
     }
 
@@ -342,6 +350,7 @@ type struct TypeArena {
 
         mut ref: TypeRef = this.alloc_type(new ClassType(this.next_id, qualified_name, module_name, this.intern_table));
         this.class_cache.insert(qualified_name.id, ref, h);
+        this.register_leaf_name(qualified_name);
         return ref;
     }
 
@@ -355,6 +364,7 @@ type struct TypeArena {
 
         mut ref: TypeRef = this.alloc_type(new EnumType(this.next_id, qualified_name, module_name, this.intern_table));
         this.enum_cache.insert(qualified_name.id, ref, h);
+        this.register_leaf_name(qualified_name);
         return ref;
     }
 
@@ -367,6 +377,7 @@ type struct TypeArena {
 
         mut ref: TypeRef = this.alloc_type(new TraitType(this.next_id, qualified_name, module_name, this.intern_table));
         this.trait_cache.insert(qualified_name.id, ref, h);
+        this.register_leaf_name(qualified_name);
         return ref;
     }
 
@@ -379,6 +390,7 @@ type struct TypeArena {
 
         mut ref: TypeRef = this.alloc_type(new TypeAliasType(this.next_id, alias_name, this.intern_table, target));
         this.alias_cache.insert(alias_name.id, ref, h);
+        this.register_leaf_name(alias_name);
         return ref;
     }
 
@@ -497,6 +509,32 @@ type struct TypeArena {
         if (a.is_some()) { return a.unwrap(); }
 
         return TypeRef::invalid();
+    }
+
+    /// Look up a type by its bare leaf name (e.g., "DeclarationNode" finds
+    /// "Compiler::AST::Declaration::DeclarationNode").  Uses the reverse
+    /// index populated during type creation.  Returns invalid if not found.
+    lookup_by_leaf(&this, bare_name: SymbolStr) -> TypeRef {
+        const h: u64 = hash_int(bare_name.id as u64);
+        const found: Option<u32> = this.leaf_index.get(bare_name.id, h);
+        if (found.is_none()) { return TypeRef::invalid(); }
+
+        const qual_sym: SymbolStr = SymbolStr { id: found.unwrap() };
+        return this.lookup_by_name(qual_sym);
+    }
+
+    /// Register a bare→qualified mapping in the reverse index.
+    register_leaf_name(mut &this, qualified_name: SymbolStr) -> void {
+        const qname_str: string = this.intern_table.resolve(qualified_name);
+        const leaf_str: string = extract_leaf_segment(qname_str);
+        if (strlen(leaf_str) == 0) { return; }
+
+        const leaf_sym: SymbolStr = this.intern_table.intern(leaf_str);
+        const h: u64 = hash_int(leaf_sym.id as u64);
+        // First registration wins — ambiguous names require qualified imports
+        if (this.leaf_index.get(leaf_sym.id, h).is_none()) {
+            this.leaf_index.insert(leaf_sym.id, qualified_name.id, h);
+        }
     }
 
     /// Get the qualified name for a user-defined type by TypeRef.
@@ -916,4 +954,24 @@ type struct TypeArena {
         }
         return "";
     }
+}
+
+
+/// Extract the last segment after the final "::" in a qualified name.
+/// E.g., "Compiler::AST::Declaration::DeclarationNode" → "DeclarationNode".
+/// Returns the input as-is if no "::" is found.
+function extract_leaf_segment(s: string) -> string {
+    const len: i64 = strlen(s) as i64;
+    mut last_sep: i64 = -1;
+    for (mut i: i64 = 0; i + 1 < len; i++) {
+        if (s[i] == ':' && s[i + 1] == ':') {
+            last_sep = i;
+        }
+    }
+    if (last_sep < 0) { return s; }
+    const start: i64 = last_sep + 2;
+    if (start >= len) { return ""; }
+    // Use format("%s") on the tail pointer to create a safe copy
+    const tail: string = ptr_add(s as void*, start) as string;
+    return format("%s", tail);
 }
