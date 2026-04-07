@@ -98,7 +98,7 @@ namespace Cryo::Codegen
             return generate_eprintln(args);
         else if (intrinsic_name == "eprint")
             return generate_eprint(args);
-        else if (intrinsic_name == "sprintf")
+        else if (intrinsic_name == "sprintf" || intrinsic_name == "format")
             return generate_sprintf(args);
         else if (intrinsic_name == "snprintf")
             return generate_snprintf(args);

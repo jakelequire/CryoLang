@@ -483,22 +483,64 @@ type struct CompilerInstance {
             pipeline.reset();
         }
 
-        // Phase 6: Specialization + Semantic Analysis + Codegen Preparation
+        // Phase 6a: Specialization — monomorphize ALL modules before validation.
+        // GenericValidation walks the shared TypeArena which contains
+        // InstantiatedTypes from every module.  If we ran validation
+        // per-module inside the same loop as monomorphization, the first
+        // module's validation would see unmonomorphized types created by
+        // later modules during Phase 5 (TypeResolution).  Splitting into
+        // 6a (mono) and 6b (validation+sema) ensures every module has
+        // completed monomorphization before any validation runs.
         pipeline.set_passes([
             PassID::DirectiveProcessing,
             PassID::Monomorphization,
             PassID::GenericExpressionResolution,
+        ]);
+        {
+            mut initial6a: ProvisionSet = ProvisionSet::empty();
+            initial6a.mark(Provision::ASTValidated);
+            initial6a.mark(Provision::NamesResolved);
+            initial6a.mark(Provision::TypesResolved);
+            initial6a.mark(Provision::StructFieldsSynced);
+            pipeline.validate_with_initial(initial6a);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(&ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            ctx.provisions.mark(Provision::FunctionSignatures);
+            ctx.provisions.mark(Provision::TemplatesRegistered);
+            ctx.provisions.mark(Provision::TypesResolved);
+            ctx.provisions.mark(Provision::StructFieldsSynced);
+            if (!pipeline.run_all(&ctx)) {
+                return this.project_failure(&ctx);
+            }
+            pipeline.reset();
+        }
+
+        // Phase 6b: Validation + Semantic Analysis + Codegen Preparation.
+        // Now that every module has been monomorphized and specialized ASTs
+        // injected, GenericValidation can safely walk the entire arena
+        // without false positives from not-yet-monomorphized modules.
+        pipeline.set_passes([
             PassID::GenericValidation,
             PassID::FunctionBodyTypeCheck,
             PassID::TypeLowering,
         ]);
         {
-            mut initial6: ProvisionSet = ProvisionSet::empty();
-            initial6.mark(Provision::ASTValidated);
-            initial6.mark(Provision::NamesResolved);
-            initial6.mark(Provision::TypesResolved);
-            initial6.mark(Provision::StructFieldsSynced);
-            pipeline.validate_with_initial(initial6);
+            mut initial6b: ProvisionSet = ProvisionSet::empty();
+            initial6b.mark(Provision::ASTValidated);
+            initial6b.mark(Provision::NamesResolved);
+            initial6b.mark(Provision::TypesResolved);
+            initial6b.mark(Provision::StructFieldsSynced);
+            initial6b.mark(Provision::MonomorphizationComplete);
+            initial6b.mark(Provision::GenericExpressionsResolved);
+            pipeline.validate_with_initial(initial6b);
         }
 
         mut phase6_failed: boolean = false;
@@ -514,6 +556,8 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::TemplatesRegistered);
             ctx.provisions.mark(Provision::TypesResolved);
             ctx.provisions.mark(Provision::StructFieldsSynced);
+            ctx.provisions.mark(Provision::MonomorphizationComplete);
+            ctx.provisions.mark(Provision::GenericExpressionsResolved);
             if (!pipeline.run_all(&ctx)) {
                 phase6_failed = true;
             }
