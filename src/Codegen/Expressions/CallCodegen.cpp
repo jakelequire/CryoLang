@@ -41,7 +41,7 @@ namespace Cryo::Codegen
         "strchr", "strrchr", "strstr", "strdup", "substr",
         // I/O operations
         "printf", "println", "print", "eprintln", "eprint",
-        "snprintf", "sprintf", "fprintf", "sscanf", "getchar", "putchar", "puts",
+        "snprintf", "sprintf", "fprintf", "sscanf", "getchar", "putchar", "puts", "format",
         // File I/O
         "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush", "feof", "ferror",
         "fgets", "fputs", "fgetc", "fputc", "fileno", "fdopen",
@@ -7027,6 +7027,21 @@ namespace Cryo::Codegen
             return fn;
         }
 
+        if (name == "format")
+        {
+            // format(fmt, args...) → string.  Lowered to vsprintf via the
+            // variadic handler which allocates a buffer and returns it.
+            // The LLVM-level signature matches sprintf (i32(i8*, i8*, ...))
+            // because the variadic path rewrites the call to vsprintf.
+            llvm::Function *fn = module()->getFunction("format");
+            if (!fn)
+            {
+                llvm::FunctionType *fn_type = llvm::FunctionType::get(ptr_type, {ptr_type}, true);
+                fn = llvm::Function::Create(fn_type, llvm::Function::InternalLinkage, "format", module());
+            }
+            return fn;
+        }
+
         if (name == "snprintf")
         {
             llvm::Function *fn = module()->getFunction("snprintf");
@@ -8776,6 +8791,7 @@ namespace Cryo::Codegen
             {"fprintf", "vfprintf"},
             {"sprintf", "vsprintf"},
             {"snprintf", "vsnprintf"},
+            {"format", "vsprintf"},
         };
 
         auto it = va_variants.find(intrinsic_name);

@@ -180,7 +180,7 @@ type struct Monomorphizer {
             // Cycle detection
             if (this.is_in_progress(key)) {
                 this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    sprintf("monomorphization cycle detected for %s", key)));
+                    format("monomorphization cycle detected for %s", key)));
                 this.error_count = this.error_count + 1;
                 continue;
             }
@@ -222,7 +222,7 @@ type struct Monomorphizer {
         const entry: TemplateEntry* = this.generic_registry.get_template_by_type_id(request.base_type.id);
         if (entry == null) {
             this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                sprintf("no template found for type ID %llu", request.base_type.id)));
+                format("no template found for type ID %llu", request.base_type.id)));
             return false;
         }
 
@@ -235,7 +235,7 @@ type struct Monomorphizer {
         if (request.type_args.length != entry.param_count) {
             const qn_str: string = this.intern_table.resolve(entry.qualified_name);
             this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                sprintf("arg count mismatch for %s: expected %lld, got %lld",
+                format("arg count mismatch for %s: expected %lld, got %lld",
                         qn_str, entry.param_count, request.type_args.length)));
             return false;
         }
@@ -264,7 +264,7 @@ type struct Monomorphizer {
                     type_arg_displays = type_arg_displays + [this.arena.format_display(arg_t)];
                 }
             } else {
-                type_arg_displays = type_arg_displays + [sprintf("unknown_%llu", request.type_args[i].id)];
+                type_arg_displays = type_arg_displays + [format("unknown_%llu", request.type_args[i].id)];
             }
         }
 
@@ -275,7 +275,7 @@ type struct Monomorphizer {
         if (!result.success) {
             const qn_str: string = this.intern_table.resolve(entry.qualified_name);
             this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                sprintf("specialization failed for %s: %s",
+                format("specialization failed for %s: %s",
                         qn_str, result.error_message)));
             return false;
         }
@@ -349,9 +349,12 @@ type struct Monomorphizer {
             this.resolve_specialized_ast(result.impl_asts[ri], NodeKind::ImplementationBlock, entry);
         }
 
-        // For type templates (struct/enum/class), populate the concrete type's
-        // fields/variants and set resolved_type on the InstantiatedType.
-        // For function templates, skip — they produce no arena type.
+        // Populate the concrete type and set resolved_type on the InstantiatedType.
+        // For type templates (struct/enum/class): populate fields/variants from
+        // the specialized AST, then set resolved_type to the concrete arena type.
+        // For function templates: create a FunctionType from the resolved signature
+        // so that InstantiatedType.resolved_type is valid for ALL generics — no
+        // special-casing needed in GenericValidation or codegen.
         if (concrete_type.is_valid()) {
             this.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst, entry);
 
@@ -359,6 +362,20 @@ type struct Monomorphizer {
             if (inst_t != null) {
                 const inst: InstantiatedType* = inst_t as InstantiatedType*;
                 inst.set_resolved_type(concrete_type);
+            }
+        } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
+            // Function templates don't create named arena types (no struct/enum),
+            // but we still create a concrete FunctionType from the resolved
+            // signature so the InstantiatedType has a valid resolved_type.
+            // This unifies function generics with type generics — every
+            // InstantiatedType gets a resolved_type, period.
+            const func_type: TypeRef = this.build_function_type_from_ast(result.specialized_ast);
+            if (func_type.is_valid()) {
+                const inst_t: Type* = this.arena.lookup(request.generic_type.id);
+                if (inst_t != null) {
+                    const inst: InstantiatedType* = inst_t as InstantiatedType*;
+                    inst.set_resolved_type(func_type);
+                }
             }
         }
 
@@ -717,6 +734,41 @@ type struct Monomorphizer {
             et.add_variant(EnumVariantInfo::new(variant.name, payload_types, i as u64));
         }
     }
+
+    // ----------------------------------------------------------------
+    // Function type creation from specialized AST
+    // ----------------------------------------------------------------
+
+    /// Build a concrete FunctionType from a specialized FunctionDeclNode whose
+    /// signature has already been resolved by resolve_specialized_ast().
+    /// Returns invalid if the return type wasn't resolved (shouldn't happen
+    /// after a successful resolve_specialized_ast, but defensive).
+    build_function_type_from_ast(mut &this, ast_node: ASTNode*) -> TypeRef {
+        if (ast_node == null) { return TypeRef::invalid(); }
+        const func: FunctionDeclNode* = ast_node as FunctionDeclNode*;
+        if (func == null) { return TypeRef::invalid(); }
+
+        // Return type must have been resolved
+        const ret_type: TypeRef = func.resolved_return_type;
+        if (!ret_type.is_valid()) {
+            return TypeRef::invalid();
+        }
+
+        // Collect resolved parameter types
+        mut param_types: TypeRef[] = [];
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param != null && param.resolved_type.is_valid()) {
+                param_types.push(param.resolved_type);
+            } else {
+                // If any param is unresolved, bail — shouldn't happen
+                return TypeRef::invalid();
+            }
+        }
+
+        return this.arena.get_function(ret_type, param_types, func.is_variadic);
+    }
+
 
     // ----------------------------------------------------------------
     // Nested instantiation discovery

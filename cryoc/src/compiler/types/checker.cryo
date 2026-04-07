@@ -260,6 +260,17 @@ type struct TypeChecker {
             if (from_ptr.pointee.equals(to_ptr.pointee)) {
                 return TypeCompatibility::Identical;
             }
+            // Class hierarchy upcast: Derived* → Base* is implicit.
+            // Walk the from-side inheritance chain to check if the to-side
+            // class is an ancestor.  This handles the common OOP pattern of
+            // returning a subclass pointer from a function typed as base.
+            if (from_inner != null && to_inner != null &&
+                from_inner.kind == TypeKind::Class && to_inner.kind == TypeKind::Class) {
+                if (this.is_subclass_of(from_ptr.pointee, to_ptr.pointee)) {
+                    return TypeCompatibility::ImplicitConvert;
+                }
+            }
+
             // Recursive pointee compatibility (e.g., i8** → string*
             // follows from i8* → string).
             const pointee_compat: TypeCompatibility = this.check_compatibility(
@@ -506,7 +517,7 @@ type struct TypeChecker {
             if (op == "+" && lhs_type.kind == TypeKind::String && rhs_type.kind == TypeKind::String) {
                 return TypeCheckResult::ok(this.arena.get_string());
             }
-            return TypeCheckResult::fail(sprintf("Cannot apply '%s' to %s and %s",
+            return TypeCheckResult::fail(format("Cannot apply '%s' to %s and %s",
                 op, lhs_type.kind.to_string(), rhs_type.kind.to_string()));
         }
 
@@ -524,7 +535,7 @@ type struct TypeChecker {
             if (lhs_type.kind == TypeKind::Char && rhs_type.kind == TypeKind::Char) {
                 return TypeCheckResult::ok(this.arena.get_bool());
             }
-            return TypeCheckResult::fail(sprintf("Cannot compare %s and %s",
+            return TypeCheckResult::fail(format("Cannot compare %s and %s",
                 lhs_type.kind.to_string(), rhs_type.kind.to_string()));
         }
 
@@ -533,7 +544,7 @@ type struct TypeChecker {
             if (lhs_type.kind == TypeKind::Bool && rhs_type.kind == TypeKind::Bool) {
                 return TypeCheckResult::ok(this.arena.get_bool());
             }
-            return TypeCheckResult::fail(sprintf("Logical '%s' requires boolean operands", op));
+            return TypeCheckResult::fail(format("Logical '%s' requires boolean operands", op));
         }
 
         // Bitwise: & | ^ << >>
@@ -541,10 +552,10 @@ type struct TypeChecker {
             if (lhs_type.kind == TypeKind::Int && rhs_type.kind == TypeKind::Int) {
                 return TypeCheckResult::ok(this.get_common_numeric_type(lhs, rhs));
             }
-            return TypeCheckResult::fail(sprintf("Bitwise '%s' requires integer operands", op));
+            return TypeCheckResult::fail(format("Bitwise '%s' requires integer operands", op));
         }
 
-        return TypeCheckResult::fail(sprintf("Unknown binary operator '%s'", op));
+        return TypeCheckResult::fail(format("Unknown binary operator '%s'", op));
     }
 
     /// Check a unary operation and return the result type.
@@ -601,7 +612,7 @@ type struct TypeChecker {
                 this.arena.get_reference_to(operand, RefMutability::Immutable));
         }
 
-        return TypeCheckResult::fail(sprintf("Unknown unary operator '%s'", op));
+        return TypeCheckResult::fail(format("Unknown unary operator '%s'", op));
     }
 
     /// Check a function call with the given argument types.
@@ -616,19 +627,19 @@ type struct TypeChecker {
 
         // Check arity
         if (!fn_type.is_variadic && args.length != fn_type.param_types.length) {
-            return TypeCheckResult::fail(sprintf("Expected %ld arguments, got %ld",
+            return TypeCheckResult::fail(format("Expected %ld arguments, got %ld",
                 fn_type.param_types.length, args.length));
         }
 
         if (fn_type.is_variadic && args.length < fn_type.param_types.length) {
-            return TypeCheckResult::fail(sprintf("Expected at least %ld arguments, got %ld",
+            return TypeCheckResult::fail(format("Expected at least %ld arguments, got %ld",
                 fn_type.param_types.length, args.length));
         }
 
         // Check each argument type
         for (mut i: i64 = 0; i < fn_type.param_types.length; i++) {
             if (!this.can_assign(args[i], fn_type.param_types[i])) {
-                return TypeCheckResult::fail(sprintf("Argument %ld type mismatch", i + 1));
+                return TypeCheckResult::fail(format("Argument %ld type mismatch", i + 1));
             }
         }
 
@@ -661,7 +672,7 @@ type struct TypeChecker {
             if (field != null) {
                 return TypeCheckResult::ok(field.field_type);
             }
-            return TypeCheckResult::fail(sprintf("Struct '%s' has no field '%s'",
+            return TypeCheckResult::fail(format("Struct '%s' has no field '%s'",
                 st.display_name(), st.intern_table.resolve(field_name)));
         }
 
@@ -686,7 +697,7 @@ type struct TypeChecker {
                     current = null;
                 }
             }
-            return TypeCheckResult::fail(sprintf("Class '%s' has no field '%s'",
+            return TypeCheckResult::fail(format("Class '%s' has no field '%s'",
                 ct.display_name(), ct.intern_table.resolve(field_name)));
         }
 
@@ -695,7 +706,7 @@ type struct TypeChecker {
             return TypeCheckResult::fail("Tuple field access requires numeric index");
         }
 
-        return TypeCheckResult::fail(sprintf("Cannot access field on type %s",
+        return TypeCheckResult::fail(format("Cannot access field on type %s",
             base_type.kind.to_string()));
     }
 
@@ -738,7 +749,7 @@ type struct TypeChecker {
             return TypeCheckResult::ok(this.arena.get_char());
         }
 
-        return TypeCheckResult::fail(sprintf("Cannot index into type %s",
+        return TypeCheckResult::fail(format("Cannot index into type %s",
             base_type.kind.to_string()));
     }
 
@@ -797,5 +808,30 @@ type struct TypeChecker {
         }
 
         return a;  // Fallback
+    }
+
+
+    // ----------------------------------------------------------------
+    // Class hierarchy helpers
+    // ----------------------------------------------------------------
+
+    /// Check whether `derived` is a subclass of `base` by walking the
+    /// inheritance chain.  Both TypeRefs must point to ClassType objects.
+    /// Limits depth to 32 to prevent infinite loops from malformed data.
+    is_subclass_of(&this, derived: TypeRef, base: TypeRef) -> boolean {
+        if (derived.equals(base)) { return true; }
+
+        mut current: TypeRef = derived;
+        mut depth: i32 = 0;
+        while (depth < 32) {
+            const t: Type* = this.arena.lookup(current.id);
+            if (t == null || t.kind != TypeKind::Class) { return false; }
+            const ct: ClassType* = t as ClassType*;
+            if (!ct.has_base || !ct.base_class.is_valid()) { return false; }
+            if (ct.base_class.equals(base)) { return true; }
+            current = ct.base_class;
+            depth = depth + 1;
+        }
+        return false;
     }
 }
