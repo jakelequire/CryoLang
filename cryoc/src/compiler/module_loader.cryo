@@ -18,6 +18,8 @@ import Compiler::Lex::Lexer;
 import Compiler::ProjectConfig;
 import Utils::File;
 import Utils::Logger;
+import std::collections::hashmap;
+import std::core::option;
 
 
 // ============================================================================
@@ -38,6 +40,12 @@ type struct ModuleLoader {
     // Already-loaded file paths (dedup)
     loaded_paths: string[];
 
+    // Pre-scanned namespace → file_path map.
+    // Built by scan_all_project_files() before discovery begins.
+    // Key: namespace name (e.g., "Compiler::AST::Node")
+    // Value: file path (e.g., "src/compiler/AST/node.cryo")
+    ns_map: HashMap<string, string>;
+
     static new(project_root: string, entry_point: string,
                stdlib_root: string, no_std: boolean) -> ModuleLoader {
         return ModuleLoader {
@@ -48,6 +56,7 @@ type struct ModuleLoader {
             loading_paths: [],
             loading_flags: [],
             loaded_paths:  [],
+            ns_map:        HashMap<string, string>::new(),
         };
     }
 
@@ -66,13 +75,93 @@ type struct ModuleLoader {
             printf("[ModuleLoader] Project root: %s\n", this.project_root);
         }
 
+        // Pre-scan: walk the project directory tree and lex every .cryo file
+        // to extract its namespace.  This builds the ns_map (namespace → path)
+        // so that resolve_import_path can resolve any import with a simple
+        // HashMap lookup, regardless of directory casing.
+        this.scan_all_project_files(this.entry_dir, debug);
+        if (!this.no_std && strlen(this.stdlib_root) > 0) {
+            this.scan_all_project_files(this.stdlib_root, debug);
+        }
+
+        if (debug) {
+            printf("[ModuleLoader] Pre-scan complete: %d namespaces indexed\n",
+                this.ns_map.len);
+        }
+
         return this.discover_module(intern, graph, sink, entry_path, debug);
+    }
+
+    /// Recursively walk a directory, lex every .cryo file to extract its
+    /// namespace declaration, and register namespace → file_path in ns_map.
+    scan_all_project_files(mut &this, dir: string, debug: boolean) -> void {
+        const dp: void* = opendir(dir);
+        if (dp == null) { return; }
+
+        mut entry: void* = readdir(dp);
+        while (entry != null) {
+            const name: string = dirent_name(entry);
+            const dtype: i32 = dirent_type(entry);
+
+            // Skip . and ..
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+                entry = readdir(dp);
+                continue;
+            }
+
+            const full_path: string = format("%s/%s", dir, name);
+
+            if (dtype == 1) {
+                // FileType::Directory — recurse into subdirectory
+                this.scan_all_project_files(full_path, debug);
+            } else if (dtype == 0) {
+                // FileType::File — regular file; check for .cryo extension
+                const name_len: u64 = strlen(name);
+                if (name_len > 5) {
+                    const ext: string = ptr_add(name as void*, (name_len - 5) as i64) as string;
+                    if (strcmp(ext, ".cryo") == 0) {
+                        this.scan_file_namespace(full_path);
+                    }
+                }
+            }
+
+            entry = readdir(dp);
+        }
+        closedir(dp);
+    }
+
+    /// Lex a single .cryo file, extract the namespace declaration,
+    /// and register it in ns_map.
+    scan_file_namespace(mut &this, file_path: string) -> void {
+        if (!File::exists(file_path)) { return; }
+
+        mut scan_sink: DiagnosticSink = DiagnosticSink::new();
+        const file: File = File::new(file_path);
+        const lexer: Lexer = Lexer::new(file, &scan_sink);
+        const tokens: Token[] = lexer.lex();
+
+        // Extract just the namespace — scan_tokens gives us everything
+        // but we only need the namespace name.
+        const scan: ModuleScanResult = scan_tokens(tokens);
+        if (strlen(scan.namespace_name) > 0) {
+            const h: u64 = hash_str(scan.namespace_name);
+            this.ns_map.insert(scan.namespace_name, file_path, h);
+        }
     }
 
 
     /// Resolve an import path (e.g., "BattleTest" or "Compiler::AST")
     /// to a filesystem path.  Returns "" if not found.
     resolve_import_path(&this, import_path: string) -> string {
+        // Fast path: check pre-scanned namespace map first.
+        // This handles all case-insensitive resolution automatically since
+        // the map was built by walking the actual filesystem.
+        const h: u64 = hash_str(import_path);
+        const from_map: Option<string> = this.ns_map.get(import_path, h);
+        if (from_map.is_some()) {
+            return from_map.unwrap();
+        }
+
         // Convert :: to /
         const fs_path: string = replace_separator(import_path);
 
@@ -191,11 +280,28 @@ type struct ModuleLoader {
                 printf("[ModuleLoader]   import '%s' -> '%s'\n", import_path, resolved);
             }
             if (strlen(resolved) == 0) {
-                const msg: string = format("module '%s' not found (imported from '%s')",
-                    import_path, file_path);
-                sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, msg));
-                success = false;
-                continue;
+                // Filesystem resolution failed — check if the module was
+                // already discovered (e.g., via a parent's `public module`
+                // submodule declaration).  This handles cases where the
+                // import path doesn't map cleanly to the filesystem due to
+                // mixed-case directories (e.g., `compiler/AST/node.cryo`
+                // where `AST` is uppercase but `compiler` is lowercase).
+                const already_name: SymbolStr = intern.intern(import_path);
+                const already_idx: i64 = graph.find_module_index(already_name);
+                if (already_idx >= 0) {
+                    // Module already in graph — use its recorded file path
+                    resolved = graph.modules[already_idx].file_path;
+                    if (debug) {
+                        printf("[ModuleLoader]   import '%s' -> '%s' (found in graph)\n",
+                            import_path, resolved);
+                    }
+                } else {
+                    const msg: string = format("module '%s' not found (imported from '%s')",
+                        import_path, file_path);
+                    sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, msg));
+                    success = false;
+                    continue;
+                }
             }
 
             // Recursively discover the dependency (must happen before
@@ -493,12 +599,13 @@ function replace_separator(path: string) -> string {
     for (mut i: i64 = 0; i < len; i++) {
         if (path[i] == 58 && i + 1 < len && path[i + 1] == 58) {  // '::'
             const p: i8* = ptr_add(buf as void*, j) as i8*;
-            *p = 47;  // '/'
+            *p = 47 as i8;  // '/'
             j = j + 1;
             i = i + 1;  // skip second ':'
         } else {
             const p: i8* = ptr_add(buf as void*, j) as i8*;
-            *p = path[i];
+            const byte: i8 = path[i] as i8;
+            *p = byte;
             j = j + 1;
         }
     }
@@ -523,7 +630,7 @@ function to_lowercase(s: string) -> string {
         const p: i8* = ptr_add(out as void*, i as i64) as i8*;
         const ch: i8 = *p;
         // A=65, Z=90: add 32 to make lowercase
-        const lower: i8 = ch + 32;
+        const lower: i8 = (ch + 32) as i8;
         const use_lower: boolean = ch >= 65 && ch <= 90;
         if (use_lower) { *p = lower; }
     }
@@ -576,7 +683,7 @@ function to_snake_case(s: string) -> string {
                 const next_lower: boolean = (i + 1 < len) && s[i + 1] >= 97 && s[i + 1] <= 122;
                 if (prev_lower || next_lower) {
                     const pu: i8* = ptr_add(out as void*, j as i64) as i8*;
-                    *pu = 95;
+                    *pu = 95 as i8;
                     j = j + 1;
                 }
             }
@@ -584,7 +691,8 @@ function to_snake_case(s: string) -> string {
 
         const pc: i8* = ptr_add(out as void*, j as i64) as i8*;
         if (is_upper) {
-            *pc = ch + 32;
+            const lower_ch: i8 = ch + 32 as i8;
+            *pc = lower_ch;
         } else {
             *pc = ch;
         }
