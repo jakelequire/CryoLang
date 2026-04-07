@@ -535,6 +535,23 @@ type struct TypeChecker {
             if (lhs_type.kind == TypeKind::Char && rhs_type.kind == TypeKind::Char) {
                 return TypeCheckResult::ok(this.arena.get_bool());
             }
+            // Pointer equality/inequality: ptr == null, ptr != null, ptr == ptr
+            if (lhs_type.kind == TypeKind::Pointer || rhs_type.kind == TypeKind::Pointer) {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            // Class/reference null checks: obj == null, &ref == null
+            if (lhs_type.kind == TypeKind::Class || rhs_type.kind == TypeKind::Class ||
+                lhs_type.kind == TypeKind::Reference || rhs_type.kind == TypeKind::Reference) {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            // Void on either side (null literal)
+            if (lhs_type.kind == TypeKind::Void || rhs_type.kind == TypeKind::Void) {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            // Enum equality
+            if (lhs_type.kind == TypeKind::Enum && rhs_type.kind == TypeKind::Enum) {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
             return TypeCheckResult::fail(format("Cannot compare %s and %s",
                 lhs_type.kind.to_string(), rhs_type.kind.to_string()));
         }
@@ -652,6 +669,22 @@ type struct TypeChecker {
         mut base_type: Type* = this.arena.lookup(base.id);
         if (base_type == null) {
             return TypeCheckResult::fail("Type lookup failed for field access");
+        }
+
+        // Auto-dereference pointer and reference types for member access.
+        // ptr->field and ref.field both access the pointee's fields.
+        if (base_type.kind == TypeKind::Pointer) {
+            const ptr: PointerType* = base_type as PointerType*;
+            base_type = this.arena.lookup(ptr.pointee.id);
+            if (base_type == null) {
+                return TypeCheckResult::fail("Type lookup failed for pointer dereference");
+            }
+        } else if (base_type.kind == TypeKind::Reference) {
+            const ref: ReferenceType* = base_type as ReferenceType*;
+            base_type = this.arena.lookup(ref.referent.id);
+            if (base_type == null) {
+                return TypeCheckResult::fail("Type lookup failed for reference dereference");
+            }
         }
 
         // Dereference InstantiatedType to its concrete resolved type
