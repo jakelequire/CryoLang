@@ -130,7 +130,11 @@ type struct TypeResolver {
             }
             TypeAnnotation::Pointer(p) => {
                 mut inner: TypeRef = this.resolve(p.inner, ctx);
-                this.arena.get_pointer_to(inner)
+                if (inner.is_valid()) {
+                    return this.arena.get_pointer_to(inner);
+                } else {
+                    return TypeRef::invalid();
+                }
             }
             TypeAnnotation::Reference(r) => {
                 mut inner: TypeRef = this.resolve(r.inner, ctx);
@@ -138,11 +142,11 @@ type struct TypeResolver {
                 if (r.is_mutable) {
                     mutability = RefMutability::Mutable;
                 }
-                this.arena.get_reference_to(inner, mutability)
+                return this.arena.get_reference_to(inner, mutability);
             }
             TypeAnnotation::Array(a) => {
                 mut elem: TypeRef = this.resolve(a.element, ctx);
-                this.arena.get_array_of(elem, a.size)
+                return this.arena.get_array_of(elem, a.size);
             }
             TypeAnnotation::Function(f) => {
                 this.resolve_function(f, ctx)
@@ -420,6 +424,16 @@ private:
             if (inner_ref.is_valid()) {
                 return this.arena.get_pointer_to(inner_ref);
             }
+        }
+
+        // 7. Reverse-index fallback — O(1) lookup by bare leaf name.
+        //    Handles cross-module references where the importing module
+        //    doesn't have an explicit import for the type's declaring module.
+        //    Skip short names (<=2 chars) — likely generic parameters (T, K, V).
+        const name_len: u64 = strlen(name_str);
+        if (name_len > 2) {
+            found = this.arena.lookup_by_leaf(name);
+            if (found.is_valid()) { return found; }
         }
 
         // Not found — return invalid (caller should create error)
