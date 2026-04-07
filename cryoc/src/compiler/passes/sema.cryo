@@ -990,7 +990,31 @@ public:
 
     resolve_direct_call(mut &this, ident: IdentifierNode*) -> TypeRef {
         const func_ret: TypeRef = this.lookup_func_return(ident.name);
-        if (func_ret.is_valid()) { return func_ret; }
+        if (func_ret.is_valid()) {
+            // If the return type is an unresolved generic (e.g., Result<T, E>
+            // from a generic function like ok<T, E>) and we have an expected
+            // type from the call context (e.g., return type Result<bool, string>),
+            // use the expected type instead.  This handles return-type inference
+            // for generic functions where not all type params are inferrable
+            // from arguments alone.
+            if (this.expected_type.is_valid()) {
+                const ret_t: Type* = this.arena.lookup(func_ret.id);
+                if (ret_t != null) {
+                    // FunctionTemplate: the function itself is generic, use expected type
+                    if (ret_t.kind == TypeKind::FunctionTemplate) {
+                        return this.expected_type;
+                    }
+                    // InstantiatedType with unresolved generic params
+                    if (ret_t.kind == TypeKind::InstantiatedType) {
+                        const inst: InstantiatedType* = ret_t as InstantiatedType*;
+                        if (!inst.has_resolved_type()) {
+                            return this.expected_type;
+                        }
+                    }
+                }
+            }
+            return func_ret;
+        }
 
         // Constructor call (e.g., Dog("Buddy"))
         const type_ref: TypeRef = this.lookup_type_by_sym(ident.name);
