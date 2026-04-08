@@ -151,21 +151,18 @@ type struct Monomorphizer {
     process_all(mut &this) -> boolean {
         // Import all unmonomorphized instantiations from the generic registry
         const unprocessed: TypeRef[] = this.generic_registry.collect_unmonomorphized();
-        printf("[Monomorphizer::process_all] %lld unmonomorphized instantiations\n", unprocessed.length);
+
+        // Nothing new to process — skip the worklist entirely.
+        // This is the common case for modules after the first few in a
+        // multi-module build: earlier modules already monomorphized everything.
+        if (unprocessed.length == 0) {
+            return true;
+        }
+
+        LOG_DEBUG(LogComponent::TypeChecker, "[Monomorphizer::process_all] %lld unmonomorphized instantiations",
+            unprocessed.length);
+
         for (mut i: i64 = 0; i < unprocessed.length; i++) {
-            const _t: Type* = this.arena.lookup(unprocessed[i].id);
-            if (_t != null && _t.kind == TypeKind::InstantiatedType) {
-                const _inst: InstantiatedType* = _t as InstantiatedType*;
-                const _base_t: Type* = this.arena.lookup(_inst.generic_base.id);
-                if (_base_t != null) {
-                    printf("  [%lld] InstantiatedType(id=%llu) base_id=%llu base_kind=%s base_name='%s' args=%lld\n",
-                        i, unprocessed[i].id, _inst.generic_base.id,
-                        _base_t.kind.to_string(), _base_t.display_name(), _inst.type_args.length);
-                } else {
-                    printf("  [%lld] InstantiatedType(id=%llu) base_id=%llu (base lookup FAILED) args=%lld\n",
-                        i, unprocessed[i].id, _inst.generic_base.id, _inst.type_args.length);
-                }
-            }
             this.enqueue_from_type_ref(unprocessed[i]);
         }
 
@@ -176,8 +173,10 @@ type struct Monomorphizer {
 
             const key: string = this.make_key(request);
 
-            // Already cached — skip
+            // Already cached — mark in mono_set so collect_unmonomorphized()
+            // won't return it again on the next module.
             if (this.is_cached(key)) {
+                this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
                 continue;
             }
 
@@ -201,6 +200,19 @@ type struct Monomorphizer {
 
             if (!success) {
                 this.error_count = this.error_count + 1;
+            }
+        }
+
+        // Mark ALL collected items as monomorphized — including those that
+        // enqueue_from_type_ref() filtered out (template-internal references
+        // whose args contain GenericParam, non-template base types, etc.).
+        // Without this, collect_unmonomorphized() keeps returning the same
+        // filtered-out items on every subsequent module in a batch build.
+        for (mut i: i64 = 0; i < unprocessed.length; i++) {
+            const t: Type* = this.arena.lookup(unprocessed[i].id);
+            if (t != null && t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                this.generic_registry.mark_monomorphized(inst.generic_base, inst.type_args);
             }
         }
 
