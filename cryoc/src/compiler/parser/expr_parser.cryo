@@ -756,10 +756,41 @@ public:
         const type_name: SymbolStr = this.intern_lexeme(type_tok);
         mut node: NewExprNode* = new NewExprNode(type_name, this.span_from_token(start));
 
-        // Optional generic args
+        // Optional generic args on the type: new Type<T>(...)
+        mut scope_gen_args: TypeAnnotation*[] = [];
         if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
-            const gen_args: TypeAnnotation*[] = this.parse_generic_args();
-            node.set_generic_args(gen_args);
+            scope_gen_args = this.parse_generic_args();
+            node.set_generic_args(scope_gen_args);
+        }
+
+        // Enum variant construction: new EnumType::Variant(args)
+        // The '::' means this is a heap-allocated enum variant, not a struct.
+        // Consume the ::Variant(args) and store arguments on the NewExprNode.
+        // The type_name stays as the enum type for sema to resolve.
+        if (this.check(TokenType::ColonColon)) {
+            this.advance(); // consume '::'
+            // Consume the variant name (identifier or keyword like 'new')
+            if (this.check(TokenType::Identifier) || this.current().kind.is_keyword()) {
+                this.advance(); // consume variant name
+            }
+            // Parse call arguments: new Enum::Variant(payload)
+            if (this.check(TokenType::LParen)) {
+                this.advance();
+                if (!this.check(TokenType::RParen)) {
+                    while (true) {
+                        const arg: ExpressionNode* = this.parse_expression();
+                        if (arg != null) {
+                            node.add_argument(arg);
+                        }
+                        if (!this.match_tok(TokenType::Comma)) {
+                            break;
+                        }
+                    }
+                }
+                this.consume(TokenType::RParen, "')'");
+            }
+            node.span = this.span_from(start);
+            return node;
         }
 
         if (this.check(TokenType::LParen)) {
