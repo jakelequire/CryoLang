@@ -27,6 +27,64 @@ import Compiler::Types::Substitution;
 import Compiler::Resolver::InternTable;
 
 
+/// Check if a type name string is a primitive type name.
+/// Used by the substituter to produce Primitive annotations instead of
+/// Named("i32") when a generic param is substituted with a primitive.
+function is_primitive_type_name(name: string) -> boolean {
+    return strcmp(name, "void") == 0
+        || strcmp(name, "boolean") == 0
+        || strcmp(name, "char") == 0
+        || strcmp(name, "string") == 0
+        || strcmp(name, "i8") == 0
+        || strcmp(name, "i16") == 0
+        || strcmp(name, "i32") == 0
+        || strcmp(name, "i64") == 0
+        || strcmp(name, "i128") == 0
+        || strcmp(name, "u8") == 0
+        || strcmp(name, "u16") == 0
+        || strcmp(name, "u32") == 0
+        || strcmp(name, "u64") == 0
+        || strcmp(name, "u128") == 0
+        || strcmp(name, "usize") == 0
+        || strcmp(name, "f32") == 0
+        || strcmp(name, "f64") == 0
+        || strcmp(name, "never") == 0;
+}
+
+/// Rewrite a TypeAnnotation* in-place from Named to Primitive variant.
+/// Uses a temporary heap allocation + memcpy because the C++ codegen's
+/// enum-through-pointer assignment only copies the 4-byte tag, not the
+/// 8-byte payload (same bug documented in substitute_generic_annotation).
+function rewrite_to_primitive(ann: TypeAnnotation*, name: SymbolStr, span: SourceSpan) -> void {
+    const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: name, span: span };
+    const temp: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+    *temp = TypeAnnotation::Primitive(prim);
+    memcpy(ann, temp, sizeof(TypeAnnotation));
+}
+
+/// Rewrite a TypeAnnotation* in-place from Named to Pointer(Named(inner)).
+function rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr, span: SourceSpan) -> void {
+    const inner_named: NamedAnnotation* = new NamedAnnotation { name: inner_name, span: span };
+    const inner_ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+    *inner_ann = TypeAnnotation::Named(inner_named);
+    const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner_ann, span: span };
+    const temp: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+    *temp = TypeAnnotation::Pointer(ptr);
+    memcpy(ann, temp, sizeof(TypeAnnotation));
+}
+
+/// Rewrite a TypeAnnotation* in-place from Named to Array(Named(inner), -1).
+function rewrite_to_array(ann: TypeAnnotation*, inner_name: SymbolStr, span: SourceSpan) -> void {
+    const inner_named: NamedAnnotation* = new NamedAnnotation { name: inner_name, span: span };
+    const inner_ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+    *inner_ann = TypeAnnotation::Named(inner_named);
+    const arr: ArrayAnnotation* = new ArrayAnnotation { element: inner_ann, size: -1, span: span };
+    const temp: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+    *temp = TypeAnnotation::Array(arr);
+    memcpy(ann, temp, sizeof(TypeAnnotation));
+}
+
+
 // ============================================================================
 // ASTTypeSubstituter — Rewrites type annotations and names on a cloned AST
 // ============================================================================
@@ -111,11 +169,34 @@ public:
 
     substitute_named_annotation(ann: TypeAnnotation*, named: NamedAnnotation*) -> TypeAnnotation* {
         // Check if this named annotation is one of our generic params.
-        // Modify in-place (the AST was already cloned) to avoid malloc
-        // issues with the C++ compiler's codegen for struct-literal
-        // assignment through pointers.
         for (mut i: i64 = 0; i < this.param_names.length; i++) {
             if (named.name.equals(this.param_names[i])) {
+                // Instead of blindly setting named.name (which produces
+                // Named("i32"), Named("void*"), Named("Foo[]") that the
+                // resolver must parse), produce the correct annotation kind.
+                const display: string = this.intern_table.resolve(this.type_arg_displays[i]);
+                const display_len: i64 = strlen(display) as i64;
+
+                // Primitive type? → Primitive annotation
+                if (is_primitive_type_name(display)) {
+                    rewrite_to_primitive(ann, this.type_arg_displays[i], named.span);
+                    return ann;
+                }
+                // Pointer suffix? → Pointer(Named(inner))
+                if (display_len > 1 && display[display_len - 1] == '*') {
+                    const inner_str: string = substr(display, 0, display_len - 1);
+                    const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
+                    rewrite_to_pointer(ann, inner_sym, named.span);
+                    return ann;
+                }
+                // Array suffix? → Array(Named(inner), -1)
+                if (display_len > 2 && display[display_len - 2] == '[' && display[display_len - 1] == ']') {
+                    const inner_str: string = substr(display, 0, display_len - 2);
+                    const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
+                    rewrite_to_array(ann, inner_sym, named.span);
+                    return ann;
+                }
+                // User-defined type — keep as Named with new name
                 named.name = this.type_arg_displays[i];
                 return ann;
             }

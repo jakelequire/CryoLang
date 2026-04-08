@@ -30,6 +30,10 @@ import Compiler::CompilationContext;
 import Compiler::Lex;
 import Compiler::Types;
 import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Compound;
+import Compiler::Types::Generic;
 import Compiler::Types::Arena;
 import Compiler::Types::Checker;
 import Compiler::Resolver::SymbolStr;
@@ -41,6 +45,7 @@ import Compiler::Types::GenericRegistry;
 import Compiler::ModuleGraph;
 import std::collections::hashmap;
 import Utils::Logger;
+
 
 
 // ============================================================================
@@ -1166,6 +1171,10 @@ public:
         return TypeRef::invalid();
     }
 
+    /// Dispatch: resolve `Scope::Member(args)` as one of three constructs:
+    ///   1. Static method call    — Type::method() or SpecializedType::method()
+    ///   2. Enum variant constructor — Option::Some(x), ErrorCode::E0001
+    ///   3. Module-qualified function — intrinsics::frexp(), math::sqrt()
     resolve_scope_call(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
         // If the scope has generic args (e.g., Pair<int>::new), resolve them
         // to build the specialized type name for method/type lookup.
@@ -1178,110 +1187,97 @@ public:
             }
         }
 
-        // Static method (tries specialized name first, then base name,
-        // then cross-module qualified name)
-        const method_ret: TypeRef = this.lookup_method_return(
-            lookup_sym, scope.member_name);
-        if (method_ret.is_valid()) {
-            // If the return type is an unresolved generic (e.g., Result<T, E>),
-            // try to resolve to the concrete specialization using expected_type.
-            const resolved_ret: TypeRef = this.try_resolve_generic_return(
-                method_ret, scope.scope_name, scope.member_name);
-            scope.set_resolved_type(resolved_ret);
-            return resolved_ret;
-        }
-        // Fallback: try the base name if we used a specialized one
-        if (lookup_sym.id != scope.scope_name.id) {
-            const base_ret: TypeRef = this.lookup_method_return(
-                scope.scope_name, scope.member_name);
-            if (base_ret.is_valid()) {
-                const resolved_base: TypeRef = this.try_resolve_generic_return(
-                    base_ret, scope.scope_name, scope.member_name);
-                scope.set_resolved_type(resolved_base);
-                return resolved_base;
-            }
-        }
-        // Cross-module fallback: resolve the scope name through the Resolver's
-        // scope chain to get the fully-qualified type name, then try methods.
-        {
-            const cross_sym: SymbolStr = this.resolve_cross_module_name(lookup_sym);
-            if (cross_sym.is_valid()) {
-                const cross_ret: TypeRef = this.lookup_method_return(
-                    cross_sym, scope.member_name);
-                if (cross_ret.is_valid()) {
-                    const resolved_cross: TypeRef = this.try_resolve_generic_return(
-                        cross_ret, scope.scope_name, scope.member_name);
-                    scope.set_resolved_type(resolved_cross);
-                    return resolved_cross;
-                }
-            }
-        }
+        // 1. Static method call
+        const method_ret: TypeRef = this.try_resolve_static_method(
+            scope, lookup_sym);
+        if (method_ret.is_valid()) { return method_ret; }
 
-        // Type-based static method / enum variant constructor.
-        // Resolve the scope name to a type, then:
-        //   - For structs/classes: try static method lookup using the DI name
-        //   - For enums: return the enum type (variant constructor)
-        const type_ref: TypeRef = this.lookup_type_by_sym(lookup_sym);
-        if (type_ref.is_valid()) {
-            // Try static method lookup using the type's DI-registered name.
-            // This handles cross-module calls like FieldInfo::new() where the
-            // bare name "FieldInfo" doesn't match the registered qualified name.
-            const di_name: SymbolStr = this.ctx.decl_index.lookup_type_name(type_ref);
-            if (di_name.is_valid()) {
-                const di_method_ret: TypeRef = this.lookup_method_return(
-                    di_name, scope.member_name);
-                if (di_method_ret.is_valid()) {
-                    const resolved_di: TypeRef = this.try_resolve_generic_return(
-                        di_method_ret, scope.scope_name, scope.member_name);
-                    scope.set_resolved_type(resolved_di);
-                    return resolved_di;
-                }
-            }
-            // Enum variant constructor (e.g., Optional::Some("hello"))
-            const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
-            scope.set_resolved_type(promoted);
-            return promoted;
-        }
-        if (lookup_sym.id != scope.scope_name.id) {
-            const base_type_ref: TypeRef = this.lookup_type_by_sym(scope.scope_name);
-            if (base_type_ref.is_valid()) {
-                const promoted_base: TypeRef = this.promote_to_expected_instantiation(base_type_ref);
-                scope.set_resolved_type(promoted_base);
-                return promoted_base;
-            }
-        }
+        // 2. Enum variant / type-based static method
+        const type_ret: TypeRef = this.try_resolve_type_or_variant(
+            scope, lookup_sym);
+        if (type_ret.is_valid()) { return type_ret; }
 
-        // Module-qualified function call (e.g., intrinsics::frexp).
-        // The scope_name may be a module qualifier, not a type.  Only try
-        // this if the scope_name is NOT a known type (to avoid matching
-        // wrong functions for enum variant calls like IoResult::Ok).
-        {
-            const scope_as_type: TypeRef = this.lookup_type_by_sym(scope.scope_name);
-            if (!scope_as_type.is_valid()) {
-                // Try qualified lookup first: find a module whose namespace
-                // ends with scope_name, then look up "namespace::member_name".
-                // This disambiguates when multiple modules export functions
-                // with the same bare name (e.g., intrinsics::frexp vs math::frexp).
-                const q_ret: TypeRef = this.resolve_module_qualified_function(
-                    scope.scope_name, scope.member_name);
-                if (q_ret.is_valid()) {
-                    scope.set_resolved_type(q_ret);
-                    return q_ret;
-                }
-                // Fall back to bare name lookup
-                const fn_ret: TypeRef = this.lookup_func_return(scope.member_name);
-                if (fn_ret.is_valid()) {
-                    scope.set_resolved_type(fn_ret);
-                    return fn_ret;
-                }
-            }
-        }
+        // 3. Module-qualified function call
+        const fn_ret: TypeRef = this.try_resolve_module_function(scope);
+        if (fn_ret.is_valid()) { return fn_ret; }
 
         const scope_str: string = this.intern.resolve(scope.scope_name);
         const member_str: string = this.intern.resolve(scope.member_name);
         this.ctx.emit_error(ErrorCode::E0233_UNDEFINED_SYMBOL,
             format("undefined '%s::%s' — no matching static method, variant, or type (in %s)",
                 scope_str, member_str, this.ctx.source_file));
+        return TypeRef::invalid();
+    }
+
+    /// Try resolving Scope::Member as a static method call.
+    /// Tries: specialized name → base name → DI-qualified name.
+    try_resolve_static_method(mut &this, scope: ScopeResolutionNode*,
+                              lookup_sym: SymbolStr) -> TypeRef {
+        // Try specialized name (e.g., Pair_i32::new)
+        const method_ret: TypeRef = this.lookup_method_return(
+            lookup_sym, scope.member_name);
+        if (method_ret.is_valid()) {
+            const resolved: TypeRef = this.try_resolve_generic_return(
+                method_ret, scope.scope_name, scope.member_name);
+            scope.set_resolved_type(resolved);
+            return resolved;
+        }
+        // Try base name if we used a specialized one (e.g., Pair::new)
+        if (lookup_sym.id != scope.scope_name.id) {
+            const base_ret: TypeRef = this.lookup_method_return(
+                scope.scope_name, scope.member_name);
+            if (base_ret.is_valid()) {
+                const resolved: TypeRef = this.try_resolve_generic_return(
+                    base_ret, scope.scope_name, scope.member_name);
+                scope.set_resolved_type(resolved);
+                return resolved;
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Try resolving Scope::Member as a type-based construct:
+    ///   - Static method via DI-qualified name (FieldInfo::new cross-module)
+    ///   - Enum variant constructor (Option::Some, CompileMode::Raw)
+    try_resolve_type_or_variant(mut &this, scope: ScopeResolutionNode*,
+                                lookup_sym: SymbolStr) -> TypeRef {
+        const type_ref: TypeRef = this.lookup_type_by_sym(lookup_sym);
+        if (!type_ref.is_valid()) { return TypeRef::invalid(); }
+
+        // Try static method using the type's DI-registered qualified name.
+        // Handles cross-module calls like FieldInfo::new() where the bare
+        // name doesn't match the registered qualified name.
+        const di_name: SymbolStr = this.ctx.decl_index.lookup_type_name(type_ref);
+        if (di_name.is_valid()) {
+            const di_method_ret: TypeRef = this.lookup_method_return(
+                di_name, scope.member_name);
+            if (di_method_ret.is_valid()) {
+                const resolved: TypeRef = this.try_resolve_generic_return(
+                    di_method_ret, scope.scope_name, scope.member_name);
+                scope.set_resolved_type(resolved);
+                return resolved;
+            }
+        }
+        // No method found — treat as enum variant constructor.
+        const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
+        scope.set_resolved_type(promoted);
+        return promoted;
+    }
+
+    /// Try resolving Scope::Member as a module-qualified function call
+    /// (e.g., intrinsics::frexp, math::sqrt).  Only attempts this if the
+    /// scope name is NOT a known type (prevents false matches for enum
+    /// variant calls like IoResult::Ok).
+    try_resolve_module_function(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
+        const scope_as_type: TypeRef = this.lookup_type_by_sym(scope.scope_name);
+        if (scope_as_type.is_valid()) { return TypeRef::invalid(); }
+
+        const q_ret: TypeRef = this.resolve_module_qualified_function(
+            scope.scope_name, scope.member_name);
+        if (q_ret.is_valid()) {
+            scope.set_resolved_type(q_ret);
+            return q_ret;
+        }
         return TypeRef::invalid();
     }
 

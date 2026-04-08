@@ -82,6 +82,7 @@ type struct TypeResolver {
     name_resolver:    Resolver*;
     decl_index:       DeclarationIndex*;
     diagnostics:      DiagnosticSink*;
+    bootstrap_mode:   boolean;     // true during Phase 5 (TypeResolution) when DI is being populated
 
     /// Construct with all required dependencies.
     ///
@@ -101,12 +102,20 @@ type struct TypeResolver {
             name_resolver:    name_resolver,
             decl_index:       decl_index,
             diagnostics:      null,
+            bootstrap_mode:   true,
         };
     }
 
     /// Set the diagnostic sink for error reporting.
     set_diagnostics(mut &this, sink: DiagnosticSink*) -> void {
         this.diagnostics = sink;
+    }
+
+    /// End bootstrap mode.  After this, resolve_named() uses only the
+    /// DeclarationIndex (step 3) and leaf-index (step 5).  Arena fallback
+    /// (steps 4, 5a) is disabled — all types should be in the DI.
+    end_bootstrap(mut &this) -> void {
+        this.bootstrap_mode = false;
     }
 
 
@@ -311,7 +320,6 @@ private:
         const name_str: string = this.intern_table.resolve(name);
         const name_len: i64 = strlen(name_str) as i64;
         LOG_DEBUG(LogComponent::TypeChecker, "resolve_named() name='%s'", name_str);
-
         // 1. Check generic bindings first (O(1) SymbolStr comparison)
         mut binding: TypeRef = ctx.lookup_binding(name);
         if (binding.is_valid()) {
@@ -375,32 +383,32 @@ private:
             }
         }
 
-        // 4. Arena lookup (fallback for types not yet in DeclarationIndex).
-        //    During early passes (TypeResolution populating the index),
-        //    types exist in the arena but aren't registered yet.
-        //    For TypeAliasType: if the target is resolved, return it directly;
-        //    if unresolved, fall through to step 6 (alias registry).
-        mut found: TypeRef = this.arena.lookup_by_name(name);
-        if (found.is_valid()) {
-            const found_t: Type* = this.arena.lookup(found.id);
-            if (found_t != null && found_t.kind == TypeKind::TypeAlias) {
-                const alias_t: TypeAliasType* = found_t as TypeAliasType*;
-                if (alias_t.has_target()) {
-                    return alias_t.target;
+        // 4. Arena lookup — bootstrap-only fallback.
+        //    During Phase 5 (TypeResolution), the DI is being populated, so
+        //    types created earlier in the pass exist only in the arena.
+        //    After bootstrap completes, all types are in the DI and this
+        //    step should never be reached.
+        mut found: TypeRef = TypeRef::invalid();
+        if (this.bootstrap_mode) {
+            found = this.arena.lookup_by_name(name);
+            if (found.is_valid()) {
+                const found_t: Type* = this.arena.lookup(found.id);
+                if (found_t != null && found_t.kind == TypeKind::TypeAlias) {
+                    const alias_t: TypeAliasType* = found_t as TypeAliasType*;
+                    if (alias_t.has_target()) {
+                        return alias_t.target;
+                    }
+                    return found;
+                } else {
+                    return found;
                 }
-                // Generic aliases have no target set — return the alias
-                // TypeRef itself so resolve_generic() can look up the
-                // TemplateEntry by TypeID and expand the alias there.
-                return found;
-            } else {
-                return found;
             }
         }
 
-        // 5. Delegate to Resolver for scope chain + cross-module lookup.
-        //    The Resolver already has all type symbols from NameResolution,
-        //    including imports.  It returns the qualified name for arena lookup.
-        if (this.name_resolver != null) {
+        // 4a. Scope chain + arena lookup — bootstrap-only fallback.
+        //     Uses the Resolver's scope chain to get a qualified name, then
+        //     looks it up in the arena.  Same bootstrap concern as step 4.
+        if (this.bootstrap_mode && this.name_resolver != null) {
             const qualified: SymbolStr = this.name_resolver.resolve_type_qualified_name(name);
             if (qualified.is_valid()) {
                 found = this.arena.lookup_by_name(qualified);
@@ -410,44 +418,22 @@ private:
             }
         }
 
-        // 5. Type alias resolution via ModuleTypeRegistry (last resort)
-        if (this.module_registry != null) {
-            found = this.module_registry.lookup_alias(name);
-            if (found.is_valid()) {
-                return found;
-            }
-        }
+        // (Steps 5b and 6 removed — both confirmed dead code:
+        //  5b: ModuleTypeRegistry alias — 0 hits across all builds.
+        //  6:  Compound-name fallback (ptr/array suffix parsing) — 0 hits
+        //      after ASTTypeSubstituter fix produces correct annotation kinds.)
 
-        // 6. Compound-name fallback — after generic substitution, the
-        //    ASTTypeSubstituter creates Named("void*"), Named("i8*"), etc.
-        //    when the concrete type is a pointer, and Named("Foo[]") when
-        //    the concrete type is a dynamic array.  Parse the suffix and
-        //    resolve recursively.
-        if (name_len > 1 && name_str[name_len - 1] == '*') {
-            const inner_str: string = substr(name_str, 0, name_len - 1);
-            const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
-            const inner_ref: TypeRef = this.resolve_named(inner_sym, ctx);
-            if (inner_ref.is_valid()) {
-                return this.arena.get_pointer_to(inner_ref);
-            }
-        }
-        // 6b. Array suffix "[]" — dynamic array of element type.
-        if (name_len > 2 && name_str[name_len - 2] == '[' && name_str[name_len - 1] == ']') {
-            const inner_str: string = substr(name_str, 0, name_len - 2);
-            const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
-            const inner_ref: TypeRef = this.resolve_named(inner_sym, ctx);
-            if (inner_ref.is_valid()) {
-                return this.arena.get_array_of(inner_ref, -1);
-            }
-        }
-
-        // 7. Reverse-index fallback — O(1) lookup by bare leaf name.
-        //    Handles cross-module references where the importing module
-        //    doesn't have an explicit import for the type's declaring module.
+        // 5. Leaf-index — O(1) lookup by bare leaf name.
+        //    Load-bearing for circular forward references: e.g., AST node
+        //    files reference ASTVisitor* in accept() methods but can't import
+        //    Compiler::AST::Visitor without creating a cycle.  Also handles
+        //    types from transitive submodule re-exports.
         //    Skip short names (<=2 chars) — likely generic parameters (T, K, V).
         if (name_len > 2) {
             found = this.arena.lookup_by_leaf(name);
-            if (found.is_valid()) { return found; }
+            if (found.is_valid()) {
+                return found;
+            }
         }
 
         // Not found — return invalid (caller should create error)
