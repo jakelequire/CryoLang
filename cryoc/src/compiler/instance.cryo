@@ -337,6 +337,19 @@ type struct CompilerInstance {
             return CompilationResult::failed(ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
 
+        // Discover the prelude and its submodules (primitives, etc.) when
+        // auto-imports are enabled.  Module discovery runs before AutoImport
+        // injects the synthetic `import std::prelude`, so prelude submodules
+        // wouldn't otherwise be discovered.
+        if (ctx.mode.auto_imports_enabled() && !config.no_std && strlen(stdlib_root) > 0) {
+            const prelude_path: string = stdlib_root + "/prelude.cryo";
+            if (File::exists(prelude_path)) {
+                loader.discover_module(
+                    &ctx.intern_table, &ctx.module_graph, &ctx.diagnostics,
+                    prelude_path, this.config.debug);
+            }
+        }
+
         printf("[Compiler] After discovery: module_count=%u, modules.length=%u\n",
             ctx.module_graph.module_count(), ctx.module_graph.modules.length);
         printf("[Compiler] name_index_keys.length=%u\n", ctx.module_graph.name_index_keys.length);
@@ -431,13 +444,16 @@ type struct CompilerInstance {
             pipeline.reset();
         }
 
-        // Phase 4: Declaration Collection — type declarations, function signatures, templates
-        pipeline.set_passes([PassID::TypeDeclaration, PassID::FunctionSignature, PassID::TemplateRegistration]);
+        // Phase 4a: TypeDeclaration — register all type NAMES in the arena
+        // across all modules before resolving any signatures.  This handles
+        // forward references (e.g., node.cryo uses ASTVisitor* which is
+        // defined in visitor.cryo, but visitor depends on node).
+        pipeline.set_passes([PassID::TypeDeclaration]);
         {
-            mut initial4: ProvisionSet = ProvisionSet::empty();
-            initial4.mark(Provision::ASTValidated);
-            initial4.mark(Provision::NamesResolved);
-            pipeline.validate_with_initial(initial4);
+            mut initial4a: ProvisionSet = ProvisionSet::empty();
+            initial4a.mark(Provision::ASTValidated);
+            initial4a.mark(Provision::NamesResolved);
+            pipeline.validate_with_initial(initial4a);
         }
 
         for (mut i: u32 = 0; i < n; i++) {
@@ -450,6 +466,35 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::ModulesLoaded);
             ctx.provisions.mark(Provision::ModuleOrder);
             ctx.provisions.mark(Provision::NamesResolved);
+            if (!pipeline.run_all(&ctx)) {
+                return this.project_failure(&ctx);
+            }
+            pipeline.reset();
+        }
+
+        // Phase 4b: FunctionSignature + TemplateRegistration — now that all
+        // type names exist in the arena, signatures can resolve cross-module
+        // type references via the leaf index.
+        pipeline.set_passes([PassID::FunctionSignature, PassID::TemplateRegistration]);
+        {
+            mut initial4b: ProvisionSet = ProvisionSet::empty();
+            initial4b.mark(Provision::ASTValidated);
+            initial4b.mark(Provision::NamesResolved);
+            initial4b.mark(Provision::TypeDeclarations);
+            pipeline.validate_with_initial(initial4b);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(&ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::ImportsDiscovered);
+            ctx.provisions.mark(Provision::ModulesLoaded);
+            ctx.provisions.mark(Provision::ModuleOrder);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
             if (!pipeline.run_all(&ctx)) {
                 return this.project_failure(&ctx);
             }

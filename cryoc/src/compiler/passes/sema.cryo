@@ -147,6 +147,12 @@ public:
             const cross_ty: TypeRef = this.ctx.decl_index.lookup_type(cross_sym);
             if (cross_ty.is_valid()) { return cross_ty; }
         }
+        // Arena leaf-index fallback: handles types that are visible via
+        // TypeResolver's fallback chain (arena leaf index) but not in the
+        // Resolver's scope chain (e.g., FieldInfo from a submodule imported
+        // indirectly via a parent _module.cryo `public module` declaration).
+        const leaf_ref: TypeRef = this.arena.lookup_by_leaf(name);
+        if (leaf_ref.is_valid()) { return leaf_ref; }
         return TypeRef::invalid();
     }
 
@@ -1172,7 +1178,8 @@ public:
             }
         }
 
-        // Static method (tries specialized name first, then base name)
+        // Static method (tries specialized name first, then base name,
+        // then cross-module qualified name)
         const method_ret: TypeRef = this.lookup_method_return(
             lookup_sym, scope.member_name);
         if (method_ret.is_valid()) {
@@ -1194,14 +1201,43 @@ public:
                 return resolved_base;
             }
         }
+        // Cross-module fallback: resolve the scope name through the Resolver's
+        // scope chain to get the fully-qualified type name, then try methods.
+        {
+            const cross_sym: SymbolStr = this.resolve_cross_module_name(lookup_sym);
+            if (cross_sym.is_valid()) {
+                const cross_ret: TypeRef = this.lookup_method_return(
+                    cross_sym, scope.member_name);
+                if (cross_ret.is_valid()) {
+                    const resolved_cross: TypeRef = this.try_resolve_generic_return(
+                        cross_ret, scope.scope_name, scope.member_name);
+                    scope.set_resolved_type(resolved_cross);
+                    return resolved_cross;
+                }
+            }
+        }
 
-        // Enum variant constructor (e.g., Optional::Some("hello"))
-        // Look up the specialized type first, then fallback to base.
-        // When the found type is the uninstantiated base (e.g., Optional) but
-        // expected_type is a specialization (e.g., Optional<string>), promote
-        // to the specialized type so codegen sees the concrete instantiation.
+        // Type-based static method / enum variant constructor.
+        // Resolve the scope name to a type, then:
+        //   - For structs/classes: try static method lookup using the DI name
+        //   - For enums: return the enum type (variant constructor)
         const type_ref: TypeRef = this.lookup_type_by_sym(lookup_sym);
         if (type_ref.is_valid()) {
+            // Try static method lookup using the type's DI-registered name.
+            // This handles cross-module calls like FieldInfo::new() where the
+            // bare name "FieldInfo" doesn't match the registered qualified name.
+            const di_name: SymbolStr = this.ctx.decl_index.lookup_type_name(type_ref);
+            if (di_name.is_valid()) {
+                const di_method_ret: TypeRef = this.lookup_method_return(
+                    di_name, scope.member_name);
+                if (di_method_ret.is_valid()) {
+                    const resolved_di: TypeRef = this.try_resolve_generic_return(
+                        di_method_ret, scope.scope_name, scope.member_name);
+                    scope.set_resolved_type(resolved_di);
+                    return resolved_di;
+                }
+            }
+            // Enum variant constructor (e.g., Optional::Some("hello"))
             const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
             scope.set_resolved_type(promoted);
             return promoted;
