@@ -152,12 +152,41 @@ public:
             }
             NodeKind::ExternBlock => {
                 const extern_node: ExternBlockNode* = node as ExternBlockNode*;
-                for (mut j: int = 0; j < extern_node.functions.length; j++) {
-                    const fn_node: FunctionDeclNode* = extern_node.functions[j];
-                    const sym_id: SymbolID = this.resolver.declare_function(
-                        fn_node.name, fn_node.span, fn_node.is_public);
-                    if (fn_node.is_public) {
-                        this.resolver.export_symbol(sym_id);
+                if (extern_node.is_c_import()) {
+                    // CImport: declare the namespace alias as a symbol, create
+                    // a child scope, and declare all imported functions in it.
+                    const alias: SymbolStr = extern_node.namespace_alias;
+                    const ns_id: SymbolID = this.resolver.alloc_symbol_id();
+                    const mod_str: string = this.resolver.intern_table.resolve(
+                        this.resolver.current_module);
+                    const ns_sym: Symbol = Symbol::namespace_sym(
+                        ns_id, alias, this.resolver.current_scope,
+                        extern_node.span, mod_str);
+                    this.resolver.declare(ns_sym);
+                    this.resolver.export_symbol(ns_id);
+
+                    // Enter a child scope for the namespace alias
+                    const alias_str: string = this.resolver.intern_table.resolve(alias);
+                    const scope_id: ScopeID = this.resolver.enter_scope(
+                        ScopeKind::Module, alias_str, extern_node.span);
+
+                    for (mut j: int = 0; j < extern_node.functions.length; j++) {
+                        const fn_node: FunctionDeclNode* = extern_node.functions[j];
+                        const fn_sym: SymbolID = this.resolver.declare_function(
+                            fn_node.name, fn_node.span, true);
+                        this.resolver.export_symbol(fn_sym);
+                    }
+
+                    this.resolver.exit_scope();
+                } else {
+                    // Regular extern block: declare functions in current scope
+                    for (mut j: int = 0; j < extern_node.functions.length; j++) {
+                        const fn_node: FunctionDeclNode* = extern_node.functions[j];
+                        const sym_id: SymbolID = this.resolver.declare_function(
+                            fn_node.name, fn_node.span, fn_node.is_public);
+                        if (fn_node.is_public) {
+                            this.resolver.export_symbol(sym_id);
+                        }
                     }
                 }
             }

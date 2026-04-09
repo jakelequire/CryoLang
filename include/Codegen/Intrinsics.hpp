@@ -448,6 +448,8 @@ namespace Cryo::Codegen
         llvm::Value *generate_fputs(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_fgetc(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_fputc(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_popen(const std::vector<llvm::Value *> &args);
+        llvm::Value *generate_pclose(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_sscanf(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_atoi(const std::vector<llvm::Value *> &args);
         llvm::Value *generate_panic(const std::vector<llvm::Value *> &args);
