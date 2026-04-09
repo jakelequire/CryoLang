@@ -880,7 +880,7 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Standard library linking disabled by --no-std flag");
             }
 
-            // Compile discovered C source files (from CImport blocks) and add to linker
+            // Compile discovered C source files (from C import blocks) and add to linker
             for (const auto &c_file : _c_source_files)
             {
                 // Place the .o next to the .c file to avoid collisions between parallel builds
@@ -2132,7 +2132,7 @@ namespace Cryo
                 // Register the function with its bare C name
                 collect_declarations_pass(fn_decl.get(), current_scope, scope_name);
 
-                // For CImport blocks with a namespace alias, also register under
+                // For C import blocks with a namespace alias, also register under
                 // the qualified name (e.g., "ex::greet") so ScopeResolutionNode resolves it
                 if (extern_block->is_c_import() && !ns_alias.empty())
                 {
@@ -2154,7 +2154,7 @@ namespace Cryo
                     _symbol_table->declare_function(qualified_name, function_type, fn_decl->location());
 
                     LOG_TRACE(Cryo::LogComponent::GENERAL,
-                              "Pass 1: Registered CImport function: {} (C name: {})",
+                              "Pass 1: Registered C import function: {} (C name: {})",
                               qualified_name, fn_decl->name());
                 }
             }

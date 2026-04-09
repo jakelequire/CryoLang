@@ -547,7 +547,7 @@ function example() -> void {
 ```
 
 ## FFI (Foreign Function Interface)
-Cryo can call C functions and be called from C. Use `extern "C"` blocks to declare foreign functions. Or, using `extern "CImport" [identifier] { ... }` to import C header files directly, which generates bindings automatically.
+Cryo can call C functions and be called from C. Use `extern "C"` blocks to declare foreign functions. Or, use `name := extern "C" { ... }` to import C header files directly, which generates bindings automatically under the given namespace.
 
 ```cryo
 namespace FFI;
@@ -557,9 +557,9 @@ extern "C" {
     function puts(s: string) -> int;
 }
 
-// Import C functions from a header file. 
+// Import C functions from a header file.
 // The `c` namespace (any identifier) is used to access imported C functions.
-extern "CImport" c {
+c := extern "C" {
     #include <stdio.h>
     #include "./my_header.h" // void foo(int);
 }

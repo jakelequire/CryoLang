@@ -130,14 +130,14 @@ namespace Cryo
 
         CHeaderProcessor processor;
 
-        // Walk top-level statements looking for CImport extern blocks
+        // Walk top-level statements looking for C import extern blocks
         for (const auto &stmt : program->statements())
         {
             auto *extern_block = dynamic_cast<ExternBlockNode *>(stmt.get());
             if (!extern_block || !extern_block->is_c_import())
                 continue;
 
-            LOG_DEBUG(LogComponent::GENERAL, "CHeaderImportPass: Processing CImport block with {} include paths",
+            LOG_DEBUG(LogComponent::GENERAL, "CHeaderImportPass: Processing C import block with {} include paths",
                       extern_block->include_paths().size());
 
             for (const auto &include_path : extern_block->include_paths())

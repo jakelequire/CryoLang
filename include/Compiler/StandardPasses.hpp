@@ -129,10 +129,10 @@ namespace Cryo
     /**
      * @brief Pass 1.4: C Header Import
      *
-     * Processes extern "CImport" blocks by running clang-20 -E on
-     * referenced headers, parsing the preprocessed C with a custom
-     * minimal C parser, and injecting the resulting function declarations
-     * into the ExternBlockNode.
+     * Processes C import blocks (name := extern "C" { #include ... }) by
+     * running clang-20 -E on referenced headers, parsing the preprocessed
+     * C with a custom minimal C parser, and injecting the resulting
+     * function declarations into the ExternBlockNode.
      */
     class CHeaderImportPass : public CompilerPass
     {
@@ -156,7 +156,7 @@ namespace Cryo
 
         std::string description() const override
         {
-            return "Import C header declarations via CImport blocks";
+            return "Import C header declarations via extern C import blocks";
         }
 
         PassResult run(PassContext &ctx) override;
