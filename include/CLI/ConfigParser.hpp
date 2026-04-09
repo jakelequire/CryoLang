@@ -26,6 +26,8 @@ namespace Cryo::CLI
         bool no_std = false;       // Don't link standard library
         bool dump_symbols = false; // Dump symbol tables for each module to debug files
         std::vector<std::string> args;
+        std::vector<std::string> link_libs;   // Additional libraries to link (e.g., ["LLVM-20"])
+        std::vector<std::string> link_paths;  // Additional library search paths (e.g., ["/usr/lib/llvm-20/lib"])
 
         // [dependencies] section (future feature)
         std::unordered_map<std::string, std::string> dependencies;

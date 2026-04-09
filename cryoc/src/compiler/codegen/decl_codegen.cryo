@@ -165,7 +165,7 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
     }
 
     // Add the function to the LLVM module.
-    const fn_val: LValue = cg.module.add_function(fn_name, fn_type);
+    const fn_val: LValue = cg.llvm_module.add_function(fn_name, fn_type);
     cg.register_function(node.name, fn_val);
 }
 
@@ -246,7 +246,8 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
 
         for (mut i: u32 = 0; i < user_param_count; i++) {
             const param: VarDeclNode* = func.parameters[i];
-            slots[idx] = cg.type_mapper.map_type(param.resolved_type).raw;
+            const mapped_param: LType = cg.type_mapper.map_type(param.resolved_type);
+            slots[idx] = mapped_param.raw;
             idx = idx + 1;
         }
 
@@ -254,7 +255,7 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
         free(buf);
     }
 
-    const fn_val: LValue = cg.module.add_function(fn_name, fn_type);
+    const fn_val: LValue = cg.llvm_module.add_function(fn_name, fn_type);
 
     // Use a combined key for method lookup: intern "Type::method".
     const combined: string = format("%s::%s", type_str, method_str);
@@ -285,14 +286,15 @@ function declare_extern_block(cg: CodegenContext*, node: ExternBlockNode*) -> vo
             const slots: void** = buf as void**;
             for (mut j: u32 = 0; j < param_count; j++) {
                 const param: VarDeclNode* = func.parameters[j];
-                slots[j] = cg.type_mapper.map_type(param.resolved_type).raw;
+                const mapped_ep: LType = cg.type_mapper.map_type(param.resolved_type);
+                slots[j] = mapped_ep.raw;
             }
             fn_type = LType::function_type(ret_ty, buf, param_count, func.is_variadic);
             free(buf);
         }
 
         // Use bare name for C linkage.
-        const fn_val: LValue = cg.module.add_function(name_str, fn_type);
+        const fn_val: LValue = cg.llvm_module.add_function(name_str, fn_type);
         cg.register_function(func.name, fn_val);
     }
 }
@@ -319,14 +321,15 @@ function declare_cross_module_externs(cg: CodegenContext*) -> void {
             const buf: void* = malloc(param_count as u64 * 8);
             const slots: void** = buf as void**;
             for (mut j: u32 = 0; j < param_count; j++) {
-                slots[j] = cg.type_mapper.map_type(desc.param_types[j]).raw;
+                const mapped_dp: LType = cg.type_mapper.map_type(desc.param_types[j]);
+                slots[j] = mapped_dp.raw;
             }
             fn_type = LType::function_type(ret_ty, buf, param_count, desc.is_var_arg);
             free(buf);
         }
 
         const name_str: string = cg.intern.resolve(desc.name);
-        const fn_val: LValue = cg.module.add_function(name_str, fn_type);
+        const fn_val: LValue = cg.llvm_module.add_function(name_str, fn_type);
         // Mark as external linkage (default for declarations without bodies).
         cg.register_function(desc.name, fn_val);
     }
@@ -378,7 +381,7 @@ function codegen_global_var(cg: CodegenContext*, node: VarDeclNode*) -> void {
         return;
     }
 
-    const global: LValue = cg.module.add_global(ty, mangled);
+    const global: LValue = cg.llvm_module.add_global(ty, mangled);
 
     // Set default initializer (zeroinitializer).
     const init: LValue = LType::const_null(ty);
@@ -553,7 +556,7 @@ function codegen_vtable(cg: CodegenContext*, cls_ty: ClassType*) -> LValue {
     free(buf);
 
     // Create the global vtable.
-    const global: LValue = cg.module.add_global(vtable_ty, mangled);
+    const global: LValue = cg.llvm_module.add_global(vtable_ty, mangled);
     global.set_initializer(init);
     global.set_global_constant(true);
     // Internal linkage since vtable is module-local unless inherited.

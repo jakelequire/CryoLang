@@ -1116,6 +1116,26 @@ namespace Cryo::CLI::Commands
             }
         }
 
+        // Add extra link paths and libraries from cryoconfig [compiler] section
+        for (const auto &path : config.link_paths)
+        {
+            if (compiler->linker())
+            {
+                compiler->linker()->add_library_path(path);
+                if (use_verbose)
+                    std::cout << "Added link path: -L" << path << std::endl;
+            }
+        }
+        for (const auto &lib : config.link_libs)
+        {
+            if (compiler->linker())
+            {
+                compiler->linker()->add_library(lib, false /* dynamic */);
+                if (use_verbose)
+                    std::cout << "Added link library: -l" << lib << std::endl;
+            }
+        }
+
         bool compilation_success;
         if (is_stdlib)
         {

@@ -39,10 +39,15 @@ function codegen_literal(cg: CodegenContext*, node: LiteralNode*,
     const kind: LiteralKind = node.literal_kind;
 
     if (kind == LiteralKind::Integer) {
-        const val: u64 = strtoul(node.value, null, 0);
-        *out_value = LType::const_int(ty, val, true);
+        // Use atoi for basic integer parsing (limited to i32 range).
+        // TODO: Use a proper i64 parser when available.
+        const val: i32 = atoi(node.value);
+        *out_value = LType::const_int(ty, val as u64, true);
     } else if (kind == LiteralKind::Float) {
-        const val: f64 = strtod(node.value, null);
+        // Parse float by converting string to double via sprintf round-trip.
+        // TODO: Use a proper f64 parser when available.
+        mut val: f64 = 0.0;
+        sscanf(node.value, "%lf", &val);
         *out_value = LType::const_real(ty, val);
     } else if (kind == LiteralKind::String) {
         *out_value = cg.get_or_create_string_literal(node.value);
@@ -111,9 +116,15 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
                         out_value: LValue*) -> void {
     // Determine if this is integer, float, or pointer arithmetic.
     const t: Type* = cg.arena.lookup(result_type.id);
-    const is_float: boolean = t != null && t.kind == TypeKind::Float;
-    const is_signed: boolean = t != null && t.kind == TypeKind::Int &&
-                               (t as IntType*).int_kind.is_signed();
+    mut t_kind: TypeKind = TypeKind::Error;
+    if (t != null) { t_kind = t.kind; }
+    const is_float: boolean = t_kind == TypeKind::Float;
+    mut is_signed: boolean = false;
+    if (t_kind == TypeKind::Int) {
+        const int_t: IntType* = t as IntType*;
+        const ik: IntegerKind = int_t.int_kind;
+        is_signed = ik.is_signed();
+    }
 
     // Arithmetic
     if (op_kind == TokenType::Plus) {
@@ -226,7 +237,9 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
 function codegen_unary(cg: CodegenContext*, operand: LValue, op_kind: TokenType,
                        operand_type: TypeRef, out_value: LValue*) -> void {
     const t: Type* = cg.arena.lookup(operand_type.id);
-    const is_float: boolean = t != null && t.kind == TypeKind::Float;
+    mut t_kind: TypeKind = TypeKind::Error;
+    if (t != null) { t_kind = t.kind; }
+    const is_float: boolean = t_kind == TypeKind::Float;
 
     if (op_kind == TokenType::Minus) {
         *out_value = if (is_float) {
@@ -302,30 +315,36 @@ function codegen_alignof(cg: CodegenContext*, type_ref: TypeRef,
 function codegen_cast(cg: CodegenContext*, val: LValue,
                       from_type: TypeRef, to_type: TypeRef,
                       out_value: LValue*) -> void {
-    const from: Type* = cg.arena.lookup(from_type.id);
-    const to: Type* = cg.arena.lookup(to_type.id);
-    if (from == null || to == null) {
+    const src_type: Type* = cg.arena.lookup(from_type.id);
+    const dst_type: Type* = cg.arena.lookup(to_type.id);
+    if (src_type == null || dst_type == null) {
         *out_value = val;
         return;
     }
 
     const dest_ty: LType = cg.type_mapper.map_type(to_type);
 
-    const from_int: boolean = from.kind == TypeKind::Int;
-    const from_float: boolean = from.kind == TypeKind::Float;
-    const to_int: boolean = to.kind == TypeKind::Int;
-    const to_float: boolean = to.kind == TypeKind::Float;
-    const from_ptr: boolean = from.kind == TypeKind::Pointer || from.kind == TypeKind::Reference;
-    const to_ptr: boolean = to.kind == TypeKind::Pointer || to.kind == TypeKind::Reference;
+    const from_kind: TypeKind = src_type.kind;
+    const to_kind: TypeKind = dst_type.kind;
+    const from_int: boolean = from_kind == TypeKind::Int;
+    const from_float: boolean = from_kind == TypeKind::Float;
+    const to_int: boolean = to_kind == TypeKind::Int;
+    const to_float: boolean = to_kind == TypeKind::Float;
+    const from_ptr: boolean = from_kind == TypeKind::Pointer || from_kind == TypeKind::Reference;
+    const to_ptr: boolean = to_kind == TypeKind::Pointer || to_kind == TypeKind::Reference;
 
     // Int → Int (truncate, zext, or sext)
     if (from_int && to_int) {
-        const from_bits: u64 = (from as IntType*).int_kind.bit_width();
-        const to_bits: u64 = (to as IntType*).int_kind.bit_width();
+        const from_it: IntType* = src_type as IntType*;
+        const to_it: IntType* = dst_type as IntType*;
+        const from_ik: IntegerKind = from_it.int_kind;
+        const to_ik: IntegerKind = to_it.int_kind;
+        const from_bits: u64 = from_ik.bit_width();
+        const to_bits: u64 = to_ik.bit_width();
         if (from_bits > to_bits) {
             *out_value = cg.builder.build_trunc(val, dest_ty, "trunctmp");
         } else if (from_bits < to_bits) {
-            if ((from as IntType*).int_kind.is_signed()) {
+            if (from_ik.is_signed()) {
                 *out_value = cg.builder.build_sext(val, dest_ty, "sexttmp");
             } else {
                 *out_value = cg.builder.build_zext(val, dest_ty, "zexttmp");
@@ -335,8 +354,12 @@ function codegen_cast(cg: CodegenContext*, val: LValue,
         }
     // Float → Float
     } else if (from_float && to_float) {
-        const from_bits: u64 = (from as FloatType*).float_kind.bit_width();
-        const to_bits: u64 = (to as FloatType*).float_kind.bit_width();
+        const from_ft: FloatType* = src_type as FloatType*;
+        const to_ft: FloatType* = dst_type as FloatType*;
+        const from_fk: FloatKind = from_ft.float_kind;
+        const to_fk: FloatKind = to_ft.float_kind;
+        const from_bits: u64 = from_fk.bit_width();
+        const to_bits: u64 = to_fk.bit_width();
         if (from_bits > to_bits) {
             *out_value = cg.builder.build_fp_trunc(val, dest_ty, "fptrunctmp");
         } else if (from_bits < to_bits) {
@@ -346,14 +369,18 @@ function codegen_cast(cg: CodegenContext*, val: LValue,
         }
     // Int → Float
     } else if (from_int && to_float) {
-        if ((from as IntType*).int_kind.is_signed()) {
+        const from_it2: IntType* = src_type as IntType*;
+        const from_ik2: IntegerKind = from_it2.int_kind;
+        if (from_ik2.is_signed()) {
             *out_value = cg.builder.build_si_to_fp(val, dest_ty, "sitofptmp");
         } else {
             *out_value = cg.builder.build_ui_to_fp(val, dest_ty, "uitofptmp");
         }
     // Float → Int
     } else if (from_float && to_int) {
-        if ((to as IntType*).int_kind.is_signed()) {
+        const to_it2: IntType* = dst_type as IntType*;
+        const to_ik2: IntegerKind = to_it2.int_kind;
+        if (to_ik2.is_signed()) {
             *out_value = cg.builder.build_fp_to_si(val, dest_ty, "fptositmp");
         } else {
             *out_value = cg.builder.build_fp_to_ui(val, dest_ty, "fptouitmp");
@@ -368,7 +395,7 @@ function codegen_cast(cg: CodegenContext*, val: LValue,
     } else if (from_ptr && to_int) {
         *out_value = cg.builder.build_ptr_to_int(val, dest_ty, "ptrtoint");
     // Bool to int
-    } else if (from.kind == TypeKind::Bool && to_int) {
+    } else if (from_kind == TypeKind::Bool && to_int) {
         *out_value = cg.builder.build_zext(val, dest_ty, "booltoint");
     // Fallback: bitcast
     } else {
@@ -392,11 +419,13 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
         return;
     }
 
+    const tk: TypeKind = t.kind;
     mut field_idx: i64 = -1;
 
-    if (t.kind == TypeKind::Struct) {
-        field_idx = (t as StructType*).field_index(member);
-    } else if (t.kind == TypeKind::Class) {
+    if (tk == TypeKind::Struct) {
+        const st: StructType* = t as StructType*;
+        field_idx = st.field_index(member);
+    } else if (tk == TypeKind::Class) {
         const cls: ClassType* = t as ClassType*;
         field_idx = cls.field_index(member);
         // Offset by 1 if class has vtable pointer.

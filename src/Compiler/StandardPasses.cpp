@@ -152,9 +152,20 @@ namespace Cryo
                 LOG_DEBUG(LogComponent::GENERAL, "CHeaderImportPass: Got {} function declarations from {}",
                           func_nodes.size(), include_path);
 
+                // Get the namespace alias for this C import block.
+                std::string ns_alias = extern_block->namespace_alias();
+
                 for (auto &func : func_nodes)
                 {
+                    // Register in the global C-import registry BEFORE moving.
+                    // The raw pointer remains valid because ExternBlockNode owns
+                    // the FunctionDeclarationNode after add_function_declaration().
+                    FunctionDeclarationNode *raw_ptr = func.get();
                     extern_block->add_function_declaration(std::move(func));
+                    if (!ns_alias.empty() && raw_ptr)
+                    {
+                        _compiler.register_c_import(ns_alias, raw_ptr);
+                    }
                 }
 
                 // Check for matching .c file for auto-linking

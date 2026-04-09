@@ -21,6 +21,11 @@
 #include <stack>
 #include <unordered_set>
 
+namespace Cryo
+{
+    class CompilerInstance; // Forward declaration for C-import registry access
+}
+
 namespace Cryo::Codegen
 {
     // Forward declarations
@@ -209,6 +214,12 @@ namespace Cryo::Codegen
 
         /** @brief Get monomorphizer (may be null) */
         Cryo::Monomorphizer *monomorphizer() { return _monomorphizer; }
+
+        /** @brief Set compiler instance for C-import registry access */
+        void set_compiler_instance(Cryo::CompilerInstance *ci) { _compiler_instance = ci; }
+
+        /** @brief Get compiler instance (may be null) */
+        Cryo::CompilerInstance *compiler_instance() { return _compiler_instance; }
 
         /** @brief Set generic registry for generic type resolution during codegen */
         void set_generic_registry(Cryo::GenericRegistry *registry)
@@ -447,6 +458,7 @@ namespace Cryo::Codegen
         CodegenVisitor *_visitor = nullptr;
         Cryo::TemplateRegistry *_template_registry = nullptr;
         Cryo::Monomorphizer *_monomorphizer = nullptr;
+        Cryo::CompilerInstance *_compiler_instance = nullptr;
 
         //===================================================================
         // Owned Components
