@@ -1,0 +1,583 @@
+/// C Header Import Pass
+///
+/// Processes CImport extern blocks: `name := extern "C" { #include "file.h" }`.
+/// Resolves include paths relative to the source file, invokes the C
+/// preprocessor (`clang-20 -E -P`), parses the preprocessed output to extract
+/// function prototypes, and injects FunctionDeclNode entries into the
+/// ExternBlockNode so that downstream passes (name resolution, type resolution,
+/// codegen) treat them identically to manually declared extern functions.
+
+namespace Compiler::Passes::CHeaderImport;
+
+import Compiler::Passes::PassID;
+import Compiler::Diag::Snapshot;
+import Compiler::Diag::Sink;
+import Compiler::Diag::SourceSpan;
+import Compiler::Diag;
+import Compiler::Artifacts;
+import Compiler::CompilationContext;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Utils;
+
+
+// ============================================================================
+// Pass Entry Point
+// ============================================================================
+
+/// Runs the CHeaderImport pass.  Walks all top-level statements looking for
+/// ExternBlockNodes that have a namespace alias (CImport blocks).  For each
+/// block, resolves include paths, preprocesses the header, parses function
+/// prototypes, and injects them as FunctionDeclNode children.
+function run(ctx: CompilationContext*) -> PassResult {
+    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+    const root: ProgramNode* = ctx.artifacts.ast.root;
+
+    if (root == null) {
+        return PassResult::from_snapshot(&ctx.diagnostics, snap);
+    }
+
+    mut total_imported: i32 = 0;
+    for (mut i: int = 0; i < root.statements.length; i++) {
+        const node: ASTNode* = root.statements[i];
+        if (node == null) { continue; }
+        if (node.kind != NodeKind::ExternBlock) { continue; }
+
+        const extern_node: ExternBlockNode* = node as ExternBlockNode*;
+        if (!extern_node.is_c_import()) { continue; }
+
+        const source_dir: string = get_directory(ctx.source_file);
+
+        for (mut j: int = 0; j < extern_node.include_paths.length; j++) {
+            const include_path: string = extern_node.include_paths[j];
+            const resolved: string = resolve_include_path(source_dir, include_path);
+
+            if (resolved == "") {
+                printf("[CHeaderImport] WARNING: header not found: '%s' (relative to '%s')\n",
+                       include_path, source_dir);
+                continue;
+            }
+
+            const count: i32 = process_c_header(resolved, extern_node, ctx);
+            total_imported = total_imported + count;
+        }
+
+        if (ctx.debug_mode) {
+            const alias_str: string = ctx.intern_table.resolve(extern_node.namespace_alias);
+            printf("[CHeaderImport] '%s': %d includes, %d functions\n",
+                   alias_str, extern_node.include_paths.length, extern_node.functions.length);
+        }
+    }
+
+    if (ctx.debug_mode && total_imported > 0) {
+        printf("[CHeaderImport] Total: %d C functions imported\n", total_imported);
+    }
+
+    return PassResult::from_snapshot(&ctx.diagnostics, snap);
+}
+
+
+// ============================================================================
+// Path Resolution
+// ============================================================================
+
+/// Extract directory component from a file path.
+function get_directory(path: string) -> string {
+    const len: u64 = strlen(path);
+    mut last_sep: i64 = -1;
+    for (mut i: u64 = 0; i < len; i++) {
+        if (path[i] == '/' || path[i] == '\\') {
+            last_sep = i as i64;
+        }
+    }
+    if (last_sep < 0) {
+        return ".";
+    }
+    const dir: i8* = malloc((last_sep + 1) as u64) as i8*;
+    memcpy(dir as void*, path as void*, last_sep as u64);
+    dir[last_sep] = 0;
+    return dir as string;
+}
+
+/// Resolve an include path relative to a source directory.
+/// Returns the resolved path if the file exists, empty string otherwise.
+function resolve_include_path(source_dir: string, include_path: string) -> string {
+    const src_len: u64 = strlen(source_dir);
+    const inc_len: u64 = strlen(include_path);
+    const total: u64 = src_len + 1 + inc_len + 1;
+    const buf: i8* = malloc(total) as i8*;
+    memcpy(buf as void*, source_dir as void*, src_len);
+    buf[src_len] = '/';
+    memcpy((buf + src_len + 1) as void*, include_path as void*, inc_len);
+    buf[src_len + 1 + inc_len] = 0;
+
+    const f: void* = fopen(buf as string, "r");
+    if (f != null) {
+        fclose(f);
+        return buf as string;
+    }
+
+    free(buf as void*);
+    return "";
+}
+
+
+// ============================================================================
+// Preprocessor Invocation
+// ============================================================================
+
+/// Run the C preprocessor on a header file and parse the output.
+/// Returns the number of function declarations extracted.
+function process_c_header(resolved_path: string, extern_node: ExternBlockNode*,
+                          ctx: CompilationContext*) -> i32 {
+    const path_len: u64 = strlen(resolved_path);
+    const cmd_prefix: string = "clang-20 -E -P \"";
+    const cmd_suffix: string = "\" 2>/dev/null";
+    const prefix_len: u64 = strlen(cmd_prefix);
+    const suffix_len: u64 = strlen(cmd_suffix);
+    const cmd_len: u64 = prefix_len + path_len + suffix_len + 1;
+    const cmd: i8* = malloc(cmd_len) as i8*;
+    memcpy(cmd as void*, cmd_prefix as void*, prefix_len);
+    memcpy((cmd + prefix_len) as void*, resolved_path as void*, path_len);
+    memcpy((cmd + prefix_len + path_len) as void*, cmd_suffix as void*, suffix_len);
+    cmd[prefix_len + path_len + suffix_len] = 0;
+
+    if (ctx.debug_mode) {
+        printf("[CHeaderImport] Running preprocessor: %s\n", cmd);
+    }
+
+    const pipe: void* = popen(cmd as string, "r");
+    free(cmd as void*);
+    if (pipe == null) {
+        printf("[CHeaderImport] WARNING: Failed to run clang-20 preprocessor\n");
+        return 0;
+    }
+
+    // Read all preprocessor output
+    mut output_buf: i8* = malloc(65536) as i8*;
+    mut output_len: u64 = 0;
+    mut output_cap: u64 = 65536;
+    mut line_buf: i8[4096];
+
+    while (fgets(&line_buf[0], 4096, pipe) != null) {
+        const line_len: u64 = strlen(&line_buf[0] as string);
+        if (output_len + line_len >= output_cap) {
+            output_cap = output_cap * 2;
+            const new_buf: i8* = malloc(output_cap) as i8*;
+            memcpy(new_buf as void*, output_buf as void*, output_len);
+            free(output_buf as void*);
+            output_buf = new_buf;
+        }
+        memcpy((output_buf + output_len) as void*, &line_buf[0] as void*, line_len);
+        output_len = output_len + line_len;
+    }
+    output_buf[output_len] = 0;
+    pclose(pipe);
+
+    if (output_len == 0) {
+        free(output_buf as void*);
+        return 0;
+    }
+
+    const count: i32 = parse_c_functions(output_buf as string, output_len as i64, extern_node, ctx);
+    free(output_buf as void*);
+    return count;
+}
+
+
+// ============================================================================
+// C Function Declaration Parser
+// ============================================================================
+
+type struct CFuncParseResult {
+    success: boolean;
+    func:    FunctionDeclNode*;
+    end_pos: i64;
+}
+
+/// Parse preprocessed C source to extract function prototypes.
+/// Skips typedefs, struct/union/enum definitions, and function bodies.
+function parse_c_functions(source: string, source_len: i64,
+                           extern_node: ExternBlockNode*,
+                           ctx: CompilationContext*) -> i32 {
+    mut count: i32 = 0;
+    mut pos: i64 = 0;
+
+    while (pos < source_len) {
+        // Skip whitespace
+        while (pos < source_len && is_whitespace(source[pos])) {
+            pos = pos + 1;
+        }
+        if (pos >= source_len) { break; }
+
+        // Skip typedef, struct, union, enum blocks
+        if (starts_with_at(source, pos, "typedef ") ||
+            starts_with_at(source, pos, "struct ") ||
+            starts_with_at(source, pos, "union ") ||
+            starts_with_at(source, pos, "enum ")) {
+            pos = skip_to_semicolon_or_brace(source, source_len, pos);
+            continue;
+        }
+
+        // Skip __attribute__, _Pragma, etc.
+        if (source[pos] == '_' && pos + 1 < source_len && source[pos + 1] == '_') {
+            pos = skip_to_semicolon_or_brace(source, source_len, pos);
+            continue;
+        }
+
+        // Skip preprocessor leftovers (# lines)
+        if (source[pos] == '#') {
+            while (pos < source_len && source[pos] != '\n') { pos = pos + 1; }
+            continue;
+        }
+
+        // Try to parse a function declaration
+        const result: CFuncParseResult = try_parse_c_func(source, source_len, pos, ctx);
+        if (result.success) {
+            extern_node.add_function(result.func);
+            count = count + 1;
+            pos = result.end_pos;
+        } else {
+            pos = skip_to_semicolon_or_brace(source, source_len, pos);
+        }
+    }
+
+    return count;
+}
+
+/// Try to parse a single C function declaration.
+/// Pattern: [qualifiers] return_type [*...] name ( params ) ;
+function try_parse_c_func(source: string, source_len: i64, start: i64,
+                          ctx: CompilationContext*) -> CFuncParseResult {
+    mut pos: i64 = start;
+    const fail: CFuncParseResult = CFuncParseResult { success: false, func: null, end_pos: start };
+
+    // Skip storage-class specifiers
+    pos = skip_c_qualifiers(source, source_len, pos);
+
+    // Scan forward to find: ... name (
+    // The last identifier before '(' is the function name
+    const ret_start: i64 = pos;
+    mut ret_end: i64 = pos;
+    mut name_start: i64 = -1;
+    mut name_end: i64 = -1;
+    mut paren_pos: i64 = -1;
+    mut depth: i32 = 0;
+
+    while (pos < source_len) {
+        const c: i8 = source[pos];
+        if (c == '(') {
+            if (depth == 0) { paren_pos = pos; break; }
+            depth = depth + 1;
+        }
+        if (c == ')') { depth = depth - 1; }
+        if (c == ';' || c == '{' || c == '}') { return fail; }
+        if (c == '\n' && pos > start + 500) { return fail; }
+
+        if (is_c_ident_start(c)) {
+            const id_start: i64 = pos;
+            while (pos < source_len && is_c_ident_char(source[pos])) { pos = pos + 1; }
+            name_start = id_start;
+            name_end = pos;
+            ret_end = id_start;
+            continue;
+        }
+        pos = pos + 1;
+    }
+
+    if (paren_pos < 0 || name_start < 0) { return fail; }
+
+    // Extract function name
+    const func_name: SymbolStr = intern_slice(source, name_start, name_end, ctx);
+
+    // Extract return type string
+    const ret_type_str: string = extract_trimmed(source, ret_start, ret_end);
+
+    // Parse parameter list
+    pos = paren_pos + 1;
+    mut params: VarDeclNode*[] = [];
+    mut is_variadic: boolean = false;
+
+    pos = skip_ws(source, source_len, pos);
+
+    if (pos < source_len && source[pos] == ')') {
+        pos = pos + 1;
+    } else if (starts_with_at(source, pos, "void)") || starts_with_at(source, pos, "void )")) {
+        while (pos < source_len && source[pos] != ')') { pos = pos + 1; }
+        pos = pos + 1;
+    } else {
+        while (pos < source_len && source[pos] != ')') {
+            pos = skip_ws(source, source_len, pos);
+
+            if (starts_with_at(source, pos, "...")) {
+                is_variadic = true;
+                pos = pos + 3;
+                while (pos < source_len && source[pos] != ')') { pos = pos + 1; }
+                break;
+            }
+
+            // Parse one parameter: type [*...] [name]
+            const param_start: i64 = pos;
+            mut param_name_start: i64 = -1;
+            mut param_name_end: i64 = -1;
+            mut param_type_end: i64 = pos;
+
+            while (pos < source_len && source[pos] != ',' && source[pos] != ')') {
+                if (is_c_ident_start(source[pos])) {
+                    const ps: i64 = pos;
+                    while (pos < source_len && is_c_ident_char(source[pos])) { pos = pos + 1; }
+                    param_name_start = ps;
+                    param_name_end = pos;
+                    param_type_end = ps;
+                    continue;
+                }
+                pos = pos + 1;
+            }
+
+            // Determine parameter name vs type keyword
+            mut pname: string = "";
+            if (param_name_start >= 0) {
+                pname = extract_trimmed(source, param_name_start, param_name_end);
+                if (is_c_type_keyword(pname)) {
+                    param_type_end = param_name_end;
+                    pname = "";
+                }
+            }
+
+            if (pname == "") {
+                const idx: i32 = params.length as i32;
+                const arg_buf: i8* = malloc(16) as i8*;
+                sprintf(arg_buf as string, "arg%d", idx);
+                pname = arg_buf as string;
+            }
+
+            const param_type_str: string = extract_trimmed(source, param_start, param_type_end);
+            const param_sym: SymbolStr = ctx.intern_table.intern(pname);
+            const param_type_ann: TypeAnnotation* = c_type_to_annotation(param_type_str, ctx);
+            const span: SourceSpan = SourceSpan::none();
+            mut param_node: VarDeclNode* = new VarDeclNode(param_sym, span);
+            param_node.type_annotation = param_type_ann;
+            params.push(param_node);
+
+            if (pos < source_len && source[pos] == ',') { pos = pos + 1; }
+        }
+        if (pos < source_len && source[pos] == ')') { pos = pos + 1; }
+    }
+
+    // Must end with ';' (declaration), not '{' (definition)
+    pos = skip_ws(source, source_len, pos);
+    if (pos < source_len && source[pos] == '{') { return fail; }
+    if (pos < source_len && source[pos] == ';') { pos = pos + 1; }
+
+    // Build the FunctionDeclNode
+    const ret_ann: TypeAnnotation* = c_type_to_annotation(ret_type_str, ctx);
+    const span: SourceSpan = SourceSpan::none();
+    mut func: FunctionDeclNode* = new FunctionDeclNode(func_name, span);
+    func.return_type_annotation = ret_ann;
+    func.parameters = params;
+    func.is_variadic = is_variadic;
+
+    return CFuncParseResult { success: true, func: func, end_pos: pos };
+}
+
+
+// ============================================================================
+// C-to-Cryo Type Mapping
+// ============================================================================
+
+/// Allocate a PrimitiveAnnotation wrapped in a heap TypeAnnotation.
+function make_prim_annotation(name: string, ctx: CompilationContext*) -> TypeAnnotation* {
+    const sym: SymbolStr = ctx.intern_table.intern(name);
+    const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: sym, span: SourceSpan::none() };
+    const ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+    *ann = TypeAnnotation::Primitive(prim);
+    return ann;
+}
+
+/// Allocate a PointerAnnotation wrapped in a heap TypeAnnotation.
+function make_ptr_annotation(inner: TypeAnnotation*) -> TypeAnnotation* {
+    const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner, span: SourceSpan::none() };
+    const ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+    *ann = TypeAnnotation::Pointer(ptr);
+    return ann;
+}
+
+/// Map a C type string to a Cryo TypeAnnotation.
+/// Handles qualifiers, pointer types, standard C types, fixed-width types,
+/// and falls back to void* for unknown types.
+function c_type_to_annotation(c_type: string, ctx: CompilationContext*) -> TypeAnnotation* {
+    mut type_str: string = c_type;
+
+    // Strip qualifiers (may appear multiple times)
+    if (starts_with_at(type_str, 0, "const "))    { type_str = type_str + 6; }
+    if (starts_with_at(type_str, 0, "volatile ")) { type_str = type_str + 9; }
+    if (starts_with_at(type_str, 0, "static "))   { type_str = type_str + 7; }
+    if (starts_with_at(type_str, 0, "extern "))   { type_str = type_str + 7; }
+    if (starts_with_at(type_str, 0, "inline "))   { type_str = type_str + 7; }
+    if (starts_with_at(type_str, 0, "signed "))   { type_str = type_str + 7; }
+
+    // Check for pointer (ends with *)
+    const tlen: u64 = strlen(type_str);
+    if (tlen > 0 && type_str[tlen - 1] == '*') {
+        const inner_buf: i8* = malloc(tlen) as i8*;
+        memcpy(inner_buf as void*, type_str as void*, tlen - 1);
+        inner_buf[tlen - 1] = 0;
+        mut end: i64 = (tlen as i64) - 2;
+        while (end >= 0 && (inner_buf[end] == ' ' || inner_buf[end] == '\t')) {
+            inner_buf[end] = 0;
+            end = end - 1;
+        }
+        const inner: TypeAnnotation* = c_type_to_annotation(inner_buf as string, ctx);
+        free(inner_buf as void*);
+        return make_ptr_annotation(inner);
+    }
+
+    // Map standard C types → Cryo primitives
+    if (str_eq(type_str, "void"))                 { return make_prim_annotation("void", ctx); }
+    if (str_eq(type_str, "int"))                  { return make_prim_annotation("i32", ctx); }
+    if (str_eq(type_str, "unsigned int"))          { return make_prim_annotation("u32", ctx); }
+    if (str_eq(type_str, "unsigned"))              { return make_prim_annotation("u32", ctx); }
+    if (str_eq(type_str, "char"))                 { return make_prim_annotation("i8", ctx); }
+    if (str_eq(type_str, "unsigned char"))         { return make_prim_annotation("u8", ctx); }
+    if (str_eq(type_str, "short"))                { return make_prim_annotation("i16", ctx); }
+    if (str_eq(type_str, "short int"))            { return make_prim_annotation("i16", ctx); }
+    if (str_eq(type_str, "unsigned short"))        { return make_prim_annotation("u16", ctx); }
+    if (str_eq(type_str, "unsigned short int"))    { return make_prim_annotation("u16", ctx); }
+    if (str_eq(type_str, "long"))                 { return make_prim_annotation("i64", ctx); }
+    if (str_eq(type_str, "long int"))             { return make_prim_annotation("i64", ctx); }
+    if (str_eq(type_str, "long long"))            { return make_prim_annotation("i64", ctx); }
+    if (str_eq(type_str, "long long int"))        { return make_prim_annotation("i64", ctx); }
+    if (str_eq(type_str, "unsigned long"))         { return make_prim_annotation("u64", ctx); }
+    if (str_eq(type_str, "unsigned long int"))     { return make_prim_annotation("u64", ctx); }
+    if (str_eq(type_str, "unsigned long long"))    { return make_prim_annotation("u64", ctx); }
+    if (str_eq(type_str, "unsigned long long int")){ return make_prim_annotation("u64", ctx); }
+    if (str_eq(type_str, "float"))                { return make_prim_annotation("f32", ctx); }
+    if (str_eq(type_str, "double"))               { return make_prim_annotation("f64", ctx); }
+    if (str_eq(type_str, "long double"))           { return make_prim_annotation("f64", ctx); }
+    if (str_eq(type_str, "_Bool"))                { return make_prim_annotation("boolean", ctx); }
+    if (str_eq(type_str, "size_t"))               { return make_prim_annotation("u64", ctx); }
+    if (str_eq(type_str, "ssize_t"))              { return make_prim_annotation("i64", ctx); }
+    if (str_eq(type_str, "ptrdiff_t"))            { return make_prim_annotation("i64", ctx); }
+    if (str_eq(type_str, "intptr_t"))             { return make_prim_annotation("i64", ctx); }
+    if (str_eq(type_str, "uintptr_t"))            { return make_prim_annotation("u64", ctx); }
+
+    // Fixed-width integer types
+    if (str_eq(type_str, "int8_t"))               { return make_prim_annotation("i8", ctx); }
+    if (str_eq(type_str, "int16_t"))              { return make_prim_annotation("i16", ctx); }
+    if (str_eq(type_str, "int32_t"))              { return make_prim_annotation("i32", ctx); }
+    if (str_eq(type_str, "int64_t"))              { return make_prim_annotation("i64", ctx); }
+    if (str_eq(type_str, "uint8_t"))              { return make_prim_annotation("u8", ctx); }
+    if (str_eq(type_str, "uint16_t"))             { return make_prim_annotation("u16", ctx); }
+    if (str_eq(type_str, "uint32_t"))             { return make_prim_annotation("u32", ctx); }
+    if (str_eq(type_str, "uint64_t"))             { return make_prim_annotation("u64", ctx); }
+
+    // LLVM-specific typedef
+    if (str_eq(type_str, "LLVMBool"))             { return make_prim_annotation("i32", ctx); }
+
+    // Enum types → i32
+    if (starts_with_at(type_str, 0, "enum "))     { return make_prim_annotation("i32", ctx); }
+
+    // Unknown type → void* (opaque pointer)
+    return make_ptr_annotation(make_prim_annotation("void", ctx));
+}
+
+
+// ============================================================================
+// String / Character Helpers
+// ============================================================================
+
+function is_whitespace(c: i8) -> boolean {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+function skip_ws(source: string, source_len: i64, start: i64) -> i64 {
+    mut pos: i64 = start;
+    while (pos < source_len && is_whitespace(source[pos])) { pos = pos + 1; }
+    return pos;
+}
+
+function starts_with_at(s: string, pos: i64, prefix: string) -> boolean {
+    const plen: u64 = strlen(prefix);
+    const slen: u64 = strlen(s);
+    if (pos as u64 + plen > slen) { return false; }
+    for (mut i: u64 = 0; i < plen; i++) {
+        if (s[pos + i] != prefix[i]) { return false; }
+    }
+    return true;
+}
+
+function skip_to_semicolon_or_brace(source: string, source_len: i64, start: i64) -> i64 {
+    mut pos: i64 = start;
+    mut depth: i32 = 0;
+    while (pos < source_len) {
+        const c: i8 = source[pos];
+        if (c == '{') { depth = depth + 1; }
+        if (c == '}') {
+            if (depth > 0) { depth = depth - 1; }
+            else { pos = pos + 1; return pos; }
+        }
+        if (c == ';' && depth == 0) { pos = pos + 1; return pos; }
+        pos = pos + 1;
+    }
+    return pos;
+}
+
+function is_c_ident_start(c: i8) -> boolean {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+function is_c_ident_char(c: i8) -> boolean {
+    return is_c_ident_start(c) || (c >= '0' && c <= '9');
+}
+
+function is_c_type_keyword(s: string) -> boolean {
+    return str_eq(s, "void") || str_eq(s, "int") || str_eq(s, "char") ||
+           str_eq(s, "short") || str_eq(s, "long") || str_eq(s, "float") ||
+           str_eq(s, "double") || str_eq(s, "unsigned") || str_eq(s, "signed") ||
+           str_eq(s, "const") || str_eq(s, "volatile") || str_eq(s, "struct") ||
+           str_eq(s, "union") || str_eq(s, "enum") || str_eq(s, "extern") ||
+           str_eq(s, "static") || str_eq(s, "inline");
+}
+
+function skip_c_qualifiers(source: string, source_len: i64, start: i64) -> i64 {
+    mut pos: i64 = start;
+    mut changed: boolean = true;
+    while (changed) {
+        changed = false;
+        pos = skip_ws(source, source_len, pos);
+        if (starts_with_at(source, pos, "extern "))   { pos = pos + 7; changed = true; }
+        if (starts_with_at(source, pos, "static "))   { pos = pos + 7; changed = true; }
+        if (starts_with_at(source, pos, "inline "))   { pos = pos + 7; changed = true; }
+    }
+    return pos;
+}
+
+function extract_trimmed(source: string, start: i64, end: i64) -> string {
+    mut s: i64 = start;
+    mut e: i64 = end;
+    while (s < e && is_whitespace(source[s])) { s = s + 1; }
+    while (e > s && is_whitespace(source[e - 1])) { e = e - 1; }
+    const len: i64 = e - s;
+    if (len <= 0) { return "void"; }
+    const buf: i8* = malloc((len + 1) as u64) as i8*;
+    memcpy(buf as void*, (source + s) as void*, len as u64);
+    buf[len] = 0;
+    return buf as string;
+}
+
+function intern_slice(source: string, start: i64, end: i64, ctx: CompilationContext*) -> SymbolStr {
+    const len: i64 = end - start;
+    const buf: i8* = malloc((len + 1) as u64) as i8*;
+    memcpy(buf as void*, (source + start) as void*, len as u64);
+    buf[len] = 0;
+    const sym: SymbolStr = ctx.intern_table.intern(buf as string);
+    free(buf as void*);
+    return sym;
+}
+
+function str_eq(a: string, b: string) -> boolean {
+    return strcmp(a, b) == 0;
+}

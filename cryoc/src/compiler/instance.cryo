@@ -393,7 +393,7 @@ type struct CompilerInstance {
         mut pipeline: PassRegistry = PassRegistry::new();
         pipeline.set_verbose(this.config.verbose_passes);
         printf("[Compiler] Phase 2: Calling set_passes...\n");
-        pipeline.set_passes([PassID::Lexing, PassID::Parsing, PassID::ASTValidation]);
+        pipeline.set_passes([PassID::Lexing, PassID::Parsing, PassID::ASTValidation, PassID::CHeaderImport]);
         printf("[Compiler] Phase 2: Calling validate...\n");
         const phase2_valid: boolean = pipeline.validate();
         printf("[Compiler] Phase 2: validate returned %d\n", phase2_valid as int);
@@ -646,7 +646,7 @@ type struct CompilerInstance {
                 const mod_info: ModuleInfo = ctx.module_graph.modules[mod_idx];
                 const mod_sym: SymbolStr = ctx.intern(mod_info.file_path);
                 build_cross_module_descriptors(
-                    &ctx.module_graph, mod_sym, &ctx.decl_index);
+                    &ctx.module_graph, mod_sym, &ctx.decl_index, ctx.type_arena);
             }
         }
 
@@ -666,6 +666,7 @@ type struct CompilerInstance {
 
             pipeline.set_passes([
                 PassID::IRGeneration,
+                PassID::ObjectEmission,
             ]);
             {
                 mut initial7: ProvisionSet = ProvisionSet::empty();
@@ -702,20 +703,42 @@ type struct CompilerInstance {
                 ctx.provisions.mark(Provision::TypesLowered);
                 ctx.provisions.mark(Provision::FunctionsDeclared);
 
-                if (!pipeline.run_all(&ctx)) {
-                    printf("[Compiler] Phase 7: Codegen FAILED for module %u\n", i);
-                } else if (ctx.artifacts.ir.is_valid()) {
-                    // Dump IR text for debugging.
+                const pipeline_ok: boolean = pipeline.run_all(&ctx);
+
+                if (ctx.artifacts.ir.is_valid()) {
                     const mod_info: ModuleInfo = ctx.module_graph.modules[order[i]];
                     const mod_name: string = ctx.intern_table.resolve(mod_info.name);
-                    printf("[Compiler] Phase 7: IR generated for module %u (%s)\n", i, mod_name);
 
-                    // Print the generated LLVM IR if --ast/--debug flag is set.
-                    if (this.config.show_ast) {
-                        const ir_mod: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
-                        const ir_text: string = ir_mod.print_to_string();
-                        printf("\n=== LLVM IR: %s ===\n%s\n", mod_name, ir_text);
+                    // Write .ll text file via LLVMPrintModuleToFile (safer than
+                    // print_to_string on potentially malformed modules).
+                    {
+                        const mn_len: u64 = strlen(mod_name);
+                        const mn_buf: i8* = malloc(mn_len + 1) as i8*;
+                        memcpy(mn_buf as void*, mod_name as void*, mn_len);
+                        mn_buf[mn_len] = 0;
+                        for (mut k: u64 = 0; k < mn_len; k++) {
+                            if (mn_buf[k] == ':') { mn_buf[k] = '_'; }
+                        }
+                        mkdir(obj_dir, 493);
+                        const ll_path: string = format("%s/%s.ll", obj_dir, mn_buf as string);
+                        mut ll_err: i8* = null;
+                        const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
+                            ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
+                        if (ll_ok != 0 && ll_err != null) {
+                            printf("[Compiler] Warning: failed to write %s: %s\n",
+                                   ll_path, ll_err as string);
+                            llvm::LLVMDisposeMessage(ll_err as void*);
+                        }
+                        free(mn_buf as void*);
                     }
+
+                    if (pipeline_ok) {
+                        printf("[Compiler] Phase 7: IR + obj for module %u (%s)\n", i, mod_name);
+                    } else {
+                        printf("[Compiler] Phase 7: IR generated for module %u (%s)\n", i, mod_name);
+                    }
+                } else if (!pipeline_ok) {
+                    printf("[Compiler] Phase 7: Codegen FAILED for module %u\n", i);
                 }
                 pipeline.reset();
             }

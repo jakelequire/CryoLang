@@ -62,6 +62,11 @@ LLVMBool       LLVMPrintModuleToFile(LLVMModuleRef M, const char *Filename, char
 LLVMBool       LLVMVerifyModule(LLVMModuleRef M, int Action, char **OutMessage);
 void           LLVMDumpModule(LLVMModuleRef M);
 LLVMContextRef LLVMGetModuleContext(LLVMModuleRef M);
+LLVMValueRef   LLVMGetFirstFunction(LLVMModuleRef M);
+LLVMValueRef   LLVMGetNextFunction(LLVMValueRef Fn);
+LLVMTypeRef    LLVMGlobalGetValueType(LLVMValueRef Global);
+const char    *LLVMGetValueName(LLVMValueRef Val);
+void           LLVMGetParamTypes(LLVMTypeRef FunctionTy, LLVMTypeRef *Dest);
 
 
 /* ===================================================================

@@ -147,6 +147,8 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
 
     // Build the LLVM function type.
     const ret_ty: LType = map_return_type(cg, node);
+    if (!ret_ty.is_valid()) { return; }
+
     const param_count: u32 = node.parameters.length as u32;
 
     mut fn_type: LType = LType::null();
@@ -155,10 +157,19 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
     } else {
         const buf: void* = malloc(param_count as u64 * 8);
         const slots: void** = buf as void**;
+        mut all_valid: boolean = true;
         for (mut i: u32 = 0; i < param_count; i++) {
             const param: VarDeclNode* = node.parameters[i];
             const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
+            if (!param_ty.is_valid()) {
+                all_valid = false;
+                break;
+            }
             slots[i] = param_ty.raw;
+        }
+        if (!all_valid) {
+            free(buf);
+            return;
         }
         fn_type = LType::function_type(ret_ty, buf, param_count, node.is_variadic);
         free(buf);
@@ -216,44 +227,61 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
 
     // Build LLVM function type.  Non-static methods prepend a `this` pointer.
     const ret_ty: LType = map_return_type(cg, func);
+    if (!ret_ty.is_valid()) { return; }
+
     const is_instance: boolean = !node.is_static;
 
     // Look up the target type for the `this` pointer.
     mut this_ty: LType = LType::null();
     if (is_instance) {
-        const target_ref: TypeRef = cg.ctx.decl_index.lookup_type(target_type);
+        // Try qualified name first, then bare name
+        const qualified_target: SymbolStr = cg.ctx.qualify_symbol_sym(target_type);
+        mut target_ref: TypeRef = cg.ctx.decl_index.lookup_type(qualified_target);
+        if (target_ref.is_invalid()) {
+            target_ref = cg.ctx.decl_index.lookup_type(target_type);
+        }
         if (target_ref.is_valid()) {
             const mapped: LType = cg.type_mapper.map_type(target_ref);
-            this_ty = LType::pointer_to(mapped);
+            if (mapped.is_valid()) {
+                this_ty = LType::pointer_to(mapped);
+            }
+        }
+        if (!this_ty.is_valid()) {
+            return;
         }
     }
 
     const user_param_count: u32 = func.parameters.length as u32;
     const total_params: u32 = user_param_count + (if (is_instance) { 1 } else { 0 } as u32);
 
-    mut fn_type: LType = LType::null();
-    if (total_params == 0) {
-        fn_type = LType::function_type(ret_ty, null, 0, func.is_variadic);
-    } else {
-        const buf: void* = malloc(total_params as u64 * 8);
-        const slots: void** = buf as void**;
+    const buf: void* = malloc(total_params as u64 * 8);
+    const slots: void** = buf as void**;
 
-        mut idx: u32 = 0;
-        if (is_instance) {
-            slots[0] = this_ty.raw;
-            idx = 1;
-        }
-
-        for (mut i: u32 = 0; i < user_param_count; i++) {
-            const param: VarDeclNode* = func.parameters[i];
-            const mapped_param: LType = cg.type_mapper.map_type(param.resolved_type);
-            slots[idx] = mapped_param.raw;
-            idx = idx + 1;
-        }
-
-        fn_type = LType::function_type(ret_ty, buf, total_params, func.is_variadic);
-        free(buf);
+    mut idx: u32 = 0;
+    if (is_instance) {
+        slots[0] = this_ty.raw;
+        idx = 1;
     }
+
+    mut params_valid: boolean = true;
+    for (mut i: u32 = 0; i < user_param_count; i++) {
+        const param: VarDeclNode* = func.parameters[i];
+        const mapped_param: LType = cg.type_mapper.map_type(param.resolved_type);
+        if (!mapped_param.is_valid()) {
+            params_valid = false;
+            break;
+        }
+        slots[idx] = mapped_param.raw;
+        idx = idx + 1;
+    }
+
+    if (!params_valid) {
+        free(buf);
+        return;
+    }
+
+    const fn_type: LType = LType::function_type(ret_ty, buf, total_params, func.is_variadic);
+    free(buf);
 
     const fn_val: LValue = cg.llvm_module.add_function(fn_name, fn_type);
 
@@ -302,36 +330,67 @@ function declare_extern_block(cg: CodegenContext*, node: ExternBlockNode*) -> vo
 /// Declare cross-module extern functions from the module graph.
 function declare_cross_module_externs(cg: CodegenContext*) -> void {
     const descriptors: CrossModuleFnDescriptor[] = cg.ctx.module_graph.cross_module_fns;
+    mut declared: i32 = 0;
+    mut skipped: i32 = 0;
+
     for (mut i: i64 = 0; i < descriptors.length; i++) {
         const desc: CrossModuleFnDescriptor = descriptors[i];
 
-        // Skip if already declared (could be from this module).
+        // Skip if already declared (defined in this module or previously declared).
         const existing: LValue = cg.get_function(desc.name);
         if (existing.is_valid()) {
             continue;
         }
 
+        // Map return type
         const ret_ty: LType = cg.type_mapper.map_type(desc.return_type);
-        const param_count: u32 = desc.param_types.length as u32;
+        if (!ret_ty.is_valid()) {
+            skipped = skipped + 1;
+            continue;
+        }
 
+        // Map parameter types
+        const param_count: u32 = desc.param_types.length as u32;
         mut fn_type: LType = LType::null();
+        mut valid: boolean = true;
+
         if (param_count == 0) {
             fn_type = LType::function_type(ret_ty, null, 0, desc.is_var_arg);
         } else {
             const buf: void* = malloc(param_count as u64 * 8);
             const slots: void** = buf as void**;
             for (mut j: u32 = 0; j < param_count; j++) {
-                const mapped_dp: LType = cg.type_mapper.map_type(desc.param_types[j]);
-                slots[j] = mapped_dp.raw;
+                const param_ref: TypeRef = desc.param_types[j];
+                if (param_ref.is_invalid()) {
+                    valid = false;
+                    break;
+                }
+                const mapped: LType = cg.type_mapper.map_type(param_ref);
+                if (!mapped.is_valid()) {
+                    valid = false;
+                    break;
+                }
+                slots[j] = mapped.raw;
             }
-            fn_type = LType::function_type(ret_ty, buf, param_count, desc.is_var_arg);
+            if (valid) {
+                fn_type = LType::function_type(ret_ty, buf, param_count, desc.is_var_arg);
+            }
             free(buf);
+        }
+
+        if (!valid || !fn_type.is_valid()) {
+            skipped = skipped + 1;
+            continue;
         }
 
         const name_str: string = cg.intern.resolve(desc.name);
         const fn_val: LValue = cg.llvm_module.add_function(name_str, fn_type);
-        // Mark as external linkage (default for declarations without bodies).
         cg.register_function(desc.name, fn_val);
+        declared = declared + 1;
+    }
+
+    if (cg.ctx.debug_mode) {
+        printf("[Codegen] Cross-module externs: %d declared, %d skipped\n", declared, skipped);
     }
 }
 

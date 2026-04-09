@@ -142,6 +142,10 @@ namespace Cryo::Codegen
             return generate_fgetc(args);
         else if (intrinsic_name == "fputc")
             return generate_fputc(args);
+        else if (intrinsic_name == "popen")
+            return generate_popen(args);
+        else if (intrinsic_name == "pclose")
+            return generate_pclose(args);
         else if (intrinsic_name == "sscanf")
             return generate_sscanf(args);
         else if (intrinsic_name == "atoi")
@@ -4544,6 +4548,46 @@ namespace Cryo::Codegen
             args[1]};
 
         return builder.CreateCall(fputc_func, call_args, "fputc.result");
+    }
+
+    llvm::Value *Intrinsics::generate_popen(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 2)
+        {
+            report_error("popen requires exactly 2 arguments (command, mode)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create popen function type: FILE* popen(const char* command, const char* mode)
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::FunctionType *popen_type = llvm::FunctionType::get(
+            void_ptr_type, {void_ptr_type, void_ptr_type}, false);
+
+        llvm::Function *popen_func = get_or_create_libc_function("popen", popen_type);
+        return builder.CreateCall(popen_func, {args[0], args[1]}, "popen.result");
+    }
+
+    llvm::Value *Intrinsics::generate_pclose(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("pclose requires exactly 1 argument (pipe)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // Create pclose function type: int pclose(FILE* stream)
+        llvm::Type *void_ptr_type = llvm::PointerType::get(context, 0);
+        llvm::Type *int_type = llvm::Type::getInt32Ty(context);
+        llvm::FunctionType *pclose_type = llvm::FunctionType::get(int_type, {void_ptr_type}, false);
+
+        llvm::Function *pclose_func = get_or_create_libc_function("pclose", pclose_type);
+        return builder.CreateCall(pclose_func, {args[0]}, "pclose.result");
     }
 
     llvm::Value *Intrinsics::generate_sscanf(const std::vector<llvm::Value *> &args)
