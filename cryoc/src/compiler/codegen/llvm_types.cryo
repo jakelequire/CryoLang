@@ -1,0 +1,676 @@
+/// LLVM Type-Safe Wrappers
+///
+/// Wraps opaque void* LLVM-C handles in distinct structs to prevent
+/// misuse (e.g., passing a value where a type is expected).  Each
+/// wrapper is a lightweight value type holding a single pointer.
+
+namespace Compiler::Codegen::LLVMTypes;
+
+import Compiler::Codegen;
+
+
+// ============================================================================
+// LLVMModule — Wrapper around LLVMModuleRef
+// ============================================================================
+
+type struct LModule {
+    raw: void*;
+
+    static create(name: string) -> LModule {
+        return LModule { raw: llvm::LLVMModuleCreateWithName(name) };
+    }
+
+    static null() -> LModule {
+        return LModule { raw: null };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.raw != null;
+    }
+
+    dispose(mut &this) -> void {
+        if (this.raw != null) {
+            llvm::LLVMDisposeModule(this.raw);
+            this.raw = null;
+        }
+    }
+
+    /// Verify the module.  Returns true if valid.
+    verify(&this) -> boolean {
+        mut err_msg: i8* = null;
+        // Action 2 = LLVMReturnStatusAction
+        const result: i32 = llvm::LLVMVerifyModule(this.raw, 2, &err_msg as void*);
+        if (err_msg != null) {
+            llvm::LLVMDisposeMessage(err_msg as void*);
+        }
+        return result == 0;
+    }
+
+    print_to_string(&this) -> string {
+        return llvm::LLVMPrintModuleToString(this.raw) as string;
+    }
+
+    dump(&this) -> void {
+        llvm::LLVMDumpModule(this.raw);
+    }
+
+    set_target_triple(&this, triple: string) -> void {
+        llvm::LLVMSetTarget(this.raw, triple);
+    }
+
+    set_data_layout(&this, layout: string) -> void {
+        llvm::LLVMSetDataLayout(this.raw, layout);
+    }
+
+    context(&this) -> LContext {
+        return LContext { raw: llvm::LLVMGetModuleContext(this.raw) };
+    }
+
+    get_named_function(&this, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMGetNamedFunction(this.raw, name) };
+    }
+
+    add_function(&this, name: string, fn_type: LType) -> LValue {
+        return LValue { raw: llvm::LLVMAddFunction(this.raw, name, fn_type.raw) };
+    }
+
+    add_global(&this, ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMAddGlobal(this.raw, ty.raw, name) };
+    }
+}
+
+
+// ============================================================================
+// LContext — Wrapper around LLVMContextRef
+// ============================================================================
+
+type struct LContext {
+    raw: void*;
+
+    static create() -> LContext {
+        return LContext { raw: llvm::LLVMContextCreate() };
+    }
+
+    static global() -> LContext {
+        return LContext { raw: llvm::LLVMGetGlobalContext() };
+    }
+
+    static null() -> LContext {
+        return LContext { raw: null };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.raw != null;
+    }
+
+    dispose(mut &this) -> void {
+        if (this.raw != null) {
+            llvm::LLVMContextDispose(this.raw);
+            this.raw = null;
+        }
+    }
+}
+
+
+// ============================================================================
+// LBuilder — Wrapper around LLVMBuilderRef
+// ============================================================================
+
+type struct LBuilder {
+    raw: void*;
+
+    static create() -> LBuilder {
+        return LBuilder { raw: llvm::LLVMCreateBuilder() };
+    }
+
+    static null() -> LBuilder {
+        return LBuilder { raw: null };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.raw != null;
+    }
+
+    dispose(mut &this) -> void {
+        if (this.raw != null) {
+            llvm::LLVMDisposeBuilder(this.raw);
+            this.raw = null;
+        }
+    }
+
+    position_at_end(&this, block: LBasicBlock) -> void {
+        llvm::LLVMPositionBuilderAtEnd(this.raw, block.raw);
+    }
+
+    get_insert_block(&this) -> LBasicBlock {
+        return LBasicBlock { raw: llvm::LLVMGetInsertBlock(this.raw) };
+    }
+
+    // ----- Terminators -----
+
+    build_ret_void(&this) -> LValue {
+        return LValue { raw: llvm::LLVMBuildRetVoid(this.raw) };
+    }
+
+    build_ret(&this, val: LValue) -> LValue {
+        return LValue { raw: llvm::LLVMBuildRet(this.raw, val.raw) };
+    }
+
+    build_br(&this, dest: LBasicBlock) -> LValue {
+        return LValue { raw: llvm::LLVMBuildBr(this.raw, dest.raw) };
+    }
+
+    build_cond_br(&this, cond: LValue, then_bb: LBasicBlock, else_bb: LBasicBlock) -> LValue {
+        return LValue { raw: llvm::LLVMBuildCondBr(this.raw, cond.raw, then_bb.raw, else_bb.raw) };
+    }
+
+    build_switch(&this, val: LValue, else_bb: LBasicBlock, num_cases: u32) -> LValue {
+        return LValue { raw: llvm::LLVMBuildSwitch(this.raw, val.raw, else_bb.raw, num_cases) };
+    }
+
+    build_unreachable(&this) -> LValue {
+        return LValue { raw: llvm::LLVMBuildUnreachable(this.raw) };
+    }
+
+    // ----- Integer Arithmetic -----
+
+    build_add(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildAdd(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_sub(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildSub(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_mul(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildMul(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_sdiv(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildSDiv(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_udiv(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildUDiv(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_srem(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildSRem(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_urem(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildURem(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_neg(&this, val: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildNeg(this.raw, val.raw, name) };
+    }
+
+    // ----- Float Arithmetic -----
+
+    build_fadd(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFAdd(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_fsub(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFSub(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_fmul(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFMul(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_fdiv(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFDiv(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_frem(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFRem(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_fneg(&this, val: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFNeg(this.raw, val.raw, name) };
+    }
+
+    // ----- Bitwise -----
+
+    build_shl(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildShl(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_lshr(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildLShr(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_ashr(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildAShr(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_and(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildAnd(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_or(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildOr(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_xor(&this, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildXor(this.raw, lhs.raw, rhs.raw, name) };
+    }
+
+    build_not(&this, val: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildNot(this.raw, val.raw, name) };
+    }
+
+    // ----- Comparisons -----
+
+    build_icmp(&this, op: i32, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildICmp(this.raw, op, lhs.raw, rhs.raw, name) };
+    }
+
+    build_fcmp(&this, op: i32, lhs: LValue, rhs: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFCmp(this.raw, op, lhs.raw, rhs.raw, name) };
+    }
+
+    // ----- Memory -----
+
+    build_alloca(&this, ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildAlloca(this.raw, ty.raw, name) };
+    }
+
+    build_load(&this, ty: LType, ptr: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildLoad2(this.raw, ty.raw, ptr.raw, name) };
+    }
+
+    build_store(&this, val: LValue, ptr: LValue) -> LValue {
+        return LValue { raw: llvm::LLVMBuildStore(this.raw, val.raw, ptr.raw) };
+    }
+
+    build_gep(&this, ty: LType, ptr: LValue, indices: void*, num_indices: u32, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildGEP2(this.raw, ty.raw, ptr.raw, indices, num_indices, name) };
+    }
+
+    build_struct_gep(&this, ty: LType, ptr: LValue, idx: u32, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildStructGEP2(this.raw, ty.raw, ptr.raw, idx, name) };
+    }
+
+    build_global_string_ptr(&this, str: string, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildGlobalStringPtr(this.raw, str, name) };
+    }
+
+    // ----- Casts -----
+
+    build_trunc(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildTrunc(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_zext(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildZExt(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_sext(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildSExt(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_fp_to_ui(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFPToUI(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_fp_to_si(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFPToSI(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_ui_to_fp(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildUIToFP(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_si_to_fp(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildSIToFP(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_fp_trunc(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFPTrunc(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_fp_ext(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFPExt(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_ptr_to_int(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildPtrToInt(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_int_to_ptr(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildIntToPtr(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_bitcast(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildBitCast(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    build_pointer_cast(&this, val: LValue, dest_ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildPointerCast(this.raw, val.raw, dest_ty.raw, name) };
+    }
+
+    // ----- Misc -----
+
+    build_phi(&this, ty: LType, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildPhi(this.raw, ty.raw, name) };
+    }
+
+    build_call(&this, fn_ty: LType, fn_val: LValue, args: void*, num_args: u32, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildCall2(this.raw, fn_ty.raw, fn_val.raw, args, num_args, name) };
+    }
+
+    build_select(&this, cond: LValue, then_val: LValue, else_val: LValue, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildSelect(this.raw, cond.raw, then_val.raw, else_val.raw, name) };
+    }
+
+    build_extract_value(&this, agg: LValue, index: u32, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildExtractValue(this.raw, agg.raw, index, name) };
+    }
+
+    build_insert_value(&this, agg: LValue, elt: LValue, index: u32, name: string) -> LValue {
+        return LValue { raw: llvm::LLVMBuildInsertValue(this.raw, agg.raw, elt.raw, index, name) };
+    }
+}
+
+
+// ============================================================================
+// LValue — Wrapper around LLVMValueRef
+// ============================================================================
+
+type struct LValue {
+    raw: void*;
+
+    static null() -> LValue {
+        return LValue { raw: null };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.raw != null;
+    }
+
+    set_linkage(&this, linkage: i32) -> void {
+        llvm::LLVMSetLinkage(this.raw, linkage);
+    }
+
+    set_initializer(&this, val: LValue) -> void {
+        llvm::LLVMSetInitializer(this.raw, val.raw);
+    }
+
+    set_global_constant(&this, is_const: boolean) -> void {
+        llvm::LLVMSetGlobalConstant(this.raw, is_const as i32);
+    }
+
+    get_param(index: u32) -> LValue {
+        return LValue { raw: llvm::LLVMGetParam(this.raw, index) };
+    }
+
+    type_of(&this) -> LType {
+        return LType { raw: llvm::LLVMTypeOf(this.raw) };
+    }
+
+    dump(&this) -> void {
+        llvm::LLVMDumpValue(this.raw);
+    }
+}
+
+
+// ============================================================================
+// LType — Wrapper around LLVMTypeRef
+// ============================================================================
+
+type struct LType {
+    raw: void*;
+
+    static null() -> LType {
+        return LType { raw: null };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.raw != null;
+    }
+
+    // ----- Primitive type constructors -----
+
+    static void_type() -> LType {
+        return LType { raw: llvm::LLVMVoidType() };
+    }
+
+    static i1() -> LType {
+        return LType { raw: llvm::LLVMInt1Type() };
+    }
+
+    static i8() -> LType {
+        return LType { raw: llvm::LLVMInt8Type() };
+    }
+
+    static i16() -> LType {
+        return LType { raw: llvm::LLVMInt16Type() };
+    }
+
+    static i32() -> LType {
+        return LType { raw: llvm::LLVMInt32Type() };
+    }
+
+    static i64() -> LType {
+        return LType { raw: llvm::LLVMInt64Type() };
+    }
+
+    static i128() -> LType {
+        return LType { raw: llvm::LLVMInt128Type() };
+    }
+
+    static int_type(bits: u32) -> LType {
+        return LType { raw: llvm::LLVMIntType(bits) };
+    }
+
+    static f32() -> LType {
+        return LType { raw: llvm::LLVMFloatType() };
+    }
+
+    static f64() -> LType {
+        return LType { raw: llvm::LLVMDoubleType() };
+    }
+
+    // ----- Compound type constructors -----
+
+    static pointer_to(element: LType) -> LType {
+        return LType { raw: llvm::LLVMPointerType(element.raw, 0) };
+    }
+
+    static array_of(element: LType, count: u32) -> LType {
+        return LType { raw: llvm::LLVMArrayType(element.raw, count) };
+    }
+
+    static function_type(ret: LType, params: void*, param_count: u32, is_var_arg: boolean) -> LType {
+        return LType { raw: llvm::LLVMFunctionType(ret.raw, params, param_count, is_var_arg as i32) };
+    }
+
+    static named_struct(ctx: LContext, name: string) -> LType {
+        return LType { raw: llvm::LLVMStructCreateNamed(ctx.raw, name) };
+    }
+
+    static literal_struct(elements: void*, count: u32, packed: boolean) -> LType {
+        return LType { raw: llvm::LLVMStructTypeInContext(
+            llvm::LLVMGetGlobalContext(), elements, count, packed as i32) };
+    }
+
+    // ----- Struct body -----
+
+    set_struct_body(&this, elements: void*, count: u32, packed: boolean) -> void {
+        llvm::LLVMStructSetBody(this.raw, elements, count, packed as i32);
+    }
+
+    is_opaque_struct(&this) -> boolean {
+        return llvm::LLVMIsOpaqueStruct(this.raw) != 0;
+    }
+
+    // ----- Constant constructors -----
+
+    static const_int(ty: LType, val: u64, sign_extend: boolean) -> LValue {
+        return LValue { raw: llvm::LLVMConstInt(ty.raw, val, sign_extend as i32) };
+    }
+
+    static const_real(ty: LType, val: f64) -> LValue {
+        return LValue { raw: llvm::LLVMConstReal(ty.raw, val) };
+    }
+
+    static const_null(ty: LType) -> LValue {
+        return LValue { raw: llvm::LLVMConstNull(ty.raw) };
+    }
+
+    static const_pointer_null(ty: LType) -> LValue {
+        return LValue { raw: llvm::LLVMConstPointerNull(ty.raw) };
+    }
+
+    static const_undef(ty: LType) -> LValue {
+        return LValue { raw: llvm::LLVMGetUndef(ty.raw) };
+    }
+
+    static const_struct(values: void*, count: u32, packed: boolean) -> LValue {
+        return LValue { raw: llvm::LLVMConstStruct(values, count, packed as i32) };
+    }
+
+    static const_named_struct(ty: LType, values: void*, count: u32) -> LValue {
+        return LValue { raw: llvm::LLVMConstNamedStruct(ty.raw, values, count) };
+    }
+
+    static const_array(element_ty: LType, values: void*, count: u32) -> LValue {
+        return LValue { raw: llvm::LLVMConstArray(element_ty.raw, values, count) };
+    }
+}
+
+
+// ============================================================================
+// LBasicBlock — Wrapper around LLVMBasicBlockRef
+// ============================================================================
+
+type struct LBasicBlock {
+    raw: void*;
+
+    static null() -> LBasicBlock {
+        return LBasicBlock { raw: null };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.raw != null;
+    }
+
+    static append(fn: LValue, name: string) -> LBasicBlock {
+        return LBasicBlock { raw: llvm::LLVMAppendBasicBlock(fn.raw, name) };
+    }
+
+    get_terminator(&this) -> LValue {
+        return LValue { raw: llvm::LLVMGetBasicBlockTerminator(this.raw) };
+    }
+
+    has_terminator(&this) -> boolean {
+        return llvm::LLVMGetBasicBlockTerminator(this.raw) != null;
+    }
+
+    get_parent(&this) -> LValue {
+        return LValue { raw: llvm::LLVMGetBasicBlockParent(this.raw) };
+    }
+}
+
+
+// ============================================================================
+// LTargetMachine — Wrapper around LLVMTargetMachineRef
+// ============================================================================
+
+type struct LTargetMachine {
+    raw: void*;
+
+    static null() -> LTargetMachine {
+        return LTargetMachine { raw: null };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.raw != null;
+    }
+
+    dispose(mut &this) -> void {
+        if (this.raw != null) {
+            llvm::LLVMDisposeTargetMachine(this.raw);
+            this.raw = null;
+        }
+    }
+
+    get_data_layout_string(&this) -> string {
+        const td: void* = llvm::LLVMCreateTargetDataLayout(this.raw);
+        const str: string = llvm::LLVMCopyStringRepOfTargetData(td) as string;
+        llvm::LLVMDisposeTargetData(td);
+        return str;
+    }
+
+    emit_to_file(&this, module: LModule, filename: string, file_type: i32) -> boolean {
+        mut err_msg: i8* = null;
+        const result: i32 = llvm::LLVMTargetMachineEmitToFile(
+            this.raw, module.raw, filename, file_type, &err_msg as void*);
+        if (err_msg != null) {
+            printf("[Codegen] Emit error: %s\n", err_msg as string);
+            llvm::LLVMDisposeMessage(err_msg as void*);
+        }
+        return result == 0;
+    }
+}
+
+
+// ============================================================================
+// Phi Node Helper
+// ============================================================================
+
+/// Add incoming values to a phi node.  `values` and `blocks` are parallel
+/// arrays of LLVMValueRef and LLVMBasicBlockRef raw pointers.
+function phi_add_incoming(phi: LValue, values: void*, blocks: void*, count: u32) -> void {
+    llvm::LLVMAddIncoming(phi.raw, values, blocks, count);
+}
+
+/// Add a case to a switch instruction.
+function switch_add_case(switch_val: LValue, on_val: LValue, dest: LBasicBlock) -> void {
+    llvm::LLVMAddCase(switch_val.raw, on_val.raw, dest.raw);
+}
+
+
+// ============================================================================
+// LLVM Initialization
+// ============================================================================
+
+/// Initialize the native target for code generation.  Must be called
+/// once before any target-dependent operations.
+function init_native_target() -> void {
+    llvm::LLVMInitializeX86TargetInfo();
+    llvm::LLVMInitializeX86Target();
+    llvm::LLVMInitializeX86TargetMC();
+    llvm::LLVMInitializeX86AsmPrinter();
+    llvm::LLVMInitializeX86AsmParser();
+}
+
+/// Create a target machine for the host triple.
+function create_native_target_machine() -> LTargetMachine {
+    const triple: string = llvm::LLVMGetDefaultTargetTriple() as string;
+    mut target: void* = null;
+    mut err_msg: i8* = null;
+
+    const found: i32 = llvm::LLVMGetTargetFromTriple(triple, &target as void*, &err_msg as void*);
+    if (found != 0) {
+        if (err_msg != null) {
+            printf("[Codegen] Target lookup failed: %s\n", err_msg as string);
+            llvm::LLVMDisposeMessage(err_msg as void*);
+        }
+        return LTargetMachine::null();
+    }
+
+    // LLVMCodeGenLevelDefault=2, LLVMRelocPIC=2, LLVMCodeModelDefault=0
+    const tm: void* = llvm::LLVMCreateTargetMachine(
+        target, triple, "generic", "", 2, 2, 0);
+
+    return LTargetMachine { raw: tm };
+}
+
+/// Get the default target triple string.
+function get_default_triple() -> string {
+    return llvm::LLVMGetDefaultTargetTriple() as string;
+}

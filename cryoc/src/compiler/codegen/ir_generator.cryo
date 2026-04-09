@@ -1,0 +1,735 @@
+/// IR Generator
+///
+/// The main AST visitor that produces LLVM IR.  Extends BaseASTVisitor
+/// and delegates to the expression, statement, and declaration codegen
+/// modules for the actual IR construction.
+
+namespace Compiler::Codegen::IRGenerator;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Context;
+import Compiler::Codegen::DeclCodegen;
+import Compiler::Codegen::ExprCodegen;
+import Compiler::Codegen::StmtCodegen;
+import Compiler::CompilationContext;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::Lex;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+
+
+// ============================================================================
+// IRGeneratorVisitor
+// ============================================================================
+
+type class IRGeneratorVisitor : BaseASTVisitor {
+public:
+    cg: CodegenContext*;
+
+    /// Result of the most recent expression codegen.
+    last_value:     LValue;
+    last_is_lvalue: boolean;
+
+    /// Current impl block target type (set during impl block traversal).
+    current_impl_target: SymbolStr;
+
+    IRGeneratorVisitor(cg: CodegenContext*) : BaseASTVisitor() {
+        this.cg              = cg;
+        this.last_value      = LValue::null();
+        this.last_is_lvalue  = false;
+        this.current_impl_target = SymbolStr::empty();
+    }
+
+
+    // ========================================================================
+    // Top-level program generation
+    // ========================================================================
+
+    /// Generate IR for an entire module's program.
+    /// Three-pass approach:
+    ///   1. Forward-declare all types
+    ///   2. Declare all function signatures
+    ///   3. Generate function bodies
+    generate_program(mut &this, program: ProgramNode*) -> boolean {
+        if (program == null) {
+            return false;
+        }
+
+        // Phase 1: Declare types.
+        declare_types(this.cg, program);
+
+        // Phase 2: Declare function signatures.
+        declare_functions(this.cg, program);
+
+        // Phase 3: Generate function bodies by visiting each declaration.
+        const stmts: ASTNode*[] = program.statements;
+        for (mut i: i64 = 0; i < stmts.length; i++) {
+            const stmt: ASTNode* = stmts[i];
+            if (stmt == null) { continue; }
+
+            const kind: NodeKind = stmt.kind;
+
+            if (kind == NodeKind::FunctionDeclaration) {
+                const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                if (func.generic_params.length > 0) { continue; }
+                if (func.body != null) {
+                    this.visit(func);
+                }
+            } else if (kind == NodeKind::ImplementationBlock) {
+                this.visit(stmt as ImplBlockNode*);
+            } else if (kind == NodeKind::VariableDeclaration) {
+                const var_decl: VarDeclNode* = stmt as VarDeclNode*;
+                if (var_decl.is_global) {
+                    codegen_global_var(this.cg, var_decl);
+                }
+            }
+        }
+
+        return true;
+    }
+
+
+    // ========================================================================
+    // Expression helpers
+    // ========================================================================
+
+    /// Codegen an expression and return the resulting value.
+    codegen_expr(mut &this, expr: ExpressionNode*) -> LValue {
+        if (expr == null) { return LValue::null(); }
+        expr.accept(this as ASTVisitor*);
+        return this.last_value;
+    }
+
+    /// Codegen an expression, ensuring the result is an rvalue (loaded).
+    codegen_rvalue(mut &this, expr: ExpressionNode*) -> LValue {
+        if (expr == null) { return LValue::null(); }
+        expr.accept(this as ASTVisitor*);
+
+        if (this.last_is_lvalue && this.last_value.is_valid()) {
+            const ty: LType = this.cg.type_mapper.map_type(expr.resolved_type);
+            const loaded: LValue = this.cg.builder.build_load(ty, this.last_value, "load");
+            this.last_value = loaded;
+            this.last_is_lvalue = false;
+        }
+        return this.last_value;
+    }
+
+    /// Codegen an expression, ensuring the result is an lvalue (address).
+    codegen_lvalue(mut &this, expr: ExpressionNode*) -> LValue {
+        if (expr == null) { return LValue::null(); }
+        expr.accept(this as ASTVisitor*);
+        return this.last_value;
+    }
+
+
+    // ========================================================================
+    // Expression visitors
+    // ========================================================================
+
+    override visit(node: LiteralNode*) -> void {
+        codegen_literal(this.cg, node, &this.last_value, &this.last_is_lvalue);
+    }
+
+    override visit(node: IdentifierNode*) -> void {
+        codegen_identifier(this.cg, node, &this.last_value, &this.last_is_lvalue);
+    }
+
+    override visit(node: BinaryExprNode*) -> void {
+        const op: TokenType = node.op.kind;
+
+        // Assignment operators.
+        if (op == TokenType::Equal) {
+            const addr: LValue = this.codegen_lvalue(node.left);
+            const val: LValue = this.codegen_rvalue(node.right);
+            this.cg.builder.build_store(val, addr);
+            this.last_value = val;
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // Compound assignment (+=, -=, etc.).
+        if (op == TokenType::PlusEqual || op == TokenType::MinusEqual ||
+            op == TokenType::StarEqual || op == TokenType::SlashEqual ||
+            op == TokenType::PercentEqual) {
+            const addr: LValue = this.codegen_lvalue(node.left);
+            const lhs_ty: LType = this.cg.type_mapper.map_type(node.left.resolved_type);
+            const lhs_loaded: LValue = this.cg.builder.build_load(lhs_ty, addr, "compoundlhs");
+            const rhs: LValue = this.codegen_rvalue(node.right);
+
+            // Map compound op to base op.
+            const base_op: TokenType = match (op) {
+                TokenType::PlusEqual    => { TokenType::Plus }
+                TokenType::MinusEqual   => { TokenType::Minus }
+                TokenType::StarEqual    => { TokenType::Star }
+                TokenType::SlashEqual   => { TokenType::Slash }
+                TokenType::PercentEqual => { TokenType::Percent }
+                _                       => { TokenType::Plus }
+            };
+
+            mut result: LValue = LValue::null();
+            codegen_binary(this.cg, lhs_loaded, rhs, base_op, node.resolved_type, &result);
+            this.cg.builder.build_store(result, addr);
+            this.last_value = result;
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // Logical short-circuit: && and ||.
+        if (op == TokenType::AmpAmp || op == TokenType::PipePipe) {
+            this.codegen_logical_short_circuit(node);
+            return;
+        }
+
+        // Regular binary: both operands as rvalues.
+        const lhs: LValue = this.codegen_rvalue(node.left);
+        const rhs: LValue = this.codegen_rvalue(node.right);
+
+        mut result: LValue = LValue::null();
+        // Use the left operand type for arithmetic dispatch.
+        codegen_binary(this.cg, lhs, rhs, op, node.left.resolved_type, &result);
+        this.last_value = result;
+        this.last_is_lvalue = false;
+    }
+
+    /// Short-circuit evaluation for && and ||.
+    codegen_logical_short_circuit(mut &this, node: BinaryExprNode*) -> void {
+        const is_and: boolean = node.op.kind == TokenType::AmpAmp;
+
+        const lhs: LValue = this.codegen_rvalue(node.left);
+        const current_bb: LBasicBlock = this.cg.builder.get_insert_block();
+        const current_fn: LValue = current_bb.get_parent();
+
+        const rhs_bb: LBasicBlock = LBasicBlock::append(current_fn, "sc.rhs");
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "sc.merge");
+
+        if (is_and) {
+            // &&: if lhs is false, short-circuit to merge with false.
+            this.cg.builder.build_cond_br(lhs, rhs_bb, merge_bb);
+        } else {
+            // ||: if lhs is true, short-circuit to merge with true.
+            this.cg.builder.build_cond_br(lhs, merge_bb, rhs_bb);
+        }
+
+        // Evaluate RHS.
+        this.cg.builder.position_at_end(rhs_bb);
+        const rhs: LValue = this.codegen_rvalue(node.right);
+        const rhs_end_bb: LBasicBlock = this.cg.builder.get_insert_block();
+        branch_if_not_terminated(this.cg, merge_bb);
+
+        // Merge with phi.
+        this.cg.builder.position_at_end(merge_bb);
+        const phi: LValue = this.cg.builder.build_phi(LType::i1(), "sc.result");
+
+        // Add incoming values.
+        const vals_buf: void* = malloc(16);
+        const vals: void** = vals_buf as void**;
+        const blocks_buf: void* = malloc(16);
+        const blocks: void** = blocks_buf as void**;
+
+        vals[0] = lhs.raw;
+        blocks[0] = current_bb.raw;
+        vals[1] = rhs.raw;
+        blocks[1] = rhs_end_bb.raw;
+        phi_add_incoming(phi, vals_buf, blocks_buf, 2);
+
+        free(vals_buf);
+        free(blocks_buf);
+
+        this.last_value = phi;
+        this.last_is_lvalue = false;
+    }
+
+    override visit(node: UnaryExprNode*) -> void {
+        const op: TokenType = node.op.kind;
+
+        // Dereference: *ptr
+        if (op == TokenType::Star) {
+            const ptr: LValue = this.codegen_rvalue(node.operand);
+            this.last_value = ptr;
+            this.last_is_lvalue = true;
+            return;
+        }
+
+        // Address-of: &expr
+        if (op == TokenType::Amp) {
+            const addr: LValue = this.codegen_lvalue(node.operand);
+            this.last_value = addr;
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const operand: LValue = this.codegen_rvalue(node.operand);
+        mut result: LValue = LValue::null();
+        codegen_unary(this.cg, operand, op, node.operand.resolved_type, &result);
+        this.last_value = result;
+        this.last_is_lvalue = false;
+    }
+
+    override visit(node: TernaryExprNode*) -> void {
+        const cond: LValue = this.codegen_rvalue(node.condition);
+        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+
+        const then_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.then");
+        const else_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.else");
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.merge");
+
+        this.cg.builder.build_cond_br(cond, then_bb, else_bb);
+
+        this.cg.builder.position_at_end(then_bb);
+        const then_val: LValue = this.codegen_rvalue(node.true_expr);
+        const then_end: LBasicBlock = this.cg.builder.get_insert_block();
+        branch_if_not_terminated(this.cg, merge_bb);
+
+        this.cg.builder.position_at_end(else_bb);
+        const else_val: LValue = this.codegen_rvalue(node.false_expr);
+        const else_end: LBasicBlock = this.cg.builder.get_insert_block();
+        branch_if_not_terminated(this.cg, merge_bb);
+
+        this.cg.builder.position_at_end(merge_bb);
+        const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        const phi: LValue = this.cg.builder.build_phi(ty, "ternary");
+
+        const vals: void* = malloc(16);
+        const blks: void* = malloc(16);
+        (vals as void**)[0] = then_val.raw;
+        (vals as void**)[1] = else_val.raw;
+        (blks as void**)[0] = then_end.raw;
+        (blks as void**)[1] = else_end.raw;
+        phi_add_incoming(phi, vals, blks, 2);
+        free(vals);
+        free(blks);
+
+        this.last_value = phi;
+        this.last_is_lvalue = false;
+    }
+
+    override visit(node: IfExprNode*) -> void {
+        // Same structure as ternary.
+        this.visit(node as TernaryExprNode*);
+    }
+
+    override visit(node: CallExprNode*) -> void {
+        // Resolve callee.
+        mut callee_val: LValue = LValue::null();
+
+        if (node.callee.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = node.callee as IdentifierNode*;
+            callee_val = this.cg.get_function(id.name);
+        } else if (node.callee.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
+            const combined: string = format("%s::%s",
+                this.cg.intern.resolve(sr.scope_name),
+                this.cg.intern.resolve(sr.member_name));
+            const sym: SymbolStr = this.cg.intern.intern(combined);
+            callee_val = this.cg.get_function(sym);
+            if (!callee_val.is_valid()) {
+                callee_val = this.cg.get_function(sr.member_name);
+            }
+        } else if (node.callee.kind == NodeKind::MemberAccess) {
+            // Method call: obj.method(args)
+            // The method is resolved by type + name.
+            const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
+            const obj_type: TypeRef = ma.object.resolved_type;
+            const t: Type* = this.cg.arena.lookup(obj_type.id);
+            if (t != null) {
+                const type_str: string = t.display_name();
+                const method_str: string = this.cg.intern.resolve(ma.member);
+                const combined: string = format("%s::%s", type_str, method_str);
+                const sym: SymbolStr = this.cg.intern.intern(combined);
+                callee_val = this.cg.get_function(sym);
+            }
+        } else {
+            callee_val = this.codegen_rvalue(node.callee);
+        }
+
+        if (!callee_val.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // Codegen arguments.
+        mut args: LValue[] = [];
+
+        // If this is a method call, prepend the object as `this`.
+        if (node.callee.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
+            const obj: LValue = this.codegen_lvalue(ma.object);
+            args = args + [obj];
+        }
+
+        for (mut i: i64 = 0; i < node.arguments.length; i++) {
+            const arg: LValue = this.codegen_rvalue(node.arguments[i]);
+            args = args + [arg];
+        }
+
+        // Get the function type for the call.
+        const fn_ty: LType = LType { raw: llvm::LLVMTypeOf(callee_val.raw) };
+        // Call name: use "" for void returns, "calltmp" for value returns.
+        const ret_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        const call_name: string = if (ret_ty.raw == LType::void_type().raw) { "" } else { "calltmp" };
+
+        mut result: LValue = LValue::null();
+        codegen_call(this.cg, callee_val, fn_ty, args, call_name, &result);
+        this.last_value = result;
+        this.last_is_lvalue = false;
+    }
+
+    override visit(node: SizeofExprNode*) -> void {
+        const type_ref: TypeRef = this.cg.ctx.decl_index.lookup_type(node.type_name);
+        codegen_sizeof(this.cg, type_ref, &this.last_value);
+        this.last_is_lvalue = false;
+    }
+
+    override visit(node: AlignofExprNode*) -> void {
+        const type_ref: TypeRef = this.cg.ctx.decl_index.lookup_type(node.type_name);
+        codegen_alignof(this.cg, type_ref, &this.last_value);
+        this.last_is_lvalue = false;
+    }
+
+    override visit(node: CastExprNode*) -> void {
+        const val: LValue = this.codegen_rvalue(node.expression);
+        codegen_cast(this.cg, val, node.expression.resolved_type,
+                     node.resolved_target, &this.last_value);
+        this.last_is_lvalue = false;
+    }
+
+    override visit(node: StructLiteralNode*) -> void {
+        const type_ref: TypeRef = this.cg.ctx.decl_index.lookup_type(node.struct_type);
+
+        mut field_names: SymbolStr[] = [];
+        mut field_values: LValue[] = [];
+
+        for (mut i: i64 = 0; i < node.field_inits.length; i++) {
+            const init: FieldInit = node.field_inits[i];
+            field_names = field_names + [init.field_name];
+            field_values = field_values + [this.codegen_rvalue(init.value)];
+        }
+
+        codegen_struct_literal(this.cg, type_ref, field_names, field_values,
+                               &this.last_value, &this.last_is_lvalue);
+    }
+
+    override visit(node: ArrayLiteralNode*) -> void {
+        // Generate array elements and build an alloca.
+        const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+        const alloca: LValue = this.cg.create_entry_alloca(current_fn, "arrlit", ty);
+
+        for (mut i: i64 = 0; i < node.elements.length; i++) {
+            const elem: LValue = this.codegen_rvalue(node.elements[i]);
+            const idx: LValue = LType::const_int(LType::i64(), i as u64, false);
+            const buf: void* = malloc(16);
+            (buf as void**)[0] = LType::const_int(LType::i64(), 0, false).raw;
+            (buf as void**)[1] = idx.raw;
+            const gep: LValue = this.cg.builder.build_gep(ty, alloca, buf, 2, "arrelem");
+            free(buf);
+            this.cg.builder.build_store(elem, gep);
+        }
+
+        this.last_value = alloca;
+        this.last_is_lvalue = true;
+    }
+
+    override visit(node: MemberAccessNode*) -> void {
+        const obj: LValue = this.codegen_lvalue(node.object);
+        codegen_member_access(this.cg, obj, node.object.resolved_type,
+                              node.member, &this.last_value, &this.last_is_lvalue);
+    }
+
+    override visit(node: ArrayAccessNode*) -> void {
+        const arr: LValue = this.codegen_lvalue(node.array);
+        const idx: LValue = this.codegen_rvalue(node.index);
+        codegen_array_access(this.cg, arr, node.array.resolved_type,
+                             idx, &this.last_value, &this.last_is_lvalue);
+    }
+
+    override visit(node: ScopeResolutionNode*) -> void {
+        // Could be enum variant, static method reference, or namespace constant.
+        const combined: string = format("%s::%s",
+            this.cg.intern.resolve(node.scope_name),
+            this.cg.intern.resolve(node.member_name));
+        const sym: SymbolStr = this.cg.intern.intern(combined);
+
+        // Try function lookup first.
+        const fn_val: LValue = this.cg.get_function(sym);
+        if (fn_val.is_valid()) {
+            this.last_value = fn_val;
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // Try global lookup.
+        const global: LValue = this.cg.get_global(sym);
+        if (global.is_valid()) {
+            this.last_value = global;
+            this.last_is_lvalue = true;
+            return;
+        }
+
+        this.last_value = LValue::null();
+        this.last_is_lvalue = false;
+    }
+
+    override visit(node: NewExprNode*) -> void {
+        // Heap allocation: malloc + optional constructor call.
+        const type_ref: TypeRef = this.cg.ctx.decl_index.lookup_type(node.type_name);
+        const t: Type* = this.cg.arena.lookup(type_ref.id);
+        if (t == null) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const size: u64 = t.size_bytes();
+        const malloc_fn: LValue = this.cg.module.get_named_function("malloc");
+        if (malloc_fn.is_valid()) {
+            const size_val: LValue = LType::const_int(LType::i64(), size, false);
+            mut args: LValue[] = [size_val];
+            const malloc_ty: LType = LType { raw: llvm::LLVMTypeOf(malloc_fn.raw) };
+            mut result: LValue = LValue::null();
+            codegen_call(this.cg, malloc_fn, malloc_ty, args, "newtmp", &result);
+            // Bitcast to the target pointer type.
+            const ptr_ty: LType = LType::pointer_to(this.cg.type_mapper.map_type(type_ref));
+            this.last_value = this.cg.builder.build_pointer_cast(result, ptr_ty, "newcast");
+        } else {
+            this.last_value = LValue::null();
+        }
+        this.last_is_lvalue = false;
+    }
+
+    override visit(node: DeleteExprNode*) -> void {
+        const ptr: LValue = this.codegen_rvalue(node.operand);
+        const free_fn: LValue = this.cg.module.get_named_function("free");
+        if (free_fn.is_valid() && ptr.is_valid()) {
+            const void_ptr: LValue = this.cg.builder.build_pointer_cast(
+                ptr, LType::pointer_to(LType::i8()), "delcast");
+            const free_ty: LType = LType { raw: llvm::LLVMTypeOf(free_fn.raw) };
+            mut result: LValue = LValue::null();
+            codegen_call(this.cg, free_fn, free_ty, [void_ptr], "", &result);
+        }
+        this.last_value = LValue::null();
+        this.last_is_lvalue = false;
+    }
+
+
+    // ========================================================================
+    // Statement visitors
+    // ========================================================================
+
+    override visit(node: BlockStmtNode*) -> void {
+        this.cg.push_scope();
+        for (mut i: i64 = 0; i < node.statements.length; i++) {
+            const current: LBasicBlock = this.cg.builder.get_insert_block();
+            if (current.is_valid() && current.has_terminator()) {
+                break;
+            }
+            const stmt: StatementNode* = node.statements[i];
+            if (stmt != null) {
+                stmt.accept(this as ASTVisitor*);
+            }
+        }
+        this.cg.pop_scope();
+    }
+
+    override visit(node: UnsafeBlockStmtNode*) -> void {
+        this.visit(node.block);
+    }
+
+    override visit(node: ReturnStmtNode*) -> void {
+        if (node.expression != null) {
+            const val: LValue = this.codegen_rvalue(node.expression);
+            codegen_return(this.cg, val, true);
+        } else {
+            codegen_return(this.cg, LValue::null(), false);
+        }
+    }
+
+    override visit(node: IfStmtNode*) -> void {
+        const cond: LValue = this.codegen_rvalue(node.condition);
+        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+
+        const blocks: IfBlocks = codegen_if(this.cg, cond, current_fn,
+                                             node.else_stmt != null);
+
+        // Then branch.
+        this.cg.builder.position_at_end(blocks.then_bb);
+        if (node.then_stmt != null) {
+            node.then_stmt.accept(this as ASTVisitor*);
+        }
+        branch_if_not_terminated(this.cg, blocks.merge_bb);
+
+        // Else branch.
+        if (node.else_stmt != null) {
+            this.cg.builder.position_at_end(blocks.else_bb);
+            node.else_stmt.accept(this as ASTVisitor*);
+            branch_if_not_terminated(this.cg, blocks.merge_bb);
+        }
+
+        this.cg.builder.position_at_end(blocks.merge_bb);
+    }
+
+    override visit(node: WhileStmtNode*) -> void {
+        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+        const blocks: LoopBlocks = codegen_while_header(this.cg, current_fn);
+
+        // Condition.
+        this.cg.builder.position_at_end(blocks.cond_bb);
+        const cond: LValue = this.codegen_rvalue(node.condition);
+        this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
+
+        // Body.
+        this.cg.builder.position_at_end(blocks.body_bb);
+        if (node.body != null) {
+            node.body.accept(this as ASTVisitor*);
+        }
+        branch_if_not_terminated(this.cg, blocks.cond_bb);
+
+        this.cg.pop_loop();
+        this.cg.builder.position_at_end(blocks.merge_bb);
+    }
+
+    override visit(node: ForStmtNode*) -> void {
+        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+
+        // Init.
+        this.cg.push_scope();
+        if (node.init != null) {
+            node.init.accept(this as ASTVisitor*);
+        }
+
+        const blocks: ForBlocks = codegen_for_header(this.cg, current_fn);
+        this.cg.builder.build_br(blocks.cond_bb);
+
+        // Condition.
+        this.cg.builder.position_at_end(blocks.cond_bb);
+        if (node.condition != null) {
+            const cond: LValue = this.codegen_rvalue(node.condition);
+            this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
+        } else {
+            this.cg.builder.build_br(blocks.body_bb);
+        }
+
+        // Body.
+        this.cg.builder.position_at_end(blocks.body_bb);
+        if (node.body != null) {
+            node.body.accept(this as ASTVisitor*);
+        }
+        branch_if_not_terminated(this.cg, blocks.update_bb);
+
+        // Update.
+        this.cg.builder.position_at_end(blocks.update_bb);
+        if (node.update != null) {
+            this.codegen_rvalue(node.update);
+        }
+        branch_if_not_terminated(this.cg, blocks.cond_bb);
+
+        this.cg.pop_loop();
+        this.cg.pop_scope();
+        this.cg.builder.position_at_end(blocks.merge_bb);
+    }
+
+    override visit(node: LoopStmtNode*) -> void {
+        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+        const blocks: LoopBlocks = codegen_loop_header(this.cg, current_fn);
+
+        this.cg.builder.position_at_end(blocks.body_bb);
+        if (node.body != null) {
+            node.body.accept(this as ASTVisitor*);
+        }
+        branch_if_not_terminated(this.cg, blocks.body_bb);
+
+        this.cg.pop_loop();
+        this.cg.builder.position_at_end(blocks.merge_bb);
+    }
+
+    override visit(node: BreakStmtNode*) -> void {
+        codegen_break(this.cg);
+    }
+
+    override visit(node: ContinueStmtNode*) -> void {
+        codegen_continue(this.cg);
+    }
+
+    override visit(node: ExprStmtNode*) -> void {
+        if (node.expression != null) {
+            this.codegen_rvalue(node.expression);
+        }
+    }
+
+    override visit(node: DeclStmtNode*) -> void {
+        if (node.declaration != null) {
+            node.declaration.accept(this as ASTVisitor*);
+        }
+    }
+
+
+    // ========================================================================
+    // Declaration visitors
+    // ========================================================================
+
+    override visit(node: FunctionDeclNode*) -> void {
+        if (node.generic_params.length > 0) { return; }
+        if (node.body == null) { return; }
+
+        const fn_val: LValue = codegen_function_prologue(this.cg, node);
+        if (!fn_val.is_valid()) { return; }
+
+        // Visit the body.
+        this.visit(node.body);
+
+        // Emit epilogue (implicit return if needed).
+        codegen_function_epilogue(this.cg, node);
+    }
+
+    override visit(node: ImplBlockNode*) -> void {
+        if (node.generic_params.length > 0) { return; }
+
+        this.current_impl_target = node.target_type;
+
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            this.visit(node.methods[i]);
+        }
+
+        this.current_impl_target = SymbolStr::empty();
+    }
+
+    override visit(node: MethodNode*) -> void {
+        const func: FunctionDeclNode* = node.func;
+        if (func == null || func.body == null) { return; }
+        if (func.generic_params.length > 0) { return; }
+
+        const fn_val: LValue = codegen_method_prologue(
+            this.cg, node, this.current_impl_target);
+        if (!fn_val.is_valid()) { return; }
+
+        this.visit(func.body);
+        codegen_function_epilogue(this.cg, func);
+    }
+
+    override visit(node: VarDeclNode*) -> void {
+        // Local variable declaration.
+        if (node.is_global) { return; }  // Globals handled in Phase 3.
+
+        mut init_val: LValue = LValue::null();
+        const has_init: boolean = node.initializer != null;
+        if (has_init) {
+            init_val = this.codegen_rvalue(node.initializer);
+        }
+
+        codegen_local_var(this.cg, node.name, node.resolved_type, init_val, has_init);
+    }
+}

@@ -1,0 +1,274 @@
+/// Statement Codegen
+///
+/// Free functions for generating LLVM IR from statement nodes.
+/// Handles control flow (if, while, for, loop, match, switch),
+/// block scoping, return, break, continue, and expression statements.
+
+namespace Compiler::Codegen::StmtCodegen;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::Context;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Statement;
+import Compiler::AST::Expression;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+
+
+// ============================================================================
+// Block
+// ============================================================================
+
+/// Generate IR for a block statement.  Pushes a new scope and pops it
+/// after all statements are visited.  `visit_stmt` is used to dispatch
+/// each statement through the visitor.
+///
+/// Returns true if the block was terminated (return/break/continue).
+function codegen_block(cg: CodegenContext*, node: BlockStmtNode*,
+                       visitor: void*, visit_fn: void*) -> boolean {
+    cg.push_scope();
+    mut terminated: boolean = false;
+
+    for (mut i: i64 = 0; i < node.statements.length; i++) {
+        // If we already emitted a terminator, skip remaining statements.
+        const current: LBasicBlock = cg.builder.get_insert_block();
+        if (current.is_valid() && current.has_terminator()) {
+            terminated = true;
+            break;
+        }
+        // Dispatch to the visitor (caller provides the visit function).
+        // The visitor will call the appropriate codegen function.
+        const stmt: StatementNode* = node.statements[i];
+        if (stmt != null) {
+            stmt.accept(visitor as BaseASTVisitor*);
+        }
+    }
+
+    cg.pop_scope();
+    return terminated;
+}
+
+
+// ============================================================================
+// Return
+// ============================================================================
+
+function codegen_return(cg: CodegenContext*, val: LValue, has_value: boolean) -> void {
+    if (has_value && val.is_valid()) {
+        cg.builder.build_ret(val);
+    } else {
+        cg.builder.build_ret_void();
+    }
+}
+
+
+// ============================================================================
+// If Statement
+// ============================================================================
+
+/// Generate IR for an if/else statement.
+/// Creates then_bb, else_bb (if needed), and merge_bb.
+function codegen_if(cg: CodegenContext*, cond: LValue,
+                    current_fn: LValue,
+                    has_else: boolean) -> IfBlocks {
+    const then_bb: LBasicBlock = LBasicBlock::append(current_fn, "then");
+    const else_bb: LBasicBlock = if (has_else) {
+        LBasicBlock::append(current_fn, "else")
+    } else {
+        LBasicBlock::null()
+    };
+    const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "ifcont");
+
+    // Emit conditional branch.
+    if (has_else) {
+        cg.builder.build_cond_br(cond, then_bb, else_bb);
+    } else {
+        cg.builder.build_cond_br(cond, then_bb, merge_bb);
+    }
+
+    return IfBlocks {
+        then_bb:  then_bb,
+        else_bb:  else_bb,
+        merge_bb: merge_bb,
+    };
+}
+
+type struct IfBlocks {
+    then_bb:  LBasicBlock;
+    else_bb:  LBasicBlock;
+    merge_bb: LBasicBlock;
+}
+
+
+// ============================================================================
+// While Loop
+// ============================================================================
+
+/// Create the basic blocks for a while loop.
+/// Returns cond_bb, body_bb, and merge_bb.
+function codegen_while_header(cg: CodegenContext*, current_fn: LValue) -> LoopBlocks {
+    const cond_bb: LBasicBlock = LBasicBlock::append(current_fn, "while.cond");
+    const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "while.body");
+    const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "while.end");
+
+    // Branch to condition check.
+    cg.builder.build_br(cond_bb);
+
+    // Push loop targets for break/continue.
+    cg.push_loop(merge_bb, cond_bb);
+
+    return LoopBlocks {
+        cond_bb:  cond_bb,
+        body_bb:  body_bb,
+        merge_bb: merge_bb,
+    };
+}
+
+type struct LoopBlocks {
+    cond_bb:  LBasicBlock;
+    body_bb:  LBasicBlock;
+    merge_bb: LBasicBlock;
+}
+
+
+// ============================================================================
+// For Loop
+// ============================================================================
+
+/// Create basic blocks for a for loop: init -> cond -> body -> update -> cond.
+function codegen_for_header(cg: CodegenContext*, current_fn: LValue) -> ForBlocks {
+    const cond_bb: LBasicBlock = LBasicBlock::append(current_fn, "for.cond");
+    const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "for.body");
+    const update_bb: LBasicBlock = LBasicBlock::append(current_fn, "for.update");
+    const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "for.end");
+
+    // Push loop targets: break -> merge, continue -> update.
+    cg.push_loop(merge_bb, update_bb);
+
+    return ForBlocks {
+        cond_bb:   cond_bb,
+        body_bb:   body_bb,
+        update_bb: update_bb,
+        merge_bb:  merge_bb,
+    };
+}
+
+type struct ForBlocks {
+    cond_bb:   LBasicBlock;
+    body_bb:   LBasicBlock;
+    update_bb: LBasicBlock;
+    merge_bb:  LBasicBlock;
+}
+
+
+// ============================================================================
+// Infinite Loop
+// ============================================================================
+
+/// Create basic blocks for a `loop { ... }` infinite loop.
+function codegen_loop_header(cg: CodegenContext*, current_fn: LValue) -> LoopBlocks {
+    const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "loop.body");
+    const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "loop.end");
+
+    cg.builder.build_br(body_bb);
+    cg.push_loop(merge_bb, body_bb);
+
+    return LoopBlocks {
+        cond_bb:  LBasicBlock::null(),
+        body_bb:  body_bb,
+        merge_bb: merge_bb,
+    };
+}
+
+
+// ============================================================================
+// Break / Continue
+// ============================================================================
+
+function codegen_break(cg: CodegenContext*) -> void {
+    const target: LBasicBlock = cg.current_break_target();
+    if (target.is_valid()) {
+        cg.builder.build_br(target);
+    }
+}
+
+function codegen_continue(cg: CodegenContext*) -> void {
+    const target: LBasicBlock = cg.current_continue_target();
+    if (target.is_valid()) {
+        cg.builder.build_br(target);
+    }
+}
+
+
+// ============================================================================
+// Match Statement
+// ============================================================================
+
+/// Create basic blocks for a match/switch statement.
+function codegen_match_header(cg: CodegenContext*, current_fn: LValue,
+                               num_arms: u32) -> MatchBlocks {
+    mut arm_bbs: LBasicBlock[] = [];
+    for (mut i: u32 = 0; i < num_arms; i++) {
+        const name: string = format("match.arm%d", i);
+        arm_bbs = arm_bbs + [LBasicBlock::append(current_fn, name)];
+    }
+    const default_bb: LBasicBlock = LBasicBlock::append(current_fn, "match.default");
+    const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "match.end");
+
+    return MatchBlocks {
+        arm_bbs:    arm_bbs,
+        default_bb: default_bb,
+        merge_bb:   merge_bb,
+    };
+}
+
+type struct MatchBlocks {
+    arm_bbs:    LBasicBlock[];
+    default_bb: LBasicBlock;
+    merge_bb:   LBasicBlock;
+}
+
+
+// ============================================================================
+// Variable Declaration (local)
+// ============================================================================
+
+/// Generate IR for a local variable declaration.
+function codegen_local_var(cg: CodegenContext*, name: SymbolStr,
+                           ty: TypeRef, init_val: LValue,
+                           has_init: boolean) -> void {
+    const var_name: string = cg.intern.resolve(name);
+    const llvm_ty: LType = cg.type_mapper.map_type(ty);
+    if (!llvm_ty.is_valid()) {
+        return;
+    }
+
+    // Get the current function for entry-block alloca.
+    const current_bb: LBasicBlock = cg.builder.get_insert_block();
+    const current_fn: LValue = current_bb.get_parent();
+
+    const alloca: LValue = cg.create_entry_alloca(current_fn, var_name, llvm_ty);
+
+    if (has_init && init_val.is_valid()) {
+        cg.builder.build_store(init_val, alloca);
+    }
+
+    cg.set_named_value(name, alloca);
+}
+
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Branch to a target block if the current block has no terminator.
+function branch_if_not_terminated(cg: CodegenContext*, target: LBasicBlock) -> void {
+    const current: LBasicBlock = cg.builder.get_insert_block();
+    if (current.is_valid() && !current.has_terminator()) {
+        cg.builder.build_br(target);
+    }
+}

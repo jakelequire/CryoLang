@@ -1,0 +1,350 @@
+/// Codegen Context
+///
+/// Per-module LLVM codegen state.  One CodegenContext is created for each
+/// compilation module.  Holds the LLVM module, builder, type mapper, and
+/// value/scope maps that codegen needs to produce IR.
+
+namespace Compiler::Codegen::Context;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::TypeMap;
+import Compiler::CompilationContext;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Arena;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+
+
+// ============================================================================
+// CodegenContext
+// ============================================================================
+
+type struct CodegenContext {
+    // -- LLVM state --
+    module:      LModule;
+    builder:     LBuilder;
+    type_mapper: TypeMapper;
+
+    // -- Named values: SymbolStr.id -> LLVMValueRef raw pointer --
+    // Local variables and parameters in the current scope.
+    named_keys:   u32[];
+    named_values: void*[];
+
+    // -- Scope undo log (same pattern as sema's TypeCheckVisitor) --
+    // On push_scope(), record the undo log length.  On pop_scope(), roll
+    // back all bindings added since the push.
+    undo_keys:    u32[];       // SymbolStr.id that was overwritten
+    undo_prev:    void*[];     // previous LLVMValueRef (null if new binding)
+    scope_marks:  i64[];       // undo log length at each scope push
+
+    // -- Function map: SymbolStr.id -> LLVMValueRef --
+    func_keys:   u32[];
+    func_values: void*[];
+
+    // -- Global map: SymbolStr.id -> LLVMValueRef --
+    global_keys:   u32[];
+    global_values: void*[];
+
+    // -- String literal dedup --
+    str_lit_keys:   string[];
+    str_lit_values: void*[];
+
+    // -- Break/Continue target stack (for loops) --
+    break_targets:    void*[];     // LLVMBasicBlockRef stack
+    continue_targets: void*[];     // LLVMBasicBlockRef stack
+
+    // -- Shared references --
+    ctx:    CompilationContext*;
+    arena:  TypeArena*;
+    intern: InternTable*;
+
+    /// Create a new codegen context for a module.
+    static new(ctx: CompilationContext*, module_name: string) -> CodegenContext {
+        const mod: LModule = LModule::create(module_name);
+        const builder: LBuilder = LBuilder::create();
+
+        return CodegenContext {
+            module:      mod,
+            builder:     builder,
+            type_mapper: TypeMapper::new(ctx.type_arena, &ctx.intern_table),
+
+            named_keys:   [],
+            named_values: [],
+            undo_keys:    [],
+            undo_prev:    [],
+            scope_marks:  [],
+
+            func_keys:   [],
+            func_values: [],
+
+            global_keys:   [],
+            global_values: [],
+
+            str_lit_keys:   [],
+            str_lit_values: [],
+
+            break_targets:    [],
+            continue_targets: [],
+
+            ctx:    ctx,
+            arena:  ctx.type_arena,
+            intern: &ctx.intern_table,
+        };
+    }
+
+
+    // ========================================================================
+    // Scope management
+    // ========================================================================
+
+    /// Push a new scope level.  Records the current undo log length so
+    /// pop_scope() knows how far to roll back.
+    push_scope(mut &this) -> void {
+        this.scope_marks = this.scope_marks + [this.undo_keys.length];
+    }
+
+    /// Pop the current scope.  Restores all named value bindings to their
+    /// state at the matching push_scope().
+    pop_scope(mut &this) -> void {
+        if (this.scope_marks.length == 0) {
+            return;
+        }
+
+        const mark: i64 = this.scope_marks[this.scope_marks.length - 1];
+        this.scope_marks = this.scope_marks[0 : this.scope_marks.length - 1];
+
+        // Roll back undo log entries from mark to end.
+        for (mut i: i64 = this.undo_keys.length - 1; i >= mark; i--) {
+            const key: u32 = this.undo_keys[i];
+            const prev: void* = this.undo_prev[i];
+
+            if (prev == null) {
+                // This was a new binding — remove it.
+                this.remove_named_value(key);
+            } else {
+                // Restore previous value.
+                this.set_named_value_raw(key, prev);
+            }
+        }
+
+        // Truncate undo log.
+        this.undo_keys = this.undo_keys[0 : mark];
+        this.undo_prev = this.undo_prev[0 : mark];
+    }
+
+
+    // ========================================================================
+    // Named value access (locals / parameters)
+    // ========================================================================
+
+    /// Set a named value in the current scope.  Records the previous
+    /// binding (if any) in the undo log for rollback on pop_scope().
+    set_named_value(mut &this, name: SymbolStr, val: LValue) -> void {
+        const key: u32 = name.id;
+
+        // Record undo entry: find existing binding.
+        const existing: void* = this.get_named_value_raw(key);
+        this.undo_keys = this.undo_keys + [key];
+        this.undo_prev = this.undo_prev + [existing];
+
+        // Set or update the binding.
+        this.set_named_value_raw(key, val.raw);
+    }
+
+    /// Look up a named value.  Returns null LValue if not found.
+    get_named_value(&this, name: SymbolStr) -> LValue {
+        const raw: void* = this.get_named_value_raw(name.id);
+        return LValue { raw: raw };
+    }
+
+
+    // ========================================================================
+    // Function map
+    // ========================================================================
+
+    /// Register a function by name.
+    register_function(mut &this, name: SymbolStr, val: LValue) -> void {
+        const key: u32 = name.id;
+        // Update existing or append.
+        for (mut i: i64 = 0; i < this.func_keys.length; i++) {
+            if (this.func_keys[i] == key) {
+                this.func_values[i] = val.raw;
+                return;
+            }
+        }
+        this.func_keys   = this.func_keys + [key];
+        this.func_values = this.func_values + [val.raw];
+    }
+
+    /// Look up a function by name.
+    get_function(&this, name: SymbolStr) -> LValue {
+        const key: u32 = name.id;
+        for (mut i: i64 = 0; i < this.func_keys.length; i++) {
+            if (this.func_keys[i] == key) {
+                return LValue { raw: this.func_values[i] };
+            }
+        }
+        return LValue::null();
+    }
+
+
+    // ========================================================================
+    // Global map
+    // ========================================================================
+
+    register_global(mut &this, name: SymbolStr, val: LValue) -> void {
+        const key: u32 = name.id;
+        for (mut i: i64 = 0; i < this.global_keys.length; i++) {
+            if (this.global_keys[i] == key) {
+                this.global_values[i] = val.raw;
+                return;
+            }
+        }
+        this.global_keys   = this.global_keys + [key];
+        this.global_values = this.global_values + [val.raw];
+    }
+
+    get_global(&this, name: SymbolStr) -> LValue {
+        const key: u32 = name.id;
+        for (mut i: i64 = 0; i < this.global_keys.length; i++) {
+            if (this.global_keys[i] == key) {
+                return LValue { raw: this.global_values[i] };
+            }
+        }
+        return LValue::null();
+    }
+
+
+    // ========================================================================
+    // String literal dedup
+    // ========================================================================
+
+    /// Get or create a global string constant.  Deduplicates identical strings.
+    get_or_create_string_literal(mut &this, text: string) -> LValue {
+        // Check dedup cache.
+        for (mut i: i64 = 0; i < this.str_lit_keys.length; i++) {
+            if (this.str_lit_keys[i] == text) {
+                return LValue { raw: this.str_lit_values[i] };
+            }
+        }
+
+        // Create a new global string.
+        const name: string = format(".str.%d", this.str_lit_keys.length);
+        const val: LValue = this.builder.build_global_string_ptr(text, name);
+
+        this.str_lit_keys   = this.str_lit_keys + [text];
+        this.str_lit_values = this.str_lit_values + [val.raw];
+
+        return val;
+    }
+
+
+    // ========================================================================
+    // Loop target stack
+    // ========================================================================
+
+    push_loop(mut &this, break_bb: LBasicBlock, continue_bb: LBasicBlock) -> void {
+        this.break_targets    = this.break_targets + [break_bb.raw];
+        this.continue_targets = this.continue_targets + [continue_bb.raw];
+    }
+
+    pop_loop(mut &this) -> void {
+        if (this.break_targets.length > 0) {
+            this.break_targets    = this.break_targets[0 : this.break_targets.length - 1];
+            this.continue_targets = this.continue_targets[0 : this.continue_targets.length - 1];
+        }
+    }
+
+    current_break_target(&this) -> LBasicBlock {
+        if (this.break_targets.length == 0) {
+            return LBasicBlock::null();
+        }
+        return LBasicBlock { raw: this.break_targets[this.break_targets.length - 1] };
+    }
+
+    current_continue_target(&this) -> LBasicBlock {
+        if (this.continue_targets.length == 0) {
+            return LBasicBlock::null();
+        }
+        return LBasicBlock { raw: this.continue_targets[this.continue_targets.length - 1] };
+    }
+
+
+    // ========================================================================
+    // Utility: entry block alloca
+    // ========================================================================
+
+    /// Create an alloca in the entry block of the given function.
+    /// This ensures allocas are hoisted to the entry block for mem2reg
+    /// promotion by LLVM's optimization passes.
+    create_entry_alloca(mut &this, func: LValue, name: string, ty: LType) -> LValue {
+        // Save current insert point.
+        const saved_block: LBasicBlock = this.builder.get_insert_block();
+
+        // Position at the start of the entry block.
+        const entry: LBasicBlock = LBasicBlock { raw: llvm::LLVMGetEntryBasicBlock(func.raw) };
+        this.builder.position_at_end(entry);
+
+        const alloca: LValue = this.builder.build_alloca(ty, name);
+
+        // Restore insert point.
+        if (saved_block.is_valid()) {
+            this.builder.position_at_end(saved_block);
+        }
+
+        return alloca;
+    }
+
+
+    // ========================================================================
+    // Cleanup
+    // ========================================================================
+
+    /// Dispose LLVM resources.  Call only when the LLVM module has been
+    /// transferred to artifacts (don't dispose the module if it's still owned).
+    dispose_builder(mut &this) -> void {
+        this.builder.dispose();
+    }
+
+
+    // ========================================================================
+    // Internal helpers
+    // ========================================================================
+
+    get_named_value_raw(&this, key: u32) -> void* {
+        for (mut i: i64 = 0; i < this.named_keys.length; i++) {
+            if (this.named_keys[i] == key) {
+                return this.named_values[i];
+            }
+        }
+        return null;
+    }
+
+    set_named_value_raw(mut &this, key: u32, val: void*) -> void {
+        for (mut i: i64 = 0; i < this.named_keys.length; i++) {
+            if (this.named_keys[i] == key) {
+                this.named_values[i] = val;
+                return;
+            }
+        }
+        this.named_keys   = this.named_keys + [key];
+        this.named_values = this.named_values + [val];
+    }
+
+    remove_named_value(mut &this, key: u32) -> void {
+        for (mut i: i64 = 0; i < this.named_keys.length; i++) {
+            if (this.named_keys[i] == key) {
+                // Swap with last and truncate.
+                const last: i64 = this.named_keys.length - 1;
+                if (i < last) {
+                    this.named_keys[i]   = this.named_keys[last];
+                    this.named_values[i] = this.named_values[last];
+                }
+                this.named_keys   = this.named_keys[0 : last];
+                this.named_values = this.named_values[0 : last];
+                return;
+            }
+        }
+    }
+}
