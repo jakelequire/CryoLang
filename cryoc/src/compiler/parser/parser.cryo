@@ -168,6 +168,22 @@ public:
             return imp;
         }
 
+        // CImport: name := extern "C" { #include "..." }
+        if (tok.kind == TokenType::Identifier &&
+            this.peek_at(1).kind == TokenType::Colon &&
+            this.peek_at(2).kind == TokenType::Equal &&
+            this.peek_at(3).kind == TokenType::KwExtern) {
+            const alias_tok: Token = this.advance(); // consume identifier
+            const alias: SymbolStr = this.intern_lexeme(alias_tok);
+            this.advance(); // consume ':'
+            this.advance(); // consume '='
+            const ext: ExternBlockNode* = this.parse_extern_block_cimport(alias);
+            if (ext != null && doc != "") {
+                ext.set_documentation(doc);
+            }
+            return ext;
+        }
+
         // Extern block
         if (tok.kind == TokenType::KwExtern) {
             const ext: ExternBlockNode* = this.parse_extern_block();
@@ -1265,6 +1281,59 @@ public:
                 }
             } else {
                 this.error_unexpected();
+                this.advance();
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse a CImport extern block: name := extern "C" { #include "..." }
+    /// The 'name :=' part has already been consumed; 'extern' is current.
+    parse_extern_block_cimport(alias: SymbolStr) -> ExternBlockNode* {
+        const start: Token = this.advance(); // consume 'extern'
+        mut linkage: string = "C";
+
+        // Linkage type: "C"
+        if (this.check(TokenType::StringLiteral)) {
+            linkage = this.current().lexeme;
+            this.advance();
+        }
+
+        mut node: ExternBlockNode* = new ExternBlockNode(linkage, this.span_from_token(start));
+        node.set_namespace_alias(alias);
+
+        this.consume(TokenType::LBrace, "'{'");
+
+        // Parse #include directives
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            if (this.check(TokenType::Hash)) {
+                this.advance(); // consume '#'
+
+                // Expect 'include' identifier
+                if (!this.check(TokenType::Identifier) || this.current().lexeme != "include") {
+                    this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN,
+                        "expected 'include' after '#' in extern C import block");
+                    this.advance();
+                    continue;
+                }
+                this.advance(); // consume 'include'
+
+                // Parse include path string
+                if (!this.check(TokenType::StringLiteral)) {
+                    this.report_error(ErrorCode::E0100_EXPECTED_TOKEN,
+                        "expected string path after #include");
+                    this.advance();
+                    continue;
+                }
+                const path: string = this.current().lexeme;
+                this.advance(); // consume string literal
+                node.add_include_path(path);
+            } else {
+                this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN,
+                    "expected '#include' directive in extern C import block");
                 this.advance();
             }
         }

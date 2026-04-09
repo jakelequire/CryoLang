@@ -8,7 +8,11 @@ namespace Compiler::ModuleGraph;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::AST::Node;
+import Compiler::Types;
 import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Compound;
+import Compiler::Types::Arena;
 import Compiler::DeclIndex;
 
 
@@ -367,18 +371,44 @@ function paths_equal_ignore_case(a: string, b: string) -> boolean {
 }
 
 /// Build cross-module function descriptors for a specific module.
-/// Iterates functions defined in the module (from DeclarationIndex) and
-/// creates CrossModuleFnDescriptor entries using TypeRefs directly.
+/// Looks up each function's FunctionType in the DeclIndex → arena to get
+/// the full signature (return type, param types, variadic flag).
 function build_cross_module_descriptors(
     graph: ModuleGraph*, module_sym: SymbolStr,
-    decl_index: DeclarationIndex*) -> void {
-    if (graph == null || decl_index == null) { return; }
+    decl_index: DeclarationIndex*, arena: TypeArena*) -> void {
+    if (graph == null || decl_index == null || arena == null) { return; }
 
     const funcs: SymbolStr[] = decl_index.get_functions_in_module(module_sym);
     for (mut i: i64 = 0; i < funcs.length; i++) {
         const fn_name: SymbolStr = funcs[i];
-        const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
-        const desc: CrossModuleFnDescriptor = CrossModuleFnDescriptor::new(fn_name, ret_type);
+        const func_type_ref: TypeRef = decl_index.lookup_func_type(fn_name);
+
+        if (func_type_ref.is_invalid()) {
+            // No FunctionType registered — use return-type-only fallback
+            const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
+            if (ret_type.is_valid()) {
+                graph.register_cross_module_fn(CrossModuleFnDescriptor::new(fn_name, ret_type));
+            }
+            continue;
+        }
+
+        // Look up the FunctionType in the arena to get full signature
+        const ty: Type* = arena.lookup(func_type_ref.id);
+        if (ty == null || ty.kind != TypeKind::Function) {
+            const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
+            if (ret_type.is_valid()) {
+                graph.register_cross_module_fn(CrossModuleFnDescriptor::new(fn_name, ret_type));
+            }
+            continue;
+        }
+
+        const ft: FunctionType* = ty as FunctionType*;
+        const desc: CrossModuleFnDescriptor = CrossModuleFnDescriptor {
+            name:        fn_name,
+            return_type: ft.return_type,
+            param_types: ft.param_types,
+            is_var_arg:  ft.is_variadic,
+        };
         graph.register_cross_module_fn(desc);
     }
 }

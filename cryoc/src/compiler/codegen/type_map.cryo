@@ -97,13 +97,17 @@ type struct TypeMapper {
     /// Fill the body of a previously forward-declared struct.
     fill_struct_body(mut &this, llvm_ty: LType, field_types: TypeRef[], packed: boolean) -> void {
         const n: u32 = field_types.length;
-        // Allocate raw array of LLVMTypeRef for the C API.
         const buf: void* = malloc(n as u64 * 8);
         const slots: void** = buf as void**;
 
         for (mut i: u32 = 0; i < n; i++) {
             const ft: LType = this.map_type(field_types[i]);
-            slots[i] = ft.raw;
+            if (!ft.is_valid()) {
+                // Use i8 as a placeholder for unmappable field types
+                slots[i] = LType::i8().raw;
+            } else {
+                slots[i] = ft.raw;
+            }
         }
 
         llvm_ty.set_struct_body(buf, n, packed);
@@ -225,6 +229,10 @@ type struct TypeMapper {
     /// FunctionType → LLVMFunctionType(ret, params, is_variadic)
     map_function(mut &this, t: FunctionType*) -> LType {
         const ret: LType = this.map_type(t.return_type);
+        if (!ret.is_valid()) {
+            // Return type couldn't be mapped — use void as fallback to avoid crash
+            return LType::null();
+        }
         const n: u32 = t.param_types.length;
 
         if (n == 0) {
@@ -233,8 +241,18 @@ type struct TypeMapper {
 
         const buf: void* = malloc(n as u64 * 8);
         const slots: void** = buf as void**;
+        mut has_null: boolean = false;
         for (mut i: u32 = 0; i < n; i++) {
-            slots[i] = this.map_type(t.param_types[i]).raw;
+            const mapped: LType = this.map_type(t.param_types[i]);
+            if (!mapped.is_valid()) {
+                has_null = true;
+                break;
+            }
+            slots[i] = mapped.raw;
+        }
+        if (has_null) {
+            free(buf);
+            return LType::null();
         }
         const result: LType = LType::function_type(ret, buf, n, t.is_variadic);
         free(buf);
@@ -246,8 +264,18 @@ type struct TypeMapper {
         const n: u32 = t.elements.length;
         const buf: void* = malloc(n as u64 * 8);
         const slots: void** = buf as void**;
+        mut has_null: boolean = false;
         for (mut i: u32 = 0; i < n; i++) {
-            slots[i] = this.map_type(t.elements[i]).raw;
+            const mapped: LType = this.map_type(t.elements[i]);
+            if (!mapped.is_valid()) {
+                has_null = true;
+                break;
+            }
+            slots[i] = mapped.raw;
+        }
+        if (has_null) {
+            free(buf);
+            return LType::null();
         }
         const result: LType = LType::literal_struct(buf, n, false);
         free(buf);
@@ -257,6 +285,7 @@ type struct TypeMapper {
     /// Optional<T> → { T, i1 } (value + has_value flag)
     map_optional(mut &this, t: OptionalType*) -> LType {
         const wrapped: LType = this.map_type(t.wrapped);
+        if (!wrapped.is_valid()) { return LType::null(); }
         const buf: void* = malloc(16);
         const slots: void** = buf as void**;
         slots[0] = wrapped.raw;
@@ -293,7 +322,8 @@ type struct TypeMapper {
             const buf: void* = malloc(n as u64 * 8);
             const slots: void** = buf as void**;
             for (mut i: u32 = 0; i < n; i++) {
-                slots[i] = this.map_type(t.fields[i].field_type).raw;
+                const ft: LType = this.map_type(t.fields[i].field_type);
+                slots[i] = if (ft.is_valid()) { ft.raw } else { LType::i8().raw };
             }
             llvm_ty.set_struct_body(buf, n, false);
             free(buf);
@@ -328,13 +358,13 @@ type struct TypeMapper {
 
             mut idx: u32 = 0;
             if (has_vtable) {
-                // vtable pointer: i8** (pointer to array of function pointers)
                 slots[0] = LType::pointer_to(LType::pointer_to(LType::i8())).raw;
                 idx = 1;
             }
 
             for (mut i: u32 = 0; i < field_count; i++) {
-                slots[idx] = this.map_type(t.fields[i].field_type).raw;
+                const ft: LType = this.map_type(t.fields[i].field_type);
+                slots[idx] = if (ft.is_valid()) { ft.raw } else { LType::i8().raw };
                 idx = idx + 1;
             }
 

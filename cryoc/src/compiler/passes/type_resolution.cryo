@@ -586,14 +586,27 @@ type struct TypeResolutionPasses {
             NodeKind::FunctionDeclaration => {
                 const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
                 if (func.resolved_return_type.is_valid()) {
-                    ctx.decl_index.register_function_with_module(
-                        func.name, func.resolved_return_type, module_sym);
-                    // Also register under qualified name so module-qualified
-                    // calls (e.g., intrinsics::frexp) resolve correctly when
-                    // multiple modules export functions with the same bare name.
+                    // Collect resolved param types from AST
+                    mut param_types: TypeRef[] = [];
+                    for (mut p: i64 = 0; p < func.parameters.length; p++) {
+                        const param: VarDeclNode* = func.parameters[p];
+                        if (param != null && param.resolved_type.is_valid()) {
+                            param_types = param_types + [param.resolved_type];
+                        }
+                    }
+
+                    // Create a FunctionType in the arena (deduplicated)
+                    const func_type_ref: TypeRef = arena.get_function(
+                        func.resolved_return_type, param_types, func.is_variadic);
+
+                    ctx.decl_index.register_function_type_with_module(
+                        func.name, func.resolved_return_type, func_type_ref, module_sym);
+
+                    // Also register under qualified name
                     const q_name: SymbolStr = ctx.qualify_symbol_sym(func.name);
                     if (!q_name.equals(func.name)) {
                         ctx.decl_index.register_function(q_name, func.resolved_return_type);
+                        ctx.decl_index.register_function_type(q_name, func_type_ref);
                     }
                 }
             }
@@ -697,7 +710,36 @@ type struct TypeResolutionPasses {
                 NodeKind::ExternBlock => {
                     const node: ExternBlockNode* = stmt as ExternBlockNode*;
                     for (mut j: i64 = 0; j < node.functions.length; j++) {
-                        runner.resolve_func_signature(node.functions[j], &runner.res_ctx);
+                        const fn_node: FunctionDeclNode* = node.functions[j];
+                        runner.resolve_func_signature(fn_node, &runner.res_ctx);
+
+                        if (fn_node.resolved_return_type.is_valid()) {
+                            // Collect resolved param types
+                            mut ext_params: TypeRef[] = [];
+                            for (mut p: i64 = 0; p < fn_node.parameters.length; p++) {
+                                const param: VarDeclNode* = fn_node.parameters[p];
+                                if (param != null && param.resolved_type.is_valid()) {
+                                    ext_params = ext_params + [param.resolved_type];
+                                }
+                            }
+
+                            // Create FunctionType in the arena
+                            const func_type_ref: TypeRef = arena.get_function(
+                                fn_node.resolved_return_type, ext_params, fn_node.is_variadic);
+
+                            ctx.decl_index.register_function(fn_node.name, fn_node.resolved_return_type);
+                            ctx.decl_index.register_function_type(fn_node.name, func_type_ref);
+
+                            // For CImport blocks, also register under alias::name
+                            if (node.is_c_import()) {
+                                const alias_str: string = ctx.intern_table.resolve(node.namespace_alias);
+                                const fn_str: string = ctx.intern_table.resolve(fn_node.name);
+                                const qualified: string = alias_str + "::" + fn_str;
+                                const q_sym: SymbolStr = ctx.intern_table.intern(qualified);
+                                ctx.decl_index.register_function(q_sym, fn_node.resolved_return_type);
+                                ctx.decl_index.register_function_type(q_sym, func_type_ref);
+                            }
+                        }
                     }
                     sig_count = sig_count + node.functions.length;
                 }
