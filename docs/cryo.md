@@ -146,7 +146,7 @@ These conventions also affect syntax highlighting: the TextMate grammar treats `
 Keywords are reserved identifiers that have special meaning to the compiler. They cannot be used as variable or function names.
 
 **Control flow:**
-`if` `else` `elif` `switch` `case` `default` `match` `while` `for` `loop` `do` `break` `continue` `return` `yield`
+`if` `else` `switch` `case` `default` `match` `while` `for` `loop` `do` `break` `continue` `return` `yield`
 
 **Declarations:**
 `function` `class` `struct` `enum` `trait` `type` `namespace` `module` `import` `export` `from` `as` `implement` `intrinsic` `where` `extern`

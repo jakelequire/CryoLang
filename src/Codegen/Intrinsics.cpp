@@ -144,6 +144,8 @@ namespace Cryo::Codegen
             return generate_fputc(args);
         else if (intrinsic_name == "sscanf")
             return generate_sscanf(args);
+        else if (intrinsic_name == "atoi")
+            return generate_atoi(args);
 
         // Low-level file descriptor I/O
         else if (intrinsic_name == "read")
@@ -4570,6 +4572,27 @@ namespace Cryo::Codegen
         }
 
         return builder.CreateCall(sscanf_func, args, "sscanf.result");
+    }
+
+    llvm::Value *Intrinsics::generate_atoi(const std::vector<llvm::Value *> &args)
+    {
+        if (args.size() != 1)
+        {
+            report_error("atoi requires exactly 1 argument (str)");
+            return nullptr;
+        }
+
+        auto &builder = _context_manager.get_builder();
+        auto &context = _context_manager.get_context();
+
+        // int atoi(const char* str)
+        llvm::FunctionType *atoi_type = llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(context),
+            {llvm::PointerType::get(context, 0)},
+            false);
+        llvm::Function *atoi_func = get_or_create_libc_function("atoi", atoi_type);
+
+        return builder.CreateCall(atoi_func, args, "atoi.result");
     }
 
     // ========================================

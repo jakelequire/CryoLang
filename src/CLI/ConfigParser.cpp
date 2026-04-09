@@ -96,6 +96,14 @@ namespace Cryo::CLI
                     {
                         config.args = parse_array(value);
                     }
+                    else if (key == "link_libs")
+                    {
+                        config.link_libs = parse_array(value);
+                    }
+                    else if (key == "link_paths")
+                    {
+                        config.link_paths = parse_array(value);
+                    }
                 }
                 else if (current_section == "dependencies")
                 {

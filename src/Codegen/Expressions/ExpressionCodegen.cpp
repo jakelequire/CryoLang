@@ -1,5 +1,6 @@
 #include "Codegen/Expressions/ExpressionCodegen.hpp"
 #include "Codegen/Expressions/CallCodegen.hpp"
+#include "Compiler/CompilerInstance.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "Codegen/Declarations/TypeCodegen.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
@@ -4364,7 +4365,51 @@ namespace Cryo::Codegen
                               "resolve_member_info: CallExpressionNode has resolved type: {}",
                               obj_type->display_name());
                 }
-                else
+
+                // General fallback: extract the function name from the callee and
+                // look up its return type in the symbol table.  This handles
+                // simple calls (foo()), static methods (Type::method()), and
+                // instance method calls (obj.method()) for chaining like
+                // map_type(...).raw or LType::pointer_to(...).raw.
+                if (!obj_type)
+                {
+                    Cryo::ExpressionNode *callee = call_expr->callee();
+                    std::string func_name_for_lookup;
+
+                    if (auto *id_callee = dynamic_cast<Cryo::IdentifierNode *>(callee))
+                    {
+                        func_name_for_lookup = id_callee->name();
+                    }
+                    else if (auto *scope_callee = dynamic_cast<Cryo::ScopeResolutionNode *>(callee))
+                    {
+                        func_name_for_lookup = scope_callee->scope_name() + "::" + scope_callee->member_name();
+                    }
+
+                    if (!func_name_for_lookup.empty())
+                    {
+                        // Try symbol table lookup for the function's return type
+                        auto candidates = generate_lookup_candidates(func_name_for_lookup, Cryo::SymbolKind::Function);
+                        candidates.insert(candidates.begin(), func_name_for_lookup);
+                        for (const auto &candidate : candidates)
+                        {
+                            Cryo::Symbol *sym = symbols().lookup_symbol(candidate);
+                            if (sym && sym->type.is_valid() && sym->type->kind() == Cryo::TypeKind::Function)
+                            {
+                                auto *fn_type = dynamic_cast<const Cryo::FunctionType *>(sym->type.get());
+                                if (fn_type && fn_type->return_type().is_valid())
+                                {
+                                    obj_type = fn_type->return_type();
+                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                              "resolve_member_info: Resolved function '{}' return type to '{}' via symbol table",
+                                              candidate, obj_type->display_name());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!obj_type)
                 {
                     // Try to find the return type by looking up the method
                     Cryo::ExpressionNode *callee = call_expr->callee();
@@ -7376,6 +7421,56 @@ namespace Cryo::Codegen
                                   qualified_name, vname);
                         return vval;
                     }
+                }
+            }
+        }
+
+        // C-import registry fallback: check if this is a call to a C-imported
+        // function (e.g., llvm::LLVMModuleCreateWithName) that was declared in
+        // another module's extern "C" block with a namespace alias.
+        {
+            auto *compiler = ctx().compiler_instance();
+            auto *c_import_decl = compiler ? compiler->lookup_c_import(qualified_name) : nullptr;
+            if (c_import_decl)
+            {
+                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                          "ExpressionCodegen: Found C-import '{}' in global registry", qualified_name);
+
+                // Look up or create the extern function declaration in this LLVM module.
+                // Use the bare C name for the LLVM symbol (e.g., "LLVMModuleCreateWithName").
+                std::string bare_name = c_import_decl->name();
+                llvm::Function *fn = module()->getFunction(bare_name);
+                if (!fn)
+                {
+                    // Create the LLVM extern declaration on-the-fly from the AST node.
+                    // Map return type.
+                    llvm::Type *ret_type = nullptr;
+                    if (c_import_decl->has_resolved_return_type())
+                        ret_type = ctx().types().map_type(c_import_decl->get_resolved_return_type());
+                    if (!ret_type)
+                        ret_type = llvm::Type::getVoidTy(llvm_ctx());
+
+                    // Map parameter types.
+                    std::vector<llvm::Type *> param_types;
+                    for (const auto &param : c_import_decl->parameters())
+                    {
+                        llvm::Type *pt = nullptr;
+                        if (param->has_resolved_type())
+                            pt = ctx().types().map_type(param->get_resolved_type());
+                        if (pt)
+                            param_types.push_back(pt);
+                    }
+
+                    bool is_var_arg = c_import_decl->is_variadic();
+                    auto *fn_type = llvm::FunctionType::get(ret_type, param_types, is_var_arg);
+                    fn = llvm::Function::Create(
+                        fn_type, llvm::Function::ExternalLinkage, bare_name, module());
+                }
+                if (fn)
+                {
+                    // Cache it under the qualified name for future lookups.
+                    ctx().register_function(qualified_name, fn);
+                    return fn;
                 }
             }
         }

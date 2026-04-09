@@ -55,6 +55,22 @@ public:
 
 
     // ========================================================================
+    // Helpers to break deep chains for C++ compiler compatibility
+    // ========================================================================
+
+    /// Get the current function from the builder's insert block.
+    get_current_function(mut &this) -> LValue {
+        const bb: LBasicBlock = this.cg.builder.get_insert_block();
+        return bb.get_parent();
+    }
+
+    /// Look up a type in the declaration index.
+    lookup_type(mut &this, name: SymbolStr) -> TypeRef {
+        const ctx_ptr: CompilationContext* = this.cg.ctx;
+        return ctx_ptr.decl_index.lookup_type(name);
+    }
+
+    // ========================================================================
     // Top-level program generation
     // ========================================================================
 
@@ -210,7 +226,7 @@ public:
 
         const lhs: LValue = this.codegen_rvalue(node.left);
         const current_bb: LBasicBlock = this.cg.builder.get_insert_block();
-        const current_fn: LValue = current_bb.get_parent();
+        const current_fn: LValue = this.get_current_function();
 
         const rhs_bb: LBasicBlock = LBasicBlock::append(current_fn, "sc.rhs");
         const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "sc.merge");
@@ -280,7 +296,7 @@ public:
 
     override visit(node: TernaryExprNode*) -> void {
         const cond: LValue = this.codegen_rvalue(node.condition);
-        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+        const current_fn: LValue = this.get_current_function();
 
         const then_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.then");
         const else_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.else");
@@ -304,10 +320,12 @@ public:
 
         const vals: void* = malloc(16);
         const blks: void* = malloc(16);
-        (vals as void**)[0] = then_val.raw;
-        (vals as void**)[1] = else_val.raw;
-        (blks as void**)[0] = then_end.raw;
-        (blks as void**)[1] = else_end.raw;
+        const vals_arr: void** = vals as void**;
+        const blks_arr: void** = blks as void**;
+        vals_arr[0] = then_val.raw;
+        vals_arr[1] = else_val.raw;
+        blks_arr[0] = then_end.raw;
+        blks_arr[1] = else_end.raw;
         phi_add_incoming(phi, vals, blks, 2);
         free(vals);
         free(blks);
@@ -389,13 +407,13 @@ public:
     }
 
     override visit(node: SizeofExprNode*) -> void {
-        const type_ref: TypeRef = this.cg.ctx.decl_index.lookup_type(node.type_name);
+        const type_ref: TypeRef = this.lookup_type(node.type_name);
         codegen_sizeof(this.cg, type_ref, &this.last_value);
         this.last_is_lvalue = false;
     }
 
     override visit(node: AlignofExprNode*) -> void {
-        const type_ref: TypeRef = this.cg.ctx.decl_index.lookup_type(node.type_name);
+        const type_ref: TypeRef = this.lookup_type(node.type_name);
         codegen_alignof(this.cg, type_ref, &this.last_value);
         this.last_is_lvalue = false;
     }
@@ -408,7 +426,7 @@ public:
     }
 
     override visit(node: StructLiteralNode*) -> void {
-        const type_ref: TypeRef = this.cg.ctx.decl_index.lookup_type(node.struct_type);
+        const type_ref: TypeRef = this.lookup_type(node.struct_type);
 
         mut field_names: SymbolStr[] = [];
         mut field_values: LValue[] = [];
@@ -426,15 +444,17 @@ public:
     override visit(node: ArrayLiteralNode*) -> void {
         // Generate array elements and build an alloca.
         const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
-        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+        const current_fn: LValue = this.get_current_function();
         const alloca: LValue = this.cg.create_entry_alloca(current_fn, "arrlit", ty);
 
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             const elem: LValue = this.codegen_rvalue(node.elements[i]);
             const idx: LValue = LType::const_int(LType::i64(), i as u64, false);
             const buf: void* = malloc(16);
-            (buf as void**)[0] = LType::const_int(LType::i64(), 0, false).raw;
-            (buf as void**)[1] = idx.raw;
+            const buf_arr: void** = buf as void**;
+            const zero_idx: LValue = LType::const_int(LType::i64(), 0, false);
+            buf_arr[0] = zero_idx.raw;
+            buf_arr[1] = idx.raw;
             const gep: LValue = this.cg.builder.build_gep(ty, alloca, buf, 2, "arrelem");
             free(buf);
             this.cg.builder.build_store(elem, gep);
@@ -486,7 +506,7 @@ public:
 
     override visit(node: NewExprNode*) -> void {
         // Heap allocation: malloc + optional constructor call.
-        const type_ref: TypeRef = this.cg.ctx.decl_index.lookup_type(node.type_name);
+        const type_ref: TypeRef = this.lookup_type(node.type_name);
         const t: Type* = this.cg.arena.lookup(type_ref.id);
         if (t == null) {
             this.last_value = LValue::null();
@@ -495,7 +515,7 @@ public:
         }
 
         const size: u64 = t.size_bytes();
-        const malloc_fn: LValue = this.cg.module.get_named_function("malloc");
+        const malloc_fn: LValue = this.cg.llvm_module.get_named_function("malloc");
         if (malloc_fn.is_valid()) {
             const size_val: LValue = LType::const_int(LType::i64(), size, false);
             mut args: LValue[] = [size_val];
@@ -513,7 +533,7 @@ public:
 
     override visit(node: DeleteExprNode*) -> void {
         const ptr: LValue = this.codegen_rvalue(node.operand);
-        const free_fn: LValue = this.cg.module.get_named_function("free");
+        const free_fn: LValue = this.cg.llvm_module.get_named_function("free");
         if (free_fn.is_valid() && ptr.is_valid()) {
             const void_ptr: LValue = this.cg.builder.build_pointer_cast(
                 ptr, LType::pointer_to(LType::i8()), "delcast");
@@ -560,7 +580,7 @@ public:
 
     override visit(node: IfStmtNode*) -> void {
         const cond: LValue = this.codegen_rvalue(node.condition);
-        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+        const current_fn: LValue = this.get_current_function();
 
         const blocks: IfBlocks = codegen_if(this.cg, cond, current_fn,
                                              node.else_stmt != null);
@@ -583,7 +603,7 @@ public:
     }
 
     override visit(node: WhileStmtNode*) -> void {
-        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+        const current_fn: LValue = this.get_current_function();
         const blocks: LoopBlocks = codegen_while_header(this.cg, current_fn);
 
         // Condition.
@@ -603,7 +623,7 @@ public:
     }
 
     override visit(node: ForStmtNode*) -> void {
-        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+        const current_fn: LValue = this.get_current_function();
 
         // Init.
         this.cg.push_scope();
@@ -643,7 +663,7 @@ public:
     }
 
     override visit(node: LoopStmtNode*) -> void {
-        const current_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+        const current_fn: LValue = this.get_current_function();
         const blocks: LoopBlocks = codegen_loop_header(this.cg, current_fn);
 
         this.cg.builder.position_at_end(blocks.body_bb);
