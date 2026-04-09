@@ -1847,14 +1847,14 @@ namespace Cryo
         void accept(ASTVisitor &visitor) override;
     };
 
-    // External linkage block (extern "C" { ... } or extern "CImport" name { ... })
+    // External linkage block (extern "C" { ... } or name := extern "C" { #include ... })
     class ExternBlockNode : public DeclarationNode
     {
     private:
-        std::string _linkage_type;    // "C" or "CImport"
-        std::string _namespace_alias; // Optional namespace alias (e.g., "ex" in extern "CImport" ex { ... })
+        std::string _linkage_type;    // "C"
+        std::string _namespace_alias; // Optional namespace alias (e.g., "c" in c := extern "C" { ... })
         std::vector<std::string> _include_paths; // Include paths for CImport blocks
-        bool _is_c_import;            // true when linkage_type is "CImport"
+        bool _is_c_import;            // true when a namespace alias is present (CImport block)
         std::vector<std::unique_ptr<FunctionDeclarationNode>> _function_declarations;
 
     public:
@@ -1862,7 +1862,7 @@ namespace Cryo
             : DeclarationNode(NodeKind::ExternBlock, loc),
               _linkage_type(std::move(linkage_type)),
               _namespace_alias(std::move(namespace_alias)),
-              _is_c_import(_linkage_type == "CImport") {}
+              _is_c_import(!_namespace_alias.empty()) {}
 
         const std::string &linkage_type() const { return _linkage_type; }
         const std::string &namespace_alias() const { return _namespace_alias; }

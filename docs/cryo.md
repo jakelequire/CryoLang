@@ -1692,10 +1692,10 @@ These declarations tell the compiler the function's type signature without provi
 
 ### 16.2 C Header Import
 
-For larger C libraries, manually transcribing every function signature is tedious and error-prone. Cryo's `extern "CImport"` blocks automate this by importing C header files directly. The compiler parses the headers and generates bindings automatically.
+For larger C libraries, manually transcribing every function signature is tedious and error-prone. Cryo's C import syntax automates this by importing C header files directly. The compiler parses the headers and generates bindings automatically.
 
 ```cryo
-extern "CImport" c {
+c := extern "C" {
     #include <stdio.h>
     #include <stdlib.h>
     #include "./my_header.h"
@@ -1707,7 +1707,7 @@ function main() -> int {
 }
 ```
 
-The identifier after `"CImport"` (here, `c`) creates a namespace for the imported functions. You access them with `::` scope resolution: `c::printf(...)`, `c::malloc(...)`. This prevents name collisions between C functions and Cryo functions.
+The identifier before `:=` (here, `c`) creates a namespace for the imported functions. You access them with `::` scope resolution: `c::printf(...)`, `c::malloc(...)`. This prevents name collisions between C functions and Cryo functions.
 
 ---
 
