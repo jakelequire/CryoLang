@@ -1,0 +1,502 @@
+/// Expression Codegen
+///
+/// Free functions for generating LLVM IR from each of the 24 expression
+/// node types.  Each function takes a CodegenContext and the specific
+/// node, and stores the result in the context for the caller to retrieve.
+
+namespace Compiler::Codegen::ExprCodegen;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Context;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Compound;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Declaration;
+import Compiler::Lex;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+
+
+// ============================================================================
+// Literal
+// ============================================================================
+
+/// Generate a constant value from a literal node.
+function codegen_literal(cg: CodegenContext*, node: LiteralNode*,
+                         out_value: LValue*, out_is_lvalue: boolean*) -> void {
+    const ty: LType = cg.type_mapper.map_type(node.resolved_type);
+
+    *out_is_lvalue = false;
+
+    const kind: LiteralKind = node.literal_kind;
+
+    if (kind == LiteralKind::Integer) {
+        const val: u64 = strtoul(node.value, null, 0);
+        *out_value = LType::const_int(ty, val, true);
+    } else if (kind == LiteralKind::Float) {
+        const val: f64 = strtod(node.value, null);
+        *out_value = LType::const_real(ty, val);
+    } else if (kind == LiteralKind::String) {
+        *out_value = cg.get_or_create_string_literal(node.value);
+    } else if (kind == LiteralKind::Char) {
+        // Char is stored as i32.
+        mut char_val: u64 = 0;
+        if (strlen(node.value) > 0) {
+            char_val = node.value[0] as u64;
+        }
+        *out_value = LType::const_int(LType::i32(), char_val, false);
+    } else if (kind == LiteralKind::Boolean) {
+        const bval: u64 = if (node.value == "true") { 1 } else { 0 };
+        *out_value = LType::const_int(LType::i1(), bval, false);
+    } else if (kind == LiteralKind::Null) {
+        *out_value = LType::const_pointer_null(ty);
+    } else {
+        *out_value = LValue::null();
+    }
+}
+
+
+// ============================================================================
+// Identifier
+// ============================================================================
+
+/// Look up a named value (local, parameter, or global).
+function codegen_identifier(cg: CodegenContext*, node: IdentifierNode*,
+                            out_value: LValue*, out_is_lvalue: boolean*) -> void {
+    // Try local/parameter first.
+    const local: LValue = cg.get_named_value(node.name);
+    if (local.is_valid()) {
+        *out_value = local;
+        *out_is_lvalue = true;
+        return;
+    }
+
+    // Try global.
+    const global: LValue = cg.get_global(node.name);
+    if (global.is_valid()) {
+        *out_value = global;
+        *out_is_lvalue = true;
+        return;
+    }
+
+    // Try function (for function references / first-class functions).
+    const func: LValue = cg.get_function(node.name);
+    if (func.is_valid()) {
+        *out_value = func;
+        *out_is_lvalue = false;
+        return;
+    }
+
+    *out_value = LValue::null();
+    *out_is_lvalue = false;
+}
+
+
+// ============================================================================
+// Binary Expression
+// ============================================================================
+
+/// Generate IR for a binary expression.  Handles arithmetic, comparison,
+/// logical short-circuit, and assignment operators.
+function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
+                        op_kind: TokenType, result_type: TypeRef,
+                        out_value: LValue*) -> void {
+    // Determine if this is integer, float, or pointer arithmetic.
+    const t: Type* = cg.arena.lookup(result_type.id);
+    const is_float: boolean = t != null && t.kind == TypeKind::Float;
+    const is_signed: boolean = t != null && t.kind == TypeKind::Int &&
+                               (t as IntType*).int_kind.is_signed();
+
+    // Arithmetic
+    if (op_kind == TokenType::Plus) {
+        *out_value = if (is_float) {
+            cg.builder.build_fadd(lhs_val, rhs_val, "addtmp")
+        } else {
+            cg.builder.build_add(lhs_val, rhs_val, "addtmp")
+        };
+    } else if (op_kind == TokenType::Minus) {
+        *out_value = if (is_float) {
+            cg.builder.build_fsub(lhs_val, rhs_val, "subtmp")
+        } else {
+            cg.builder.build_sub(lhs_val, rhs_val, "subtmp")
+        };
+    } else if (op_kind == TokenType::Star) {
+        *out_value = if (is_float) {
+            cg.builder.build_fmul(lhs_val, rhs_val, "multmp")
+        } else {
+            cg.builder.build_mul(lhs_val, rhs_val, "multmp")
+        };
+    } else if (op_kind == TokenType::Slash) {
+        *out_value = if (is_float) {
+            cg.builder.build_fdiv(lhs_val, rhs_val, "divtmp")
+        } else if (is_signed) {
+            cg.builder.build_sdiv(lhs_val, rhs_val, "divtmp")
+        } else {
+            cg.builder.build_udiv(lhs_val, rhs_val, "divtmp")
+        };
+    } else if (op_kind == TokenType::Percent) {
+        *out_value = if (is_float) {
+            cg.builder.build_frem(lhs_val, rhs_val, "remtmp")
+        } else if (is_signed) {
+            cg.builder.build_srem(lhs_val, rhs_val, "remtmp")
+        } else {
+            cg.builder.build_urem(lhs_val, rhs_val, "remtmp")
+        };
+
+    // Comparison
+    } else if (op_kind == TokenType::EqualEqual) {
+        *out_value = if (is_float) {
+            cg.builder.build_fcmp(1 /* OEQ */, lhs_val, rhs_val, "eqtmp")
+        } else {
+            cg.builder.build_icmp(32 /* IntEQ */, lhs_val, rhs_val, "eqtmp")
+        };
+    } else if (op_kind == TokenType::ExclaimEqual) {
+        *out_value = if (is_float) {
+            cg.builder.build_fcmp(6 /* ONE */, lhs_val, rhs_val, "netmp")
+        } else {
+            cg.builder.build_icmp(33 /* IntNE */, lhs_val, rhs_val, "netmp")
+        };
+    } else if (op_kind == TokenType::LAngle) {
+        *out_value = if (is_float) {
+            cg.builder.build_fcmp(4 /* OLT */, lhs_val, rhs_val, "lttmp")
+        } else if (is_signed) {
+            cg.builder.build_icmp(40 /* IntSLT */, lhs_val, rhs_val, "lttmp")
+        } else {
+            cg.builder.build_icmp(36 /* IntULT */, lhs_val, rhs_val, "lttmp")
+        };
+    } else if (op_kind == TokenType::RAngle) {
+        *out_value = if (is_float) {
+            cg.builder.build_fcmp(2 /* OGT */, lhs_val, rhs_val, "gttmp")
+        } else if (is_signed) {
+            cg.builder.build_icmp(38 /* IntSGT */, lhs_val, rhs_val, "gttmp")
+        } else {
+            cg.builder.build_icmp(34 /* IntUGT */, lhs_val, rhs_val, "gttmp")
+        };
+    } else if (op_kind == TokenType::LessEqual) {
+        *out_value = if (is_float) {
+            cg.builder.build_fcmp(5 /* OLE */, lhs_val, rhs_val, "letmp")
+        } else if (is_signed) {
+            cg.builder.build_icmp(41 /* IntSLE */, lhs_val, rhs_val, "letmp")
+        } else {
+            cg.builder.build_icmp(37 /* IntULE */, lhs_val, rhs_val, "letmp")
+        };
+    } else if (op_kind == TokenType::GreaterEqual) {
+        *out_value = if (is_float) {
+            cg.builder.build_fcmp(3 /* OGE */, lhs_val, rhs_val, "getmp")
+        } else if (is_signed) {
+            cg.builder.build_icmp(39 /* IntSGE */, lhs_val, rhs_val, "getmp")
+        } else {
+            cg.builder.build_icmp(35 /* IntUGE */, lhs_val, rhs_val, "getmp")
+        };
+
+    // Bitwise
+    } else if (op_kind == TokenType::Amp) {
+        *out_value = cg.builder.build_and(lhs_val, rhs_val, "andtmp");
+    } else if (op_kind == TokenType::Pipe) {
+        *out_value = cg.builder.build_or(lhs_val, rhs_val, "ortmp");
+    } else if (op_kind == TokenType::Caret) {
+        *out_value = cg.builder.build_xor(lhs_val, rhs_val, "xortmp");
+    } else if (op_kind == TokenType::LessLess) {
+        *out_value = cg.builder.build_shl(lhs_val, rhs_val, "shltmp");
+    } else if (op_kind == TokenType::GreaterGreater) {
+        *out_value = if (is_signed) {
+            cg.builder.build_ashr(lhs_val, rhs_val, "shrtmp")
+        } else {
+            cg.builder.build_lshr(lhs_val, rhs_val, "shrtmp")
+        };
+
+    } else {
+        *out_value = LValue::null();
+    }
+}
+
+
+// ============================================================================
+// Unary Expression
+// ============================================================================
+
+function codegen_unary(cg: CodegenContext*, operand: LValue, op_kind: TokenType,
+                       operand_type: TypeRef, out_value: LValue*) -> void {
+    const t: Type* = cg.arena.lookup(operand_type.id);
+    const is_float: boolean = t != null && t.kind == TypeKind::Float;
+
+    if (op_kind == TokenType::Minus) {
+        *out_value = if (is_float) {
+            cg.builder.build_fneg(operand, "negtmp")
+        } else {
+            cg.builder.build_neg(operand, "negtmp")
+        };
+    } else if (op_kind == TokenType::Exclaim) {
+        *out_value = cg.builder.build_not(operand, "nottmp");
+    } else if (op_kind == TokenType::Tilde) {
+        *out_value = cg.builder.build_not(operand, "bnottmp");
+    } else {
+        *out_value = LValue::null();
+    }
+}
+
+
+// ============================================================================
+// Call Expression
+// ============================================================================
+
+/// Generate IR for a function call.
+function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
+                      args: LValue[], name: string,
+                      out_value: LValue*) -> void {
+    const n: u32 = args.length as u32;
+
+    if (n == 0) {
+        *out_value = cg.builder.build_call(callee_type, callee, null, 0, name);
+        return;
+    }
+
+    // Build raw argument array.
+    const buf: void* = malloc(n as u64 * 8);
+    const slots: void** = buf as void**;
+    for (mut i: u32 = 0; i < n; i++) {
+        slots[i] = args[i].raw;
+    }
+    *out_value = cg.builder.build_call(callee_type, callee, buf, n, name);
+    free(buf);
+}
+
+
+// ============================================================================
+// Sizeof / Alignof
+// ============================================================================
+
+function codegen_sizeof(cg: CodegenContext*, type_ref: TypeRef,
+                        out_value: LValue*) -> void {
+    const t: Type* = cg.arena.lookup(type_ref.id);
+    if (t != null) {
+        *out_value = LType::const_int(LType::i64(), t.size_bytes(), false);
+    } else {
+        *out_value = LType::const_int(LType::i64(), 0, false);
+    }
+}
+
+function codegen_alignof(cg: CodegenContext*, type_ref: TypeRef,
+                         out_value: LValue*) -> void {
+    const t: Type* = cg.arena.lookup(type_ref.id);
+    if (t != null) {
+        *out_value = LType::const_int(LType::i64(), t.alignment(), false);
+    } else {
+        *out_value = LType::const_int(LType::i64(), 0, false);
+    }
+}
+
+
+// ============================================================================
+// Cast Expression
+// ============================================================================
+
+function codegen_cast(cg: CodegenContext*, val: LValue,
+                      from_type: TypeRef, to_type: TypeRef,
+                      out_value: LValue*) -> void {
+    const from: Type* = cg.arena.lookup(from_type.id);
+    const to: Type* = cg.arena.lookup(to_type.id);
+    if (from == null || to == null) {
+        *out_value = val;
+        return;
+    }
+
+    const dest_ty: LType = cg.type_mapper.map_type(to_type);
+
+    const from_int: boolean = from.kind == TypeKind::Int;
+    const from_float: boolean = from.kind == TypeKind::Float;
+    const to_int: boolean = to.kind == TypeKind::Int;
+    const to_float: boolean = to.kind == TypeKind::Float;
+    const from_ptr: boolean = from.kind == TypeKind::Pointer || from.kind == TypeKind::Reference;
+    const to_ptr: boolean = to.kind == TypeKind::Pointer || to.kind == TypeKind::Reference;
+
+    // Int → Int (truncate, zext, or sext)
+    if (from_int && to_int) {
+        const from_bits: u64 = (from as IntType*).int_kind.bit_width();
+        const to_bits: u64 = (to as IntType*).int_kind.bit_width();
+        if (from_bits > to_bits) {
+            *out_value = cg.builder.build_trunc(val, dest_ty, "trunctmp");
+        } else if (from_bits < to_bits) {
+            if ((from as IntType*).int_kind.is_signed()) {
+                *out_value = cg.builder.build_sext(val, dest_ty, "sexttmp");
+            } else {
+                *out_value = cg.builder.build_zext(val, dest_ty, "zexttmp");
+            }
+        } else {
+            *out_value = val;  // Same width, no-op.
+        }
+    // Float → Float
+    } else if (from_float && to_float) {
+        const from_bits: u64 = (from as FloatType*).float_kind.bit_width();
+        const to_bits: u64 = (to as FloatType*).float_kind.bit_width();
+        if (from_bits > to_bits) {
+            *out_value = cg.builder.build_fp_trunc(val, dest_ty, "fptrunctmp");
+        } else if (from_bits < to_bits) {
+            *out_value = cg.builder.build_fp_ext(val, dest_ty, "fpexttmp");
+        } else {
+            *out_value = val;
+        }
+    // Int → Float
+    } else if (from_int && to_float) {
+        if ((from as IntType*).int_kind.is_signed()) {
+            *out_value = cg.builder.build_si_to_fp(val, dest_ty, "sitofptmp");
+        } else {
+            *out_value = cg.builder.build_ui_to_fp(val, dest_ty, "uitofptmp");
+        }
+    // Float → Int
+    } else if (from_float && to_int) {
+        if ((to as IntType*).int_kind.is_signed()) {
+            *out_value = cg.builder.build_fp_to_si(val, dest_ty, "fptositmp");
+        } else {
+            *out_value = cg.builder.build_fp_to_ui(val, dest_ty, "fptouitmp");
+        }
+    // Pointer ↔ Pointer
+    } else if (from_ptr && to_ptr) {
+        *out_value = cg.builder.build_pointer_cast(val, dest_ty, "ptrcasttmp");
+    // Int → Pointer
+    } else if (from_int && to_ptr) {
+        *out_value = cg.builder.build_int_to_ptr(val, dest_ty, "inttoptr");
+    // Pointer → Int
+    } else if (from_ptr && to_int) {
+        *out_value = cg.builder.build_ptr_to_int(val, dest_ty, "ptrtoint");
+    // Bool to int
+    } else if (from.kind == TypeKind::Bool && to_int) {
+        *out_value = cg.builder.build_zext(val, dest_ty, "booltoint");
+    // Fallback: bitcast
+    } else {
+        *out_value = cg.builder.build_bitcast(val, dest_ty, "bitcasttmp");
+    }
+}
+
+
+// ============================================================================
+// Member Access
+// ============================================================================
+
+/// Generate a GEP to a struct/class field.
+function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
+                               object_type: TypeRef, member: SymbolStr,
+                               out_value: LValue*, out_is_lvalue: boolean*) -> void {
+    const t: Type* = cg.arena.lookup(object_type.id);
+    if (t == null) {
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+
+    mut field_idx: i64 = -1;
+
+    if (t.kind == TypeKind::Struct) {
+        field_idx = (t as StructType*).field_index(member);
+    } else if (t.kind == TypeKind::Class) {
+        const cls: ClassType* = t as ClassType*;
+        field_idx = cls.field_index(member);
+        // Offset by 1 if class has vtable pointer.
+        if (cls.has_virtual_methods && field_idx >= 0) {
+            field_idx = field_idx + 1;
+        }
+    }
+
+    if (field_idx < 0) {
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+
+    const struct_ty: LType = cg.type_mapper.map_type(object_type);
+    const gep: LValue = cg.builder.build_struct_gep(struct_ty, object_ptr,
+                                                      field_idx as u32, "fieldptr");
+    *out_value = gep;
+    *out_is_lvalue = true;
+}
+
+
+// ============================================================================
+// Array Access
+// ============================================================================
+
+/// Generate a GEP for array element access.
+function codegen_array_access(cg: CodegenContext*, array_val: LValue,
+                              array_type: TypeRef, index_val: LValue,
+                              out_value: LValue*, out_is_lvalue: boolean*) -> void {
+    const t: Type* = cg.arena.lookup(array_type.id);
+    if (t == null || t.kind != TypeKind::Array) {
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+
+    const arr: ArrayType* = t as ArrayType*;
+    const elem_ty: LType = cg.type_mapper.map_type(arr.element);
+
+    if (arr.is_fixed()) {
+        // Fixed array: GEP into [N x T].
+        const arr_ty: LType = cg.type_mapper.map_type(array_type);
+        // Build indices: [0, index]
+        const buf: void* = malloc(16);
+        const slots: void** = buf as void**;
+        slots[0] = LType::const_int(LType::i64(), 0, false).raw;
+        slots[1] = index_val.raw;
+        const gep: LValue = cg.builder.build_gep(arr_ty, array_val, buf, 2, "elemptr");
+        free(buf);
+        *out_value = gep;
+        *out_is_lvalue = true;
+    } else {
+        // Dynamic array: extract data pointer from { T*, i64 }, then GEP.
+        const data_ptr: LValue = cg.builder.build_extract_value(array_val, 0, "data");
+        const buf: void* = malloc(8);
+        const slots: void** = buf as void**;
+        slots[0] = index_val.raw;
+        const gep: LValue = cg.builder.build_gep(elem_ty, data_ptr, buf, 1, "elemptr");
+        free(buf);
+        *out_value = gep;
+        *out_is_lvalue = true;
+    }
+}
+
+
+// ============================================================================
+// Struct Literal
+// ============================================================================
+
+/// Generate IR for a struct literal: allocate, fill fields, return address.
+function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
+                                field_names: SymbolStr[], field_values: LValue[],
+                                out_value: LValue*, out_is_lvalue: boolean*) -> void {
+    const ty: LType = cg.type_mapper.map_type(struct_type);
+    if (!ty.is_valid()) {
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+
+    // Get the current function for entry block alloca.
+    const current_bb: LBasicBlock = cg.builder.get_insert_block();
+    const current_fn: LValue = current_bb.get_parent();
+
+    const alloca: LValue = cg.create_entry_alloca(current_fn, "structlit", ty);
+
+    // Store each field value at its GEP index.
+    const t: Type* = cg.arena.lookup(struct_type.id);
+    if (t != null && t.kind == TypeKind::Struct) {
+        const st: StructType* = t as StructType*;
+        for (mut i: i64 = 0; i < field_names.length; i++) {
+            const fidx: i64 = st.field_index(field_names[i]);
+            if (fidx >= 0) {
+                const gep: LValue = cg.builder.build_struct_gep(ty, alloca, fidx as u32, "field");
+                cg.builder.build_store(field_values[i], gep);
+            }
+        }
+    }
+
+    *out_value = alloca;
+    *out_is_lvalue = true;
+}

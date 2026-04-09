@@ -1,0 +1,582 @@
+/// Declaration Codegen
+///
+/// Handles IR generation for declarations: struct/class/enum types,
+/// function signatures, function bodies, methods, globals, extern blocks,
+/// and vtables.  Called by IRGeneratorVisitor's visit() overrides.
+
+namespace Compiler::Codegen::DeclCodegen;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Context;
+import Compiler::CompilationContext;
+import Compiler::DeclIndex;
+import Compiler::ModuleGraph;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Compound;
+import Compiler::Types::Generic;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::AST::Statement;
+import Compiler::AST::Expression;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::MangledName;
+import Compiler::Resolver::QualifiedName;
+
+
+// ============================================================================
+// Phase 1: Forward-declare all named types
+// ============================================================================
+
+/// Walk the program and forward-declare all struct/class/enum types as
+/// named LLVM struct types.  This must run before function declarations
+/// so that parameter and return types can reference these types.
+function declare_types(cg: CodegenContext*, program: ProgramNode*) -> void {
+    const stmts: ASTNode*[] = program.statements;
+    for (mut i: i64 = 0; i < stmts.length; i++) {
+        const stmt: ASTNode* = stmts[i];
+        if (stmt == null) { continue; }
+
+        const kind: NodeKind = stmt.kind;
+
+        if (kind == NodeKind::StructDeclaration) {
+            declare_struct_type(cg, stmt as StructDeclNode*);
+        } else if (kind == NodeKind::ClassDeclaration) {
+            declare_class_type(cg, stmt as ClassDeclNode*);
+        } else if (kind == NodeKind::EnumDeclaration) {
+            declare_enum_type(cg, stmt as EnumDeclNode*);
+        } else if (kind == NodeKind::ImplementationBlock) {
+            // Impl blocks may contain methods we need, but types are
+            // already declared via StructDecl/ClassDecl.
+        }
+    }
+}
+
+/// Forward-declare a struct as a named LLVM type and fill its body.
+function declare_struct_type(cg: CodegenContext*, node: StructDeclNode*) -> void {
+    // Skip generic templates — only monomorphized versions get IR.
+    if (node.generic_params.length > 0) {
+        return;
+    }
+
+    const name: string = cg.intern.resolve(node.name);
+    const qname: QualifiedName = QualifiedName::single(cg.intern, name);
+    const mangled: string = MangledName::for_struct(cg.intern, qname).resolve(cg.intern);
+
+    // Look up the Cryo StructType to get field info.
+    const type_ref: TypeRef = cg.ctx.decl_index.lookup_type(node.name);
+    if (type_ref.is_invalid()) {
+        return;
+    }
+
+    // Let the type mapper handle forward declaration + body fill.
+    cg.type_mapper.map_type(type_ref);
+}
+
+/// Forward-declare a class type.
+function declare_class_type(cg: CodegenContext*, node: ClassDeclNode*) -> void {
+    if (node.generic_params.length > 0) {
+        return;
+    }
+
+    const type_ref: TypeRef = cg.ctx.decl_index.lookup_type(node.name);
+    if (type_ref.is_invalid()) {
+        return;
+    }
+
+    cg.type_mapper.map_type(type_ref);
+}
+
+/// Declare an enum type.
+function declare_enum_type(cg: CodegenContext*, node: EnumDeclNode*) -> void {
+    if (node.generic_params.length > 0) {
+        return;
+    }
+
+    const type_ref: TypeRef = cg.ctx.decl_index.lookup_type(node.name);
+    if (type_ref.is_invalid()) {
+        return;
+    }
+
+    cg.type_mapper.map_type(type_ref);
+}
+
+
+// ============================================================================
+// Phase 2: Declare all function signatures
+// ============================================================================
+
+/// Walk the program and create LLVM function declarations for all
+/// functions, methods, and extern blocks.
+function declare_functions(cg: CodegenContext*, program: ProgramNode*) -> void {
+    const stmts: ASTNode*[] = program.statements;
+    for (mut i: i64 = 0; i < stmts.length; i++) {
+        const stmt: ASTNode* = stmts[i];
+        if (stmt == null) { continue; }
+
+        const kind: NodeKind = stmt.kind;
+
+        if (kind == NodeKind::FunctionDeclaration) {
+            declare_function(cg, stmt as FunctionDeclNode*);
+        } else if (kind == NodeKind::ExternBlock) {
+            declare_extern_block(cg, stmt as ExternBlockNode*);
+        } else if (kind == NodeKind::ImplementationBlock) {
+            declare_impl_block(cg, stmt as ImplBlockNode*);
+        }
+    }
+}
+
+/// Declare a single function signature (no body generation).
+function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void {
+    // Skip generic templates.
+    if (node.generic_params.length > 0) {
+        return;
+    }
+
+    const name_str: string = cg.intern.resolve(node.name);
+    const qname: QualifiedName = QualifiedName::single(cg.intern, name_str);
+    const mangled: MangledName = MangledName::for_function(cg.intern, qname);
+    const fn_name: string = mangled.resolve(cg.intern);
+
+    // Build the LLVM function type.
+    const ret_ty: LType = map_return_type(cg, node);
+    const param_count: u32 = node.parameters.length as u32;
+
+    mut fn_type: LType = LType::null();
+    if (param_count == 0) {
+        fn_type = LType::function_type(ret_ty, null, 0, node.is_variadic);
+    } else {
+        const buf: void* = malloc(param_count as u64 * 8);
+        const slots: void** = buf as void**;
+        for (mut i: u32 = 0; i < param_count; i++) {
+            const param: VarDeclNode* = node.parameters[i];
+            const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
+            slots[i] = param_ty.raw;
+        }
+        fn_type = LType::function_type(ret_ty, buf, param_count, node.is_variadic);
+        free(buf);
+    }
+
+    // Add the function to the LLVM module.
+    const fn_val: LValue = cg.module.add_function(fn_name, fn_type);
+    cg.register_function(node.name, fn_val);
+}
+
+/// Declare all methods in an impl block.
+function declare_impl_block(cg: CodegenContext*, node: ImplBlockNode*) -> void {
+    // Skip generic impl blocks.
+    if (node.generic_params.length > 0) {
+        return;
+    }
+
+    for (mut i: i64 = 0; i < node.methods.length; i++) {
+        declare_method(cg, node.methods[i], node.target_type);
+    }
+}
+
+/// Declare a method.  Methods get a `this` pointer as the first parameter.
+function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: SymbolStr) -> void {
+    const func: FunctionDeclNode* = node.func;
+    if (func == null) { return; }
+
+    // Skip generic methods.
+    if (func.generic_params.length > 0) {
+        return;
+    }
+
+    const type_str: string = cg.intern.resolve(target_type);
+    const method_str: string = cg.intern.resolve(func.name);
+
+    // Build mangled name: Type_method
+    const type_qname: QualifiedName = QualifiedName::single(cg.intern, type_str);
+    const type_mangled: MangledName = MangledName::from_qualified(cg.intern, type_qname);
+
+    // Collect parameter display names for overload disambiguation.
+    mut param_displays: string[] = [];
+    for (mut i: i64 = 0; i < func.parameters.length; i++) {
+        const p: VarDeclNode* = func.parameters[i];
+        if (p.resolved_type.is_valid()) {
+            const pt: Type* = cg.arena.lookup(p.resolved_type.id);
+            if (pt != null) {
+                param_displays = param_displays + [pt.display_name()];
+            }
+        }
+    }
+
+    const mangled: MangledName = MangledName::for_method(
+        cg.intern, type_mangled, method_str, param_displays);
+    const fn_name: string = mangled.resolve(cg.intern);
+
+    // Build LLVM function type.  Non-static methods prepend a `this` pointer.
+    const ret_ty: LType = map_return_type(cg, func);
+    const is_instance: boolean = !node.is_static;
+
+    // Look up the target type for the `this` pointer.
+    mut this_ty: LType = LType::null();
+    if (is_instance) {
+        const target_ref: TypeRef = cg.ctx.decl_index.lookup_type(target_type);
+        if (target_ref.is_valid()) {
+            const mapped: LType = cg.type_mapper.map_type(target_ref);
+            this_ty = LType::pointer_to(mapped);
+        }
+    }
+
+    const user_param_count: u32 = func.parameters.length as u32;
+    const total_params: u32 = user_param_count + (if (is_instance) { 1 } else { 0 } as u32);
+
+    mut fn_type: LType = LType::null();
+    if (total_params == 0) {
+        fn_type = LType::function_type(ret_ty, null, 0, func.is_variadic);
+    } else {
+        const buf: void* = malloc(total_params as u64 * 8);
+        const slots: void** = buf as void**;
+
+        mut idx: u32 = 0;
+        if (is_instance) {
+            slots[0] = this_ty.raw;
+            idx = 1;
+        }
+
+        for (mut i: u32 = 0; i < user_param_count; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            slots[idx] = cg.type_mapper.map_type(param.resolved_type).raw;
+            idx = idx + 1;
+        }
+
+        fn_type = LType::function_type(ret_ty, buf, total_params, func.is_variadic);
+        free(buf);
+    }
+
+    const fn_val: LValue = cg.module.add_function(fn_name, fn_type);
+
+    // Use a combined key for method lookup: intern "Type::method".
+    const combined: string = format("%s::%s", type_str, method_str);
+    const combined_sym: SymbolStr = cg.intern.intern(combined);
+    cg.register_function(combined_sym, fn_val);
+
+    // Also register by bare method name for simple lookups.
+    cg.register_function(func.name, fn_val);
+}
+
+/// Declare extern block functions.
+function declare_extern_block(cg: CodegenContext*, node: ExternBlockNode*) -> void {
+    for (mut i: i64 = 0; i < node.functions.length; i++) {
+        const func: FunctionDeclNode* = node.functions[i];
+        if (func == null) { continue; }
+
+        const name_str: string = cg.intern.resolve(func.name);
+
+        // Extern functions use their bare name (C linkage).
+        const ret_ty: LType = map_return_type(cg, func);
+        const param_count: u32 = func.parameters.length as u32;
+
+        mut fn_type: LType = LType::null();
+        if (param_count == 0) {
+            fn_type = LType::function_type(ret_ty, null, 0, func.is_variadic);
+        } else {
+            const buf: void* = malloc(param_count as u64 * 8);
+            const slots: void** = buf as void**;
+            for (mut j: u32 = 0; j < param_count; j++) {
+                const param: VarDeclNode* = func.parameters[j];
+                slots[j] = cg.type_mapper.map_type(param.resolved_type).raw;
+            }
+            fn_type = LType::function_type(ret_ty, buf, param_count, func.is_variadic);
+            free(buf);
+        }
+
+        // Use bare name for C linkage.
+        const fn_val: LValue = cg.module.add_function(name_str, fn_type);
+        cg.register_function(func.name, fn_val);
+    }
+}
+
+/// Declare cross-module extern functions from the module graph.
+function declare_cross_module_externs(cg: CodegenContext*) -> void {
+    const descriptors: CrossModuleFnDescriptor[] = cg.ctx.module_graph.cross_module_fns;
+    for (mut i: i64 = 0; i < descriptors.length; i++) {
+        const desc: CrossModuleFnDescriptor = descriptors[i];
+
+        // Skip if already declared (could be from this module).
+        const existing: LValue = cg.get_function(desc.name);
+        if (existing.is_valid()) {
+            continue;
+        }
+
+        const ret_ty: LType = cg.type_mapper.map_type(desc.return_type);
+        const param_count: u32 = desc.param_types.length as u32;
+
+        mut fn_type: LType = LType::null();
+        if (param_count == 0) {
+            fn_type = LType::function_type(ret_ty, null, 0, desc.is_var_arg);
+        } else {
+            const buf: void* = malloc(param_count as u64 * 8);
+            const slots: void** = buf as void**;
+            for (mut j: u32 = 0; j < param_count; j++) {
+                slots[j] = cg.type_mapper.map_type(desc.param_types[j]).raw;
+            }
+            fn_type = LType::function_type(ret_ty, buf, param_count, desc.is_var_arg);
+            free(buf);
+        }
+
+        const name_str: string = cg.intern.resolve(desc.name);
+        const fn_val: LValue = cg.module.add_function(name_str, fn_type);
+        // Mark as external linkage (default for declarations without bodies).
+        cg.register_function(desc.name, fn_val);
+    }
+}
+
+
+// ============================================================================
+// Phase 3: Generate function bodies
+// ============================================================================
+
+/// Generate IR for all function bodies in the program.
+/// `visit_fn` is a callback that generates the body using the visitor.
+function generate_bodies(cg: CodegenContext*, program: ProgramNode*,
+                         visit_fn: void*) -> void {
+    const stmts: ASTNode*[] = program.statements;
+    for (mut i: i64 = 0; i < stmts.length; i++) {
+        const stmt: ASTNode* = stmts[i];
+        if (stmt == null) { continue; }
+
+        const kind: NodeKind = stmt.kind;
+
+        if (kind == NodeKind::FunctionDeclaration) {
+            const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
+            if (func.generic_params.length > 0) { continue; }
+            if (func.body == null) { continue; }
+            // Body generation happens through the visitor.
+        } else if (kind == NodeKind::VariableDeclaration) {
+            const var_decl: VarDeclNode* = stmt as VarDeclNode*;
+            if (var_decl.is_global) {
+                codegen_global_var(cg, var_decl);
+            }
+        }
+    }
+}
+
+
+// ============================================================================
+// Global variable codegen
+// ============================================================================
+
+/// Generate a global variable declaration with optional initializer.
+function codegen_global_var(cg: CodegenContext*, node: VarDeclNode*) -> void {
+    const name_str: string = cg.intern.resolve(node.name);
+    const qname: QualifiedName = QualifiedName::single(cg.intern, name_str);
+    const mangled: string = MangledName::for_global(cg.intern, qname).resolve(cg.intern);
+
+    const ty: LType = cg.type_mapper.map_type(node.resolved_type);
+    if (!ty.is_valid()) {
+        return;
+    }
+
+    const global: LValue = cg.module.add_global(ty, mangled);
+
+    // Set default initializer (zeroinitializer).
+    const init: LValue = LType::const_null(ty);
+    global.set_initializer(init);
+
+    if (!node.is_mutable) {
+        global.set_global_constant(true);
+    }
+
+    cg.register_global(node.name, global);
+}
+
+
+// ============================================================================
+// Function body codegen
+// ============================================================================
+
+/// Generate the body of a function.  Called from the IRGeneratorVisitor.
+///
+/// 1. Look up the LLVM function
+/// 2. Create entry basic block
+/// 3. Create allocas for parameters and store incoming values
+/// 4. Push scope, bind parameter names
+/// 5. The visitor will visit the body (BlockStmtNode)
+/// 6. Handle implicit return for void functions
+function codegen_function_prologue(cg: CodegenContext*, node: FunctionDeclNode*) -> LValue {
+    const fn_val: LValue = cg.get_function(node.name);
+    if (!fn_val.is_valid()) {
+        return LValue::null();
+    }
+
+    // Create entry basic block.
+    const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
+    cg.builder.position_at_end(entry_bb);
+
+    // Create allocas for each parameter and store the incoming value.
+    cg.push_scope();
+
+    for (mut i: u32 = 0; i < node.parameters.length as u32; i++) {
+        const param: VarDeclNode* = node.parameters[i];
+        const param_name: string = cg.intern.resolve(param.name);
+        const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
+
+        const alloca: LValue = cg.create_entry_alloca(fn_val, param_name, param_ty);
+        const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, i) };
+        cg.builder.build_store(arg, alloca);
+        cg.set_named_value(param.name, alloca);
+    }
+
+    return fn_val;
+}
+
+/// Emit implicit return if the current block has no terminator.
+function codegen_function_epilogue(cg: CodegenContext*, node: FunctionDeclNode*) -> void {
+    const current_bb: LBasicBlock = cg.builder.get_insert_block();
+    if (current_bb.is_valid() && !current_bb.has_terminator()) {
+        // Check if function returns void.
+        const ret_ty: TypeRef = node.resolved_return_type;
+        if (ret_ty.is_invalid()) {
+            cg.builder.build_ret_void();
+        } else {
+            const t: Type* = cg.arena.lookup(ret_ty.id);
+            if (t != null && (t.kind == TypeKind::Void || t.kind == TypeKind::Unit)) {
+                cg.builder.build_ret_void();
+            }
+            // Non-void functions without explicit return: insert unreachable.
+            // Sema should have caught this, so it shouldn't happen.
+        }
+    }
+    cg.pop_scope();
+}
+
+/// Generate function prologue for a method.  Prepends `this` parameter binding.
+function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
+                                  target_type: SymbolStr) -> LValue {
+    const func: FunctionDeclNode* = node.func;
+    if (func == null) { return LValue::null(); }
+
+    // Look up the function by combined key "Type::method".
+    const type_str: string = cg.intern.resolve(target_type);
+    const method_str: string = cg.intern.resolve(func.name);
+    const combined: string = format("%s::%s", type_str, method_str);
+    const combined_sym: SymbolStr = cg.intern.intern(combined);
+
+    const fn_val: LValue = cg.get_function(combined_sym);
+    if (!fn_val.is_valid()) {
+        return LValue::null();
+    }
+
+    const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
+    cg.builder.position_at_end(entry_bb);
+
+    cg.push_scope();
+
+    mut param_idx: u32 = 0;
+
+    // Bind `this` pointer for instance methods.
+    if (!node.is_static) {
+        const target_ref: TypeRef = cg.ctx.decl_index.lookup_type(target_type);
+        const mapped: LType = cg.type_mapper.map_type(target_ref);
+        const this_ty: LType = LType::pointer_to(mapped);
+
+        const alloca: LValue = cg.create_entry_alloca(fn_val, "this", this_ty);
+        const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
+        cg.builder.build_store(arg, alloca);
+
+        const this_sym: SymbolStr = cg.intern.intern("this");
+        cg.set_named_value(this_sym, alloca);
+        param_idx = 1;
+    }
+
+    // Bind remaining parameters.
+    for (mut i: u32 = 0; i < func.parameters.length as u32; i++) {
+        const param: VarDeclNode* = func.parameters[i];
+        const param_name: string = cg.intern.resolve(param.name);
+        const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
+
+        const alloca: LValue = cg.create_entry_alloca(fn_val, param_name, param_ty);
+        const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };
+        cg.builder.build_store(arg, alloca);
+        cg.set_named_value(param.name, alloca);
+        param_idx = param_idx + 1;
+    }
+
+    return fn_val;
+}
+
+
+// ============================================================================
+// VTable codegen
+// ============================================================================
+
+/// Generate a vtable global for a class with virtual methods.
+function codegen_vtable(cg: CodegenContext*, cls_ty: ClassType*) -> LValue {
+    const qname: QualifiedName = QualifiedName::from_symbol(cls_ty.qualified_name);
+    const mangled: string = MangledName::for_vtable(cg.intern, qname).resolve(cg.intern);
+
+    // Collect virtual methods.
+    mut virtual_methods: LValue[] = [];
+    for (mut i: i64 = 0; i < cls_ty.methods.length; i++) {
+        const m: MethodInfo = cls_ty.methods[i];
+        if (m.is_virtual || m.is_override) {
+            // Look up the LLVM function for this method.
+            const type_str: string = cg.intern.resolve(cls_ty.qualified_name);
+            const method_str: string = cg.intern.resolve(m.name);
+            const combined: string = format("%s::%s", type_str, method_str);
+            const combined_sym: SymbolStr = cg.intern.intern(combined);
+            const fn_val: LValue = cg.get_function(combined_sym);
+            if (fn_val.is_valid()) {
+                virtual_methods = virtual_methods + [fn_val];
+            }
+        }
+    }
+
+    if (virtual_methods.length == 0) {
+        return LValue::null();
+    }
+
+    // Create vtable type: [N x i8*] (array of function pointers).
+    const n: u32 = virtual_methods.length as u32;
+    const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
+    const vtable_ty: LType = LType::array_of(fn_ptr_ty, n);
+
+    // Build the constant initializer array.
+    const buf: void* = malloc(n as u64 * 8);
+    const slots: void** = buf as void**;
+    for (mut i: u32 = 0; i < n; i++) {
+        // Bitcast function pointer to i8*.
+        slots[i] = llvm::LLVMConstBitCast(virtual_methods[i].raw, fn_ptr_ty.raw);
+    }
+    const init: LValue = LType::const_array(fn_ptr_ty, buf, n);
+    free(buf);
+
+    // Create the global vtable.
+    const global: LValue = cg.module.add_global(vtable_ty, mangled);
+    global.set_initializer(init);
+    global.set_global_constant(true);
+    // Internal linkage since vtable is module-local unless inherited.
+    global.set_linkage(8);  // LLVMInternalLinkage = 8
+
+    return global;
+}
+
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Map a function's return type to an LLVMType.
+function map_return_type(cg: CodegenContext*, node: FunctionDeclNode*) -> LType {
+    if (node.resolved_return_type.is_invalid()) {
+        return LType::void_type();
+    }
+
+    const t: Type* = cg.arena.lookup(node.resolved_return_type.id);
+    if (t == null || t.kind == TypeKind::Void || t.kind == TypeKind::Unit) {
+        return LType::void_type();
+    }
+
+    return cg.type_mapper.map_type(node.resolved_return_type);
+}
