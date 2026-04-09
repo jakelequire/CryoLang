@@ -476,6 +476,12 @@ namespace Cryo
                 LOG_DEBUG(Cryo::LogComponent::GENERAL, "Set Monomorphizer in CodegenContext for specialized AST access");
             }
 
+            // Set CompilerInstance for C-import registry access during codegen
+            if (_codegen->ensure_visitor_initialized())
+            {
+                _codegen->get_visitor()->context().set_compiler_instance(this);
+            }
+
             // Set GenericRegistry for generic type resolution during codegen
             if (_codegen->ensure_visitor_initialized() && _generic_registry)
             {
@@ -4084,6 +4090,12 @@ namespace Cryo
                 LOG_DEBUG(LogComponent::GENERAL, "Set Monomorphizer in CodegenContext for specialized AST access");
             }
 
+            // Set CompilerInstance for C-import registry access during codegen
+            if (_codegen->ensure_visitor_initialized())
+            {
+                _codegen->get_visitor()->context().set_compiler_instance(this);
+            }
+
             // Set GenericRegistry for generic type resolution during codegen
             if (_codegen->ensure_visitor_initialized() && _generic_registry)
             {
@@ -4651,6 +4663,9 @@ namespace Cryo
 
             if (_codegen->ensure_visitor_initialized() && _monomorphization_pass)
                 _codegen->get_visitor()->context().set_monomorphizer(_monomorphization_pass.get());
+
+            if (_codegen->ensure_visitor_initialized())
+                _codegen->get_visitor()->context().set_compiler_instance(this);
 
             if (_codegen->ensure_visitor_initialized() && _generic_registry)
                 _codegen->get_visitor()->context().set_generic_registry(_generic_registry.get());

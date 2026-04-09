@@ -18,6 +18,7 @@
 #include "Codegen/CodeGenerator.hpp"
 #include "Codegen/LLVMContext.hpp"
 #include <unordered_map>
+#include <unordered_set>
 #include "Utils/SymbolResolutionManager.hpp"
 #include "Linker/CryoLinker.hpp"
 #include "Utils/File.hpp"
@@ -141,6 +142,20 @@ namespace Cryo
         };
         std::unordered_map<std::string, CrossModuleFnEntry> _cross_module_functions;
 
+        // Global C-import registry.
+        // Populated by CHeaderImportPass for extern "C" blocks with namespace aliases.
+        // Persists across modules so that `import`ing a module with a C-import
+        // block makes those symbols available to the importing module.
+        struct CImportEntry
+        {
+            std::string bare_name;       // e.g., "LLVMModuleCreateWithName"
+            std::string qualified_name;  // e.g., "llvm::LLVMModuleCreateWithName"
+            std::string ns_alias;        // e.g., "llvm"
+            FunctionDeclarationNode *decl = nullptr; // non-owning; owned by ExternBlockNode
+        };
+        std::unordered_map<std::string, CImportEntry> _c_import_registry;  // keyed by qualified_name
+        std::unordered_set<std::string> _c_import_prefixes;                // {"llvm", "c", ...}
+
         // Loaded source file (for pass-based compilation)
         std::unique_ptr<File> _loaded_file;
         std::string _loaded_file_path;
@@ -253,6 +268,31 @@ namespace Cryo
         // Extra object files from CLI
         void add_extra_object_file(const std::string &path) { _extra_object_files.push_back(path); }
         const std::vector<std::string> &extra_object_files() const { return _extra_object_files; }
+
+        // C-import registry (cross-module extern "C" symbol propagation)
+        void register_c_import(const std::string &ns_alias, FunctionDeclarationNode *decl)
+        {
+            if (!decl || ns_alias.empty())
+                return;
+            std::string qualified = ns_alias + "::" + decl->name();
+            _c_import_registry[qualified] = CImportEntry{decl->name(), qualified, ns_alias, decl};
+            _c_import_prefixes.insert(ns_alias);
+        }
+        FunctionDeclarationNode *lookup_c_import(const std::string &qualified_name) const
+        {
+            auto it = _c_import_registry.find(qualified_name);
+            if (it != _c_import_registry.end())
+                return it->second.decl;
+            return nullptr;
+        }
+        bool is_c_import_prefix(const std::string &prefix) const
+        {
+            return _c_import_prefixes.count(prefix) > 0;
+        }
+        const std::unordered_map<std::string, CImportEntry> &c_import_registry() const
+        {
+            return _c_import_registry;
+        }
 
         // Namespace context
         void set_namespace_context(const std::string &namespace_name);

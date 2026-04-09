@@ -1,5 +1,6 @@
 #include "Codegen/Expressions/CallCodegen.hpp"
 #include "Codegen/CodegenVisitor.hpp"
+#include "Compiler/CompilerInstance.hpp"
 #include "Codegen/Expressions/ExpressionCodegen.hpp"
 #include "Codegen/Memory/MemoryCodegen.hpp"
 #include "Codegen/Declarations/GenericCodegen.hpp"
@@ -41,7 +42,7 @@ namespace Cryo::Codegen
         "strchr", "strrchr", "strstr", "strdup", "substr",
         // I/O operations
         "printf", "println", "print", "eprintln", "eprint",
-        "snprintf", "sprintf", "fprintf", "sscanf", "getchar", "putchar", "puts", "format",
+        "snprintf", "sprintf", "fprintf", "sscanf", "atoi", "getchar", "putchar", "puts", "format",
         // File I/O
         "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "fflush", "feof", "ferror",
         "fgets", "fputs", "fgetc", "fputc", "fileno", "fdopen",
@@ -6784,6 +6785,54 @@ namespace Cryo::Codegen
         fn = create_forward_declaration_from_symbol(name);
         if (fn)
             return fn;
+
+        // C-import registry fallback: check if this function was declared in
+        // another module's extern "C" block with a namespace alias (e.g., llvm::LLVMFoo).
+        {
+            auto *compiler = ctx().compiler_instance();
+            if (compiler)
+            {
+                auto *c_import_decl = compiler->lookup_c_import(name);
+                if (c_import_decl)
+                {
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "resolve_function: Found C-import '{}' in global registry, bare name '{}'",
+                              name, c_import_decl->name());
+
+                    // Check if the bare name already exists in the module.
+                    std::string bare_name = c_import_decl->name();
+                    fn = module()->getFunction(bare_name);
+                    if (!fn)
+                    {
+                        // Create LLVM extern declaration from the AST node.
+                        llvm::Type *ret_type = nullptr;
+                        if (c_import_decl->has_resolved_return_type())
+                            ret_type = ctx().types().map_type(c_import_decl->get_resolved_return_type());
+                        if (!ret_type)
+                            ret_type = llvm::Type::getVoidTy(llvm_ctx());
+
+                        std::vector<llvm::Type *> param_types;
+                        for (const auto &param : c_import_decl->parameters())
+                        {
+                            llvm::Type *pt = nullptr;
+                            if (param->has_resolved_type())
+                                pt = ctx().types().map_type(param->get_resolved_type());
+                            if (pt)
+                                param_types.push_back(pt);
+                        }
+
+                        auto *fn_type = llvm::FunctionType::get(ret_type, param_types, c_import_decl->is_variadic());
+                        fn = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, bare_name, module());
+                    }
+                    if (fn)
+                    {
+                        // Cache under the qualified name too.
+                        ctx().register_function(name, fn);
+                        return fn;
+                    }
+                }
+            }
+        }
 
         return nullptr;
     }

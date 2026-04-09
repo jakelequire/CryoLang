@@ -38,33 +38,45 @@ type struct CodegenPasses {
             module_name = ctx.intern_table.resolve(ctx.namespace_str);
         }
 
-        if (ctx.debug_mode) {
-            printf("[Codegen] IR generation for module: %s\n", module_name);
-        }
+        printf("[Codegen] Step 1: IR generation for module: %s\n", module_name);
 
         // Initialize LLVM targets (idempotent).
+        printf("[Codegen] Step 2: Initializing LLVM targets...\n");
         init_native_target();
+        printf("[Codegen] Step 3: LLVM targets initialized\n");
 
         // Create per-module codegen context.
+        printf("[Codegen] Step 4: Creating CodegenContext...\n");
         mut cg: CodegenContext = CodegenContext::new(ctx, module_name);
+        printf("[Codegen] Step 5: CodegenContext created\n");
 
         // Set target triple and data layout.
+        printf("[Codegen] Step 6: Setting target triple...\n");
         const triple: string = get_default_triple();
-        cg.module.set_target_triple(triple);
+        cg.llvm_module.set_target_triple(triple);
+        printf("[Codegen] Step 7: Target triple set\n");
 
+        printf("[Codegen] Step 8: Creating target machine...\n");
         mut tm: LTargetMachine = create_native_target_machine();
         if (tm.is_valid()) {
             const layout: string = tm.get_data_layout_string();
-            cg.module.set_data_layout(layout);
+            cg.llvm_module.set_data_layout(layout);
         }
+        printf("[Codegen] Step 9: Target machine ready\n");
 
         // Declare cross-module extern functions.
+        printf("[Codegen] Step 10: Declaring cross-module externs...\n");
         declare_cross_module_externs(&cg);
+        printf("[Codegen] Step 11: Cross-module externs declared\n");
 
         // Create the visitor and generate IR.
+        printf("[Codegen] Step 12: Creating IRGeneratorVisitor...\n");
         mut gen: IRGeneratorVisitor = IRGeneratorVisitor(&cg);
+        printf("[Codegen] Step 13: Getting program AST...\n");
         const program: ProgramNode* = ctx.artifacts.ast.program();
+        printf("[Codegen] Step 14: Generating program IR (program=%p)...\n", program as void*);
         const success: boolean = gen.generate_program(program);
+        printf("[Codegen] Step 15: Program IR generation %s\n", if (success) { "succeeded" } else { "failed" });
 
         if (!success) {
             if (ctx.debug_mode) {
@@ -76,10 +88,10 @@ type struct CodegenPasses {
         }
 
         // Verify the LLVM module.
-        if (!cg.module.verify()) {
+        if (!cg.llvm_module.verify()) {
             if (ctx.debug_mode) {
                 printf("[Codegen] Module verification failed: %s\n", module_name);
-                printf("[Codegen] Module IR:\n%s\n", cg.module.print_to_string());
+                printf("[Codegen] Module IR:\n%s\n", cg.llvm_module.print_to_string());
             }
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 "LLVM module verification failed");
@@ -95,7 +107,7 @@ type struct CodegenPasses {
         // Store the LLVM module in artifacts.  The module is now owned by
         // artifacts — do NOT dispose it here.
         ctx.artifacts.ir = IROutput {
-            llvm_module: cg.module.raw,
+            llvm_module: cg.llvm_module.raw,
             module_name: module_name,
         };
 
@@ -157,8 +169,11 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
 
-        // Determine output path.
-        const output_dir: string = "build";
+        // Determine output path: {build_dir}/obj/{module_name}.o
+        mut output_dir: string = "build/obj";
+        if (ctx.project_config != null) {
+            output_dir = format("%s/obj", ctx.project_config.output_dir);
+        }
         const obj_name: string = format("%s/%s.o", output_dir, ctx.artifacts.ir.module_name);
 
         const mod: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
@@ -173,7 +188,9 @@ type struct CodegenPasses {
         }
 
         // Store the object file path.
-        ctx.artifacts.linked.object_file_path = obj_name;
+        // NOTE: Deep nested struct assignment (ctx.artifacts.linked.object_file_path)
+        // is not supported by the C++ compiler. Use a LinkedOutput replacement instead.
+        ctx.artifacts.linked = LinkedOutput { object_file_path: obj_name };
 
         if (ctx.debug_mode) {
             printf("[Codegen] Emitted: %s\n", obj_name);

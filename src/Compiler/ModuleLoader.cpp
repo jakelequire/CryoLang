@@ -1,4 +1,5 @@
 #include "Compiler/ModuleLoader.hpp"
+#include "Compiler/CHeaderProcessor.hpp"
 #include "Parser/Parser.hpp"
 #include "Lexer/lexer.hpp"
 #include "Utils/File.hpp"
@@ -1015,6 +1016,49 @@ namespace Cryo
 
             LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Successfully parsed {}", import_path);
 
+            // Process C header imports in the imported module's AST.
+            // CHeaderImportPass only runs on the main file's pipeline, so imported
+            // modules with `name := extern "C" { #include "..." }` blocks need
+            // their headers processed here.
+            {
+                std::string import_source_dir = get_parent_directory(file_path);
+                if (import_source_dir.empty())
+                    import_source_dir = ".";
+
+                CHeaderProcessor processor;
+                for (const auto &stmt : ast->statements())
+                {
+                    auto *extern_block = dynamic_cast<ExternBlockNode *>(stmt.get());
+                    if (!extern_block || !extern_block->is_c_import())
+                        continue;
+
+                    LOG_DEBUG(LogComponent::GENERAL,
+                              "ModuleLoader: Processing C import block in imported module {} ({} include paths)",
+                              import_path, extern_block->include_paths().size());
+
+                    for (const auto &include_path : extern_block->include_paths())
+                    {
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "ModuleLoader: Processing #include \"{}\" from imported module {}",
+                                  include_path, import_path);
+
+                        auto func_nodes = processor.process_header(
+                            include_path,
+                            import_source_dir,
+                            _ast_context.types());
+
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "ModuleLoader: Got {} function declarations from {}",
+                                  func_nodes.size(), include_path);
+
+                        for (auto &func : func_nodes)
+                        {
+                            extern_block->add_function_declaration(std::move(func));
+                        }
+                    }
+                }
+            }
+
             // Check if this is a runtime module that needs auto-imports
             if (_auto_import_callback &&
                 (import_path.find("runtime/runtime") != std::string::npos ||
@@ -1211,6 +1255,23 @@ namespace Cryo
                 else if (auto intrinsic_decl = dynamic_cast<IntrinsicDeclarationNode *>(decl))
                 {
                     exported_symbols.push_back(intrinsic_decl->name());
+                }
+                else if (auto extern_block = dynamic_cast<ExternBlockNode *>(decl))
+                {
+                    // Handle C import extern blocks — export functions with namespace alias
+                    if (extern_block->is_c_import() && !extern_block->namespace_alias().empty())
+                    {
+                        std::string ns_alias = extern_block->namespace_alias();
+                        for (const auto &func : extern_block->function_declarations())
+                        {
+                            // Export both bare and qualified names
+                            exported_symbols.push_back(func->name());
+                            exported_symbols.push_back(ns_alias + "::" + func->name());
+                        }
+                        LOG_DEBUG(LogComponent::GENERAL,
+                                  "ModuleLoader: Exported {} C-import functions from namespace '{}'",
+                                  extern_block->function_declarations().size(), ns_alias);
+                    }
                 }
                 else if (auto module_decl = dynamic_cast<ModuleDeclarationNode *>(decl))
                 {
@@ -2456,6 +2517,45 @@ namespace Cryo
         }
         LOG_DEBUG(LogComponent::GENERAL, "ModuleLoader: Registered types from '{}' in ModuleTypeRegistry (module_id={})",
                   module_name, module_id.id);
+
+        // Register C-import extern block functions with their namespace-qualified names.
+        // This makes `llvm::LLVMFoo()` resolvable from any module that imports the
+        // module containing the `llvm := extern "C" { ... }` block.
+        for (const auto &statement : ast.statements())
+        {
+            auto *extern_block = dynamic_cast<ExternBlockNode *>(statement.get());
+            if (!extern_block || !extern_block->is_c_import())
+                continue;
+
+            std::string ns_alias = extern_block->namespace_alias();
+            if (ns_alias.empty())
+                continue;
+
+            for (const auto &func : extern_block->function_declarations())
+            {
+                // Create function type for this C-imported function.
+                TypeRef func_type = create_function_type_from_declaration(func.get(), &type_arena);
+
+                // Register with bare name.
+                Symbol bare_sym(func->name(), SymbolKind::Function, func_type, module_id, func->location());
+                bare_sym.scope = module_name;
+                symbol_map[func->name()] = bare_sym;
+
+                // Register with namespace-qualified name (e.g., "llvm::LLVMModuleCreateWithName").
+                std::string qualified = ns_alias + "::" + func->name();
+                Symbol qual_sym(qualified, SymbolKind::Function, func_type, module_id, func->location());
+                qual_sym.scope = module_name;
+                symbol_map[qualified] = qual_sym;
+
+                // Also register in the main symbol table so it's visible globally.
+                _symbol_table.declare(qual_sym);
+                _symbol_table.declare(bare_sym);
+            }
+
+            LOG_DEBUG(LogComponent::GENERAL,
+                      "ModuleLoader: Registered {} C-import functions from namespace '{}' in module '{}'",
+                      extern_block->function_declarations().size(), ns_alias, module_name);
+        }
 
         return symbol_map;
     }
