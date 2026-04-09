@@ -1,0 +1,216 @@
+/// Codegen Passes
+///
+/// Entry points for the four codegen passes: IRGeneration, Optimization,
+/// ObjectEmission, and Linking.  Called by PassRegistry::run_pass().
+
+namespace Compiler::Codegen::Passes;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Context;
+import Compiler::Codegen::IRGenerator;
+import Compiler::Codegen::DeclCodegen;
+import Compiler::CompilationContext;
+import Compiler::Artifacts;
+import Compiler::Diag;
+import Compiler::Diag::Snapshot;
+import Compiler::AST::Node;
+import Compiler::Passes::PassID;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::SymbolStr;
+
+
+// ============================================================================
+// Codegen Pass Implementations
+// ============================================================================
+
+type struct CodegenPasses {
+
+    /// IRGeneration pass.  Creates an LLVM module, walks the AST, and
+    /// produces LLVM IR.  Stores result in ctx.artifacts.ir.
+    static run_ir_generation(ctx: CompilationContext*) -> PassResult {
+        const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+        // Resolve module name.
+        mut module_name: string = "main";
+        if (ctx.namespace_str.is_valid()) {
+            module_name = ctx.intern_table.resolve(ctx.namespace_str);
+        }
+
+        if (ctx.debug_mode) {
+            printf("[Codegen] IR generation for module: %s\n", module_name);
+        }
+
+        // Initialize LLVM targets (idempotent).
+        init_native_target();
+
+        // Create per-module codegen context.
+        mut cg: CodegenContext = CodegenContext::new(ctx, module_name);
+
+        // Set target triple and data layout.
+        const triple: string = get_default_triple();
+        cg.module.set_target_triple(triple);
+
+        mut tm: LTargetMachine = create_native_target_machine();
+        if (tm.is_valid()) {
+            const layout: string = tm.get_data_layout_string();
+            cg.module.set_data_layout(layout);
+        }
+
+        // Declare cross-module extern functions.
+        declare_cross_module_externs(&cg);
+
+        // Create the visitor and generate IR.
+        mut gen: IRGeneratorVisitor = IRGeneratorVisitor(&cg);
+        const program: ProgramNode* = ctx.artifacts.ast.program();
+        const success: boolean = gen.generate_program(program);
+
+        if (!success) {
+            if (ctx.debug_mode) {
+                printf("[Codegen] IR generation failed for module: %s\n", module_name);
+            }
+            cg.dispose_builder();
+            tm.dispose();
+            return PassResult::from_snapshot(ctx.diagnostics, snap);
+        }
+
+        // Verify the LLVM module.
+        if (!cg.module.verify()) {
+            if (ctx.debug_mode) {
+                printf("[Codegen] Module verification failed: %s\n", module_name);
+                printf("[Codegen] Module IR:\n%s\n", cg.module.print_to_string());
+            }
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                "LLVM module verification failed");
+            cg.dispose_builder();
+            tm.dispose();
+            return PassResult::failure(1);
+        }
+
+        if (ctx.debug_mode) {
+            printf("[Codegen] Module verified: %s\n", module_name);
+        }
+
+        // Store the LLVM module in artifacts.  The module is now owned by
+        // artifacts — do NOT dispose it here.
+        ctx.artifacts.ir = IROutput {
+            llvm_module: cg.module.raw,
+            module_name: module_name,
+        };
+
+        cg.dispose_builder();
+        tm.dispose();
+
+        return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+
+
+    /// Optimization pass.  Runs LLVM's new pass manager on the module.
+    static run_optimization(ctx: CompilationContext*) -> PassResult {
+        if (!ctx.artifacts.ir.is_valid()) {
+            return PassResult::ok();
+        }
+
+        if (ctx.debug_mode) {
+            printf("[Codegen] Optimization for module: %s\n", ctx.artifacts.ir.module_name);
+        }
+
+        mut tm: LTargetMachine = create_native_target_machine();
+        if (!tm.is_valid()) {
+            printf("[Codegen] Warning: no target machine, skipping optimization\n");
+            return PassResult::ok();
+        }
+
+        // Run default O2 optimization pipeline.
+        const opts: void* = llvm::LLVMCreatePassBuilderOptions();
+        const passes: string = "default<O2>";
+        const result: i32 = llvm::LLVMRunPasses(
+            ctx.artifacts.ir.llvm_module, passes, tm.raw, opts);
+        llvm::LLVMDisposePassBuilderOptions(opts);
+        tm.dispose();
+
+        if (result != 0) {
+            if (ctx.debug_mode) {
+                printf("[Codegen] Optimization failed (error code %d)\n", result);
+            }
+        }
+
+        return PassResult::ok();
+    }
+
+
+    /// ObjectEmission pass.  Emits a .o file from the LLVM module.
+    static run_object_emission(ctx: CompilationContext*) -> PassResult {
+        if (!ctx.artifacts.ir.is_valid()) {
+            return PassResult::ok();
+        }
+
+        if (ctx.debug_mode) {
+            printf("[Codegen] Object emission for module: %s\n", ctx.artifacts.ir.module_name);
+        }
+
+        mut tm: LTargetMachine = create_native_target_machine();
+        if (!tm.is_valid()) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                "failed to create target machine for object emission");
+            return PassResult::failure(1);
+        }
+
+        // Determine output path.
+        const output_dir: string = "build";
+        const obj_name: string = format("%s/%s.o", output_dir, ctx.artifacts.ir.module_name);
+
+        const mod: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
+        // LLVMObjectFile = 1
+        const success: boolean = tm.emit_to_file(mod, obj_name, 1);
+        tm.dispose();
+
+        if (!success) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("failed to emit object file: %s", obj_name));
+            return PassResult::failure(1);
+        }
+
+        // Store the object file path.
+        ctx.artifacts.linked.object_file_path = obj_name;
+
+        if (ctx.debug_mode) {
+            printf("[Codegen] Emitted: %s\n", obj_name);
+        }
+
+        return PassResult::ok();
+    }
+
+
+    /// Linking pass.  Invokes the system linker to combine all object files.
+    static run_linking(ctx: CompilationContext*) -> PassResult {
+        const obj_path: string = ctx.artifacts.linked.object_file_path;
+        if (obj_path == "") {
+            return PassResult::ok();
+        }
+
+        if (ctx.debug_mode) {
+            printf("[Codegen] Linking: %s\n", obj_path);
+        }
+
+        // Determine output executable name.
+        mut exe_name: string = "build/output";
+        if (ctx.project_config != null) {
+            exe_name = format("build/%s", ctx.project_config.project_name);
+        }
+
+        // Build linker command.
+        const cmd: string = format("cc -o %s %s -lm", exe_name, obj_path);
+
+        if (ctx.debug_mode) {
+            printf("[Codegen] Link command: %s\n", cmd);
+        }
+
+        // TODO: Execute the link command via system().
+        // For now, just print the command.
+        printf("[Codegen] TODO: execute link command\n");
+
+        return PassResult::ok();
+    }
+}

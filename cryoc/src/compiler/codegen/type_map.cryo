@@ -1,0 +1,437 @@
+/// Type Mapper
+///
+/// Converts Cryo TypeRef handles to LLVM IR types.  Caches results by
+/// TypeRef.id for deduplication and O(1) repeated lookups.  Handles all
+/// 25 TypeKind variants including recursive struct types (forward-declare
+/// then fill body).
+
+namespace Compiler::Codegen::TypeMap;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Generic;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::MangledName;
+import Compiler::Resolver::QualifiedName;
+
+
+// ============================================================================
+// TypeMapper
+// ============================================================================
+
+type struct TypeMapper {
+    // Cache: TypeRef.id -> LLVMTypeRef raw pointer.
+    // Parallel arrays (same pattern as DeclarationIndex, ModuleGraph).
+    cache_keys:   u64[];
+    cache_values: void*[];
+
+    arena:  TypeArena*;
+    intern: InternTable*;
+
+    static new(arena: TypeArena*, intern: InternTable*) -> TypeMapper {
+        return TypeMapper {
+            cache_keys:   [],
+            cache_values: [],
+            arena:        arena,
+            intern:       intern,
+        };
+    }
+
+    /// Primary entry point.  Returns the LLVMType for a Cryo TypeRef.
+    map_type(mut &this, ty: TypeRef) -> LType {
+        if (ty.is_invalid()) {
+            return LType::null();
+        }
+
+        // Check cache first.
+        const cached: LType = this.lookup_cache(ty.id);
+        if (cached.is_valid()) {
+            return cached;
+        }
+
+        // Look up the Cryo type in the arena.
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) {
+            return LType::null();
+        }
+
+        const result: LType = this.map_type_impl(t);
+        if (result.is_valid()) {
+            this.store_cache(ty.id, result);
+        }
+        return result;
+    }
+
+    /// Map a Type* directly (for internal use when we already have the pointer).
+    map_type_ptr(mut &this, t: Type*) -> LType {
+        if (t == null) {
+            return LType::null();
+        }
+        const cached: LType = this.lookup_cache(t.id);
+        if (cached.is_valid()) {
+            return cached;
+        }
+        const result: LType = this.map_type_impl(t);
+        if (result.is_valid()) {
+            this.store_cache(t.id, result);
+        }
+        return result;
+    }
+
+    /// Forward-declare a named struct type.  Returns an opaque struct that
+    /// can be referenced by pointer before its body is filled in.
+    forward_declare_struct(mut &this, name: string, type_id: u64) -> LType {
+        const ctx: LContext = LContext::global();
+        const llvm_ty: LType = LType::named_struct(ctx, name);
+        this.store_cache(type_id, llvm_ty);
+        return llvm_ty;
+    }
+
+    /// Fill the body of a previously forward-declared struct.
+    fill_struct_body(mut &this, llvm_ty: LType, field_types: TypeRef[], packed: boolean) -> void {
+        const n: u32 = field_types.length;
+        // Allocate raw array of LLVMTypeRef for the C API.
+        const buf: void* = malloc(n as u64 * 8);
+        const slots: void** = buf as void**;
+
+        for (mut i: u32 = 0; i < n; i++) {
+            const ft: LType = this.map_type(field_types[i]);
+            slots[i] = ft.raw;
+        }
+
+        llvm_ty.set_struct_body(buf, n, packed);
+        free(buf);
+    }
+
+
+    // ========================================================================
+    // Internal dispatch
+    // ========================================================================
+
+    map_type_impl(mut &this, t: Type*) -> LType {
+        return match (t.kind) {
+            TypeKind::Void             => { LType::void_type() }
+            TypeKind::Unit             => { this.map_unit() }
+            TypeKind::Bool             => { LType::i1() }
+            TypeKind::Int              => { this.map_int(t as IntType*) }
+            TypeKind::Float            => { this.map_float(t as FloatType*) }
+            TypeKind::Char             => { LType::i32() }
+            TypeKind::String           => { this.map_string() }
+            TypeKind::Never            => { LType::void_type() }
+            TypeKind::Pointer          => { this.map_pointer(t as PointerType*) }
+            TypeKind::Reference        => { this.map_reference(t as ReferenceType*) }
+            TypeKind::Array            => { this.map_array(t as ArrayType*) }
+            TypeKind::Function         => { this.map_function(t as FunctionType*) }
+            TypeKind::Tuple            => { this.map_tuple(t as TupleType*) }
+            TypeKind::Optional         => { this.map_optional(t as OptionalType*) }
+            TypeKind::Struct           => { this.map_struct(t as StructType*) }
+            TypeKind::Class            => { this.map_class(t as ClassType*) }
+            TypeKind::Enum             => { this.map_enum(t as EnumType*) }
+            TypeKind::Trait            => { LType::i8() }  // trait objects are opaque pointers
+            TypeKind::TypeAlias        => { this.map_type_alias(t as TypeAliasType*) }
+            TypeKind::GenericParam     => { LType::null() }  // should not reach codegen
+            TypeKind::BoundedParam     => { LType::null() }  // should not reach codegen
+            TypeKind::InstantiatedType => { this.map_instantiated(t as InstantiatedType*) }
+            TypeKind::FunctionTemplate => { LType::null() }  // template, not concrete
+            TypeKind::Error            => { LType::null() }
+        };
+    }
+
+
+    // ========================================================================
+    // Primitive type mappers
+    // ========================================================================
+
+    /// Unit type → empty struct {}
+    map_unit(mut &this) -> LType {
+        return LType::literal_struct(null, 0, false);
+    }
+
+    /// IntType → LLVMIntType with correct bit width.
+    map_int(mut &this, t: IntType*) -> LType {
+        return LType::int_type(t.int_kind.bit_width() as u32);
+    }
+
+    /// FloatType → LLVMFloatType or LLVMDoubleType.
+    map_float(mut &this, t: FloatType*) -> LType {
+        return match (t.float_kind) {
+            FloatKind::F32 => { LType::f32() }
+            FloatKind::F64 => { LType::f64() }
+        };
+    }
+
+    /// String → { i8*, i64 } (pointer + length).
+    map_string(mut &this) -> LType {
+        const buf: void* = malloc(16);
+        const slots: void** = buf as void**;
+        slots[0] = LType::pointer_to(LType::i8()).raw;
+        slots[1] = LType::i64().raw;
+        const result: LType = LType::literal_struct(buf, 2, false);
+        free(buf);
+        return result;
+    }
+
+
+    // ========================================================================
+    // Compound type mappers
+    // ========================================================================
+
+    /// Pointer → LLVMPointerType(pointee, 0)
+    map_pointer(mut &this, t: PointerType*) -> LType {
+        const pointee: LType = this.map_type(t.pointee);
+        if (!pointee.is_valid()) {
+            return LType::pointer_to(LType::i8());  // fallback to i8* for void*
+        }
+        return LType::pointer_to(pointee);
+    }
+
+    /// Reference → pointer at IR level.
+    map_reference(mut &this, t: ReferenceType*) -> LType {
+        const referent: LType = this.map_type(t.referent);
+        if (!referent.is_valid()) {
+            return LType::pointer_to(LType::i8());
+        }
+        return LType::pointer_to(referent);
+    }
+
+    /// Array → fixed: [N x T]; dynamic: { T*, i64 }
+    map_array(mut &this, t: ArrayType*) -> LType {
+        const elem: LType = this.map_type(t.element);
+        if (!elem.is_valid()) {
+            return LType::null();
+        }
+
+        if (t.is_fixed()) {
+            return LType::array_of(elem, t.size as u32);
+        }
+
+        // Dynamic array: fat pointer { T*, i64 }
+        const buf: void* = malloc(16);
+        const slots: void** = buf as void**;
+        slots[0] = LType::pointer_to(elem).raw;
+        slots[1] = LType::i64().raw;
+        const result: LType = LType::literal_struct(buf, 2, false);
+        free(buf);
+        return result;
+    }
+
+    /// FunctionType → LLVMFunctionType(ret, params, is_variadic)
+    map_function(mut &this, t: FunctionType*) -> LType {
+        const ret: LType = this.map_type(t.return_type);
+        const n: u32 = t.param_types.length;
+
+        if (n == 0) {
+            return LType::function_type(ret, null, 0, t.is_variadic);
+        }
+
+        const buf: void* = malloc(n as u64 * 8);
+        const slots: void** = buf as void**;
+        for (mut i: u32 = 0; i < n; i++) {
+            slots[i] = this.map_type(t.param_types[i]).raw;
+        }
+        const result: LType = LType::function_type(ret, buf, n, t.is_variadic);
+        free(buf);
+        return result;
+    }
+
+    /// Tuple → anonymous struct { elem0, elem1, ... }
+    map_tuple(mut &this, t: TupleType*) -> LType {
+        const n: u32 = t.elements.length;
+        const buf: void* = malloc(n as u64 * 8);
+        const slots: void** = buf as void**;
+        for (mut i: u32 = 0; i < n; i++) {
+            slots[i] = this.map_type(t.elements[i]).raw;
+        }
+        const result: LType = LType::literal_struct(buf, n, false);
+        free(buf);
+        return result;
+    }
+
+    /// Optional<T> → { T, i1 } (value + has_value flag)
+    map_optional(mut &this, t: OptionalType*) -> LType {
+        const wrapped: LType = this.map_type(t.wrapped);
+        const buf: void* = malloc(16);
+        const slots: void** = buf as void**;
+        slots[0] = wrapped.raw;
+        slots[1] = LType::i1().raw;
+        const result: LType = LType::literal_struct(buf, 2, false);
+        free(buf);
+        return result;
+    }
+
+
+    // ========================================================================
+    // User-defined type mappers
+    // ========================================================================
+
+    /// StructType → named LLVM struct with fields.
+    /// If already forward-declared (in cache), just returns it.
+    map_struct(mut &this, t: StructType*) -> LType {
+        const mangled: string = MangledName::for_struct(this.intern, QualifiedName::from_symbol(t.qualified_name)).resolve(this.intern);
+
+        // Check if already forward-declared.
+        const cached: LType = this.lookup_cache(t.id);
+        if (cached.is_valid()) {
+            return cached;
+        }
+
+        // Forward-declare to handle recursive references.
+        const ctx: LContext = LContext::global();
+        mut llvm_ty: LType = LType::named_struct(ctx, mangled);
+        this.store_cache(t.id, llvm_ty);
+
+        // Build field type array.
+        const n: u32 = t.fields.length as u32;
+        if (n > 0) {
+            const buf: void* = malloc(n as u64 * 8);
+            const slots: void** = buf as void**;
+            for (mut i: u32 = 0; i < n; i++) {
+                slots[i] = this.map_type(t.fields[i].field_type).raw;
+            }
+            llvm_ty.set_struct_body(buf, n, false);
+            free(buf);
+        } else {
+            llvm_ty.set_struct_body(null, 0, false);
+        }
+
+        return llvm_ty;
+    }
+
+    /// ClassType → struct with optional vtable pointer at index 0.
+    map_class(mut &this, t: ClassType*) -> LType {
+        const mangled: string = MangledName::for_struct(this.intern, QualifiedName::from_symbol(t.qualified_name)).resolve(this.intern);
+
+        const cached: LType = this.lookup_cache(t.id);
+        if (cached.is_valid()) {
+            return cached;
+        }
+
+        const ctx: LContext = LContext::global();
+        mut llvm_ty: LType = LType::named_struct(ctx, mangled);
+        this.store_cache(t.id, llvm_ty);
+
+        // Count fields: vtable pointer (if virtual) + actual fields.
+        const has_vtable: boolean = t.has_virtual_methods;
+        const field_count: u32 = t.fields.length as u32;
+        const total: u32 = field_count + (if (has_vtable) { 1 } else { 0 } as u32);
+
+        if (total > 0) {
+            const buf: void* = malloc(total as u64 * 8);
+            const slots: void** = buf as void**;
+
+            mut idx: u32 = 0;
+            if (has_vtable) {
+                // vtable pointer: i8** (pointer to array of function pointers)
+                slots[0] = LType::pointer_to(LType::pointer_to(LType::i8())).raw;
+                idx = 1;
+            }
+
+            for (mut i: u32 = 0; i < field_count; i++) {
+                slots[idx] = this.map_type(t.fields[i].field_type).raw;
+                idx = idx + 1;
+            }
+
+            llvm_ty.set_struct_body(buf, total, false);
+            free(buf);
+        } else {
+            llvm_ty.set_struct_body(null, 0, false);
+        }
+
+        return llvm_ty;
+    }
+
+    /// EnumType → simple: i32; ADT: { i32, [max_payload x i8] }
+    map_enum(mut &this, t: EnumType*) -> LType {
+        if (t.is_simple_enum()) {
+            return LType::i32();
+        }
+
+        // ADT enum: find max payload size across variants.
+        mut max_payload: u64 = 0;
+        for (mut i: i64 = 0; i < t.variants.length; i++) {
+            const v: EnumVariantInfo = t.variants[i];
+            if (v.has_payload()) {
+                mut variant_size: u64 = 0;
+                for (mut j: i64 = 0; j < v.payload_types.length; j++) {
+                    const pt: Type* = this.arena.lookup(v.payload_types[j].id);
+                    if (pt != null) {
+                        variant_size = variant_size + pt.size_bytes();
+                    }
+                }
+                if (variant_size > max_payload) {
+                    max_payload = variant_size;
+                }
+            }
+        }
+
+        // { i32 tag, [max_payload x i8] }
+        const buf: void* = malloc(16);
+        const slots: void** = buf as void**;
+        slots[0] = LType::i32().raw;
+        if (max_payload > 0) {
+            slots[1] = LType::array_of(LType::i8(), max_payload as u32).raw;
+            const result: LType = LType::literal_struct(buf, 2, false);
+            free(buf);
+            return result;
+        } else {
+            free(buf);
+            return LType::i32();
+        }
+    }
+
+
+    // ========================================================================
+    // Alias / Instantiated type mappers
+    // ========================================================================
+
+    /// TypeAlias → delegates to target type.
+    map_type_alias(mut &this, t: TypeAliasType*) -> LType {
+        if (t.has_target()) {
+            return this.map_type(t.target);
+        }
+        return LType::null();
+    }
+
+    /// InstantiatedType → delegates to resolved_type.
+    /// By the time codegen runs, all instantiated types have been resolved
+    /// by the monomorphization pass.
+    map_instantiated(mut &this, t: InstantiatedType*) -> LType {
+        if (t.has_resolved_type()) {
+            return this.map_type(t.resolved_type);
+        }
+        return LType::null();
+    }
+
+
+    // ========================================================================
+    // Cache
+    // ========================================================================
+
+    lookup_cache(&this, id: u64) -> LType {
+        for (mut i: i64 = 0; i < this.cache_keys.length; i++) {
+            if (this.cache_keys[i] == id) {
+                return LType { raw: this.cache_values[i] };
+            }
+        }
+        return LType::null();
+    }
+
+    store_cache(mut &this, id: u64, ty: LType) -> void {
+        // Check if already present (update in place).
+        for (mut i: i64 = 0; i < this.cache_keys.length; i++) {
+            if (this.cache_keys[i] == id) {
+                this.cache_values[i] = ty.raw;
+                return;
+            }
+        }
+        this.cache_keys   = this.cache_keys + [id];
+        this.cache_values = this.cache_values + [ty.raw];
+    }
+}
