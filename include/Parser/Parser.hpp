@@ -170,7 +170,7 @@ namespace Cryo
         std::unique_ptr<EnumDeclarationNode> parse_enum_declaration();
         std::unique_ptr<TypeAliasDeclarationNode> parse_type_alias_declaration();
         std::unique_ptr<ImplementationBlockNode> parse_implementation_block();
-        std::unique_ptr<ExternBlockNode> parse_extern_block();
+        std::unique_ptr<ExternBlockNode> parse_extern_block(std::string namespace_alias = "");
         std::unique_ptr<ReturnStatementNode> parse_return_statement();
         std::unique_ptr<BlockStatementNode> parse_block_statement();
         std::unique_ptr<ASTNode> parse_if_statement();

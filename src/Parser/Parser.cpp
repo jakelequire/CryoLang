@@ -1375,9 +1375,22 @@ namespace Cryo
             }
             else
             {
-                // This is "extern \"C\" { ... }" syntax
+                // This is "extern \"C\" { ... }" syntax (no namespace alias)
                 statement = parse_extern_block();
             }
+        }
+        // CImport with namespace alias: c := extern "C" { #include ... }
+        else if (_current_token.is(TokenKind::TK_IDENTIFIER) &&
+                 peek_next().is(TokenKind::TK_COLON) &&
+                 peek_next_n(2).is(TokenKind::TK_EQUAL) &&
+                 peek_next_n(3).is(TokenKind::TK_KW_EXTERN))
+        {
+            // Parse: identifier := extern "C" { #include ... }
+            std::string namespace_alias = std::string(_current_token.text());
+            advance(); // consume identifier
+            advance(); // consume ':'
+            advance(); // consume '='
+            statement = parse_extern_block(namespace_alias);
         }
         // Intrinsic function declarations
         else if (_current_token.is(TokenKind::TK_KW_INTRINSIC))
@@ -6321,13 +6334,13 @@ namespace Cryo
         return impl_block;
     }
 
-    std::unique_ptr<ExternBlockNode> Parser::parse_extern_block()
+    std::unique_ptr<ExternBlockNode> Parser::parse_extern_block(std::string namespace_alias)
     {
         SourceLocation start_loc = _current_token.location();
 
         consume(TokenKind::TK_KW_EXTERN, "Expected 'extern'");
 
-        // Parse linkage specifier (e.g., "C" or "CImport")
+        // Parse linkage specifier (e.g., "C")
         // NOTE: Must capture text BEFORE advance() — Token holds a string_view
         // into lexer memory that advance() can invalidate.
         if (!_current_token.is(TokenKind::TK_STRING_LITERAL))
@@ -6344,22 +6357,13 @@ namespace Cryo
             linkage_type = linkage_type.substr(1, linkage_type.length() - 2);
         }
 
-        // Parse optional namespace alias (e.g., "ex" in extern "CImport" ex { ... })
-        // Same pattern: capture text before advance.
-        std::string namespace_alias;
-        if (_current_token.is(TokenKind::TK_IDENTIFIER))
-        {
-            namespace_alias = std::string(_current_token.text());
-            advance();
-        }
-
         auto extern_block = _builder.create_extern_block(start_loc, linkage_type, namespace_alias);
 
         consume(TokenKind::TK_L_BRACE, "Expected '{' after extern linkage");
 
-        if (linkage_type == "CImport")
+        if (!namespace_alias.empty())
         {
-            // Parse #include directives within the CImport block
+            // Parse #include directives within the CImport block (name := extern "C" { ... })
             while (!_current_token.is(TokenKind::TK_R_BRACE) && !is_at_end())
             {
                 try
@@ -6373,7 +6377,7 @@ namespace Cryo
                         if (!_current_token.is(TokenKind::TK_IDENTIFIER) ||
                             std::string(_current_token.text()) != "include")
                         {
-                            error("Expected 'include' after '#' in CImport block");
+                            error("Expected 'include' after '#' in extern C import block");
                             synchronize();
                             continue;
                         }
@@ -6400,7 +6404,7 @@ namespace Cryo
                     }
                     else
                     {
-                        error("Expected '#include' directive in CImport block");
+                        error("Expected '#include' directive in extern C import block");
                         synchronize();
                     }
                 }

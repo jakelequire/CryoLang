@@ -4509,7 +4509,7 @@ namespace Cryo::Codegen
             {
                 llvm::Function *fn = generate_extern_function(fn_decl.get());
 
-                // For CImport blocks with a namespace alias, also register the
+                // For C import blocks with a namespace alias, also register the
                 // function under the qualified name (e.g., "ex::greet" -> llvm "greet")
                 if (fn && node->is_c_import() && !ns_alias.empty())
                 {
@@ -4529,7 +4529,7 @@ namespace Cryo::Codegen
 
                     ctx().register_function(qualified_name, fn);
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "DeclarationCodegen: Registered CImport function alias: {} -> {}",
+                              "DeclarationCodegen: Registered C import function alias: {} -> {}",
                               qualified_name, fn_decl->name());
                 }
             }
