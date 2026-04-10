@@ -28,6 +28,7 @@ import Compiler::AST::Pattern;
 import Compiler::AST::Visitor;
 import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
+import Compiler::ModuleGraph;
 import Compiler::Resolver::QualifiedName;
 import Utils::Logger;
 
@@ -763,15 +764,21 @@ public:
         // Try to find the module in the graph by its actual registered name.
         // ModuleGraph::find_module_index uses the module's namespace-based name,
         // which matches dependencies recorded by the loader.
-        const _mg: ModuleGraph* = this.ctx.module_graph;
-        const graph_idx: i64 = _mg.find_module_index(module_sym);
+        // NOTE: Access module_graph directly through this.ctx rather than a local
+        // pointer — the C++ compiler resolves method calls and field accesses
+        // correctly through this.ctx.module_graph but not through a local alias.
+        const graph_idx: i64 = this.ctx.module_graph.find_module_index(module_sym);
         if (graph_idx < 0) {
             // The raw import path didn't match — try resolving through the
             // module graph's file path lookup.  The ImportResolution pass
             // may have stored the resolved path; search all modules for one
             // whose import-path suffix matches.
-            for (mut k: i64 = 0; k < _mg.modules.length; k++) {
-                const candidate: ModuleInfo = _mg.modules[k];
+            // Use module_count() for the bound — method calls resolve
+            // correctly through the pointer chain, whereas .modules.length
+            // loses type info when accessed through this.ctx.
+            const _mod_count: i64 = this.ctx.module_graph.module_count() as i64;
+            for (mut k: i64 = 0; k < _mod_count; k++) {
+                const candidate: ModuleInfo = this.ctx.module_graph.get_module(k);
                 const cand_name: string = this.resolver.intern_table.resolve(candidate.name);
                 // Check if the candidate's name ends with the import path.
                 // e.g., "std::core::option" ends with "core::option".
