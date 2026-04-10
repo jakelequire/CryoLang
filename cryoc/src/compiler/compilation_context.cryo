@@ -50,25 +50,25 @@ public:
     debug_mode:        boolean;
     namespace_str:     SymbolStr;        // interned current namespace (e.g., "Math::Vec2")
 
-    // -- Phase outputs (populated by passes) --
-    artifacts: PhaseArtifacts;
+    // -- Phase outputs (heap-allocated to keep CompilationContext small) --
+    artifacts: PhaseArtifacts*;
 
-    // -- Diagnostics --
-    diagnostics:   DiagnosticSink;
+    // -- Diagnostics (heap-allocated) --
+    diagnostics:   DiagnosticSink*;
     diag_renderer: DiagRenderer*;
-    diag_config:   DiagConfig;
+    diag_config:   DiagConfig*;
 
     // -- Pass tracking --
     provisions: ProvisionSet;
 
-    // -- Multi-module state --
-    module_graph: ModuleGraph;
+    // -- Multi-module state (heap-allocated) --
+    module_graph: ModuleGraph*;
 
-    // -- Interned strings (lives for the entire compilation) --
-    intern_table: InternTable;
+    // -- Interned strings (heap-allocated, lives for the entire compilation) --
+    intern_table: InternTable*;
 
-    // -- Declaration index (populated incrementally by TypeResolution & Specialization) --
-    decl_index: DeclarationIndex;
+    // -- Declaration index (heap-allocated) --
+    decl_index: DeclarationIndex*;
 
     // -- Injected specialization origin tracking --
     // Maps ASTNode pointer (as u64) → template module SymbolStr.id.
@@ -101,10 +101,21 @@ private:
 public:
     /// Create a new compilation context for the given mode and source file.
     static new(mode: CompileMode, source_file: string) -> CompilationContext {
-        // Create the diagnostic renderer on the heap so it outlives this scope.
-        // TODO: Turn `DiagRenderer` into a class with internal heap allocation to avoid raw pointers in the context.
+        // Heap-allocate large sub-components to keep CompilationContext small.
+        // The C++ Cryo compiler passes structs by value, so a large
+        // CompilationContext causes stack overflow during construction.
         const _box_renderer: Box<DiagRenderer> = Box<DiagRenderer>::new(DiagRenderer::new(RenderConfig::default()));
         const renderer: DiagRenderer* = _box_renderer.leak();
+
+        const _box_artifacts: Box<PhaseArtifacts> = Box<PhaseArtifacts>::new(PhaseArtifacts::new());
+        const _box_diag: Box<DiagnosticSink> = Box<DiagnosticSink>::new(DiagnosticSink::new());
+        const _box_diag_config: Box<DiagConfig> = Box<DiagConfig>::new(DiagConfig::default());
+        const _box_module_graph: Box<ModuleGraph> = Box<ModuleGraph>::new(ModuleGraph::new());
+        const _box_intern: Box<InternTable> = Box<InternTable>::new(InternTable::new());
+        const _box_decl: Box<DeclarationIndex> = Box<DeclarationIndex>::new(DeclarationIndex::new());
+
+        const diag_ptr: DiagnosticSink* = _box_diag.leak();
+        const diag_config_ptr: DiagConfig* = _box_diag_config.leak();
 
         mut ctx: CompilationContext = CompilationContext {
             mode:              mode,
@@ -113,14 +124,14 @@ public:
             debug_mode:        false,
             namespace_str:     SymbolStr::empty(),
 
-            artifacts:     PhaseArtifacts::new(),
-            diagnostics:   DiagnosticSink::new(),
+            artifacts:     _box_artifacts.leak(),
+            diagnostics:   diag_ptr,
             diag_renderer: renderer,
-            diag_config:   DiagConfig::default(),
+            diag_config:   diag_config_ptr,
             provisions:    ProvisionSet::empty(),
-            module_graph:  ModuleGraph::new(),
-            intern_table:  InternTable::new(),
-            decl_index:    DeclarationIndex::new(),
+            module_graph:  _box_module_graph.leak(),
+            intern_table:  _box_intern.leak(),
+            decl_index:    _box_decl.leak(),
             injected_ast_ptrs:    [],
             injected_ast_modules: [],
             type_arena:    null,
@@ -142,16 +153,16 @@ public:
         };
 
         // Wire the renderer and config into the sink
-        ctx.diagnostics.set_renderer(renderer);
-        ctx.diagnostics.set_config(ctx.diag_config);
+        diag_ptr.set_renderer(renderer);
+        diag_ptr.set_config(*diag_config_ptr);
         return ctx;
     }
 
     /// Create a debug context with verbose logging.
     static debug(mode: CompileMode, source_file: string) -> CompilationContext {
-        mut ctx: CompilationContext = CompilationContext::new(mode, source_file);
-        ctx.debug_mode = true;
-        return ctx;
+        mut ctx_val: CompilationContext = CompilationContext::new(mode, source_file);
+        ctx_val.debug_mode = true;
+        return ctx_val;
     }
 
 
@@ -172,11 +183,11 @@ public:
     }
 
     /// Get a pointer to the intern table.
-    /// Use this instead of &ctx.intern_table when accessing through an
+    /// Use this instead of ctx.intern_table when accessing through an
     /// inherited pointer (e.g. this.ctx in parser subclasses), where field
     /// access through class hierarchies doesn't resolve correctly.
     get_intern_table(mut &this) -> InternTable* {
-        return &this.intern_table;
+        return this.intern_table;
     }
 
     get_resolver(mut &this) -> Resolver* {
@@ -262,11 +273,11 @@ public:
     /// Build a structured QualifiedName: namespace + leaf.
     qualify(&this, leaf: string) -> QualifiedName {
         if (this.namespace_str.is_empty()) {
-            return QualifiedName::single(&this.intern_table, leaf);
+            return QualifiedName::single(this.intern_table, leaf);
         }
         // Build from the interned namespace string to avoid QualifiedName method chaining
         const full: string = this.intern_table.resolve(this.namespace_str) + "::" + leaf;
-        return QualifiedName::parse(&this.intern_table, full);
+        return QualifiedName::parse(this.intern_table, full);
     }
 
 
@@ -285,7 +296,7 @@ public:
 
         // Create the TypeArena if it doesn't exist yet
         if (this.type_arena == null) {
-            const _box_arena: Box<TypeArena> = Box<TypeArena>::new(TypeArena::new(&this.intern_table));
+            const _box_arena: Box<TypeArena> = Box<TypeArena>::new(TypeArena::new(this.intern_table));
             this.type_arena = _box_arena.leak();
         }
 
@@ -309,14 +320,14 @@ public:
         if (this.type_resolver == null) {
             const _box_tr: Box<TypeResolver> = Box<TypeResolver>::new(TypeResolver::new(
                 this.type_arena,
-                &this.intern_table,
+                this.intern_table,
                 this.generic_registry,
                 this.module_type_registry,
                 this.resolver,
-                &this.decl_index
+                this.decl_index
             ));
             this.type_resolver = _box_tr.leak();
-            this.type_resolver.set_diagnostics(&this.diagnostics);
+            this.type_resolver.set_diagnostics(this.diagnostics);
         }
     }
 
@@ -325,7 +336,7 @@ public:
     init_resolver(mut &this) -> void {
         LOG_DEBUG(LogComponent::General, "[CompilationContext] init_resolver()");
         if (this.resolver == null) {
-            const _box_res: Box<Resolver> = Box<Resolver>::new(Resolver::new(&this.intern_table));
+            const _box_res: Box<Resolver> = Box<Resolver>::new(Resolver::new(this.intern_table));
             this.resolver = _box_res.leak();
         }
     }
