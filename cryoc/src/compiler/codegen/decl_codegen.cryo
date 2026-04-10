@@ -539,8 +539,29 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
 
     // Bind `this` pointer for instance methods.
     if (!node.is_static) {
-        const target_ref: TypeRef = cg.ctx.decl_index.lookup_type(target_type);
+        // Try qualified name first, then bare (matches declare_method lookup).
+        const qualified_target: SymbolStr = cg.ctx.qualify_symbol_sym(target_type);
+        mut target_ref: TypeRef = cg.ctx.decl_index.lookup_type(qualified_target);
+        if (target_ref.is_invalid()) {
+            target_ref = cg.ctx.decl_index.lookup_type(target_type);
+        }
+        if (target_ref.is_invalid()) {
+            const ts: string = cg.intern.resolve(target_type);
+            const ms: string = cg.intern.resolve(func.name);
+            cg.ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("codegen: method '%s::%s' — target type '%s' not found in declaration index", ts, ms, ts));
+            cg.pop_scope();
+            return LValue::null();
+        }
         const mapped: LType = cg.type_mapper.map_type(target_ref);
+        if (!mapped.is_valid()) {
+            const ts: string = cg.intern.resolve(target_type);
+            const ms: string = cg.intern.resolve(func.name);
+            cg.ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("codegen: method '%s::%s' — failed to map target type to LLVM IR type", ts, ms));
+            cg.pop_scope();
+            return LValue::null();
+        }
         const this_ty: LType = LType::pointer_to(mapped);
 
         const alloca: LValue = cg.create_entry_alloca(fn_val, "this", this_ty);
