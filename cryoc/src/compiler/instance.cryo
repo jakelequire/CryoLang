@@ -141,7 +141,7 @@ type struct CompilerInstance {
         // Dump AST if --ast was requested
         if (this.config.show_ast && ctx.artifacts.ast.is_valid()) {
             const ast_root: ProgramNode* = ctx.artifacts.ast.root;
-            ASTDumper::dump(ast_root, &ctx.intern_table);
+            ASTDumper::dump(ast_root, ctx.intern_table);
         }
 
         // Print diagnostic summary when errors occurred or in debug mode
@@ -298,7 +298,12 @@ type struct CompilerInstance {
             TargetType::Stdlib  => { CompileMode::StdlibBatch }
             _                   => { CompileMode::MultiModule }
         };
-        mut ctx: CompilationContext = CompilationContext::new(mode, root_path);
+        // Heap-allocate CompilationContext to avoid stack overflow.
+        // The struct is very large (InternTable, ModuleGraph, DiagnosticSink, etc.)
+        // and keeping it on the stack alongside phase locals exhausts the default 8MB limit.
+        const _box_ctx: Box<CompilationContext> = Box<CompilationContext>::new(
+            CompilationContext::new(mode, root_path));
+        mut ctx: CompilationContext* = _box_ctx.leak();
         ctx.debug_mode = this.config.debug;
         ctx.project_no_std = config.no_std;
 
@@ -329,7 +334,7 @@ type struct CompilerInstance {
             config.project_root, root_path, stdlib_root, config.no_std);
 
         const discovery_ok: boolean = loader.discover_project(
-            &ctx.intern_table, &ctx.module_graph, &ctx.diagnostics,
+            ctx.intern_table, ctx.module_graph, ctx.diagnostics,
             root_path, this.config.debug);
 
         if (!discovery_ok) {
@@ -345,7 +350,7 @@ type struct CompilerInstance {
             const prelude_path: string = stdlib_root + "/prelude.cryo";
             if (File::exists(prelude_path)) {
                 loader.discover_module(
-                    &ctx.intern_table, &ctx.module_graph, &ctx.diagnostics,
+                    ctx.intern_table, ctx.module_graph, ctx.diagnostics,
                     prelude_path, this.config.debug);
             }
         }
@@ -403,9 +408,9 @@ type struct CompilerInstance {
             printf("[Compiler] Phase 2: Processing module %u (index %u)\n", i, mod_idx);
             ctx.switch_to_module(mod_idx as i64);
             printf("[Compiler] Phase 2: Calling run_all for module %u...\n", i);
-            if (!pipeline.run_all(&ctx)) {
+            if (!pipeline.run_all(ctx)) {
                 printf("[Compiler] Phase 2: run_all FAILED for module %u:\n", i);
-                return this.project_failure(&ctx);
+                return this.project_failure(ctx);
             }
             printf("[Compiler] Phase 2: Module %u succeeded\n", i);
             // Save the parsed AST using local buffer
@@ -424,13 +429,13 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module(&ctx, &ctx.intern_table, ast_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
             ctx.provisions.mark(Provision::ASTValidated);
-            if (!pipeline.run_all(&ctx)) {
-                return this.project_failure(&ctx);
+            if (!pipeline.run_all(ctx)) {
+                return this.project_failure(ctx);
             }
             // Save the resolver's scope to local buffer
             if (ctx.resolver != null && ctx.active_module_index >= 0) {
@@ -457,7 +462,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(&ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -466,8 +471,8 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::ModulesLoaded);
             ctx.provisions.mark(Provision::ModuleOrder);
             ctx.provisions.mark(Provision::NamesResolved);
-            if (!pipeline.run_all(&ctx)) {
-                return this.project_failure(&ctx);
+            if (!pipeline.run_all(ctx)) {
+                return this.project_failure(ctx);
             }
             pipeline.reset();
         }
@@ -485,7 +490,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(&ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -495,8 +500,8 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::ModuleOrder);
             ctx.provisions.mark(Provision::NamesResolved);
             ctx.provisions.mark(Provision::TypeDeclarations);
-            if (!pipeline.run_all(&ctx)) {
-                return this.project_failure(&ctx);
+            if (!pipeline.run_all(ctx)) {
+                return this.project_failure(ctx);
             }
             pipeline.reset();
         }
@@ -514,7 +519,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(&ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -523,8 +528,8 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::TypeDeclarations);
             ctx.provisions.mark(Provision::FunctionSignatures);
             ctx.provisions.mark(Provision::TemplatesRegistered);
-            if (!pipeline.run_all(&ctx)) {
-                return this.project_failure(&ctx);
+            if (!pipeline.run_all(ctx)) {
+                return this.project_failure(ctx);
             }
             pipeline.reset();
         }
@@ -552,7 +557,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(&ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -563,8 +568,8 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::TemplatesRegistered);
             ctx.provisions.mark(Provision::TypesResolved);
             ctx.provisions.mark(Provision::StructFieldsSynced);
-            if (!pipeline.run_all(&ctx)) {
-                return this.project_failure(&ctx);
+            if (!pipeline.run_all(ctx)) {
+                return this.project_failure(ctx);
             }
             pipeline.reset();
         }
@@ -598,7 +603,7 @@ type struct CompilerInstance {
 
         mut phase6_failed: boolean = false;
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(&ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -611,7 +616,7 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::StructFieldsSynced);
             ctx.provisions.mark(Provision::MonomorphizationComplete);
             ctx.provisions.mark(Provision::GenericExpressionsResolved);
-            if (!pipeline.run_all(&ctx)) {
+            if (!pipeline.run_all(ctx)) {
                 phase6_failed = true;
             }
             pipeline.reset();
@@ -627,7 +632,7 @@ type struct CompilerInstance {
                     if (dump_ast != null) {
                         const mod_info: ModuleInfo = ctx.module_graph.modules[mi];
                         printf("\n=== AST: %s ===\n", mod_info.file_path);
-                        ASTDumper::dump(dump_ast, &ctx.intern_table);
+                        ASTDumper::dump(dump_ast, ctx.intern_table);
                     }
                 }
             }
@@ -646,7 +651,7 @@ type struct CompilerInstance {
                 const mod_info: ModuleInfo = ctx.module_graph.modules[mod_idx];
                 const mod_sym: SymbolStr = ctx.intern(mod_info.file_path);
                 build_cross_module_descriptors(
-                    &ctx.module_graph, mod_sym, &ctx.decl_index, ctx.type_arena);
+                    ctx.module_graph, mod_sym, ctx.decl_index, ctx.type_arena);
             }
         }
 
@@ -685,7 +690,7 @@ type struct CompilerInstance {
 
             for (mut i: u32 = 0; i < n; i++) {
                 CompilerInstance::load_module_with_scope(
-                    &ctx, &ctx.intern_table, ast_buf, scope_buf, order[i], n);
+                    ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
                 ctx.provisions.clear();
                 ctx.provisions.mark(Provision::Tokens);
                 ctx.provisions.mark(Provision::AST);
@@ -703,7 +708,7 @@ type struct CompilerInstance {
                 ctx.provisions.mark(Provision::TypesLowered);
                 ctx.provisions.mark(Provision::FunctionsDeclared);
 
-                const pipeline_ok: boolean = pipeline.run_all(&ctx);
+                const pipeline_ok: boolean = pipeline.run_all(ctx);
 
                 if (ctx.artifacts.ir.is_valid()) {
                     const mod_info: ModuleInfo = ctx.module_graph.modules[order[i]];
