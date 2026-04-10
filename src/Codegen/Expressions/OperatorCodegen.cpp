@@ -3511,7 +3511,11 @@ namespace Cryo::Codegen
                 LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                           "get_lvalue_address: obj_type is valid, display_name='{}', kind={}",
                           type_name, static_cast<int>(obj_type->kind()));
-                // Handle pointer types - get the pointee type name
+                // Handle pointer types - get the pointee type name and load the pointer.
+                // When the object is a pointer field (e.g., `ctx.artifacts` where artifacts
+                // is PhaseArtifacts*), `object` currently points to the STORAGE of that
+                // pointer (a pointer-to-pointer). We must load the actual pointer value
+                // so that subsequent GEP operates on the pointee struct, not the parent.
                 if (obj_type->kind() == Cryo::TypeKind::Pointer)
                 {
                     auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(obj_type.get());
@@ -3519,6 +3523,11 @@ namespace Cryo::Codegen
                     {
                         type_name = ptr_type->pointee().get()->display_name();
                     }
+                    // Load the pointer value so GEP targets the pointee struct
+                    object = create_load(object, object->getType(), member_name + ".deref");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "get_lvalue_address: Loaded pointer field for nested member access, pointee='{}'",
+                              type_name);
                 }
                 else if (!type_name.empty() && type_name.back() == '*')
                 {
@@ -3629,6 +3638,8 @@ namespace Cryo::Codegen
                                         {
                                             type_name = field_type.get()->display_name();
                                             // If it's a pointer, get the pointee type name
+                                            // AND load the pointer value so subsequent GEP
+                                            // operates on the pointee struct, not the parent.
                                             if (field_type->kind() == Cryo::TypeKind::Pointer)
                                             {
                                                 auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(field_type.get());
@@ -3636,6 +3647,10 @@ namespace Cryo::Codegen
                                                 {
                                                     type_name = ptr_type->pointee().get()->display_name();
                                                 }
+                                                object = create_load(object, object->getType(), nested_field + ".deref");
+                                                LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                          "get_lvalue_address: Loaded pointer field '{}' for nested member access",
+                                                          nested_field);
                                             }
                                             else if (!type_name.empty() && type_name.back() == '*')
                                             {
@@ -3665,6 +3680,7 @@ namespace Cryo::Codegen
                                     TypeRef field_type = field_type_opt.value();
                                     type_name = field_type.get()->display_name();
                                     // If it's a pointer, get the pointee type name
+                                    // AND load the pointer value (same fix as TemplateRegistry path).
                                     if (field_type->kind() == Cryo::TypeKind::Pointer)
                                     {
                                         auto *ptr_type = dynamic_cast<const Cryo::PointerType *>(field_type.get());
@@ -3672,6 +3688,10 @@ namespace Cryo::Codegen
                                         {
                                             type_name = ptr_type->pointee().get()->display_name();
                                         }
+                                        object = create_load(object, object->getType(), nested_field + ".deref");
+                                        LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                                                  "get_lvalue_address: Loaded pointer field '{}' for nested member access (StructType path)",
+                                                  nested_field);
                                     }
                                     else if (!type_name.empty() && type_name.back() == '*')
                                     {
