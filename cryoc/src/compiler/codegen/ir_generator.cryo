@@ -101,11 +101,30 @@ public:
             if (kind == NodeKind::FunctionDeclaration) {
                 const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
                 if (func.generic_params.length > 0) { continue; }
+                const _fn_name: string = this.cg.intern.resolve(func.name);
+                printf("[Codegen] Phase3: func '%s' body=%p\n", _fn_name, func.body as void*);
                 if (func.body != null) {
-                    this.visit(func);
+                    // Call codegen directly — virtual dispatch through this.visit()
+                    // may resolve to the wrong overload due to vtable limitations.
+                    this.generate_function_body(func);
                 }
             } else if (kind == NodeKind::ImplementationBlock) {
                 this.visit(stmt as ImplBlockNode*);
+            } else if (kind == NodeKind::StructDeclaration) {
+                const sd: StructDeclNode* = stmt as StructDeclNode*;
+                if (sd.generic_params.length == 0) {
+                    for (mut j: i64 = 0; j < sd.methods.length; j++) {
+                        this.generate_method_body(sd.methods[j], sd.name);
+                    }
+                }
+            } else if (kind == NodeKind::ClassDeclaration) {
+                const cd: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (cd.generic_params.length == 0) {
+                    for (mut j: i64 = 0; j < cd.methods.length; j++) {
+                        this.generate_method_body(cd.methods[j], cd.name);
+                    }
+                }
+            // Note: Enum methods are in ImplementationBlock nodes, handled above.
             } else if (kind == NodeKind::VariableDeclaration) {
                 const var_decl: VarDeclNode* = stmt as VarDeclNode*;
                 if (var_decl.is_global) {
@@ -125,17 +144,23 @@ public:
     /// Codegen an expression and return the resulting value.
     codegen_expr(mut &this, expr: ExpressionNode*) -> LValue {
         if (expr == null) { return LValue::null(); }
-        expr.accept(this as ASTVisitor*);
+        this.dispatch_expression(expr as ASTNode*);
         return this.last_value;
     }
 
     /// Codegen an expression, ensuring the result is an rvalue (loaded).
     codegen_rvalue(mut &this, expr: ExpressionNode*) -> LValue {
         if (expr == null) { return LValue::null(); }
-        expr.accept(this as ASTVisitor*);
+        this.dispatch_expression(expr as ASTNode*);
 
         if (this.last_is_lvalue && this.last_value.is_valid()) {
             const ty: LType = this.cg.type_mapper.map_type(expr.resolved_type);
+            if (!ty.is_valid()) {
+                printf("[Codegen] ERROR: codegen_rvalue load — unmappable type (id=%lu)\n",
+                       expr.resolved_type.id);
+                this.last_is_lvalue = false;
+                return LValue::null();
+            }
             const loaded: LValue = this.cg.builder.build_load(ty, this.last_value, "load");
             this.last_value = loaded;
             this.last_is_lvalue = false;
@@ -146,7 +171,7 @@ public:
     /// Codegen an expression, ensuring the result is an lvalue (address).
     codegen_lvalue(mut &this, expr: ExpressionNode*) -> LValue {
         if (expr == null) { return LValue::null(); }
-        expr.accept(this as ASTVisitor*);
+        this.dispatch_expression(expr as ASTNode*);
         return this.last_value;
     }
 
@@ -559,10 +584,88 @@ public:
             }
             const stmt: StatementNode* = node.statements[i];
             if (stmt != null) {
-                stmt.accept(this as ASTVisitor*);
+                this.dispatch_statement(stmt as ASTNode*);
             }
         }
         this.cg.pop_scope();
+    }
+
+    /// Manual statement dispatch to avoid overloaded virtual dispatch bugs.
+    /// The C++ compiler's vtable may resolve visit(ReturnStmtNode*) to the
+    /// wrong overload, causing infinite recursion.
+    dispatch_statement(mut &this, node: ASTNode*) -> void {
+        if (node == null) { return; }
+        const kind: NodeKind = node.kind;
+
+        if (kind == NodeKind::ReturnStatement) {
+            this.visit(node as ReturnStmtNode*);
+        } else if (kind == NodeKind::IfStatement) {
+            this.visit(node as IfStmtNode*);
+        } else if (kind == NodeKind::WhileStatement) {
+            this.visit(node as WhileStmtNode*);
+        } else if (kind == NodeKind::ForStatement) {
+            this.visit(node as ForStmtNode*);
+        } else if (kind == NodeKind::BlockStatement) {
+            this.visit(node as BlockStmtNode*);
+        } else if (kind == NodeKind::UnsafeBlockStatement) {
+            this.visit(node as UnsafeBlockStmtNode*);
+        } else if (kind == NodeKind::ExpressionStatement) {
+            this.visit(node as ExprStmtNode*);
+        } else if (kind == NodeKind::DeclarationStatement) {
+            this.visit(node as DeclStmtNode*);
+        } else if (kind == NodeKind::BreakStatement) {
+            this.visit(node as BreakStmtNode*);
+        } else if (kind == NodeKind::ContinueStatement) {
+            this.visit(node as ContinueStmtNode*);
+        } else if (kind == NodeKind::MatchStatement) {
+            this.visit(node as MatchStmtNode*);
+        } else if (kind == NodeKind::LoopStatement) {
+            this.visit(node as LoopStmtNode*);
+        } else if (kind == NodeKind::DoWhileStatement) {
+            this.visit(node as DoWhileStmtNode*);
+        }
+    }
+
+    /// Manual expression dispatch to avoid overloaded virtual dispatch bugs.
+    dispatch_expression(mut &this, node: ASTNode*) -> void {
+        if (node == null) { return; }
+        const kind: NodeKind = node.kind;
+
+        if (kind == NodeKind::Literal) {
+            this.visit(node as LiteralNode*);
+        } else if (kind == NodeKind::Identifier) {
+            this.visit(node as IdentifierNode*);
+        } else if (kind == NodeKind::BinaryExpression) {
+            this.visit(node as BinaryExprNode*);
+        } else if (kind == NodeKind::UnaryExpression) {
+            this.visit(node as UnaryExprNode*);
+        } else if (kind == NodeKind::CallExpression) {
+            this.visit(node as CallExprNode*);
+        } else if (kind == NodeKind::MemberAccess) {
+            this.visit(node as MemberAccessNode*);
+        } else if (kind == NodeKind::ArrayAccess) {
+            this.visit(node as ArrayAccessNode*);
+        } else if (kind == NodeKind::ScopeResolution) {
+            this.visit(node as ScopeResolutionNode*);
+        } else if (kind == NodeKind::CastExpression) {
+            this.visit(node as CastExprNode*);
+        } else if (kind == NodeKind::StructLiteral) {
+            this.visit(node as StructLiteralNode*);
+        } else if (kind == NodeKind::ArrayLiteral) {
+            this.visit(node as ArrayLiteralNode*);
+        } else if (kind == NodeKind::IfExpression) {
+            this.visit(node as IfExprNode*);
+        } else if (kind == NodeKind::MatchExpression) {
+            this.visit(node as MatchExprNode*);
+        } else if (kind == NodeKind::TernaryExpression) {
+            this.visit(node as TernaryExprNode*);
+        } else if (kind == NodeKind::SizeofExpression) {
+            this.visit(node as SizeofExprNode*);
+        } else if (kind == NodeKind::NewExpression) {
+            this.visit(node as NewExprNode*);
+        } else if (kind == NodeKind::DeleteExpression) {
+            this.visit(node as DeleteExprNode*);
+        }
     }
 
     override visit(node: UnsafeBlockStmtNode*) -> void {
@@ -588,14 +691,14 @@ public:
         // Then branch.
         this.cg.builder.position_at_end(blocks.then_bb);
         if (node.then_stmt != null) {
-            node.then_stmt.accept(this as ASTVisitor*);
+            this.dispatch_statement(node.then_stmt as ASTNode*);
         }
         branch_if_not_terminated(this.cg, blocks.merge_bb);
 
         // Else branch.
         if (node.else_stmt != null) {
             this.cg.builder.position_at_end(blocks.else_bb);
-            node.else_stmt.accept(this as ASTVisitor*);
+            this.dispatch_statement(node.else_stmt as ASTNode*);
             branch_if_not_terminated(this.cg, blocks.merge_bb);
         }
 
@@ -614,7 +717,7 @@ public:
         // Body.
         this.cg.builder.position_at_end(blocks.body_bb);
         if (node.body != null) {
-            node.body.accept(this as ASTVisitor*);
+            this.dispatch_statement(node.body as ASTNode*);
         }
         branch_if_not_terminated(this.cg, blocks.cond_bb);
 
@@ -628,7 +731,7 @@ public:
         // Init.
         this.cg.push_scope();
         if (node.init != null) {
-            node.init.accept(this as ASTVisitor*);
+            this.dispatch_statement(node.init as ASTNode*);
         }
 
         const blocks: ForBlocks = codegen_for_header(this.cg, current_fn);
@@ -646,7 +749,7 @@ public:
         // Body.
         this.cg.builder.position_at_end(blocks.body_bb);
         if (node.body != null) {
-            node.body.accept(this as ASTVisitor*);
+            this.dispatch_statement(node.body as ASTNode*);
         }
         branch_if_not_terminated(this.cg, blocks.update_bb);
 
@@ -668,7 +771,7 @@ public:
 
         this.cg.builder.position_at_end(blocks.body_bb);
         if (node.body != null) {
-            node.body.accept(this as ASTVisitor*);
+            this.dispatch_statement(node.body as ASTNode*);
         }
         branch_if_not_terminated(this.cg, blocks.body_bb);
 
@@ -692,7 +795,7 @@ public:
 
     override visit(node: DeclStmtNode*) -> void {
         if (node.declaration != null) {
-            node.declaration.accept(this as ASTVisitor*);
+            this.dispatch_statement(node.declaration as ASTNode*);
         }
     }
 
@@ -701,18 +804,45 @@ public:
     // Declaration visitors
     // ========================================================================
 
-    override visit(node: FunctionDeclNode*) -> void {
+    /// Generate IR for a function body.  Called directly from generate_program
+    /// to avoid overloaded virtual dispatch issues with this.visit().
+    generate_function_body(mut &this, node: FunctionDeclNode*) -> void {
         if (node.generic_params.length > 0) { return; }
         if (node.body == null) { return; }
+
+        const _fn: string = this.cg.intern.resolve(node.name);
+        printf("[Codegen] func_body: %s\n", _fn);
 
         const fn_val: LValue = codegen_function_prologue(this.cg, node);
         if (!fn_val.is_valid()) { return; }
 
-        // Visit the body.
-        this.visit(node.body);
-
-        // Emit epilogue (implicit return if needed).
+        printf("[Codegen] func_body: visiting body of %s\n", _fn);
+        this.dispatch_statement(node.body as ASTNode*);
         codegen_function_epilogue(this.cg, node);
+        printf("[Codegen] func_body: done %s\n", _fn);
+    }
+
+    /// Generate IR for a method body.  Called directly to avoid vtable issues.
+    generate_method_body(mut &this, node: MethodNode*, target: SymbolStr) -> void {
+        const func: FunctionDeclNode* = node.func;
+        if (func == null || func.body == null) { return; }
+        if (func.generic_params.length > 0) { return; }
+
+        const _tgt: string = this.cg.intern.resolve(target);
+        const _mn: string = this.cg.intern.resolve(func.name);
+        printf("[Codegen] method_body: %s::%s\n", _tgt, _mn);
+
+        const fn_val: LValue = codegen_method_prologue(this.cg, node, target);
+        if (!fn_val.is_valid()) { return; }
+
+        printf("[Codegen] method_body: visiting body of %s::%s\n", _tgt, _mn);
+        this.dispatch_statement(func.body as ASTNode*);
+        codegen_function_epilogue(this.cg, func);
+        printf("[Codegen] method_body: done %s::%s\n", _tgt, _mn);
+    }
+
+    override visit(node: FunctionDeclNode*) -> void {
+        this.generate_function_body(node);
     }
 
     override visit(node: ImplBlockNode*) -> void {
@@ -721,23 +851,14 @@ public:
         this.current_impl_target = node.target_type;
 
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.visit(node.methods[i]);
+            this.generate_method_body(node.methods[i], node.target_type);
         }
 
         this.current_impl_target = SymbolStr::empty();
     }
 
     override visit(node: MethodNode*) -> void {
-        const func: FunctionDeclNode* = node.func;
-        if (func == null || func.body == null) { return; }
-        if (func.generic_params.length > 0) { return; }
-
-        const fn_val: LValue = codegen_method_prologue(
-            this.cg, node, this.current_impl_target);
-        if (!fn_val.is_valid()) { return; }
-
-        this.visit(func.body);
-        codegen_function_epilogue(this.cg, func);
+        this.generate_method_body(node, this.current_impl_target);
     }
 
     override visit(node: VarDeclNode*) -> void {
