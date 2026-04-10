@@ -59,42 +59,51 @@ function declare_types(cg: CodegenContext*, program: ProgramNode*) -> void {
     }
 }
 
-/// Look up a type in the DeclIndex, trying qualified name first then bare name.
-function lookup_type_qualified(cg: CodegenContext*, name: SymbolStr) -> TypeRef {
-    const qualified: SymbolStr = cg.ctx.qualify_symbol_sym(name);
-    mut ref: TypeRef = cg.ctx.decl_index.lookup_type(qualified);
-    if (ref.is_invalid()) {
-        ref = cg.ctx.decl_index.lookup_type(name);
-    }
-    return ref;
-}
-
 /// Forward-declare a struct as a named LLVM type and fill its body.
 function declare_struct_type(cg: CodegenContext*, node: StructDeclNode*) -> void {
-    if (node.generic_params.length > 0) { return; }
+    // Skip generic templates — only monomorphized versions get IR.
+    if (node.generic_params.length > 0) {
+        return;
+    }
 
-    const type_ref: TypeRef = lookup_type_qualified(cg, node.name);
-    if (type_ref.is_invalid()) { return; }
+    const name: string = cg.intern.resolve(node.name);
+    const qname: QualifiedName = QualifiedName::single(cg.intern, name);
+    const mangled: string = MangledName::for_struct(cg.intern, qname).resolve(cg.intern);
 
+    // Look up the Cryo StructType to get field info.
+    const type_ref: TypeRef = cg.ctx.decl_index.lookup_type(node.name);
+    if (type_ref.is_invalid()) {
+        return;
+    }
+
+    // Let the type mapper handle forward declaration + body fill.
     cg.type_mapper.map_type(type_ref);
 }
 
 /// Forward-declare a class type.
 function declare_class_type(cg: CodegenContext*, node: ClassDeclNode*) -> void {
-    if (node.generic_params.length > 0) { return; }
+    if (node.generic_params.length > 0) {
+        return;
+    }
 
-    const type_ref: TypeRef = lookup_type_qualified(cg, node.name);
-    if (type_ref.is_invalid()) { return; }
+    const type_ref: TypeRef = cg.ctx.decl_index.lookup_type(node.name);
+    if (type_ref.is_invalid()) {
+        return;
+    }
 
     cg.type_mapper.map_type(type_ref);
 }
 
 /// Declare an enum type.
 function declare_enum_type(cg: CodegenContext*, node: EnumDeclNode*) -> void {
-    if (node.generic_params.length > 0) { return; }
+    if (node.generic_params.length > 0) {
+        return;
+    }
 
-    const type_ref: TypeRef = lookup_type_qualified(cg, node.name);
-    if (type_ref.is_invalid()) { return; }
+    const type_ref: TypeRef = cg.ctx.decl_index.lookup_type(node.name);
+    if (type_ref.is_invalid()) {
+        return;
+    }
 
     cg.type_mapper.map_type(type_ref);
 }
@@ -120,23 +129,7 @@ function declare_functions(cg: CodegenContext*, program: ProgramNode*) -> void {
             declare_extern_block(cg, stmt as ExternBlockNode*);
         } else if (kind == NodeKind::ImplementationBlock) {
             declare_impl_block(cg, stmt as ImplBlockNode*);
-        } else if (kind == NodeKind::StructDeclaration) {
-            // Declare inline methods defined inside the struct body.
-            const sd: StructDeclNode* = stmt as StructDeclNode*;
-            if (sd.generic_params.length == 0 && sd.methods.length > 0) {
-                for (mut j: i64 = 0; j < sd.methods.length; j++) {
-                    declare_method(cg, sd.methods[j], sd.name);
-                }
-            }
-        } else if (kind == NodeKind::ClassDeclaration) {
-            const cd: ClassDeclNode* = stmt as ClassDeclNode*;
-            if (cd.generic_params.length == 0 && cd.methods.length > 0) {
-                for (mut j: i64 = 0; j < cd.methods.length; j++) {
-                    declare_method(cg, cd.methods[j], cd.name);
-                }
-            }
         }
-        // Note: Enum methods are in ImplementationBlock nodes, not on EnumDeclNode.
     }
 }
 
@@ -152,44 +145,38 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
     const mangled: MangledName = MangledName::for_function(cg.intern, qname);
     const fn_name: string = mangled.resolve(cg.intern);
 
-    // Check if this function was already declared (e.g., as a cross-module extern).
-    // If so, reuse the existing declaration — adding a new function with the same
-    // name causes LLVM to rename it (main -> main.1), breaking body generation.
-    mut fn_val: LValue = LValue { raw: llvm::LLVMGetNamedFunction(cg.llvm_module.raw, fn_name) };
+    // Build the LLVM function type.
+    const ret_ty: LType = map_return_type(cg, node);
+    if (!ret_ty.is_valid()) { return; }
 
-    if (!fn_val.is_valid()) {
-        // Function not yet in the module — create it.
-        const ret_ty: LType = map_return_type(cg, node);
-        if (!ret_ty.is_valid()) { return; }
+    const param_count: u32 = node.parameters.length as u32;
 
-        const param_count: u32 = node.parameters.length as u32;
-
-        if (param_count == 0) {
-            const fn_type: LType = LType::function_type(ret_ty, null, 0, node.is_variadic);
-            fn_val = cg.llvm_module.add_function(fn_name, fn_type);
-        } else {
-            const buf: void* = malloc(param_count as u64 * 8);
-            const slots: void** = buf as void**;
-            mut all_valid: boolean = true;
-            for (mut i: u32 = 0; i < param_count; i++) {
-                const param: VarDeclNode* = node.parameters[i];
-                const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
-                if (!param_ty.is_valid()) {
-                    all_valid = false;
-                    break;
-                }
-                slots[i] = param_ty.raw;
+    mut fn_type: LType = LType::null();
+    if (param_count == 0) {
+        fn_type = LType::function_type(ret_ty, null, 0, node.is_variadic);
+    } else {
+        const buf: void* = malloc(param_count as u64 * 8);
+        const slots: void** = buf as void**;
+        mut all_valid: boolean = true;
+        for (mut i: u32 = 0; i < param_count; i++) {
+            const param: VarDeclNode* = node.parameters[i];
+            const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
+            if (!param_ty.is_valid()) {
+                all_valid = false;
+                break;
             }
-            if (!all_valid) {
-                free(buf);
-                return;
-            }
-            const fn_type: LType = LType::function_type(ret_ty, buf, param_count, node.is_variadic);
-            fn_val = cg.llvm_module.add_function(fn_name, fn_type);
-            free(buf);
+            slots[i] = param_ty.raw;
         }
+        if (!all_valid) {
+            free(buf);
+            return;
+        }
+        fn_type = LType::function_type(ret_ty, buf, param_count, node.is_variadic);
+        free(buf);
     }
 
+    // Add the function to the LLVM module.
+    const fn_val: LValue = cg.llvm_module.add_function(fn_name, fn_type);
     cg.register_function(node.name, fn_val);
 }
 
@@ -296,11 +283,7 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     const fn_type: LType = LType::function_type(ret_ty, buf, total_params, func.is_variadic);
     free(buf);
 
-    // Reuse existing declaration if already in the module (from cross-module externs).
-    mut fn_val: LValue = LValue { raw: llvm::LLVMGetNamedFunction(cg.llvm_module.raw, fn_name) };
-    if (!fn_val.is_valid()) {
-        fn_val = cg.llvm_module.add_function(fn_name, fn_type);
-    }
+    const fn_val: LValue = cg.llvm_module.add_function(fn_name, fn_type);
 
     // Use a combined key for method lookup: intern "Type::method".
     const combined: string = format("%s::%s", type_str, method_str);
@@ -486,13 +469,8 @@ function codegen_global_var(cg: CodegenContext*, node: VarDeclNode*) -> void {
 function codegen_function_prologue(cg: CodegenContext*, node: FunctionDeclNode*) -> LValue {
     const fn_val: LValue = cg.get_function(node.name);
     if (!fn_val.is_valid()) {
-        const dbg_name: string = cg.intern.resolve(node.name);
-        printf("[Codegen] prologue: '%s' NOT FOUND in function map\n", dbg_name);
         return LValue::null();
     }
-
-    const dbg_name2: string = cg.intern.resolve(node.name);
-    printf("[Codegen] prologue: generating body for '%s'\n", dbg_name2);
 
     // Create entry basic block.
     const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
@@ -505,16 +483,6 @@ function codegen_function_prologue(cg: CodegenContext*, node: FunctionDeclNode*)
         const param: VarDeclNode* = node.parameters[i];
         const param_name: string = cg.intern.resolve(param.name);
         const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
-
-        if (!param_ty.is_valid()) {
-            const fn_name_str: string = cg.intern.resolve(node.name);
-            printf("[Codegen] ERROR: param '%s' in function '%s' has unmappable type (id=%lu) — skipping body\n",
-                   param_name, fn_name_str, param.resolved_type.id);
-            cg.pop_scope();
-            // Delete the entry block we just created so the function stays as a declaration
-            llvm::LLVMDeleteBasicBlock(entry_bb.raw);
-            return LValue::null();
-        }
 
         const alloca: LValue = cg.create_entry_alloca(fn_val, param_name, param_ty);
         const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, i) };
@@ -559,7 +527,6 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
 
     const fn_val: LValue = cg.get_function(combined_sym);
     if (!fn_val.is_valid()) {
-        printf("[Codegen] method_prologue FAILED: '%s' not found (key=%u)\n", combined, combined_sym.id);
         return LValue::null();
     }
 
@@ -572,15 +539,7 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
 
     // Bind `this` pointer for instance methods.
     if (!node.is_static) {
-        const qualified_target: SymbolStr = cg.ctx.qualify_symbol_sym(target_type);
-        mut target_ref: TypeRef = cg.ctx.decl_index.lookup_type(qualified_target);
-        if (target_ref.is_invalid()) {
-            target_ref = cg.ctx.decl_index.lookup_type(target_type);
-        }
-        if (target_ref.is_invalid()) {
-            cg.pop_scope();
-            return LValue::null();
-        }
+        const target_ref: TypeRef = cg.ctx.decl_index.lookup_type(target_type);
         const mapped: LType = cg.type_mapper.map_type(target_ref);
         const this_ty: LType = LType::pointer_to(mapped);
 
@@ -598,15 +557,6 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
         const param: VarDeclNode* = func.parameters[i];
         const param_name: string = cg.intern.resolve(param.name);
         const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
-
-        if (!param_ty.is_valid()) {
-            const method_name: string = cg.intern.resolve(func.name);
-            printf("[Codegen] ERROR: param '%s' in method '%s' has unmappable type (id=%lu) — skipping body\n",
-                   param_name, method_name, param.resolved_type.id);
-            cg.pop_scope();
-            llvm::LLVMDeleteBasicBlock(entry_bb.raw);
-            return LValue::null();
-        }
 
         const alloca: LValue = cg.create_entry_alloca(fn_val, param_name, param_ty);
         const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };

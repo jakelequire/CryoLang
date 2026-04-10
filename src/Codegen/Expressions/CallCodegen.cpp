@@ -594,24 +594,6 @@ namespace Cryo::Codegen
                 // Ensure receiver is a pointer type (methods expect ptr to self)
                 if (!receiver->getType()->isPointerTy())
                 {
-                    // Before creating a temp copy, check if the value was loaded
-                    // from an addressable location — if so, use that address directly.
-                    if (auto *load_inst = llvm::dyn_cast<llvm::LoadInst>(receiver))
-                    {
-                        llvm::Value *source_ptr = load_inst->getPointerOperand();
-                        if (llvm::isa<llvm::AllocaInst>(source_ptr) ||
-                            llvm::isa<llvm::GetElementPtrInst>(source_ptr) ||
-                            llvm::isa<llvm::GlobalVariable>(source_ptr))
-                        {
-                            LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                      "Method receiver: recovering source address from LoadInst");
-                            receiver = source_ptr;
-                        }
-                    }
-                }
-
-                if (!receiver->getType()->isPointerTy())
-                {
                     LOG_DEBUG(Cryo::LogComponent::CODEGEN,
                               "Method receiver is not a pointer, creating temporary storage");
 
@@ -7697,100 +7679,7 @@ namespace Cryo::Codegen
             }
         }
 
-        // Handle nested member access chains (e.g., cg.ctx.decl_index)
-        // by recursively resolving to a GEP pointer instead of loading the value.
-        if (!object)
-        {
-            if (auto *nested_member = dynamic_cast<Cryo::MemberAccessNode *>(node->object()))
-            {
-                object = generate_member_receiver_address(nested_member);
-
-                // If the nested member resolved to a pointer, check if the field
-                // itself is a pointer type that needs dereferencing.
-                if (object && object->getType()->isPointerTy())
-                {
-                    TypeRef nested_type = nested_member->object()->get_resolved_type();
-                    if (nested_type.is_valid())
-                    {
-                        // Get the struct type name for the nested object
-                        std::string nested_type_name = nested_type->display_name();
-
-                        // Unwrap pointer/reference types
-                        if (nested_type->kind() == Cryo::TypeKind::Pointer)
-                        {
-                            auto *ptr_t = dynamic_cast<const Cryo::PointerType *>(nested_type.get());
-                            if (ptr_t && ptr_t->pointee().is_valid())
-                                nested_type_name = ptr_t->pointee()->display_name();
-                        }
-                        else if (nested_type->kind() == Cryo::TypeKind::Reference)
-                        {
-                            auto *ref_t = dynamic_cast<const Cryo::ReferenceType *>(nested_type.get());
-                            if (ref_t && ref_t->referent().is_valid())
-                                nested_type_name = ref_t->referent()->display_name();
-                        }
-
-                        // Look up the LLVM struct type by name in the module
-                        llvm::StructType *nested_struct = llvm::StructType::getTypeByName(
-                            module()->getContext(), nested_type_name);
-                        if (!nested_struct)
-                        {
-                            // Try with common mangling patterns
-                            std::string mangled_name = nested_type_name;
-                            std::replace(mangled_name.begin(), mangled_name.end(), ':', '_');
-                            nested_struct = llvm::StructType::getTypeByName(
-                                module()->getContext(), mangled_name);
-                        }
-
-                        if (nested_struct && !nested_struct->isOpaque())
-                        {
-                            // Find the field index for the nested member's field
-                            std::string nested_field = nested_member->member();
-                            unsigned field_idx = 0;
-                            bool found = false;
-
-                            // Try TemplateRegistry for field names
-                            if (auto *template_reg = ctx().template_registry())
-                            {
-                                const auto *field_info = template_reg->get_struct_field_types(nested_type_name);
-                                if (field_info)
-                                {
-                                    for (size_t i = 0; i < field_info->field_names.size(); ++i)
-                                    {
-                                        if (field_info->field_names[i] == nested_field)
-                                        {
-                                            field_idx = static_cast<unsigned>(i);
-                                            found = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-
-                            if (found && field_idx < nested_struct->getNumElements())
-                            {
-                                llvm::Type *field_type = nested_struct->getElementType(field_idx);
-                                if (field_type->isPointerTy())
-                                {
-                                    // The field stores a pointer — load it so we can GEP into the pointed-to struct
-                                    object = create_load(object, field_type, nested_field + ".deref");
-                                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                                              "generate_member_receiver_address: Dereferenced pointer field '{}' in chain",
-                                              nested_field);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (object)
-                {
-                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
-                              "generate_member_receiver_address: Resolved nested chain for '{}'", member_name);
-                }
-            }
-        }
-
-        // Fallback to generating the expression (loads struct value)
+        // Fallback to generating the expression
         if (!object)
         {
             object = generate_expression(node->object());
