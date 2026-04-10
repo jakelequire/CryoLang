@@ -1,6 +1,6 @@
 <div align="center">
-  <img src="./assets/cryo-logo.svg" alt="Cryo" width="180"/>
-
+  <img src="./assets/cryo-logo-1.png" alt="Cryo" width="180"/>
+    <br/>
   <h1>The Cryo Programming Language</h1>
   <h4><i>Under Development</i></h4>
 
