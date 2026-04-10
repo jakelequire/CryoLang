@@ -45,45 +45,49 @@ type struct CodegenPasses {
         init_native_target();
         printf("[Codegen] Step 3: LLVM targets initialized\n");
 
-        // Create per-module codegen context.
+        // Create per-module codegen context (heap-allocated to avoid stack overflow
+        // from the C++ compiler's large stack frames for virtual dispatch).
         printf("[Codegen] Step 4: Creating CodegenContext...\n");
-        mut cg: CodegenContext = CodegenContext::new(ctx, module_name);
+        const cg_ptr: CodegenContext* = malloc(sizeof(CodegenContext)) as CodegenContext*;
+        *cg_ptr = CodegenContext::new(ctx, module_name);
         printf("[Codegen] Step 5: CodegenContext created\n");
 
         // Set target triple and data layout.
         printf("[Codegen] Step 6: Setting target triple...\n");
         const triple: string = get_default_triple();
-        cg.llvm_module.set_target_triple(triple);
+        cg_ptr.llvm_module.set_target_triple(triple);
         printf("[Codegen] Step 7: Target triple set\n");
 
         printf("[Codegen] Step 8: Creating target machine...\n");
         mut tm: LTargetMachine = create_native_target_machine();
         if (tm.is_valid()) {
             const layout: string = tm.get_data_layout_string();
-            cg.llvm_module.set_data_layout(layout);
+            cg_ptr.llvm_module.set_data_layout(layout);
         }
         printf("[Codegen] Step 9: Target machine ready\n");
 
         // Declare cross-module extern functions.
         printf("[Codegen] Step 10: Declaring cross-module externs...\n");
-        declare_cross_module_externs(&cg);
+        declare_cross_module_externs(cg_ptr);
         printf("[Codegen] Step 11: Cross-module externs declared\n");
 
-        // Create the visitor and generate IR.
+        // Create the visitor and generate IR (heap-allocated — the visitor
+        // inherits BaseASTVisitor with a large vtable that bloats stack frames).
         printf("[Codegen] Step 12: Creating IRGeneratorVisitor...\n");
-        mut gen: IRGeneratorVisitor = IRGeneratorVisitor(&cg);
+        const gen_ptr: IRGeneratorVisitor* = new IRGeneratorVisitor(cg_ptr);
         printf("[Codegen] Step 13: Getting program AST...\n");
         const program: ProgramNode* = ctx.artifacts.ast.program();
         printf("[Codegen] Step 14: Generating program IR (program=%p)...\n", program as void*);
-        const success: boolean = gen.generate_program(program);
+        const success: boolean = gen_ptr.generate_program(program);
         printf("[Codegen] Step 15: Program IR generation %s\n", if (success) { "succeeded" } else { "failed" });
 
         if (!success) {
             if (ctx.debug_mode) {
                 printf("[Codegen] IR generation failed for module: %s\n", module_name);
             }
-            cg.dispose_builder();
+            cg_ptr.dispose_builder();
             tm.dispose();
+            free(cg_ptr as void*);
             return PassResult::from_snapshot(ctx.diagnostics, snap);
         }
 
@@ -91,7 +95,7 @@ type struct CodegenPasses {
         // LLVMVerifyModule (which crashes on null function types).
         mut has_corrupt: boolean = false;
         {
-            mut fn_val: void* = llvm::LLVMGetFirstFunction(cg.llvm_module.raw);
+            mut fn_val: void* = llvm::LLVMGetFirstFunction(cg_ptr.llvm_module.raw);
             while (fn_val != null) {
                 const fn_ty: void* = llvm::LLVMGlobalGetValueType(fn_val);
                 if (fn_ty == null) {
@@ -132,7 +136,7 @@ type struct CodegenPasses {
         } else {
             // Verify the LLVM module.
             mut verify_err: i8* = null;
-            const verify_result: i32 = llvm::LLVMVerifyModule(cg.llvm_module.raw, 2, &verify_err as void*);
+            const verify_result: i32 = llvm::LLVMVerifyModule(cg_ptr.llvm_module.raw, 2, &verify_err as void*);
             if (verify_err != null) {
                 if (verify_result != 0) {
                     printf("[Codegen] Verification failed for %s: %s\n", module_name, verify_err as string);
@@ -142,8 +146,9 @@ type struct CodegenPasses {
             if (verify_result != 0) {
                 ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                     format("LLVM module verification failed for %s", module_name));
-                cg.dispose_builder();
+                cg_ptr.dispose_builder();
                 tm.dispose();
+                free(cg_ptr as void*);
                 return PassResult::failure(1);
             }
         }
@@ -155,12 +160,13 @@ type struct CodegenPasses {
         // Store the LLVM module in artifacts.  The module is now owned by
         // artifacts — do NOT dispose it here.
         ctx.artifacts.ir = IROutput {
-            llvm_module: cg.llvm_module.raw,
+            llvm_module: cg_ptr.llvm_module.raw,
             module_name: module_name,
         };
 
-        cg.dispose_builder();
+        cg_ptr.dispose_builder();
         tm.dispose();
+        free(cg_ptr as void*);
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
