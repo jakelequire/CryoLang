@@ -433,6 +433,19 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
         if (cls.has_virtual_methods && field_idx >= 0) {
             field_idx = field_idx + 1;
         }
+    } else if (tk == TypeKind::Array) {
+        const arr_t: ArrayType* = t as ArrayType*;
+        const length_sym: SymbolStr = cg.intern.intern("length");
+        if (member.id == length_sym.id) {
+            if (arr_t.is_fixed()) {
+                // Fixed array: length is a compile-time constant.
+                *out_value = LType::const_int(LType::i64(), arr_t.size as u64, false);
+                *out_is_lvalue = false;
+                return;
+            }
+            // Dynamic array { T*, i64 }: length is field 1.
+            field_idx = 1;
+        }
     }
 
     if (field_idx < 0) {
@@ -471,17 +484,20 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
         // Fixed array: GEP into [N x T].
         const arr_ty: LType = cg.type_mapper.map_type(array_type);
         // Build indices: [0, index]
+        const zero: LValue = LType::const_int(LType::i64(), 0, false);
         const buf: void* = malloc(16);
         const slots: void** = buf as void**;
-        slots[0] = LType::const_int(LType::i64(), 0, false).raw;
+        slots[0] = zero.raw;
         slots[1] = index_val.raw;
         const gep: LValue = cg.builder.build_gep(arr_ty, array_val, buf, 2, "elemptr");
         free(buf);
         *out_value = gep;
         *out_is_lvalue = true;
     } else {
-        // Dynamic array: extract data pointer from { T*, i64 }, then GEP.
-        const data_ptr: LValue = cg.builder.build_extract_value(array_val, 0, "data");
+        // Dynamic array: load { T*, i64 } from pointer, extract data pointer, then GEP.
+        const arr_ty: LType = cg.type_mapper.map_type(array_type);
+        const loaded: LValue = cg.builder.build_load(arr_ty, array_val, "arrload");
+        const data_ptr: LValue = cg.builder.build_extract_value(loaded, 0, "data");
         const buf: void* = malloc(8);
         const slots: void** = buf as void**;
         slots[0] = index_val.raw;
