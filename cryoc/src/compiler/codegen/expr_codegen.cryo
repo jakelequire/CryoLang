@@ -10,6 +10,7 @@ import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
 import Compiler::Codegen::Context;
+import Compiler::CompilationContext;
 import Compiler::Types;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Type;
@@ -23,6 +24,7 @@ import Compiler::AST::Declaration;
 import Compiler::Lex;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
+import Compiler::Diag;
 
 
 // ============================================================================
@@ -455,6 +457,22 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
     }
 
     const struct_ty: LType = cg.type_mapper.map_type(object_type);
+    if (!struct_ty.is_valid()) {
+        printf("[IRGen] WARNING: member access — failed to map object type\n"); fflush(null);
+        cg.ctx.emit_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+            "codegen: member access — failed to map object type to LLVM type");
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+    if (!object_ptr.is_valid()) {
+        printf("[IRGen] WARNING: member access — object pointer is null\n"); fflush(null);
+        cg.ctx.emit_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+            "codegen: member access — object pointer is null");
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
     const gep: LValue = cg.builder.build_struct_gep(struct_ty, object_ptr,
                                                       field_idx as u32, "fieldptr");
     *out_value = gep;
@@ -479,6 +497,30 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
 
     const arr: ArrayType* = t as ArrayType*;
     const elem_ty: LType = cg.type_mapper.map_type(arr.element);
+    if (!elem_ty.is_valid()) {
+        printf("[IRGen] WARNING: array access — failed to map element type\n"); fflush(null);
+        cg.ctx.emit_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+            "codegen: array access — failed to map element type");
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+    if (!array_val.is_valid()) {
+        printf("[IRGen] WARNING: array access — array value is null\n"); fflush(null);
+        cg.ctx.emit_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+            "codegen: array access — array value is null");
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+    if (!index_val.is_valid()) {
+        printf("[IRGen] WARNING: array access — index value is null\n"); fflush(null);
+        cg.ctx.emit_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+            "codegen: array access — index value is null");
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
 
     if (arr.is_fixed()) {
         // Fixed array: GEP into [N x T].
@@ -526,7 +568,23 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
 
     // Get the current function for entry block alloca.
     const current_bb: LBasicBlock = cg.builder.get_insert_block();
+    if (!current_bb.is_valid()) {
+        printf("[IRGen] WARNING: struct literal — no insert block set\n"); fflush(null);
+        cg.ctx.emit_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+            "codegen: struct literal — builder has no insert block");
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
     const current_fn: LValue = current_bb.get_parent();
+    if (!current_fn.is_valid()) {
+        printf("[IRGen] WARNING: struct literal — no parent function\n"); fflush(null);
+        cg.ctx.emit_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+            "codegen: struct literal — insert block has no parent function");
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
 
     const alloca: LValue = cg.create_entry_alloca(current_fn, "structlit", ty);
 

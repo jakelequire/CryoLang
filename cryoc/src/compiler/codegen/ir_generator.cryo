@@ -14,6 +14,7 @@ import Compiler::Codegen::DeclCodegen;
 import Compiler::Codegen::ExprCodegen;
 import Compiler::Codegen::StmtCodegen;
 import Compiler::CompilationContext;
+import Compiler::Diag;
 import Compiler::Types;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Type;
@@ -61,6 +62,12 @@ public:
     /// Get the current function from the builder's insert block.
     get_current_function(mut &this) -> LValue {
         const bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (!bb.is_valid()) {
+            printf("[IRGen] ERROR: get_current_function — no insert block set\n"); fflush(null);
+            this.cg.ctx.emit_error(ErrorCode::E0600_CODEGEN_FAILED,
+                "codegen: builder has no insert block — cannot determine current function");
+            return LValue::null();
+        }
         return bb.get_parent();
     }
 
@@ -340,6 +347,10 @@ public:
         } else if (kind == NodeKind::UnsafeBlockStatement) {
             const unsafe_node: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
             this.generate_block(unsafe_node.block);
+        } else {
+            printf("[IRGen] WARNING: unhandled statement kind %d — skipping\n", kind as i32); fflush(null);
+            this.cg.ctx.emit_warning(ErrorCode::E0600_CODEGEN_FAILED,
+                format("codegen: unhandled statement kind %d — skipping (not yet implemented)", kind as i32));
         }
     }
 
@@ -433,6 +444,9 @@ public:
             this.gen_ternary(expr as TernaryExprNode*);
         } else {
             // Unsupported expression — leave last_value as null.
+            printf("[IRGen] WARNING: unhandled expression kind %d — returning null\n", kind as i32); fflush(null);
+            this.cg.ctx.emit_warning(ErrorCode::E0600_CODEGEN_FAILED,
+                format("codegen: unhandled expression kind %d — not yet implemented", kind as i32));
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
         }
@@ -462,7 +476,23 @@ public:
             op == TokenType::StarEqual || op == TokenType::SlashEqual ||
             op == TokenType::PercentEqual) {
             const addr: LValue = this.codegen_lvalue(node.left);
+            if (!addr.is_valid()) {
+                printf("[IRGen] WARNING: compound assignment — lvalue is null\n"); fflush(null);
+                this.cg.ctx.emit_error(ErrorCode::E0614_ASSIGNMENT_ERROR,
+                    "codegen: compound assignment target produced null lvalue");
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
             const lhs_ty: LType = this.cg.type_mapper.map_type(node.left.resolved_type);
+            if (!lhs_ty.is_valid()) {
+                printf("[IRGen] WARNING: compound assignment — failed to map lhs type\n"); fflush(null);
+                this.cg.ctx.emit_error(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                    "codegen: compound assignment — failed to map left-hand side type");
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
             const lhs_loaded: LValue = this.cg.builder.build_load(lhs_ty, addr, "compoundlhs");
             const rhs: LValue = this.codegen_rvalue(node.right);
             const base_op: TokenType = match (op) {
@@ -551,6 +581,9 @@ public:
         }
 
         if (!callee_val.is_valid()) {
+            printf("[IRGen] WARNING: call — callee not found\n"); fflush(null);
+            this.cg.ctx.emit_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                "codegen: call expression — callee function not found");
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
@@ -568,6 +601,14 @@ public:
         }
 
         const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
+        if (!fn_ty.is_valid()) {
+            printf("[IRGen] WARNING: call — LLVMGlobalGetValueType returned null\n"); fflush(null);
+            this.cg.ctx.emit_error(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                "codegen: call expression — failed to retrieve function type from callee");
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
         const ret_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         const void_ty: LType = LType::void_type();
         const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
@@ -670,6 +711,14 @@ public:
         if (op == TokenType::Equal) {
             const addr: LValue = this.codegen_lvalue(node.left);
             const val: LValue = this.codegen_rvalue(node.right);
+            if (!addr.is_valid() || !val.is_valid()) {
+                printf("[IRGen] WARNING: assignment (override) — lvalue or rvalue is null\n"); fflush(null);
+                this.cg.ctx.emit_error(ErrorCode::E0614_ASSIGNMENT_ERROR,
+                    "codegen: assignment — target or value produced null");
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
             this.cg.builder.build_store(val, addr);
             this.last_value = val;
             this.last_is_lvalue = false;
@@ -681,7 +730,23 @@ public:
             op == TokenType::StarEqual || op == TokenType::SlashEqual ||
             op == TokenType::PercentEqual) {
             const addr: LValue = this.codegen_lvalue(node.left);
+            if (!addr.is_valid()) {
+                printf("[IRGen] WARNING: compound assignment (override) — lvalue is null\n"); fflush(null);
+                this.cg.ctx.emit_error(ErrorCode::E0614_ASSIGNMENT_ERROR,
+                    "codegen: compound assignment target produced null lvalue");
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
             const lhs_ty: LType = this.cg.type_mapper.map_type(node.left.resolved_type);
+            if (!lhs_ty.is_valid()) {
+                printf("[IRGen] WARNING: compound assignment (override) — failed to map lhs type\n"); fflush(null);
+                this.cg.ctx.emit_error(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                    "codegen: compound assignment — failed to map left-hand side type");
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
             const lhs_loaded: LValue = this.cg.builder.build_load(lhs_ty, addr, "compoundlhs");
             const rhs: LValue = this.codegen_rvalue(node.right);
 
@@ -874,6 +939,9 @@ public:
         }
 
         if (!callee_val.is_valid()) {
+            printf("[IRGen] WARNING: call (override) — callee not found\n"); fflush(null);
+            this.cg.ctx.emit_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                "codegen: call expression — callee function not found");
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
@@ -896,6 +964,14 @@ public:
 
         // Get the function type for the call.
         const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
+        if (!fn_ty.is_valid()) {
+            printf("[IRGen] WARNING: call (override) — LLVMGlobalGetValueType returned null\n"); fflush(null);
+            this.cg.ctx.emit_error(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                "codegen: call expression — failed to retrieve function type from callee");
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
         // Call name: use "" for void returns, "calltmp" for value returns.
         const ret_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         const void_ty: LType = LType::void_type();

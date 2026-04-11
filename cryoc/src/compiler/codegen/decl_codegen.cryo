@@ -29,6 +29,7 @@ import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::MangledName;
 import Compiler::Resolver::QualifiedName;
+import Compiler::Diag;
 
 
 // ============================================================================
@@ -304,6 +305,12 @@ function declare_extern_block(cg: CodegenContext*, node: ExternBlockNode*) -> vo
 
         // Extern functions use their bare name (C linkage).
         const ret_ty: LType = map_return_type(cg, func);
+        if (!ret_ty.is_valid()) {
+            printf("[IRGen] WARNING: extern '%s' — failed to map return type, skipping\n", name_str); fflush(null);
+            cg.ctx.emit_warning(ErrorCode::E0643_RETURN_TYPE_ERROR,
+                format("codegen: extern function '%s' — failed to map return type", name_str));
+            continue;
+        }
         const param_count: u32 = func.parameters.length as u32;
 
         mut fn_type: LType = LType::null();
@@ -312,10 +319,22 @@ function declare_extern_block(cg: CodegenContext*, node: ExternBlockNode*) -> vo
         } else {
             const buf: void* = malloc(param_count as u64 * 8);
             const slots: void** = buf as void**;
+            mut params_ok: boolean = true;
             for (mut j: u32 = 0; j < param_count; j++) {
                 const param: VarDeclNode* = func.parameters[j];
                 const mapped_ep: LType = cg.type_mapper.map_type(param.resolved_type);
+                if (!mapped_ep.is_valid()) {
+                    printf("[IRGen] WARNING: extern '%s' param %d — failed to map type, skipping\n", name_str, j); fflush(null);
+                    cg.ctx.emit_warning(ErrorCode::E0642_PARAM_TYPE_ERROR,
+                        format("codegen: extern function '%s' — failed to map parameter %d type", name_str, j as i32));
+                    params_ok = false;
+                    break;
+                }
                 slots[j] = mapped_ep.raw;
+            }
+            if (!params_ok) {
+                free(buf);
+                continue;
             }
             fn_type = LType::function_type(ret_ty, buf, param_count, func.is_variadic);
             free(buf);
