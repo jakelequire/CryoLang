@@ -107,6 +107,7 @@ LLVMTypeRef LLVMDoubleType(void);
 
 LLVMTypeRef LLVMVoidTypeInContext(LLVMContextRef C);
 LLVMTypeRef LLVMVoidType(void);
+int LLVMGetTypeKind(LLVMTypeRef Ty);  /* 0 = LLVMVoidTypeKind */
 LLVMTypeRef LLVMPointerType(LLVMTypeRef ElementType, unsigned AddressSpace);
 LLVMTypeRef LLVMPointerTypeInContext(LLVMContextRef C, unsigned AddressSpace);
 

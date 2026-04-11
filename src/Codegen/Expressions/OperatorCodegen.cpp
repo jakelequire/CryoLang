@@ -2320,27 +2320,50 @@ namespace Cryo::Codegen
     {
         llvm::IRBuilder<> &b = builder();
 
-        // In Cryo, raw pointer equality is only meaningful against null.
-        // When comparing two non-null pointers with == or !=, the operands
-        // are almost certainly strings (Cryo's string type is ptr/i8*).
-        // Use strcmp for value equality instead of pointer identity.
-        // This is critical for monomorphized generic code (e.g., HashMap<string, V>)
-        // where type information is lost during specialization.
+        // Determine if the operands are Cryo strings or raw pointers.
+        // String comparisons use strcmp for value equality.  Non-string pointer
+        // comparisons (void*, SomeStruct*, etc.) use direct icmp eq/ne.
+        // Default: assume string if we can't determine the type, since Cryo's
+        // string type is ptr and string equality must be value-based.
+        // generate_comparison() handles most string comparisons via operand_type,
+        // string literal detection, and child resolved types.  However, some string
+        // comparisons escape that detection (e.g., comparing string variables without
+        // resolved_type set).  For those, we still need strcmp as a fallback.
         //
-        // Null-safe: if either runtime pointer is null, fall back to pointer
-        // comparison (handles calloc'd/uninitialized entries in HashMap).
+        // The exception: if we can prove the operands are NOT strings (e.g., they
+        // are loaded from a struct field — a void* or typed pointer), use icmp eq.
+        // The Cryo type system's `string` is never stored as a struct field named
+        // `raw` or accessed via extractvalue — those patterns indicate void*/handle
+        // types like LLVMTypeRef, LLVMValueRef, etc.
+        bool is_known_non_string = false;
+
+        // Check Cryo type info if available
+        if (node && node->left() && node->left()->has_resolved_type())
+        {
+            auto left_type = node->left()->get_resolved_type();
+            if (left_type.is_valid())
+            {
+                auto *cryo_type = left_type.get();
+                if (cryo_type && cryo_type->kind() != TypeKind::String)
+                {
+                    is_known_non_string = true;
+                }
+            }
+        }
+
         bool either_is_null_constant = llvm::isa<llvm::ConstantPointerNull>(lhs) ||
                                        llvm::isa<llvm::ConstantPointerNull>(rhs);
-        if (!either_is_null_constant &&
+        if (!is_known_non_string && !either_is_null_constant &&
             (op == TokenKind::TK_EQUALEQUAL || op == TokenKind::TK_EXCLAIMEQUAL))
         {
+            // Fallback: use null-safe strcmp for unresolved pointer comparisons
+            // that might be strings.
             llvm::Value *null_ptr = llvm::ConstantPointerNull::get(
                 llvm::PointerType::get(llvm_ctx(), 0));
             llvm::Value *lhs_is_null = b.CreateICmpEQ(lhs, null_ptr, "lhs.null");
             llvm::Value *rhs_is_null = b.CreateICmpEQ(rhs, null_ptr, "rhs.null");
             llvm::Value *any_null = b.CreateOr(lhs_is_null, rhs_is_null, "any.null");
 
-            // Build the strcmp path
             llvm::FunctionCallee strcmp_fn = module()->getOrInsertFunction(
                 "strcmp",
                 llvm::FunctionType::get(
@@ -2349,7 +2372,6 @@ namespace Cryo::Codegen
                      llvm::PointerType::get(llvm_ctx(), 0)},
                     false));
 
-            // Create basic blocks for the branch
             llvm::Function *func = b.GetInsertBlock()->getParent();
             llvm::BasicBlock *null_bb = llvm::BasicBlock::Create(llvm_ctx(), "ptr.cmp.null", func);
             llvm::BasicBlock *str_bb = llvm::BasicBlock::Create(llvm_ctx(), "ptr.cmp.str", func);
@@ -2357,7 +2379,6 @@ namespace Cryo::Codegen
 
             b.CreateCondBr(any_null, null_bb, str_bb);
 
-            // Null path: pointer comparison
             b.SetInsertPoint(null_bb);
             llvm::Value *ptr_result;
             if (op == TokenKind::TK_EQUALEQUAL)
@@ -2365,9 +2386,8 @@ namespace Cryo::Codegen
             else
                 ptr_result = b.CreateICmpNE(lhs, rhs, "ptr_ne");
             b.CreateBr(merge_bb);
-            null_bb = b.GetInsertBlock(); // Update for PHI
+            null_bb = b.GetInsertBlock();
 
-            // String path: strcmp
             b.SetInsertPoint(str_bb);
             llvm::Value *cmp_result = b.CreateCall(strcmp_fn, {lhs, rhs}, "strcmp.result");
             llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_ctx()), 0);
@@ -2377,9 +2397,8 @@ namespace Cryo::Codegen
             else
                 str_result = b.CreateICmpNE(cmp_result, zero, "str_ne");
             b.CreateBr(merge_bb);
-            str_bb = b.GetInsertBlock(); // Update for PHI
+            str_bb = b.GetInsertBlock();
 
-            // Merge
             b.SetInsertPoint(merge_bb);
             llvm::PHINode *phi = b.CreatePHI(llvm::Type::getInt1Ty(llvm_ctx()), 2, "ptr.str.cmp");
             phi->addIncoming(ptr_result, null_bb);
