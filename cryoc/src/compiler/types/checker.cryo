@@ -201,10 +201,16 @@ type struct TypeChecker {
         if (from_type.kind == TypeKind::Array && to_type.kind == TypeKind::Array) {
             const from_arr: ArrayType* = from_type as ArrayType*;
             const to_arr: ArrayType* = to_type as ArrayType*;
-            if (from_arr.element.equals(to_arr.element)) {
-                // Same element type — sizes are compatible:
-                // T[N] → T[] (fixed to dynamic), T[N] → T[N] (same size, caught by identity check above),
-                // T[] → T[] (same, caught by identity), T[N] → T[M] (different sizes)
+            // Check element compatibility by ID first, then by kind.
+            mut elems_ok: boolean = from_arr.element.equals(to_arr.element);
+            if (!elems_ok) {
+                const ea: Type* = this.arena.lookup(from_arr.element.id);
+                const eb: Type* = this.arena.lookup(to_arr.element.id);
+                if (ea != null && eb != null && ea.kind == eb.kind) {
+                    elems_ok = true;
+                }
+            }
+            if (elems_ok) {
                 if (to_arr.is_dynamic() || from_arr.size == to_arr.size) {
                     return TypeCompatibility::Compatible;
                 }
@@ -329,6 +335,13 @@ type struct TypeChecker {
             const from_ref: ReferenceType* = from_type as ReferenceType*;
             const to_ptr: PointerType* = to_type as PointerType*;
             if (from_ref.referent.equals(to_ptr.pointee)) {
+                return TypeCompatibility::ImplicitConvert;
+            }
+            // Cross-module: referent and pointee may have different TypeIDs.
+            // Compare by kind — same kind means structurally compatible.
+            const ri: Type* = this.arena.lookup(from_ref.referent.id);
+            const pi: Type* = this.arena.lookup(to_ptr.pointee.id);
+            if (ri != null && pi != null && ri.kind == pi.kind) {
                 return TypeCompatibility::ImplicitConvert;
             }
             // &T → void* is also valid
