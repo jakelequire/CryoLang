@@ -81,20 +81,19 @@ public:
     ///   3. Generate function bodies
     generate_program(mut &this, program: ProgramNode*) -> boolean {
         if (program == null) {
+            printf("[IRGen] generate_program: program is null\n"); fflush(null);
             return false;
         }
 
-        // Phase 1: Declare types.
+        printf("[IRGen] Phase 1: declare_types...\n"); fflush(null);
         declare_types(this.cg, program);
+        printf("[IRGen] Phase 1: done\n"); fflush(null);
 
-        // Phase 2: Declare function signatures.
+        printf("[IRGen] Phase 2: declare_functions...\n"); fflush(null);
         declare_functions(this.cg, program);
+        printf("[IRGen] Phase 2: done\n"); fflush(null);
 
-        // Phase 3: Generate function bodies.
-        // NOTE: We call codegen functions DIRECTLY instead of going through
-        // this.visit() / node.accept() because the C++ Cryo compiler has a
-        // vtable bug with overridden visit() methods — virtual dispatch
-        // calls the empty BaseASTVisitor::visit() instead of our overrides.
+        printf("[IRGen] Phase 3: generate bodies (%lld stmts)...\n", program.statements.length); fflush(null);
         const stmts: ASTNode*[] = program.statements;
         for (mut i: i64 = 0; i < stmts.length; i++) {
             const stmt: ASTNode* = stmts[i];
@@ -106,17 +105,28 @@ public:
                 const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
                 if (func.generic_params.length > 0) { continue; }
                 if (func.body == null) { continue; }
+                const fn_name: string = this.cg.intern.resolve(func.name);
+                printf("[IRGen]   [%lld] func body: %s\n", i, fn_name); fflush(null);
                 this.generate_function_body(func);
+                printf("[IRGen]   [%lld] func done\n", i); fflush(null);
             } else if (kind == NodeKind::ImplementationBlock) {
-                this.generate_impl_block(stmt as ImplBlockNode*);
+                const impl_node: ImplBlockNode* = stmt as ImplBlockNode*;
+                const impl_target: string = this.cg.intern.resolve(impl_node.target_type);
+                printf("[IRGen]   [%lld] impl block: %s (%lld methods)\n",
+                       i, impl_target, impl_node.methods.length); fflush(null);
+                this.generate_impl_block(impl_node);
+                printf("[IRGen]   [%lld] impl done\n", i); fflush(null);
             } else if (kind == NodeKind::VariableDeclaration) {
                 const var_decl: VarDeclNode* = stmt as VarDeclNode*;
                 if (var_decl.is_global) {
+                    const var_name: string = this.cg.intern.resolve(var_decl.name);
+                    printf("[IRGen]   [%lld] global var: %s\n", i, var_name); fflush(null);
                     codegen_global_var(this.cg, var_decl);
                 }
             }
         }
 
+        printf("[IRGen] Phase 3: all bodies done\n"); fflush(null);
         return true;
     }
 
@@ -128,22 +138,36 @@ public:
     /// Generate a function body directly, without virtual dispatch.
     generate_function_body(mut &this, node: FunctionDeclNode*) -> void {
         const fn_val: LValue = codegen_function_prologue(this.cg, node);
-        if (!fn_val.is_valid()) { return; }
-
-        // Generate body statements directly.
+        if (!fn_val.is_valid()) {
+            printf("[IRGen]     func prologue failed\n"); fflush(null);
+            return;
+        }
+        printf("[IRGen]     func prologue ok, generating block...\n"); fflush(null);
         this.generate_block(node.body);
-
+        printf("[IRGen]     func block done, epilogue...\n"); fflush(null);
         codegen_function_epilogue(this.cg, node);
     }
 
     /// Generate an impl block directly.
     generate_impl_block(mut &this, node: ImplBlockNode*) -> void {
-        if (node.generic_params.length > 0) { return; }
+        if (node.generic_params.length > 0) {
+            printf("[IRGen]     impl skipped (generic)\n"); fflush(null);
+            return;
+        }
 
         this.current_impl_target = node.target_type;
 
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.generate_method_body(node.methods[i]);
+            const m: MethodNode* = node.methods[i];
+            const mfunc: FunctionDeclNode* = m.func;
+            if (mfunc != null) {
+                const mname: string = this.cg.intern.resolve(mfunc.name);
+                printf("[IRGen]     method[%lld]: %s (static=%d, generic=%lld, body=%p)\n",
+                       i, mname, m.is_static as i32,
+                       mfunc.generic_params.length, mfunc.body as void*); fflush(null);
+            }
+            this.generate_method_body(m);
+            printf("[IRGen]     method[%lld] done\n", i); fflush(null);
         }
 
         this.current_impl_target = SymbolStr::empty();
@@ -155,11 +179,17 @@ public:
         if (func == null || func.body == null) { return; }
         if (func.generic_params.length > 0) { return; }
 
+        printf("[IRGen]       method prologue...\n"); fflush(null);
         const fn_val: LValue = codegen_method_prologue(
             this.cg, node, this.current_impl_target);
-        if (!fn_val.is_valid()) { return; }
+        if (!fn_val.is_valid()) {
+            printf("[IRGen]       method prologue FAILED\n"); fflush(null);
+            return;
+        }
 
+        printf("[IRGen]       method body block...\n"); fflush(null);
         this.generate_block(func.body);
+        printf("[IRGen]       method body done, epilogue...\n"); fflush(null);
         codegen_function_epilogue(this.cg, func);
     }
 
@@ -167,6 +197,7 @@ public:
     generate_block(mut &this, block: BlockStmtNode*) -> void {
         if (block == null) { return; }
         this.cg.push_scope();
+        printf("[IRGen]         block (%lld stmts)\n", block.statements.length); fflush(null);
         for (mut i: i64 = 0; i < block.statements.length; i++) {
             const current: LBasicBlock = this.cg.builder.get_insert_block();
             if (current.is_valid() && current.has_terminator()) {
@@ -184,6 +215,7 @@ public:
     generate_statement(mut &this, stmt: StatementNode*) -> void {
         if (stmt == null) { return; }
         const kind: NodeKind = stmt.kind;
+        printf("[IRGen]           stmt kind=%d\n", kind as i32); fflush(null);
 
         if (kind == NodeKind::BlockStatement) {
             this.generate_block(stmt as BlockStmtNode*);
@@ -317,8 +349,10 @@ public:
 
         if (this.last_is_lvalue && this.last_value.is_valid()) {
             const ty: LType = this.cg.type_mapper.map_type(expr.resolved_type);
-            const loaded: LValue = this.cg.builder.build_load(ty, this.last_value, "load");
-            this.last_value = loaded;
+            if (ty.is_valid()) {
+                const loaded: LValue = this.cg.builder.build_load(ty, this.last_value, "load");
+                this.last_value = loaded;
+            }
             this.last_is_lvalue = false;
         }
         return this.last_value;
@@ -334,6 +368,7 @@ public:
     /// Dispatch an expression directly by kind (bypass vtable).
     generate_expression(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
+        printf("[IRGen]             expr kind=%d\n", expr.kind as i32); fflush(null);
         const kind: NodeKind = expr.kind;
 
         if (kind == NodeKind::Literal) {
@@ -399,6 +434,11 @@ public:
         if (op == TokenType::Equal) {
             const addr: LValue = this.codegen_lvalue(node.left);
             const val: LValue = this.codegen_rvalue(node.right);
+            if (!addr.is_valid() || !val.is_valid()) {
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
             this.cg.builder.build_store(val, addr);
             this.last_value = val;
             this.last_is_lvalue = false;
