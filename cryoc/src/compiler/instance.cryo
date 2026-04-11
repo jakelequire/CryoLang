@@ -40,12 +40,14 @@ type struct CompilerConfig {
     debug:          boolean;
     show_ast:       boolean;
     verbose_passes: boolean;
+    emit_llvm:      boolean;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
             debug:          false,
             show_ast:       false,
             verbose_passes: false,
+            emit_llvm:      false,
         };
     }
 
@@ -54,6 +56,7 @@ type struct CompilerConfig {
             debug:          true,
             show_ast:       true,
             verbose_passes: true,
+            emit_llvm:      false,
         };
     }
 }
@@ -137,6 +140,21 @@ type struct CompilerInstance {
         }
 
         const success: boolean = pipeline.run_all(ctx);
+
+        // Write .ll text file when --emit-llvm is set (single-file mode).
+        if (this.config.emit_llvm && ctx.artifacts.ir.is_valid()) {
+            const ll_path: string = format("%s.ll", output_path);
+            mut ll_err: i8* = null;
+            const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
+                ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
+            if (ll_ok == 0) {
+                printf("[Compiler] LLVM IR emitted: %s\n", ll_path);
+            } else if (ll_err != null) {
+                printf("[Compiler] Warning: failed to write %s: %s\n",
+                       ll_path, ll_err as string);
+                llvm::LLVMDisposeMessage(ll_err as void*);
+            }
+        }
 
         // Dump AST if --ast was requested
         if (this.config.show_ast && ctx.artifacts.ast.is_valid()) {
@@ -689,6 +707,10 @@ type struct CompilerInstance {
             }
 
             for (mut i: u32 = 0; i < n; i++) {
+                const _mi: ModuleInfo = ctx.module_graph.modules[order[i]];
+                const _mn: string = ctx.intern_table.resolve(_mi.name);
+                printf("[Compiler] Phase 7: module %u/%u (%s)\n", i, n, _mn);
+                fflush(null);
                 CompilerInstance::load_module_with_scope(
                     ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
                 ctx.provisions.clear();
@@ -714,9 +736,9 @@ type struct CompilerInstance {
                     const mod_info: ModuleInfo = ctx.module_graph.modules[order[i]];
                     const mod_name: string = ctx.intern_table.resolve(mod_info.name);
 
-                    // Write .ll text file via LLVMPrintModuleToFile (safer than
-                    // print_to_string on potentially malformed modules).
-                    {
+                    // Write .ll text file when --emit-llvm is set
+                    // (either via CLI flag or cryoconfig args).
+                    if (this.config.emit_llvm || config.emit_llvm) {
                         const mn_len: u64 = strlen(mod_name);
                         const mn_buf: i8* = malloc(mn_len + 1) as i8*;
                         memcpy(mn_buf as void*, mod_name as void*, mn_len);
@@ -794,7 +816,7 @@ type struct CompilerInstance {
 
         // TODO: Discover stdlib modules from source_dir and populate module_graph.
         // For now, returns success with zero modules.
-        const graph: ModuleGraph = ctx.module_graph;
+        const graph: ModuleGraph* = ctx.module_graph;
         if (graph.module_count() == 0) {
             if (this.config.debug) {
                 LOG_DEBUG(LogComponent::General, "[Compiler] Stdlib batch: no modules discovered");

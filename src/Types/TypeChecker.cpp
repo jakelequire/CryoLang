@@ -117,6 +117,26 @@ namespace Cryo
             return check_compatibility(from, alias->target());
         }
 
+        // Array compatibility: check element types recursively.
+        // Two array types created in different modules may have different TypeIDs
+        // but identical element types (e.g., ASTNode*[] from module A vs module B).
+        if (from_kind == TypeKind::Array && to_kind == TypeKind::Array)
+        {
+            auto *from_arr = dynamic_cast<const ArrayType *>(from_t);
+            auto *to_arr = dynamic_cast<const ArrayType *>(to_t);
+            if (from_arr && to_arr)
+            {
+                TypeRef from_elem = from_arr->element();
+                TypeRef to_elem = to_arr->element();
+                auto elem_compat = check_compatibility(from_elem, to_elem);
+                if (elem_compat == TypeCompatibility::Identical ||
+                    elem_compat == TypeCompatibility::Compatible)
+                {
+                    return TypeCompatibility::Compatible;
+                }
+            }
+        }
+
         // Unwrap InstantiatedType to its resolved concrete type
         if (from_kind == TypeKind::InstantiatedType)
         {
