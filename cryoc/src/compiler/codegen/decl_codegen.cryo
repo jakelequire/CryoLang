@@ -67,9 +67,9 @@ function declare_struct_type(cg: CodegenContext*, node: StructDeclNode*) -> void
         return;
     }
 
-    const name: string = cg.intern.resolve(node.name);
-    const qname: QualifiedName = QualifiedName::single(cg.intern, name);
-    const mangled: string = MangledName::for_struct(cg.intern, qname).resolve(cg.intern);
+    const name: string = cg.resolve(node.name);
+    const qname: QualifiedName = QualifiedName::single(cg.get_intern(), name);
+    const mangled: string = MangledName::for_struct(cg.get_intern(), qname).resolve(cg.get_intern());
 
     // Look up the Cryo StructType to get field info.
     const type_ref: TypeRef = cg.ctx.decl_index.lookup_type(node.name);
@@ -151,10 +151,9 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
     // Break pointer chains into locals — the C++ compiler can't
     // resolve double dereferences like cg.ctx.method().
     const ctx_ptr: CompilationContext* = cg.ctx;
-    const intern: InternTable* = cg.intern;
+    const intern: InternTable* = ctx_ptr.intern_table;
     const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
-    const qualified_str: string = intern.resolve(qualified);
-    const qname: QualifiedName = QualifiedName::parse(intern, qualified_str);
+    const qname: QualifiedName = QualifiedName::from_symbol(qualified);
     const mangled: MangledName = MangledName::for_function(intern, qname);
     const fn_name: string = mangled.resolve(intern);
 
@@ -251,18 +250,17 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
         return;
     }
 
-    // Break cg.intern chain into local.
-    const intern: InternTable* = cg.intern;
+    const intern: InternTable* = cg.get_intern();
     const type_str: string = intern.resolve(target_type);
     const method_str: string = intern.resolve(func.name);
 
     // Parse the qualified type name so the mangler produces a fully
     // qualified IR name (e.g., "std_collections_Array_String_push").
-    const type_qname: QualifiedName = QualifiedName::parse(intern, type_str);
+    const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
     const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
 
     // Collect parameter display names for overload disambiguation.
-    const arena: TypeArena* = cg.arena;
+    const arena: TypeArena* = cg.get_arena();
     mut param_displays: string[] = [];
     for (mut i: i64 = 0; i < func.parameters.length; i++) {
         const p: VarDeclNode* = func.parameters[i];
@@ -345,11 +343,15 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
 
 /// Declare extern block functions.
 function declare_extern_block(cg: CodegenContext*, node: ExternBlockNode*) -> void {
+    // Get intern table from CompilationContext to avoid CodegenContext offset issues.
+    const ctx_ptr: CompilationContext* = cg.ctx;
+    const intern: InternTable* = ctx_ptr.intern_table;
+
     for (mut i: i64 = 0; i < node.functions.length; i++) {
         const func: FunctionDeclNode* = node.functions[i];
         if (func == null) { continue; }
 
-        const name_str: string = cg.intern.resolve(func.name);
+        const name_str: string = intern.resolve(func.name);
 
         // Extern functions use their bare name (C linkage).
         const ret_ty: LType = map_return_type(cg, func);
@@ -394,76 +396,113 @@ function declare_extern_block(cg: CodegenContext*, node: ExternBlockNode*) -> vo
     }
 }
 
-/// Declare cross-module extern functions from the module graph.
+/// Declare cross-module extern functions.
+///
+/// Instead of reading from pre-built CrossModuleFnDescriptor objects
+/// (which suffer from struct-copy corruption when the descriptor
+/// contains dynamic array fields), query the DeclarationIndex directly
+/// for each module's functions and look up their FunctionType in the arena.
 function declare_cross_module_externs(cg: CodegenContext*) -> void {
-    // Break pointer chains into locals.
+    // Get shared state from CompilationContext, NOT from CodegenContext.
+    // cg.intern may read from the wrong struct offset due to the large
+    // CodegenContext layout — use ctx_ptr.intern_table which earlier
+    // passes rely on successfully.
     const ctx_ptr: CompilationContext* = cg.ctx;
-    const intern: InternTable* = cg.intern;
+    const intern: InternTable* = ctx_ptr.intern_table;
     const mg: ModuleGraph* = ctx_ptr.module_graph;
-    const descriptors: CrossModuleFnDescriptor[] = mg.cross_module_fns;
+    const di: DeclarationIndex* = ctx_ptr.decl_index;
+    const arena: TypeArena* = cg.get_arena();
     mut declared: i32 = 0;
     mut skipped: i32 = 0;
 
-    for (mut i: i64 = 0; i < descriptors.length; i++) {
-        const desc: CrossModuleFnDescriptor = descriptors[i];
+    // Iterate over all modules and declare their functions as externs.
+    const modules: ModuleInfo[] = mg.modules;
+    for (mut mi: i64 = 0; mi < modules.length; mi++) {
+        const mod_info: ModuleInfo = modules[mi];
+        const mod_sym: SymbolStr = intern.intern(mod_info.file_path);
 
-        // Skip if already declared (defined in this module or previously declared).
-        const existing: LValue = cg.get_function(desc.name);
-        if (existing.is_valid()) {
-            continue;
-        }
+        // Get all functions registered in this module.
+        const funcs: SymbolStr[] = di.get_functions_in_module(mod_sym);
 
-        // Map return type
-        const ret_ty: LType = cg.type_mapper.map_type(desc.return_type);
-        if (!ret_ty.is_valid()) {
-            skipped = skipped + 1;
-            continue;
-        }
+        for (mut fi: i64 = 0; fi < funcs.length; fi++) {
+            const fn_name: SymbolStr = funcs[fi];
 
-        // Map parameter types
-        const param_count: u32 = desc.param_types.length as u32;
-        mut fn_type: LType = LType::null();
-        mut valid: boolean = true;
-
-        if (param_count == 0) {
-            fn_type = LType::function_type(ret_ty, null, 0, desc.is_var_arg);
-        } else {
-            const buf: void* = malloc(param_count as u64 * 8);
-            const slots: void** = buf as void**;
-            for (mut j: u32 = 0; j < param_count; j++) {
-                const param_ref: TypeRef = desc.param_types[j];
-                if (param_ref.is_invalid()) {
-                    valid = false;
-                    break;
-                }
-                const mapped: LType = cg.type_mapper.map_type(param_ref);
-                if (!mapped.is_valid()) {
-                    valid = false;
-                    break;
-                }
-                slots[j] = mapped.raw;
+            // Skip if already declared in the current LLVM module.
+            const existing: LValue = cg.get_function(fn_name);
+            if (existing.is_valid()) {
+                continue;
             }
-            if (valid) {
-                fn_type = LType::function_type(ret_ty, buf, param_count, desc.is_var_arg);
+
+            // Look up the FunctionType from the DI → arena.
+            const func_type_ref: TypeRef = di.lookup_func_type(fn_name);
+            if (func_type_ref.is_invalid()) {
+                // No full signature — try return-type-only fallback.
+                const ret_ref: TypeRef = di.lookup_func_return(fn_name);
+                if (ret_ref.is_valid()) {
+                    const ret_ty: LType = cg.type_mapper.map_type(ret_ref);
+                    if (ret_ty.is_valid()) {
+                        // Declare as a no-arg function (best effort).
+                        const fn_type: LType = LType::function_type(ret_ty, null, 0, false);
+                        const ir_name: string = cg.mangle_qualified_name(fn_name);
+                        const fn_val: LValue = cg.llvm_module.add_function(ir_name, fn_type);
+                        cg.register_function(fn_name, fn_val);
+                        declared = declared + 1;
+                    }
+                }
+                continue;
             }
-            free(buf);
+
+            // Resolve the FunctionType from the arena.
+            const ft_ptr: Type* = arena.lookup(func_type_ref.id);
+            if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) {
+                skipped = skipped + 1;
+                continue;
+            }
+            const ft: FunctionType* = ft_ptr as FunctionType*;
+
+            // Map return type.
+            const ret_ty: LType = cg.type_mapper.map_type(ft.return_type);
+            if (!ret_ty.is_valid()) {
+                skipped = skipped + 1;
+                continue;
+            }
+
+            // Map parameter types.
+            const param_count: u32 = ft.param_types.length as u32;
+            mut fn_type: LType = LType::null();
+            mut valid: boolean = true;
+
+            if (param_count == 0) {
+                fn_type = LType::function_type(ret_ty, null, 0, ft.is_variadic);
+            } else {
+                const buf: void* = malloc(param_count as u64 * 8);
+                const slots: void** = buf as void**;
+                for (mut j: u32 = 0; j < param_count; j++) {
+                    const mapped: LType = cg.type_mapper.map_type(ft.param_types[j]);
+                    if (!mapped.is_valid()) {
+                        valid = false;
+                        break;
+                    }
+                    slots[j] = mapped.raw;
+                }
+                if (valid) {
+                    fn_type = LType::function_type(ret_ty, buf, param_count, ft.is_variadic);
+                }
+                free(buf);
+            }
+
+            if (!valid || !fn_type.is_valid()) {
+                skipped = skipped + 1;
+                continue;
+            }
+
+            // Build fully qualified mangled IR name.
+            const ir_name: string = cg.mangle_qualified_name(fn_name);
+
+            const fn_val: LValue = cg.llvm_module.add_function(ir_name, fn_type);
+            cg.register_function(fn_name, fn_val);
+            declared = declared + 1;
         }
-
-        if (!valid || !fn_type.is_valid()) {
-            skipped = skipped + 1;
-            continue;
-        }
-
-        // desc.name is the qualified function name from the source module.
-        // Build a mangled IR name from the qualified name.
-        const qualified_str: string = intern.resolve(desc.name);
-        const qname: QualifiedName = QualifiedName::parse(intern, qualified_str);
-        const mangled: MangledName = MangledName::for_function(intern, qname);
-        const fn_ir_name: string = mangled.resolve(intern);
-
-        const fn_val: LValue = cg.llvm_module.add_function(fn_ir_name, fn_type);
-        cg.register_function(desc.name, fn_val);
-        declared = declared + 1;
     }
 
     if (ctx_ptr.debug_mode) {
@@ -508,9 +547,9 @@ function generate_bodies(cg: CodegenContext*, program: ProgramNode*,
 
 /// Generate a global variable declaration with optional initializer.
 function codegen_global_var(cg: CodegenContext*, node: VarDeclNode*) -> void {
-    const name_str: string = cg.intern.resolve(node.name);
-    const qname: QualifiedName = QualifiedName::single(cg.intern, name_str);
-    const mangled: string = MangledName::for_global(cg.intern, qname).resolve(cg.intern);
+    const name_str: string = cg.resolve(node.name);
+    const qname: QualifiedName = QualifiedName::single(cg.get_intern(), name_str);
+    const mangled: string = MangledName::for_global(cg.get_intern(), qname).resolve(cg.get_intern());
 
     const ty: LType = cg.type_mapper.map_type(node.resolved_type);
     if (!ty.is_valid()) {
@@ -560,7 +599,7 @@ function codegen_function_prologue(cg: CodegenContext*, node: FunctionDeclNode*)
 
     for (mut i: u32 = 0; i < node.parameters.length as u32; i++) {
         const param: VarDeclNode* = node.parameters[i];
-        const param_name: string = cg.intern.resolve(param.name);
+        const param_name: string = cg.resolve(param.name);
         const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
 
         if (!param_ty.is_valid()) {
@@ -586,7 +625,7 @@ function codegen_function_epilogue(cg: CodegenContext*, node: FunctionDeclNode*)
         if (ret_ty.is_invalid()) {
             cg.builder.build_ret_void();
         } else {
-            const t: Type* = cg.arena.lookup(ret_ty.id);
+            const t: Type* = cg.lookup_type_by_id(ret_ty.id);
             if (t != null && (t.kind == TypeKind::Void || t.kind == TypeKind::Unit)) {
                 cg.builder.build_ret_void();
             }
@@ -604,10 +643,10 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
     if (func == null) { return LValue::null(); }
 
     // Look up the function by combined key "Type::method".
-    const type_str: string = cg.intern.resolve(target_type);
-    const method_str: string = cg.intern.resolve(func.name);
+    const type_str: string = cg.resolve(target_type);
+    const method_str: string = cg.resolve(func.name);
     const combined: string = format("%s::%s", type_str, method_str);
-    const combined_sym: SymbolStr = cg.intern.intern(combined);
+    const combined_sym: SymbolStr = cg.intern_str(combined);
 
     const fn_val: LValue = cg.get_function(combined_sym);
     if (!fn_val.is_valid()) {
@@ -630,8 +669,8 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
             target_ref = cg.ctx.decl_index.lookup_type(target_type);
         }
         if (target_ref.is_invalid()) {
-            const ts: string = cg.intern.resolve(target_type);
-            const ms: string = cg.intern.resolve(func.name);
+            const ts: string = cg.resolve(target_type);
+            const ms: string = cg.resolve(func.name);
             cg.ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("codegen: method '%s::%s' — target type '%s' not found in declaration index", ts, ms, ts));
             cg.pop_scope();
@@ -639,8 +678,8 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
         }
         const mapped: LType = cg.type_mapper.map_type(target_ref);
         if (!mapped.is_valid()) {
-            const ts: string = cg.intern.resolve(target_type);
-            const ms: string = cg.intern.resolve(func.name);
+            const ts: string = cg.resolve(target_type);
+            const ms: string = cg.resolve(func.name);
             cg.ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("codegen: method '%s::%s' — failed to map target type to LLVM IR type", ts, ms));
             cg.pop_scope();
@@ -651,7 +690,7 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
         const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
         cg.builder.build_store(arg, alloca);
 
-        const this_sym: SymbolStr = cg.intern.intern("this");
+        const this_sym: SymbolStr = cg.intern_str("this");
         cg.set_named_value(this_sym, alloca);
         param_idx = 1;
     }
@@ -659,7 +698,7 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
     // Bind remaining parameters.
     for (mut i: u32 = 0; i < func.parameters.length as u32; i++) {
         const param: VarDeclNode* = func.parameters[i];
-        const param_name: string = cg.intern.resolve(param.name);
+        const param_name: string = cg.resolve(param.name);
         const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
 
         if (!param_ty.is_valid()) {
@@ -685,7 +724,7 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
 /// Generate a vtable global for a class with virtual methods.
 function codegen_vtable(cg: CodegenContext*, cls_ty: ClassType*) -> LValue {
     const qname: QualifiedName = QualifiedName::from_symbol(cls_ty.qualified_name);
-    const mangled: string = MangledName::for_vtable(cg.intern, qname).resolve(cg.intern);
+    const mangled: string = MangledName::for_vtable(cg.get_intern(), qname).resolve(cg.get_intern());
 
     // Collect virtual methods.
     mut virtual_methods: LValue[] = [];
@@ -693,10 +732,10 @@ function codegen_vtable(cg: CodegenContext*, cls_ty: ClassType*) -> LValue {
         const m: MethodInfo = cls_ty.methods[i];
         if (m.is_virtual || m.is_override) {
             // Look up the LLVM function for this method.
-            const type_str: string = cg.intern.resolve(cls_ty.qualified_name);
-            const method_str: string = cg.intern.resolve(m.name);
+            const type_str: string = cg.resolve(cls_ty.qualified_name);
+            const method_str: string = cg.resolve(m.name);
             const combined: string = format("%s::%s", type_str, method_str);
-            const combined_sym: SymbolStr = cg.intern.intern(combined);
+            const combined_sym: SymbolStr = cg.intern_str(combined);
             const fn_val: LValue = cg.get_function(combined_sym);
             if (fn_val.is_valid()) {
                 virtual_methods = virtual_methods + [fn_val];
@@ -744,7 +783,7 @@ function map_return_type(cg: CodegenContext*, node: FunctionDeclNode*) -> LType 
         return LType::void_type();
     }
 
-    const t: Type* = cg.arena.lookup(node.resolved_return_type.id);
+    const t: Type* = cg.lookup_type_by_id(node.resolved_return_type.id);
     if (t == null || t.kind == TypeKind::Void || t.kind == TypeKind::Unit) {
         return LType::void_type();
     }

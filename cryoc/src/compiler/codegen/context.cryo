@@ -10,10 +10,14 @@ import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
 import Compiler::CompilationContext;
+import Compiler::DeclIndex;
 import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
 import Compiler::Types::Arena;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
+import Compiler::Resolver::QualifiedName;
+import Compiler::Resolver::MangledName;
 
 
 // ============================================================================
@@ -93,6 +97,80 @@ type struct CodegenContext {
         };
     }
 
+
+    // ========================================================================
+    // Safe accessors — route through CompilationContext to avoid
+    // CodegenContext struct offset issues in the C++ compiler.
+    // ========================================================================
+
+    /// Get the InternTable reliably via ctx→intern_table.
+    /// Do NOT use `this.intern` — the field offset may be wrong
+    /// due to the large CodegenContext struct layout.
+    get_intern(&this) -> InternTable* {
+        const c: CompilationContext* = this.ctx;
+        return c.intern_table;
+    }
+
+    /// Get the TypeArena reliably via ctx→type_arena.
+    get_arena(&this) -> TypeArena* {
+        const c: CompilationContext* = this.ctx;
+        return c.type_arena;
+    }
+
+    /// Get the DeclarationIndex reliably via ctx→decl_index.
+    get_decl_index(&this) -> DeclarationIndex* {
+        const c: CompilationContext* = this.ctx;
+        return c.decl_index;
+    }
+
+    /// Qualify a symbol name with the current module namespace.
+    qualify(&this, sym: SymbolStr) -> SymbolStr {
+        const c: CompilationContext* = this.ctx;
+        return c.qualify_symbol_sym(sym);
+    }
+
+    /// Resolve an interned SymbolStr to its string.
+    resolve(&this, sym: SymbolStr) -> string {
+        const c: CompilationContext* = this.ctx;
+        const it: InternTable* = c.intern_table;
+        return it.resolve(sym);
+    }
+
+    /// Intern a string into the shared InternTable.
+    intern_str(&this, text: string) -> SymbolStr {
+        const c: CompilationContext* = this.ctx;
+        const it: InternTable* = c.intern_table;
+        return it.intern(text);
+    }
+
+    /// Look up a type in the arena by ID.
+    /// Avoids the chained `cg.get_arena().lookup(id)` pattern which
+    /// the C++ compiler can't resolve.
+    lookup_type_by_id(&this, id: u64) -> Type* {
+        const c: CompilationContext* = this.ctx;
+        const a: TypeArena* = c.type_arena;
+        return a.lookup(id);
+    }
+
+    /// Mangle a qualified SymbolStr into an LLVM IR name.
+    /// e.g., SymbolStr("std::core::mem::size_of") → "std_core_mem_size_of"
+    ///
+    /// Routes through MangledName::for_function with a safely-obtained
+    /// InternTable pointer. The C++ compiler has issues passing InternTable*
+    /// through static method chains called from free functions — calling
+    /// from an instance method on CodegenContext avoids this.
+    mangle_qualified_name(&this, sym: SymbolStr) -> string {
+        const c: CompilationContext* = this.ctx;
+        const it: InternTable* = c.intern_table;
+        // Use from_symbol (single-part) instead of parse (multi-part).
+        // QualifiedName::parse returns a struct with a dynamic array
+        // that gets corrupted during return-by-value in the C++ compiler.
+        // from_symbol creates a single part containing the full qualified
+        // string; from_qualified then escapes "::" → "__" via mangle_char.
+        const qname: QualifiedName = QualifiedName::from_symbol(sym);
+        const mangled: MangledName = MangledName::for_function(it, qname);
+        return mangled.resolve(it);
+    }
 
     // ========================================================================
     // Scope management
