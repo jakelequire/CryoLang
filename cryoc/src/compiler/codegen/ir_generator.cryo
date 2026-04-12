@@ -132,7 +132,7 @@ public:
                     const sname: string = this.cg.resolve(struct_node.name);
                     printf("[IRGen]   [%lld] struct methods: %s (%lld methods)\n",
                            i, sname, struct_node.methods.length); fflush(null);
-                    this.current_impl_target = struct_node.name;
+                    this.current_impl_target = this.cg.qualify(struct_node.name);
                     for (mut j: i64 = 0; j < struct_node.methods.length; j++) {
                         this.generate_method_body(struct_node.methods[j]);
                     }
@@ -146,7 +146,7 @@ public:
                     const cname: string = this.cg.resolve(class_node.name);
                     printf("[IRGen]   [%lld] class methods: %s (%lld methods)\n",
                            i, cname, class_node.methods.length); fflush(null);
-                    this.current_impl_target = class_node.name;
+                    this.current_impl_target = this.cg.qualify(class_node.name);
                     for (mut j: i64 = 0; j < class_node.methods.length; j++) {
                         this.generate_method_body(class_node.methods[j]);
                     }
@@ -183,6 +183,13 @@ public:
         this.generate_block(node.body);
         printf("[IRGen]     func block done, epilogue...\n"); fflush(null);
         codegen_function_epilogue(this.cg, node);
+
+        // Validate: if any block lacks a terminator, body generation
+        // failed. Strip back to a clean declare rather than emitting
+        // broken IR that fails LLVM verification.
+        if (!this.cg.is_function_body_valid(fn_val)) {
+            this.cg.strip_function_body(fn_val);
+        }
     }
 
     /// Generate an impl block directly.
@@ -228,6 +235,10 @@ public:
         this.generate_block(func.body);
         printf("[IRGen]       method body done, epilogue...\n"); fflush(null);
         codegen_function_epilogue(this.cg, func);
+
+        if (!this.cg.is_function_body_valid(fn_val)) {
+            this.cg.strip_function_body(fn_val);
+        }
     }
 
     /// Generate a block of statements directly (no virtual dispatch).
@@ -695,7 +706,21 @@ public:
         }
 
         if (!callee_val.is_valid()) {
-            printf("[IRGen] WARNING: call — callee not found\n"); fflush(null);
+            // Log which call path failed and what name was tried.
+            if (node.callee.kind == NodeKind::Identifier) {
+                const id: IdentifierNode* = node.callee as IdentifierNode*;
+                printf("[IRGen] WARNING: call — callee not found (ident '%s')\n", this.cg.resolve(id.name)); fflush(null);
+            } else if (node.callee.kind == NodeKind::ScopeResolution) {
+                const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
+                printf("[IRGen] WARNING: call — callee not found (scope '%s::%s')\n",
+                    intern.resolve(sr.scope_name), intern.resolve(sr.member_name)); fflush(null);
+            } else if (node.callee.kind == NodeKind::MemberAccess) {
+                const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
+                printf("[IRGen] WARNING: call — callee not found (member '.%s')\n",
+                    intern.resolve(ma.member)); fflush(null);
+            } else {
+                printf("[IRGen] WARNING: call — callee not found (kind=%d)\n", node.callee.kind as i32); fflush(null);
+            }
             this.cg.ctx.emit_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
                 "codegen: call expression — callee function not found");
             this.last_value = LValue::null();
