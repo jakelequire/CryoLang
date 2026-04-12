@@ -550,7 +550,10 @@ type struct TypeResolutionPasses {
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
-                ctx.decl_index.register_methods(qualified_sym, node.methods);
+                if (!qualified_sym.equals(node.name)) {
+                    ctx.decl_index.register_name_mapping(node.name, qualified_sym);
+                }
+                ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table);
             }
             NodeKind::ClassDeclaration => {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
@@ -562,7 +565,10 @@ type struct TypeResolutionPasses {
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
-                ctx.decl_index.register_methods(qualified_sym, node.methods);
+                if (!qualified_sym.equals(node.name)) {
+                    ctx.decl_index.register_name_mapping(node.name, qualified_sym);
+                }
+                ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table);
             }
             NodeKind::EnumDeclaration => {
                 const node: EnumDeclNode* = stmt as EnumDeclNode*;
@@ -573,6 +579,9 @@ type struct TypeResolutionPasses {
                 }
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
+                }
+                if (!qualified_sym.equals(node.name)) {
+                    ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                 }
             }
             NodeKind::TraitDeclaration => {
@@ -609,17 +618,16 @@ type struct TypeResolutionPasses {
                     if (!q_name.equals(func.name)) {
                         ctx.decl_index.register_function(func.name, func.resolved_return_type);
                         ctx.decl_index.register_function_type(func.name, func_type_ref);
+                        ctx.decl_index.register_name_mapping(func.name, q_name);
                     }
                 }
             }
             NodeKind::ImplementationBlock => {
                 const node: ImplBlockNode* = stmt as ImplBlockNode*;
                 const qualified_impl: SymbolStr = ctx.qualify_symbol_sym(node.target_type);
-                ctx.decl_index.register_methods(qualified_impl, node.methods);
-                // Also register under bare target name so methods are findable
-                // without full qualification.  This handles implement blocks on
-                // primitives (e.g., `implement f64 { ... }`) where the reverse
-                // type map returns "f64", not "std::core::primitives::f64".
+                ctx.decl_index.register_methods_with_module(qualified_impl, node.methods, module_sym, ctx.intern_table);
+                // Also register under bare target name for impl blocks on
+                // primitives (e.g., `implement f64 { ... }`).
                 if (!qualified_impl.equals(node.target_type)) {
                     ctx.decl_index.register_methods(node.target_type, node.methods);
                 }
@@ -766,11 +774,29 @@ type struct TypeResolutionPasses {
                         }
                     }
                     if (node.has_resolved_return_type()) {
-                        ctx.decl_index.register_function(node.name, node.resolved_return_type);
-                        // Also register under qualified name (same as FunctionDeclaration)
+                        // Build FunctionType for full signature.
+                        mut i_param_types: TypeRef[] = [];
+                        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+                            const ip: VarDeclNode* = node.parameters[pi];
+                            if (ip.resolved_type.is_valid()) {
+                                i_param_types = i_param_types + [ip.resolved_type];
+                            }
+                        }
+                        const i_func_type_ref: TypeRef = arena.get_function(
+                            node.resolved_return_type, i_param_types, false);
+
+                        // Register under qualified name with module
+                        // so cross-module externs pick up intrinsics.
+                        const i_mod_sym: SymbolStr = ctx.intern(ctx.source_file);
                         const q_name: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                        ctx.decl_index.register_function_type_with_module(
+                            q_name, node.resolved_return_type, i_func_type_ref, i_mod_sym);
+
+                        // Also register bare name for lookups.
                         if (!q_name.equals(node.name)) {
-                            ctx.decl_index.register_function(q_name, node.resolved_return_type);
+                            ctx.decl_index.register_function(node.name, node.resolved_return_type);
+                            ctx.decl_index.register_function_type(node.name, i_func_type_ref);
+                            ctx.decl_index.register_name_mapping(node.name, q_name);
                         }
                     }
                     sig_count++;
