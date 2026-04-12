@@ -212,7 +212,10 @@ unsigned        LLVMCountParams(LLVMValueRef Fn);
 LLVMValueRef    LLVMGetParam(LLVMValueRef Fn, unsigned Index);
 void            LLVMSetFunctionCallConv(LLVMValueRef Fn, unsigned CC);
 LLVMBasicBlockRef LLVMGetEntryBasicBlock(LLVMValueRef Fn);
+LLVMBasicBlockRef LLVMGetFirstBasicBlock(LLVMValueRef Fn);
 LLVMBasicBlockRef LLVMGetLastBasicBlock(LLVMValueRef Fn);
+LLVMBasicBlockRef LLVMGetNextBasicBlock(LLVMBasicBlockRef BB);
+unsigned          LLVMCountBasicBlocks(LLVMValueRef Fn);
 
 
 /* ===================================================================

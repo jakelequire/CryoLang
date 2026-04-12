@@ -616,22 +616,24 @@ function codegen_function_prologue(cg: CodegenContext*, node: FunctionDeclNode*)
     return fn_val;
 }
 
-/// Emit implicit return if the current block has no terminator.
+/// Emit implicit void return ONLY for void/unit functions.
+/// Non-void functions must have explicit returns from the source code.
+/// If a non-void function's block has no terminator, body generation
+/// failed — the caller will strip it back to a declare.
 function codegen_function_epilogue(cg: CodegenContext*, node: FunctionDeclNode*) -> void {
     const current_bb: LBasicBlock = cg.builder.get_insert_block();
     if (current_bb.is_valid() && !current_bb.has_terminator()) {
-        // Check if function returns void.
         const ret_ty: TypeRef = node.resolved_return_type;
-        if (ret_ty.is_invalid()) {
-            cg.builder.build_ret_void();
-        } else {
+        mut is_void: boolean = ret_ty.is_invalid();
+        if (!is_void) {
             const t: Type* = cg.lookup_type_by_id(ret_ty.id);
-            if (t != null && (t.kind == TypeKind::Void || t.kind == TypeKind::Unit)) {
-                cg.builder.build_ret_void();
-            }
-            // Non-void functions without explicit return: insert unreachable.
-            // Sema should have caught this, so it shouldn't happen.
+            is_void = t != null && (t.kind == TypeKind::Void || t.kind == TypeKind::Unit);
         }
+        if (is_void) {
+            cg.builder.build_ret_void();
+        }
+        // Non-void: intentionally leave unterminated. The caller
+        // detects this and strips the function body.
     }
     cg.pop_scope();
 }
