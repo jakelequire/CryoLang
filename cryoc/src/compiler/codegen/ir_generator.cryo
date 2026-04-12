@@ -20,6 +20,8 @@ import Compiler::Types::TypeRef;
 import Compiler::Types::Type;
 import Compiler::Types::Arena;
 import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Generic;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Visitor;
@@ -621,29 +623,73 @@ public:
     visit_call_expr(mut &this, node: CallExprNode*) -> void {
         mut callee_val: LValue = LValue::null();
 
+        // Break pointer chains into locals for C++ compiler compatibility.
+        const ctx_ptr: CompilationContext* = this.cg.ctx;
+        const intern: InternTable* = this.cg.intern;
+
         if (node.callee.kind == NodeKind::Identifier) {
+            // Identifier call: try qualified (module-scoped) name first,
+            // then bare name for extern/C functions.
             const id: IdentifierNode* = node.callee as IdentifierNode*;
-            callee_val = this.cg.get_function(id.name);
+            const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(id.name);
+            callee_val = this.cg.get_function(qualified);
+            if (!callee_val.is_valid()) {
+                // Extern/C functions are registered under their bare name.
+                callee_val = this.cg.get_function(id.name);
+            }
         } else if (node.callee.kind == NodeKind::ScopeResolution) {
+            // Scope resolution: build "scope::member" directly.
             const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
             const combined: string = format("%s::%s",
-                this.cg.intern.resolve(sr.scope_name),
-                this.cg.intern.resolve(sr.member_name));
-            const sym: SymbolStr = this.cg.intern.intern(combined);
+                intern.resolve(sr.scope_name),
+                intern.resolve(sr.member_name));
+            const sym: SymbolStr = intern.intern(combined);
             callee_val = this.cg.get_function(sym);
-            if (!callee_val.is_valid()) {
-                callee_val = this.cg.get_function(sr.member_name);
-            }
         } else if (node.callee.kind == NodeKind::MemberAccess) {
+            // Member access: resolve the object's type to get its
+            // qualified name, then look up "QualifiedType::method".
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
-            const obj_type: TypeRef = ma.object.resolved_type;
-            const t: Type* = this.cg.arena.lookup(obj_type.id);
+            const arena: TypeArena* = this.cg.arena;
+            mut t: Type* = arena.lookup(ma.object.resolved_type.id);
+
+            // Unwrap pointer/reference to get the pointee type.
+            if (t != null && t.kind == TypeKind::Pointer) {
+                const ptr_t: PointerType* = t as PointerType*;
+                t = arena.lookup(ptr_t.pointee.id);
+            } else if (t != null && t.kind == TypeKind::Reference) {
+                const ref_t: ReferenceType* = t as ReferenceType*;
+                t = arena.lookup(ref_t.referent.id);
+            }
+
+            // Follow InstantiatedType to the concrete resolved type.
+            if (t != null && t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                if (inst.has_resolved_type()) {
+                    t = arena.lookup(inst.resolved_type.id);
+                }
+            }
+
             if (t != null) {
-                const type_str: string = t.display_name();
-                const method_str: string = this.cg.intern.resolve(ma.member);
-                const combined: string = format("%s::%s", type_str, method_str);
-                const sym: SymbolStr = this.cg.intern.intern(combined);
-                callee_val = this.cg.get_function(sym);
+                // Extract qualified_name from the concrete type.
+                // This is the same name used during declare_method registration.
+                mut type_str: string = "";
+                if (t.kind == TypeKind::Struct) {
+                    const st: StructType* = t as StructType*;
+                    type_str = intern.resolve(st.qualified_name);
+                } else if (t.kind == TypeKind::Class) {
+                    const ct: ClassType* = t as ClassType*;
+                    type_str = intern.resolve(ct.qualified_name);
+                } else if (t.kind == TypeKind::Enum) {
+                    const et: EnumType* = t as EnumType*;
+                    type_str = intern.resolve(et.qualified_name);
+                }
+
+                if (strlen(type_str) > 0) {
+                    const method_str: string = intern.resolve(ma.member);
+                    const combined: string = format("%s::%s", type_str, method_str);
+                    const sym: SymbolStr = intern.intern(combined);
+                    callee_val = this.cg.get_function(sym);
+                }
             }
         } else {
             callee_val = this.codegen_rvalue(node.callee);
