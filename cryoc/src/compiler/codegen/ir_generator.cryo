@@ -114,13 +114,13 @@ public:
                 const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
                 if (func.generic_params.length > 0) { continue; }
                 if (func.body == null) { continue; }
-                const fn_name: string = this.cg.intern.resolve(func.name);
+                const fn_name: string = this.cg.resolve(func.name);
                 printf("[IRGen]   [%lld] func body: %s\n", i, fn_name); fflush(null);
                 this.generate_function_body(func);
                 printf("[IRGen]   [%lld] func done\n", i); fflush(null);
             } else if (kind == NodeKind::ImplementationBlock) {
                 const impl_node: ImplBlockNode* = stmt as ImplBlockNode*;
-                const impl_target: string = this.cg.intern.resolve(impl_node.target_type);
+                const impl_target: string = this.cg.resolve(impl_node.target_type);
                 printf("[IRGen]   [%lld] impl block: %s (%lld methods)\n",
                        i, impl_target, impl_node.methods.length); fflush(null);
                 this.generate_impl_block(impl_node);
@@ -129,7 +129,7 @@ public:
                 const struct_node: StructDeclNode* = stmt as StructDeclNode*;
                 if (struct_node.generic_params.length > 0) { continue; }
                 if (struct_node.methods.length > 0) {
-                    const sname: string = this.cg.intern.resolve(struct_node.name);
+                    const sname: string = this.cg.resolve(struct_node.name);
                     printf("[IRGen]   [%lld] struct methods: %s (%lld methods)\n",
                            i, sname, struct_node.methods.length); fflush(null);
                     this.current_impl_target = struct_node.name;
@@ -143,7 +143,7 @@ public:
                 const class_node: ClassDeclNode* = stmt as ClassDeclNode*;
                 if (class_node.generic_params.length > 0) { continue; }
                 if (class_node.methods.length > 0) {
-                    const cname: string = this.cg.intern.resolve(class_node.name);
+                    const cname: string = this.cg.resolve(class_node.name);
                     printf("[IRGen]   [%lld] class methods: %s (%lld methods)\n",
                            i, cname, class_node.methods.length); fflush(null);
                     this.current_impl_target = class_node.name;
@@ -156,7 +156,7 @@ public:
             } else if (kind == NodeKind::VariableDeclaration) {
                 const var_decl: VarDeclNode* = stmt as VarDeclNode*;
                 if (var_decl.is_global) {
-                    const var_name: string = this.cg.intern.resolve(var_decl.name);
+                    const var_name: string = this.cg.resolve(var_decl.name);
                     printf("[IRGen]   [%lld] global var: %s\n", i, var_name); fflush(null);
                     codegen_global_var(this.cg, var_decl);
                 }
@@ -198,7 +198,7 @@ public:
             const m: MethodNode* = node.methods[i];
             const mfunc: FunctionDeclNode* = m.func;
             if (mfunc != null) {
-                const mname: string = this.cg.intern.resolve(mfunc.name);
+                const mname: string = this.cg.resolve(mfunc.name);
                 printf("[IRGen]     method[%lld]: %s (static=%d, generic=%lld, body=%p)\n",
                        i, mname, m.is_static as i32,
                        mfunc.generic_params.length, mfunc.body as void*); fflush(null);
@@ -625,7 +625,7 @@ public:
 
         // Break pointer chains into locals for C++ compiler compatibility.
         const ctx_ptr: CompilationContext* = this.cg.ctx;
-        const intern: InternTable* = this.cg.intern;
+        const intern: InternTable* = this.cg.get_intern();
 
         if (node.callee.kind == NodeKind::Identifier) {
             // Identifier call: try qualified (module-scoped) name first,
@@ -649,23 +649,22 @@ public:
             // Member access: resolve the object's type to get its
             // qualified name, then look up "QualifiedType::method".
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
-            const arena: TypeArena* = this.cg.arena;
-            mut t: Type* = arena.lookup(ma.object.resolved_type.id);
+            mut t: Type* = this.cg.lookup_type_by_id(ma.object.resolved_type.id);
 
             // Unwrap pointer/reference to get the pointee type.
             if (t != null && t.kind == TypeKind::Pointer) {
                 const ptr_t: PointerType* = t as PointerType*;
-                t = arena.lookup(ptr_t.pointee.id);
+                t = this.cg.lookup_type_by_id(ptr_t.pointee.id);
             } else if (t != null && t.kind == TypeKind::Reference) {
                 const ref_t: ReferenceType* = t as ReferenceType*;
-                t = arena.lookup(ref_t.referent.id);
+                t = this.cg.lookup_type_by_id(ref_t.referent.id);
             }
 
             // Follow InstantiatedType to the concrete resolved type.
             if (t != null && t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = t as InstantiatedType*;
                 if (inst.has_resolved_type()) {
-                    t = arena.lookup(inst.resolved_type.id);
+                    t = this.cg.lookup_type_by_id(inst.resolved_type.id);
                 }
             }
 
@@ -786,9 +785,9 @@ public:
     /// Scope resolution — direct dispatch.
     visit_scope_resolution(mut &this, node: ScopeResolutionNode*) -> void {
         const combined: string = format("%s::%s",
-            this.cg.intern.resolve(node.scope_name),
-            this.cg.intern.resolve(node.member_name));
-        const sym: SymbolStr = this.cg.intern.intern(combined);
+            this.cg.resolve(node.scope_name),
+            this.cg.resolve(node.member_name));
+        const sym: SymbolStr = this.cg.intern_str(combined);
         const fn_val: LValue = this.cg.get_function(sym);
         if (fn_val.is_valid()) {
             this.last_value = fn_val;
@@ -845,7 +844,7 @@ public:
     /// New expression (heap allocation) — direct dispatch.
     visit_new_expr(mut &this, node: NewExprNode*) -> void {
         const type_ref: TypeRef = this.lookup_type(node.type_name);
-        const t: Type* = this.cg.arena.lookup(type_ref.id);
+        const t: Type* = this.cg.lookup_type_by_id(type_ref.id);
         if (t == null) {
             printf("[IRGen] WARNING: new — type not found\n"); fflush(null);
             this.cg.ctx.emit_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
