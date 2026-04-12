@@ -18,6 +18,7 @@ namespace Compiler::DeclIndex;
 import Compiler::AST::Declaration;
 import std::core::option;
 import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
 import Compiler::Types::TypeRef;
 import std::collections::hashmap;
 
@@ -67,6 +68,12 @@ type struct DeclarationIndex {
     module_type_keys:    u32[];       // SymbolStr.id of type
     module_type_modules: u32[];       // SymbolStr.id of defining module
 
+    // Bare name → qualified name mapping.
+    // When a function is registered under both "printf" and
+    // "std::core::intrinsics::printf", this maps the bare id → qualified id.
+    // Used by codegen to resolve auto-imported identifiers.
+    bare_to_qualified:   HashMap<u32, u32>;
+
 
     static new() -> DeclarationIndex {
         return DeclarationIndex {
@@ -80,6 +87,7 @@ type struct DeclarationIndex {
             module_func_modules: [],
             module_type_keys:    [],
             module_type_modules: [],
+            bare_to_qualified:   HashMap<u32, u32>::new(),
         };
     }
 
@@ -142,6 +150,36 @@ type struct DeclarationIndex {
             if (method == null || method.func == null) { continue; }
             this.register_method(type_sym, method.func.name,
                                  method.func.resolved_return_type);
+        }
+    }
+
+    /// Register methods with full per-module visibility.
+    /// This adds each method to the per-module function list under the
+    /// combined key "QualifiedType::method" so that cross-module externs
+    /// can declare them and codegen can find them.
+    register_methods_with_module(mut &this, type_sym: SymbolStr, methods: MethodNode*[],
+                                  module: SymbolStr, intern: InternTable*) -> void {
+        const type_str: string = intern.resolve(type_sym);
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+
+            // Register in method_returns (existing behavior).
+            this.register_method(type_sym, method.func.name,
+                                 method.func.resolved_return_type);
+
+            // Build combined key "QualifiedType::method" and register
+            // as a function in the per-module list.
+            const method_str: string = intern.resolve(method.func.name);
+            const combined: string = format("%s::%s", type_str, method_str);
+            const combined_sym: SymbolStr = intern.intern(combined);
+
+            // Register return type and function type in the function maps.
+            this.register_function(combined_sym, method.func.resolved_return_type);
+
+            // Add to per-module list for cross-module extern enumeration.
+            this.module_func_keys.push(combined_sym.id);
+            this.module_func_modules.push(module.id);
         }
     }
 
@@ -236,6 +274,23 @@ type struct DeclarationIndex {
         this.module_type_modules.push(module.id);
     }
 
+
+    /// Register a bare → qualified name mapping.
+    /// Called by type_resolution when registering both forms.
+    register_name_mapping(mut &this, bare: SymbolStr, qualified: SymbolStr) -> void {
+        const h: u64 = hash_int(bare.id as u64);
+        this.bare_to_qualified.insert(bare.id, qualified.id, h);
+    }
+
+    /// Resolve a bare name to its qualified form.
+    /// Returns the qualified SymbolStr, or the input unchanged if no mapping exists.
+    resolve_qualified(&this, bare: SymbolStr) -> SymbolStr {
+        const h: u64 = hash_int(bare.id as u64);
+        return match (this.bare_to_qualified.get(bare.id, h)) {
+            Option::Some(val) => { SymbolStr::from_id(val) }
+            Option::None      => { bare }
+        };
+    }
 
     // ----------------------------------------------------------------
     // Per-module queries (used by codegen to enumerate module exports)

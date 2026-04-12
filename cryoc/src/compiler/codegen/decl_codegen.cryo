@@ -126,6 +126,8 @@ function declare_functions(cg: CodegenContext*, program: ProgramNode*) -> void {
 
         if (kind == NodeKind::FunctionDeclaration) {
             declare_function(cg, stmt as FunctionDeclNode*);
+        } else if (kind == NodeKind::IntrinsicDeclaration) {
+            declare_intrinsic(cg, stmt as IntrinsicDeclNode*);
         } else if (kind == NodeKind::ExternBlock) {
             declare_extern_block(cg, stmt as ExternBlockNode*);
         } else if (kind == NodeKind::ImplementationBlock) {
@@ -339,6 +341,59 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     const combined: string = format("%s::%s", type_str, method_str);
     const combined_sym: SymbolStr = intern.intern(combined);
     cg.register_function(combined_sym, fn_val);
+}
+
+/// Declare an intrinsic function (e.g., malloc, printf, strlen).
+/// Intrinsics use C linkage — bare name, no namespace qualification.
+function declare_intrinsic(cg: CodegenContext*, node: IntrinsicDeclNode*) -> void {
+    const intern: InternTable* = cg.get_intern();
+    const name_str: string = intern.resolve(node.name);
+
+    // Map return type.
+    mut ret_ty: LType = LType::void_type();
+    if (node.has_resolved_return_type()) {
+        ret_ty = cg.type_mapper.map_type(node.resolved_return_type);
+        if (!ret_ty.is_valid()) { return; }
+    }
+
+    const param_count: u32 = node.parameters.length as u32;
+    mut fn_type: LType = LType::null();
+
+    if (param_count == 0) {
+        fn_type = LType::function_type(ret_ty, null, 0, false);
+    } else {
+        const buf: void* = malloc(param_count as u64 * 8);
+        const slots: void** = buf as void**;
+        mut all_valid: boolean = true;
+        for (mut i: u32 = 0; i < param_count; i++) {
+            const param: VarDeclNode* = node.parameters[i];
+            const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
+            if (!param_ty.is_valid()) {
+                all_valid = false;
+                break;
+            }
+            slots[i] = param_ty.raw;
+        }
+        if (!all_valid) {
+            free(buf);
+            return;
+        }
+        fn_type = LType::function_type(ret_ty, buf, param_count, false);
+        free(buf);
+    }
+
+    // C linkage: use bare name.
+    const fn_val: LValue = cg.llvm_module.add_function(name_str, fn_type);
+
+    // Register under bare name (for identifier lookups like `malloc(...)`)
+    cg.register_function(node.name, fn_val);
+
+    // Also register under qualified name (for cross-module resolution).
+    const ctx_ptr: CompilationContext* = cg.ctx;
+    const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+    if (!qualified.equals(node.name)) {
+        cg.register_function(qualified, fn_val);
+    }
 }
 
 /// Declare extern block functions.
