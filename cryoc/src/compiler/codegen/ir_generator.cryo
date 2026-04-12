@@ -639,21 +639,39 @@ public:
         const intern: InternTable* = this.cg.get_intern();
 
         if (node.callee.kind == NodeKind::Identifier) {
-            // Identifier call: try qualified (module-scoped) name first,
-            // then bare name for extern/C functions.
             const id: IdentifierNode* = node.callee as IdentifierNode*;
+
+            // 1. Try current module's qualified name.
             const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(id.name);
             callee_val = this.cg.get_function(qualified);
+
+            // 2. Try the DI's bare→qualified mapping (resolves auto-imports
+            //    like printf → std::core::intrinsics::printf).
             if (!callee_val.is_valid()) {
-                // Extern/C functions are registered under their bare name.
+                const di: DeclarationIndex* = this.cg.get_decl_index();
+                const resolved: SymbolStr = di.resolve_qualified(id.name);
+                callee_val = this.cg.get_function(resolved);
+            }
+
+            // 3. Bare name (for extern C functions registered without qualification).
+            if (!callee_val.is_valid()) {
                 callee_val = this.cg.get_function(id.name);
             }
         } else if (node.callee.kind == NodeKind::ScopeResolution) {
-            // Scope resolution: build "scope::member" directly.
+            // Scope resolution: e.g., LValue::null(), TypeRef::invalid().
+            // The scope name may be bare (LValue) while the function was
+            // registered under the qualified type name.
+            // Resolve the scope name through the DI type map to get the
+            // qualified type name, then build the combined key.
             const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
-            const combined: string = format("%s::%s",
-                intern.resolve(sr.scope_name),
-                intern.resolve(sr.member_name));
+            const di: DeclarationIndex* = this.cg.get_decl_index();
+
+            // Resolve the scope name (e.g., "LValue") to its qualified form
+            // (e.g., "Compiler::Codegen::LLVMTypes::LValue") via the DI mapping.
+            const resolved_scope: SymbolStr = di.resolve_qualified(sr.scope_name);
+            const scope_str: string = intern.resolve(resolved_scope);
+
+            const combined: string = format("%s::%s", scope_str, intern.resolve(sr.member_name));
             const sym: SymbolStr = intern.intern(combined);
             callee_val = this.cg.get_function(sym);
         } else if (node.callee.kind == NodeKind::MemberAccess) {
