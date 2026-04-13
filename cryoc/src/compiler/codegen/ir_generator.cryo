@@ -296,6 +296,8 @@ public:
         } else if (kind == NodeKind::VariableDeclaration) {
             // Raw VarDeclNode (not wrapped in DeclStmt) — happens in for-loop init.
             this.visit_var_decl(stmt as VarDeclNode*);
+        } else if (kind == NodeKind::MatchStatement) {
+            this.visit_match_stmt(stmt as MatchStmtNode*);
         } else if (kind == NodeKind::UnsafeBlockStatement) {
             const unsafe_node: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
             this.generate_block(unsafe_node.block);
@@ -393,6 +395,134 @@ public:
         branch_if_not_terminated(this.cg, blocks.body_bb);
         this.cg.pop_loop();
         this.cg.builder.position_at_end(blocks.merge_bb);
+    }
+
+    visit_match_stmt(mut &this, node: MatchStmtNode*) -> void {
+        if (node.subject == null || node.arms.length == 0) { return; }
+
+        const current_fn: LValue = this.get_current_function();
+        if (!current_fn.is_valid()) { return; }
+
+        // Evaluate the subject expression.
+        const subject: LValue = this.codegen_rvalue(node.subject);
+        if (!subject.is_valid()) { return; }
+
+        const num_arms: i64 = node.arms.length;
+
+        // Create basic blocks: one per arm + merge.
+        mut arm_bbs: LBasicBlock[] = [];
+        for (mut i: i64 = 0; i < num_arms; i++) {
+            const name: string = format("match.arm%lld", i);
+            arm_bbs = arm_bbs + [LBasicBlock::append(current_fn, name)];
+        }
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "match.end");
+
+        // Generate the comparison chain.
+        // For each arm, compare subject against the pattern(s).
+        // Wildcard (_) matches unconditionally — branch directly.
+        for (mut i: i64 = 0; i < num_arms; i++) {
+            const arm: MatchArmNode* = node.arms[i];
+            if (arm == null) { continue; }
+
+            // Determine the next block to fall through to if this arm doesn't match.
+            mut next_bb: LBasicBlock = merge_bb;
+            if (i + 1 < num_arms) {
+                next_bb = LBasicBlock::append(current_fn, format("match.test%lld", i + 1));
+            }
+
+            // Check each pattern in this arm (multiple patterns = OR).
+            mut matched: boolean = false;
+            for (mut p: i64 = 0; p < arm.patterns.length; p++) {
+                const pat: PatternNode* = arm.patterns[p];
+                if (pat == null) { continue; }
+
+                if (pat.pattern_kind == PatternKind::Wildcard) {
+                    // Wildcard: unconditional branch to this arm.
+                    this.cg.builder.build_br(arm_bbs[i]);
+                    matched = true;
+                    break;
+                } else if (pat.pattern_kind == PatternKind::Literal) {
+                    // Literal pattern: compare subject == literal value.
+                    const pat_val: LValue = this.codegen_pattern_value(pat);
+                    if (pat_val.is_valid()) {
+                        const cmp: LValue = this.cg.builder.build_icmp(
+                            32, subject, pat_val, "match.cmp");
+                        this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
+                        matched = true;
+                        break;
+                    }
+                } else if (pat.pattern_kind == PatternKind::Identifier) {
+                    // Identifier pattern: enum variant or named constant.
+                    // Treat as a literal comparison (the value is the enum discriminant).
+                    const pat_val: LValue = this.codegen_pattern_value(pat);
+                    if (pat_val.is_valid()) {
+                        const cmp: LValue = this.cg.builder.build_icmp(
+                            32, subject, pat_val, "match.cmp");
+                        this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+
+            // If no pattern matched (codegen failure), fall through.
+            if (!matched) {
+                const cur: LBasicBlock = this.cg.builder.get_insert_block();
+                if (cur.is_valid() && !cur.has_terminator()) {
+                    this.cg.builder.build_br(next_bb);
+                }
+            }
+
+            // Position at next_bb for the next test (if not the last arm).
+            if (i + 1 < num_arms) {
+                this.cg.builder.position_at_end(next_bb);
+            }
+        }
+
+        // Generate each arm's body.
+        for (mut i: i64 = 0; i < num_arms; i++) {
+            const arm: MatchArmNode* = node.arms[i];
+            if (arm == null) { continue; }
+
+            this.cg.builder.position_at_end(arm_bbs[i]);
+            if (arm.body != null) {
+                this.generate_statement(arm.body);
+            }
+            branch_if_not_terminated(this.cg, merge_bb);
+        }
+
+        this.cg.builder.position_at_end(merge_bb);
+    }
+
+    /// Evaluate a pattern to an LLVM value for comparison.
+    codegen_pattern_value(mut &this, pat: PatternNode*) -> LValue {
+        if (pat.pattern_kind == PatternKind::Literal) {
+            // The pattern's value SymbolStr contains the literal text.
+            const intern: InternTable* = this.cg.get_intern();
+            const text: string = intern.resolve(pat.value);
+            // Try parsing as integer.
+            const ival: i32 = atoi(text);
+            // Check if it's a character literal (single char in quotes).
+            if (strlen(text) == 1) {
+                return LType::const_int(LType::i32(), text[0] as u64, false);
+            }
+            return LType::const_int(LType::i32(), ival as u64, true);
+        } else if (pat.pattern_kind == PatternKind::Identifier) {
+            // Identifier pattern — could be an enum variant name.
+            // Look it up as a named value or try to resolve as an enum discriminant.
+            const val: LValue = this.cg.get_named_value(pat.value);
+            if (val.is_valid()) {
+                // Load the named value.
+                const ty: LType = LType::i32();
+                return this.cg.builder.build_load(ty, val, "pat.load");
+            }
+            // Try as a scope-resolved enum variant (e.g., TokenType::Plus).
+            // The value field might contain just the variant name.
+            // For simple enums, variants are sequential i32 constants.
+            // This needs the enum type info to resolve the discriminant.
+            return LValue::null();
+        }
+        return LValue::null();
     }
 
     visit_decl_stmt(mut &this, node: DeclStmtNode*) -> void {
@@ -675,31 +805,49 @@ public:
             const sym: SymbolStr = intern.intern(combined);
             callee_val = this.cg.get_function(sym);
         } else if (node.callee.kind == NodeKind::MemberAccess) {
-            // Member access: resolve the object's type to get its
-            // qualified name, then look up "QualifiedType::method".
+            // Member access: resolve the object's type to find the method.
+            // Use the same approach as sema: ask the DI for the type's
+            // registered name (via type_reverse), which handles compound
+            // types like ArrayType by mapping through InstantiatedType.
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
-            mut t: Type* = this.cg.lookup_type_by_id(ma.object.resolved_type.id);
+            const di: DeclarationIndex* = this.cg.get_decl_index();
+            const method_str: string = intern.resolve(ma.member);
 
-            // Unwrap pointer/reference to get the pointee type.
+            // Get the object's type, unwrapping pointer/reference.
+            mut obj_ref: TypeRef = ma.object.resolved_type;
+            mut t: Type* = this.cg.lookup_type_by_id(obj_ref.id);
             if (t != null && t.kind == TypeKind::Pointer) {
                 const ptr_t: PointerType* = t as PointerType*;
-                t = this.cg.lookup_type_by_id(ptr_t.pointee.id);
+                obj_ref = ptr_t.pointee;
+                t = this.cg.lookup_type_by_id(obj_ref.id);
             } else if (t != null && t.kind == TypeKind::Reference) {
                 const ref_t: ReferenceType* = t as ReferenceType*;
-                t = this.cg.lookup_type_by_id(ref_t.referent.id);
+                obj_ref = ref_t.referent;
+                t = this.cg.lookup_type_by_id(obj_ref.id);
             }
 
-            // Follow InstantiatedType to the concrete resolved type.
+            // Follow InstantiatedType to get the concrete type's TypeRef.
             if (t != null && t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = t as InstantiatedType*;
                 if (inst.has_resolved_type()) {
-                    t = this.cg.lookup_type_by_id(inst.resolved_type.id);
+                    obj_ref = inst.resolved_type;
+                    t = this.cg.lookup_type_by_id(obj_ref.id);
                 }
             }
 
-            if (t != null) {
-                // Extract qualified_name from the concrete type.
-                // This is the same name used during declare_method registration.
+            // Use DI type_reverse to get the type's registered name,
+            // then look up "QualifiedType::method" in the function map.
+            const type_sym: SymbolStr = di.lookup_type_name(obj_ref);
+            if (type_sym.is_valid()) {
+                const type_str: string = intern.resolve(type_sym);
+                const combined: string = format("%s::%s", type_str, method_str);
+                const sym: SymbolStr = intern.intern(combined);
+                callee_val = this.cg.get_function(sym);
+            }
+
+            // Strategy 2: Extract qualified_name directly from the Type object.
+            // Handles cases where type_reverse doesn't have the entry.
+            if (!callee_val.is_valid() && t != null) {
                 mut type_str: string = "";
                 if (t.kind == TypeKind::Struct) {
                     const st: StructType* = t as StructType*;
@@ -713,10 +861,34 @@ public:
                 }
 
                 if (strlen(type_str) > 0) {
-                    const method_str: string = intern.resolve(ma.member);
                     const combined: string = format("%s::%s", type_str, method_str);
                     const sym: SymbolStr = intern.intern(combined);
                     callee_val = this.cg.get_function(sym);
+                }
+            }
+
+            // Strategy 3: Walk class inheritance chain.
+            if (!callee_val.is_valid() && t != null && t.kind == TypeKind::Class) {
+                mut walk: Type* = t;
+                while (!callee_val.is_valid() && walk != null && walk.kind == TypeKind::Class) {
+                    const wcls: ClassType* = walk as ClassType*;
+                    if (!wcls.has_base) { break; }
+                    walk = this.cg.lookup_type_by_id(wcls.base_class.id);
+                    if (walk == null) { break; }
+
+                    mut parent_str: string = "";
+                    if (walk.kind == TypeKind::Class) {
+                        const pcls: ClassType* = walk as ClassType*;
+                        parent_str = intern.resolve(pcls.qualified_name);
+                    } else if (walk.kind == TypeKind::Struct) {
+                        const pst: StructType* = walk as StructType*;
+                        parent_str = intern.resolve(pst.qualified_name);
+                    }
+                    if (strlen(parent_str) > 0) {
+                        const pcombined: string = format("%s::%s", parent_str, method_str);
+                        const psym: SymbolStr = intern.intern(pcombined);
+                        callee_val = this.cg.get_function(psym);
+                    }
                 }
             }
         } else {
