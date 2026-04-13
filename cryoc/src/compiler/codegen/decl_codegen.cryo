@@ -147,17 +147,20 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
         return;
     }
 
-    // Qualify the function name (e.g., "helper" → "Module::helper")
-    // and parse into a QualifiedName so the mangler produces a
-    // fully qualified IR name (e.g., "Module_helper").
-    // Break pointer chains into locals — the C++ compiler can't
-    // resolve double dereferences like cg.ctx.method().
+    // Look up the pre-computed mangled name from the DI.
     const ctx_ptr: CompilationContext* = cg.ctx;
     const intern: InternTable* = ctx_ptr.intern_table;
     const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
-    const qname: QualifiedName = QualifiedName::from_symbol(qualified);
-    const mangled: MangledName = MangledName::for_function(intern, qname);
-    const fn_name: string = mangled.resolve(intern);
+    const di: DeclarationIndex* = ctx_ptr.decl_index;
+    mut mangled_sym: SymbolStr = di.lookup_mangled_name(qualified);
+    if (!mangled_sym.is_valid()) {
+        // Compute and register on first use.
+        const qname: QualifiedName = QualifiedName::from_symbol(qualified);
+        const computed: MangledName = MangledName::for_function(intern, qname);
+        mangled_sym = computed.value;
+        di.register_mangled_name(qualified, mangled_sym);
+    }
+    const fn_name: string = intern.resolve(mangled_sym);
 
     // Build the LLVM function type.
     const ret_ty: LType = map_return_type(cg, node);
@@ -203,8 +206,13 @@ function declare_impl_block(cg: CodegenContext*, node: ImplBlockNode*) -> void {
         return;
     }
 
+    // Qualify the target type — node.target_type may be bare ("CompileMode")
+    // but the DI and type system use qualified names.
+    const ctx_ptr: CompilationContext* = cg.ctx;
+    const qualified_target: SymbolStr = ctx_ptr.qualify_symbol_sym(node.target_type);
+
     for (mut i: i64 = 0; i < node.methods.length; i++) {
-        declare_method(cg, node.methods[i], node.target_type);
+        declare_method(cg, node.methods[i], qualified_target);
     }
 }
 
@@ -256,27 +264,32 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     const type_str: string = intern.resolve(target_type);
     const method_str: string = intern.resolve(func.name);
 
-    // Parse the qualified type name so the mangler produces a fully
-    // qualified IR name (e.g., "std_collections_Array_String_push").
-    const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
-    const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
-
-    // Collect parameter display names for overload disambiguation.
-    const arena: TypeArena* = cg.get_arena();
-    mut param_displays: string[] = [];
-    for (mut i: i64 = 0; i < func.parameters.length; i++) {
-        const p: VarDeclNode* = func.parameters[i];
-        if (p.resolved_type.is_valid()) {
-            const pt: Type* = arena.lookup(p.resolved_type.id);
-            if (pt != null) {
-                param_displays.push(pt.display_name());
+    // Build the combined DI key and look up the pre-computed mangled name.
+    const combined: string = format("%s::%s", type_str, method_str);
+    const combined_sym: SymbolStr = intern.intern(combined);
+    const ctx_ptr: CompilationContext* = cg.ctx;
+    const di: DeclarationIndex* = ctx_ptr.decl_index;
+    mut mangled_sym: SymbolStr = di.lookup_mangled_name(combined_sym);
+    if (!mangled_sym.is_valid()) {
+        // Compute and register on first use — covers paths that don't
+        // register upfront (monomorphized impl blocks, etc.).
+        const arena: TypeArena* = cg.get_arena();
+        const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
+        const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
+        mut pd: string[] = [];
+        const this_sym: SymbolStr = intern.intern("&this");
+        for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
+            const pp: VarDeclNode* = func.parameters[pi];
+            if (pp != null && pp.resolved_type.is_valid() && !pp.name.equals(this_sym)) {
+                const pt: Type* = arena.lookup(pp.resolved_type.id);
+                if (pt != null) { pd.push(pt.display_name()); }
             }
         }
+        const computed: MangledName = MangledName::for_method(intern, type_mangled, method_str, pd);
+        mangled_sym = computed.value;
+        di.register_mangled_name(combined_sym, mangled_sym);
     }
-
-    const mangled: MangledName = MangledName::for_method(
-        intern, type_mangled, method_str, param_displays);
-    const fn_name: string = mangled.resolve(intern);
+    const fn_name: string = intern.resolve(mangled_sym);
 
     // Build LLVM function type.  Non-static methods prepend a `this` pointer.
     const ret_ty: LType = map_return_type(cg, func);
@@ -285,9 +298,6 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     const is_instance: boolean = !node.is_static;
 
     // Look up the target type for the `this` pointer.
-    // Break cg.ctx chain into locals.
-    const ctx_ptr: CompilationContext* = cg.ctx;
-    const di: DeclarationIndex* = ctx_ptr.decl_index;
     mut this_ty: LType = LType::null();
     if (is_instance) {
         mut target_ref: TypeRef = di.lookup_type(target_type);
@@ -302,7 +312,18 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
         }
     }
 
-    const user_param_count: u32 = func.parameters.length as u32;
+    // Count user parameters, skipping &this (it's the implicit this pointer
+    // which is already prepended above — don't double-count).
+    mut user_param_count: u32 = 0;
+    for (mut pc: u32 = 0; pc < func.parameters.length as u32; pc++) {
+        const pp: VarDeclNode* = func.parameters[pc];
+        if (pp != null) {
+            const pname: string = intern.resolve(pp.name);
+            if (strcmp(pname, "&this") != 0) {
+                user_param_count = user_param_count + 1;
+            }
+        }
+    }
     const total_params: u32 = user_param_count + (if (is_instance) { 1 } else { 0 } as u32);
 
     const buf: void* = malloc(total_params as u64 * 8);
@@ -315,8 +336,12 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     }
 
     mut params_valid: boolean = true;
-    for (mut i: u32 = 0; i < user_param_count; i++) {
+    for (mut i: u32 = 0; i < func.parameters.length as u32; i++) {
         const param: VarDeclNode* = func.parameters[i];
+        if (param == null) { continue; }
+        // Skip &this — already handled as the implicit this pointer.
+        const param_name: string = intern.resolve(param.name);
+        if (strcmp(param_name, "&this") == 0) { continue; }
         const mapped_param: LType = cg.type_mapper.map_type(param.resolved_type);
         if (!mapped_param.is_valid()) {
             params_valid = false;
@@ -336,9 +361,7 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
 
     const fn_val: LValue = cg.llvm_module.add_function(fn_name, fn_type);
 
-    // Register under qualified combined key: "QualifiedType::method".
-    const combined: string = format("%s::%s", type_str, method_str);
-    const combined_sym: SymbolStr = intern.intern(combined);
+    // Register under the combined key built above.
     cg.register_function(combined_sym, fn_val);
 }
 
@@ -471,8 +494,14 @@ function declare_cross_module_externs(cg: CodegenContext*) -> void {
 
     // Iterate over all modules and declare their functions as externs.
     const modules: ModuleInfo[] = mg.modules;
+    const current_file: string = ctx_ptr.source_file;
     for (mut mi: i64 = 0; mi < modules.length; mi++) {
         const mod_info: ModuleInfo = modules[mi];
+        // Skip the current module — its functions are declared by
+        // declare_functions/declare_method in generate_program.
+        if (strcmp(mod_info.file_path, current_file) == 0) {
+            continue;
+        }
         const mod_sym: SymbolStr = intern.intern(mod_info.file_path);
 
         // Get all functions registered in this module.
@@ -497,7 +526,12 @@ function declare_cross_module_externs(cg: CodegenContext*) -> void {
                     if (ret_ty.is_valid()) {
                         // Declare as a no-arg function (best effort).
                         const fn_type: LType = LType::function_type(ret_ty, null, 0, false);
-                        const ir_name: string = cg.mangle_qualified_name(fn_name);
+                        mut fb_mangled: SymbolStr = di.lookup_mangled_name(fn_name);
+                        if (!fb_mangled.is_valid()) {
+                            const fb_qname: QualifiedName = QualifiedName::from_symbol(fn_name);
+                            fb_mangled = MangledName::for_function(intern, fb_qname).value;
+                        }
+                        const ir_name: string = intern.resolve(fb_mangled);
                         const fn_val: LValue = cg.llvm_module.add_function(ir_name, fn_type);
                         cg.register_function(fn_name, fn_val);
                         declared = declared + 1;
@@ -551,8 +585,15 @@ function declare_cross_module_externs(cg: CodegenContext*) -> void {
                 continue;
             }
 
-            // Build fully qualified mangled IR name.
-            const ir_name: string = cg.mangle_qualified_name(fn_name);
+            // Look up the pre-computed mangled name from the DI.
+            mut mangled_sym: SymbolStr = di.lookup_mangled_name(fn_name);
+            if (!mangled_sym.is_valid()) {
+                // Fallback: compute from qualified name.
+                const ext_qname: QualifiedName = QualifiedName::from_symbol(fn_name);
+                const ext_mangled: MangledName = MangledName::for_function(intern, ext_qname);
+                mangled_sym = ext_mangled.value;
+            }
+            const ir_name: string = intern.resolve(mangled_sym);
 
             const fn_val: LValue = cg.llvm_module.add_function(ir_name, fn_type);
             cg.register_function(fn_name, fn_val);
@@ -707,6 +748,7 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
 
     const fn_val: LValue = cg.get_function(combined_sym);
     if (!fn_val.is_valid()) {
+        printf("[IRGen] WARNING: method_prologue — not found: '%s' (id=%u)\n", combined, combined_sym.id); fflush(null);
         return LValue::null();
     }
 
@@ -752,10 +794,12 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
         param_idx = 1;
     }
 
-    // Bind remaining parameters.
+    // Bind remaining parameters (skip &this — already bound above).
     for (mut i: u32 = 0; i < func.parameters.length as u32; i++) {
         const param: VarDeclNode* = func.parameters[i];
+        if (param == null) { continue; }
         const param_name: string = cg.resolve(param.name);
+        if (strcmp(param_name, "&this") == 0) { continue; }
         const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
 
         if (!param_ty.is_valid()) {
