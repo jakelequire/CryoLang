@@ -19,7 +19,10 @@ import Compiler::AST::Declaration;
 import std::core::option;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
+import Compiler::Resolver::MangledName;
+import Compiler::Resolver::QualifiedName;
 import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
 import Compiler::Types::Arena;
 import std::collections::hashmap;
 
@@ -75,7 +78,9 @@ type struct DeclarationIndex {
     // Used by codegen to resolve auto-imported identifiers.
     bare_to_qualified:   HashMap<u32, u32>;
 
-
+    // Qualified function name → mangled LLVM symbol name.
+    // Computed once at registration time so codegen never mangles.
+    mangled_names:       HashMap<u32, u32>;
 
 
     static new() -> DeclarationIndex {
@@ -91,6 +96,7 @@ type struct DeclarationIndex {
             module_type_keys:    [],
             module_type_modules: [],
             bare_to_qualified:   HashMap<u32, u32>::new(),
+            mangled_names:       HashMap<u32, u32>::new(),
         };
     }
 
@@ -188,9 +194,12 @@ type struct DeclarationIndex {
                     param_types.push(this_ptr_ref);
                 }
             }
+            // Collect user parameter types, skipping &this (the implicit
+            // this pointer is prepended separately above).
+            const this_name: SymbolStr = intern.intern("&this");
             for (mut p: i64 = 0; p < func.parameters.length; p++) {
                 const param: VarDeclNode* = func.parameters[p];
-                if (param != null && param.resolved_type.is_valid()) {
+                if (param != null && param.resolved_type.is_valid() && !param.name.equals(this_name)) {
                     param_types.push(param.resolved_type);
                 }
             }
@@ -200,6 +209,23 @@ type struct DeclarationIndex {
             // Register with full signature for cross-module externs.
             this.register_function(combined_sym, func.resolved_return_type);
             this.register_function_type(combined_sym, func_type_ref);
+
+            // Compute and store the mangled LLVM symbol name.
+            const type_qname: QualifiedName = QualifiedName::from_symbol(type_sym);
+            const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
+            mut param_displays: string[] = [];
+            for (mut pd: i64 = 0; pd < func.parameters.length; pd++) {
+                const pdp: VarDeclNode* = func.parameters[pd];
+                if (pdp != null && pdp.resolved_type.is_valid() && !pdp.name.equals(this_name)) {
+                    const pdt: Type* = arena.lookup(pdp.resolved_type.id);
+                    if (pdt != null) {
+                        param_displays.push(pdt.display_name());
+                    }
+                }
+            }
+            const mangled: MangledName = MangledName::for_method(
+                intern, type_mangled, method_str, param_displays);
+            this.register_mangled_name(combined_sym, mangled.value);
 
             // Add to per-module list.
             this.module_func_keys.push(combined_sym.id);
@@ -281,11 +307,18 @@ type struct DeclarationIndex {
     }
 
     /// Register a function type with its defining module for per-module enumeration.
+    /// Also computes and stores the mangled LLVM symbol name.
     register_function_type_with_module(mut &this, name: SymbolStr,
                                        return_type: TypeRef, func_type_ref: TypeRef,
-                                       module: SymbolStr) -> void {
+                                       module: SymbolStr, intern: InternTable*) -> void {
         this.register_function(name, return_type);
         this.register_function_type(name, func_type_ref);
+
+        // Compute mangled name for free functions (no param suffixes).
+        const qname: QualifiedName = QualifiedName::from_symbol(name);
+        const mangled: MangledName = MangledName::for_function(intern, qname);
+        this.register_mangled_name(name, mangled.value);
+
         this.module_func_keys.push(name.id);
         this.module_func_modules.push(module.id);
     }
@@ -298,6 +331,22 @@ type struct DeclarationIndex {
         this.module_type_modules.push(module.id);
     }
 
+
+    /// Store the mangled LLVM symbol name for a function or method.
+    /// Called at registration time so codegen never computes mangling.
+    register_mangled_name(mut &this, qualified: SymbolStr, mangled: SymbolStr) -> void {
+        const h: u64 = hash_int(qualified.id as u64);
+        this.mangled_names.insert(qualified.id, mangled.id, h);
+    }
+
+    /// Look up the pre-computed mangled LLVM symbol name.
+    lookup_mangled_name(&this, qualified: SymbolStr) -> SymbolStr {
+        const h: u64 = hash_int(qualified.id as u64);
+        return match (this.mangled_names.get(qualified.id, h)) {
+            Option::Some(val) => { SymbolStr::from_id(val) }
+            Option::None      => { SymbolStr::empty() }
+        };
+    }
 
     /// Register a bare → qualified name mapping.
     /// Called by type_resolution when registering both forms.

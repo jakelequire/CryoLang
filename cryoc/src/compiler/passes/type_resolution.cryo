@@ -612,13 +612,18 @@ type struct TypeResolutionPasses {
                     // cross-module descriptors carry fully qualified names.
                     const q_name: SymbolStr = ctx.qualify_symbol_sym(func.name);
                     ctx.decl_index.register_function_type_with_module(
-                        q_name, func.resolved_return_type, func_type_ref, module_sym);
+                        q_name, func.resolved_return_type, func_type_ref, module_sym, ctx.intern_table);
 
                     // Also register under bare name for backward-compatible lookups.
+                    // Use the same mangled name as the qualified version.
                     if (!q_name.equals(func.name)) {
                         ctx.decl_index.register_function(func.name, func.resolved_return_type);
                         ctx.decl_index.register_function_type(func.name, func_type_ref);
                         ctx.decl_index.register_name_mapping(func.name, q_name);
+                        const q_mangled: SymbolStr = ctx.decl_index.lookup_mangled_name(q_name);
+                        if (q_mangled.is_valid()) {
+                            ctx.decl_index.register_mangled_name(func.name, q_mangled);
+                        }
                     }
                 }
             }
@@ -739,6 +744,8 @@ type struct TypeResolutionPasses {
 
                             ctx.decl_index.register_function(fn_node.name, fn_node.resolved_return_type);
                             ctx.decl_index.register_function_type(fn_node.name, func_type_ref);
+                            // Extern C functions use bare name as LLVM symbol.
+                            ctx.decl_index.register_mangled_name(fn_node.name, fn_node.name);
 
                             // For CImport blocks, also register under alias::name
                             if (node.is_c_import()) {
@@ -748,6 +755,8 @@ type struct TypeResolutionPasses {
                                 const q_sym: SymbolStr = ctx.intern_table.intern(qualified);
                                 ctx.decl_index.register_function(q_sym, fn_node.resolved_return_type);
                                 ctx.decl_index.register_function_type(q_sym, func_type_ref);
+                                // CImport qualified name also maps to bare C name.
+                                ctx.decl_index.register_mangled_name(q_sym, fn_node.name);
                             }
                         }
                     }
@@ -790,13 +799,21 @@ type struct TypeResolutionPasses {
                         const i_mod_sym: SymbolStr = ctx.intern(ctx.source_file);
                         const q_name: SymbolStr = ctx.qualify_symbol_sym(node.name);
                         ctx.decl_index.register_function_type_with_module(
-                            q_name, node.resolved_return_type, i_func_type_ref, i_mod_sym);
+                            q_name, node.resolved_return_type, i_func_type_ref, i_mod_sym, ctx.intern_table);
+
+                        // Intrinsics use C linkage — their LLVM symbol is the
+                        // bare function name, not the qualified/mangled form.
+                        const bare_name_str: string = ctx.intern_table.resolve(node.name);
+                        const bare_mangled: SymbolStr = ctx.intern_table.intern(bare_name_str);
+                        ctx.decl_index.register_mangled_name(q_name, bare_mangled);
 
                         // Also register bare name for lookups.
                         if (!q_name.equals(node.name)) {
                             ctx.decl_index.register_function(node.name, node.resolved_return_type);
                             ctx.decl_index.register_function_type(node.name, i_func_type_ref);
                             ctx.decl_index.register_name_mapping(node.name, q_name);
+                            // Bare name also needs its own mangled entry.
+                            ctx.decl_index.register_mangled_name(node.name, bare_mangled);
                         }
                     }
                     sig_count++;
