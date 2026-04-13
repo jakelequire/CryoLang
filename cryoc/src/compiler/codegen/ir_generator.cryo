@@ -646,6 +646,8 @@ public:
             this.visit_new_expr(expr as NewExprNode*);
         } else if (kind == NodeKind::DeleteExpression) {
             this.visit_delete_expr(expr as DeleteExprNode*);
+        } else if (kind == NodeKind::MatchExpression) {
+            this.visit_match_expr(expr as MatchExprNode*);
         } else {
             // Unsupported expression — leave last_value as null.
             printf("[IRGen] WARNING: unhandled expression kind %d — returning null\n", kind as i32); fflush(null);
@@ -787,6 +789,81 @@ public:
             if (!callee_val.is_valid()) {
                 callee_val = this.cg.get_function(id.name);
             }
+
+            // 4. Function-typed parameter — look in named_values (local scope).
+            //    If the identifier refers to a parameter of function type,
+            //    it will be stored as an alloca in named_values.  Load the
+            //    function pointer and call through it.
+            //    We must handle the call here because the loaded value is an
+            //    instruction, not a GlobalValue — LLVMGlobalGetValueType
+            //    would segfault on it.
+            if (!callee_val.is_valid()) {
+                const local: LValue = this.cg.get_named_value(id.name);
+                if (local.is_valid()) {
+                    // Build the LLVM function type from the Cryo FunctionType.
+                    // Unwrap Pointer/Reference if the param type is &fn(...).
+                    mut callee_type_ref: TypeRef = id.resolved_type;
+                    mut callee_t: Type* = this.cg.lookup_type_by_id(callee_type_ref.id);
+                    if (callee_t != null && callee_t.kind == TypeKind::Pointer) {
+                        const pt: PointerType* = callee_t as PointerType*;
+                        callee_type_ref = pt.pointee;
+                        callee_t = this.cg.lookup_type_by_id(callee_type_ref.id);
+                    } else if (callee_t != null && callee_t.kind == TypeKind::Reference) {
+                        const rt: ReferenceType* = callee_t as ReferenceType*;
+                        callee_type_ref = rt.referent;
+                        callee_t = this.cg.lookup_type_by_id(callee_type_ref.id);
+                    }
+                    if (callee_t != null && callee_t.kind == TypeKind::Function) {
+                        const ft: FunctionType* = callee_t as FunctionType*;
+                        // Map return type.
+                        const ret_ty: LType = this.cg.type_mapper.map_type(ft.return_type);
+                        if (!ret_ty.is_valid()) {
+                            this.last_value = LValue::null();
+                            this.last_is_lvalue = false;
+                            return;
+                        }
+                        // Map parameter types.
+                        const param_count: u32 = ft.param_types.length as u32;
+                        mut fn_type: LType = LType::null();
+                        if (param_count == 0) {
+                            fn_type = LType::function_type(ret_ty, null, 0, false);
+                        } else {
+                            const pbuf: void* = malloc(param_count as u64 * 8);
+                            const pslots: void** = pbuf as void**;
+                            mut valid: boolean = true;
+                            for (mut pi: u32 = 0; pi < param_count; pi++) {
+                                const pt: LType = this.cg.type_mapper.map_type(ft.param_types[pi]);
+                                if (!pt.is_valid()) { valid = false; break; }
+                                pslots[pi] = pt.raw;
+                            }
+                            if (!valid) {
+                                free(pbuf);
+                                this.last_value = LValue::null();
+                                this.last_is_lvalue = false;
+                                return;
+                            }
+                            fn_type = LType::function_type(ret_ty, pbuf, param_count, false);
+                            free(pbuf);
+                        }
+                        // Load the function pointer from the alloca.
+                        const fn_ptr_llvm: LType = LType::pointer_to(LType::i8());
+                        const fn_ptr: LValue = this.cg.builder.build_load(fn_ptr_llvm, local, "fn.ptr.load");
+                        // Codegen arguments.
+                        mut call_args: LValue[] = [];
+                        for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
+                            call_args = call_args + [this.codegen_rvalue(node.arguments[ai])];
+                        }
+                        // Build the call.
+                        const void_ty: LType = LType::void_type();
+                        const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
+                        mut call_result: LValue = LValue::null();
+                        codegen_call(this.cg, fn_ptr, fn_type, call_args, call_name, &call_result);
+                        this.last_value = call_result;
+                        this.last_is_lvalue = false;
+                        return;
+                    }
+                }
+            }
         } else if (node.callee.kind == NodeKind::ScopeResolution) {
             // Scope resolution: e.g., LValue::null(), TypeRef::invalid().
             // The scope name may be bare (LValue) while the function was
@@ -804,6 +881,62 @@ public:
             const combined: string = format("%s::%s", scope_str, intern.resolve(sr.member_name));
             const sym: SymbolStr = intern.intern(combined);
             callee_val = this.cg.get_function(sym);
+
+            // If the function wasn't found, check if this is an enum variant
+            // constructor (e.g., Option::Some, Result::Ok).  Enum constructors
+            // are not registered as functions — synthesize the value inline.
+            // Use node.resolved_type (the sema-resolved result type of the call)
+            // to find the concrete monomorphized enum, not the scope name
+            // (which may still be the generic "Option" template name).
+            if (!callee_val.is_valid()) {
+                mut real_ref: TypeRef = node.resolved_type;
+                mut real_t: Type* = this.cg.lookup_type_by_id(real_ref.id);
+                // Follow InstantiatedType chain (may be multiple levels deep).
+                mut follow_count: i32 = 0;
+                while (real_t != null && real_t.kind == TypeKind::InstantiatedType && follow_count < 5) {
+                    const inst: InstantiatedType* = real_t as InstantiatedType*;
+                    if (inst.has_resolved_type()) {
+                        real_ref = inst.resolved_type;
+                        real_t = this.cg.lookup_type_by_id(real_ref.id);
+                    } else {
+                        break;
+                    }
+                    follow_count = follow_count + 1;
+                }
+                // Also try: the scope name might resolve to a type directly
+                // (for cases where resolved_type isn't set on the call node).
+                if (real_t == null || (real_t.kind != TypeKind::Enum && real_t.kind != TypeKind::Struct)) {
+                    const scope_ref: TypeRef = di.lookup_type(resolved_scope);
+                    if (scope_ref.is_valid()) {
+                        real_ref = scope_ref;
+                        real_t = this.cg.lookup_type_by_id(real_ref.id);
+                        mut sc: i32 = 0;
+                        while (real_t != null && real_t.kind == TypeKind::InstantiatedType && sc < 5) {
+                            const sinst: InstantiatedType* = real_t as InstantiatedType*;
+                            if (sinst.has_resolved_type()) {
+                                real_ref = sinst.resolved_type;
+                                real_t = this.cg.lookup_type_by_id(real_ref.id);
+                            } else { break; }
+                            sc = sc + 1;
+                        }
+                    }
+                }
+                if (real_t != null && real_t.kind == TypeKind::Enum) {
+                    const et: EnumType* = real_t as EnumType*;
+                    const variant: EnumVariantInfo* = et.get_variant(sr.member_name);
+                    if (variant != null) {
+                        // Codegen the arguments first.
+                        mut vargs: LValue[] = [];
+                        for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
+                            vargs = vargs + [this.codegen_rvalue(node.arguments[ai])];
+                        }
+                        const result: LValue = this.build_enum_variant(et, variant, real_ref, vargs);
+                        this.last_value = result;
+                        this.last_is_lvalue = false;
+                        return;
+                    }
+                }
+            }
         } else if (node.callee.kind == NodeKind::MemberAccess) {
             // Member access: resolve the object's type to find the method.
             // Use the same approach as sema: ask the DI for the type's
@@ -826,13 +959,27 @@ public:
                 t = this.cg.lookup_type_by_id(obj_ref.id);
             }
 
-            // Follow InstantiatedType to get the concrete type's TypeRef.
-            if (t != null && t.kind == TypeKind::InstantiatedType) {
+            // Follow InstantiatedType chain to get the concrete type's TypeRef.
+            mut inst_depth: i32 = 0;
+            while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth < 5) {
                 const inst: InstantiatedType* = t as InstantiatedType*;
                 if (inst.has_resolved_type()) {
                     obj_ref = inst.resolved_type;
                     t = this.cg.lookup_type_by_id(obj_ref.id);
-                }
+                } else { break; }
+                inst_depth = inst_depth + 1;
+            }
+
+            // Also unwrap pointer/reference AFTER InstantiatedType unwrap
+            // (some monomorphized types resolve to Pointer<ConcreteStruct>).
+            if (t != null && t.kind == TypeKind::Pointer) {
+                const ptr_t2: PointerType* = t as PointerType*;
+                obj_ref = ptr_t2.pointee;
+                t = this.cg.lookup_type_by_id(obj_ref.id);
+            } else if (t != null && t.kind == TypeKind::Reference) {
+                const ref_t2: ReferenceType* = t as ReferenceType*;
+                obj_ref = ref_t2.referent;
+                t = this.cg.lookup_type_by_id(obj_ref.id);
             }
 
             // Use DI type_reverse to get the type's registered name,
@@ -906,8 +1053,14 @@ public:
                     intern.resolve(sr.scope_name), intern.resolve(sr.member_name)); fflush(null);
             } else if (node.callee.kind == NodeKind::MemberAccess) {
                 const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
-                printf("[IRGen] WARNING: call — callee not found (member '.%s')\n",
-                    intern.resolve(ma.member)); fflush(null);
+                // Diagnostic: show the type we tried resolving against.
+                mut dbg_type_str: string = "<unknown>";
+                const dbg_t: Type* = this.cg.lookup_type_by_id(ma.object.resolved_type.id);
+                if (dbg_t != null) {
+                    dbg_type_str = dbg_t.display_name();
+                }
+                printf("[IRGen] WARNING: call — callee not found (member '.%s' on type '%s' id=%llu)\n",
+                    intern.resolve(ma.member), dbg_type_str, ma.object.resolved_type.id); fflush(null);
             } else {
                 printf("[IRGen] WARNING: call — callee not found (kind=%d)\n", node.callee.kind as i32); fflush(null);
             }
@@ -1015,8 +1168,167 @@ public:
             this.last_is_lvalue = true;
             return;
         }
+
+        // Check if this is an enum variant reference (e.g., Option::None).
+        // Use resolved_type from sema to find the concrete enum type.
+        // Follow InstantiatedType chain (may be multiple levels).
+        mut real_ref: TypeRef = node.resolved_type;
+        mut real_t: Type* = this.cg.lookup_type_by_id(real_ref.id);
+        mut sr_depth: i32 = 0;
+        while (real_t != null && real_t.kind == TypeKind::InstantiatedType && sr_depth < 5) {
+            const inst: InstantiatedType* = real_t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                real_ref = inst.resolved_type;
+                real_t = this.cg.lookup_type_by_id(real_ref.id);
+            } else { break; }
+            sr_depth = sr_depth + 1;
+        }
+        if (real_t != null && real_t.kind == TypeKind::Enum) {
+            const et: EnumType* = real_t as EnumType*;
+            const variant: EnumVariantInfo* = et.get_variant(node.member_name);
+            if (variant != null) {
+                mut no_args: LValue[] = [];
+                this.last_value = this.build_enum_variant(et, variant, real_ref, no_args);
+                this.last_is_lvalue = false;
+                return;
+            }
+        }
+
         this.last_value = LValue::null();
         this.last_is_lvalue = false;
+    }
+
+    /// Match expression — produces a value via phi node.
+    /// Same comparison chain as visit_match_stmt, but each arm evaluates
+    /// to a value and the merge block collects them with a phi.
+    visit_match_expr(mut &this, node: MatchExprNode*) -> void {
+        if (node.subject == null || node.arms.length == 0) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const current_fn: LValue = this.get_current_function();
+        if (!current_fn.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const subject: LValue = this.codegen_rvalue(node.subject);
+        if (!subject.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const num_arms: i64 = node.arms.length;
+
+        // Create basic blocks: one per arm + merge.
+        mut arm_bbs: LBasicBlock[] = [];
+        for (mut i: i64 = 0; i < num_arms; i++) {
+            arm_bbs = arm_bbs + [LBasicBlock::append(current_fn, format("mexpr.arm%lld", i))];
+        }
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "mexpr.end");
+
+        // Comparison chain — same as visit_match_stmt.
+        for (mut i: i64 = 0; i < num_arms; i++) {
+            const arm: MatchArmNode* = node.arms[i];
+            if (arm == null) { continue; }
+
+            mut next_bb: LBasicBlock = merge_bb;
+            if (i + 1 < num_arms) {
+                next_bb = LBasicBlock::append(current_fn, format("mexpr.test%lld", i + 1));
+            }
+
+            mut matched: boolean = false;
+            for (mut p: i64 = 0; p < arm.patterns.length; p++) {
+                const pat: PatternNode* = arm.patterns[p];
+                if (pat == null) { continue; }
+
+                if (pat.pattern_kind == PatternKind::Wildcard) {
+                    this.cg.builder.build_br(arm_bbs[i]);
+                    matched = true;
+                    break;
+                } else if (pat.pattern_kind == PatternKind::Literal) {
+                    const pat_val: LValue = this.codegen_pattern_value(pat);
+                    if (pat_val.is_valid()) {
+                        const cmp: LValue = this.cg.builder.build_icmp(32, subject, pat_val, "mexpr.cmp");
+                        this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
+                        matched = true;
+                        break;
+                    }
+                } else if (pat.pattern_kind == PatternKind::Identifier) {
+                    const pat_val: LValue = this.codegen_pattern_value(pat);
+                    if (pat_val.is_valid()) {
+                        const cmp: LValue = this.cg.builder.build_icmp(32, subject, pat_val, "mexpr.cmp");
+                        this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!matched) {
+                const cur: LBasicBlock = this.cg.builder.get_insert_block();
+                if (cur.is_valid() && !cur.has_terminator()) {
+                    this.cg.builder.build_br(next_bb);
+                }
+            }
+
+            if (i + 1 < num_arms) {
+                this.cg.builder.position_at_end(next_bb);
+            }
+        }
+
+        // Generate arm bodies and collect values + end blocks for phi.
+        const result_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        mut phi_vals: void* = malloc(num_arms as u64 * 8);
+        mut phi_blks: void* = malloc(num_arms as u64 * 8);
+        const phi_vals_arr: void** = phi_vals as void**;
+        const phi_blks_arr: void** = phi_blks as void**;
+        mut phi_count: u32 = 0;
+
+        for (mut i: i64 = 0; i < num_arms; i++) {
+            const arm: MatchArmNode* = node.arms[i];
+            if (arm == null) { continue; }
+
+            this.cg.builder.position_at_end(arm_bbs[i]);
+
+            // Match expression arms produce values.
+            // The arm body is a statement — for expression arms, it's typically
+            // a block with a trailing expression or a single expression statement.
+            mut arm_val: LValue = LValue::null();
+            if (arm.body != null) {
+                this.generate_statement(arm.body);
+                arm_val = this.last_value;
+            }
+
+            const arm_end: LBasicBlock = this.cg.builder.get_insert_block();
+            if (arm_end.is_valid() && !arm_end.has_terminator()) {
+                this.cg.builder.build_br(merge_bb);
+            }
+
+            if (arm_val.is_valid()) {
+                phi_vals_arr[phi_count] = arm_val.raw;
+                phi_blks_arr[phi_count] = arm_end.raw;
+                phi_count = phi_count + 1;
+            }
+        }
+
+        this.cg.builder.position_at_end(merge_bb);
+
+        if (phi_count > 0 && result_ty.is_valid()) {
+            const phi: LValue = this.cg.builder.build_phi(result_ty, "mexpr.val");
+            phi_add_incoming(phi, phi_vals, phi_blks, phi_count);
+            this.last_value = phi;
+        } else {
+            this.last_value = LValue::null();
+        }
+        this.last_is_lvalue = false;
+
+        free(phi_vals);
+        free(phi_blks);
     }
 
     /// Ternary/if expression — direct dispatch.
@@ -1169,5 +1481,83 @@ public:
 
         this.last_value = phi;
         this.last_is_lvalue = false;
+    }
+
+    // ========================================================================
+    // Enum variant construction (inline)
+    // ========================================================================
+
+    /// Build an enum variant value.
+    /// For simple enums: returns i32 tag constant.
+    /// For ADT enums: returns { i32 tag, [N x i8] } with payload stored.
+    build_enum_variant(mut &this, et: EnumType*, variant: EnumVariantInfo*,
+                       enum_ref: TypeRef, args: LValue[]) -> LValue {
+        const tag_val: LValue = LType::const_int(LType::i32(), variant.tag_value, false);
+
+        // Simple enum — just an i32 tag.
+        if (et.is_simple_enum()) {
+            return tag_val;
+        }
+
+        // ADT enum — map the full enum type to { i32, [N x i8] }.
+        const enum_llvm: LType = this.cg.type_mapper.map_type(enum_ref);
+        if (!enum_llvm.is_valid()) {
+            return LValue::null();
+        }
+
+        // No-payload variant on an ADT enum — return { tag, zeroinit }.
+        if (!variant.has_payload()) {
+            const null_val: LValue = LType::const_null(enum_llvm);
+            const result: LValue = this.cg.builder.build_insert_value(
+                null_val, tag_val, 0, "enum.tag");
+            return result;
+        }
+
+        // Payload variant — alloca, store tag, store payload fields.
+        const current_fn: LValue = this.get_current_function();
+        const alloca: LValue = this.cg.create_entry_alloca(current_fn, "enum.tmp", enum_llvm);
+
+        // Store tag at field 0 using struct GEP.
+        const tag_ptr: LValue = this.cg.builder.build_struct_gep(enum_llvm, alloca, 0, "enum.tag.ptr");
+        this.cg.builder.build_store(tag_val, tag_ptr);
+
+        // Get pointer to payload at field 1.
+        const payload_ptr: LValue = this.cg.builder.build_struct_gep(enum_llvm, alloca, 1, "enum.payload.ptr");
+
+        // For single-payload variants, store the argument directly.
+        // For multi-payload, store each field sequentially.
+        if (args.length == 1 && variant.payload_types.length == 1) {
+            const payload_ty: LType = this.cg.type_mapper.map_type(variant.payload_types[0]);
+            if (payload_ty.is_valid()) {
+                const typed_ptr: LValue = this.cg.builder.build_bitcast(
+                    payload_ptr, LType::pointer_to(payload_ty), "enum.payload.cast");
+                this.cg.builder.build_store(args[0], typed_ptr);
+            }
+        } else {
+            // Multi-field payload: lay out sequentially.
+            mut offset: u64 = 0;
+            for (mut i: i64 = 0; i < args.length && i < variant.payload_types.length as i64; i++) {
+                const field_ty: LType = this.cg.type_mapper.map_type(variant.payload_types[i]);
+                if (!field_ty.is_valid()) { continue; }
+                const byte_offset: LValue = LType::const_int(LType::i64(), offset, false);
+                const obuf: void* = malloc(8);
+                const obuf_arr: void** = obuf as void**;
+                obuf_arr[0] = byte_offset.raw;
+                const field_ptr_raw: LValue = this.cg.builder.build_gep(
+                    LType::i8(), payload_ptr, obuf, 1, "enum.field.ptr");
+                free(obuf);
+                const field_ptr: LValue = this.cg.builder.build_bitcast(
+                    field_ptr_raw, LType::pointer_to(field_ty), "enum.field.cast");
+                this.cg.builder.build_store(args[i], field_ptr);
+                // Advance offset by the field's size.
+                const ft: Type* = this.cg.lookup_type_by_id(variant.payload_types[i].id);
+                if (ft != null) {
+                    offset = offset + ft.size_bytes();
+                }
+            }
+        }
+
+        // Load and return the complete enum value.
+        return this.cg.builder.build_load(enum_llvm, alloca, "enum.val");
     }
 }
