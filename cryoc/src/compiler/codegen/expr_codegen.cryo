@@ -17,6 +17,7 @@ import Compiler::Types::Type;
 import Compiler::Types::Arena;
 import Compiler::Types::UserDefined;
 import Compiler::Types::Compound;
+import Compiler::Types::Generic;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Expression;
@@ -128,9 +129,55 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
         return;
     }
     // Determine if this is integer, float, or pointer arithmetic.
-    const t: Type* = cg.lookup_type_by_id(result_type.id);
+    // Follow InstantiatedType chain to get the concrete type.
+    mut t: Type* = cg.lookup_type_by_id(result_type.id);
+    mut bd: i32 = 0;
+    while (t != null && t.kind == TypeKind::InstantiatedType && bd < 5) {
+        const binst: InstantiatedType* = t as InstantiatedType*;
+        if (binst.has_resolved_type()) {
+            t = cg.lookup_type_by_id(binst.resolved_type.id);
+        } else { break; }
+        bd = bd + 1;
+    }
     mut t_kind: TypeKind = TypeKind::Error;
     if (t != null) { t_kind = t.kind; }
+
+    // String comparison via strcmp.  Strings are i8* (null-terminated).
+    if (t_kind == TypeKind::String) {
+        if (op_kind == TokenType::EqualEqual || op_kind == TokenType::ExclaimEqual) {
+            codegen_string_compare(cg, lhs_val, rhs_val, op_kind, out_value);
+            return;
+        }
+        printf("[IRGen] WARNING: binary op — unsupported string operation\n"); fflush(null);
+        *out_value = LValue::null();
+        return;
+    }
+
+    // Enum comparison: compare i32 discriminant tags.
+    // For simple enums the value is already i32.
+    // For ADT enums extract field 0 (the tag) first.
+    if (t_kind == TypeKind::Enum) {
+        if (op_kind == TokenType::EqualEqual || op_kind == TokenType::ExclaimEqual) {
+            mut lhs_tag: LValue = lhs_val;
+            mut rhs_tag: LValue = rhs_val;
+            // Check if this is an ADT enum (struct type in LLVM) or simple (i32).
+            const lhs_llvm_ty: void* = llvm::LLVMTypeOf(lhs_val.raw);
+            if (lhs_llvm_ty != null && llvm::LLVMGetTypeKind(lhs_llvm_ty) == 13) {
+                // LLVMStructTypeKind = 13 — extract tag at index 0.
+                lhs_tag = cg.builder.build_extract_value(lhs_val, 0, "lhs.tag");
+                rhs_tag = cg.builder.build_extract_value(rhs_val, 0, "rhs.tag");
+            }
+            if (op_kind == TokenType::EqualEqual) {
+                *out_value = cg.builder.build_icmp(32, lhs_tag, rhs_tag, "enum.eq");
+            } else {
+                *out_value = cg.builder.build_icmp(33, lhs_tag, rhs_tag, "enum.ne");
+            }
+            return;
+        }
+        printf("[IRGen] WARNING: binary op — unsupported enum operation\n"); fflush(null);
+        *out_value = LValue::null();
+        return;
+    }
 
     // Bail out if the result type is not a numeric or pointer type.
     // Operating on void/error/unresolved types crashes LLVM.
@@ -150,102 +197,134 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
         is_signed = ik.is_signed();
     }
 
+    // Normalize integer operand widths.
+    // LLVM requires both operands to binary ops (icmp, add, shl, etc.)
+    // to have the same type.  If they differ (e.g., i32 vs i64),
+    // extend the narrower one to match the wider.
+    mut lhs: LValue = lhs_val;
+    mut rhs: LValue = rhs_val;
+    if (!is_float) {
+        const lhs_ty: void* = llvm::LLVMTypeOf(lhs.raw);
+        const rhs_ty: void* = llvm::LLVMTypeOf(rhs.raw);
+        // LLVMIntegerTypeKind = 8
+        if (lhs_ty != null && rhs_ty != null &&
+            llvm::LLVMGetTypeKind(lhs_ty) == 8 && llvm::LLVMGetTypeKind(rhs_ty) == 8) {
+            const lhs_w: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty);
+            const rhs_w: u32 = llvm::LLVMGetIntTypeWidth(rhs_ty);
+            if (lhs_w < rhs_w) {
+                const target: LType = LType { raw: rhs_ty };
+                if (is_signed) {
+                    lhs = cg.builder.build_sext(lhs, target, "widen");
+                } else {
+                    lhs = cg.builder.build_zext(lhs, target, "widen");
+                }
+            } else if (rhs_w < lhs_w) {
+                const target: LType = LType { raw: lhs_ty };
+                if (is_signed) {
+                    rhs = cg.builder.build_sext(rhs, target, "widen");
+                } else {
+                    rhs = cg.builder.build_zext(rhs, target, "widen");
+                }
+            }
+        }
+    }
+
     // Arithmetic
     if (op_kind == TokenType::Plus) {
         *out_value = if (is_float) {
-            cg.builder.build_fadd(lhs_val, rhs_val, "addtmp")
+            cg.builder.build_fadd(lhs, rhs, "addtmp")
         } else {
-            cg.builder.build_add(lhs_val, rhs_val, "addtmp")
+            cg.builder.build_add(lhs, rhs, "addtmp")
         };
     } else if (op_kind == TokenType::Minus) {
         *out_value = if (is_float) {
-            cg.builder.build_fsub(lhs_val, rhs_val, "subtmp")
+            cg.builder.build_fsub(lhs, rhs, "subtmp")
         } else {
-            cg.builder.build_sub(lhs_val, rhs_val, "subtmp")
+            cg.builder.build_sub(lhs, rhs, "subtmp")
         };
     } else if (op_kind == TokenType::Star) {
         *out_value = if (is_float) {
-            cg.builder.build_fmul(lhs_val, rhs_val, "multmp")
+            cg.builder.build_fmul(lhs, rhs, "multmp")
         } else {
-            cg.builder.build_mul(lhs_val, rhs_val, "multmp")
+            cg.builder.build_mul(lhs, rhs, "multmp")
         };
     } else if (op_kind == TokenType::Slash) {
         *out_value = if (is_float) {
-            cg.builder.build_fdiv(lhs_val, rhs_val, "divtmp")
+            cg.builder.build_fdiv(lhs, rhs, "divtmp")
         } else { if (is_signed) {
-            cg.builder.build_sdiv(lhs_val, rhs_val, "divtmp")
+            cg.builder.build_sdiv(lhs, rhs, "divtmp")
         } else {
-            cg.builder.build_udiv(lhs_val, rhs_val, "divtmp")
+            cg.builder.build_udiv(lhs, rhs, "divtmp")
         } };
     } else if (op_kind == TokenType::Percent) {
         *out_value = if (is_float) {
-            cg.builder.build_frem(lhs_val, rhs_val, "remtmp")
+            cg.builder.build_frem(lhs, rhs, "remtmp")
         } else { if (is_signed) {
-            cg.builder.build_srem(lhs_val, rhs_val, "remtmp")
+            cg.builder.build_srem(lhs, rhs, "remtmp")
         } else {
-            cg.builder.build_urem(lhs_val, rhs_val, "remtmp")
+            cg.builder.build_urem(lhs, rhs, "remtmp")
         } };
 
     // Comparison
     } else if (op_kind == TokenType::EqualEqual) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(1 /* OEQ */, lhs_val, rhs_val, "eqtmp")
+            cg.builder.build_fcmp(1 /* OEQ */, lhs, rhs, "eqtmp")
         } else {
-            cg.builder.build_icmp(32 /* IntEQ */, lhs_val, rhs_val, "eqtmp")
+            cg.builder.build_icmp(32 /* IntEQ */, lhs, rhs, "eqtmp")
         };
     } else if (op_kind == TokenType::ExclaimEqual) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(6 /* ONE */, lhs_val, rhs_val, "netmp")
+            cg.builder.build_fcmp(6 /* ONE */, lhs, rhs, "netmp")
         } else {
-            cg.builder.build_icmp(33 /* IntNE */, lhs_val, rhs_val, "netmp")
+            cg.builder.build_icmp(33 /* IntNE */, lhs, rhs, "netmp")
         };
     } else if (op_kind == TokenType::LAngle) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(4 /* OLT */, lhs_val, rhs_val, "lttmp")
+            cg.builder.build_fcmp(4 /* OLT */, lhs, rhs, "lttmp")
         } else { if (is_signed) {
-            cg.builder.build_icmp(40 /* IntSLT */, lhs_val, rhs_val, "lttmp")
+            cg.builder.build_icmp(40 /* IntSLT */, lhs, rhs, "lttmp")
         } else {
-            cg.builder.build_icmp(36 /* IntULT */, lhs_val, rhs_val, "lttmp")
+            cg.builder.build_icmp(36 /* IntULT */, lhs, rhs, "lttmp")
         } };
     } else if (op_kind == TokenType::RAngle) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(2 /* OGT */, lhs_val, rhs_val, "gttmp")
+            cg.builder.build_fcmp(2 /* OGT */, lhs, rhs, "gttmp")
         } else { if (is_signed) {
-            cg.builder.build_icmp(38 /* IntSGT */, lhs_val, rhs_val, "gttmp")
+            cg.builder.build_icmp(38 /* IntSGT */, lhs, rhs, "gttmp")
         } else {
-            cg.builder.build_icmp(34 /* IntUGT */, lhs_val, rhs_val, "gttmp")
+            cg.builder.build_icmp(34 /* IntUGT */, lhs, rhs, "gttmp")
         } };
     } else if (op_kind == TokenType::LessEqual) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(5 /* OLE */, lhs_val, rhs_val, "letmp")
+            cg.builder.build_fcmp(5 /* OLE */, lhs, rhs, "letmp")
         } else { if (is_signed) {
-            cg.builder.build_icmp(41 /* IntSLE */, lhs_val, rhs_val, "letmp")
+            cg.builder.build_icmp(41 /* IntSLE */, lhs, rhs, "letmp")
         } else {
-            cg.builder.build_icmp(37 /* IntULE */, lhs_val, rhs_val, "letmp")
+            cg.builder.build_icmp(37 /* IntULE */, lhs, rhs, "letmp")
         } };
     } else if (op_kind == TokenType::GreaterEqual) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(3 /* OGE */, lhs_val, rhs_val, "getmp")
+            cg.builder.build_fcmp(3 /* OGE */, lhs, rhs, "getmp")
         } else { if (is_signed) {
-            cg.builder.build_icmp(39 /* IntSGE */, lhs_val, rhs_val, "getmp")
+            cg.builder.build_icmp(39 /* IntSGE */, lhs, rhs, "getmp")
         } else {
-            cg.builder.build_icmp(35 /* IntUGE */, lhs_val, rhs_val, "getmp")
+            cg.builder.build_icmp(35 /* IntUGE */, lhs, rhs, "getmp")
         } };
 
     // Bitwise
     } else if (op_kind == TokenType::Amp) {
-        *out_value = cg.builder.build_and(lhs_val, rhs_val, "andtmp");
+        *out_value = cg.builder.build_and(lhs, rhs, "andtmp");
     } else if (op_kind == TokenType::Pipe) {
-        *out_value = cg.builder.build_or(lhs_val, rhs_val, "ortmp");
+        *out_value = cg.builder.build_or(lhs, rhs, "ortmp");
     } else if (op_kind == TokenType::Caret) {
-        *out_value = cg.builder.build_xor(lhs_val, rhs_val, "xortmp");
+        *out_value = cg.builder.build_xor(lhs, rhs, "xortmp");
     } else if (op_kind == TokenType::LessLess) {
-        *out_value = cg.builder.build_shl(lhs_val, rhs_val, "shltmp");
+        *out_value = cg.builder.build_shl(lhs, rhs, "shltmp");
     } else if (op_kind == TokenType::GreaterGreater) {
         *out_value = if (is_signed) {
-            cg.builder.build_ashr(lhs_val, rhs_val, "shrtmp")
+            cg.builder.build_ashr(lhs, rhs, "shrtmp")
         } else {
-            cg.builder.build_lshr(lhs_val, rhs_val, "shrtmp")
+            cg.builder.build_lshr(lhs, rhs, "shrtmp")
         };
 
     } else {
@@ -624,4 +703,48 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
 
     *out_value = alloca;
     *out_is_lvalue = true;
+}
+
+
+// ============================================================================
+// String comparison
+// ============================================================================
+
+/// Compare two i8* string values using strcmp.
+/// Returns i1: true if equal (==) or not equal (!=).
+function codegen_string_compare(cg: CodegenContext*, lhs: LValue, rhs: LValue,
+                                 op_kind: TokenType, out_value: LValue*) -> void {
+    // Ensure strcmp is declared: i32 strcmp(i8*, i8*)
+    const intern: InternTable* = cg.get_intern();
+    const strcmp_name: string = "strcmp";
+    const strcmp_sym: SymbolStr = intern.intern(strcmp_name);
+    mut strcmp_fn: LValue = cg.get_function(strcmp_sym);
+    if (!strcmp_fn.is_valid()) {
+        const i8_ptr: LType = LType::pointer_to(LType::i8());
+        const param_buf: void* = malloc(16);
+        const params: void** = param_buf as void**;
+        params[0] = i8_ptr.raw;
+        params[1] = i8_ptr.raw;
+        const strcmp_ty: LType = LType::function_type(LType::i32(), param_buf, 2, false);
+        free(param_buf);
+        strcmp_fn = cg.llvm_module.add_function(strcmp_name, strcmp_ty);
+        cg.register_function(strcmp_sym, strcmp_fn);
+    }
+
+    // Call strcmp(lhs, rhs).
+    const strcmp_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(strcmp_fn.raw) };
+    const arg_buf: void* = malloc(16);
+    const args: void** = arg_buf as void**;
+    args[0] = lhs.raw;
+    args[1] = rhs.raw;
+    const cmp_result: LValue = cg.builder.build_call(strcmp_ty, strcmp_fn, arg_buf, 2, "strcmp");
+    free(arg_buf);
+
+    // strcmp returns 0 when equal.
+    const zero: LValue = LType::const_int(LType::i32(), 0, false);
+    if (op_kind == TokenType::EqualEqual) {
+        *out_value = cg.builder.build_icmp(32 /* IntEQ */, cmp_result, zero, "streq");
+    } else {
+        *out_value = cg.builder.build_icmp(33 /* IntNE */, cmp_result, zero, "strne");
+    }
 }
