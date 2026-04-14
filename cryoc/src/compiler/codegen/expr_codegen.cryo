@@ -365,6 +365,8 @@ function codegen_unary(cg: CodegenContext*, operand: LValue, op_kind: TokenType,
 // ============================================================================
 
 /// Generate IR for a function call.
+/// Coerces integer argument widths to match the callee's LLVM parameter
+/// types (e.g., i8→i32 for memset, i32→i64 for u64 params).
 function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                       args: LValue[], name: string,
                       out_value: LValue*) -> void {
@@ -375,12 +377,46 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
         return;
     }
 
-    // Build raw argument array.
+    // Get expected parameter types for argument coercion.
+    // callee_type is the function type passed to LLVMBuildCall2.
+    // Even though LLVMGetTypeKind may report it as pointer (opaque ptr era),
+    // LLVMCountParamTypes still works on function types.
+    // Also try LLVMCountParams on the callee value as fallback.
+    mut expected_count: u32 = llvm::LLVMCountParamTypes(callee_type.raw);
+    mut param_types_buf: void* = null;
+    if (expected_count > 0 && expected_count <= 64) {
+        param_types_buf = malloc(expected_count as u64 * 8);
+        llvm::LLVMGetParamTypes(callee_type.raw, param_types_buf);
+    }
+
+    // Build argument array, coercing integer widths where needed.
     const buf: void* = malloc(n as u64 * 8);
     const slots: void** = buf as void**;
+    const param_types: void** = param_types_buf as void**;
     for (mut i: u32 = 0; i < n; i++) {
-        slots[i] = args[i].raw;
+        mut arg_val: LValue = args[i];
+        if (arg_val.is_valid() && param_types_buf != null && i < expected_count) {
+            const expected_ty: void* = param_types[i];
+            const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
+            if (expected_ty != null && actual_ty != null && expected_ty != actual_ty) {
+                const ek: i32 = llvm::LLVMGetTypeKind(expected_ty);
+                const ak: i32 = llvm::LLVMGetTypeKind(actual_ty);
+                if (ek == 8 && ak == 8) {
+                    const ew: u32 = llvm::LLVMGetIntTypeWidth(expected_ty);
+                    const aw: u32 = llvm::LLVMGetIntTypeWidth(actual_ty);
+                    const target: LType = LType { raw: expected_ty };
+                    if (aw < ew) {
+                        arg_val = cg.builder.build_zext(arg_val, target, "arg.widen");
+                    } else if (aw > ew) {
+                        arg_val = cg.builder.build_trunc(arg_val, target, "arg.trunc");
+                    }
+                }
+            }
+        }
+        slots[i] = arg_val.raw;
     }
+    if (param_types_buf != null) { free(param_types_buf); }
+
     *out_value = cg.builder.build_call(callee_type, callee, buf, n, name);
     free(buf);
 }

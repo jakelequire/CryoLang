@@ -1093,7 +1093,11 @@ public:
         }
         const ret_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         const void_ty: LType = LType::void_type();
-        const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
+        // Void calls and unresolved return types must use empty name —
+        // LLVM doesn't allow naming void-typed instructions.
+        const is_void: boolean = !ret_ty.is_valid() || ret_ty.raw == void_ty.raw ||
+                                  llvm::LLVMGetTypeKind(ret_ty.raw) == 0;
+        const call_name: string = if (is_void) { "" } else { "calltmp" };
         mut result: LValue = LValue::null();
         codegen_call(this.cg, callee_val, fn_ty, args, call_name, &result);
         this.last_value = result;
@@ -1229,6 +1233,9 @@ public:
         for (mut i: i64 = 0; i < num_arms; i++) {
             arm_bbs = arm_bbs + [LBasicBlock::append(current_fn, format("mexpr.arm%lld", i))];
         }
+        // Default block handles the "no arm matched" case — provides
+        // an undef value to the phi so all predecessors are covered.
+        const default_bb: LBasicBlock = LBasicBlock::append(current_fn, "mexpr.default");
         const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "mexpr.end");
 
         // Comparison chain — same as visit_match_stmt.
@@ -1236,7 +1243,7 @@ public:
             const arm: MatchArmNode* = node.arms[i];
             if (arm == null) { continue; }
 
-            mut next_bb: LBasicBlock = merge_bb;
+            mut next_bb: LBasicBlock = default_bb;
             if (i + 1 < num_arms) {
                 next_bb = LBasicBlock::append(current_fn, format("mexpr.test%lld", i + 1));
             }
@@ -1282,9 +1289,10 @@ public:
         }
 
         // Generate arm bodies and collect values + end blocks for phi.
+        // Allocate num_arms + 1 for the default block entry.
         const result_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
-        mut phi_vals: void* = malloc(num_arms as u64 * 8);
-        mut phi_blks: void* = malloc(num_arms as u64 * 8);
+        mut phi_vals: void* = malloc((num_arms + 1) as u64 * 8);
+        mut phi_blks: void* = malloc((num_arms + 1) as u64 * 8);
         const phi_vals_arr: void** = phi_vals as void**;
         const phi_blks_arr: void** = phi_blks as void**;
         mut phi_count: u32 = 0;
@@ -1305,18 +1313,39 @@ public:
             }
 
             const arm_end: LBasicBlock = this.cg.builder.get_insert_block();
-            if (arm_end.is_valid() && !arm_end.has_terminator()) {
+            const arm_terminated: boolean = arm_end.is_valid() && arm_end.has_terminator();
+            if (!arm_terminated && arm_end.is_valid()) {
                 this.cg.builder.build_br(merge_bb);
             }
 
-            if (arm_val.is_valid()) {
-                phi_vals_arr[phi_count] = arm_val.raw;
+            // Only add to phi for arms that branch to merge (not terminated
+            // by return/break). Every predecessor of merge_bb needs a phi entry.
+            if (!arm_terminated && arm_end.is_valid()) {
+                if (arm_val.is_valid()) {
+                    phi_vals_arr[phi_count] = arm_val.raw;
+                } else if (result_ty.is_valid()) {
+                    // Arm produced no value — use undef as placeholder.
+                    phi_vals_arr[phi_count] = llvm::LLVMGetUndef(result_ty.raw);
+                } else {
+                    continue;
+                }
                 phi_blks_arr[phi_count] = arm_end.raw;
                 phi_count = phi_count + 1;
             }
         }
 
+        // Default block: no arm matched — branch to merge with undef.
+        this.cg.builder.position_at_end(default_bb);
+        this.cg.builder.build_br(merge_bb);
+
         this.cg.builder.position_at_end(merge_bb);
+
+        if (result_ty.is_valid()) {
+            // Add default block as a phi predecessor with undef value.
+            phi_vals_arr[phi_count] = llvm::LLVMGetUndef(result_ty.raw);
+            phi_blks_arr[phi_count] = default_bb.raw;
+            phi_count = phi_count + 1;
+        }
 
         if (phi_count > 0 && result_ty.is_valid()) {
             const phi: LValue = this.cg.builder.build_phi(result_ty, "mexpr.val");
