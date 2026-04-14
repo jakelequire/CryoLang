@@ -882,6 +882,50 @@ public:
             const sym: SymbolStr = intern.intern(combined);
             callee_val = this.cg.get_function(sym);
 
+            // Fallback 1: try the bare member name.  Extern "C" functions
+            // (e.g., llvm::LLVMGetTypeKind) are registered under their
+            // unqualified C name, not the scope-qualified form.
+            if (!callee_val.is_valid()) {
+                callee_val = this.cg.get_function(sr.member_name);
+            }
+
+            // Fallback 2: use node.resolved_type to find the concrete
+            // monomorphized type name.  For generic constructors like
+            // HashMap::new(), the scope "HashMap" is the template name
+            // but the function is registered as "HashMap_K_V::new".
+            if (!callee_val.is_valid()) {
+                mut conc_ref: TypeRef = node.resolved_type;
+                mut conc_t: Type* = this.cg.lookup_type_by_id(conc_ref.id);
+                mut fc: i32 = 0;
+                while (conc_t != null && conc_t.kind == TypeKind::InstantiatedType && fc < 5) {
+                    const ci: InstantiatedType* = conc_t as InstantiatedType*;
+                    if (ci.has_resolved_type()) {
+                        conc_ref = ci.resolved_type;
+                        conc_t = this.cg.lookup_type_by_id(conc_ref.id);
+                    } else { break; }
+                    fc = fc + 1;
+                }
+                if (conc_t != null) {
+                    mut conc_name: string = "";
+                    if (conc_t.kind == TypeKind::Struct) {
+                        const cst: StructType* = conc_t as StructType*;
+                        conc_name = intern.resolve(cst.qualified_name);
+                    } else if (conc_t.kind == TypeKind::Class) {
+                        const cct: ClassType* = conc_t as ClassType*;
+                        conc_name = intern.resolve(cct.qualified_name);
+                    } else if (conc_t.kind == TypeKind::Enum) {
+                        const cet: EnumType* = conc_t as EnumType*;
+                        conc_name = intern.resolve(cet.qualified_name);
+                    }
+                    if (strlen(conc_name) > 0) {
+                        const member_str: string = intern.resolve(sr.member_name);
+                        const conc_combined: string = format("%s::%s", conc_name, member_str);
+                        const conc_sym: SymbolStr = intern.intern(conc_combined);
+                        callee_val = this.cg.get_function(conc_sym);
+                    }
+                }
+            }
+
             // If the function wasn't found, check if this is an enum variant
             // constructor (e.g., Option::Some, Result::Ok).  Enum constructors
             // are not registered as functions — synthesize the value inline.
@@ -984,7 +1028,13 @@ public:
 
             // Use DI type_reverse to get the type's registered name,
             // then look up "QualifiedType::method" in the function map.
-            const type_sym: SymbolStr = di.lookup_type_name(obj_ref);
+            // For ArrayType, use the element-type → Array_<T> mapping
+            // since ArrayType TypeRefs are not canonical.
+            mut type_sym: SymbolStr = di.lookup_type_name(obj_ref);
+            if (!type_sym.is_valid() && t != null && t.kind == TypeKind::Array) {
+                const arr_t: ArrayType* = t as ArrayType*;
+                type_sym = di.lookup_array_type_name(arr_t.element);
+            }
             if (type_sym.is_valid()) {
                 const type_str: string = intern.resolve(type_sym);
                 const combined: string = format("%s::%s", type_str, method_str);
