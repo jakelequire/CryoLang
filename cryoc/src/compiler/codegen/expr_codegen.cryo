@@ -398,18 +398,39 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
         if (arg_val.is_valid() && param_types_buf != null && i < expected_count) {
             const expected_ty: void* = param_types[i];
             const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
-            if (expected_ty != null && actual_ty != null && expected_ty != actual_ty) {
-                const ek: i32 = llvm::LLVMGetTypeKind(expected_ty);
-                const ak: i32 = llvm::LLVMGetTypeKind(actual_ty);
-                if (ek == 8 && ak == 8) {
-                    const ew: u32 = llvm::LLVMGetIntTypeWidth(expected_ty);
-                    const aw: u32 = llvm::LLVMGetIntTypeWidth(actual_ty);
+            // Compare by type kind — void* pointer equality is broken in the
+            // Cryo compiler (always returns true), so we cannot rely on
+            // expected_ty != actual_ty to detect mismatches.
+            const ek: i32 = llvm::LLVMGetTypeKind(expected_ty);
+            const ak: i32 = llvm::LLVMGetTypeKind(actual_ty);
+            if (ek != ak) {
+                if (ek == 12 && ak == 10) {
+                    // Expected ptr (12), actual struct (10): store struct to
+                    // temp alloca and pass its address.  This handles passing
+                    // `this` (struct value) to a function expecting &this (ptr).
+                    const st: LType = LType { raw: actual_ty };
+                    const tmp: LValue = cg.builder.build_alloca(st, "arg.ref");
+                    cg.builder.build_store(arg_val, tmp);
+                    arg_val = tmp;
+                } else if (ek == 12 && ak == 8) {
+                    // Expected ptr (12), actual integer: inttoptr.
                     const target: LType = LType { raw: expected_ty };
-                    if (aw < ew) {
-                        arg_val = cg.builder.build_zext(arg_val, target, "arg.widen");
-                    } else if (aw > ew) {
-                        arg_val = cg.builder.build_trunc(arg_val, target, "arg.trunc");
-                    }
+                    arg_val = LValue { raw: llvm::LLVMBuildIntToPtr(cg.builder.raw, arg_val.raw, expected_ty, "arg.i2p") };
+                } else if (ek == 8 && ak == 12) {
+                    // Expected integer, actual ptr: ptrtoint.
+                    const target: LType = LType { raw: expected_ty };
+                    arg_val = LValue { raw: llvm::LLVMBuildPtrToInt(cg.builder.raw, arg_val.raw, expected_ty, "arg.p2i") };
+                }
+            } else if (ek == 8 && ak == 8) {
+                // Both integers — coerce widths if needed.
+                const ew: u32 = llvm::LLVMGetIntTypeWidth(expected_ty);
+                const aw: u32 = llvm::LLVMGetIntTypeWidth(actual_ty);
+                if (aw < ew) {
+                    const target: LType = LType { raw: expected_ty };
+                    arg_val = cg.builder.build_zext(arg_val, target, "arg.widen");
+                } else if (aw > ew) {
+                    const target: LType = LType { raw: expected_ty };
+                    arg_val = cg.builder.build_trunc(arg_val, target, "arg.trunc");
                 }
             }
         }
