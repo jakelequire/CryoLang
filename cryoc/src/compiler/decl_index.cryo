@@ -82,6 +82,11 @@ type struct DeclarationIndex {
     // Computed once at registration time so codegen never mangles.
     mangled_names:       HashMap<u32, u32>;
 
+    // Array element TypeRef.id → concrete Array_<T> qualified name SymbolStr.id.
+    // Populated by the specialization pass so codegen can resolve T[].method()
+    // to the monomorphized Array_T struct without name reconstruction.
+    array_elem_to_type:  HashMap<u64, u32>;
+
 
     static new() -> DeclarationIndex {
         return DeclarationIndex {
@@ -91,6 +96,7 @@ type struct DeclarationIndex {
             type_map:            HashMap<u32, TypeRef>::new(),
             global_vars:         HashMap<u32, TypeRef>::new(),
             type_reverse:        HashMap<u64, u32>::new(),
+            array_elem_to_type:  HashMap<u64, u32>::new(),
             module_func_keys:    [],
             module_func_modules: [],
             module_type_keys:    [],
@@ -133,6 +139,32 @@ type struct DeclarationIndex {
         this.type_map.insert(qualified_name.id, ty, h);
 
         // Reverse map: TypeRef.id → qualified name
+        const rh: u64 = hash_int(ty.id);
+        this.type_reverse.insert(ty.id, qualified_name.id, rh);
+    }
+
+    /// Register a mapping from an array element TypeRef to the concrete
+    /// Array_<T> struct's qualified name.  Called by the specialization
+    /// pass after monomorphizing Array<T>.
+    register_array_element_type(mut &this, element: TypeRef, array_struct_name: SymbolStr) -> void {
+        const h: u64 = hash_int(element.id);
+        this.array_elem_to_type.insert(element.id, array_struct_name.id, h);
+    }
+
+    /// Look up the concrete Array_<T> struct name for a given element type.
+    lookup_array_type_name(&this, element: TypeRef) -> SymbolStr {
+        const h: u64 = hash_int(element.id);
+        return match (this.array_elem_to_type.get(element.id, h)) {
+            Option::Some(val) => { SymbolStr::from_id(val) }
+            Option::None      => { SymbolStr::empty() }
+        };
+    }
+
+    /// Register a reverse-only mapping (TypeRef → qualified name) without
+    /// touching the forward type_map.  Used to make additional TypeRefs
+    /// (e.g., InstantiatedType, ArrayType) resolvable to an already-
+    /// registered concrete type's qualified name.
+    register_type_reverse_only(mut &this, qualified_name: SymbolStr, ty: TypeRef) -> void {
         const rh: u64 = hash_int(ty.id);
         this.type_reverse.insert(ty.id, qualified_name.id, rh);
     }

@@ -470,6 +470,35 @@ type struct SpecializationPasses {
                 SpecInjector::register(entry.ast_node, entry.specialized_name,
                                        entry.specialized_type, ctx);
             }
+            // Register the InstantiatedType's TypeRef in type_reverse so
+            // that codegen can look up the concrete type's qualified name
+            // directly from the expression's resolved_type (which may be
+            // the InstantiatedType, not the concrete struct).
+            if (entry.instantiated_type.is_valid() && entry.specialized_type.is_valid()) {
+                const conc_qname: SymbolStr = arena.get_qualified_name(entry.specialized_type);
+                if (conc_qname.is_valid()) {
+                    ctx.decl_index.register_type_reverse_only(conc_qname, entry.instantiated_type);
+
+                    // For Array specializations, register a mapping from
+                    // element TypeRef → concrete Array_<T> struct name.
+                    // Sema sets expression types to ArrayType (T[]), not
+                    // InstantiatedType, so codegen needs this to find methods.
+                    const inst_t: Type* = arena.lookup(entry.instantiated_type.id);
+                    if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
+                        const inst: InstantiatedType* = inst_t as InstantiatedType*;
+                        if (inst.type_args.length == 1) {
+                            const base_qn: SymbolStr = arena.get_qualified_name(inst.generic_base);
+                            if (base_qn.is_valid()) {
+                                const base_str: string = ctx.intern_table.resolve(base_qn);
+                                if (strcmp(base_str, "std::collections::array::Array") == 0) {
+                                    ctx.decl_index.register_array_element_type(
+                                        inst.type_args[0], conc_qname);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // Register impl block methods under the SAME qualified name as
             // the type itself (from the arena), not ctx.qualify_symbol_sym
             // which would use the consuming module's namespace.
