@@ -208,8 +208,15 @@ function declare_impl_block(cg: CodegenContext*, node: ImplBlockNode*) -> void {
 
     // Qualify the target type — node.target_type may be bare ("CompileMode")
     // but the DI and type system use qualified names.
+    // If specialization already set a fully-qualified arena name (contains
+    // "::"), don't re-qualify — it would double-prefix and produce a key
+    // that callers can't find.
     const ctx_ptr: CompilationContext* = cg.ctx;
-    const qualified_target: SymbolStr = ctx_ptr.qualify_symbol_sym(node.target_type);
+    const target_str: string = ctx_ptr.intern_table.resolve(node.target_type);
+    mut qualified_target: SymbolStr = node.target_type;
+    if (strstr(target_str, "::") == null) {
+        qualified_target = ctx_ptr.qualify_symbol_sym(node.target_type);
+    }
 
     for (mut i: i64 = 0; i < node.methods.length; i++) {
         declare_method(cg, node.methods[i], qualified_target);
@@ -224,10 +231,28 @@ function declare_struct_methods(cg: CodegenContext*, node: StructDeclNode*) -> v
     if (node.methods.length == 0) {
         return;
     }
-    // Qualify the struct name — node.name is the bare AST name.
-    // Break cg.ctx chain into local to avoid C++ compiler double-deref bug.
+    // Use the arena's canonical qualified name for the struct type.
+    // For specialized structs (e.g., Array_Token), the arena name is
+    // the correct DI key (e.g., std::collections::array::Array_Token).
+    // qualify_symbol_sym would produce the consuming module's namespace
+    // prefix, which doesn't match the DI registration.
     const ctx_ptr: CompilationContext* = cg.ctx;
-    const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+    const di: DeclarationIndex* = ctx_ptr.decl_index;
+    mut qualified: SymbolStr = SymbolStr::empty();
+    // Try both local-qualified and bare name in the DI, then get the
+    // arena's canonical qualified name from the TypeRef.
+    const local_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+    mut di_ref: TypeRef = di.lookup_type(local_sym);
+    if (!di_ref.is_valid()) {
+        di_ref = di.lookup_type(node.name);
+    }
+    if (di_ref.is_valid()) {
+        const arena: TypeArena* = cg.get_arena();
+        qualified = arena.get_qualified_name(di_ref);
+    }
+    if (!qualified.is_valid()) {
+        qualified = local_sym;
+    }
     for (mut i: i64 = 0; i < node.methods.length; i++) {
         declare_method(cg, node.methods[i], qualified);
     }

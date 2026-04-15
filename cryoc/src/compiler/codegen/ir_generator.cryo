@@ -132,7 +132,25 @@ public:
                     const sname: string = this.cg.resolve(struct_node.name);
                     printf("[IRGen]   [%lld] struct methods: %s (%lld methods)\n",
                            i, sname, struct_node.methods.length); fflush(null);
-                    this.current_impl_target = this.cg.qualify(struct_node.name);
+                    // Use the arena's canonical qualified name for specialized
+                    // structs so method keys match the DI registration.
+                    const s_di: DeclarationIndex* = this.cg.get_decl_index();
+                    const s_local: SymbolStr = this.cg.qualify(struct_node.name);
+                    mut s_ref: TypeRef = s_di.lookup_type(s_local);
+                    if (!s_ref.is_valid()) {
+                        s_ref = s_di.lookup_type(struct_node.name);
+                    }
+                    if (s_ref.is_valid()) {
+                        const s_arena: TypeArena* = this.cg.get_arena();
+                        const s_qname: SymbolStr = s_arena.get_qualified_name(s_ref);
+                        if (s_qname.is_valid()) {
+                            this.current_impl_target = s_qname;
+                        } else {
+                            this.current_impl_target = s_local;
+                        }
+                    } else {
+                        this.current_impl_target = s_local;
+                    }
                     for (mut j: i64 = 0; j < struct_node.methods.length; j++) {
                         this.generate_method_body(struct_node.methods[j]);
                     }
@@ -199,7 +217,15 @@ public:
             return;
         }
 
-        this.current_impl_target = this.cg.qualify(node.target_type);
+        // If specialization already set a fully-qualified arena name
+        // (contains "::"), use it directly — re-qualifying would
+        // double-prefix and mismatch the DI registration key.
+        const impl_target_str: string = this.cg.resolve(node.target_type);
+        if (strstr(impl_target_str, "::") != null) {
+            this.current_impl_target = node.target_type;
+        } else {
+            this.current_impl_target = this.cg.qualify(node.target_type);
+        }
 
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const m: MethodNode* = node.methods[i];
