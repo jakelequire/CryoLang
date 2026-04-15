@@ -204,6 +204,49 @@ type struct Monomorphizer {
             }
         }
 
+        // Second pass: discover Array<T> for standalone T[] usages.
+        // The nested discovery above only catches arrays that appear as
+        // fields of other monomorphized types.  Standalone T[] (in function
+        // params, locals) creates ArrayType without InstantiatedType.
+        // Scan the arena once for dynamic ArrayTypes with concrete elements
+        // and enqueue any missing Array<T> instantiations.
+        const array_sym: SymbolStr = this.intern_table.intern("std::collections::array::Array");
+        const array_entry: TemplateEntry* = this.generic_registry.get_template(array_sym);
+        if (array_entry != null) {
+            const array_base: TypeRef = array_entry.base_type;
+            const type_count: i64 = this.arena.type_count();
+            for (mut tid: u64 = 1; tid <= type_count as u64; tid++) {
+                const at: Type* = this.arena.lookup(tid);
+                if (at == null || at.kind != TypeKind::Array) { continue; }
+                const arr: ArrayType* = at as ArrayType*;
+                if (!arr.is_dynamic() || !arr.element.is_valid()) { continue; }
+                const elem_t: Type* = this.arena.lookup(arr.element.id);
+                if (elem_t == null) { continue; }
+                if (elem_t.kind == TypeKind::GenericParam ||
+                    elem_t.kind == TypeKind::BoundedParam) { continue; }
+                mut arr_args: TypeRef[] = [];
+                arr_args.push(arr.element);
+                const inst_ref: TypeRef = this.generic_registry.instantiate(array_base, arr_args);
+                this.enqueue_from_type_ref(inst_ref);
+            }
+            // Process any newly enqueued Array<T> instantiations.
+            while (this.pending_cursor < this.pending.length) {
+                const req: MonomorphRequest = this.pending[this.pending_cursor];
+                this.pending_cursor = this.pending_cursor + 1;
+                const rkey: string = this.make_key(req);
+                if (this.is_cached(rkey)) {
+                    this.generic_registry.mark_monomorphized(req.base_type, req.type_args);
+                    continue;
+                }
+                if (this.is_in_progress(rkey)) { continue; }
+                const rip_h: u64 = hash_str(rkey);
+                this.in_progress.insert(rkey, true, rip_h);
+                const rsuccess: boolean = this.specialize_request(req, rkey);
+                this.remove_in_progress(rkey);
+                if (!rsuccess) { this.error_count = this.error_count + 1; }
+            }
+        }
+
         // Mark ALL collected items as monomorphized — including those that
         // enqueue_from_type_ref() filtered out (template-internal references
         // whose args contain GenericParam, non-template base types, etc.).
@@ -844,6 +887,26 @@ type struct Monomorphizer {
             TypeKind::Array => {
                 const arr: ArrayType* = t as ArrayType*;
                 this.request_nested_instantiations(arr.element);
+                // For dynamic arrays with concrete element types, ensure
+                // Array<elem> is monomorphized.  T[] creates ArrayType but
+                // not InstantiatedType(Array,[T]), so the worklist misses it.
+                if (arr.is_dynamic() && arr.element.is_valid()) {
+                    const elem_t: Type* = this.arena.lookup(arr.element.id);
+                    if (elem_t != null && elem_t.kind != TypeKind::GenericParam
+                                       && elem_t.kind != TypeKind::BoundedParam) {
+                        const array_sym: SymbolStr = this.intern_table.intern(
+                            "std::collections::array::Array");
+                        const array_entry: TemplateEntry* =
+                            this.generic_registry.get_template(array_sym);
+                        if (array_entry != null) {
+                            mut args: TypeRef[] = [];
+                            args.push(arr.element);
+                            const inst_ref: TypeRef =
+                                this.generic_registry.instantiate(array_entry.base_type, args);
+                            this.enqueue_from_type_ref(inst_ref);
+                        }
+                    }
+                }
             }
             TypeKind::Optional => {
                 const opt: OptionalType* = t as OptionalType*;
