@@ -35,6 +35,19 @@ import Compiler::Resolver::InternTable;
 
 
 // ============================================================================
+// MatchSubjectInfo — precomputed state for match/if-let pattern codegen.
+// ============================================================================
+
+type struct MatchSubjectInfo {
+    enum_type:   EnumType*;
+    enum_ref:    TypeRef;
+    enum_llvm:   LType;
+    subject_ptr: LValue;    // ptr to the enum (alloca'd if subject was a value)
+    tag_val:     LValue;    // i32 discriminant extracted from subject
+}
+
+
+// ============================================================================
 // IRGeneratorVisitor
 // ============================================================================
 
@@ -433,6 +446,11 @@ public:
         const subject: LValue = this.codegen_rvalue(node.subject);
         if (!subject.is_valid()) { return; }
 
+        // Resolve the enum type (if subject is an enum), normalize to ptr, and
+        // pre-extract the tag value for pattern comparison.
+        const minfo: MatchSubjectInfo = this.prepare_match_subject(
+            subject, node.subject.resolved_type, current_fn);
+
         const num_arms: i64 = node.arms.length;
 
         // Create basic blocks: one per arm + merge.
@@ -488,6 +506,21 @@ public:
                         matched = true;
                         break;
                     }
+                } else if (pat.pattern_kind == PatternKind::Enum) {
+                    // Enum pattern: compare subject's tag to the variant's tag.
+                    if (minfo.enum_type != null && minfo.tag_val.is_valid()) {
+                        const epat: EnumPatternNode* = pat as EnumPatternNode*;
+                        const variant: EnumVariantInfo* = minfo.enum_type.get_variant(epat.variant_name);
+                        if (variant != null) {
+                            const pat_val: LValue = LType::const_int(
+                                LType::i32(), variant.tag_value, false);
+                            const cmp: LValue = this.cg.builder.build_icmp(
+                                32, minfo.tag_val, pat_val, "match.cmp");
+                            this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
+                            matched = true;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -511,13 +544,194 @@ public:
             if (arm == null) { continue; }
 
             this.cg.builder.position_at_end(arm_bbs[i]);
+
+            // Bind enum pattern payloads (scoped to arm body).
+            this.cg.push_scope();
+            this.bind_arm_enum_payloads(arm, minfo);
+
             if (arm.body != null) {
                 this.generate_statement(arm.body);
             }
             branch_if_not_terminated(this.cg, merge_bb);
+            this.cg.pop_scope();
         }
 
         this.cg.builder.position_at_end(merge_bb);
+    }
+
+    /// Prepare a match subject: resolve its enum type (if any), normalize to
+    /// a ptr (for payload extraction), and pre-extract the i32 tag value.
+    prepare_match_subject(mut &this, subject: LValue, subj_ref: TypeRef,
+                          current_fn: LValue) -> MatchSubjectInfo {
+        mut info: MatchSubjectInfo = MatchSubjectInfo {
+            enum_type:   null,
+            enum_ref:    subj_ref,
+            enum_llvm:   LType::null(),
+            subject_ptr: subject,
+            tag_val:     LValue::null(),
+        };
+
+        // Unwrap Reference/Pointer/InstantiatedType to find the enum type.
+        mut unwrap_ref: TypeRef = subj_ref;
+        mut t: Type* = this.cg.lookup_type_by_id(unwrap_ref.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 8) {
+            if (t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = t as PointerType*;
+                unwrap_ref = pt.pointee;
+                t = this.cg.lookup_type_by_id(unwrap_ref.id);
+            } else if (t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = t as ReferenceType*;
+                unwrap_ref = rt.referent;
+                t = this.cg.lookup_type_by_id(unwrap_ref.id);
+            } else if (t.kind == TypeKind::InstantiatedType) {
+                const it: InstantiatedType* = t as InstantiatedType*;
+                if (it.has_resolved_type()) {
+                    unwrap_ref = it.resolved_type;
+                    t = this.cg.lookup_type_by_id(unwrap_ref.id);
+                } else { break; }
+            } else {
+                break;
+            }
+            depth = depth + 1;
+        }
+
+        if (t == null || t.kind != TypeKind::Enum) {
+            return info;
+        }
+
+        info.enum_type = t as EnumType*;
+        info.enum_ref  = unwrap_ref;
+        info.enum_llvm = this.cg.type_mapper.map_type(unwrap_ref);
+        if (!info.enum_llvm.is_valid()) {
+            return info;
+        }
+
+        // LLVMPointerTypeKind = 12.
+        mut is_ptr: boolean = false;
+        const subj_llvm_ty: void* = llvm::LLVMTypeOf(subject.raw);
+        if (subj_llvm_ty != null && llvm::LLVMGetTypeKind(subj_llvm_ty) == 12) {
+            is_ptr = true;
+        }
+
+        if (info.enum_type.is_simple_enum()) {
+            // Simple enum: the value IS the i32 tag.  No alloca needed; we
+            // either use the subject directly or load one i32 through the ptr.
+            if (is_ptr) {
+                info.tag_val = this.cg.builder.build_load(
+                    LType::i32(), subject, "enum.tag");
+            } else {
+                info.tag_val = subject;
+            }
+            info.subject_ptr = subject;
+            return info;
+        }
+
+        // ADT enum — we need a ptr to do struct GEP for tag and payload.
+        // Only alloca when the subject is a raw struct value.  Alloca goes in
+        // the current block (not the entry block) so it stays before the
+        // match's own control flow — `create_entry_alloca` can't be used here
+        // because if visit_match_stmt runs mid-function the entry block already
+        // has a terminator.
+        if (is_ptr) {
+            info.subject_ptr = subject;
+        } else {
+            info.subject_ptr = this.cg.builder.build_alloca(info.enum_llvm, "match.subj");
+            if (info.subject_ptr.is_valid()) {
+                this.cg.builder.build_store(subject, info.subject_ptr);
+            }
+        }
+
+        if (info.subject_ptr.is_valid()) {
+            const tag_ptr: LValue = this.cg.builder.build_struct_gep(
+                info.enum_llvm, info.subject_ptr, 0, "enum.tag.ptr");
+            if (tag_ptr.is_valid()) {
+                info.tag_val = this.cg.builder.build_load(
+                    LType::i32(), tag_ptr, "enum.tag");
+            }
+        }
+
+        return info;
+    }
+
+    /// Extract enum variant payload bindings into named values in the current scope.
+    /// No-op unless the arm's pattern is an enum pattern with bindings.
+    ///
+    /// Registers each binding as a pointer to its payload slot.  `codegen_identifier`
+    /// treats named values as lvalues, so `codegen_rvalue` loads through the ptr.
+    /// This avoids creating entry-block allocas after the entry block has been
+    /// terminated (cryoc's `create_entry_alloca` uses position_at_end and would
+    /// emit allocas after the terminator).
+    bind_arm_enum_payloads(mut &this, arm: MatchArmNode*, minfo: MatchSubjectInfo) -> void {
+        if (minfo.enum_type == null || !minfo.subject_ptr.is_valid()) { return; }
+        if (!minfo.enum_llvm.is_valid()) { return; }
+
+        for (mut p: i64 = 0; p < arm.patterns.length; p++) {
+            const pat: PatternNode* = arm.patterns[p];
+            if (pat == null || pat.pattern_kind != PatternKind::Enum) { continue; }
+
+            const epat: EnumPatternNode* = pat as EnumPatternNode*;
+            if (epat.binding_names.length == 0) { continue; }
+
+            const variant: EnumVariantInfo* = minfo.enum_type.get_variant(epat.variant_name);
+            if (variant == null || !variant.has_payload()) { continue; }
+
+            // Simple enum (no payload on any variant) → nothing to bind.
+            if (minfo.enum_type.is_simple_enum()) { continue; }
+
+            // GEP to payload field (field 1 of { i32 tag, [N x i8] payload }).
+            const payload_ptr: LValue = this.cg.builder.build_struct_gep(
+                minfo.enum_llvm, minfo.subject_ptr, 1, "enum.payload.ptr");
+            if (!payload_ptr.is_valid()) { continue; }
+
+            // Precompute payload field offsets (sum of earlier field sizes).
+            const num_payload: i64 = variant.payload_types.length;
+            mut offsets: u64[] = [];
+            mut running: u64 = 0;
+            for (mut pi: i64 = 0; pi < num_payload; pi++) {
+                offsets.push(running);
+                const ft: Type* = this.cg.lookup_type_by_id(variant.payload_types[pi].id);
+                if (ft != null) {
+                    running = running + ft.size_bytes();
+                }
+            }
+
+            for (mut bi: i64 = 0; bi < epat.binding_names.length; bi++) {
+                const pos: i64 = epat.binding_positions[bi];
+                if (pos < 0 || pos >= num_payload) { continue; }
+
+                const field_ref: TypeRef = variant.payload_types[pos];
+                const field_llvm: LType = this.cg.type_mapper.map_type(field_ref);
+                if (!field_llvm.is_valid()) { continue; }
+                if (llvm::LLVMGetTypeKind(field_llvm.raw) == 0) { continue; }
+
+                // field_ptr = payload_ptr + offsets[pos] (byte offset via i8 GEP).
+                mut field_ptr_raw: LValue = payload_ptr;
+                if (offsets[pos] != 0) {
+                    const byte_off: LValue = LType::const_int(
+                        LType::i64(), offsets[pos], false);
+                    const obuf: void* = malloc(8);
+                    const obuf_arr: void** = obuf as void**;
+                    obuf_arr[0] = byte_off.raw;
+                    field_ptr_raw = this.cg.builder.build_gep(
+                        LType::i8(), payload_ptr, obuf, 1, "enum.field.ptr");
+                    free(obuf);
+                }
+                const field_ptr: LValue = this.cg.builder.build_bitcast(
+                    field_ptr_raw, LType::pointer_to(field_llvm), "enum.field.cast");
+
+                // Register the ptr-to-payload as a named lvalue.  Reads through
+                // the binding will load via `codegen_rvalue` using the
+                // identifier's resolved_type.
+                if (field_ptr.is_valid()) {
+                    this.cg.set_named_value(epat.binding_names[bi], field_ptr);
+                }
+            }
+
+            // Only bind for the first enum pattern in this arm (multi-pattern
+            // arms with different variants can't share bindings anyway).
+            return;
+        }
     }
 
     /// Evaluate a pattern to an LLVM value for comparison.
@@ -1302,6 +1516,9 @@ public:
             return;
         }
 
+        const minfo: MatchSubjectInfo = this.prepare_match_subject(
+            subject, node.subject.resolved_type, current_fn);
+
         const num_arms: i64 = node.arms.length;
 
         // Create basic blocks: one per arm + merge.
@@ -1349,6 +1566,20 @@ public:
                         matched = true;
                         break;
                     }
+                } else if (pat.pattern_kind == PatternKind::Enum) {
+                    if (minfo.enum_type != null && minfo.tag_val.is_valid()) {
+                        const epat: EnumPatternNode* = pat as EnumPatternNode*;
+                        const variant: EnumVariantInfo* = minfo.enum_type.get_variant(epat.variant_name);
+                        if (variant != null) {
+                            const pat_val: LValue = LType::const_int(
+                                LType::i32(), variant.tag_value, false);
+                            const cmp: LValue = this.cg.builder.build_icmp(
+                                32, minfo.tag_val, pat_val, "mexpr.cmp");
+                            this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
+                            matched = true;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -1379,6 +1610,9 @@ public:
 
             this.cg.builder.position_at_end(arm_bbs[i]);
 
+            this.cg.push_scope();
+            this.bind_arm_enum_payloads(arm, minfo);
+
             // Match expression arms produce values.
             // The arm body is a statement — for expression arms, it's typically
             // a block with a trailing expression or a single expression statement.
@@ -1403,11 +1637,13 @@ public:
                     // Arm produced no value — use undef as placeholder.
                     phi_vals_arr[phi_count] = llvm::LLVMGetUndef(result_ty.raw);
                 } else {
+                    this.cg.pop_scope();
                     continue;
                 }
                 phi_blks_arr[phi_count] = arm_end.raw;
                 phi_count = phi_count + 1;
             }
+            this.cg.pop_scope();
         }
 
         // Default block: no arm matched — branch to merge with undef.
@@ -1475,10 +1711,28 @@ public:
 
     /// New expression (heap allocation) — direct dispatch.
     visit_new_expr(mut &this, node: NewExprNode*) -> void {
-        const type_ref: TypeRef = this.lookup_type(node.type_name);
+        // Resolve the type name: try current module's qualified form first,
+        // then fall back to the DI's bare→qualified mapping, then the raw
+        // name (for already-qualified cases and cross-module aliases).
+        const ctx_ptr: CompilationContext* = this.cg.ctx;
+        const intern: InternTable* = this.cg.get_intern();
+        const di: DeclarationIndex* = this.cg.get_decl_index();
+
+        mut qualified_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.type_name);
+        mut type_ref: TypeRef = di.lookup_type(qualified_sym);
+        if (type_ref.is_invalid()) {
+            qualified_sym = di.resolve_qualified(node.type_name);
+            type_ref = di.lookup_type(qualified_sym);
+        }
+        if (type_ref.is_invalid()) {
+            qualified_sym = node.type_name;
+            type_ref = di.lookup_type(qualified_sym);
+        }
+
         const t: Type* = this.cg.lookup_type_by_id(type_ref.id);
         if (t == null) {
-            printf("[IRGen] WARNING: new — type not found\n"); fflush(null);
+            printf("[IRGen] WARNING: new — type '%s' not found\n",
+                intern.resolve(node.type_name)); fflush(null);
             this.cg.ctx.emit_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
                 "codegen: new expression — target type not found");
             this.last_value = LValue::null();
@@ -1486,36 +1740,92 @@ public:
             return;
         }
 
-        const size: u64 = t.size_bytes();
         const malloc_fn: LValue = this.cg.llvm_module.get_named_function("malloc");
-        if (malloc_fn.is_valid()) {
-            const size_val: LValue = LType::const_int(LType::i64(), size, false);
-            mut args: LValue[] = [size_val];
-            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-            if (!malloc_ty.is_valid()) {
-                printf("[IRGen] WARNING: new — malloc function type is null\n"); fflush(null);
-                this.cg.ctx.emit_error(ErrorCode::E0602_INVALID_LLVM_TYPE,
-                    "codegen: new expression — failed to retrieve malloc function type");
-                this.last_value = LValue::null();
-                this.last_is_lvalue = false;
-                return;
-            }
-            mut result: LValue = LValue::null();
-            codegen_call(this.cg, malloc_fn, malloc_ty, args, "newtmp", &result);
-            // Bitcast to the target pointer type.
-            const mapped: LType = this.cg.type_mapper.map_type(type_ref);
-            if (mapped.is_valid()) {
-                const ptr_ty: LType = LType::pointer_to(mapped);
-                this.last_value = this.cg.builder.build_pointer_cast(result, ptr_ty, "newcast");
-            } else {
-                this.last_value = result;
-            }
-        } else {
+        if (!malloc_fn.is_valid()) {
             printf("[IRGen] WARNING: new — malloc not declared\n"); fflush(null);
             this.cg.ctx.emit_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
                 "codegen: new expression — 'malloc' not declared");
             this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
         }
+        const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+        if (!malloc_ty.is_valid()) {
+            printf("[IRGen] WARNING: new — malloc function type is null\n"); fflush(null);
+            this.cg.ctx.emit_error(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                "codegen: new expression — failed to retrieve malloc function type");
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const mapped: LType = this.cg.type_mapper.map_type(type_ref);
+        mut size: u64 = t.size_bytes();
+        if (size == 0) { size = 1; }  // safe fallback — malloc(0) is UB on some platforms
+
+        const size_val: LValue = LType::const_int(LType::i64(), size, false);
+        // Avoid the single-element array literal form (`[size_val]`) — the C++
+        // Cryo compiler miscompiles it: emits `alloca [1 x T]` but then loads
+        // as `Array<T>` (3-field struct), reading 16 bytes of stack garbage
+        // into the length/capacity fields.  Downstream code that reads
+        // `args.length` (e.g., `codegen_call`) then feeds the garbage into
+        // `LLVMBuildCall2` as NumArgs → `bad_alloc`.  `push` on an empty
+        // array initializes the struct correctly.
+        mut malloc_args: LValue[] = [];
+        malloc_args.push(size_val);
+        mut raw_ptr: LValue = LValue::null();
+        codegen_call(this.cg, malloc_fn, malloc_ty, malloc_args, "newtmp", &raw_ptr);
+
+        // Bitcast to the target struct pointer type.
+        mut obj_ptr: LValue = raw_ptr;
+        if (mapped.is_valid()) {
+            obj_ptr = this.cg.builder.build_pointer_cast(
+                raw_ptr, LType::pointer_to(mapped), "newcast");
+        }
+
+        // Store the vtable pointer at slot 0 for classes with virtual methods.
+        // The vtable global is emitted by codegen_vtable_from_ast during the
+        // declare_class_methods phase.
+        if (t.kind == TypeKind::Class) {
+            const cls: ClassType* = t as ClassType*;
+            if (cls.has_virtual_methods && mapped.is_valid() && obj_ptr.is_valid()) {
+                const qname: QualifiedName = QualifiedName::from_symbol(qualified_sym);
+                const vtbl_name: string = MangledName::for_vtable(intern, qname).resolve(intern);
+                const vtbl_global: LValue = this.cg.llvm_module.get_named_global(vtbl_name);
+                if (vtbl_global.is_valid()) {
+                    const vptr_slot: LValue = this.cg.builder.build_struct_gep(
+                        mapped, obj_ptr, 0, "vptr.slot");
+                    if (vptr_slot.is_valid()) {
+                        this.cg.builder.build_store(vtbl_global, vptr_slot);
+                    }
+                }
+            }
+        }
+
+        // Call the constructor.  Cryo constructors are named like the class
+        // itself (e.g. `VoidType(id: u64)` on `class VoidType`).  The DI
+        // registered the method under `QualifiedClass::BareClassName`.
+        const type_str: string = intern.resolve(qualified_sym);
+        const bare_str: string = intern.resolve(node.type_name);
+        const ctor_combined: string = format("%s::%s", type_str, bare_str);
+        const ctor_sym: SymbolStr = intern.intern(ctor_combined);
+        const ctor_fn: LValue = this.cg.get_function(ctor_sym);
+        if (ctor_fn.is_valid() && obj_ptr.is_valid()) {
+            const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
+            if (ctor_ty.is_valid() && llvm::LLVMGetTypeKind(ctor_ty.raw) == 9) {
+                // Same single-element-literal bug applies here — use push.
+                mut ctor_args: LValue[] = [];
+                ctor_args.push(obj_ptr);
+                for (mut i: i64 = 0; i < node.arguments.length; i++) {
+                    const arg_val: LValue = this.codegen_rvalue(node.arguments[i]);
+                    ctor_args.push(arg_val);
+                }
+                mut ctor_result: LValue = LValue::null();
+                codegen_call(this.cg, ctor_fn, ctor_ty, ctor_args, "", &ctor_result);
+            }
+        }
+
+        this.last_value = obj_ptr;
         this.last_is_lvalue = false;
     }
 

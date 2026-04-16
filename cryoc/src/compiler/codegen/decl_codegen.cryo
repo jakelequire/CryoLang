@@ -273,6 +273,59 @@ function declare_class_methods(cg: CodegenContext*, node: ClassDeclNode*) -> voi
     for (mut i: i64 = 0; i < node.methods.length; i++) {
         declare_method(cg, node.methods[i], qualified);
     }
+
+    // Emit the vtable for classes with virtual methods.  Drive this from the
+    // AST's method list rather than ClassType.methods — `add_method` is never
+    // called on ClassType in cryoc, so `has_virtual_methods` is always false
+    // and `cls_ty.methods` is empty.  The AST MethodNode carries is_virtual /
+    // is_override flags set by the parser.
+    codegen_vtable_from_ast(cg, node, qualified);
+}
+
+/// Emit the vtable global for a class declared in the AST.  Iterates the AST
+/// methods (since ClassType.methods isn't populated in cryoc) and collects
+/// the LLVM function values for any `virtual` or `override` methods.
+function codegen_vtable_from_ast(cg: CodegenContext*, node: ClassDeclNode*,
+                                  qualified: SymbolStr) -> void {
+    const intern: InternTable* = cg.get_intern();
+    const type_str: string = intern.resolve(qualified);
+
+    mut virtual_methods: LValue[] = [];
+    for (mut i: i64 = 0; i < node.methods.length; i++) {
+        const m: MethodNode* = node.methods[i];
+        if (m == null) { continue; }
+        if (!m.is_virtual && !m.is_override) { continue; }
+        if (m.func == null) { continue; }
+
+        const method_str: string = intern.resolve(m.func.name);
+        const combined: string = format("%s::%s", type_str, method_str);
+        const combined_sym: SymbolStr = intern.intern(combined);
+        const fn_val: LValue = cg.get_function(combined_sym);
+        if (fn_val.is_valid()) {
+            virtual_methods.push(fn_val);
+        }
+    }
+
+    if (virtual_methods.length == 0) { return; }
+
+    const n: u32 = virtual_methods.length as u32;
+    const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
+    const vtable_ty: LType = LType::array_of(fn_ptr_ty, n);
+
+    const buf: void* = malloc(n as u64 * 8);
+    const slots: void** = buf as void**;
+    for (mut i: u32 = 0; i < n; i++) {
+        slots[i] = llvm::LLVMConstBitCast(virtual_methods[i].raw, fn_ptr_ty.raw);
+    }
+    const init: LValue = LType::const_array(fn_ptr_ty, buf, n);
+    free(buf);
+
+    const qname: QualifiedName = QualifiedName::from_symbol(qualified);
+    const mangled: string = MangledName::for_vtable(intern, qname).resolve(intern);
+    const global: LValue = cg.llvm_module.add_global(vtable_ty, mangled);
+    global.set_initializer(init);
+    global.set_global_constant(true);
+    global.set_linkage(8);  // LLVMInternalLinkage
 }
 
 /// Declare a method.  Methods get a `this` pointer as the first parameter.

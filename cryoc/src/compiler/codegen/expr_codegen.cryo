@@ -85,6 +85,26 @@ function codegen_literal(cg: CodegenContext*, node: LiteralNode*,
 /// Look up a named value (local, parameter, or global).
 function codegen_identifier(cg: CodegenContext*, node: IdentifierNode*,
                             out_value: LValue*, out_is_lvalue: boolean*) -> void {
+    // Built-in pseudo-macros: FILE and LINE expand to the source location of
+    // the identifier reference.  These match the C++ reference compiler's
+    // behavior (ExpressionCodegen.cpp handles `FILE` / `LINE` specially).
+    const name_str: string = cg.resolve(node.name);
+    if (strcmp(name_str, "FILE") == 0) {
+        mut filename: string = node.span.file;
+        if (filename == null || strlen(filename) == 0) {
+            filename = "<unknown>";
+        }
+        *out_value = cg.builder.build_global_string_ptr(filename, "FILE.str");
+        *out_is_lvalue = false;
+        return;
+    }
+    if (strcmp(name_str, "LINE") == 0) {
+        const line: u64 = node.span.start_line as u64;
+        *out_value = LType::const_int(LType::i32(), line, false);
+        *out_is_lvalue = false;
+        return;
+    }
+
     // Try local/parameter first.
     const local: LValue = cg.get_named_value(node.name);
     if (local.is_valid()) {
@@ -572,7 +592,39 @@ function codegen_cast(cg: CodegenContext*, val: LValue,
 function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
                                object_type: TypeRef, member: SymbolStr,
                                out_value: LValue*, out_is_lvalue: boolean*) -> void {
-    const t: Type* = cg.lookup_type_by_id(object_type.id);
+    // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmtNode*`
+    // stored in an alloca), load the pointer value so we can GEP into the struct.
+    // This matches C/Rust behavior where `node.field` on a pointer is an implicit
+    // deref.  Applied once per call — GEP'd field pointers stay as struct pointers.
+    mut obj_ptr: LValue = object_ptr;
+    mut obj_type: TypeRef = object_type;
+    mut t: Type* = cg.lookup_type_by_id(obj_type.id);
+
+    if (t != null && (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference)) {
+        if (t.kind == TypeKind::Pointer) {
+            const pt: PointerType* = t as PointerType*;
+            obj_type = pt.pointee;
+        } else {
+            const rt: ReferenceType* = t as ReferenceType*;
+            obj_type = rt.referent;
+        }
+        t = cg.lookup_type_by_id(obj_type.id);
+
+        // Load the pointer value through the alloca (if object_ptr is an lvalue
+        // pointing to a ptr slot).  Skip when object_ptr is already the ptr
+        // value — e.g., `&this` parameters are stored raw in named_values.
+        if (obj_ptr.is_valid()) {
+            const obj_llvm_ty: void* = llvm::LLVMTypeOf(obj_ptr.raw);
+            if (obj_llvm_ty != null && llvm::LLVMGetTypeKind(obj_llvm_ty) == 12) {
+                // LLVMPointerTypeKind = 12.  In practice all named_values are
+                // stored as pointer-typed LLVM values, so this always holds;
+                // the load is correct either way (load ptr from ptr-to-ptr).
+                obj_ptr = cg.builder.build_load(LType::pointer_to(LType::i8()),
+                                                obj_ptr, "autoderef");
+            }
+        }
+    }
+
     if (t == null) {
         *out_value = LValue::null();
         *out_is_lvalue = false;
@@ -613,7 +665,7 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
         return;
     }
 
-    const struct_ty: LType = cg.type_mapper.map_type(object_type);
+    const struct_ty: LType = cg.type_mapper.map_type(obj_type);
     if (!struct_ty.is_valid()) {
         printf("[IRGen] WARNING: member access — failed to map object type\n"); fflush(null);
         cg.ctx.emit_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
@@ -622,7 +674,7 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
         *out_is_lvalue = false;
         return;
     }
-    if (!object_ptr.is_valid()) {
+    if (!obj_ptr.is_valid()) {
         printf("[IRGen] WARNING: member access — object pointer is null\n"); fflush(null);
         cg.ctx.emit_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
             "codegen: member access — object pointer is null");
@@ -630,7 +682,7 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
         *out_is_lvalue = false;
         return;
     }
-    const gep: LValue = cg.builder.build_struct_gep(struct_ty, object_ptr,
+    const gep: LValue = cg.builder.build_struct_gep(struct_ty, obj_ptr,
                                                       field_idx as u32, "fieldptr");
     *out_value = gep;
     *out_is_lvalue = true;
@@ -646,7 +698,35 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
                               array_type: TypeRef, index_val: LValue,
                               out_value: LValue*, out_is_lvalue: boolean*) -> void {
     const t: Type* = cg.lookup_type_by_id(array_type.id);
-    if (t == null || t.kind != TypeKind::Array) {
+    if (t == null) {
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+
+    // Pointer indexing (C-style `ptr[i]` ≡ `*(ptr + i)`).  `array_val` is an
+    // lvalue holding the ptr — load it, then GEP element_ty to the ith slot.
+    if (t.kind == TypeKind::Pointer) {
+        const pt: PointerType* = t as PointerType*;
+        const elem_ty: LType = cg.type_mapper.map_type(pt.pointee);
+        if (!elem_ty.is_valid() || !array_val.is_valid() || !index_val.is_valid()) {
+            *out_value = LValue::null();
+            *out_is_lvalue = false;
+            return;
+        }
+        const ptr_ty: LType = LType::pointer_to(elem_ty);
+        const data_ptr: LValue = cg.builder.build_load(ptr_ty, array_val, "ptrload");
+        const buf: void* = malloc(8);
+        const slots: void** = buf as void**;
+        slots[0] = index_val.raw;
+        const gep: LValue = cg.builder.build_gep(elem_ty, data_ptr, buf, 1, "elemptr");
+        free(buf);
+        *out_value = gep;
+        *out_is_lvalue = true;
+        return;
+    }
+
+    if (t.kind != TypeKind::Array) {
         *out_value = LValue::null();
         *out_is_lvalue = false;
         return;
