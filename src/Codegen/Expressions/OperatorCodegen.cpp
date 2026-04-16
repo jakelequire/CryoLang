@@ -2337,16 +2337,34 @@ namespace Cryo::Codegen
         // types like LLVMTypeRef, LLVMValueRef, etc.
         bool is_known_non_string = false;
 
-        // Check Cryo type info if available
+        // Check Cryo type info if available.
+        // Only mark as non-string if we can DEFINITIVELY prove it's a
+        // non-string pointer type.  Generic/unresolved types (GenericParam,
+        // InstantiatedType, etc.) might resolve to String after monomorphization,
+        // so we must NOT assume they're non-string.
         if (node && node->left() && node->left()->has_resolved_type())
         {
             auto left_type = node->left()->get_resolved_type();
             if (left_type.is_valid())
             {
                 auto *cryo_type = left_type.get();
-                if (cryo_type && cryo_type->kind() != TypeKind::String)
+                if (cryo_type)
                 {
-                    is_known_non_string = true;
+                    auto k = cryo_type->kind();
+                    // Only concrete non-string types are known non-string.
+                    // Generic params, instantiated types, and other unresolved
+                    // types might be String after substitution.
+                    bool is_concrete_non_string =
+                        k != TypeKind::String &&
+                        k != TypeKind::GenericParam &&
+                        k != TypeKind::BoundedParam &&
+                        k != TypeKind::InstantiatedType &&
+                        k != TypeKind::TypeAlias &&
+                        k != TypeKind::Error;
+                    if (is_concrete_non_string)
+                    {
+                        is_known_non_string = true;
+                    }
                 }
             }
         }

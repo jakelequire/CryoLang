@@ -404,9 +404,9 @@ type struct Monomorphizer {
         }
 
         // Re-resolve type annotations on the specialized AST.
-        this.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry);
+        this.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry, &subst);
         for (mut ri: i64 = 0; ri < result.impl_asts.length; ri++) {
-            this.resolve_specialized_ast(result.impl_asts[ri], NodeKind::ImplementationBlock, entry);
+            this.resolve_specialized_ast(result.impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst);
         }
 
         // Populate the concrete type and set resolved_type on the InstantiatedType.
@@ -569,7 +569,7 @@ type struct Monomorphizer {
     /// context so that cross-module and user-defined types resolve correctly
     /// through the Resolver's scope chain.
     resolve_specialized_ast(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
-                            entry: TemplateEntry*) -> void {
+                            entry: TemplateEntry*, subst: TypeSubstitution*) -> void {
         if (ast_node == null || this.type_resolver == null) { return; }
 
         mut module_name: string = "";
@@ -583,13 +583,13 @@ type struct Monomorphizer {
                 const decl: StructDeclNode* = ast_node as StructDeclNode*;
                 if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
-                this.resolve_methods(decl.methods, &res_ctx);
+                this.resolve_methods(decl.methods, &res_ctx, subst);
             }
             NodeKind::ClassDeclaration => {
                 const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
                 if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
-                this.resolve_methods(decl.methods, &res_ctx);
+                this.resolve_methods(decl.methods, &res_ctx, subst);
             }
             NodeKind::EnumDeclaration => {
                 // Enum variants use SymbolStr names, not type annotations.
@@ -598,12 +598,12 @@ type struct Monomorphizer {
             NodeKind::FunctionDeclaration => {
                 const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
                 if (decl == null) { return; }
-                this.resolve_func_and_body(decl, &res_ctx);
+                this.resolve_func_and_body(decl, &res_ctx, subst);
             }
             NodeKind::ImplementationBlock => {
                 const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
                 if (decl == null) { return; }
-                this.resolve_methods(decl.methods, &res_ctx);
+                this.resolve_methods(decl.methods, &res_ctx, subst);
             }
             _ => {}
         }
@@ -611,19 +611,43 @@ type struct Monomorphizer {
 
     /// Resolve signatures on an array of methods — delegates core signature
     /// resolution to TypeResolver, then resolves body locals.
-    resolve_methods(mut &this, methods: MethodNode*[], res_ctx: ResolutionContext*) -> void {
+    resolve_methods(mut &this, methods: MethodNode*[], res_ctx: ResolutionContext*,
+                    subst: TypeSubstitution*) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
-            this.resolve_func_and_body(method.func, res_ctx);
+            this.resolve_func_and_body(method.func, res_ctx, subst);
         }
     }
 
     /// Resolve a function's signature (via TypeResolver) and then resolve
     /// local variable types in its body (monomorphizer-specific concern,
     /// since cloned AST bodies have cleared resolved_type fields).
-    resolve_func_and_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*) -> void {
+    resolve_func_and_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*,
+                          subst: TypeSubstitution*) -> void {
         this.type_resolver.resolve_func_signature(func, res_ctx);
+        // If resolved_return_type is still invalid, the substituter may not
+        // have rewritten the return_type_annotation (C++ compiler virtual
+        // dispatch limitation).  Build a resolution context with generic
+        // param bindings, then apply the substitution to the result.
+        if (!func.has_resolved_return_type() && subst != null && func.return_type_annotation != null) {
+            // Bind generic params directly to their concrete replacements
+            // (not to GenericParam TypeRefs).  This way resolve() produces
+            // concrete types directly — e.g., Named("T") → u64 TypeRef.
+            mut gen_ctx: ResolutionContext = *res_ctx;
+            for (mut si: i64 = 0; si < subst.param_ids.length; si++) {
+                const param_t: Type* = this.arena.lookup(subst.param_ids[si]);
+                if (param_t != null && param_t.kind == TypeKind::GenericParam) {
+                    const gp: GenericParamType* = param_t as GenericParamType*;
+                    gen_ctx.add_binding(gp.param_name, subst.replacements[si]);
+                }
+            }
+            const resolved: TypeRef = this.type_resolver.resolve(
+                func.return_type_annotation, &gen_ctx);
+            if (resolved.is_valid()) {
+                func.resolved_return_type = resolved;
+            }
+        }
         if (func.body != null) {
             this.resolve_body_locals(func.body, res_ctx);
         }
