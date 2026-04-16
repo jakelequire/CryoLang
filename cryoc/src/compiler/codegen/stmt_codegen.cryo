@@ -61,13 +61,63 @@ function codegen_block(cg: CodegenContext*, node: BlockStmtNode*,
 
 function codegen_return(cg: CodegenContext*, val: LValue, has_value: boolean) -> void {
     if (has_value && val.is_valid()) {
-        cg.builder.build_ret(val);
+        // Coerce the return value to the function's declared return type.
+        // Handles common implicit conversions like u64↔ptr (stdlib uses this
+        // in `align_up`/`align_down`) and narrower integer returns.
+        const coerced: LValue = coerce_return_value(cg, val);
+        cg.builder.build_ret(coerced);
     } else if (!has_value) {
         cg.builder.build_ret_void();
     }
     // If has_value but val is null, expression codegen failed.
     // Don't emit anything — the caller will detect the incomplete
     // function and strip it back to a declare.
+}
+
+/// Coerce a return-statement value to match the declared return type.
+/// Emits inttoptr/ptrtoint/trunc/zext when the straight ret would fail LLVM
+/// verification.  Returns the original value if no coercion is needed.
+///
+/// Comparisons use LLVMGetTypeKind codes (integers) rather than void*
+/// equality — the C++ Cryo compiler lowers `==` on void* to strcmp, so we
+/// never pull the raw types into a `==` expression.
+function coerce_return_value(cg: CodegenContext*, val: LValue) -> LValue {
+    const cur_bb: LBasicBlock = cg.builder.get_insert_block();
+    if (!cur_bb.is_valid()) { return val; }
+    const fn: LValue = cur_bb.get_parent();
+    if (!fn.is_valid()) { return val; }
+
+    const fn_ty_raw: void* = llvm::LLVMGlobalGetValueType(fn.raw);
+    if (llvm::LLVMGetTypeKind(fn_ty_raw) != 9) {
+        // Not a function type — can't determine return type.  Kind 9 = Function.
+        return val;
+    }
+    const want_ty_raw: void* = llvm::LLVMGetReturnType(fn_ty_raw);
+    const got_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
+
+    // LLVM kind codes: 0=void, 8=integer, 12=pointer.
+    const want_kind: i32 = llvm::LLVMGetTypeKind(want_ty_raw);
+    const got_kind:  i32 = llvm::LLVMGetTypeKind(got_ty_raw);
+    const want_lty: LType = LType { raw: want_ty_raw };
+
+    if (want_kind == 12 && got_kind == 8) {
+        return cg.builder.build_int_to_ptr(val, want_lty, "ret.inttoptr");
+    }
+    if (want_kind == 8 && got_kind == 12) {
+        return cg.builder.build_ptr_to_int(val, want_lty, "ret.ptrtoint");
+    }
+    if (want_kind == 8 && got_kind == 8) {
+        const want_bits: u32 = llvm::LLVMGetIntTypeWidth(want_ty_raw);
+        const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(got_ty_raw);
+        if (want_bits > got_bits) {
+            return cg.builder.build_zext(val, want_lty, "ret.zext");
+        }
+        if (want_bits < got_bits) {
+            return cg.builder.build_trunc(val, want_lty, "ret.trunc");
+        }
+    }
+
+    return val;
 }
 
 
