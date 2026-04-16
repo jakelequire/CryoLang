@@ -44,6 +44,13 @@ type struct CodegenContext {
     func_keys:   u32[];
     func_values: void*[];
 
+    // -- Overload-aware function map: (SymbolStr.id, arity) -> LLVMValueRef.
+    //    Parallel arrays so callers can disambiguate `Array::new()` from
+    //    `Array::new(u64)` without collapsing to a single last-wins entry.
+    func_overload_keys:    u32[];
+    func_overload_arities: u32[];
+    func_overload_values:  void*[];
+
     // -- Global map: SymbolStr.id -> LLVMValueRef --
     global_keys:   u32[];
     global_values: void*[];
@@ -79,6 +86,10 @@ type struct CodegenContext {
 
             func_keys:   [],
             func_values: [],
+
+            func_overload_keys:    [],
+            func_overload_arities: [],
+            func_overload_values:  [],
 
             global_keys:   [],
             global_values: [],
@@ -259,12 +270,42 @@ type struct CodegenContext {
         this.func_values.push(val.raw);
     }
 
+    /// Register a function against a (name, user-arg-count) composite key so
+    /// overloaded methods (e.g., `Array::new()` vs `Array::new(u64)`) stay
+    /// distinct.  The regular `register_function` still records the last-
+    /// seen overload for callers that don't disambiguate by arity.
+    register_function_with_arity(mut &this, name: SymbolStr, arity: u32, val: LValue) -> void {
+        const key: u32 = name.id;
+        for (mut i: i64 = 0; i < this.func_overload_keys.length; i++) {
+            if (this.func_overload_keys[i] == key && this.func_overload_arities[i] == arity) {
+                this.func_overload_values[i] = val.raw;
+                return;
+            }
+        }
+        this.func_overload_keys.push(key);
+        this.func_overload_arities.push(arity);
+        this.func_overload_values.push(val.raw);
+    }
+
     /// Look up a function by name.
     get_function(&this, name: SymbolStr) -> LValue {
         const key: u32 = name.id;
         for (mut i: i64 = 0; i < this.func_keys.length; i++) {
             if (this.func_keys[i] == key) {
                 return LValue { raw: this.func_values[i] };
+            }
+        }
+        return LValue::null();
+    }
+
+    /// Look up an overloaded function by (name, user-arg-count).  Returns
+    /// null if no matching overload is registered; callers should fall back
+    /// to `get_function` for code paths that weren't arity-annotated.
+    get_function_with_arity(&this, name: SymbolStr, arity: u32) -> LValue {
+        const key: u32 = name.id;
+        for (mut i: i64 = 0; i < this.func_overload_keys.length; i++) {
+            if (this.func_overload_keys[i] == key && this.func_overload_arities[i] == arity) {
+                return LValue { raw: this.func_overload_values[i] };
             }
         }
         return LValue::null();
