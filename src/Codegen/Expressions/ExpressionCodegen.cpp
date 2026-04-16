@@ -1216,8 +1216,43 @@ namespace Cryo::Codegen
         }
         else if (auto *array_access = dynamic_cast<Cryo::ArrayAccessNode *>(node->object()))
         {
-            // For array element member access (e.g., entries[i].state), get the address of the element
+            // For array element member access (e.g., entries[i].state), get the
+            // address of the element.  When the element type is itself a
+            // pointer (e.g., `chain: ClassType*[]`), `chain[i]` yields a
+            // pointer-to-pointer; we must load it to obtain the actual
+            // struct pointer before doing member GEP.  Without this load the
+            // subsequent GEP uses `&chain.data[i]` as the struct base, which
+            // reads memory from neighboring array elements.
             object = generate_index_address(array_access);
+            if (object)
+            {
+                bool elem_is_pointer = false;
+                if (auto *arr_ident = dynamic_cast<Cryo::IdentifierNode *>(array_access->array()))
+                {
+                    TypeRef arr_type = arr_ident->get_resolved_type();
+                    if (!arr_type)
+                    {
+                        auto &var_types = ctx().variable_types_map();
+                        auto it = var_types.find(arr_ident->name());
+                        if (it != var_types.end()) arr_type = it->second;
+                    }
+                    if (arr_type && arr_type->kind() == TypeKind::Array)
+                    {
+                        auto *at = static_cast<const Cryo::ArrayType *>(arr_type.get());
+                        TypeRef elem = at->element();
+                        if (elem && elem->kind() == TypeKind::Pointer)
+                            elem_is_pointer = true;
+                    }
+                }
+                if (elem_is_pointer)
+                {
+                    object = create_load(object,
+                                         llvm::PointerType::get(llvm_ctx(), 0),
+                                         "arr.elem.deref");
+                    LOG_DEBUG(Cryo::LogComponent::CODEGEN,
+                              "generate_member_address: Dereferenced array element for pointer-typed array");
+                }
+            }
         }
         else
         {

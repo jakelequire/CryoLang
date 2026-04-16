@@ -638,11 +638,36 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
         const st: StructType* = t as StructType*;
         field_idx = st.field_index(member);
     } else if (tk == TypeKind::Class) {
+        // Classes are flattened at struct-layout time (see `map_class`):
+        //   [ vtable ptr, if any ancestor has virtual methods ]
+        //   [ root class's fields, then each derived class's fields in order ]
+        //   [ this class's own fields ]
+        // Walk the base chain root-first and sum field counts to get the
+        // absolute slot index.
         const cls: ClassType* = t as ClassType*;
-        field_idx = cls.field_index(member);
-        // Offset by 1 if class has vtable pointer.
-        if (cls.has_virtual_methods && field_idx >= 0) {
-            field_idx = field_idx + 1;
+        mut chain: ClassType*[] = [];
+        mut any_virtual: boolean = false;
+        mut walk: ClassType* = cls;
+        mut depth: i32 = 0;
+        while (walk != null && depth < 16) {
+            chain.push(walk);
+            if (walk.has_virtual_methods) { any_virtual = true; }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const base_t: Type* = cg.lookup_type_by_id(walk.base_class.id);
+            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+            walk = base_t as ClassType*;
+            depth = depth + 1;
+        }
+
+        mut cumulative: i64 = if (any_virtual) { 1 } else { 0 };
+        for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+            const link: ClassType* = chain[ci];
+            const local_idx: i64 = link.field_index(member);
+            if (local_idx >= 0) {
+                field_idx = cumulative + local_idx;
+                break;
+            }
+            cumulative = cumulative + link.fields.length;
         }
     } else if (tk == TypeKind::Array) {
         const arr_t: ArrayType* = t as ArrayType*;

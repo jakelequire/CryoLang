@@ -325,7 +325,13 @@ type struct TypeMapper {
         return llvm_ty;
     }
 
-    /// ClassType → struct with optional vtable pointer at index 0.
+    /// ClassType → struct with inheritance flattened (Itanium-ABI style).
+    /// Layout matches the C++ Cryo compiler's emission:
+    ///   [ vtable ptr, if any ancestor has virtual methods ]
+    ///   [ root class's fields, then each derived class's fields in order ]
+    ///   [ this class's own fields ]
+    /// A subclass pointer is valid as a base pointer because their struct
+    /// layouts share a prefix — no bitcast needed for upcasts.
     map_class(mut &this, t: ClassType*) -> LType {
         const mangled: string = MangledName::for_struct(this.intern, QualifiedName::from_symbol(t.qualified_name)).resolve(this.intern);
 
@@ -338,40 +344,67 @@ type struct TypeMapper {
         mut llvm_ty: LType = LType::named_struct(ctx, mangled);
         this.store_cache(t.id, llvm_ty);
 
-        // Count fields: vtable pointer (if virtual) + actual fields.
-        const has_vtable: boolean = t.has_virtual_methods;
-        const field_count: u32 = t.fields.length as u32;
-        const total: u32 = field_count + (if (has_vtable) { 1 } else { 0 } as u32);
+        // Walk the base chain: chain[0] is this class; chain[N-1] is the root.
+        // Any ancestor with virtual methods means this subclass also carries
+        // a vtable pointer at slot 0.
+        mut chain: ClassType*[] = [];
+        mut any_virtual: boolean = false;
+        mut walk: ClassType* = t;
+        mut depth: i32 = 0;
+        while (walk != null && depth < 16) {
+            chain.push(walk);
+            if (walk.has_virtual_methods) { any_virtual = true; }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const base_t: Type* = this.arena.lookup(walk.base_class.id);
+            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+            walk = base_t as ClassType*;
+            depth = depth + 1;
+        }
 
-        if (total > 0) {
-            const buf: void* = malloc(total as u64 * 8);
-            const slots: void** = buf as void**;
+        // Total slot count = vtable (if any) + sum of each class's own fields.
+        mut total: u32 = if (any_virtual) { 1 } else { 0 } as u32;
+        for (mut ci: i64 = 0; ci < chain.length; ci++) {
+            total = total + chain[ci].fields.length as u32;
+        }
 
-            mut idx: u32 = 0;
-            if (has_vtable) {
-                const i8_ty: LType = LType::i8();
-                const vptr_inner: LType = LType::pointer_to(i8_ty);
-                const vptr_ty: LType = LType::pointer_to(vptr_inner);
-                slots[0] = vptr_ty.raw;
-                idx = 1;
-            }
+        if (total == 0) {
+            llvm_ty.set_struct_body(null, 0, false);
+            return llvm_ty;
+        }
 
-            for (mut i: u32 = 0; i < field_count; i++) {
-                const ft: LType = this.map_type(t.fields[i].field_type);
+        const buf: void* = malloc(total as u64 * 8);
+        const slots: void** = buf as void**;
+
+        // Pre-fill with i8 so no slot is ever null — LLVM's checkBody segfaults
+        // on null body entries.
+        const i8_init: LType = LType::i8();
+        for (mut pi: u32 = 0; pi < total; pi++) {
+            slots[pi] = i8_init.raw;
+        }
+
+        mut idx: u32 = 0;
+        if (any_virtual) {
+            const vptr_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
+            slots[0] = vptr_ty.raw;
+            idx = 1;
+        }
+
+        // Emit fields in root → derived order so a Derived* shares a prefix
+        // with Base* at the LLVM-struct level.
+        for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+            const link: ClassType* = chain[ci];
+            for (mut i: u32 = 0; i < link.fields.length as u32; i++) {
+                if (idx >= total) { break; }
+                const ft: LType = this.map_type(link.fields[i].field_type);
                 if (ft.is_valid()) {
                     slots[idx] = ft.raw;
-                } else {
-                    const i8_fb2: LType = LType::i8();
-                    slots[idx] = i8_fb2.raw;
                 }
                 idx = idx + 1;
             }
-
-            llvm_ty.set_struct_body(buf, total, false);
-            free(buf);
-        } else {
-            llvm_ty.set_struct_body(null, 0, false);
         }
+
+        llvm_ty.set_struct_body(buf, total, false);
+        free(buf);
 
         return llvm_ty;
     }
