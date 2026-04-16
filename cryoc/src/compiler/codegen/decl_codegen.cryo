@@ -375,14 +375,40 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
 
     const is_instance: boolean = !node.is_static;
 
-    // Look up the target type for the `this` pointer.
+    // Detect whether the method already declares an explicit self parameter.
+    // Cryo allows three forms: `&this` / `mut &this` (reference, default),
+    // and `this` (by-value).  `&this` is stored in `parameters` with the
+    // literal name "&this"; `this` by-value is stored with the literal name
+    // "this".  In EITHER case we must NOT prepend an extra implicit `this`
+    // slot — the explicit param already accounts for the self argument.
+    // Only when the method has no self-param at all (e.g., some elaborated
+    // methods) should we synthesize the `&this` pointer prefix.
+    mut explicit_self_name: string = "";  // "", "&this", or "this"
+    for (mut pc0: u32 = 0; pc0 < func.parameters.length as u32; pc0++) {
+        const pp0: VarDeclNode* = func.parameters[pc0];
+        if (pp0 == null) { continue; }
+        const pn: string = intern.resolve(pp0.name);
+        if (strcmp(pn, "&this") == 0) {
+            explicit_self_name = "&this";
+            break;
+        }
+        if (strcmp(pn, "this") == 0) {
+            explicit_self_name = "this";
+            break;
+        }
+    }
+
+    // Look up the target type.  `&this` forms want `T*`; by-value `this`
+    // wants the struct `T` directly.  If there's no explicit self we'll
+    // synthesize `T*` as the implicit prefix.
+    mut target_mapped: LType = LType::null();
     mut this_ty: LType = LType::null();
     if (is_instance) {
         mut target_ref: TypeRef = di.lookup_type(target_type);
         if (target_ref.is_valid()) {
-            const mapped: LType = cg.type_mapper.map_type(target_ref);
-            if (mapped.is_valid()) {
-                this_ty = LType::pointer_to(mapped);
+            target_mapped = cg.type_mapper.map_type(target_ref);
+            if (target_mapped.is_valid()) {
+                this_ty = LType::pointer_to(target_mapped);
             }
         }
         if (!this_ty.is_valid()) {
@@ -390,25 +416,23 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
         }
     }
 
-    // Count user parameters, skipping &this (it's the implicit this pointer
-    // which is already prepended above — don't double-count).
+    const prepend_implicit_this: boolean = is_instance && strlen(explicit_self_name) == 0;
+
+    // Count user parameters.  `&this` contributes a ptr slot via the
+    // existing param; by-value `this` contributes a struct slot via the
+    // existing param; implicit missing self is handled by prepend_implicit_this.
     mut user_param_count: u32 = 0;
     for (mut pc: u32 = 0; pc < func.parameters.length as u32; pc++) {
         const pp: VarDeclNode* = func.parameters[pc];
-        if (pp != null) {
-            const pname: string = intern.resolve(pp.name);
-            if (strcmp(pname, "&this") != 0) {
-                user_param_count = user_param_count + 1;
-            }
-        }
+        if (pp != null) { user_param_count = user_param_count + 1; }
     }
-    const total_params: u32 = user_param_count + (if (is_instance) { 1 } else { 0 } as u32);
+    const total_params: u32 = user_param_count + (if (prepend_implicit_this) { 1 } else { 0 } as u32);
 
     const buf: void* = malloc(total_params as u64 * 8);
     const slots: void** = buf as void**;
 
     mut idx: u32 = 0;
-    if (is_instance) {
+    if (prepend_implicit_this) {
         slots[0] = this_ty.raw;
         idx = 1;
     }
@@ -417,10 +441,20 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     for (mut i: u32 = 0; i < func.parameters.length as u32; i++) {
         const param: VarDeclNode* = func.parameters[i];
         if (param == null) { continue; }
-        // Skip &this — already handled as the implicit this pointer.
         const param_name: string = intern.resolve(param.name);
-        if (strcmp(param_name, "&this") == 0) { continue; }
-        const mapped_param: LType = cg.type_mapper.map_type(param.resolved_type);
+
+        // For `&this` and `mut &this`, force the LLVM type to `T*` —
+        // parser-synthesized reference annotations may not round-trip
+        // through the arena correctly for every method.
+        // For by-value `this`, use the struct type directly.
+        mut mapped_param: LType = LType::null();
+        if (strcmp(param_name, "&this") == 0 && this_ty.is_valid()) {
+            mapped_param = this_ty;
+        } else if (strcmp(param_name, "this") == 0 && target_mapped.is_valid()) {
+            mapped_param = target_mapped;
+        } else {
+            mapped_param = cg.type_mapper.map_type(param.resolved_type);
+        }
         if (!mapped_param.is_valid()) {
             params_valid = false;
             break;
@@ -439,8 +473,14 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
 
     const fn_val: LValue = cg.llvm_module.add_function(fn_name, fn_type);
 
-    // Register under the combined key built above.
+    // Register under the combined key built above.  Also register against the
+    // (name, total-LLVM-arity) composite so that callers can pick the correct
+    // overload at call sites (e.g., `Array::new()` vs `Array::new(u64)`).
+    // `total_params` matches the arity cross-module externs register with
+    // (the FunctionType's param count), keeping the two registration paths
+    // interoperable.
     cg.register_function(combined_sym, fn_val);
+    cg.register_function_with_arity(combined_sym, total_params, fn_val);
 }
 
 /// Declare an intrinsic function (e.g., malloc, printf, strlen).
@@ -675,12 +715,74 @@ function declare_cross_module_externs(cg: CodegenContext*) -> void {
 
             const fn_val: LValue = cg.llvm_module.add_function(ir_name, fn_type);
             cg.register_function(fn_name, fn_val);
+            cg.register_function_with_arity(fn_name, param_count, fn_val);
             declared = declared + 1;
         }
     }
 
     if (ctx_ptr.debug_mode) {
         printf("[Codegen] Cross-module externs: %d declared, %d skipped\n", declared, skipped);
+    }
+}
+
+/// Declare cross-module global variable externs.  Mirrors
+/// `declare_cross_module_externs` for functions: walks every module in the
+/// module graph, finds globals defined elsewhere, and emits
+/// `@name = external global T` stubs in the current LLVM module so that
+/// `get_global` lookups resolve to a valid LValue at call sites that
+/// reference `g_stderr`, `g_logger`, etc.
+function declare_cross_module_global_externs(cg: CodegenContext*) -> void {
+    const ctx_ptr: CompilationContext* = cg.ctx;
+    const intern: InternTable* = ctx_ptr.intern_table;
+    const mg: ModuleGraph* = ctx_ptr.module_graph;
+    const di: DeclarationIndex* = ctx_ptr.decl_index;
+    mut declared: i32 = 0;
+    mut skipped: i32 = 0;
+
+    const modules: ModuleInfo[] = mg.modules;
+    const current_file: string = ctx_ptr.source_file;
+    for (mut mi: i64 = 0; mi < modules.length; mi++) {
+        const mod_info: ModuleInfo = modules[mi];
+        if (strcmp(mod_info.file_path, current_file) == 0) {
+            continue;
+        }
+        const mod_sym: SymbolStr = intern.intern(mod_info.file_path);
+
+        const globals: SymbolStr[] = di.get_globals_in_module(mod_sym);
+        for (mut gi: i64 = 0; gi < globals.length; gi++) {
+            const g_name: SymbolStr = globals[gi];
+
+            // Skip if already declared/registered in the current LLVM module.
+            const existing: LValue = cg.get_global(g_name);
+            if (existing.is_valid()) {
+                continue;
+            }
+
+            const g_type_ref: TypeRef = di.lookup_global(g_name);
+            if (g_type_ref.is_invalid()) {
+                skipped = skipped + 1;
+                continue;
+            }
+            const g_llvm_ty: LType = cg.type_mapper.map_type(g_type_ref);
+            if (!g_llvm_ty.is_valid()) {
+                skipped = skipped + 1;
+                continue;
+            }
+
+            // Use the same global-mangling scheme as local definitions so
+            // the extern references match the defining module's symbol.
+            const g_name_str: string = intern.resolve(g_name);
+            const g_qname: QualifiedName = QualifiedName::single(intern, g_name_str);
+            const mangled: string = MangledName::for_global(intern, g_qname).resolve(intern);
+
+            const g_val: LValue = cg.llvm_module.add_global(g_llvm_ty, mangled);
+            cg.register_global(g_name, g_val);
+            declared = declared + 1;
+        }
+    }
+
+    if (ctx_ptr.debug_mode) {
+        printf("[Codegen] Cross-module global externs: %d declared, %d skipped\n", declared, skipped);
     }
 }
 
@@ -835,11 +937,29 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
 
     cg.push_scope();
 
+    // Detect which of the three self forms (if any) this method uses.
+    //   `&this` / `mut &this` — param named "&this", semantically a T*
+    //   `this`                — param named "this", semantically a by-value T
+    //   (none)                — implicit `&this`; `declare_method` synthesized
+    //                           a leading T* in the LLVM function signature
+    // The LLVM parameter layout depends on which case we're in — matches the
+    // logic in declare_method so named_values and LLVM params line up.
+    mut explicit_ref_idx: i64 = -1;   // parameters[i] is "&this"
+    mut explicit_val_idx: i64 = -1;   // parameters[i] is "this"
+    for (mut pc: i64 = 0; pc < func.parameters.length; pc++) {
+        const pp: VarDeclNode* = func.parameters[pc];
+        if (pp == null) { continue; }
+        const pn: string = cg.resolve(pp.name);
+        if (strcmp(pn, "&this") == 0) { explicit_ref_idx = pc; break; }
+        if (strcmp(pn, "this") == 0)  { explicit_val_idx = pc; break; }
+    }
+
     mut param_idx: u32 = 0;
 
-    // Bind `this` pointer for instance methods.
+    // Bind `this` for instance methods.  All three forms produce a `this`
+    // named-value that's a pointer to the struct — for by-value `this` we
+    // alloca+store the struct so member-access GEPs work the same way.
     if (!node.is_static) {
-        // Try qualified name first, then bare (matches declare_method lookup).
         const qualified_target: SymbolStr = cg.ctx.qualify_symbol_sym(target_type);
         mut target_ref: TypeRef = cg.ctx.decl_index.lookup_type(qualified_target);
         if (target_ref.is_invalid()) {
@@ -853,23 +973,41 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
             cg.pop_scope();
             return LValue::null();
         }
-        // Store the raw `this` pointer directly in named_values (no alloca).
-        // The ptr IS the address of the struct — codegen_lvalue returns it
-        // for GEP field access, and codegen_rvalue loads the struct through it.
-        const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
+
         const this_sym: SymbolStr = cg.intern_str("this");
-        cg.set_named_value(this_sym, arg);
+        const arg0: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
+
+        if (explicit_val_idx >= 0) {
+            // By-value `this`: LLVM param 0 is a struct value.  Alloca it so
+            // downstream code (member access, method calls) can treat `this`
+            // as a pointer uniformly.
+            const target_mapped: LType = cg.type_mapper.map_type(target_ref);
+            if (!target_mapped.is_valid()) {
+                cg.pop_scope();
+                return LValue::null();
+            }
+            const slot: LValue = cg.create_entry_alloca(fn_val, "this", target_mapped);
+            cg.builder.build_store(arg0, slot);
+            cg.set_named_value(this_sym, slot);
+        } else {
+            // `&this` (explicit or implicit): LLVM param 0 is already a ptr.
+            // Store the raw pointer directly in named_values (no alloca).
+            cg.set_named_value(this_sym, arg0);
+        }
+
         param_idx = 1;
     }
 
-    // Bind remaining parameters (skip &this — already bound above).
+    // Bind the remaining user parameters.  Skip whichever self form this
+    // method uses (we already handled it above).
     for (mut i: u32 = 0; i < func.parameters.length as u32; i++) {
         const param: VarDeclNode* = func.parameters[i];
         if (param == null) { continue; }
-        const param_name: string = cg.resolve(param.name);
-        if (strcmp(param_name, "&this") == 0) { continue; }
-        const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
+        if (i as i64 == explicit_ref_idx) { continue; }
+        if (i as i64 == explicit_val_idx) { continue; }
 
+        const param_name: string = cg.resolve(param.name);
+        const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
         if (!param_ty.is_valid()) {
             cg.pop_scope();
             return LValue::null();

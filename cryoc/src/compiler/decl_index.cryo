@@ -71,6 +71,8 @@ type struct DeclarationIndex {
     module_func_modules: u32[];       // SymbolStr.id of defining module
     module_type_keys:    u32[];       // SymbolStr.id of type
     module_type_modules: u32[];       // SymbolStr.id of defining module
+    module_global_keys:    u32[];     // SymbolStr.id of global variable
+    module_global_modules: u32[];     // SymbolStr.id of defining module
 
     // Bare name → qualified name mapping.
     // When a function is registered under both "printf" and
@@ -101,6 +103,8 @@ type struct DeclarationIndex {
             module_func_modules: [],
             module_type_keys:    [],
             module_type_modules: [],
+            module_global_keys:    [],
+            module_global_modules: [],
             bare_to_qualified:   HashMap<u32, u32>::new(),
             mangled_names:       HashMap<u32, u32>::new(),
         };
@@ -184,6 +188,23 @@ type struct DeclarationIndex {
         this.global_vars.insert(name.id, ty, h);
     }
 
+    /// Register a global with its defining module so codegen can walk the
+    /// per-module list to emit cross-module externs.  Callers already set
+    /// the shared type map via register_global; this method is additive.
+    register_global_with_module(mut &this, name: SymbolStr, ty: TypeRef,
+                                 module: SymbolStr) -> void {
+        this.register_global(name, ty);
+        // Dedup so re-processing doesn't grow the list unboundedly.
+        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
+            if (this.module_global_keys[i] == name.id &&
+                this.module_global_modules[i] == module.id) {
+                return;
+            }
+        }
+        this.module_global_keys.push(name.id);
+        this.module_global_modules.push(module.id);
+    }
+
     /// Convenience: register all methods from a MethodNode*[] array on a type.
     register_methods(mut &this, type_sym: SymbolStr, methods: MethodNode*[]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
@@ -215,23 +236,40 @@ type struct DeclarationIndex {
             const combined: string = format("%s::%s", type_str, method_str);
             const combined_sym: SymbolStr = intern.intern(combined);
 
-            // Build full FunctionType from resolved parameter types.
-            // Instance methods prepend a `this` pointer (ptr to target type)
-            // so the FunctionType matches the in-module declaration.
+            // Build full FunctionType.  Cryo allows three self forms on
+            // non-static methods:
+            //   `&this` / `mut &this`  — stored as a param named "&this",
+            //                             semantically a `T*`
+            //   `this`                 — stored as a param named "this",
+            //                             semantically a by-value `T`
+            //   (none)                 — implicit `&this`; synthesize `T*`
+            // Only synthesize the prefix when the parameter list contains
+            // NEITHER of the explicit forms, otherwise we'd double-count.
+            const this_name: SymbolStr = intern.intern("&this");
+            const this_val_name: SymbolStr = intern.intern("this");
+            mut has_explicit_self: boolean = false;
+            for (mut ps: i64 = 0; ps < func.parameters.length; ps++) {
+                const pps: VarDeclNode* = func.parameters[ps];
+                if (pps == null) { continue; }
+                if (pps.name.equals(this_name) || pps.name.equals(this_val_name)) {
+                    has_explicit_self = true;
+                    break;
+                }
+            }
+
             mut param_types: TypeRef[] = [];
-            if (!method.is_static) {
+            if (!method.is_static && !has_explicit_self) {
                 const target_ref: TypeRef = this.lookup_type(type_sym);
                 if (target_ref.is_valid()) {
                     const this_ptr_ref: TypeRef = arena.get_pointer_to(target_ref);
                     param_types.push(this_ptr_ref);
                 }
             }
-            // Collect user parameter types, skipping &this (the implicit
-            // this pointer is prepended separately above).
-            const this_name: SymbolStr = intern.intern("&this");
+            // Collect all explicit parameter types — both `&this` and `this`
+            // already carry the correct resolved_type from type resolution.
             for (mut p: i64 = 0; p < func.parameters.length; p++) {
                 const param: VarDeclNode* = func.parameters[p];
-                if (param != null && param.resolved_type.is_valid() && !param.name.equals(this_name)) {
+                if (param != null && param.resolved_type.is_valid()) {
                     param_types.push(param.resolved_type);
                 }
             }
@@ -418,6 +456,17 @@ type struct DeclarationIndex {
         for (mut i: i64 = 0; i < this.module_type_keys.length; i++) {
             if (this.module_type_modules[i] == module.id) {
                 result.push(SymbolStr::from_id(this.module_type_keys[i]));
+            }
+        }
+        return result;
+    }
+
+    /// Get all global variable names defined in a specific module.
+    get_globals_in_module(&this, module: SymbolStr) -> SymbolStr[] {
+        mut result: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
+            if (this.module_global_modules[i] == module.id) {
+                result.push(SymbolStr::from_id(this.module_global_keys[i]));
             }
         }
         return result;
