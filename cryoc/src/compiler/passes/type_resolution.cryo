@@ -1240,6 +1240,28 @@ type struct TypeResolutionPasses {
                     }
                     ct.set_fields(field_infos);
 
+                    // Populate ClassType.methods from the AST so virtual
+                    // dispatch machinery (vtable emission, `has_virtual_methods`
+                    // flag, slot indexing) has the data it needs.  Without
+                    // this, cls.methods stays empty and every class looks
+                    // non-virtual — the `new T(...)` path never stores a
+                    // vtable pointer and polymorphic calls never dispatch
+                    // through one.
+                    for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
+                        const mnode: MethodNode* = node.methods[jm];
+                        if (mnode == null || mnode.func == null) { continue; }
+                        const fn_node: FunctionDeclNode* = mnode.func;
+                        const minfo: MethodInfo = MethodInfo {
+                            name:          fn_node.name,
+                            function_type: fn_node.resolved_return_type,
+                            is_public:     mnode.visibility == Visibility::Public,
+                            is_static:     mnode.is_static,
+                            is_virtual:    mnode.is_virtual,
+                            is_override:   mnode.is_override,
+                        };
+                        ct.add_method(minfo);
+                    }
+
                     // Resolve base class via the name resolver, which handles
                     // cross-module imports (e.g., ExpressionNode : ASTNode
                     // where ASTNode is in a different module).
@@ -1262,6 +1284,24 @@ type struct TypeResolutionPasses {
                         }
                         if (base_ref.is_valid()) {
                             ct.set_base_class(base_ref);
+                            // Propagate vtable presence: if any ancestor has
+                            // virtual methods, this subclass needs a vtable
+                            // slot too (even if it only inherits, doesn't
+                            // add its own virtuals).
+                            mut anc_ref: TypeRef = base_ref;
+                            mut anc_depth: i32 = 0;
+                            while (anc_depth < 16) {
+                                const anc_t: Type* = arena.lookup(anc_ref.id);
+                                if (anc_t == null || anc_t.kind != TypeKind::Class) { break; }
+                                const anc_cls: ClassType* = anc_t as ClassType*;
+                                if (anc_cls.has_virtual_methods) {
+                                    ct.has_virtual_methods = true;
+                                    break;
+                                }
+                                if (!anc_cls.has_base || !anc_cls.base_class.is_valid()) { break; }
+                                anc_ref = anc_cls.base_class;
+                                anc_depth = anc_depth + 1;
+                            }
                         }
                     }
                     class_count++;

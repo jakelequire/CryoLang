@@ -274,53 +274,150 @@ function declare_class_methods(cg: CodegenContext*, node: ClassDeclNode*) -> voi
         declare_method(cg, node.methods[i], qualified);
     }
 
-    // Emit the vtable for classes with virtual methods.  Drive this from the
-    // AST's method list rather than ClassType.methods — `add_method` is never
-    // called on ClassType in cryoc, so `has_virtual_methods` is always false
-    // and `cls_ty.methods` is empty.  The AST MethodNode carries is_virtual /
-    // is_override flags set by the parser.
-    codegen_vtable_from_ast(cg, node, qualified);
-}
-
-/// Emit the vtable global for a class declared in the AST.  Iterates the AST
-/// methods (since ClassType.methods isn't populated in cryoc) and collects
-/// the LLVM function values for any `virtual` or `override` methods.
-function codegen_vtable_from_ast(cg: CodegenContext*, node: ClassDeclNode*,
-                                  qualified: SymbolStr) -> void {
-    const intern: InternTable* = cg.get_intern();
-    const type_str: string = intern.resolve(qualified);
-
-    mut virtual_methods: LValue[] = [];
-    for (mut i: i64 = 0; i < node.methods.length; i++) {
-        const m: MethodNode* = node.methods[i];
-        if (m == null) { continue; }
-        if (!m.is_virtual && !m.is_override) { continue; }
-        if (m.func == null) { continue; }
-
-        const method_str: string = intern.resolve(m.func.name);
-        const combined: string = format("%s::%s", type_str, method_str);
-        const combined_sym: SymbolStr = intern.intern(combined);
-        const fn_val: LValue = cg.get_function(combined_sym);
-        if (fn_val.is_valid()) {
-            virtual_methods.push(fn_val);
+    // Emit the vtable for classes with virtual methods.  Drive this from
+    // ClassType.methods + its base chain (populated by the type-resolution
+    // pass) so the vtable is inheritance-complete: a subclass's vtable has
+    // one slot per virtual method introduced anywhere in the ancestry,
+    // in the order of first introduction (root → leaf).  The slot's
+    // implementation is the most-derived override present in the chain,
+    // falling back to the inherited base implementation when the subclass
+    // doesn't override that slot.  Layout discipline is what makes call-site
+    // dispatch work: a `Base*` callsite looks up slot N in `Base`'s layout,
+    // and any subclass's vtable guarantees slot N at the same index.
+    const di: DeclarationIndex* = ctx_ptr.decl_index;
+    const type_ref: TypeRef = di.lookup_type(qualified);
+    if (type_ref.is_valid()) {
+        const arena: TypeArena* = cg.get_arena();
+        const t: Type* = arena.lookup(type_ref.id);
+        if (t != null && t.kind == TypeKind::Class) {
+            const cls: ClassType* = t as ClassType*;
+            if (cls.has_virtual_methods) {
+                codegen_vtable_for_class(cg, cls);
+            }
         }
     }
+}
 
-    if (virtual_methods.length == 0) { return; }
+/// Walk the class's base chain (leaf → root) and collect the ordered list
+/// of virtual-method names.  New `is_virtual` methods append a new slot;
+/// `is_override` methods reuse an existing slot.  The returned list is in
+/// root → leaf declaration order — the canonical vtable layout — and every
+/// subclass's vtable extends this list with its own additions.
+function collect_vtable_slot_names(cg: CodegenContext*, cls: ClassType*) -> SymbolStr[] {
+    const arena: TypeArena* = cg.get_arena();
 
-    const n: u32 = virtual_methods.length as u32;
+    // Build chain = [cls, ..., root].
+    mut chain: ClassType*[] = [];
+    mut walk: ClassType* = cls;
+    mut depth: i32 = 0;
+    while (walk != null && depth < 16) {
+        chain.push(walk);
+        if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+        const base_t: Type* = arena.lookup(walk.base_class.id);
+        if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+        walk = base_t as ClassType*;
+        depth = depth + 1;
+    }
+
+    // Walk root → leaf, collecting virtual-slot names in declaration order.
+    mut names: SymbolStr[] = [];
+    for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+        const link: ClassType* = chain[ci];
+        for (mut mi: i64 = 0; mi < link.methods.length; mi++) {
+            const m: MethodInfo = link.methods[mi];
+            if (!m.is_virtual) { continue; }
+            mut already: boolean = false;
+            for (mut ki: i64 = 0; ki < names.length; ki++) {
+                if (names[ki].equals(m.name)) { already = true; break; }
+            }
+            if (!already) { names.push(m.name); }
+        }
+    }
+    return names;
+}
+
+/// For a given vtable slot (identified by method name), walk the class's
+/// chain leaf → root and return the first `{class, method}` pair that
+/// declares the slot (as `is_virtual` or `is_override`).  The resulting
+/// LValue is the LLVM function whose pointer gets installed into the slot.
+/// Returns `LValue::null()` if no implementation can be resolved.
+function find_vtable_slot_impl(cg: CodegenContext*, cls: ClassType*,
+                                slot_name: SymbolStr) -> LValue {
+    const arena: TypeArena* = cg.get_arena();
+    const intern: InternTable* = cg.get_intern();
+    mut walk: ClassType* = cls;
+    mut depth: i32 = 0;
+    while (walk != null && depth < 16) {
+        for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
+            const m: MethodInfo = walk.methods[mi];
+            if (!m.name.equals(slot_name)) { continue; }
+            if (!m.is_virtual && !m.is_override) { continue; }
+            const type_str: string = intern.resolve(walk.qualified_name);
+            const method_str: string = intern.resolve(slot_name);
+            const combined: string = format("%s::%s", type_str, method_str);
+            const combined_sym: SymbolStr = intern.intern(combined);
+            return cg.get_function(combined_sym);
+        }
+        if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+        const base_t: Type* = arena.lookup(walk.base_class.id);
+        if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+        walk = base_t as ClassType*;
+        depth = depth + 1;
+    }
+    return LValue::null();
+}
+
+/// Return the vtable slot index of `method_name` in this class's layout,
+/// or -1 if `method_name` isn't a virtual method of the class or any
+/// ancestor.  Used by call-site dispatch to emit `load vtbl[idx]` as the
+/// indirect callee.
+function vtable_slot_index(cg: CodegenContext*, cls: ClassType*,
+                            method_name: SymbolStr) -> i32 {
+    const names: SymbolStr[] = collect_vtable_slot_names(cg, cls);
+    for (mut i: i32 = 0; i < names.length as i32; i++) {
+        if (names[i].equals(method_name)) { return i; }
+    }
+    return -1;
+}
+
+/// Emit the vtable global for `cls`.  Slot layout comes from
+/// `collect_vtable_slot_names` (inheritance-complete), and each slot's
+/// contents come from `find_vtable_slot_impl` (most-derived override wins,
+/// inherited base implementation otherwise).
+function codegen_vtable_for_class(cg: CodegenContext*, cls: ClassType*) -> void {
+    const intern: InternTable* = cg.get_intern();
+
+    const slot_names: SymbolStr[] = collect_vtable_slot_names(cg, cls);
+    if (slot_names.length == 0) { return; }
+
+    mut impls: LValue[] = [];
+    for (mut i: i64 = 0; i < slot_names.length; i++) {
+        const impl: LValue = find_vtable_slot_impl(cg, cls, slot_names[i]);
+        if (!impl.is_valid()) {
+            // If the slot's implementation isn't declared in this module,
+            // skip vtable emission entirely — a half-populated vtable would
+            // misdispatch.  Cross-module vtables are handled when the owning
+            // module's codegen runs; this module can still store the vtable
+            // pointer by name via a forward global declaration, but that's
+            // out of scope here.
+            return;
+        }
+        impls.push(impl);
+    }
+
+    const n: u32 = impls.length as u32;
     const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
     const vtable_ty: LType = LType::array_of(fn_ptr_ty, n);
 
     const buf: void* = malloc(n as u64 * 8);
     const slots: void** = buf as void**;
     for (mut i: u32 = 0; i < n; i++) {
-        slots[i] = llvm::LLVMConstBitCast(virtual_methods[i].raw, fn_ptr_ty.raw);
+        slots[i] = llvm::LLVMConstBitCast(impls[i].raw, fn_ptr_ty.raw);
     }
     const init: LValue = LType::const_array(fn_ptr_ty, buf, n);
     free(buf);
 
-    const qname: QualifiedName = QualifiedName::from_symbol(qualified);
+    const qname: QualifiedName = QualifiedName::from_symbol(cls.qualified_name);
     const mangled: string = MangledName::for_vtable(intern, qname).resolve(intern);
     const global: LValue = cg.llvm_module.add_global(vtable_ty, mangled);
     global.set_initializer(init);
@@ -1021,62 +1118,6 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
     }
 
     return fn_val;
-}
-
-
-// ============================================================================
-// VTable codegen
-// ============================================================================
-
-/// Generate a vtable global for a class with virtual methods.
-function codegen_vtable(cg: CodegenContext*, cls_ty: ClassType*) -> LValue {
-    const qname: QualifiedName = QualifiedName::from_symbol(cls_ty.qualified_name);
-    const mangled: string = MangledName::for_vtable(cg.get_intern(), qname).resolve(cg.get_intern());
-
-    // Collect virtual methods.
-    mut virtual_methods: LValue[] = [];
-    for (mut i: i64 = 0; i < cls_ty.methods.length; i++) {
-        const m: MethodInfo = cls_ty.methods[i];
-        if (m.is_virtual || m.is_override) {
-            // Look up the LLVM function for this method.
-            const type_str: string = cg.resolve(cls_ty.qualified_name);
-            const method_str: string = cg.resolve(m.name);
-            const combined: string = format("%s::%s", type_str, method_str);
-            const combined_sym: SymbolStr = cg.intern_str(combined);
-            const fn_val: LValue = cg.get_function(combined_sym);
-            if (fn_val.is_valid()) {
-                virtual_methods.push(fn_val);
-            }
-        }
-    }
-
-    if (virtual_methods.length == 0) {
-        return LValue::null();
-    }
-
-    // Create vtable type: [N x i8*] (array of function pointers).
-    const n: u32 = virtual_methods.length as u32;
-    const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
-    const vtable_ty: LType = LType::array_of(fn_ptr_ty, n);
-
-    // Build the constant initializer array.
-    const buf: void* = malloc(n as u64 * 8);
-    const slots: void** = buf as void**;
-    for (mut i: u32 = 0; i < n; i++) {
-        // Bitcast function pointer to i8*.
-        slots[i] = llvm::LLVMConstBitCast(virtual_methods[i].raw, fn_ptr_ty.raw);
-    }
-    const init: LValue = LType::const_array(fn_ptr_ty, buf, n);
-    free(buf);
-
-    // Create the global vtable.
-    const global: LValue = cg.llvm_module.add_global(vtable_ty, mangled);
-    global.set_initializer(init);
-    global.set_global_constant(true);
-    // Internal linkage since vtable is module-local unless inherited.
-    global.set_linkage(8);  // LLVMInternalLinkage = 8
-
-    return global;
 }
 
 
