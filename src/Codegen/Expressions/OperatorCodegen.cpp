@@ -910,6 +910,18 @@ namespace Cryo::Codegen
             }
         }
 
+        // Coerce integer widths: if the RHS is a narrower integer than the
+        // alloca's element type, sign-extend it.  Without this, storing an
+        // i32 literal like `1` into an i64 alloca that previously held `-1`
+        // writes only the low 4 bytes, leaving the upper 4 bytes from the
+        // prior value (e.g., -1's 0xFFFFFFFF upper half remains, producing
+        // the bit pattern 0xFFFFFFFF00000001 = -4294967295 instead of 1).
+        if (alloc_type && alloc_type->isIntegerTy() && value->getType()->isIntegerTy() &&
+            alloc_type != value->getType())
+        {
+            value = cast_if_needed(value, alloc_type);
+        }
+
         if (store_through_ptr)
         {
             LOG_DEBUG(Cryo::LogComponent::CODEGEN,
