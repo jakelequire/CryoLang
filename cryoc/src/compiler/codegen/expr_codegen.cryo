@@ -592,20 +592,6 @@ function codegen_cast(cg: CodegenContext*, val: LValue,
 function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
                                object_type: TypeRef, member: SymbolStr,
                                out_value: LValue*, out_is_lvalue: boolean*) -> void {
-    const trace_intern: InternTable* = cg.get_intern();
-    const trace_t: Type* = cg.lookup_type_by_id(object_type.id);
-    mut trace_kind: i32 = -1;
-    mut trace_name: string = "<null>";
-    if (trace_t != null) {
-        trace_kind = trace_t.kind as i32;
-        trace_name = trace_t.display_name();
-    }
-    printf("[IRGen] member_access: member='%s' obj_type.id=%llu kind=%d name='%s' obj_ptr_valid=%d\n",
-        trace_intern.resolve(member),
-        object_type.id,
-        trace_kind,
-        trace_name,
-        if (object_ptr.is_valid()) { 1 } else { 0 } as i32); fflush(null);
     // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmtNode*`
     // stored in an alloca), load the pointer value so we can GEP into the struct.
     // This matches C/Rust behavior where `node.field` on a pointer is an implicit
@@ -653,15 +639,12 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
     }
 
     if (t == null) {
-        printf("[IRGen] member_access: BAIL t==null for member='%s'\n", trace_intern.resolve(member)); fflush(null);
         *out_value = LValue::null();
         *out_is_lvalue = false;
         return;
     }
 
     const tk: TypeKind = t.kind;
-    printf("[IRGen] member_access: dispatch member='%s' tk=%d (after unwrap)\n",
-        trace_intern.resolve(member), tk as i32); fflush(null);
     mut field_idx: i64 = -1;
 
     if (tk == TypeKind::Struct) {
@@ -702,10 +685,6 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
     } else if (tk == TypeKind::Array) {
         const arr_t: ArrayType* = t as ArrayType*;
         const length_sym: SymbolStr = cg.intern_str("length");
-        printf("[IRGen] array_branch: member.id=%u length_sym.id=%u is_fixed=%d size=%llu\n",
-            member.id, length_sym.id,
-            if (arr_t.is_fixed()) { 1 } else { 0 } as i32,
-            arr_t.size); fflush(null);
         if (member.id == length_sym.id) {
             if (arr_t.is_fixed()) {
                 // Fixed array: length is a compile-time constant.
@@ -718,23 +697,13 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
         }
     }
 
-    printf("[IRGen] member_access: post-dispatch field_idx=%lld member='%s' tk=%d\n",
-        field_idx, trace_intern.resolve(member), tk as i32); fflush(null);
-
     if (field_idx < 0) {
-        const intern: InternTable* = cg.get_intern();
-        printf("[IRGen] WARNING: member access — no field '%s' on TypeKind %d\n",
-            intern.resolve(member), tk as i32); fflush(null);
         *out_value = LValue::null();
         *out_is_lvalue = false;
         return;
     }
 
     const struct_ty: LType = cg.type_mapper.map_type(obj_type);
-    printf("[IRGen] member_access: struct_ty valid=%d obj_ptr_valid=%d field_idx=%lld\n",
-        if (struct_ty.is_valid()) { 1 } else { 0 } as i32,
-        if (obj_ptr.is_valid()) { 1 } else { 0 } as i32,
-        field_idx); fflush(null);
     if (!struct_ty.is_valid()) {
         printf("[IRGen] WARNING: member access — failed to map object type\n"); fflush(null);
         cg.ctx.emit_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
@@ -753,9 +722,6 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
     }
     const gep: LValue = cg.builder.build_struct_gep(struct_ty, obj_ptr,
                                                       field_idx as u32, "fieldptr");
-    printf("[IRGen] member_access: emitted GEP valid=%d for member='%s'\n",
-        if (gep.is_valid()) { 1 } else { 0 } as i32,
-        trace_intern.resolve(member)); fflush(null);
     *out_value = gep;
     *out_is_lvalue = true;
 }
