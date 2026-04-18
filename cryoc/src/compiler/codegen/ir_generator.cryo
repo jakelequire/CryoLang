@@ -1010,6 +1010,16 @@ public:
         const ctx_ptr: CompilationContext* = this.cg.ctx;
         const intern: InternTable* = this.cg.get_intern();
 
+        // Virtual-dispatch state — populated in the MemberAccess branch when
+        // the static receiver type declares virtual methods and the called
+        // method has a vtable slot.  If set, after we emit arg evaluation
+        // and fn_ty lookup, we replace `callee_val` with a vtable-indexed
+        // function-pointer load instead of a direct call to the statically
+        // resolved function.
+        mut vtable_dispatch: boolean = false;
+        mut vtable_slot_idx: i32 = -1;
+        mut vtable_obj_ref: TypeRef = TypeRef::invalid();
+
         if (node.callee.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = node.callee as IdentifierNode*;
 
@@ -1286,6 +1296,27 @@ public:
                 const arr_t: ArrayType* = t as ArrayType*;
                 type_sym = di.lookup_array_type_name(arr_t.element);
             }
+
+            // Check for virtual dispatch: if the STATIC receiver type is a
+            // class with virtual methods and `ma.member` occupies a vtable
+            // slot, dispatch indirectly through the object's vtable pointer.
+            // We use the static type (rather than walking to the most-
+            // derived type) because the vtable layout is defined by the
+            // static type's declaration order; subclass vtables are
+            // inheritance-complete, so `slot[idx]` resolves correctly at
+            // runtime to whatever override the dynamic type installed.
+            if (t != null && t.kind == TypeKind::Class) {
+                const cls_for_vtbl: ClassType* = t as ClassType*;
+                if (cls_for_vtbl.has_virtual_methods) {
+                    const slot_idx: i32 = vtable_slot_index(this.cg, cls_for_vtbl, ma.member);
+                    if (slot_idx >= 0) {
+                        vtable_dispatch = true;
+                        vtable_slot_idx = slot_idx;
+                        vtable_obj_ref = obj_ref;
+                    }
+                }
+            }
+
             // Instance-method calls prepend `&this` at the call site, so the
             // LLVM arity is user-args + 1.  This matches declare_method's
             // `total_params` registration key.
@@ -1406,6 +1437,43 @@ public:
             this.last_is_lvalue = false;
             return;
         }
+
+        // Virtual dispatch: replace the direct callee with a vtable-loaded
+        // function pointer.  We keep `fn_ty` from the statically resolved
+        // function — it describes the correct signature for `LLVMBuildCall2`
+        // and matches whatever override got installed in the slot at
+        // runtime (since all overrides share the base's signature).
+        if (vtable_dispatch && args.length > 0 && args[0].is_valid() && vtable_obj_ref.is_valid()) {
+            const class_lty: LType = this.cg.type_mapper.map_type(vtable_obj_ref);
+            if (class_lty.is_valid()) {
+                const vptr_slot: LValue = this.cg.builder.build_struct_gep(
+                    class_lty, args[0], 0, "vptr.slot");
+                if (vptr_slot.is_valid()) {
+                    const i8_ptr_ty: LType = LType::pointer_to(LType::i8());
+                    const i8_ptr_ptr_ty: LType = LType::pointer_to(i8_ptr_ty);
+                    const vtbl: LValue = this.cg.builder.build_load(
+                        i8_ptr_ptr_ty, vptr_slot, "vtbl");
+                    if (vtbl.is_valid()) {
+                        const idx_val: LValue = LType::const_int(
+                            LType::i32(), vtable_slot_idx as u64, false);
+                        const idx_buf: void* = malloc(8);
+                        const idx_slots: void** = idx_buf as void**;
+                        idx_slots[0] = idx_val.raw;
+                        const fn_slot: LValue = this.cg.builder.build_gep(
+                            i8_ptr_ty, vtbl, idx_buf, 1, "vtbl.slot");
+                        free(idx_buf);
+                        if (fn_slot.is_valid()) {
+                            const fn_ptr: LValue = this.cg.builder.build_load(
+                                i8_ptr_ty, fn_slot, "vtbl.fn");
+                            if (fn_ptr.is_valid()) {
+                                callee_val = fn_ptr;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         const ret_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         const void_ty: LType = LType::void_type();
         // Void calls and unresolved return types must use empty name —
