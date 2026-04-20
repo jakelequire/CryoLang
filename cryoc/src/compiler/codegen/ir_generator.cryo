@@ -1298,21 +1298,43 @@ public:
             }
 
             // Check for virtual dispatch: if the STATIC receiver type is a
-            // class with virtual methods and `ma.member` occupies a vtable
-            // slot, dispatch indirectly through the object's vtable pointer.
-            // We use the static type (rather than walking to the most-
-            // derived type) because the vtable layout is defined by the
-            // static type's declaration order; subclass vtables are
-            // inheritance-complete, so `slot[idx]` resolves correctly at
-            // runtime to whatever override the dynamic type installed.
-            if (t != null && t.kind == TypeKind::Class) {
+            // class with virtual methods and sema has resolved this call
+            // to a specific method declaration, dispatch indirectly through
+            // the object's vtable pointer.  We use the static type (rather
+            // than walking to the most-derived type) because the vtable
+            // layout is defined by the static type's declaration order;
+            // subclass vtables are inheritance-complete, so `slot[idx]`
+            // resolves correctly at runtime to whatever override the
+            // dynamic type installed.  The slot key is (name, param_types)
+            // read directly from sema's resolved method — no string
+            // matching, no guessing at arg-type display names, no chance
+            // of collapsing overloads.
+            if (t != null && t.kind == TypeKind::Class &&
+                node.resolved_method != null) {
                 const cls_for_vtbl: ClassType* = t as ClassType*;
                 if (cls_for_vtbl.has_virtual_methods) {
-                    const slot_idx: i32 = vtable_slot_index(this.cg, cls_for_vtbl, ma.member);
-                    if (slot_idx >= 0) {
-                        vtable_dispatch = true;
-                        vtable_slot_idx = slot_idx;
-                        vtable_obj_ref = obj_ref;
+                    const rm: MethodNode* = node.resolved_method as MethodNode*;
+                    if (rm != null && rm.func != null) {
+                        const fn_node: FunctionDeclNode* = rm.func;
+                        // Extract the resolved method's declared param
+                        // types (skipping self) in exact declaration order.
+                        mut rm_params: TypeRef[] = [];
+                        const this_amp: SymbolStr = intern.intern("&this");
+                        const this_val: SymbolStr = intern.intern("this");
+                        for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                            const pp: VarDeclNode* = fn_node.parameters[pi];
+                            if (pp == null) { continue; }
+                            if (pp.name.equals(this_amp)) { continue; }
+                            if (pp.name.equals(this_val)) { continue; }
+                            rm_params.push(pp.resolved_type);
+                        }
+                        const slot_idx: i32 = vtable_slot_index(
+                            this.cg, cls_for_vtbl, fn_node.name, rm_params);
+                        if (slot_idx >= 0) {
+                            vtable_dispatch = true;
+                            vtable_slot_idx = slot_idx;
+                            vtable_obj_ref = obj_ref;
+                        }
                     }
                 }
             }

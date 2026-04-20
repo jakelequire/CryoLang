@@ -295,12 +295,35 @@ function declare_class_methods(cg: CodegenContext*, node: ClassDeclNode*) -> voi
     }
 }
 
-/// Walk the class's base chain (leaf → root) and collect the ordered list
-/// of virtual-method names.  New `is_virtual` methods append a new slot;
-/// `is_override` methods reuse an existing slot.  The returned list is in
-/// root → leaf declaration order — the canonical vtable layout — and every
-/// subclass's vtable extends this list with its own additions.
-function collect_vtable_slot_names(cg: CodegenContext*, cls: ClassType*) -> SymbolStr[] {
+/// Identity of a single vtable slot — the (method_name, param_types)
+/// pair.  Two methods occupy the same slot iff the name matches AND
+/// every parameter TypeRef matches by arena ID.  Keeps overloaded
+/// virtuals in distinct slots while letting overrides collapse back
+/// onto the base virtual's slot.
+type struct VTableSlot {
+    name:        SymbolStr;
+    param_types: TypeRef[];
+}
+
+/// Structural equality on two param-type lists by arena ID.  The arena
+/// canonicalizes types so equal IDs mean equal types regardless of how
+/// they were spelled at the source level (including through type
+/// aliases, generic instantiations, etc.).
+function param_types_equal(a: TypeRef[], b: TypeRef[]) -> boolean {
+    if (a.length != b.length) { return false; }
+    for (mut i: i64 = 0; i < a.length; i++) {
+        if (a[i].id != b[i].id) { return false; }
+    }
+    return true;
+}
+
+/// Walk the class's base chain (leaf → root) and collect the ordered
+/// list of virtual-method slots.  New `is_virtual` methods append a
+/// new slot; `is_override` methods do NOT — they install into an
+/// existing slot at vtable-emission time.  The returned list is in
+/// root → leaf declaration order, so every subclass's vtable extends
+/// the base's layout with its own additions.
+function collect_vtable_slots(cg: CodegenContext*, cls: ClassType*) -> VTableSlot[] {
     const arena: TypeArena* = cg.get_arena();
 
     // Build chain = [cls, ..., root].
@@ -316,30 +339,37 @@ function collect_vtable_slot_names(cg: CodegenContext*, cls: ClassType*) -> Symb
         depth = depth + 1;
     }
 
-    // Walk root → leaf, collecting virtual-slot names in declaration order.
-    mut names: SymbolStr[] = [];
+    mut slots: VTableSlot[] = [];
     for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
         const link: ClassType* = chain[ci];
         for (mut mi: i64 = 0; mi < link.methods.length; mi++) {
             const m: MethodInfo = link.methods[mi];
             if (!m.is_virtual) { continue; }
             mut already: boolean = false;
-            for (mut ki: i64 = 0; ki < names.length; ki++) {
-                if (names[ki].equals(m.name)) { already = true; break; }
+            for (mut ki: i64 = 0; ki < slots.length; ki++) {
+                if (slots[ki].name.equals(m.name) &&
+                    param_types_equal(slots[ki].param_types, m.param_types)) {
+                    already = true;
+                    break;
+                }
             }
-            if (!already) { names.push(m.name); }
+            if (!already) {
+                slots.push(VTableSlot { name: m.name, param_types: m.param_types });
+            }
         }
     }
-    return names;
+    return slots;
 }
 
-/// For a given vtable slot (identified by method name), walk the class's
-/// chain leaf → root and return the first `{class, method}` pair that
-/// declares the slot (as `is_virtual` or `is_override`).  The resulting
-/// LValue is the LLVM function whose pointer gets installed into the slot.
-/// Returns `LValue::null()` if no implementation can be resolved.
+/// For a given vtable slot (name + param_types), walk leaf → root and
+/// return the first matching method's LLVM function — the most-derived
+/// override, falling back to the inherited base implementation when
+/// the subclass doesn't override that specific overload.  Resolution
+/// goes through the overload-specific mangled name so the correct LLVM
+/// function is installed in the slot, not the last-registered one
+/// under `Type::method`.
 function find_vtable_slot_impl(cg: CodegenContext*, cls: ClassType*,
-                                slot_name: SymbolStr) -> LValue {
+                                slot_name: SymbolStr, slot_params: TypeRef[]) -> LValue {
     const arena: TypeArena* = cg.get_arena();
     const intern: InternTable* = cg.get_intern();
     mut walk: ClassType* = cls;
@@ -348,12 +378,25 @@ function find_vtable_slot_impl(cg: CodegenContext*, cls: ClassType*,
         for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
             const m: MethodInfo = walk.methods[mi];
             if (!m.name.equals(slot_name)) { continue; }
+            if (!param_types_equal(m.param_types, slot_params)) { continue; }
             if (!m.is_virtual && !m.is_override) { continue; }
-            const type_str: string = intern.resolve(walk.qualified_name);
+            const type_qname: QualifiedName = QualifiedName::from_symbol(walk.qualified_name);
+            const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
             const method_str: string = intern.resolve(slot_name);
-            const combined: string = format("%s::%s", type_str, method_str);
-            const combined_sym: SymbolStr = intern.intern(combined);
-            return cg.get_function(combined_sym);
+            mut pd: string[] = [];
+            for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
+                const pt: Type* = arena.lookup(m.param_types[pi].id);
+                if (pt != null) { pd.push(pt.display_name()); }
+                else { pd.push("?"); }
+            }
+            const computed: MangledName = MangledName::for_method(intern, type_mangled, method_str, pd);
+            mut fn_val: LValue = cg.get_function(computed.value);
+            if (!fn_val.is_valid()) {
+                const type_str: string = intern.resolve(walk.qualified_name);
+                const combined: string = format("%s::%s", type_str, method_str);
+                fn_val = cg.get_function(intern.intern(combined));
+            }
+            return fn_val;
         }
         if (!walk.has_base || !walk.base_class.is_valid()) { break; }
         const base_t: Type* = arena.lookup(walk.base_class.id);
@@ -364,39 +407,41 @@ function find_vtable_slot_impl(cg: CodegenContext*, cls: ClassType*,
     return LValue::null();
 }
 
-/// Return the vtable slot index of `method_name` in this class's layout,
-/// or -1 if `method_name` isn't a virtual method of the class or any
-/// ancestor.  Used by call-site dispatch to emit `load vtbl[idx]` as the
-/// indirect callee.
+/// Return the vtable slot index of (method_name, param_types) in this
+/// class's layout, or -1 if no matching virtual slot exists.  Called
+/// from codegen dispatch after sema has identified the exact overload
+/// via `CallExprNode.resolved_method` — this function just maps that
+/// declaration to its slot position.
 function vtable_slot_index(cg: CodegenContext*, cls: ClassType*,
-                            method_name: SymbolStr) -> i32 {
-    const names: SymbolStr[] = collect_vtable_slot_names(cg, cls);
-    for (mut i: i32 = 0; i < names.length as i32; i++) {
-        if (names[i].equals(method_name)) { return i; }
+                            method_name: SymbolStr, param_types: TypeRef[]) -> i32 {
+    const slots: VTableSlot[] = collect_vtable_slots(cg, cls);
+    for (mut i: i32 = 0; i < slots.length as i32; i++) {
+        if (slots[i].name.equals(method_name) &&
+            param_types_equal(slots[i].param_types, param_types)) {
+            return i;
+        }
     }
     return -1;
 }
 
 /// Emit the vtable global for `cls`.  Slot layout comes from
-/// `collect_vtable_slot_names` (inheritance-complete), and each slot's
-/// contents come from `find_vtable_slot_impl` (most-derived override wins,
-/// inherited base implementation otherwise).
+/// `collect_vtable_slots` (inheritance-complete, overload-aware); each
+/// slot's contents come from `find_vtable_slot_impl` (most-derived
+/// override wins, inherited base implementation otherwise).
 function codegen_vtable_for_class(cg: CodegenContext*, cls: ClassType*) -> void {
     const intern: InternTable* = cg.get_intern();
 
-    const slot_names: SymbolStr[] = collect_vtable_slot_names(cg, cls);
-    if (slot_names.length == 0) { return; }
+    const slots: VTableSlot[] = collect_vtable_slots(cg, cls);
+    if (slots.length == 0) { return; }
 
     mut impls: LValue[] = [];
-    for (mut i: i64 = 0; i < slot_names.length; i++) {
-        const impl: LValue = find_vtable_slot_impl(cg, cls, slot_names[i]);
+    for (mut i: i64 = 0; i < slots.length; i++) {
+        const impl: LValue = find_vtable_slot_impl(cg, cls, slots[i].name, slots[i].param_types);
         if (!impl.is_valid()) {
             // If the slot's implementation isn't declared in this module,
             // skip vtable emission entirely — a half-populated vtable would
             // misdispatch.  Cross-module vtables are handled when the owning
-            // module's codegen runs; this module can still store the vtable
-            // pointer by name via a forward global declaration, but that's
-            // out of scope here.
+            // module's codegen runs.
             return;
         }
         impls.push(impl);
@@ -407,9 +452,9 @@ function codegen_vtable_for_class(cg: CodegenContext*, cls: ClassType*) -> void 
     const vtable_ty: LType = LType::array_of(fn_ptr_ty, n);
 
     const buf: void* = malloc(n as u64 * 8);
-    const slots: void** = buf as void**;
+    const slot_ptrs: void** = buf as void**;
     for (mut i: u32 = 0; i < n; i++) {
-        slots[i] = llvm::LLVMConstBitCast(impls[i].raw, fn_ptr_ty.raw);
+        slot_ptrs[i] = llvm::LLVMConstBitCast(impls[i].raw, fn_ptr_ty.raw);
     }
     const init: LValue = LType::const_array(fn_ptr_ty, buf, n);
     free(buf);
@@ -436,29 +481,38 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     const type_str: string = intern.resolve(target_type);
     const method_str: string = intern.resolve(func.name);
 
-    // Build the combined DI key and look up the pre-computed mangled name.
+    // Build the combined DI key.  Always compute the mangled name fresh
+    // from THIS overload's parameter types — the DI cache `lookup_mangled_name`
+    // only stores ONE entry per combined key, so for overloaded methods
+    // (e.g., every `visit(SomeNode*)` in BaseASTVisitor) using the cached
+    // name would map every overload to the first one's mangled name,
+    // collide at LLVM level, and leave all but the first-declared overload
+    // as unnamed declares without bodies.
     const combined: string = format("%s::%s", type_str, method_str);
     const combined_sym: SymbolStr = intern.intern(combined);
     const ctx_ptr: CompilationContext* = cg.ctx;
     const di: DeclarationIndex* = ctx_ptr.decl_index;
-    mut mangled_sym: SymbolStr = di.lookup_mangled_name(combined_sym);
-    if (!mangled_sym.is_valid()) {
-        // Compute and register on first use — covers paths that don't
-        // register upfront (monomorphized impl blocks, etc.).
-        const arena: TypeArena* = cg.get_arena();
-        const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
-        const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
-        mut pd: string[] = [];
-        const this_sym: SymbolStr = intern.intern("&this");
-        for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
-            const pp: VarDeclNode* = func.parameters[pi];
-            if (pp != null && pp.resolved_type.is_valid() && !pp.name.equals(this_sym)) {
-                const pt: Type* = arena.lookup(pp.resolved_type.id);
-                if (pt != null) { pd.push(pt.display_name()); }
-            }
+    const arena: TypeArena* = cg.get_arena();
+    const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
+    const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
+    mut pd: string[] = [];
+    const this_sym_amp: SymbolStr = intern.intern("&this");
+    const this_sym_val: SymbolStr = intern.intern("this");
+    for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
+        const pp: VarDeclNode* = func.parameters[pi];
+        if (pp == null) { continue; }
+        if (pp.name.equals(this_sym_amp)) { continue; }
+        if (pp.name.equals(this_sym_val)) { continue; }
+        if (pp.resolved_type.is_valid()) {
+            const pt: Type* = arena.lookup(pp.resolved_type.id);
+            if (pt != null) { pd.push(pt.display_name()); }
         }
-        const computed: MangledName = MangledName::for_method(intern, type_mangled, method_str, pd);
-        mangled_sym = computed.value;
+    }
+    const computed: MangledName = MangledName::for_method(intern, type_mangled, method_str, pd);
+    const mangled_sym: SymbolStr = computed.value;
+    // Cache into DI only if this is the first overload — preserves the
+    // existing single-slot behavior for call sites that don't disambiguate.
+    if (!di.lookup_mangled_name(combined_sym).is_valid()) {
         di.register_mangled_name(combined_sym, mangled_sym);
     }
     const fn_name: string = intern.resolve(mangled_sym);
@@ -572,9 +626,13 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     // overload at call sites (e.g., `Array::new()` vs `Array::new(u64)`).
     // `total_params` matches the arity cross-module externs register with
     // (the FunctionType's param count), keeping the two registration paths
-    // interoperable.
+    // interoperable.  Finally register under the unique mangled_sym — that's
+    // the key `codegen_method_prologue` uses to look up the right LLVM
+    // function for each overload (combined_sym alone is ambiguous because
+    // overloads share the same `Type::method` form).
     cg.register_function(combined_sym, fn_val);
     cg.register_function_with_arity(combined_sym, total_params, fn_val);
+    cg.register_function(mangled_sym, fn_val);
 }
 
 /// Declare an intrinsic function (e.g., malloc, printf, strlen).
@@ -1014,13 +1072,42 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
     const func: FunctionDeclNode* = node.func;
     if (func == null) { return LValue::null(); }
 
-    // Look up the function by combined key "Type::method".
-    const type_str: string = cg.resolve(target_type);
-    const method_str: string = cg.resolve(func.name);
+    const intern: InternTable* = cg.get_intern();
+    const type_str: string = intern.resolve(target_type);
+    const method_str: string = intern.resolve(func.name);
     const combined: string = format("%s::%s", type_str, method_str);
-    const combined_sym: SymbolStr = cg.intern_str(combined);
+    const combined_sym: SymbolStr = intern.intern(combined);
 
-    const fn_val: LValue = cg.get_function(combined_sym);
+    // Recompute the mangled name from THIS overload's parameter types so
+    // overloaded methods (e.g., BaseASTVisitor's 62 `visit(...)` overrides)
+    // resolve to their own LLVM function rather than all mapping to the
+    // first-declared overload via the ambiguous combined key.  Must mirror
+    // the computation in `declare_method` exactly.
+    const arena: TypeArena* = cg.get_arena();
+    const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
+    const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
+    mut pd: string[] = [];
+    const this_sym_amp: SymbolStr = intern.intern("&this");
+    const this_sym_val: SymbolStr = intern.intern("this");
+    for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
+        const pp: VarDeclNode* = func.parameters[pi];
+        if (pp == null) { continue; }
+        if (pp.name.equals(this_sym_amp)) { continue; }
+        if (pp.name.equals(this_sym_val)) { continue; }
+        if (pp.resolved_type.is_valid()) {
+            const pt: Type* = arena.lookup(pp.resolved_type.id);
+            if (pt != null) { pd.push(pt.display_name()); }
+        }
+    }
+    const computed: MangledName = MangledName::for_method(intern, type_mangled, method_str, pd);
+    const mangled_sym: SymbolStr = computed.value;
+
+    // Prefer mangled_sym for overload-correct lookup; fall back to the
+    // combined key for paths that only registered the non-overloaded form.
+    mut fn_val: LValue = cg.get_function(mangled_sym);
+    if (!fn_val.is_valid()) {
+        fn_val = cg.get_function(combined_sym);
+    }
     if (!fn_val.is_valid()) {
         printf("[IRGen] WARNING: method_prologue — not found: '%s' (id=%u)\n", combined, combined_sym.id); fflush(null);
         return LValue::null();
