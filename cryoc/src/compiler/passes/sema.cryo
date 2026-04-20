@@ -976,10 +976,88 @@ public:
         return result.result_type;
     }
 
-    resolve_call(mut &this, call: CallExprNode*) -> TypeRef {
-        for (mut i: i64 = 0; i < call.arguments.length; i++) {
-            this.resolve_expr(call.arguments[i]);
+    /// Best-effort lookup of a callee's FunctionType TypeRef.  Used by
+    /// `resolve_call` to push expected parameter types during arg
+    /// resolution.  Returns invalid when the callee isn't statically
+    /// resolvable (first-class function pointers, unresolved methods).
+    lookup_callee_function_type(&this, callee: ExpressionNode*) -> TypeRef {
+        if (callee == null) { return TypeRef::invalid(); }
+        const n: ASTNode* = callee as ASTNode*;
+        if (n.kind == NodeKind::Identifier) {
+            const ident: IdentifierNode* = callee as IdentifierNode*;
+            const bare: TypeRef = this.ctx.decl_index.lookup_func_type(ident.name);
+            if (bare.is_valid()) { return bare; }
+            // Fall back to the current-module qualified form for paths
+            // that only registered the fully-qualified key.
+            const q_sym: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+            return this.ctx.decl_index.lookup_func_type(q_sym);
         }
+        if (n.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;
+            // Try the bare scope name first.
+            const bare_combined: string = format("%s::%s",
+                this.intern.resolve(sr.scope_name),
+                this.intern.resolve(sr.member_name));
+            const bare_sym: SymbolStr = this.intern.intern(bare_combined);
+            const bare_ft: TypeRef = this.ctx.decl_index.lookup_func_type(bare_sym);
+            if (bare_ft.is_valid()) { return bare_ft; }
+            // Fall back to the fully-qualified scope (TokenStream →
+            // Compiler::Artifacts::TokenStream) via DI's scope resolution.
+            const resolved_scope: SymbolStr = this.ctx.decl_index.resolve_qualified(sr.scope_name);
+            if (resolved_scope.is_valid()) {
+                const q_combined: string = format("%s::%s",
+                    this.intern.resolve(resolved_scope),
+                    this.intern.resolve(sr.member_name));
+                const q_sym: SymbolStr = this.intern.intern(q_combined);
+                return this.ctx.decl_index.lookup_func_type(q_sym);
+            }
+            return TypeRef::invalid();
+        }
+        // MemberAccess would need a receiver-type lookup; skip for now
+        // (method overload resolution handles type-correctness there).
+        return TypeRef::invalid();
+    }
+
+    resolve_call(mut &this, call: CallExprNode*) -> TypeRef {
+        // Most args resolve without an expected type — integer literal
+        // widths, etc., are resolved from their own literal form.  BUT
+        // empty array literals (`[]`) need the param type to pick up an
+        // element type, since they have no contents to infer from.  To
+        // avoid side-effects on other literals (e.g. widening i32 → i64
+        // where a subsequent cast expected i32), we ONLY push expected
+        // type when the arg is a zero-length ArrayLiteral.
+        mut param_types: TypeRef[] = [];
+        const callee_fn_type: TypeRef = this.lookup_callee_function_type(call.callee);
+        if (callee_fn_type.is_valid()) {
+            const ft_raw: Type* = this.arena.lookup(callee_fn_type.id);
+            if (ft_raw != null && ft_raw.kind == TypeKind::Function) {
+                const ft: FunctionType* = ft_raw as FunctionType*;
+                param_types = ft.param_types;
+            }
+        }
+        const saved_expected: TypeRef = this.expected_type;
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            mut push_expected: boolean = false;
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg != null && i < param_types.length && param_types[i].is_valid()) {
+                const arg_node: ASTNode* = arg as ASTNode*;
+                if (arg_node.kind == NodeKind::ArrayLiteral) {
+                    const alit: ArrayLiteralNode* = arg as ArrayLiteralNode*;
+                    if (alit.elements.length == 0 &&
+                        alit.repeat_count == 0 &&
+                        alit.repeat_count_expr == null) {
+                        push_expected = true;
+                    }
+                }
+            }
+            if (push_expected) {
+                this.expected_type = param_types[i];
+            } else {
+                this.expected_type = TypeRef::invalid();
+            }
+            this.resolve_expr(arg);
+        }
+        this.expected_type = saved_expected;
 
         const callee: ExpressionNode* = call.callee;
         const callee_node: ASTNode* = callee as ASTNode*;
@@ -1697,10 +1775,64 @@ public:
     }
 
     resolve_struct_literal(mut &this, lit: StructLiteralNode*) -> TypeRef {
-        for (mut i: i64 = 0; i < lit.field_inits.length; i++) {
-            this.resolve_expr(lit.field_inits[i].value);
+        // Resolve the struct's type first so we know its field layout.
+        // Push each field's declared type as `expected_type` while we
+        // resolve the field's initializer — same motivation as
+        // `resolve_call`: empty `[]` literals in a struct field like
+        // `aliases: []` need the field type to pick up their element
+        // type.  Limited to empty ArrayLiterals to avoid side-effects
+        // on other literal kinds.
+        const struct_ref: TypeRef = this.lookup_type_by_sym(lit.struct_type);
+        mut struct_t: Type* = if (struct_ref.is_valid()) {
+            this.arena.lookup(struct_ref.id)
+        } else {
+            null
+        };
+        if (struct_t != null && struct_t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = struct_t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                struct_t = this.arena.lookup(inst.resolved_type.id);
+            }
         }
-        return this.lookup_type_by_sym(lit.struct_type);
+
+        const saved_expected: TypeRef = this.expected_type;
+        for (mut i: i64 = 0; i < lit.field_inits.length; i++) {
+            const field_init: FieldInit = lit.field_inits[i];
+            const value_expr: ExpressionNode* = field_init.value;
+            mut push_expected: boolean = false;
+            mut field_type: TypeRef = TypeRef::invalid();
+            if (value_expr != null && struct_t != null &&
+                (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
+                const v_node: ASTNode* = value_expr as ASTNode*;
+                if (v_node.kind == NodeKind::ArrayLiteral) {
+                    const alit: ArrayLiteralNode* = value_expr as ArrayLiteralNode*;
+                    if (alit.elements.length == 0 &&
+                        alit.repeat_count == 0 &&
+                        alit.repeat_count_expr == null) {
+                        mut finfo: FieldInfo* = null;
+                        if (struct_t.kind == TypeKind::Struct) {
+                            const st: StructType* = struct_t as StructType*;
+                            finfo = st.get_field(field_init.field_name);
+                        } else {
+                            const ct: ClassType* = struct_t as ClassType*;
+                            finfo = ct.get_field(field_init.field_name);
+                        }
+                        if (finfo != null && finfo.field_type.is_valid()) {
+                            field_type = finfo.field_type;
+                            push_expected = true;
+                        }
+                    }
+                }
+            }
+            if (push_expected) {
+                this.expected_type = field_type;
+            } else {
+                this.expected_type = TypeRef::invalid();
+            }
+            this.resolve_expr(value_expr);
+        }
+        this.expected_type = saved_expected;
+        return struct_ref;
     }
 
     resolve_scope_resolution(&this, scope: ScopeResolutionNode*) -> TypeRef {
@@ -1737,6 +1869,28 @@ public:
         }
         if (arr.repeat_count_expr != null) {
             this.resolve_expr(arr.repeat_count_expr);
+        }
+        // Empty literal (`[]`): can't infer the element type from
+        // contents — look at the surrounding context via `expected_type`.
+        // If the call site or assignment context expects `Array<T>`, we
+        // adopt the expected type VERBATIM (element type AND size/shape):
+        // a dynamic `T[]` needs `size = -1` to map to `{ptr, i64}`; a
+        // fixed `[T; N]` needs the declared N.  Returning a fresh type
+        // with `size = elements.length = 0` would emit a zero-sized
+        // fixed array that doesn't match the caller's param type.
+        if (!elem_type.is_valid() && this.expected_type.is_valid() &&
+            arr.elements.length == 0 && arr.repeat_count == 0 &&
+            arr.repeat_count_expr == null) {
+            mut exp_t: Type* = this.arena.lookup(this.expected_type.id);
+            if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = exp_t as InstantiatedType*;
+                if (inst.has_resolved_type()) {
+                    exp_t = this.arena.lookup(inst.resolved_type.id);
+                }
+            }
+            if (exp_t != null && exp_t.kind == TypeKind::Array) {
+                return this.expected_type;
+            }
         }
         if (elem_type.is_valid()) {
             // Fill expression [value; count]: use the repeat count for the

@@ -162,10 +162,48 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
     mut t_kind: TypeKind = TypeKind::Error;
     if (t != null) { t_kind = t.kind; }
 
-    // String comparison via strcmp.  Strings are i8* (null-terminated).
+    // String ops.  Strings are null-terminated `i8*` at the LLVM level.
+    //   `==`/`!=` → strcmp
+    //   `+` string + string → append (concat into fresh heap buffer)
+    //   `+` string + int    → pointer advancement (GEP over i8)
     if (t_kind == TypeKind::String) {
         if (op_kind == TokenType::EqualEqual || op_kind == TokenType::ExclaimEqual) {
             codegen_string_compare(cg, lhs_val, rhs_val, op_kind, out_value);
+            return;
+        }
+        if (op_kind == TokenType::Plus) {
+            // Decide concat vs pointer-advance by the RHS's LLVM type.
+            // Both operands are already rvalues at this point.
+            const rhs_llvm: void* = llvm::LLVMTypeOf(rhs_val.raw);
+            if (rhs_llvm != null && llvm::LLVMGetTypeKind(rhs_llvm) == 8) {
+                // string + int → GEP i8 for pointer arithmetic.  Caller
+                // uses this idiom for substring-from-offset, C-string
+                // walking, etc.
+                const buf: void* = malloc(8);
+                const slots: void** = buf as void**;
+                slots[0] = rhs_val.raw;
+                *out_value = cg.builder.build_gep(
+                    LType::i8(), lhs_val, buf, 1, "ptradv");
+                free(buf);
+                return;
+            }
+            // string + string → call std::core::primitives::string::append.
+            // The stdlib already provides this as a method on `string`;
+            // every module gets it via cross-module extern declarations.
+            const intern: InternTable* = cg.get_intern();
+            const fn_sym: SymbolStr = intern.intern(
+                "std::core::primitives::string::append");
+            const fn_val: LValue = cg.get_function(fn_sym);
+            if (!fn_val.is_valid()) {
+                printf("[IRGen] WARNING: string concat — append not declared\n"); fflush(null);
+                *out_value = LValue::null();
+                return;
+            }
+            const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(fn_val.raw) };
+            mut args: LValue[] = [];
+            args.push(lhs_val);
+            args.push(rhs_val);
+            codegen_call(cg, fn_val, fn_ty, args, "strcat", out_value);
             return;
         }
         printf("[IRGen] WARNING: binary op — unsupported string operation\n"); fflush(null);
@@ -509,25 +547,50 @@ function codegen_cast(cg: CodegenContext*, val: LValue,
 
     const from_kind: TypeKind = src_type.kind;
     const to_kind: TypeKind = dst_type.kind;
-    const from_int: boolean = from_kind == TypeKind::Int;
+    // Treat Char and Bool as integer-like for cast purposes — both are
+    // integer types at the LLVM level (i32 and i1 respectively).  Without
+    // including Char here, casts like `s[i] as u64` (where `s[i]: char`)
+    // fall through to the bitcast fallback and LLVM rejects
+    // `bitcast i32 to i64` (bitcast requires same-size operands).
+    const from_int: boolean = from_kind == TypeKind::Int || from_kind == TypeKind::Char;
     const from_float: boolean = from_kind == TypeKind::Float;
-    const to_int: boolean = to_kind == TypeKind::Int;
+    const to_int: boolean = to_kind == TypeKind::Int || to_kind == TypeKind::Char;
     const to_float: boolean = to_kind == TypeKind::Float;
     const from_ptr: boolean = from_kind == TypeKind::Pointer || from_kind == TypeKind::Reference;
     const to_ptr: boolean = to_kind == TypeKind::Pointer || to_kind == TypeKind::Reference;
 
-    // Int → Int (truncate, zext, or sext)
+    // Int → Int (truncate, zext, or sext).  Determine bit widths via the
+    // cryo-level type where possible (IntType's `int_kind.bit_width()`);
+    // Char is stored as i32 at the LLVM level but is its own TypeKind,
+    // so fall back to 32 bits for it without dereferencing `val.raw`
+    // (which may be null on upstream codegen failures — LLVMTypeOf would
+    // segfault on a null operand).  The target width comes from LLVM
+    // since `dest_ty` was freshly mapped above and guaranteed non-null
+    // when both kinds are int-like.
     if (from_int && to_int) {
-        const from_it: IntType* = src_type as IntType*;
-        const to_it: IntType* = dst_type as IntType*;
-        const from_ik: IntegerKind = from_it.int_kind;
-        const to_ik: IntegerKind = to_it.int_kind;
-        const from_bits: u64 = from_ik.bit_width();
-        const to_bits: u64 = to_ik.bit_width();
-        if (from_bits > to_bits) {
+        mut from_bits: u32 = 0;
+        mut signed_src: boolean = false;
+        if (from_kind == TypeKind::Int) {
+            const from_it: IntType* = src_type as IntType*;
+            from_bits = from_it.int_kind.bit_width() as u32;
+            signed_src = from_it.int_kind.is_signed();
+        } else if (from_kind == TypeKind::Char) {
+            from_bits = 32;
+            signed_src = false;
+        }
+        mut to_bits: u32 = 0;
+        if (to_kind == TypeKind::Int) {
+            const to_it: IntType* = dst_type as IntType*;
+            to_bits = to_it.int_kind.bit_width() as u32;
+        } else if (to_kind == TypeKind::Char) {
+            to_bits = 32;
+        }
+        if (from_bits == 0 || to_bits == 0 || !val.is_valid()) {
+            *out_value = val;
+        } else if (from_bits > to_bits) {
             *out_value = cg.builder.build_trunc(val, dest_ty, "trunctmp");
         } else if (from_bits < to_bits) {
-            if (from_ik.is_signed()) {
+            if (signed_src) {
                 *out_value = cg.builder.build_sext(val, dest_ty, "sexttmp");
             } else {
                 *out_value = cg.builder.build_zext(val, dest_ty, "zexttmp");
@@ -720,6 +783,18 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
         cg.ctx.emit_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
             "codegen: member access — object pointer is null");
         *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+    // If `obj_ptr` is a struct VALUE (e.g., a direct return from a
+    // function call: `f().field`), it isn't a GEP-able address.  Use
+    // `extractvalue` to pull out the field from the value and return
+    // an rvalue.  LLVMStructTypeKind = 10; under opaque pointers an
+    // actual pointer has kind 12, so the check is unambiguous.
+    const obj_llvm_ty: void* = llvm::LLVMTypeOf(obj_ptr.raw);
+    if (obj_llvm_ty != null && llvm::LLVMGetTypeKind(obj_llvm_ty) == 10) {
+        *out_value = cg.builder.build_extract_value(
+            obj_ptr, field_idx as u32, "fieldval");
         *out_is_lvalue = false;
         return;
     }

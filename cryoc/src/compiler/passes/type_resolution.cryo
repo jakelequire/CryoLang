@@ -251,7 +251,6 @@ type struct TypeResolutionRunner {
             }
             NodeKind::ExpressionStatement => {
                 const expr_stmt: ExprStmtNode* = stmt as ExprStmtNode*;
-                // Check for cast expressions
                 const _expr: ExpressionNode* = expr_stmt.expression;
                 const _expr_node: ASTNode* = _expr as ASTNode*;
                 if (_expr != null &&
@@ -264,6 +263,16 @@ type struct TypeResolutionRunner {
                         }
                     }
                 }
+                this.resolve_var_types_in_expression(_expr, res_ctx);
+            }
+            NodeKind::ReturnStatement => {
+                // `return match (...) { ... }` and `return if (...) ...`
+                // both hide var declarations inside their branches, which
+                // need to be traversed for type resolution.  The earlier
+                // no-op comment was wrong — return statements don't have
+                // annotations themselves but their expression subtree does.
+                const ret_stmt: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                this.resolve_var_types_in_expression(ret_stmt.expression, res_ctx);
             }
             NodeKind::LoopStatement => {
                 const loop_stmt: LoopStmtNode* = stmt as LoopStmtNode*;
@@ -278,11 +287,52 @@ type struct TypeResolutionRunner {
                     }
                 }
             }
-            NodeKind::ReturnStatement => {
-                // Return statements don't have type annotations to resolve
-            }
             _ => {
                 // Other statement kinds (break, continue) — no type annotations
+            }
+        }
+    }
+
+    /// Recurse into an expression looking for nested statement containers
+    /// (match-arm bodies, ternary/if-expression branches) so any var
+    /// declarations inside them get their `resolved_type` set.  Without
+    /// this, `return match (...) { Pattern => { mut x: T = ...; } }`
+    /// (and similar idioms) leaves `x.resolved_type = invalid`, and
+    /// codegen can't allocate it.
+    resolve_var_types_in_expression(&this, expr: ExpressionNode*,
+                                     res_ctx: ResolutionContext*) -> void {
+        if (expr == null) { return; }
+        const n: ASTNode* = expr as ASTNode*;
+        match (n.kind) {
+            NodeKind::MatchExpression => {
+                const match_expr: MatchExprNode* = expr as MatchExprNode*;
+                for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
+                    const arm: MatchArmNode* = match_expr.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.resolve_var_types_in_statement(arm.body as ASTNode*, res_ctx);
+                    }
+                }
+            }
+            NodeKind::IfExpression => {
+                const if_expr: IfExprNode* = expr as IfExprNode*;
+                if (if_expr.then_expr != null) {
+                    this.resolve_var_types_in_expression(if_expr.then_expr, res_ctx);
+                }
+                if (if_expr.else_expr != null) {
+                    this.resolve_var_types_in_expression(if_expr.else_expr, res_ctx);
+                }
+            }
+            NodeKind::TernaryExpression => {
+                const te: TernaryExprNode* = expr as TernaryExprNode*;
+                if (te.true_expr != null) {
+                    this.resolve_var_types_in_expression(te.true_expr, res_ctx);
+                }
+                if (te.false_expr != null) {
+                    this.resolve_var_types_in_expression(te.false_expr, res_ctx);
+                }
+            }
+            _ => {
+                // Other expression kinds don't contain var declarations
             }
         }
     }
@@ -1279,15 +1329,22 @@ type struct TypeResolutionPasses {
                         ct.add_method(minfo);
                     }
 
-                    // Resolve base class via the name resolver, which handles
-                    // cross-module imports (e.g., ExpressionNode : ASTNode
-                    // where ASTNode is in a different module).
+                    // Resolve base class.  Cascades through:
+                    //   1. Current-module qualified form (`ThisModule::Type`)
+                    //      — works when the base is declared in the same module.
+                    //   2. Name-resolver scope walk — handles imports that
+                    //      aliased the base into the current namespace.
+                    //   3. Arena leaf-index lookup — handles the common case
+                    //      where the base's defining namespace shadows its
+                    //      own name (e.g., `class Type` inside `namespace
+                    //      Compiler::Types::Type` gets registered as
+                    //      `Compiler::Types::Type::Type`; current-module
+                    //      qualification and scope walks don't find that
+                    //      double-qualified form, but the leaf index does).
                     if (node.has_base_class()) {
                         const base_sym: SymbolStr = ctx.qualify_symbol_sym(node.base_class);
                         mut base_ref: TypeRef = ctx.decl_index.lookup_type(base_sym);
                         if (!base_ref.is_valid()) {
-                            // Cross-module: use the resolver to find the fully
-                            // qualified name through imports and scope chain.
                             const resolver: Resolver* = ctx.get_resolver();
                             if (resolver != null) {
                                 const resolved_name: SymbolStr = resolver.resolve_type_qualified_name(node.base_class);
@@ -1298,6 +1355,9 @@ type struct TypeResolutionPasses {
                                     }
                                 }
                             }
+                        }
+                        if (!base_ref.is_valid()) {
+                            base_ref = arena.lookup_by_leaf(node.base_class);
                         }
                         if (base_ref.is_valid()) {
                             ct.set_base_class(base_ref);
