@@ -566,6 +566,11 @@ public:
             // Skip generic methods — their bodies contain unsubstituted
             // type parameters (T) that can't be resolved until monomorphization.
             if (method.func.is_generic()) { continue; }
+            // `this` resolves to the bare owner type (reference
+            // semantics — `&this` is transparent at expression level,
+            // like Rust's `&self`).  The pointer-vs-value distinction
+            // is handled at call sites during overload resolution via
+            // the implicit-convert pass (see `resolve_method_overload`).
             const method_this: TypeRef = if (method.is_static) {
                 TypeRef::invalid()
             } else {
@@ -994,6 +999,12 @@ public:
             return this.resolve_direct_call(callee as IdentifierNode*);
         }
         if (callee_node.kind == NodeKind::MemberAccess) {
+            // Run overload resolution first — tags `call.resolved_method`
+            // with the specific method declaration whose parameter types
+            // match the call args.  Codegen trusts this tag to pick the
+            // correct vtable slot for virtual dispatch; it's also the
+            // foundation for precise direct-call overload selection.
+            this.resolve_method_overload(call, callee as MemberAccessNode*);
             return this.resolve_method_call(callee as MemberAccessNode*);
         }
         if (callee_node.kind == NodeKind::ScopeResolution) {
@@ -1052,6 +1063,146 @@ public:
         this.ctx.emit_error(ErrorCode::E0202_UNDEFINED_FUNCTION,
             format("call to undefined function '%s' (in %s)", name, this.ctx.source_file));
         return TypeRef::invalid();
+    }
+
+    /// Tag the call with the specific method declaration chosen by
+    /// overload resolution.  Walks the receiver class's base chain
+    /// (leaf → root) looking for a method named `member.member` whose
+    /// declared parameter types match the call's argument types by
+    /// arena TypeRef ID (arena dedup makes this a real semantic equality
+    /// check, not a string compare).  First exact match wins — derived
+    /// overloads shadow base overloads with the same signature, which
+    /// mirrors C++'s name-hiding rule.  Leaves `call.resolved_method`
+    /// null on ambiguity or no-match so codegen can fall back cleanly.
+    resolve_method_overload(mut &this, call: CallExprNode*, member: MemberAccessNode*) -> void {
+        const obj_type: TypeRef = this.resolve_expr(member.object);
+        if (!obj_type.is_valid()) { return; }
+
+        // Unwrap Pointer / Reference / InstantiatedType to the concrete
+        // class so we can walk its method table.  `resolve_expr` has
+        // already populated every arg's `resolved_type` by the time we
+        // enter this function (resolve_call evaluates args first).
+        mut base_t: Type* = this.arena.lookup(obj_type.id);
+        mut unwrap_depth: i32 = 0;
+        while (base_t != null && unwrap_depth < 5) {
+            if (base_t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = base_t as PointerType*;
+                base_t = this.arena.lookup(pt.pointee.id);
+            } else if (base_t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = base_t as ReferenceType*;
+                base_t = this.arena.lookup(rt.referent.id);
+            } else if (base_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = base_t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { break; }
+                base_t = this.arena.lookup(inst.resolved_type.id);
+            } else {
+                break;
+            }
+            unwrap_depth = unwrap_depth + 1;
+        }
+        if (base_t == null || base_t.kind != TypeKind::Class) { return; }
+        const start_cls: ClassType* = base_t as ClassType*;
+
+        // Gather the call's arg TypeRefs.
+        mut arg_types: TypeRef[] = [];
+        for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+            const arg_expr: ExpressionNode* = call.arguments[ai];
+            if (arg_expr == null) { return; }
+            if (!arg_expr.resolved_type.is_valid()) { return; }
+            arg_types.push(arg_expr.resolved_type);
+        }
+
+        // Two-pass overload resolution over the leaf→root chain.  Pass 1
+        // picks exact arena-ID matches (the fast, unambiguous case — e.g.,
+        // `visit(LiteralNode*)` called with a `LiteralNode*` arg).  Pass 2
+        // accepts implicit-convert matches (e.g., derived-to-base pointer
+        // upcasts), which is what handles `node.accept(visitor)` where
+        // `visitor` is a concrete subclass passed as the base visitor
+        // parameter.  Exact matches win over conversions — if pass 1
+        // finds a match we never run pass 2.
+        mut walk: ClassType* = start_cls;
+        mut depth: i32 = 0;
+        while (walk != null && depth < 16) {
+            for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
+                const m: MethodInfo = walk.methods[mi];
+                if (!m.name.equals(member.member)) { continue; }
+                if (m.param_types.length != arg_types.length) { continue; }
+                mut exact: boolean = true;
+                for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
+                    if (m.param_types[pi].id != arg_types[pi].id) {
+                        exact = false;
+                        break;
+                    }
+                }
+                if (exact) {
+                    call.set_resolved_method(m.ast_node as ASTNode*);
+                    return;
+                }
+            }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const parent_t: Type* = this.arena.lookup(walk.base_class.id);
+            if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+            walk = parent_t as ClassType*;
+            depth = depth + 1;
+        }
+
+        // Pass 2: implicit-convert + take-address fallback.  Cryoc's
+        // `&this` reference semantics let value-typed self expressions
+        // be passed to pointer-typed parameters (implicit address-of),
+        // matching the way cryoc's stdlib/compiler is written: inside
+        // a `&this` method, `this` has the bare class type, but method
+        // call sites like `visitor.visit(this)` forward it to params
+        // declared as `T*`.  We accept both `can_implicit_convert` (for
+        // pointer-to-pointer hierarchy upcasts, int widening, etc.)
+        // and a narrow take-address match (arg `T` → param `Pointer<T>`
+        // or `Reference<T>`).
+        walk = start_cls;
+        depth = 0;
+        while (walk != null && depth < 16) {
+            for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
+                const m: MethodInfo = walk.methods[mi];
+                if (!m.name.equals(member.member)) { continue; }
+                if (m.param_types.length != arg_types.length) { continue; }
+                mut compat: boolean = true;
+                for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
+                    if (this.checker.can_implicit_convert(
+                        arg_types[pi], m.param_types[pi])) {
+                        continue;
+                    }
+                    // Take-address: arg is bare T, param is Pointer<T>
+                    // or Reference<T>.  Compare by arena ID so the
+                    // match is canonical, not string-based.
+                    const pt: Type* = this.arena.lookup(m.param_types[pi].id);
+                    if (pt != null) {
+                        mut pointee: TypeRef = TypeRef::invalid();
+                        if (pt.kind == TypeKind::Pointer) {
+                            const ptr: PointerType* = pt as PointerType*;
+                            pointee = ptr.pointee;
+                        } else if (pt.kind == TypeKind::Reference) {
+                            const rt: ReferenceType* = pt as ReferenceType*;
+                            pointee = rt.referent;
+                        }
+                        if (pointee.is_valid() && pointee.id == arg_types[pi].id) {
+                            continue;
+                        }
+                    }
+                    compat = false;
+                    break;
+                }
+                if (compat) {
+                    call.set_resolved_method(m.ast_node as ASTNode*);
+                    return;
+                }
+            }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const parent_t: Type* = this.arena.lookup(walk.base_class.id);
+            if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+            walk = parent_t as ClassType*;
+            depth = depth + 1;
+        }
+        // Still no match — leave resolved_method null; codegen falls
+        // back to direct (non-virtual) dispatch via the usual name-based
+        // lookup paths.
     }
 
     resolve_method_call(mut &this, member: MemberAccessNode*) -> TypeRef {
