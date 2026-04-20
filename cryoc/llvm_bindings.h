@@ -241,6 +241,7 @@ LLVMBuilderRef LLVMCreateBuilder(void);
 LLVMBuilderRef LLVMCreateBuilderInContext(LLVMContextRef C);
 void           LLVMDisposeBuilder(LLVMBuilderRef Builder);
 void           LLVMPositionBuilderAtEnd(LLVMBuilderRef Builder, LLVMBasicBlockRef Block);
+void           LLVMPositionBuilderBefore(LLVMBuilderRef Builder, LLVMValueRef Instr);
 LLVMBasicBlockRef LLVMGetInsertBlock(LLVMBuilderRef Builder);
 
 

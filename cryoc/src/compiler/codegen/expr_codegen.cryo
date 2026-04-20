@@ -182,8 +182,11 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             mut rhs_tag: LValue = rhs_val;
             // Check if this is an ADT enum (struct type in LLVM) or simple (i32).
             const lhs_llvm_ty: void* = llvm::LLVMTypeOf(lhs_val.raw);
-            if (lhs_llvm_ty != null && llvm::LLVMGetTypeKind(lhs_llvm_ty) == 13) {
-                // LLVMStructTypeKind = 13 — extract tag at index 0.
+            if (lhs_llvm_ty != null && llvm::LLVMGetTypeKind(lhs_llvm_ty) == 10) {
+                // LLVMStructTypeKind = 10 — extract tag at index 0.
+                // (13 is LLVMVectorTypeKind; the old constant was wrong,
+                // which made every ADT-enum `==` compare full structs
+                // and fail `icmp requires integer operands` at verify.)
                 lhs_tag = cg.builder.build_extract_value(lhs_val, 0, "lhs.tag");
                 rhs_tag = cg.builder.build_extract_value(rhs_val, 0, "rhs.tag");
             }
@@ -764,13 +767,13 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
         return;
     }
 
-    // String indexing (`s[i]`) — treat the string as an `i8*` at the LLVM
-    // level and produce a `char` (i32) result, matching sema's rule that
-    // `string[i] -> char`.  Without this, every `string`-indexing pattern
-    // (`s[i] == '_'`, `c = s[i]`, ...) feeds a null LValue into the next
-    // operator and breaks any enclosing expression, often the RHS of a
-    // short-circuit `&&`/`||` — which then invalidates the phi in the
-    // merge block.
+    // String indexing (`s[i]`) — treat the string as `i8*` at the LLVM
+    // level.  Return the byte's address as an lvalue so it can be used
+    // on both sides of an assignment (`c = s[i]` AND `s[i] = c`).  The
+    // `char` (i32) vs byte (i8) size mismatch is resolved by the callers
+    // (`codegen_rvalue` load-and-zext for reads, the assignment path
+    // trunc-and-store for writes — both look for the `TypeKind::String`
+    // source type to detect this case).
     if (t.kind == TypeKind::String) {
         if (!array_val.is_valid() || !index_val.is_valid()) {
             *out_value = LValue::null();
@@ -779,21 +782,14 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
         }
         const i8_ty: LType = LType::i8();
         const i8_ptr_ty: LType = LType::pointer_to(i8_ty);
-        // Load the raw char-ptr: strings are stored as an `i8*` in the
-        // slot/alloca `array_val` points at.
         const data_ptr: LValue = cg.builder.build_load(i8_ptr_ty, array_val, "strptr");
         const buf: void* = malloc(8);
         const slots: void** = buf as void**;
         slots[0] = index_val.raw;
         const byte_ptr: LValue = cg.builder.build_gep(i8_ty, data_ptr, buf, 1, "charptr");
         free(buf);
-        // Load the byte and zero-extend to i32 (char).  We surface the
-        // result as an rvalue — taking `&s[i]` would land on the i8 slot,
-        // but cryoc doesn't support mutating through a string index.
-        const byte_val: LValue = cg.builder.build_load(i8_ty, byte_ptr, "charbyte");
-        const char_val: LValue = cg.builder.build_zext(byte_val, LType::i32(), "char");
-        *out_value = char_val;
-        *out_is_lvalue = false;
+        *out_value = byte_ptr;
+        *out_is_lvalue = true;
         return;
     }
 

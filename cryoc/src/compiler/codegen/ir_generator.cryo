@@ -804,6 +804,24 @@ public:
         this.generate_expression(expr);
 
         if (this.last_is_lvalue && this.last_value.is_valid()) {
+            // String-index special case: char is i32 but string storage
+            // is i8 per byte.  `codegen_array_access` returns the byte's
+            // i8* as lvalue; here we do the i8-load-and-zext so the
+            // value has the expected char/i32 type.  Generic map_type
+            // load would read 4 bytes from an i8 slot (walking into
+            // neighbouring bytes), which is wrong.
+            if (expr.kind == NodeKind::ArrayAccess) {
+                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+                const arr_t: Type* = this.cg.lookup_type_by_id(aa.array.resolved_type.id);
+                if (arr_t != null && arr_t.kind == TypeKind::String) {
+                    const byte: LValue = this.cg.builder.build_load(
+                        LType::i8(), this.last_value, "charbyte");
+                    this.last_value = this.cg.builder.build_zext(
+                        byte, LType::i32(), "char");
+                    this.last_is_lvalue = false;
+                    return this.last_value;
+                }
+            }
             const ty: LType = this.cg.type_mapper.map_type(expr.resolved_type);
             if (ty.is_valid()) {
                 const loaded: LValue = this.cg.builder.build_load(ty, this.last_value, "load");
@@ -857,10 +875,66 @@ public:
                                  idx, &this.last_value, &this.last_is_lvalue);
         } else if (kind == NodeKind::CastExpression) {
             const cast_node: CastExprNode* = expr as CastExprNode*;
-            const val: LValue = this.codegen_rvalue(cast_node.expression);
-            codegen_cast(this.cg, val, cast_node.expression.resolved_type,
-                         cast_node.resolved_target, &this.last_value);
-            this.last_is_lvalue = false;
+            const src_t: Type* = this.cg.lookup_type_by_id(cast_node.expression.resolved_type.id);
+            const dst_t: Type* = this.cg.lookup_type_by_id(cast_node.resolved_target.id);
+            const dst_is_ptr_like: boolean = dst_t != null &&
+                (dst_t.kind == TypeKind::Pointer || dst_t.kind == TypeKind::String);
+
+            if (src_t != null && dst_t != null &&
+                dst_t.kind == TypeKind::Pointer &&
+                (src_t.kind == TypeKind::Class || src_t.kind == TypeKind::Struct)) {
+                // Class/Struct value → Pointer: reference upcast.  The
+                // object's lvalue is already a pointer to storage;
+                // pointer-cast it to the target pointer type.  Avoids
+                // the illegal `bitcast %struct to ptr` that would
+                // otherwise come out of the generic cast path.
+                const addr: LValue = this.codegen_lvalue(cast_node.expression);
+                const dst_lty: LType = this.cg.type_mapper.map_type(cast_node.resolved_target);
+                if (addr.is_valid() && dst_lty.is_valid()) {
+                    this.last_value = this.cg.builder.build_pointer_cast(
+                        addr, dst_lty, "upcast");
+                } else {
+                    this.last_value = addr;
+                }
+                this.last_is_lvalue = false;
+            } else if (src_t != null && dst_is_ptr_like &&
+                       src_t.kind == TypeKind::Array) {
+                // Array → Pointer / String: extract the data-pointer
+                // field from the fat-pointer `{ptr, i64}` struct.
+                // Fixed arrays (`[N x T]`) don't have a fat pointer —
+                // their lvalue is already a pointer to the storage, so
+                // pointer-cast that directly.  For dynamic arrays we
+                // need an explicit extract to avoid the illegal
+                // `bitcast { ptr, i64 } to ptr` that the generic path
+                // emits.
+                const arr_t: ArrayType* = src_t as ArrayType*;
+                const dst_lty: LType = this.cg.type_mapper.map_type(cast_node.resolved_target);
+                if (arr_t.is_fixed()) {
+                    const addr: LValue = this.codegen_lvalue(cast_node.expression);
+                    if (addr.is_valid() && dst_lty.is_valid()) {
+                        this.last_value = this.cg.builder.build_pointer_cast(
+                            addr, dst_lty, "arrcast");
+                    } else {
+                        this.last_value = addr;
+                    }
+                } else {
+                    const val: LValue = this.codegen_rvalue(cast_node.expression);
+                    const data_ptr: LValue = this.cg.builder.build_extract_value(
+                        val, 0, "arrdata");
+                    if (data_ptr.is_valid() && dst_lty.is_valid()) {
+                        this.last_value = this.cg.builder.build_pointer_cast(
+                            data_ptr, dst_lty, "arrcast");
+                    } else {
+                        this.last_value = data_ptr;
+                    }
+                }
+                this.last_is_lvalue = false;
+            } else {
+                const val: LValue = this.codegen_rvalue(cast_node.expression);
+                codegen_cast(this.cg, val, cast_node.expression.resolved_type,
+                             cast_node.resolved_target, &this.last_value);
+                this.last_is_lvalue = false;
+            }
         } else if (kind == NodeKind::SizeofExpression) {
             const sz: SizeofExprNode* = expr as SizeofExprNode*;
             const type_ref: TypeRef = this.lookup_type(sz.type_name);
@@ -919,7 +993,18 @@ public:
                 this.last_is_lvalue = false;
                 return;
             }
-            this.cg.builder.build_store(val, addr);
+            // String-index special case: the lvalue is an i8* but the
+            // char rvalue is i32 — truncate before storing.  Mirrors
+            // the load-and-zext path on the read side.
+            mut store_val: LValue = val;
+            if (node.left.kind == NodeKind::ArrayAccess) {
+                const aa: ArrayAccessNode* = node.left as ArrayAccessNode*;
+                const arr_t: Type* = this.cg.lookup_type_by_id(aa.array.resolved_type.id);
+                if (arr_t != null && arr_t.kind == TypeKind::String) {
+                    store_val = this.cg.builder.build_trunc(val, LType::i8(), "chartrunc");
+                }
+            }
+            this.cg.builder.build_store(store_val, addr);
             this.last_value = val;
             this.last_is_lvalue = false;
             return;
@@ -1525,6 +1610,20 @@ public:
 
     /// Array literal — direct dispatch.
     visit_array_literal(mut &this, node: ArrayLiteralNode*) -> void {
+        // Fill form `[value; N]` — single element repeated N times.  Needs
+        // its own codegen path: allocate the backing storage, run a fill
+        // loop writing the value at every slot, and (for dynamic arrays)
+        // wire up the fat-pointer struct.  The element-form path below
+        // would write only slot 0 and GEP as if the alloca's outer type
+        // were a flat array, which is wrong for both fixed `[N x T]`
+        // alloca shapes and dynamic `{T*, i64}` fat pointers.
+        const is_fill: boolean = (node.repeat_count > 0 || node.repeat_count_expr != null)
+                                 && node.elements.length == 1;
+        if (is_fill) {
+            this.visit_fill_array_literal(node);
+            return;
+        }
+
         const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         if (!ty.is_valid()) {
             printf("[IRGen] WARNING: array literal — failed to map type\n"); fflush(null);
@@ -1557,6 +1656,218 @@ public:
 
         this.last_value = alloca;
         this.last_is_lvalue = true;
+    }
+
+    /// Emit codegen for `[value; N]` — fill form.  N may be a compile-time
+    /// constant (fixed array) or a runtime expression (dynamic array).
+    visit_fill_array_literal(mut &this, node: ArrayLiteralNode*) -> void {
+        const arr_t_raw: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+        if (arr_t_raw == null || arr_t_raw.kind != TypeKind::Array) {
+            printf("[IRGen] WARNING: fill array — resolved_type isn't Array\n"); fflush(null);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        const arr_type: ArrayType* = arr_t_raw as ArrayType*;
+        const elem_ty: LType = this.cg.type_mapper.map_type(arr_type.element);
+        if (!elem_ty.is_valid()) {
+            printf("[IRGen] WARNING: fill array — failed to map element type\n"); fflush(null);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        const current_fn: LValue = this.get_current_function();
+        if (!current_fn.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // Compute count as i64.  Either from the static `repeat_count`
+        // field or by evaluating `repeat_count_expr` and widening.
+        mut count_val: LValue = LValue::null();
+        if (node.repeat_count_expr != null) {
+            const raw: LValue = this.codegen_rvalue(node.repeat_count_expr);
+            if (raw.is_valid()) {
+                const raw_ty: void* = llvm::LLVMTypeOf(raw.raw);
+                if (raw_ty != null && llvm::LLVMGetTypeKind(raw_ty) == 8) {
+                    const width: u32 = llvm::LLVMGetIntTypeWidth(raw_ty);
+                    if (width < 64) {
+                        count_val = this.cg.builder.build_zext(raw, LType::i64(), "cnt.widen");
+                    } else if (width > 64) {
+                        count_val = this.cg.builder.build_trunc(raw, LType::i64(), "cnt.trunc");
+                    } else {
+                        count_val = raw;
+                    }
+                } else {
+                    count_val = raw;
+                }
+            }
+        } else {
+            count_val = LType::const_int(LType::i64(), node.repeat_count as u64, false);
+        }
+        if (!count_val.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // Compute the fill value.  Coerce the RHS integer width to match
+        // the element type — common case: `[0; N]` for `i8[]` where 0 is
+        // an i32 literal and slots want i8.
+        mut fill_val: LValue = this.codegen_rvalue(node.elements[0]);
+        if (fill_val.is_valid()) {
+            const fill_llvm_ty: void* = llvm::LLVMTypeOf(fill_val.raw);
+            if (fill_llvm_ty != null &&
+                llvm::LLVMGetTypeKind(fill_llvm_ty) == 8 &&
+                llvm::LLVMGetTypeKind(elem_ty.raw) == 8) {
+                const fw: u32 = llvm::LLVMGetIntTypeWidth(fill_llvm_ty);
+                const ew: u32 = llvm::LLVMGetIntTypeWidth(elem_ty.raw);
+                if (fw < ew) {
+                    fill_val = this.cg.builder.build_zext(fill_val, elem_ty, "fill.widen");
+                } else if (fw > ew) {
+                    fill_val = this.cg.builder.build_trunc(fill_val, elem_ty, "fill.trunc");
+                }
+            }
+        }
+
+        if (arr_type.is_fixed()) {
+            // Fixed `[value; N]` where N is a compile-time constant.
+            // Alloca `[N x T]` and fill loop.  `gep_element_type` is T;
+            // GEP needs `[N x T]` + indices `[0, i]` to land on slot i.
+            const arr_lty: LType = LType::array_of(elem_ty, arr_type.size as u32);
+            const alloca: LValue = this.cg.create_entry_alloca(current_fn, "arrlit", arr_lty);
+            this.emit_fill_loop_indexed(current_fn, arr_lty, alloca,
+                                         elem_ty, fill_val, count_val);
+            this.last_value = alloca;
+            this.last_is_lvalue = true;
+        } else {
+            // Dynamic `{T*, i64}` fat pointer.  Alloca the struct, malloc
+            // a buffer of `count * sizeof(T)` bytes, fill it, then store
+            // the (data_ptr, count) into the fat pointer.
+            const fat_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+            const fat: LValue = this.cg.create_entry_alloca(current_fn, "arrlit", fat_ty);
+
+            const elem_t: Type* = this.cg.lookup_type_by_id(arr_type.element.id);
+            mut elem_size: u64 = 1;
+            if (elem_t != null && elem_t.size_bytes() > 0) {
+                elem_size = elem_t.size_bytes();
+            }
+            const elem_size_val: LValue = LType::const_int(LType::i64(), elem_size, false);
+            const byte_count: LValue = this.cg.builder.build_mul(
+                count_val, elem_size_val, "bytecnt");
+
+            const malloc_fn: LValue = this.cg.llvm_module.get_named_function("malloc");
+            if (!malloc_fn.is_valid()) {
+                printf("[IRGen] WARNING: fill array — malloc not declared\n"); fflush(null);
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
+            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+            mut malloc_args: LValue[] = [];
+            malloc_args.push(byte_count);
+            mut data_ptr: LValue = LValue::null();
+            codegen_call(this.cg, malloc_fn, malloc_ty, malloc_args, "filldata", &data_ptr);
+            if (!data_ptr.is_valid()) {
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
+
+            this.emit_fill_loop_raw(current_fn, elem_ty, data_ptr, fill_val, count_val);
+
+            const ptr_slot: LValue = this.cg.builder.build_struct_gep(
+                fat_ty, fat, 0, "fat.ptr");
+            this.cg.builder.build_store(data_ptr, ptr_slot);
+            const len_slot: LValue = this.cg.builder.build_struct_gep(
+                fat_ty, fat, 1, "fat.len");
+            this.cg.builder.build_store(count_val, len_slot);
+
+            this.last_value = fat;
+            this.last_is_lvalue = true;
+        }
+    }
+
+    /// Fill `[N x T]`-typed storage by looping through indices [0..count)
+    /// and storing `fill_val` at each slot via a two-index GEP.
+    emit_fill_loop_indexed(mut &this, current_fn: LValue, arr_ty: LType,
+                            base: LValue, elem_ty: LType,
+                            fill_val: LValue, count_val: LValue) -> void {
+        const cond_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.cond");
+        const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.body");
+        const end_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.end");
+
+        // Alloca the counter in the CURRENT block, not via create_entry_alloca.
+        // The entry block may already hold allocas for preceding locals and
+        // is about to get its `br cond_bb` terminator; inserting another
+        // alloca via `position_at_end(entry)` after we've emitted a
+        // terminator there lands the instruction after the terminator and
+        // breaks the block.  Inline alloca keeps the block well-formed and
+        // LLVM still optimizes it correctly.
+        const i_slot: LValue = this.cg.builder.build_alloca(LType::i64(), "fill.i");
+        this.cg.builder.build_store(
+            LType::const_int(LType::i64(), 0, false), i_slot);
+        this.cg.builder.build_br(cond_bb);
+
+        this.cg.builder.position_at_end(cond_bb);
+        const cur: LValue = this.cg.builder.build_load(LType::i64(), i_slot, "fill.cur");
+        const done: LValue = this.cg.builder.build_icmp(35, cur, count_val, "fill.done");
+        this.cg.builder.build_cond_br(done, end_bb, body_bb);
+
+        this.cg.builder.position_at_end(body_bb);
+        const buf: void* = malloc(16);
+        const buf_arr: void** = buf as void**;
+        buf_arr[0] = LType::const_int(LType::i64(), 0, false).raw;
+        buf_arr[1] = cur.raw;
+        const slot: LValue = this.cg.builder.build_gep(arr_ty, base, buf, 2, "fill.slot");
+        free(buf);
+        if (fill_val.is_valid() && slot.is_valid()) {
+            this.cg.builder.build_store(fill_val, slot);
+        }
+        const one: LValue = LType::const_int(LType::i64(), 1, false);
+        const nxt: LValue = this.cg.builder.build_add(cur, one, "fill.nxt");
+        this.cg.builder.build_store(nxt, i_slot);
+        this.cg.builder.build_br(cond_bb);
+
+        this.cg.builder.position_at_end(end_bb);
+    }
+
+    /// Fill a raw element-typed pointer (dynamic buffer from malloc) by
+    /// looping through indices [0..count) with a single-index GEP.
+    emit_fill_loop_raw(mut &this, current_fn: LValue, elem_ty: LType,
+                        base: LValue, fill_val: LValue, count_val: LValue) -> void {
+        const cond_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.cond");
+        const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.body");
+        const end_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.end");
+
+        // See `emit_fill_loop_indexed` above for why this alloca goes in
+        // the current block, not via `create_entry_alloca`.
+        const i_slot: LValue = this.cg.builder.build_alloca(LType::i64(), "fill.i");
+        this.cg.builder.build_store(
+            LType::const_int(LType::i64(), 0, false), i_slot);
+        this.cg.builder.build_br(cond_bb);
+
+        this.cg.builder.position_at_end(cond_bb);
+        const cur: LValue = this.cg.builder.build_load(LType::i64(), i_slot, "fill.cur");
+        const done: LValue = this.cg.builder.build_icmp(35, cur, count_val, "fill.done");
+        this.cg.builder.build_cond_br(done, end_bb, body_bb);
+
+        this.cg.builder.position_at_end(body_bb);
+        const buf: void* = malloc(8);
+        const buf_arr: void** = buf as void**;
+        buf_arr[0] = cur.raw;
+        const slot: LValue = this.cg.builder.build_gep(elem_ty, base, buf, 1, "fill.slot");
+        free(buf);
+        if (fill_val.is_valid() && slot.is_valid()) {
+            this.cg.builder.build_store(fill_val, slot);
+        }
+        const one: LValue = LType::const_int(LType::i64(), 1, false);
+        const nxt: LValue = this.cg.builder.build_add(cur, one, "fill.nxt");
+        this.cg.builder.build_store(nxt, i_slot);
+        this.cg.builder.build_br(cond_bb);
+
+        this.cg.builder.position_at_end(end_bb);
     }
 
     /// Scope resolution — direct dispatch.
