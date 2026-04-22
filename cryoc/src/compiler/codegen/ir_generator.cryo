@@ -1815,7 +1815,7 @@ public:
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 
-            const malloc_fn: LValue = this.cg.llvm_module.get_named_function("malloc");
+            const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
             if (!malloc_fn.is_valid()) {
                 printf("[IRGen] WARNING: dynamic array literal — malloc not declared\n"); fflush(null);
                 this.last_value = LValue::null();
@@ -1958,7 +1958,7 @@ public:
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 
-            const malloc_fn: LValue = this.cg.llvm_module.get_named_function("malloc");
+            const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
             if (!malloc_fn.is_valid()) {
                 printf("[IRGen] WARNING: fill array — malloc not declared\n"); fflush(null);
                 this.last_value = LValue::null();
@@ -2285,7 +2285,13 @@ public:
             // by return/break). Every predecessor of merge_bb needs a phi entry.
             if (!arm_terminated && arm_end.is_valid()) {
                 if (arm_val.is_valid()) {
-                    phi_vals_arr[phi_count] = arm_val.raw;
+                    // LLVM requires all phi operands to have the phi's result
+                    // type.  Arms often produce narrower (or otherwise convertible)
+                    // values than the declared match type — e.g. a `Result<i32,_>`
+                    // payload bound to `fd` in one arm vs a widened integer in
+                    // another.  Widen/narrow/inttoptr as needed before adding.
+                    phi_vals_arr[phi_count] = coerce_to_phi_type(
+                        this.cg, arm_val, result_ty).raw;
                 } else if (result_ty.is_valid()) {
                     // Arm produced no value — use undef as placeholder.
                     phi_vals_arr[phi_count] = llvm::LLVMGetUndef(result_ty.raw);
@@ -2393,7 +2399,7 @@ public:
             return;
         }
 
-        const malloc_fn: LValue = this.cg.llvm_module.get_named_function("malloc");
+        const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
         if (!malloc_fn.is_valid()) {
             printf("[IRGen] WARNING: new — malloc not declared\n"); fflush(null);
             this.cg.ctx.emit_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
@@ -2507,7 +2513,7 @@ public:
     /// Delete expression (heap free) — direct dispatch.
     visit_delete_expr(mut &this, node: DeleteExprNode*) -> void {
         const ptr: LValue = this.codegen_rvalue(node.operand);
-        const free_fn: LValue = this.cg.llvm_module.get_named_function("free");
+        const free_fn: LValue = resolve_function(this.cg, this.cg.intern_str("free"));
         if (free_fn.is_valid() && ptr.is_valid()) {
             const void_ptr: LValue = this.cg.builder.build_pointer_cast(
                 ptr, LType::pointer_to(LType::i8()), "delcast");
@@ -2650,4 +2656,55 @@ public:
         // Load and return the complete enum value.
         return this.cg.builder.build_load(enum_llvm, alloca, "enum.val");
     }
+}
+
+
+// ============================================================================
+// Phi-operand coercion
+// ============================================================================
+
+/// Coerce `val` to match `expected` for use as a phi-node operand.  LLVM
+/// requires every phi incoming to have the phi's result type exactly, and
+/// match arms routinely produce differently-sized integers (e.g. an i32
+/// payload binding in one arm vs an i64 literal in another, both feeding a
+/// phi typed by the outer `const x: i64 =` declaration).  Mirrors the
+/// widening/narrowing logic in `coerce_return_value`; returns the original
+/// value when no cheap conversion applies.  LLVM kind codes: 0=void, 8=int,
+/// 10=struct, 12=pointer.
+function coerce_to_phi_type(cg: CodegenContext*, val: LValue,
+                             expected: LType) -> LValue {
+    if (!val.is_valid() || !expected.is_valid()) { return val; }
+
+    // NB: do NOT compare `void*`-typed LLVMTypeRef values with `==` — the
+    // C++ Cryo bootstrap compiler lowers that to strcmp, which returns
+    // "equal" for structurally-different types and short-circuits the
+    // coercion path.  Dispatch on kind + width instead.
+    const got_ty: void* = llvm::LLVMTypeOf(val.raw);
+    const want_ty: void* = expected.raw;
+    const gk: i32 = llvm::LLVMGetTypeKind(got_ty);
+    const wk: i32 = llvm::LLVMGetTypeKind(want_ty);
+
+    // int ↔ int: widen or narrow.
+    if (gk == 8 && wk == 8) {
+        const gw: u32 = llvm::LLVMGetIntTypeWidth(got_ty);
+        const ww: u32 = llvm::LLVMGetIntTypeWidth(want_ty);
+        if (gw == ww) { return val; }
+        if (gw < ww) {
+            return cg.builder.build_zext(val, expected, "mexpr.widen");
+        }
+        return cg.builder.build_trunc(val, expected, "mexpr.trunc");
+    }
+
+    // int → ptr / ptr → int — match the `coerce_return_value` conventions.
+    if (gk == 8 && wk == 12) {
+        return LValue { raw: llvm::LLVMBuildIntToPtr(cg.builder.raw, val.raw, want_ty, "mexpr.i2p") };
+    }
+    if (gk == 12 && wk == 8) {
+        return LValue { raw: llvm::LLVMBuildPtrToInt(cg.builder.raw, val.raw, want_ty, "mexpr.p2i") };
+    }
+
+    // Same-kind struct/ptr/etc with different SHAPE is not safely
+    // convertible at this level — return as-is and let LLVM verification
+    // surface the mismatch.
+    return val;
 }
