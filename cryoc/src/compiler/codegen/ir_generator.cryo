@@ -32,6 +32,8 @@ import Compiler::AST::Pattern;
 import Compiler::Lex;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
+import Compiler::Resolver::QualifiedName;
+import Compiler::Resolver::MangledName;
 
 
 // ============================================================================
@@ -493,34 +495,46 @@ public:
                     matched = true;
                     break;
                 } else if (pat.pattern_kind == PatternKind::Literal) {
-                    // Literal pattern: compare subject == literal value.
-                    const pat_val: LValue = this.codegen_pattern_value(pat);
-                    if (pat_val.is_valid()) {
-                        mut cmp: LValue = LValue::null();
-                        if (is_string_subj) {
-                            codegen_string_compare(this.cg, subject, pat_val,
-                                TokenType::EqualEqual, &cmp);
-                        } else {
+                    // For string subjects, build the pattern as a global
+                    // string pointer and compare via strcmp.  The default
+                    // `codegen_pattern_value` treats every literal as an
+                    // `atoi`-parsed i32 which is correct for int/char
+                    // matches but produces `const i32 0` for any string
+                    // pattern — neither typed nor useful for content
+                    // comparison against a string subject.
+                    mut cmp: LValue = LValue::null();
+                    if (is_string_subj) {
+                        const pat_text: string = this.cg.resolve(pat.value);
+                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
+                        codegen_string_compare(this.cg, subject, pat_val,
+                            TokenType::EqualEqual, &cmp);
+                    } else {
+                        const pat_val: LValue = this.codegen_pattern_value(pat);
+                        if (pat_val.is_valid()) {
                             cmp = this.cg.builder.build_icmp(
                                 32, subject, pat_val, "match.cmp");
                         }
+                    }
+                    if (cmp.is_valid()) {
                         this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
                         matched = true;
                         break;
                     }
                 } else if (pat.pattern_kind == PatternKind::Identifier) {
-                    // Identifier pattern: enum variant or named constant.
-                    // Treat as a literal comparison (the value is the enum discriminant).
-                    const pat_val: LValue = this.codegen_pattern_value(pat);
-                    if (pat_val.is_valid()) {
-                        mut cmp: LValue = LValue::null();
-                        if (is_string_subj) {
-                            codegen_string_compare(this.cg, subject, pat_val,
-                                TokenType::EqualEqual, &cmp);
-                        } else {
+                    mut cmp: LValue = LValue::null();
+                    if (is_string_subj) {
+                        const pat_text: string = this.cg.resolve(pat.value);
+                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
+                        codegen_string_compare(this.cg, subject, pat_val,
+                            TokenType::EqualEqual, &cmp);
+                    } else {
+                        const pat_val: LValue = this.codegen_pattern_value(pat);
+                        if (pat_val.is_valid()) {
                             cmp = this.cg.builder.build_icmp(
                                 32, subject, pat_val, "match.cmp");
                         }
+                    }
+                    if (cmp.is_valid()) {
                         this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
                         matched = true;
                         break;
@@ -837,6 +851,20 @@ public:
                         LType::i8(), this.last_value, "charbyte");
                     this.last_value = this.cg.builder.build_zext(
                         byte, LType::i32(), "char");
+                    this.last_is_lvalue = false;
+                    return this.last_value;
+                }
+            }
+            // Variadic bucket: `args` in a variadic function body is
+            // bound to a `[24 x i8]` va_list alloca.  When referenced
+            // as an rvalue (e.g., forwarded to `vformat(fmt, args)`),
+            // return the alloca pointer directly rather than loading
+            // — loading the raw [24 x i8] array value isn't meaningful
+            // for va_list forwarding, which always takes a pointer.
+            if (expr.kind == NodeKind::Identifier) {
+                const ident: IdentifierNode* = expr as IdentifierNode*;
+                if (this.cg.current_variadic_arg_id != 0 &&
+                    ident.name.id == this.cg.current_variadic_arg_id) {
                     this.last_is_lvalue = false;
                     return this.last_value;
                 }
@@ -1448,7 +1476,53 @@ public:
             // `total_params` registration key.
             const ma_arity: u32 = (node.arguments.length + 1) as u32;
 
-            if (type_sym.is_valid()) {
+            // Strategy 0: if sema resolved the overload, compute the exact
+            // mangled name from the method's declared param types and look
+            // it up directly.  This is the only strategy that disambiguates
+            // overloads like `String::push(string)` vs `String::push(String)`
+            // — the arity-keyed lookup collapses them to whichever was
+            // registered first.
+            if (node.resolved_method != null) {
+                const rm: MethodNode* = node.resolved_method as MethodNode*;
+                if (rm != null && rm.func != null) {
+                    const rm_fn: FunctionDeclNode* = rm.func;
+                    mut owner_str: string = "";
+                    if (type_sym.is_valid()) {
+                        owner_str = intern.resolve(type_sym);
+                    } else if (t != null) {
+                        if (t.kind == TypeKind::Struct) {
+                            const ost: StructType* = t as StructType*;
+                            owner_str = intern.resolve(ost.qualified_name);
+                        } else if (t.kind == TypeKind::Class) {
+                            const oct: ClassType* = t as ClassType*;
+                            owner_str = intern.resolve(oct.qualified_name);
+                        }
+                    }
+                    if (strlen(owner_str) > 0) {
+                        const arena_ptr: TypeArena* = this.cg.get_arena();
+                        const type_qn: QualifiedName = QualifiedName::single(intern, owner_str);
+                        const type_mn: MangledName = MangledName::from_qualified(intern, type_qn);
+                        mut pd: string[] = [];
+                        const this_amp: SymbolStr = intern.intern("&this");
+                        const this_val: SymbolStr = intern.intern("this");
+                        for (mut pi: i64 = 0; pi < rm_fn.parameters.length; pi++) {
+                            const pp: VarDeclNode* = rm_fn.parameters[pi];
+                            if (pp == null) { continue; }
+                            if (pp.name.equals(this_amp)) { continue; }
+                            if (pp.name.equals(this_val)) { continue; }
+                            if (pp.resolved_type.is_valid()) {
+                                const pt: Type* = arena_ptr.lookup(pp.resolved_type.id);
+                                if (pt != null) { pd.push(pt.display_name()); }
+                            }
+                        }
+                        const mn: MangledName = MangledName::for_method(
+                            intern, type_mn, method_str, pd);
+                        callee_val = this.cg.get_function(mn.value);
+                    }
+                }
+            }
+
+            if (!callee_val.is_valid() && type_sym.is_valid()) {
                 const type_str: string = intern.resolve(type_sym);
                 const combined: string = format("%s::%s", type_str, method_str);
                 const sym: SymbolStr = intern.intern(combined);
@@ -1650,6 +1724,20 @@ public:
             return;
         }
 
+        const arr_t_raw: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+        mut is_dynamic: boolean = false;
+        mut arr_type_ptr: ArrayType* = null;
+        if (arr_t_raw != null && arr_t_raw.kind == TypeKind::Array) {
+            arr_type_ptr = arr_t_raw as ArrayType*;
+            if (!arr_type_ptr.is_fixed()) {
+                is_dynamic = true;
+            }
+        }
+        if (is_dynamic) {
+            this.visit_dynamic_array_literal(node, arr_type_ptr);
+            return;
+        }
+
         const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         if (!ty.is_valid()) {
             printf("[IRGen] WARNING: array literal — failed to map type\n"); fflush(null);
@@ -1681,6 +1769,93 @@ public:
         }
 
         this.last_value = alloca;
+        this.last_is_lvalue = true;
+    }
+
+    /// Emit element-form `[a, b, c]` where the expected type is a dynamic
+    /// array `T[]` (fat pointer `{T*, i64}`).  Malloc a buffer for N elements,
+    /// store each element into it, then stash (data, len) into the fat
+    /// pointer alloca.  Without this path, we'd alloca `[N x T]` and hand
+    /// back a fixed-size array to a caller expecting `{ptr, i64}`, failing
+    /// LLVM verification.
+    visit_dynamic_array_literal(mut &this, node: ArrayLiteralNode*,
+                                 arr_type: ArrayType*) -> void {
+        const elem_ty: LType = this.cg.type_mapper.map_type(arr_type.element);
+        if (!elem_ty.is_valid()) {
+            printf("[IRGen] WARNING: dynamic array literal — failed to map element type\n"); fflush(null);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        const current_fn: LValue = this.get_current_function();
+        if (!current_fn.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        const fat_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        if (!fat_ty.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        const fat: LValue = this.cg.create_entry_alloca(current_fn, "arrlit", fat_ty);
+
+        const count: i64 = node.elements.length;
+        const count_val: LValue = LType::const_int(LType::i64(), count as u64, false);
+
+        mut data_ptr: LValue = LValue::null();
+        if (count > 0) {
+            const elem_t: Type* = this.cg.lookup_type_by_id(arr_type.element.id);
+            mut elem_size: u64 = 1;
+            if (elem_t != null && elem_t.size_bytes() > 0) {
+                elem_size = elem_t.size_bytes();
+            }
+            const elem_size_val: LValue = LType::const_int(LType::i64(), elem_size, false);
+            const byte_count: LValue = this.cg.builder.build_mul(
+                count_val, elem_size_val, "bytecnt");
+
+            const malloc_fn: LValue = this.cg.llvm_module.get_named_function("malloc");
+            if (!malloc_fn.is_valid()) {
+                printf("[IRGen] WARNING: dynamic array literal — malloc not declared\n"); fflush(null);
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
+            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+            mut malloc_args: LValue[] = [];
+            malloc_args.push(byte_count);
+            codegen_call(this.cg, malloc_fn, malloc_ty, malloc_args, "arrdata", &data_ptr);
+            if (!data_ptr.is_valid()) {
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
+
+            for (mut i: i64 = 0; i < count; i++) {
+                const elem: LValue = this.codegen_rvalue(node.elements[i]);
+                if (!elem.is_valid()) { continue; }
+                const idx: LValue = LType::const_int(LType::i64(), i as u64, false);
+                const buf: void* = malloc(8);
+                const buf_arr: void** = buf as void**;
+                buf_arr[0] = idx.raw;
+                const slot: LValue = this.cg.builder.build_gep(
+                    elem_ty, data_ptr, buf, 1, "arrelem");
+                free(buf);
+                this.cg.builder.build_store(elem, slot);
+            }
+        } else {
+            data_ptr = LType::const_null(LType::pointer_to(elem_ty));
+        }
+
+        const ptr_slot: LValue = this.cg.builder.build_struct_gep(
+            fat_ty, fat, 0, "fat.ptr");
+        this.cg.builder.build_store(data_ptr, ptr_slot);
+        const len_slot: LValue = this.cg.builder.build_struct_gep(
+            fat_ty, fat, 1, "fat.len");
+        this.cg.builder.build_store(count_val, len_slot);
+
+        this.last_value = fat;
         this.last_is_lvalue = true;
     }
 
@@ -2009,29 +2184,37 @@ public:
                     matched = true;
                     break;
                 } else if (pat.pattern_kind == PatternKind::Literal) {
-                    const pat_val: LValue = this.codegen_pattern_value(pat);
-                    if (pat_val.is_valid()) {
-                        mut cmp: LValue = LValue::null();
-                        if (is_string_subj_e) {
-                            codegen_string_compare(this.cg, subject, pat_val,
-                                TokenType::EqualEqual, &cmp);
-                        } else {
+                    mut cmp: LValue = LValue::null();
+                    if (is_string_subj_e) {
+                        const pat_text: string = this.cg.resolve(pat.value);
+                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
+                        codegen_string_compare(this.cg, subject, pat_val,
+                            TokenType::EqualEqual, &cmp);
+                    } else {
+                        const pat_val: LValue = this.codegen_pattern_value(pat);
+                        if (pat_val.is_valid()) {
                             cmp = this.cg.builder.build_icmp(32, subject, pat_val, "mexpr.cmp");
                         }
+                    }
+                    if (cmp.is_valid()) {
                         this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
                         matched = true;
                         break;
                     }
                 } else if (pat.pattern_kind == PatternKind::Identifier) {
-                    const pat_val: LValue = this.codegen_pattern_value(pat);
-                    if (pat_val.is_valid()) {
-                        mut cmp: LValue = LValue::null();
-                        if (is_string_subj_e) {
-                            codegen_string_compare(this.cg, subject, pat_val,
-                                TokenType::EqualEqual, &cmp);
-                        } else {
+                    mut cmp: LValue = LValue::null();
+                    if (is_string_subj_e) {
+                        const pat_text: string = this.cg.resolve(pat.value);
+                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
+                        codegen_string_compare(this.cg, subject, pat_val,
+                            TokenType::EqualEqual, &cmp);
+                    } else {
+                        const pat_val: LValue = this.codegen_pattern_value(pat);
+                        if (pat_val.is_valid()) {
                             cmp = this.cg.builder.build_icmp(32, subject, pat_val, "mexpr.cmp");
                         }
+                    }
+                    if (cmp.is_valid()) {
                         this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
                         matched = true;
                         break;
