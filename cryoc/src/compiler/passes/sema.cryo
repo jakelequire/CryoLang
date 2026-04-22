@@ -691,12 +691,33 @@ public:
         this.resolve_expr(node.expression);
     }
 
-    visit_decl_stmt(node: DeclStmtNode*) -> void {
+    visit_decl_stmt(mut &this, node: DeclStmtNode*) -> void {
         if (node.declaration == null) { return; }
         const decl: ASTNode* = node.declaration;
         if (decl.kind != NodeKind::VariableDeclaration) { return; }
 
         const var_node: VarDeclNode* = decl as VarDeclNode*;
+
+        // Lazy-resolve the type annotation if earlier passes missed it — e.g.
+        // VarDecls living inside a match-expression arm body (like
+        // `const te: TypeofExprNode* = ...` in resolve_expr's Typeof arm).
+        // `resolve_body_locals` in the monomorphizer recurses into match
+        // STATEMENTS but not match EXPRESSIONS, so those VarDecls arrive
+        // here with `resolved_type` invalid.  Without this, codegen's
+        // `codegen_local_var` skips the alloca (map_type on invalid
+        // TypeRef returns null) and downstream member-accesses on the
+        // binding evaluate to null.
+        if (!var_node.has_resolved_type() && var_node.type_annotation != null
+                && this.ctx.type_resolver != null) {
+            mut res_ctx: ResolutionContext = ResolutionContext::new(
+                this.ctx.source_file, "");
+            const vtype: TypeRef = this.ctx.type_resolver.resolve(
+                var_node.type_annotation, &res_ctx);
+            if (vtype.is_valid()) {
+                var_node.resolved_type = vtype;
+            }
+        }
+
         if (var_node.has_initializer()) {
             // Set expected_type hint so generic calls can resolve to concrete types.
             // E.g. `const x: Result<int, string> = Result::ok(42)` —
@@ -1949,6 +1970,14 @@ public:
     resolve_match_expr(mut &this, match_expr: MatchExprNode*) -> TypeRef {
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
 
+        // Propagate the outer expected_type (from `const x: T = match ...`,
+        // return types, etc.) into each arm's last expression so integer
+        // literals like `-1` adopt the declared type instead of defaulting
+        // to i32.  Without this, codegen's phi sees mixed arm types (e.g.,
+        // i64 for one arm's bound variable vs i32 for another arm's literal)
+        // and fails verification.
+        const outer_expected: TypeRef = this.expected_type;
+
         mut result_type: TypeRef = TypeRef::invalid();
         for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
             const arm: MatchArmNode* = match_expr.arms[i];
@@ -1960,8 +1989,18 @@ public:
             const body_node: ASTNode* = arm.body as ASTNode*;
             if (body_node.kind == NodeKind::BlockStatement) {
                 const block: BlockStmtNode* = arm.body as BlockStmtNode*;
+                const last_idx: i64 = block.statements.length - 1;
                 for (mut j: i64 = 0; j < block.statements.length; j++) {
+                    // For the final statement of the block (the arm's
+                    // yielded value), push the outer expected_type hint so
+                    // integer/float literals resolve to the declared type.
+                    if (j == last_idx && outer_expected.is_valid()) {
+                        this.expected_type = outer_expected;
+                    }
                     this.dispatch_stmt(block.statements[j]);
+                    if (j == last_idx) {
+                        this.expected_type = outer_expected;
+                    }
                 }
                 // Infer arm type from the last expression statement
                 if (!result_type.is_valid() && block.statements.length > 0) {
@@ -1983,6 +2022,12 @@ public:
             this.restore_scope(save);
         }
 
+        // Restore caller's expected_type and prefer its hint over our own
+        // inference — a more specific context-driven type wins.
+        this.expected_type = outer_expected;
+        if (outer_expected.is_valid()) {
+            return outer_expected;
+        }
         return result_type;
     }
 

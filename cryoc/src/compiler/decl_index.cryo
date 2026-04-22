@@ -296,14 +296,34 @@ type struct DeclarationIndex {
     register_methods_with_module(mut &this, type_sym: SymbolStr, methods: MethodNode*[],
                                   module: SymbolStr, intern: InternTable*,
                                   arena: TypeArena*) -> void {
+        this.register_methods_with_module_aliased(
+            type_sym, SymbolStr::empty(), methods, module, intern, arena);
+    }
+
+    /// Same as `register_methods_with_module` but also registers a bare-name
+    /// alias for the combined key (e.g. both `std::core::primitives::string::substring`
+    /// AND `string::substring`) in the function/overload registries.  Lets
+    /// callers that only know the bare type name — namely codegen's
+    /// MemberAccess path on primitives — still find the signature.
+    register_methods_with_module_aliased(mut &this,
+                                          type_sym: SymbolStr, bare_alias: SymbolStr,
+                                          methods: MethodNode*[],
+                                          module: SymbolStr, intern: InternTable*,
+                                          arena: TypeArena*) -> void {
         const type_str: string = intern.resolve(type_sym);
+        const bare_str: string = if (bare_alias.is_valid()) { intern.resolve(bare_alias) } else { "" };
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
             const func: FunctionDeclNode* = method.func;
 
-            // Register in method_returns (existing behavior).
+            // Register in method_returns under the qualified type (existing
+            // behavior) AND under the bare alias (so lookup_method_return
+            // works for both forms on primitive impls).
             this.register_method(type_sym, func.name, func.resolved_return_type);
+            if (bare_alias.is_valid()) {
+                this.register_method(bare_alias, func.name, func.resolved_return_type);
+            }
 
             // Build combined key "QualifiedType::method".
             const method_str: string = intern.resolve(func.name);
@@ -376,6 +396,25 @@ type struct DeclarationIndex {
             // extern declaration can emit the right LLVM symbol per
             // overload (not just the last-registered one).
             this.register_overload_mangled(combined_sym, func_type_ref, mangled.value);
+
+            // Bare-name alias.  For impl blocks on primitives (e.g. `implement
+            // string`) the qualified form is `std::core::primitives::string::substring`
+            // but the consumer (sema + codegen MemberAccess path) only has
+            // the bare type name "string".  Mirror the qualified registration
+            // under "string::substring" so resolve_function / resolve_function_with_arity
+            // finds the signature regardless of which form the call site
+            // used.  The LLVM symbol (`mangled.value`) is identical — linking
+            // converges on the one defining module.
+            if (bare_alias.is_valid()) {
+                const bare_combined: string = format("%s::%s", bare_str, method_str);
+                const bare_combined_sym: SymbolStr = intern.intern(bare_combined);
+                if (bare_combined_sym.id != combined_sym.id) {
+                    this.register_function(bare_combined_sym, func.resolved_return_type);
+                    this.register_function_type(bare_combined_sym, func_type_ref);
+                    this.register_mangled_name(bare_combined_sym, mangled.value);
+                    this.register_overload_mangled(bare_combined_sym, func_type_ref, mangled.value);
+                }
+            }
 
             // Add to per-module list.  Skip if this (combined_sym, module)
             // pair was already added by a prior overload — multiple
