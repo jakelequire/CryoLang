@@ -1157,19 +1157,19 @@ public:
 
             // 1. Try current module's qualified name.
             const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(id.name);
-            callee_val = this.cg.get_function(qualified);
+            callee_val = resolve_function(this.cg, qualified);
 
             // 2. Try the DI's bare→qualified mapping (resolves auto-imports
             //    like printf → std::core::intrinsics::printf).
             if (!callee_val.is_valid()) {
                 const di: DeclarationIndex* = this.cg.get_decl_index();
                 const resolved: SymbolStr = di.resolve_qualified(id.name);
-                callee_val = this.cg.get_function(resolved);
+                callee_val = resolve_function(this.cg, resolved);
             }
 
             // 3. Bare name (for extern C functions registered without qualification).
             if (!callee_val.is_valid()) {
-                callee_val = this.cg.get_function(id.name);
+                callee_val = resolve_function(this.cg, id.name);
             }
 
             // 4. Function-typed parameter — look in named_values (local scope).
@@ -1266,16 +1266,16 @@ public:
             // arity equals the user-arg count.  Try arity-specific lookup
             // first so `Array::new()` and `Array::new(u64)` stay distinct.
             const sr_arity: u32 = node.arguments.length as u32;
-            callee_val = this.cg.get_function_with_arity(sym, sr_arity);
+            callee_val = resolve_function_with_arity(this.cg, sym, sr_arity);
             if (!callee_val.is_valid()) {
-                callee_val = this.cg.get_function(sym);
+                callee_val = resolve_function(this.cg, sym);
             }
 
             // Fallback 1: try the bare member name.  Extern "C" functions
             // (e.g., llvm::LLVMGetTypeKind) are registered under their
             // unqualified C name, not the scope-qualified form.
             if (!callee_val.is_valid()) {
-                callee_val = this.cg.get_function(sr.member_name);
+                callee_val = resolve_function(this.cg, sr.member_name);
             }
 
             // Fallback 2: use node.resolved_type to find the concrete
@@ -1311,9 +1311,9 @@ public:
                         const conc_combined: string = format("%s::%s", conc_name, member_str);
                         const conc_sym: SymbolStr = intern.intern(conc_combined);
                         const conc_arity: u32 = node.arguments.length as u32;
-                        callee_val = this.cg.get_function_with_arity(conc_sym, conc_arity);
+                        callee_val = resolve_function_with_arity(this.cg, conc_sym, conc_arity);
                         if (!callee_val.is_valid()) {
-                            callee_val = this.cg.get_function(conc_sym);
+                            callee_val = resolve_function(this.cg, conc_sym);
                         }
                     }
                 }
@@ -1517,7 +1517,7 @@ public:
                         }
                         const mn: MangledName = MangledName::for_method(
                             intern, type_mn, method_str, pd);
-                        callee_val = this.cg.get_function(mn.value);
+                        callee_val = resolve_function(this.cg, mn.value);
                     }
                 }
             }
@@ -1526,9 +1526,9 @@ public:
                 const type_str: string = intern.resolve(type_sym);
                 const combined: string = format("%s::%s", type_str, method_str);
                 const sym: SymbolStr = intern.intern(combined);
-                callee_val = this.cg.get_function_with_arity(sym, ma_arity);
+                callee_val = resolve_function_with_arity(this.cg, sym, ma_arity);
                 if (!callee_val.is_valid()) {
-                    callee_val = this.cg.get_function(sym);
+                    callee_val = resolve_function(this.cg, sym);
                 }
             }
 
@@ -1550,9 +1550,9 @@ public:
                 if (strlen(type_str) > 0) {
                     const combined: string = format("%s::%s", type_str, method_str);
                     const sym: SymbolStr = intern.intern(combined);
-                    callee_val = this.cg.get_function_with_arity(sym, ma_arity);
+                    callee_val = resolve_function_with_arity(this.cg, sym, ma_arity);
                     if (!callee_val.is_valid()) {
-                        callee_val = this.cg.get_function(sym);
+                        callee_val = resolve_function(this.cg, sym);
                     }
                 }
             }
@@ -1577,9 +1577,9 @@ public:
                     if (strlen(parent_str) > 0) {
                         const pcombined: string = format("%s::%s", parent_str, method_str);
                         const psym: SymbolStr = intern.intern(pcombined);
-                        callee_val = this.cg.get_function_with_arity(psym, ma_arity);
+                        callee_val = resolve_function_with_arity(this.cg, psym, ma_arity);
                         if (!callee_val.is_valid()) {
-                            callee_val = this.cg.get_function(psym);
+                            callee_val = resolve_function(this.cg, psym);
                         }
                     }
                 }
@@ -2077,13 +2077,13 @@ public:
             this.cg.resolve(node.scope_name),
             this.cg.resolve(node.member_name));
         const sym: SymbolStr = this.cg.intern_str(combined);
-        const fn_val: LValue = this.cg.get_function(sym);
+        const fn_val: LValue = resolve_function(this.cg, sym);
         if (fn_val.is_valid()) {
             this.last_value = fn_val;
             this.last_is_lvalue = false;
             return;
         }
-        const global: LValue = this.cg.get_global(sym);
+        const global: LValue = resolve_global(this.cg, sym);
         if (global.is_valid()) {
             this.last_value = global;
             this.last_is_lvalue = true;
@@ -2481,9 +2481,9 @@ public:
         const ctor_sym: SymbolStr = intern.intern(ctor_combined);
         // Constructor LLVM arity = user args + 1 for the implicit `this`.
         const ctor_arity: u32 = (node.arguments.length + 1) as u32;
-        mut ctor_fn: LValue = this.cg.get_function_with_arity(ctor_sym, ctor_arity);
+        mut ctor_fn: LValue = resolve_function_with_arity(this.cg, ctor_sym, ctor_arity);
         if (!ctor_fn.is_valid()) {
-            ctor_fn = this.cg.get_function(ctor_sym);
+            ctor_fn = resolve_function(this.cg, ctor_sym);
         }
         if (ctor_fn.is_valid() && obj_ptr.is_valid()) {
             const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };

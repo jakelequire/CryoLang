@@ -42,6 +42,7 @@ import Compiler::Resolver::MangledName;
 import Compiler::Resolver::Resolver;
 import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
+import Compiler::Types::Substitution;
 import Compiler::ModuleGraph;
 import std::collections::hashmap;
 import Utils::Logger;
@@ -357,6 +358,30 @@ public:
         return t;
     }
 
+    /// Peel Reference/Pointer wrappers and return the innermost InstantiatedType
+    /// (if any), even when its `resolved_type` is still invalid.  Used by
+    /// bind_arm_patterns to substitute generic params in variant payload types
+    /// when the instantiation hasn't been monomorphized yet — for example,
+    /// methods whose this-param type differs from the outer enum instantiation
+    /// (`copied(this: Result<T*, E>)` on Result<i32, string>).
+    peel_to_instantiation(&this, ty: TypeRef) -> InstantiatedType* {
+        if (!ty.is_valid()) { return null; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return null; }
+        if (t.kind == TypeKind::Reference) {
+            const ref_t: ReferenceType* = t as ReferenceType*;
+            return this.peel_to_instantiation(ref_t.referent);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            const ptr_t: PointerType* = t as PointerType*;
+            return this.peel_to_instantiation(ptr_t.pointee);
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            return t as InstantiatedType*;
+        }
+        return null;
+    }
+
     bind_arm_patterns(mut &this, arm: MatchArmNode*, subject_type: TypeRef) -> void {
         for (mut i: i64 = 0; i < arm.patterns.length; i++) {
             const pat: PatternNode* = arm.patterns[i];
@@ -385,7 +410,20 @@ public:
             // InstantiatedType(Option, [string]) → Option_string.
             enum_ty = this.unwrap_to_enum(subject_type);
 
-            // Fallback: look up by pattern's enum name (works for non-generic
+            // Capture the instantiation (even if not yet monomorphized) so we
+            // can substitute generic params into payload_types below.
+            const peeled_inst: InstantiatedType* = this.peel_to_instantiation(subject_type);
+
+            // Fallback A: if we have an InstantiatedType but no concrete enum
+            // yet, use the generic base enum template directly.
+            if ((enum_ty == null || enum_ty.kind != TypeKind::Enum) && peeled_inst != null) {
+                const base_t: Type* = this.arena.lookup(peeled_inst.generic_base.id);
+                if (base_t != null && base_t.kind == TypeKind::Enum) {
+                    enum_ty = base_t;
+                }
+            }
+
+            // Fallback B: look up by pattern's enum name (works for non-generic
             // enums where the pattern name matches the type name exactly).
             if (enum_ty == null || enum_ty.kind != TypeKind::Enum) {
                 const enum_type_ref: TypeRef = this.lookup_type_by_sym(enum_pat.enum_name);
@@ -399,6 +437,30 @@ public:
                 const variant: EnumVariantInfo* = et.get_variant(enum_pat.variant_name);
                 if (variant != null) {
                     payload_types = variant.payload_types;
+
+                    // When the subject is a generic instantiation whose concrete
+                    // specialization hasn't been monomorphized yet (or when the
+                    // enum template we're looking at still carries GenericParam
+                    // payload types), substitute the template's generic params
+                    // with the instantiation's type_args so the binding resolves
+                    // to the correct concrete type.  Without this, methods like
+                    // `copied(this: Result<T*, E>)` bind `ptr` to GenericParam T
+                    // (mapped as the raw payload byte type) instead of T*.
+                    const gr: GenericRegistry* = this.ctx.get_generic_registry();
+                    if (peeled_inst != null && gr != null) {
+                        const tmpl: TemplateEntry* = gr.get_template_by_type_id(
+                            peeled_inst.generic_base.id);
+                        if (tmpl != null &&
+                            tmpl.param_type_ids.length == peeled_inst.type_args.length) {
+                            mut subst: TypeSubstitution = TypeSubstitution::from_params(
+                                tmpl.param_type_ids, peeled_inst.type_args);
+                            mut substituted: TypeRef[] = [];
+                            for (mut k: i64 = 0; k < payload_types.length; k++) {
+                                substituted.push(subst.apply(payload_types[k], this.arena));
+                            }
+                            payload_types = substituted;
+                        }
+                    }
                 }
             }
 
