@@ -60,7 +60,11 @@ type struct TypeArena {
     // -- Compound type dedup caches (key → TypeRef) --
     pointer_cache:   HashMap<string, TypeRef>;
     reference_cache: HashMap<string, TypeRef>;
-    array_cache:     HashMap<string, TypeRef>;
+    /// Array cache key: `(element.id << 32) | (size + 1)`.  Uses integer
+    /// composite key rather than format()-built string because the
+    /// bootstrap's HashMap<string, V> equality compares by pointer not
+    /// content — fresh format() allocations miss even when content matches.
+    array_cache:     HashMap<u64, TypeRef>;
     optional_cache:  HashMap<string, TypeRef>;
     function_cache:  HashMap<string, TypeRef>;
     tuple_cache:     HashMap<string, TypeRef>;
@@ -119,7 +123,7 @@ type struct TypeArena {
 
             pointer_cache:       HashMap<string, TypeRef>::new(),
             reference_cache:     HashMap<string, TypeRef>::new(),
-            array_cache:         HashMap<string, TypeRef>::new(),
+            array_cache:         HashMap<u64, TypeRef>::new(),
             optional_cache:      HashMap<string, TypeRef>::new(),
             function_cache:      HashMap<string, TypeRef>::new(),
             tuple_cache:         HashMap<string, TypeRef>::new(),
@@ -259,9 +263,13 @@ type struct TypeArena {
     }
 
     /// Get or create an array type with the given element type and size.
+    /// Key layout: high 32 bits = element TypeRef ID, low 32 bits = size
+    /// offset by +1 so `-1` (dynamic) and `0` (fixed zero-length) don't
+    /// collide.  Caps support to 32-bit element IDs and 31-bit sizes —
+    /// both fit real programs with headroom.
     get_array_of(mut &this, element: TypeRef, size: i64) -> TypeRef {
-        mut key: string = format("array_%lu_%ld", element.id, size);
-        const h: u64 = hash_str(key);
+        const key: u64 = (element.id << 32) | ((size + 1) as u64 & 0xFFFFFFFF);
+        const h: u64 = hash_int(key);
 
         const cached: Option<TypeRef> = this.array_cache.get(key, h);
         if (cached.is_some()) { return cached.unwrap(); }

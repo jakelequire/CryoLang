@@ -89,6 +89,18 @@ type struct DeclarationIndex {
     // to the monomorphized Array_T struct without name reconstruction.
     array_elem_to_type:  HashMap<u64, u32>;
 
+    // Function overload registry — parallel arrays keyed by function
+    // name (SymbolStr.id), storing every registered FunctionType TypeRef
+    // and its overload-specific mangled name.  `func_type_refs` and
+    // `mangled_names` above each keep only the last registration per
+    // name, which collapses overloads like `String::new()` and
+    // `String::new(u64)` to a single entry.  Cross-module extern
+    // declaration needs every overload's signature AND mangled name,
+    // so it walks these arrays instead.
+    overload_func_keys:    u32[];     // SymbolStr.id of function name
+    overload_func_types:   TypeRef[]; // FunctionType TypeRef for this overload
+    overload_func_mangled: u32[];     // SymbolStr.id of mangled LLVM name (0 = unset)
+
 
     static new() -> DeclarationIndex {
         return DeclarationIndex {
@@ -107,6 +119,9 @@ type struct DeclarationIndex {
             module_global_modules: [],
             bare_to_qualified:   HashMap<u32, u32>::new(),
             mangled_names:       HashMap<u32, u32>::new(),
+            overload_func_keys:    [],
+            overload_func_types:   [],
+            overload_func_mangled: [],
         };
     }
 
@@ -122,9 +137,68 @@ type struct DeclarationIndex {
     }
 
     /// Register a function's FunctionType TypeRef (full signature in the arena).
+    /// `func_type_refs` is a single-slot map (last wins) — use the parallel
+    /// overload arrays below when every overload matters (cross-module
+    /// extern declaration).
     register_function_type(mut &this, name: SymbolStr, func_type_ref: TypeRef) -> void {
         const h: u64 = hash_int(name.id as u64);
         this.func_type_refs.insert(name.id, func_type_ref, h);
+        // Also append to the overload list so cross-module extern
+        // declaration can enumerate every overload's signature.
+        // De-dup by exact (name, TypeRef.id) so re-registration doesn't
+        // produce duplicates.
+        for (mut i: i64 = 0; i < this.overload_func_keys.length; i++) {
+            if (this.overload_func_keys[i] == name.id &&
+                this.overload_func_types[i].id == func_type_ref.id) {
+                return;
+            }
+        }
+        this.overload_func_keys.push(name.id);
+        this.overload_func_types.push(func_type_ref);
+        this.overload_func_mangled.push(0);
+    }
+
+    /// Associate an overload-specific mangled LLVM name with a registered
+    /// (name, func_type_ref) pair.  Cross-module extern declaration uses
+    /// this to emit the right LLVM symbol per overload instead of the
+    /// single mangled name stored in `mangled_names`.
+    register_overload_mangled(mut &this, name: SymbolStr, func_type_ref: TypeRef,
+                               mangled: SymbolStr) -> void {
+        for (mut i: i64 = 0; i < this.overload_func_keys.length; i++) {
+            if (this.overload_func_keys[i] == name.id &&
+                this.overload_func_types[i].id == func_type_ref.id) {
+                this.overload_func_mangled[i] = mangled.id;
+                return;
+            }
+        }
+    }
+
+    /// Return every (FunctionType, mangled-name) pair registered under
+    /// the given name.  Parallel arrays: `types[i]` goes with `mangled[i]`.
+    /// A mangled SymbolStr.id of 0 means no overload-specific mangled name
+    /// was registered; callers should fall back to `lookup_mangled_name`.
+    lookup_func_type_overloads(&this, name: SymbolStr) -> TypeRef[] {
+        mut result: TypeRef[] = [];
+        for (mut i: i64 = 0; i < this.overload_func_keys.length; i++) {
+            if (this.overload_func_keys[i] == name.id) {
+                result.push(this.overload_func_types[i]);
+            }
+        }
+        return result;
+    }
+
+    lookup_overload_mangled(&this, name: SymbolStr, func_type_ref: TypeRef) -> SymbolStr {
+        for (mut i: i64 = 0; i < this.overload_func_keys.length; i++) {
+            if (this.overload_func_keys[i] == name.id &&
+                this.overload_func_types[i].id == func_type_ref.id) {
+                const mid: u32 = this.overload_func_mangled[i];
+                if (mid != 0) {
+                    return SymbolStr::from_id(mid);
+                }
+                return SymbolStr::empty();
+            }
+        }
+        return SymbolStr::empty();
     }
 
     /// Register a method's return type on a specific type.
@@ -297,9 +371,27 @@ type struct DeclarationIndex {
                 intern, type_mangled, method_str, param_displays);
             this.register_mangled_name(combined_sym, mangled.value);
 
-            // Add to per-module list.
-            this.module_func_keys.push(combined_sym.id);
-            this.module_func_modules.push(module.id);
+            // Also associate this overload's mangled name with its
+            // FunctionType in the overload registry, so cross-module
+            // extern declaration can emit the right LLVM symbol per
+            // overload (not just the last-registered one).
+            this.register_overload_mangled(combined_sym, func_type_ref, mangled.value);
+
+            // Add to per-module list.  Skip if this (combined_sym, module)
+            // pair was already added by a prior overload — multiple
+            // overloads of the same method share one per-module entry.
+            mut already_listed: boolean = false;
+            for (mut mi: i64 = 0; mi < this.module_func_keys.length; mi++) {
+                if (this.module_func_keys[mi] == combined_sym.id &&
+                    this.module_func_modules[mi] == module.id) {
+                    already_listed = true;
+                    break;
+                }
+            }
+            if (!already_listed) {
+                this.module_func_keys.push(combined_sym.id);
+                this.module_func_modules.push(module.id);
+            }
         }
     }
 

@@ -10,6 +10,7 @@ import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
 import Compiler::Codegen::Context;
+import Compiler::Codegen::ExprCodegen;
 import Compiler::CompilationContext;
 import Compiler::DeclIndex;
 import Compiler::ModuleGraph;
@@ -58,6 +59,116 @@ function declare_types(cg: CodegenContext*, program: ProgramNode*) -> void {
             // already declared via StructDecl/ClassDecl.
         }
     }
+}
+
+/// Number of parameters to emit as fixed-arity in an LLVM function type.
+/// For variadic Cryo functions (`args...`), the trailing name-only parameter
+/// stands in for the vararg bucket — sema needs it to be a local in scope,
+/// but LLVM must not see it as a fixed param (there's no callable type for
+/// it, and every call site passes a different arity for that slot).
+function fixed_param_count(func: FunctionDeclNode*) -> u32 {
+    mut count: u32 = func.parameters.length as u32;
+    if (func.is_variadic && count > 0) {
+        const last: VarDeclNode* = func.parameters[count - 1];
+        if (last.type_annotation == null) {
+            count = count - 1;
+        }
+    }
+    return count;
+}
+
+/// Return the name of the trailing `args...` parameter when `func` is
+/// variadic and its last parameter is the vararg bucket (no type
+/// annotation, so sema couldn't give it a concrete type).  Returns an
+/// empty SymbolStr when the function has no such parameter.
+function variadic_param_name(func: FunctionDeclNode*) -> SymbolStr {
+    if (!func.is_variadic) { return SymbolStr::empty(); }
+    const n: i64 = func.parameters.length;
+    if (n == 0) { return SymbolStr::empty(); }
+    const last: VarDeclNode* = func.parameters[n - 1];
+    if (last == null || last.type_annotation != null) {
+        return SymbolStr::empty();
+    }
+    return last.name;
+}
+
+/// Declare the `@llvm.va_start.p0` intrinsic in the current LLVM module.
+/// Signature: `void (ptr)` — the argument is a pointer to the va_list
+/// storage to initialize from the caller's argument area.
+function declare_va_start(cg: CodegenContext*) -> LValue {
+    mut fn: LValue = cg.llvm_module.get_named_function("llvm.va_start.p0");
+    if (fn.is_valid()) { return fn; }
+    const ptr_ty: LType = LType::pointer_to(LType::i8());
+    const buf: void* = malloc(8);
+    const slots: void** = buf as void**;
+    slots[0] = ptr_ty.raw;
+    const fty: LType = LType::function_type(LType::void_type(), buf, 1, false);
+    free(buf);
+    fn = cg.llvm_module.add_function("llvm.va_start.p0", fty);
+    return fn;
+}
+
+/// Declare the `@llvm.va_end.p0` intrinsic — mirror of va_start.
+function declare_va_end(cg: CodegenContext*) -> LValue {
+    mut fn: LValue = cg.llvm_module.get_named_function("llvm.va_end.p0");
+    if (fn.is_valid()) { return fn; }
+    const ptr_ty: LType = LType::pointer_to(LType::i8());
+    const buf: void* = malloc(8);
+    const slots: void** = buf as void**;
+    slots[0] = ptr_ty.raw;
+    const fty: LType = LType::function_type(LType::void_type(), buf, 1, false);
+    free(buf);
+    fn = cg.llvm_module.add_function("llvm.va_end.p0", fty);
+    return fn;
+}
+
+/// Emit va_start for a variadic function's vararg bucket.  Allocates a
+/// `[24 x i8]` (System V x86-64 va_list layout; larger than Win64's
+/// 8-byte char* so both platforms fit in the same storage) and calls
+/// @llvm.va_start on the pointer.  Binds `args_name` to the alloca so
+/// that references in the body resolve to the va_list pointer.  Stashes
+/// the args name on the context so `codegen_return` can emit `va_end`
+/// before every `ret` instruction.
+function emit_va_start_for_variadic(cg: CodegenContext*, fn_val: LValue,
+                                     args_name: SymbolStr) -> void {
+    if (!args_name.is_valid()) {
+        cg.current_variadic_arg_id = 0;
+        return;
+    }
+    const va_list_ty: LType = LType::array_of(LType::i8(), 24);
+    const va_list_alloca: LValue = cg.create_entry_alloca(
+        fn_val, cg.resolve(args_name), va_list_ty);
+    const va_start_fn: LValue = declare_va_start(cg);
+    const va_start_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(va_start_fn.raw) };
+    mut args: LValue[] = [];
+    args.push(va_list_alloca);
+    mut _result: LValue = LValue::null();
+    codegen_call(cg, va_start_fn, va_start_ty, args, "", &_result);
+    cg.set_named_value(args_name, va_list_alloca);
+    cg.current_variadic_arg_id = args_name.id;
+}
+
+/// Emit va_end on the va_list alloca bound to `args_name`, if that
+/// binding exists.  Called immediately before every terminating return
+/// so the va_list is properly cleaned up on every exit path.
+function emit_va_end_if_variadic(cg: CodegenContext*, args_name: SymbolStr) -> void {
+    if (!args_name.is_valid()) { return; }
+    const va_list_alloca: LValue = cg.get_named_value(args_name);
+    if (!va_list_alloca.is_valid()) { return; }
+    const va_end_fn: LValue = declare_va_end(cg);
+    const va_end_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(va_end_fn.raw) };
+    mut args: LValue[] = [];
+    args.push(va_list_alloca);
+    mut _result: LValue = LValue::null();
+    codegen_call(cg, va_end_fn, va_end_ty, args, "", &_result);
+}
+
+/// Look up the active variadic arg's SymbolStr from the codegen context.
+/// Returns an empty SymbolStr if the current function is not variadic.
+function current_variadic_arg(cg: CodegenContext*) -> SymbolStr {
+    const id: u32 = cg.current_variadic_arg_id;
+    if (id == 0) { return SymbolStr::empty(); }
+    return SymbolStr::from_id(id);
 }
 
 /// Forward-declare a struct as a named LLVM type and fill its body.
@@ -166,7 +277,7 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
     const ret_ty: LType = map_return_type(cg, node);
     if (!ret_ty.is_valid()) { return; }
 
-    const param_count: u32 = node.parameters.length as u32;
+    const param_count: u32 = fixed_param_count(node);
 
     mut fn_type: LType = LType::null();
     if (param_count == 0) {
@@ -531,7 +642,7 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     // slot — the explicit param already accounts for the self argument.
     // Only when the method has no self-param at all (e.g., some elaborated
     // methods) should we synthesize the `&this` pointer prefix.
-    mut explicit_self_name: string = "";  // "", "&this", or "this"
+    mut explicit_self_name: string = "";  // "", "&this", "this", or "typed-this"
     for (mut pc0: u32 = 0; pc0 < func.parameters.length as u32; pc0++) {
         const pp0: VarDeclNode* = func.parameters[pc0];
         if (pp0 == null) { continue; }
@@ -541,7 +652,16 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
             break;
         }
         if (strcmp(pn, "this") == 0) {
-            explicit_self_name = "this";
+            // Distinguish parser-synthesized by-value `this` (no annotation)
+            // from user-written `this: Lexer*` (explicit annotation).  Both
+            // count as "self" so we skip the implicit-prefix synthesis, but
+            // the LLVM param type comes from different sources: bare `this`
+            // uses the struct by value; typed `this` uses the annotation.
+            if (pp0.type_annotation == null) {
+                explicit_self_name = "this";
+            } else {
+                explicit_self_name = "typed-this";
+            }
             break;
         }
     }
@@ -569,8 +689,11 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     // Count user parameters.  `&this` contributes a ptr slot via the
     // existing param; by-value `this` contributes a struct slot via the
     // existing param; implicit missing self is handled by prepend_implicit_this.
+    // For variadic methods (`args...`), skip the trailing name-only param —
+    // LLVM's `...` marker covers it.
+    const fixed_user_count: u32 = fixed_param_count(func);
     mut user_param_count: u32 = 0;
-    for (mut pc: u32 = 0; pc < func.parameters.length as u32; pc++) {
+    for (mut pc: u32 = 0; pc < fixed_user_count; pc++) {
         const pp: VarDeclNode* = func.parameters[pc];
         if (pp != null) { user_param_count = user_param_count + 1; }
     }
@@ -586,7 +709,7 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     }
 
     mut params_valid: boolean = true;
-    for (mut i: u32 = 0; i < func.parameters.length as u32; i++) {
+    for (mut i: u32 = 0; i < fixed_user_count; i++) {
         const param: VarDeclNode* = func.parameters[i];
         if (param == null) { continue; }
         const param_name: string = intern.resolve(param.name);
@@ -594,11 +717,15 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
         // For `&this` and `mut &this`, force the LLVM type to `T*` —
         // parser-synthesized reference annotations may not round-trip
         // through the arena correctly for every method.
-        // For by-value `this`, use the struct type directly.
+        // For by-value `this` with NO type annotation (parser-synthesized
+        // self form), use the struct type directly.  But `this: Lexer*`
+        // — a user-written explicit annotation on a param named `this`
+        // — is just a regular typed parameter; map via resolved_type.
         mut mapped_param: LType = LType::null();
         if (strcmp(param_name, "&this") == 0 && this_ty.is_valid()) {
             mapped_param = this_ty;
-        } else if (strcmp(param_name, "this") == 0 && target_mapped.is_valid()) {
+        } else if (strcmp(param_name, "this") == 0 && target_mapped.is_valid()
+                   && param.type_annotation == null) {
             mapped_param = target_mapped;
         } else {
             mapped_param = cg.type_mapper.map_type(param.resolved_type);
@@ -648,7 +775,7 @@ function declare_intrinsic(cg: CodegenContext*, node: IntrinsicDeclNode*) -> voi
         if (!ret_ty.is_valid()) { return; }
     }
 
-    const param_count: u32 = node.parameters.length as u32;
+    const param_count: u32 = fixed_param_count(node);
     mut fn_type: LType = LType::null();
 
     if (param_count == 0) {
@@ -708,7 +835,7 @@ function declare_extern_block(cg: CodegenContext*, node: ExternBlockNode*) -> vo
                 format("codegen: extern function '%s' — failed to map return type", name_str));
             continue;
         }
-        const param_count: u32 = func.parameters.length as u32;
+        const param_count: u32 = fixed_param_count(func);
 
         mut fn_type: LType = LType::null();
         if (param_count == 0) {
@@ -780,16 +907,18 @@ function declare_cross_module_externs(cg: CodegenContext*) -> void {
         for (mut fi: i64 = 0; fi < funcs.length; fi++) {
             const fn_name: SymbolStr = funcs[fi];
 
-            // Skip if already declared in the current LLVM module.
-            const existing: LValue = cg.get_function(fn_name);
-            if (existing.is_valid()) {
-                continue;
-            }
-
-            // Look up the FunctionType from the DI → arena.
-            const func_type_ref: TypeRef = di.lookup_func_type(fn_name);
-            if (func_type_ref.is_invalid()) {
+            // Pull every registered overload for this name.  The
+            // single-slot `func_type_refs` map collapses overloads to
+            // the last one registered, which breaks call sites that
+            // need a specific arity (e.g. `String::new()` vs
+            // `String::new(u64)`).  Walking every overload here keeps
+            // the arity-aware LLVM extern set complete.
+            const overloads: TypeRef[] = di.lookup_func_type_overloads(fn_name);
+            if (overloads.length == 0) {
                 // No full signature — try return-type-only fallback.
+                // Skip if already declared under this name.
+                const existing_rt: LValue = cg.get_function(fn_name);
+                if (existing_rt.is_valid()) { continue; }
                 const ret_ref: TypeRef = di.lookup_func_return(fn_name);
                 if (ret_ref.is_valid()) {
                     const ret_ty: LType = cg.type_mapper.map_type(ret_ref);
@@ -809,66 +938,80 @@ function declare_cross_module_externs(cg: CodegenContext*) -> void {
                 }
                 continue;
             }
-            // Full signature available — resolve from arena.
 
-            // Resolve the FunctionType from the arena.
-            const ft_ptr: Type* = arena.lookup(func_type_ref.id);
-            if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) {
-                skipped = skipped + 1;
-                continue;
-            }
-            const ft: FunctionType* = ft_ptr as FunctionType*;
+            // Declare every overload.  Each gets its own LLVM extern
+            // keyed by the overload's mangled name; the arity-aware
+            // function registry lets call sites pick the right one.
+            for (mut oi: i64 = 0; oi < overloads.length; oi++) {
+                const func_type_ref: TypeRef = overloads[oi];
+                const ft_ptr: Type* = arena.lookup(func_type_ref.id);
+                if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) {
+                    skipped = skipped + 1;
+                    continue;
+                }
+                const ft: FunctionType* = ft_ptr as FunctionType*;
 
-            // Map return type.
-            const ret_ty: LType = cg.type_mapper.map_type(ft.return_type);
-            if (!ret_ty.is_valid()) {
-                skipped = skipped + 1;
-                continue;
-            }
+                // Map return type.
+                const ret_ty: LType = cg.type_mapper.map_type(ft.return_type);
+                if (!ret_ty.is_valid()) {
+                    skipped = skipped + 1;
+                    continue;
+                }
 
-            // Map parameter types.
-            const param_count: u32 = ft.param_types.length as u32;
-            mut fn_type: LType = LType::null();
-            mut valid: boolean = true;
+                // Map parameter types.
+                const param_count: u32 = ft.param_types.length as u32;
+                mut fn_type: LType = LType::null();
+                mut valid: boolean = true;
 
-            if (param_count == 0) {
-                fn_type = LType::function_type(ret_ty, null, 0, ft.is_variadic);
-            } else {
-                const buf: void* = malloc(param_count as u64 * 8);
-                const slots: void** = buf as void**;
-                for (mut j: u32 = 0; j < param_count; j++) {
-                    const mapped: LType = cg.type_mapper.map_type(ft.param_types[j]);
-                    if (!mapped.is_valid()) {
-                        valid = false;
-                        break;
+                if (param_count == 0) {
+                    fn_type = LType::function_type(ret_ty, null, 0, ft.is_variadic);
+                } else {
+                    const buf: void* = malloc(param_count as u64 * 8);
+                    const slots: void** = buf as void**;
+                    for (mut j: u32 = 0; j < param_count; j++) {
+                        const mapped: LType = cg.type_mapper.map_type(ft.param_types[j]);
+                        if (!mapped.is_valid()) {
+                            valid = false;
+                            break;
+                        }
+                        slots[j] = mapped.raw;
                     }
-                    slots[j] = mapped.raw;
+                    if (valid) {
+                        fn_type = LType::function_type(ret_ty, buf, param_count, ft.is_variadic);
+                    }
+                    free(buf);
                 }
-                if (valid) {
-                    fn_type = LType::function_type(ret_ty, buf, param_count, ft.is_variadic);
+
+                if (!valid || !fn_type.is_valid()) {
+                    skipped = skipped + 1;
+                    continue;
                 }
-                free(buf);
-            }
 
-            if (!valid || !fn_type.is_valid()) {
-                skipped = skipped + 1;
-                continue;
-            }
+                // Pick up the overload-specific mangled name that
+                // register_methods_with_module stored for this exact
+                // (fn_name, func_type_ref) pair.  Falls back to the
+                // single-slot lookup_mangled_name (pre-existing path)
+                // only when the overload-specific entry is missing.
+                mut mangled_sym: SymbolStr = di.lookup_overload_mangled(fn_name, func_type_ref);
+                if (!mangled_sym.is_valid()) {
+                    mangled_sym = di.lookup_mangled_name(fn_name);
+                }
+                if (!mangled_sym.is_valid()) {
+                    const ext_qname: QualifiedName = QualifiedName::from_symbol(fn_name);
+                    mangled_sym = MangledName::for_function(intern, ext_qname).value;
+                }
+                const ir_name: string = intern.resolve(mangled_sym);
 
-            // Look up the pre-computed mangled name from the DI.
-            mut mangled_sym: SymbolStr = di.lookup_mangled_name(fn_name);
-            if (!mangled_sym.is_valid()) {
-                // Fallback: compute from qualified name.
-                const ext_qname: QualifiedName = QualifiedName::from_symbol(fn_name);
-                const ext_mangled: MangledName = MangledName::for_function(intern, ext_qname);
-                mangled_sym = ext_mangled.value;
+                // If this LLVM symbol already exists (another overload
+                // or a prior pass declared it), reuse the existing one.
+                mut fn_val: LValue = cg.llvm_module.get_named_function(ir_name);
+                if (!fn_val.is_valid()) {
+                    fn_val = cg.llvm_module.add_function(ir_name, fn_type);
+                }
+                cg.register_function(fn_name, fn_val);
+                cg.register_function_with_arity(fn_name, param_count, fn_val);
+                declared = declared + 1;
             }
-            const ir_name: string = intern.resolve(mangled_sym);
-
-            const fn_val: LValue = cg.llvm_module.add_function(ir_name, fn_type);
-            cg.register_function(fn_name, fn_val);
-            cg.register_function_with_arity(fn_name, param_count, fn_val);
-            declared = declared + 1;
         }
     }
 
@@ -1025,7 +1168,8 @@ function codegen_function_prologue(cg: CodegenContext*, node: FunctionDeclNode*)
     // Create allocas for each parameter and store the incoming value.
     cg.push_scope();
 
-    for (mut i: u32 = 0; i < node.parameters.length as u32; i++) {
+    const fixed_count: u32 = fixed_param_count(node);
+    for (mut i: u32 = 0; i < fixed_count; i++) {
         const param: VarDeclNode* = node.parameters[i];
         const param_name: string = cg.resolve(param.name);
         const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
@@ -1040,6 +1184,13 @@ function codegen_function_prologue(cg: CodegenContext*, node: FunctionDeclNode*)
         cg.builder.build_store(arg, alloca);
         cg.set_named_value(param.name, alloca);
     }
+
+    // For variadic functions with an `args...` bucket, set up a va_list
+    // so the body can forward varargs to other variadic intrinsics via
+    // a v* variant (vsprintf, vfprintf, etc.).  Without this the `args`
+    // identifier has no LLVM value and every forwarding call codegens
+    // with a null operand.
+    emit_va_start_for_variadic(cg, fn_val, variadic_param_name(node));
 
     return fn_val;
 }
@@ -1058,6 +1209,7 @@ function codegen_function_epilogue(cg: CodegenContext*, node: FunctionDeclNode*)
             is_void = t != null && (t.kind == TypeKind::Void || t.kind == TypeKind::Unit);
         }
         if (is_void) {
+            emit_va_end_if_variadic(cg, variadic_param_name(node));
             cg.builder.build_ret_void();
         }
         // Non-void: intentionally leave unterminated. The caller
@@ -1125,14 +1277,25 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
     //                           a leading T* in the LLVM function signature
     // The LLVM parameter layout depends on which case we're in — matches the
     // logic in declare_method so named_values and LLVM params line up.
-    mut explicit_ref_idx: i64 = -1;   // parameters[i] is "&this"
-    mut explicit_val_idx: i64 = -1;   // parameters[i] is "this"
+    mut explicit_ref_idx: i64 = -1;    // parameters[i] is "&this"
+    mut explicit_val_idx: i64 = -1;    // parameters[i] is bare "this" (by-value self)
+    mut explicit_typed_idx: i64 = -1;  // parameters[i] is "this: T*" (user-typed self)
     for (mut pc: i64 = 0; pc < func.parameters.length; pc++) {
         const pp: VarDeclNode* = func.parameters[pc];
         if (pp == null) { continue; }
         const pn: string = cg.resolve(pp.name);
         if (strcmp(pn, "&this") == 0) { explicit_ref_idx = pc; break; }
-        if (strcmp(pn, "this") == 0)  { explicit_val_idx = pc; break; }
+        if (strcmp(pn, "this") == 0) {
+            if (pp.type_annotation == null) {
+                explicit_val_idx = pc;
+            } else {
+                // `this: T*` — user wrote the type out, method takes
+                // `this` as a regular typed parameter (e.g. Lexer's
+                // helper methods that use this convention).
+                explicit_typed_idx = pc;
+            }
+            break;
+        }
     }
 
     mut param_idx: u32 = 0;
@@ -1170,6 +1333,11 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
             const slot: LValue = cg.create_entry_alloca(fn_val, "this", target_mapped);
             cg.builder.build_store(arg0, slot);
             cg.set_named_value(this_sym, slot);
+        } else if (explicit_typed_idx >= 0) {
+            // User-typed `this: T*` — LLVM param 0 is whatever the
+            // annotation resolves to (typically a ptr).  Bind `this`
+            // directly to that value, same as the `&this` path.
+            cg.set_named_value(this_sym, arg0);
         } else {
             // `&this` (explicit or implicit): LLVM param 0 is already a ptr.
             // Store the raw pointer directly in named_values (no alloca).
@@ -1180,12 +1348,16 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
     }
 
     // Bind the remaining user parameters.  Skip whichever self form this
-    // method uses (we already handled it above).
-    for (mut i: u32 = 0; i < func.parameters.length as u32; i++) {
+    // method uses (we already handled it above).  Cap iteration at the
+    // fixed-param count so a trailing `args...` bucket doesn't try to pull
+    // an LLVM param that doesn't exist.
+    const fixed_count: u32 = fixed_param_count(func);
+    for (mut i: u32 = 0; i < fixed_count; i++) {
         const param: VarDeclNode* = func.parameters[i];
         if (param == null) { continue; }
         if (i as i64 == explicit_ref_idx) { continue; }
         if (i as i64 == explicit_val_idx) { continue; }
+        if (i as i64 == explicit_typed_idx) { continue; }
 
         const param_name: string = cg.resolve(param.name);
         const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);

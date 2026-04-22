@@ -1267,6 +1267,38 @@ type struct TypeResolutionPasses {
                         field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, true));
                     }
                     st.set_fields(field_infos);
+
+                    // Populate StructType.methods so sema's overload
+                    // resolution (resolve_method_overload) can pick the
+                    // right overload for struct methods — same rationale
+                    // as ClassType below, except structs are dispatched
+                    // statically rather than via vtable.
+                    const st_this_amp: SymbolStr = ctx.intern_table.intern("&this");
+                    const st_this_val: SymbolStr = ctx.intern_table.intern("this");
+                    for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
+                        const mnode: MethodNode* = node.methods[jm];
+                        if (mnode == null || mnode.func == null) { continue; }
+                        const fn_node: FunctionDeclNode* = mnode.func;
+                        mut ptypes: TypeRef[] = [];
+                        for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                            const pp: VarDeclNode* = fn_node.parameters[pi];
+                            if (pp == null) { continue; }
+                            if (pp.name.equals(st_this_amp)) { continue; }
+                            if (pp.name.equals(st_this_val)) { continue; }
+                            ptypes.push(pp.resolved_type);
+                        }
+                        const minfo: MethodInfo = MethodInfo {
+                            name:          fn_node.name,
+                            function_type: fn_node.resolved_return_type,
+                            is_public:     mnode.visibility == Visibility::Public,
+                            is_static:     mnode.is_static,
+                            is_virtual:    mnode.is_virtual,
+                            is_override:   mnode.is_override,
+                            param_types:   ptypes,
+                            ast_node:      mnode as void*,
+                        };
+                        st.add_method(minfo);
+                    }
                     struct_count++;
                 }
                 NodeKind::ClassDeclaration => {
