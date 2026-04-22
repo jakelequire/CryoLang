@@ -11,11 +11,15 @@ import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
 import Compiler::CompilationContext;
 import Compiler::DeclIndex;
+import Compiler::Types;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Type;
 import Compiler::Types::Arena;
+import Compiler::Types::Compound;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
+import Compiler::Resolver::MangledName;
+import Compiler::Resolver::QualifiedName;
 
 
 // ============================================================================
@@ -538,4 +542,217 @@ function truncate_voidptr(arr: void*[], new_len: i64) -> void*[] {
         result = result + [arr[i]];
     }
     return result;
+}
+
+
+// ============================================================================
+// On-demand cross-module extern declaration
+// ============================================================================
+//
+// These helpers replace the old `declare_cross_module_externs` /
+// `declare_cross_module_global_externs` pre-pass that walked every function
+// and global in every module and emitted an LLVM `declare` in the current
+// module regardless of whether it was referenced.  The bulk pass was
+// O(modules × functions × overloads) per compiled module — crippling for
+// stdlib-heavy programs with many generic specializations.
+//
+// Instead, codegen calls `resolve_function` / `resolve_function_with_arity`
+// / `resolve_global` at each cross-module reference.  The helpers:
+//   1. Fast-path: check the context's own function/global map.
+//   2. Slow-path: look up the signature in `DeclarationIndex`, emit an
+//      `external` declaration in the current LLVM module, register it,
+//      and return the handle.
+// This mirrors what LLVM itself does via `Module::getOrInsertFunction`.
+
+/// Build an LLVM function type from a Cryo `FunctionType*`.  Returns
+/// `LType::null()` if any parameter or the return type fails to map.
+function build_function_ltype(cg: CodegenContext*, ft: FunctionType*) -> LType {
+    const ret_ty: LType = cg.type_mapper.map_type(ft.return_type);
+    if (!ret_ty.is_valid()) { return LType::null(); }
+
+    const param_count: u32 = ft.param_types.length as u32;
+    if (param_count == 0) {
+        return LType::function_type(ret_ty, null, 0, ft.is_variadic);
+    }
+
+    const buf: void* = malloc(param_count as u64 * 8);
+    const slots: void** = buf as void**;
+    mut valid: boolean = true;
+    for (mut j: u32 = 0; j < param_count; j++) {
+        const mapped: LType = cg.type_mapper.map_type(ft.param_types[j]);
+        if (!mapped.is_valid()) { valid = false; break; }
+        slots[j] = mapped.raw;
+    }
+    mut result: LType = LType::null();
+    if (valid) {
+        result = LType::function_type(ret_ty, buf, param_count, ft.is_variadic);
+    }
+    free(buf);
+    return result;
+}
+
+/// Declare an extern function for a single (name, func_type_ref) pair, and
+/// register it under both the bare name and the (name, arity) composite key.
+/// If an LLVM symbol with the same mangled name already exists in this
+/// module, reuse it.  Returns the LValue on success, null otherwise.
+function declare_extern_function_overload(cg: CodegenContext*, fn_name: SymbolStr,
+                                          func_type_ref: TypeRef) -> LValue {
+    const arena: TypeArena* = cg.get_arena();
+    const ft_ptr: Type* = arena.lookup(func_type_ref.id);
+    if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { return LValue::null(); }
+    const ft: FunctionType* = ft_ptr as FunctionType*;
+
+    const fn_type: LType = build_function_ltype(cg, ft);
+    if (!fn_type.is_valid()) { return LValue::null(); }
+
+    const intern: InternTable* = cg.ctx.intern_table;
+    const di: DeclarationIndex* = cg.ctx.decl_index;
+
+    // Prefer the overload-specific mangled name registered for this exact
+    // (fn_name, func_type_ref) pair.  Fall back to the single-slot alias
+    // only when no overload entry exists.
+    mut mangled_sym: SymbolStr = di.lookup_overload_mangled(fn_name, func_type_ref);
+    if (!mangled_sym.is_valid()) {
+        mangled_sym = di.lookup_mangled_name(fn_name);
+    }
+    if (!mangled_sym.is_valid()) {
+        const ext_qname: QualifiedName = QualifiedName::from_symbol(fn_name);
+        mangled_sym = MangledName::for_function(intern, ext_qname).value;
+    }
+    const ir_name: string = intern.resolve(mangled_sym);
+
+    mut fn_val: LValue = cg.llvm_module.get_named_function(ir_name);
+    if (!fn_val.is_valid()) {
+        fn_val = cg.llvm_module.add_function(ir_name, fn_type);
+    }
+    cg.register_function(fn_name, fn_val);
+    cg.register_function_with_arity(fn_name, ft.param_types.length as u32, fn_val);
+    return fn_val;
+}
+
+/// Return-type-only fallback: declare a no-arg function for names that
+/// have no full signature in DeclarationIndex but do have a return type.
+function declare_extern_function_return_only(cg: CodegenContext*, fn_name: SymbolStr) -> LValue {
+    const intern: InternTable* = cg.ctx.intern_table;
+    const di: DeclarationIndex* = cg.ctx.decl_index;
+    const ret_ref: TypeRef = di.lookup_func_return(fn_name);
+    if (ret_ref.is_invalid()) { return LValue::null(); }
+
+    const ret_ty: LType = cg.type_mapper.map_type(ret_ref);
+    if (!ret_ty.is_valid()) { return LValue::null(); }
+
+    const fn_type: LType = LType::function_type(ret_ty, null, 0, false);
+    mut fb_mangled: SymbolStr = di.lookup_mangled_name(fn_name);
+    if (!fb_mangled.is_valid()) {
+        const fb_qname: QualifiedName = QualifiedName::from_symbol(fn_name);
+        fb_mangled = MangledName::for_function(intern, fb_qname).value;
+    }
+    const ir_name: string = intern.resolve(fb_mangled);
+    mut fn_val: LValue = cg.llvm_module.get_named_function(ir_name);
+    if (!fn_val.is_valid()) {
+        fn_val = cg.llvm_module.add_function(ir_name, fn_type);
+    }
+    cg.register_function(fn_name, fn_val);
+    return fn_val;
+}
+
+/// Returns true iff `name` is defined in the module currently being
+/// compiled.  Used by the resolve_* helpers to avoid turning a stale local
+/// lookup into a stub extern declaration (which would leave the would-be
+/// body without a terminator — the callers rely on declare_functions /
+/// declare_method having registered the handle before body codegen runs).
+function owned_by_current_module(cg: CodegenContext*, mod_sym: SymbolStr) -> boolean {
+    if (!mod_sym.is_valid()) { return false; }
+    const current: SymbolStr = cg.ctx.intern_table.intern(cg.ctx.source_file);
+    return mod_sym.equals(current);
+}
+
+/// Look up a function by name, declaring a cross-module extern on demand
+/// when this module hasn't seen it yet.  Returns null when the name is
+/// unknown to the DeclarationIndex OR when the symbol is owned by the
+/// current module (the caller should be using the value that declare_* put
+/// in the map, not a freshly declared extern that would clobber the body).
+function resolve_function(cg: CodegenContext*, name: SymbolStr) -> LValue {
+    const cached: LValue = cg.get_function(name);
+    if (cached.is_valid()) { return cached; }
+
+    const di: DeclarationIndex* = cg.ctx.decl_index;
+    if (owned_by_current_module(cg, di.get_function_module(name))) {
+        return LValue::null();
+    }
+
+    const overloads: TypeRef[] = di.lookup_func_type_overloads(name);
+    // Declare every known overload so that arity-aware lookups and
+    // unqualified fallbacks both resolve; return the first success for
+    // the bare-name path.
+    mut first: LValue = LValue::null();
+    for (mut i: i64 = 0; i < overloads.length; i++) {
+        const v: LValue = declare_extern_function_overload(cg, name, overloads[i]);
+        if (!first.is_valid() && v.is_valid()) { first = v; }
+    }
+    if (first.is_valid()) { return first; }
+
+    return declare_extern_function_return_only(cg, name);
+}
+
+/// Look up an overloaded function by (name, user-arg-count), declaring a
+/// cross-module extern on demand.  Returns null if no overload matches or
+/// when the symbol is owned by the current module (same reason as
+/// resolve_function).
+function resolve_function_with_arity(cg: CodegenContext*, name: SymbolStr,
+                                      arity: u32) -> LValue {
+    const cached: LValue = cg.get_function_with_arity(name, arity);
+    if (cached.is_valid()) { return cached; }
+
+    const di: DeclarationIndex* = cg.ctx.decl_index;
+    if (owned_by_current_module(cg, di.get_function_module(name))) {
+        return LValue::null();
+    }
+
+    const arena: TypeArena* = cg.get_arena();
+    const overloads: TypeRef[] = di.lookup_func_type_overloads(name);
+    for (mut i: i64 = 0; i < overloads.length; i++) {
+        const ft_ptr: Type* = arena.lookup(overloads[i].id);
+        if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
+        const ft: FunctionType* = ft_ptr as FunctionType*;
+        if (ft.param_types.length as u32 != arity) { continue; }
+        const v: LValue = declare_extern_function_overload(cg, name, overloads[i]);
+        if (v.is_valid()) { return v; }
+    }
+    return LValue::null();
+}
+
+/// Look up a global by name, declaring a cross-module extern on demand.
+/// Returns null when the name is unknown to the DeclarationIndex OR when
+/// it's owned by the current module (codegen_global_var registers the
+/// definition; an extern stub would collide).
+function resolve_global(cg: CodegenContext*, name: SymbolStr) -> LValue {
+    const cached: LValue = cg.get_global(name);
+    if (cached.is_valid()) { return cached; }
+
+    const intern: InternTable* = cg.ctx.intern_table;
+    const di: DeclarationIndex* = cg.ctx.decl_index;
+    if (owned_by_current_module(cg, di.get_global_module(name))) {
+        return LValue::null();
+    }
+
+    const g_type_ref: TypeRef = di.lookup_global(name);
+    if (g_type_ref.is_invalid()) { return LValue::null(); }
+
+    const g_llvm_ty: LType = cg.type_mapper.map_type(g_type_ref);
+    if (!g_llvm_ty.is_valid()) { return LValue::null(); }
+
+    const g_name_str: string = intern.resolve(name);
+    const g_qname: QualifiedName = QualifiedName::single(intern, g_name_str);
+    const mangled: string = MangledName::for_global(intern, g_qname).resolve(intern);
+
+    // Reuse an existing LLVM global if something (e.g. a prior pass) already
+    // created one with the same mangled name — identical-name externs share
+    // the same symbol at link time.
+    mut g_val: LValue = cg.llvm_module.get_named_global(mangled);
+    if (!g_val.is_valid()) {
+        g_val = cg.llvm_module.add_global(g_llvm_ty, mangled);
+    }
+    cg.register_global(name, g_val);
+    return g_val;
 }
