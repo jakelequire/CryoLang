@@ -1,0 +1,299 @@
+///! Result — a value that may be an error
+///!
+///! `Result<T, E>` is the canonical return type for operations that can fail
+///! in a way the caller is expected to handle. Every fallible stdlib call
+///! returns `Result<T, E>` with a module-specific `E`, except where absence
+///! alone is the failure mode — in that case we use `Option<T>`.
+///!
+///! # Requirements on the type parameters
+///!
+///! Most methods treat `T` and `E` opaquely. The `contains_eq` family needs
+///! `==` on `T`; `contains_err_eq` needs `==` on `E`. When the trait system
+///! lands these become `where T: Eq` / `where E: Eq`. See `PLAN.md` §2.1.
+
+namespace std::core::result;
+
+import core::intrinsics;
+import core::panic;
+import core::option;
+import core::error;
+
+// ============================================================================
+// Declaration
+// ============================================================================
+
+type enum Result<T, E> {
+    Ok(T);
+    Err(E);
+}
+
+/// `Result` specialized to a `string` error. Handy for quick-and-dirty
+/// error paths that don't need a structured error type yet.
+type StringResult<T> = Result<T, string>;
+
+/// `Result` specialized to the stdlib's standard `Error` struct.
+type StdResult<T> = Result<T, Error>;
+
+// ============================================================================
+// Methods
+// ============================================================================
+
+implement enum Result<T, E> {
+    // ------------------------------------------------------------------------
+    // Predicates
+    // ------------------------------------------------------------------------
+
+    is_ok(&this) -> boolean {
+        match (&this) {
+            Result::Ok(_) => { return true; }
+            Result::Err(_) => { return false; }
+        }
+    }
+
+    is_err(&this) -> boolean {
+        match (&this) {
+            Result::Ok(_) => { return false; }
+            Result::Err(_) => { return true; }
+        }
+    }
+
+    is_ok_and(&this, predicate: (T) -> boolean) -> boolean {
+        match (&this) {
+            Result::Ok(value) => { return predicate(value); }
+            Result::Err(_) => { return false; }
+        }
+    }
+
+    is_err_and(&this, predicate: (E) -> boolean) -> boolean {
+        match (&this) {
+            Result::Ok(_) => { return false; }
+            Result::Err(err) => { return predicate(err); }
+        }
+    }
+
+    /// `true` iff `this` is `Ok(v)` and `v == value`. Requires `T` to
+    /// support `==`.
+    contains_eq(&this, value: T) -> boolean {
+        match (&this) {
+            Result::Ok(v) => { return v == value; }
+            Result::Err(_) => { return false; }
+        }
+    }
+
+    /// `true` iff `this` is `Err(e)` and `e == error`. Requires `E` to
+    /// support `==`.
+    contains_err_eq(&this, error: E) -> boolean {
+        match (&this) {
+            Result::Ok(_) => { return false; }
+            Result::Err(e) => { return e == error; }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Extraction (panicking)
+    // ------------------------------------------------------------------------
+
+    /// Return the inner `Ok` value, aborting the program if `Err`.
+    unwrap(&this) -> T {
+        match (&this) {
+            Result::Ok(value) => { return value; }
+            Result::Err(_) => {
+                intrinsics::panic("called Result::unwrap() on an Err value", FILE, LINE);
+            }
+        }
+    }
+
+    /// Like `unwrap`, but panic with a caller-supplied message.
+    expect(&this, message: string) -> T {
+        match (&this) {
+            Result::Ok(value) => { return value; }
+            Result::Err(_) => {
+                intrinsics::panic(message, FILE, LINE);
+            }
+        }
+    }
+
+    /// Return the inner `Err` value, aborting if `Ok`. The mirror of
+    /// `unwrap`; reach for this in tests that assert an operation fails.
+    unwrap_err(&this) -> E {
+        match (&this) {
+            Result::Ok(_) => {
+                intrinsics::panic("called Result::unwrap_err() on an Ok value", FILE, LINE);
+            }
+            Result::Err(err) => { return err; }
+        }
+    }
+
+    expect_err(&this, message: string) -> E {
+        match (&this) {
+            Result::Ok(_) => {
+                intrinsics::panic(message, FILE, LINE);
+            }
+            Result::Err(err) => { return err; }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Extraction (non-panicking)
+    // ------------------------------------------------------------------------
+
+    unwrap_or(&this, default_value: T) -> T {
+        match (&this) {
+            Result::Ok(value) => { return value; }
+            Result::Err(_) => { return default_value; }
+        }
+    }
+
+    unwrap_or_else(&this, op: (E) -> T) -> T {
+        match (&this) {
+            Result::Ok(value) => { return value; }
+            Result::Err(err) => { return op(err); }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Transformation
+    // ------------------------------------------------------------------------
+
+    /// Apply `op` to the inner `Ok` value; leave `Err` unchanged.
+    map<U>(&this, op: (T) -> U) -> Result<U, E> {
+        match (&this) {
+            Result::Ok(value) => { return Result::Ok(op(value)); }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    map_or<U>(&this, default_value: U, op: (T) -> U) -> U {
+        match (&this) {
+            Result::Ok(value) => { return op(value); }
+            Result::Err(_) => { return default_value; }
+        }
+    }
+
+    map_or_else<U>(&this, default_fn: (E) -> U, op: (T) -> U) -> U {
+        match (&this) {
+            Result::Ok(value) => { return op(value); }
+            Result::Err(err) => { return default_fn(err); }
+        }
+    }
+
+    /// Apply `op` to the inner `Err` value; leave `Ok` unchanged. The
+    /// primary tool for adapting an inner error type to a caller's outer
+    /// error type.
+    map_err<F>(&this, op: (E) -> F) -> Result<T, F> {
+        match (&this) {
+            Result::Ok(value) => { return Result::Ok(value); }
+            Result::Err(err) => { return Result::Err(op(err)); }
+        }
+    }
+
+    inspect(&this, op: (T) -> void) -> Result<T, E> {
+        match (&this) {
+            Result::Ok(value) => { op(value); }
+            Result::Err(_) => { }
+        }
+        return this;
+    }
+
+    inspect_err(&this, op: (E) -> void) -> Result<T, E> {
+        match (&this) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { op(err); }
+        }
+        return this;
+    }
+
+    // ------------------------------------------------------------------------
+    // Choice
+    // ------------------------------------------------------------------------
+
+    and<U>(&this, res: Result<U, E>) -> Result<U, E> {
+        match (&this) {
+            Result::Ok(_) => { return res; }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    and_then<U>(&this, op: (T) -> Result<U, E>) -> Result<U, E> {
+        match (&this) {
+            Result::Ok(value) => { return op(value); }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    or<F>(&this, res: Result<T, F>) -> Result<T, F> {
+        match (&this) {
+            Result::Ok(value) => { return Result::Ok(value); }
+            Result::Err(_) => { return res; }
+        }
+    }
+
+    or_else<F>(&this, op: (E) -> Result<T, F>) -> Result<T, F> {
+        match (&this) {
+            Result::Ok(value) => { return Result::Ok(value); }
+            Result::Err(err) => { return op(err); }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Conversion to Option
+    // ------------------------------------------------------------------------
+
+    /// Project to the success side: `Ok(v)` becomes `Some(v)`, `Err` is
+    /// discarded and becomes `None`.
+    ok(&this) -> Option<T> {
+        match (&this) {
+            Result::Ok(value) => { return Option::Some(value); }
+            Result::Err(_) => { return Option::None; }
+        }
+    }
+
+    /// Project to the error side: `Err(e)` becomes `Some(e)`, `Ok` is
+    /// discarded and becomes `None`.
+    err(&this) -> Option<E> {
+        match (&this) {
+            Result::Ok(_) => { return Option::None; }
+            Result::Err(err) => { return Option::Some(err); }
+        }
+    }
+}
+
+// ============================================================================
+// Free helpers
+// ============================================================================
+
+/// Flatten a `Result<Result<T, E>, E>` into a `Result<T, E>`. Useful when
+/// an operation itself returns a fallible operation.
+function flatten<T, E>(nested: Result<Result<T, E>, E>) -> Result<T, E> {
+    match (nested) {
+        Result::Ok(inner) => { return inner; }
+        Result::Err(err) => { return Result::Err(err); }
+    }
+}
+
+/// Swap a `Result<Option<T>, E>` into an `Option<Result<T, E>>`. The
+/// three cases map as:
+///   - `Ok(Some(v))` -> `Some(Ok(v))`
+///   - `Ok(None)`    -> `None`
+///   - `Err(e)`      -> `Some(Err(e))`
+function transpose<T, E>(value: Result<Option<T>, E>) -> Option<Result<T, E>> {
+    match (value) {
+        Result::Ok(opt) => {
+            match (opt) {
+                Option::Some(v) => { return Option::Some(Result::Ok(v)); }
+                Option::None => { return Option::None; }
+            }
+        }
+        Result::Err(err) => { return Option::Some(Result::Err(err)); }
+    }
+}
+
+/// Shorthand constructor for the success case.
+function ok<T, E>(value: T) -> Result<T, E> {
+    return Result::Ok(value);
+}
+
+/// Shorthand constructor for the error case.
+function err<T, E>(error: E) -> Result<T, E> {
+    return Result::Err(error);
+}

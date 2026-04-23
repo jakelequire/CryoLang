@@ -1,0 +1,91 @@
+///! Slice<T> — a borrowed view into a contiguous sequence.
+///!
+///! `Slice<T>` is `(pointer, length)`. Algorithms operate on slices;
+///! collections expose `as_slice()` so algorithms need only be written
+///! once. A slice does not own its storage — the backing memory must
+///! outlive every slice that refers to it.
+
+namespace std::core::slice;
+
+import core::intrinsics;
+import core::iter;
+import core::option;
+import core::mem;
+
+type struct Slice<T> {
+    ptr: T*;
+    length: u64;
+
+    /// Construct from a raw pointer and length. The caller certifies
+    /// that `[ptr, ptr + length)` is valid initialized memory for as
+    /// long as the slice exists.
+    static from_raw(ptr: T*, length: u64) -> Slice<T> {
+        return Slice<T> { ptr: ptr, length: length };
+    }
+
+    length(&this) -> u64 {
+        return this.length;
+    }
+
+    is_empty(&this) -> boolean {
+        return this.length == 0;
+    }
+
+    /// Bounds-checked lookup.
+    get(&this, index: u64) -> Option<T> {
+        if (index >= this.length) {
+            return Option::None;
+        }
+        return Option::Some(this.ptr[index]);
+    }
+
+    /// Raw pointer to the first element. Callers must respect `length`.
+    as_ptr(&this) -> T* {
+        return this.ptr;
+    }
+
+    /// The sub-slice `[start, end)`. Panics if `start > end` or
+    /// `end > length`.
+    subslice(&this, start: u64, end: u64) -> Slice<T> {
+        if (start > end || end > this.length) {
+            intrinsics::panic("Slice::subslice: out of range", FILE, LINE);
+        }
+        return Slice<T> {
+            ptr: mem::offset(this.ptr, start as i64),
+            length: end - start
+        };
+    }
+
+    /// Return an iterator that yields each element in order.
+    iter(&this) -> SliceIter<T> {
+        return SliceIter<T> { ptr: this.ptr, remaining: this.length };
+    }
+}
+
+// ============================================================================
+// SliceIter — forward iterator over a Slice<T>
+// ============================================================================
+
+type struct SliceIter<T> {
+    ptr: T*;
+    remaining: u64;
+}
+
+implement<T> Iterator<T> for SliceIter<T> {
+    next(mut &this) -> Option<T> {
+        if (this.remaining == 0) {
+            return Option::None;
+        }
+        const value: T = *this.ptr;
+        this.ptr = mem::offset(this.ptr, 1);
+        this.remaining = this.remaining - 1;
+        return Option::Some(value);
+    }
+
+    /// Override the default — slice length is known O(1).
+    count(mut &this) -> u64 {
+        const n: u64 = this.remaining;
+        this.remaining = 0;
+        return n;
+    }
+}
