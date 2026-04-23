@@ -19,8 +19,6 @@ import net::http::status;
 import net::http::headers;
 import net::http::request;
 
-const HTTP_VERSION: Str = Str::from_raw("HTTP/1.1" as u8*, 8);
-
 type struct Response {
     public status: StatusCode;
     public version: String;
@@ -30,7 +28,7 @@ type struct Response {
     static new(status: StatusCode) -> Response {
         return Response {
             status: status,
-            version: String::from_str(HTTP_VERSION),
+            version: String::from_str(request::HTTP_VERSION),
             headers: Headers::new(),
             body: Array::new()
         };
@@ -45,14 +43,7 @@ type struct Response {
             Str::from_raw("text/plain; charset=utf-8" as u8*, 25)
         );
         mut bytes: Array<u8> = Array::with_capacity(body.length());
-        mut i: u64 = 0;
-        while (i < body.length()) {
-            match (body.byte_at(i)) {
-                Option::Some(byte) => { bytes.push(byte); }
-                Option::None => { break; }
-            }
-            i++;
-        }
+        bytes.push_slice(body.as_bytes());
         resp.set_body(bytes);
         return resp;
     }
@@ -112,14 +103,12 @@ type struct Response {
             Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
         }
 
-        // Headers — Phase 5 doesn't iterate HashMap. The Content-Length
-        // that `set_body` installed is not emitted here; users should
-        // set Content-Length explicitly via `headers.insert` and also
-        // emit any headers with a helper of their own. When iteration
-        // lands, this writes every header in the map.
-        // TODO(phase6): emit `this.headers` entries once HashMap iter
-        // is available.
+        // Headers: emit every stored header as `name: value\r\n`.
+        match (this.headers.write_to(writer)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
 
+        // Blank line separating headers from body.
         match (writer.write_all(crlf)) {
             Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
         }

@@ -6,16 +6,18 @@
 ///! so algorithms that only read can be written once.
 ///!
 ///! Byte-level access is always safe: `length()` returns the byte
-///! count, `as_bytes()` hands out the underlying `Slice<u8>`. Char
-///! iteration needs a UTF-8 decoder and is deferred until the caller
-///! shape settles — `byte_at` and `as_bytes` cover the common cases
-///! without speculating on an iterator API.
+///! count, `as_bytes()` hands out the underlying `Slice<u8>`. Scalar
+///! iteration requires a UTF-8 decoder; use `byte_at` and `as_bytes`
+///! for byte-level operations.
 
 namespace std::collections::str;
 
 import core::intrinsics;
 import core::option;
 import core::slice;
+import core::cmp;
+import core::hash;
+import collections::string;
 
 type struct Str {
     bytes: u8*;
@@ -54,8 +56,8 @@ type struct Str {
         return this.bytes;
     }
 
-    /// Bounds-checked byte lookup. For iteration by UTF-8 code point,
-    /// wait for the decoder module (not in Phase 4).
+    /// Bounds-checked byte lookup. For scalar iteration, use
+    /// `as_bytes()` with a UTF-8 decoder.
     byte_at(&this, index: u64) -> Option<u8> {
         if (index >= this.length) {
             return Option::None;
@@ -65,8 +67,7 @@ type struct Str {
 
     /// `[start, end)` byte sub-slice. Panics if the range is out of
     /// bounds or if `start > end`. **Not UTF-8-aware** — splitting
-    /// inside a multi-byte scalar is the caller's problem (fix: use
-    /// the decoder when it lands).
+    /// inside a multi-byte scalar is the caller's responsibility.
     sub_bytes(&this, start: u64, end: u64) -> Str {
         if (start > end || end > this.length) {
             intrinsics::panic("Str::sub_bytes: out of range", FILE, LINE);
@@ -91,5 +92,52 @@ type struct Str {
             other.bytes as void*,
             this.length
         ) == 0;
+    }
+
+    /// Return a new `String` with every ASCII uppercase byte folded to
+    /// lowercase. Non-ASCII bytes are passed through unchanged.
+    /// Requires `collections::string` — callers that only need `Str`
+    /// can byte-scan manually, but most callers want this method.
+    to_ascii_lowercase(&this) -> String {
+        mut out: String = String::with_capacity(this.length);
+        mut i: u64 = 0;
+        while (i < this.length) {
+            match (this.byte_at(i)) {
+                Option::Some(byte) => {
+                    mut b: u8 = byte;
+                    if (b >= 0x41 && b <= 0x5A) { b = b + 32; }
+                    out.push_byte(b);
+                }
+                Option::None => { break; }
+            }
+            i++;
+        }
+        return out;
+    }
+}
+
+// ============================================================================
+// Trait impls
+// ============================================================================
+
+implement Eq for Str {
+    equals(&this, other: &Str) -> boolean {
+        if (this.length != other.length) {
+            return false;
+        }
+        if (this.length == 0) {
+            return true;
+        }
+        return intrinsics::memcmp(
+            this.bytes as void*,
+            other.bytes as void*,
+            this.length
+        ) == 0;
+    }
+}
+
+implement Hash for Str {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        hasher.write_bytes(this.as_bytes());
     }
 }

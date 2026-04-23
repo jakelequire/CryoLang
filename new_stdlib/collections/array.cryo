@@ -15,6 +15,7 @@ import core::intrinsics;
 import core::option;
 import core::result;
 import core::slice;
+import core::mem;
 import alloc::allocator;
 import collections::raw_buffer;
 
@@ -173,6 +174,36 @@ type struct Array<T, A = GlobalAlloc> {
     /// array is going away entirely.
     clear(mut &this) -> void {
         this.length = 0;
+    }
+
+    /// Append every element of `source` to the end of this array.
+    /// Panics on allocation failure; use `try_push_slice` to recover.
+    push_slice(mut &this, source: Slice<T>) -> void {
+        match (this.try_push_slice(source)) {
+            Result::Ok(_) => { return; }
+            Result::Err(_) => {
+                intrinsics::panic("Array::push_slice: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Fallible bulk append. Reserves space for all elements first so
+    /// partial copies are impossible — either all elements are appended
+    /// or none are.
+    try_push_slice(mut &this, source: Slice<T>) -> Result<(), AllocError> {
+        const add: u64 = source.length();
+        if (add == 0) { return Result::Ok(()); }
+        match (this.buffer.reserve(this.length, add, INITIAL_CAPACITY)) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        intrinsics::memcpy(
+            mem::offset(this.buffer.ptr(), this.length as i64) as void*,
+            source.as_ptr() as void*,
+            add * sizeof(T)
+        );
+        this.length = this.length + add;
+        return Result::Ok(());
     }
 
     // ========================================================================
