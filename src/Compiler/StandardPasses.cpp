@@ -2669,9 +2669,57 @@ namespace Cryo
         {
             auto *match_stmt = static_cast<MatchStatementNode *>(stmt);
             resolve_expression(match_stmt->expr(), TypeRef{}, ctx);
+
+            // Determine subject enum type for binding registration (mirrors
+            // MatchExpression sema — same nested-pattern shape lives in statements
+            // when arms return/diverge instead of producing a value).
+            const EnumType *subject_enum = nullptr;
+            {
+                TypeRef subj_ty = infer_match_subject_enum_type(match_stmt->expr(), ctx);
+                while (subj_ty.is_valid())
+                {
+                    if (subj_ty->kind() == TypeKind::TypeAlias)
+                    {
+                        subj_ty = static_cast<const TypeAliasType *>(subj_ty.get())->target();
+                        continue;
+                    }
+                    if (subj_ty->kind() == TypeKind::Reference)
+                    {
+                        subj_ty = static_cast<const ReferenceType *>(subj_ty.get())->referent();
+                        continue;
+                    }
+                    if (subj_ty->kind() == TypeKind::Pointer)
+                    {
+                        subj_ty = static_cast<const PointerType *>(subj_ty.get())->pointee();
+                        continue;
+                    }
+                    if (subj_ty->kind() == TypeKind::InstantiatedType)
+                    {
+                        auto *inst = static_cast<const InstantiatedType *>(subj_ty.get());
+                        TypeRef base = inst->has_resolved_type() ? inst->resolved_type() : inst->generic_base();
+                        if (base.is_valid() && base != subj_ty)
+                        {
+                            subj_ty = base;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if (subj_ty.is_valid() && subj_ty->kind() == TypeKind::Enum)
+                    subject_enum = static_cast<const EnumType *>(subj_ty.get());
+            }
+
             for (auto &arm : match_stmt->arms())
             {
+                std::unordered_map<std::string, TypeRef> saved_locals = _local_variable_types;
+                if (subject_enum)
+                {
+                    const auto &patterns = arm->patterns();
+                    if (!patterns.empty())
+                        register_pattern_bindings(patterns[0].get(), subject_enum);
+                }
                 resolve_statement(arm->body(), expected_type, ctx);
+                _local_variable_types = std::move(saved_locals);
             }
             break;
         }
@@ -3389,9 +3437,67 @@ namespace Cryo
             // Resolve the match expression itself (no expected type)
             resolve_expression(match_expr->expression(), TypeRef{}, ctx);
 
+            // Determine the subject's enum type so we can register pattern bindings
+            // into _local_variable_types for each arm body.  Without this, nested
+            // member-access chains through pattern-bound variables like
+            //   `match (*outer) { Generic(gen) => match (*gen.base) { Named(n) => n.name }}`
+            // fail in downstream resolve_member_access_type because `gen` and `n`
+            // are never seen as locals.
+            const EnumType *subject_enum = nullptr;
+            {
+                TypeRef subj_ty = infer_match_subject_enum_type(match_expr->expression(), ctx);
+                // Unwrap through TypeAlias / Reference / Pointer / InstantiatedType
+                while (subj_ty.is_valid())
+                {
+                    if (subj_ty->kind() == TypeKind::TypeAlias)
+                    {
+                        subj_ty = static_cast<const TypeAliasType *>(subj_ty.get())->target();
+                        continue;
+                    }
+                    if (subj_ty->kind() == TypeKind::Reference)
+                    {
+                        auto *r = static_cast<const ReferenceType *>(subj_ty.get());
+                        subj_ty = r->referent();
+                        continue;
+                    }
+                    if (subj_ty->kind() == TypeKind::Pointer)
+                    {
+                        auto *p = static_cast<const PointerType *>(subj_ty.get());
+                        subj_ty = p->pointee();
+                        continue;
+                    }
+                    if (subj_ty->kind() == TypeKind::InstantiatedType)
+                    {
+                        auto *inst = static_cast<const InstantiatedType *>(subj_ty.get());
+                        TypeRef base = inst->has_resolved_type() ? inst->resolved_type() : inst->generic_base();
+                        if (base.is_valid() && base != subj_ty)
+                        {
+                            subj_ty = base;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if (subj_ty.is_valid() && subj_ty->kind() == TypeKind::Enum)
+                    subject_enum = static_cast<const EnumType *>(subj_ty.get());
+            }
+
             // Propagate expected type to each arm's body
             for (const auto &arm : match_expr->arms())
             {
+                // Save/restore local-variable map so bindings only scope to this arm
+                std::unordered_map<std::string, TypeRef> saved_locals = _local_variable_types;
+
+                // Register pattern bindings (first pattern only — the Cryo grammar
+                // requires all alternates in `Pat1 | Pat2` to bind the same names
+                // with compatible types, so any arm's first pattern is representative).
+                if (subject_enum)
+                {
+                    const auto &patterns = arm->patterns();
+                    if (!patterns.empty())
+                        register_pattern_bindings(patterns[0].get(), subject_enum);
+                }
+
                 // Handle the arm body - it's a StatementNode (usually BlockStatementNode)
                 auto *body = arm->body();
                 if (body)
@@ -3421,6 +3527,9 @@ namespace Cryo
                         resolve_statement(body, expected_type, ctx);
                     }
                 }
+
+                // Restore locals after arm — bindings don't leak into sibling arms
+                _local_variable_types = std::move(saved_locals);
             }
             break;
         }
@@ -3444,6 +3553,57 @@ namespace Cryo
                           "GenericExpressionResolutionPass: Resolved MemberAccess '.{}' to type '{}'",
                           member_access->member(),
                           field_type->display_name());
+            }
+            break;
+        }
+        case NodeKind::UnaryExpression:
+        {
+            // Needed so that `*ptr` used as a match subject carries a
+            // resolved_type downstream.  Without this, nested matches like
+            //   match (*outer) { ...(gen) => match (*gen.base) { ...(n) => n.name }}
+            // leave `*gen.base` with no resolved_type, and codegen's
+            // generate_unary can't determine the pointee type from the
+            // MemberAccess operand, which falls back to returning the
+            // previously-set ctx result (often an i32 discriminant from the
+            // enclosing match) as the match subject — breaking payload
+            // extraction for the inner arm's binding.
+            auto *unary = static_cast<UnaryExpressionNode *>(expr);
+            if (unary->has_resolved_type())
+                break;
+            // Recursively resolve the operand first
+            resolve_expression(unary->operand(), TypeRef{}, ctx);
+            // For dereference `*x`, this node's type is the pointee of operand
+            if (unary->operator_token().kind() == TokenKind::TK_STAR)
+            {
+                TypeRef op_ty = unary->operand()->get_resolved_type();
+                if (!op_ty.is_valid())
+                {
+                    // Fallback: local lookup for identifier operands
+                    if (auto *id = dynamic_cast<IdentifierNode *>(unary->operand()))
+                    {
+                        auto it = _local_variable_types.find(id->name());
+                        if (it != _local_variable_types.end())
+                            op_ty = it->second;
+                    }
+                }
+                if (op_ty.is_valid())
+                {
+                    // Strip TypeAlias wrapper
+                    while (op_ty.is_valid() && op_ty->kind() == TypeKind::TypeAlias)
+                        op_ty = static_cast<const TypeAliasType *>(op_ty.get())->target();
+                    if (op_ty.is_valid() && op_ty->kind() == TypeKind::Pointer)
+                    {
+                        TypeRef pointee = static_cast<const PointerType *>(op_ty.get())->pointee();
+                        if (pointee.is_valid())
+                            unary->set_resolved_type(pointee);
+                    }
+                    else if (op_ty.is_valid() && op_ty->kind() == TypeKind::Reference)
+                    {
+                        TypeRef referent = static_cast<const ReferenceType *>(op_ty.get())->referent();
+                        if (referent.is_valid())
+                            unary->set_resolved_type(referent);
+                    }
+                }
             }
             break;
         }
@@ -3875,6 +4035,98 @@ namespace Cryo
                   "lookup_concrete_type: Could not find concrete type for '{}' or '{}'",
                   mangled_name, simple_base + "_...");
         return TypeRef{};
+    }
+
+    TypeRef GenericExpressionResolutionPass::infer_match_subject_enum_type(ExpressionNode *subject, PassContext &ctx)
+    {
+        if (!subject)
+            return TypeRef{};
+
+        // Fast path: resolved_type already set
+        TypeRef ty = subject->get_resolved_type();
+        if (ty.is_valid())
+            return ty;
+
+        // Identifier: look up in locals (includes pattern bindings and function params)
+        if (auto *id = dynamic_cast<IdentifierNode *>(subject))
+        {
+            auto it = _local_variable_types.find(id->name());
+            if (it != _local_variable_types.end())
+                return it->second;
+            // 'this'
+            if (id->name() == "this" && _current_struct_type.is_valid())
+                return _current_struct_type;
+            return TypeRef{};
+        }
+
+        // UnaryExpression: dereference `*operand` → pointee type of operand
+        if (auto *unary = dynamic_cast<UnaryExpressionNode *>(subject))
+        {
+            if (unary->operator_token().kind() == TokenKind::TK_STAR)
+            {
+                TypeRef operand_ty = infer_match_subject_enum_type(unary->operand(), ctx);
+                if (!operand_ty.is_valid())
+                    return TypeRef{};
+                // Unwrap TypeAlias
+                while (operand_ty.is_valid() && operand_ty->kind() == TypeKind::TypeAlias)
+                    operand_ty = static_cast<const TypeAliasType *>(operand_ty.get())->target();
+                // *ptr → pointee
+                if (operand_ty.is_valid() && operand_ty->kind() == TypeKind::Pointer)
+                {
+                    auto *p = static_cast<const PointerType *>(operand_ty.get());
+                    return p->pointee();
+                }
+                // *&x → referent
+                if (operand_ty.is_valid() && operand_ty->kind() == TypeKind::Reference)
+                {
+                    auto *r = static_cast<const ReferenceType *>(operand_ty.get());
+                    return r->referent();
+                }
+                // Already by-value — treat operand's type as the subject (some
+                // call sites pass `*x` where x is already a value, expecting
+                // identity).
+                return operand_ty;
+            }
+            return TypeRef{};
+        }
+
+        // MemberAccess: delegate to resolve_member_access_type
+        if (auto *ma = dynamic_cast<MemberAccessNode *>(subject))
+        {
+            return resolve_member_access_type(ma, ctx);
+        }
+
+        return TypeRef{};
+    }
+
+    void GenericExpressionResolutionPass::register_pattern_bindings(PatternNode *pattern, const EnumType *subject_enum)
+    {
+        if (!pattern || !subject_enum)
+            return;
+        if (pattern->kind() != NodeKind::EnumPattern)
+            return;
+
+        auto *enum_pat = static_cast<EnumPatternNode *>(pattern);
+        const EnumVariant *variant = subject_enum->get_variant(enum_pat->variant_name());
+        if (!variant)
+            return;
+
+        const auto &elements = enum_pat->pattern_elements();
+        size_t payload_i = 0;
+        for (const auto &elem : elements)
+        {
+            if (elem.is_binding() && !elem.binding_name.empty() && elem.binding_name != "_")
+            {
+                if (payload_i < variant->payload_types.size())
+                {
+                    TypeRef pt = variant->payload_types[payload_i];
+                    if (pt.is_valid())
+                        _local_variable_types[elem.binding_name] = pt;
+                }
+            }
+            if (elem.is_binding() || elem.is_wildcard() || elem.is_literal())
+                payload_i++;
+        }
     }
 
     TypeRef GenericExpressionResolutionPass::resolve_member_access_type(MemberAccessNode *member_access, PassContext &ctx)
