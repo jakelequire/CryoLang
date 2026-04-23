@@ -13,6 +13,8 @@ import core::result;
 import core::hash;
 import core::cmp;
 import core::slice;
+import io::error;
+import io::traits;
 import collections::str;
 import collections::string;
 import collections::hash_map;
@@ -36,7 +38,7 @@ type struct Headers {
     /// stored verbatim. Ownership of both values transfers to the
     /// headers map.
     insert(mut &this, name: Str, value: Str) -> void {
-        mut key: String = to_lowercase(name);
+        mut key: String = name.to_ascii_lowercase();
         mut val: String = String::from_str(value);
         this.inner.insert(key, val);
     }
@@ -45,7 +47,7 @@ type struct Headers {
     /// value — header values are small, so copy-on-read is cheap and
     /// keeps the API simple.
     get(&this, name: Str) -> Option<String> {
-        mut key: String = to_lowercase(name);
+        mut key: String = name.to_ascii_lowercase();
         const result: Option<String> = this.inner.get(&key);
         key.drop();
         return result;
@@ -56,7 +58,7 @@ type struct Headers {
     }
 
     remove(mut &this, name: Str) -> boolean {
-        mut key: String = to_lowercase(name);
+        mut key: String = name.to_ascii_lowercase();
         const result: Option<String> = this.inner.remove(&key);
         key.drop();
         match (result) {
@@ -101,33 +103,48 @@ type struct Headers {
         return true;
     }
 
+    /// Serialize all stored headers as HTTP/1.1 field lines:
+    /// `name: value\r\n` for every entry. The caller is responsible
+    /// for writing the trailing blank-line CRLF that separates
+    /// headers from the message body.
+    write_to<W>(&this, writer: mut &W) -> Result<(), IoError>
+    where W: Write {
+        const colon_sp: Slice<u8> = Slice::from_raw(": " as u8*, 2);
+        const crlf: Slice<u8> = Slice::from_raw("\r\n" as u8*, 2);
+        const count: u64 = this.inner.bucket_count();
+        mut i: u64 = 0;
+        while (i < count) {
+            mut node: hash_map::Entry<String, String>* = this.inner.get_bucket(i);
+            loop {
+                if (node == null) { break; }
+                match (writer.write_all(node.key.as_bytes())) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                match (writer.write_all(colon_sp)) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                match (writer.write_all(node.value.as_bytes())) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                match (writer.write_all(crlf)) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                node = node.next;
+            }
+            i++;
+        }
+        return Result::Ok(());
+    }
+
     /// Drop every stored header. Ownership obligation: every Headers
     /// must have `drop` called before going out of scope.
     drop(mut &this) -> void {
         // HashMap::clear doesn't drop K/V; do it ourselves.
-        // Simpler in Phase 5: walk a snapshot by repeatedly removing
+        // Walk the map by repeatedly removing
         // an arbitrary entry. Chaining + first-bucket traversal would
         // be faster but needs iterator support.
         this.inner.drop();
     }
 }
 
-/// ASCII lowercase conversion. Headers must use ASCII names; any
-/// non-ASCII byte is passed through unchanged (the server will just
-/// fail to match it later — fine as a defensive default).
-function to_lowercase(source: Str) -> String {
-    mut out: String = String::with_capacity(source.length());
-    mut i: u64 = 0;
-    while (i < source.length()) {
-        match (source.byte_at(i)) {
-            Option::Some(byte) => {
-                mut b: u8 = byte;
-                if (b >= 0x41 && b <= 0x5A) { b = b + 32; }
-                out.push_byte(b);
-            }
-            Option::None => { break; }
-        }
-        i++;
-    }
-    return out;
-}
+// `to_lowercase` now lives as `Str::to_ascii_lowercase` in `collections::str`.

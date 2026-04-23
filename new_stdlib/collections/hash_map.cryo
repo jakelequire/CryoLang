@@ -2,15 +2,14 @@
 ///!
 ///! Separate chaining over a bucket array: each bucket holds a linked
 ///! list of entries. Keys must implement `Hash + Eq`. The default
-///! hasher is FNV-1a (`core::hash::DefaultHasher`) — fine for trusted
-///! inputs, not DoS-resistant. Swap in a stronger hasher when the
-///! `Hasher`-generic variant lands.
+///! hasher is FNV-1a (`core::hash::DefaultHasher`) — appropriate for
+///! trusted inputs; supply a custom hasher when collision resistance
+///! is required.
 ///!
 ///! Chaining was chosen over open addressing because it sidesteps the
-///! "leave key/value slots uninitialized" problem while the language
-///! lacks `MaybeUninit`. The cost is one heap allocation per entry —
-///! acceptable at this stage; a flat Robin-Hood implementation can
-///! land when the type system allows it.
+///! problem of storing uninitialised key/value slots. The cost is one
+///! heap allocation per entry; a flat Robin-Hood table is a potential
+///! future optimisation.
 
 namespace std::collections::hash_map;
 
@@ -29,10 +28,10 @@ const INITIAL_BUCKETS: u64 = 8;
 // ============================================================================
 
 type struct Entry<K, V> {
-    hash: u64;
-    key: K;
-    value: V;
-    next: Entry<K, V>*;
+    public hash: u64;
+    public key: K;
+    public value: V;
+    public next: Entry<K, V>*;
 }
 
 // ============================================================================
@@ -93,6 +92,14 @@ type struct HashMap<K, V, A = GlobalAlloc> {
     /// bucket can hold many entries.
     bucket_count(&this) -> u64 {
         return this.bucket_count;
+    }
+
+    /// Return the head of the entry chain for bucket `index`. Returns
+    /// null if the bucket is empty or `index` is out of range. The
+    /// returned pointer is valid until the next mutation of the map.
+    get_bucket(&this, index: u64) -> Entry<K, V>* {
+        if (this.buckets == null || index >= this.bucket_count) { return null; }
+        return this.buckets[index];
     }
 
     // ========================================================================
@@ -232,9 +239,8 @@ type struct HashMap<K, V, A = GlobalAlloc> {
     // ========================================================================
 
     /// Release every entry and the bucket array. Ownership obligation:
-    /// every HashMap must have `drop` called before going out of scope
-    /// (auto-`Drop` arrives with cryoc stage 3). If K or V own
-    /// resources, drain entries manually before calling this.
+    /// every HashMap must have `drop` called before going out of scope.
+    /// If K or V own resources, drain entries manually before calling this.
     drop(mut &this) -> void {
         this.clear();
         if (this.buckets != null) {
