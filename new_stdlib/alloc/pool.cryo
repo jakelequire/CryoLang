@@ -1,0 +1,180 @@
+///! Pool — O(1) allocator for uniformly-sized slots.
+///!
+///! A Pool is configured at construction with a single slot layout and
+///! refuses any allocation request that doesn't match. Freed slots are
+///! threaded onto an intrusive free list, making both allocation and
+///! deallocation O(1). When the free list is empty, the pool allocates
+///! a new block from `GlobalAlloc` and carves `slots_per_block` fresh
+///! slots out of it.
+///!
+///! Use a Pool when you have many values of the same type with
+///! churn-heavy lifetimes (game entities, AST nodes under frequent
+///! edit, request objects). For mixed sizes use an Arena or
+///! `GlobalAlloc`.
+
+namespace std::alloc::pool;
+
+import core::intrinsics;
+import core::mem;
+import core::ptr;
+import core::result;
+import alloc::layout;
+import alloc::allocator;
+
+/// Default block size — each block carves this many slots. Chosen to
+/// amortize the malloc cost without sitting on a huge unused tail for
+/// pools that grow slowly.
+const DEFAULT_SLOTS_PER_BLOCK: u64 = 64;
+
+// ============================================================================
+// FreeNode — intrusive free-list header stored in unused slots
+// ============================================================================
+
+type struct FreeNode {
+    next: FreeNode*;
+}
+
+// ============================================================================
+// Block — one contiguous backing allocation
+// ============================================================================
+
+type struct Block {
+    data: u8*;
+    next: Block*;
+}
+
+// ============================================================================
+// Pool
+// ============================================================================
+
+type struct Pool {
+    slot: Layout;
+    slots_per_block: u64;
+    free_list: FreeNode*;
+    blocks: Block*;
+
+    /// Create a pool serving `slot`-sized allocations with the default
+    /// block granularity. Panics if `slot.size() < sizeof(FreeNode*)` —
+    /// the intrusive free list needs a pointer's worth of room in each
+    /// slot.
+    static new(slot: Layout) -> Pool {
+        return Pool::with_block_size(slot, DEFAULT_SLOTS_PER_BLOCK);
+    }
+
+    /// Create a pool with a custom number of slots per backing block.
+    /// Larger blocks reduce malloc frequency at the cost of more unused
+    /// tail memory for small pools.
+    static with_block_size(slot: Layout, slots_per_block: u64) -> Pool {
+        if (slot.size() < sizeof(FreeNode*)) {
+            intrinsics::panic("Pool: slot smaller than a pointer; free list cannot be stored", FILE, LINE);
+        }
+        if (slots_per_block == 0) {
+            intrinsics::panic("Pool: slots_per_block must be non-zero", FILE, LINE);
+        }
+        return Pool {
+            slot: slot,
+            slots_per_block: slots_per_block,
+            free_list: null,
+            blocks: null
+        };
+    }
+
+    /// Grab a free slot, carving a new block if the free list is empty.
+    /// Returns `Err(OutOfMemory)` if the backing allocator refuses the
+    /// block request.
+    allocate_slot(mut &this) -> Result<NonNull<u8>, AllocError> {
+        if (this.free_list == null) {
+            match (grow(this)) {
+                Result::Ok(_) => { }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+        const node: FreeNode* = this.free_list;
+        this.free_list = node.next;
+        return Result::Ok(NonNull::new(node as u8*));
+    }
+
+    /// Return a slot to the pool. `ptr` must have come from a previous
+    /// `allocate_slot` on **this** pool and must not have been freed.
+    deallocate_slot(mut &this, ptr: NonNull<u8>) -> void {
+        const node: FreeNode* = ptr.as_ptr() as FreeNode*;
+        node.next = this.free_list;
+        this.free_list = node;
+    }
+
+    /// Release every backing block. Ownership obligation: callers must
+    /// invoke `drop` before the pool goes out of scope (auto-`Drop`
+    /// arrives with cryoc stage 3). All slot pointers are invalidated.
+    drop(mut &this) -> void {
+        mut block: Block* = this.blocks;
+        loop {
+            if (block == null) { break; }
+            const next: Block* = block.next;
+            intrinsics::free(block.data as void*);
+            intrinsics::free(block as void*);
+            block = next;
+        }
+        this.blocks = null;
+        this.free_list = null;
+    }
+}
+
+// ============================================================================
+// Allocator impl
+// ============================================================================
+
+implement Allocator for Pool {
+    /// Accepts exactly the pool's configured layout. Any mismatched
+    /// request returns `Err(Exhausted)` — callers who need a different
+    /// layout picked the wrong allocator.
+    allocate(mut &this, block: Layout) -> Result<NonNull<u8>, AllocError> {
+        if (block.size() != this.slot.size()
+                || block.alignment() > this.slot.alignment()) {
+            return Result::Err(AllocError::new(AllocErrorKind::Exhausted, block));
+        }
+        return this.allocate_slot();
+    }
+
+    deallocate(mut &this, ptr: NonNull<u8>, block: Layout) -> void {
+        this.deallocate_slot(ptr);
+    }
+}
+
+// ============================================================================
+// Growth
+// ============================================================================
+
+/// Allocate a new backing block and thread its slots onto the free list.
+function grow(pool: mut &Pool) -> Result<(), AllocError> {
+    const stride: u64 = pool.slot.padded_size();
+    const bytes: u64 = stride * pool.slots_per_block;
+
+    const header: void* = intrinsics::malloc(sizeof(Block));
+    if (header == null) {
+        return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, pool.slot));
+    }
+    const data: void* = intrinsics::aligned_alloc(pool.slot.alignment(), bytes);
+    if (data == null) {
+        intrinsics::free(header);
+        return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, pool.slot));
+    }
+
+    const block: Block* = header as Block*;
+    block.data = data as u8*;
+    block.next = pool.blocks;
+    pool.blocks = block;
+
+    // Thread the freshly carved slots onto the free list in reverse
+    // order, so the first slot handed out is the one at offset 0 (nicer
+    // for cache locality and easier to reason about in tests).
+    mut i: u64 = pool.slots_per_block;
+    loop {
+        if (i == 0) { break; }
+        i = i - 1;
+        const slot_addr: u64 = (block.data as u64) + (i * stride);
+        const node: FreeNode* = slot_addr as FreeNode*;
+        node.next = pool.free_list;
+        pool.free_list = node;
+    }
+    return Result::Ok(());
+}

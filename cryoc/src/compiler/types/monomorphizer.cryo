@@ -613,6 +613,10 @@ type struct Monomorphizer {
     /// resolution to TypeResolver, then resolves body locals.
     resolve_methods(mut &this, methods: MethodNode*[], res_ctx: ResolutionContext*,
                     subst: TypeSubstitution*) -> void {
+        // Share `nested_visited` across all methods in this impl block so
+        // repeated return types (e.g. the common Option<T> return) only
+        // produce a single monomorphization request per impl.
+        this.nested_visited = [];
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
@@ -650,6 +654,16 @@ type struct Monomorphizer {
         }
         if (func.body != null) {
             this.resolve_body_locals(func.body, res_ctx);
+        }
+
+        // Discover transitive instantiations from the method's return type.
+        // Without this, methods that return another generic type
+        // (e.g. IoResult<T>::ok() -> Option<T>) fail to trigger monomorphization
+        // of the referenced generic when the outer template is specialized.
+        // Note: caller (resolve_methods) owns `nested_visited` lifecycle so
+        // repeated return types across methods in the same impl block dedupe.
+        if (func.has_resolved_return_type()) {
+            this.request_nested_instantiations(func.resolved_return_type);
         }
     }
 

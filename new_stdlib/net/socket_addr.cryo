@@ -1,0 +1,75 @@
+///! SocketAddr — (IP, port).
+///!
+///! Used everywhere a listener binds or a client connects. Parsing
+///! accepts `a.b.c.d:port` for v4; v6 bracketed form arrives with
+///! the v6 parser.
+
+namespace std::net::socket_addr;
+
+import core::option;
+import collections::str;
+import fmt::integer;
+import net::ip;
+
+type struct SocketAddr {
+    public ip: IpAddr;
+    public port: u16;
+
+    static new(ip: IpAddr, port: u16) -> SocketAddr {
+        return SocketAddr { ip: ip, port: port };
+    }
+
+    /// `0.0.0.0:port` — bind on every IPv4 interface.
+    static any_v4(port: u16) -> SocketAddr {
+        return SocketAddr {
+            ip: IpAddr::V4(IpV4Addr::unspecified()),
+            port: port
+        };
+    }
+
+    /// `127.0.0.1:port` — bind/connect on the loopback interface.
+    static localhost_v4(port: u16) -> SocketAddr {
+        return SocketAddr {
+            ip: IpAddr::V4(IpV4Addr::localhost()),
+            port: port
+        };
+    }
+
+    /// Parse `a.b.c.d:port`. Returns `None` if the address or port
+    /// is malformed or the port is out of range (u16).
+    static parse_v4(source: Str) -> Option<SocketAddr> {
+        // Find the ':' separator from the right so IPv6 (with colons
+        // in the address) fails cleanly here rather than silently
+        // misparsing.
+        mut colon: u64 = source.length();
+        mut i: u64 = 0;
+        while (i < source.length()) {
+            match (source.byte_at(i)) {
+                Option::Some(byte) => {
+                    if (byte == 0x3A) { colon = i; }
+                }
+                Option::None => { return Option::None; }
+            }
+            i = i + 1;
+        }
+        if (colon == source.length()) { return Option::None; }
+
+        const addr_part: Str = source.sub_bytes(0, colon);
+        const port_part: Str = source.sub_bytes(colon + 1, source.length());
+
+        match (IpV4Addr::parse(addr_part)) {
+            Option::Some(v4) => {
+                match (integer::parse_u16(port_part)) {
+                    Option::Some(port) => {
+                        return Option::Some(SocketAddr {
+                            ip: IpAddr::V4(v4),
+                            port: port
+                        });
+                    }
+                    Option::None => { return Option::None; }
+                }
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+}

@@ -1,0 +1,188 @@
+///! String — owned, heap-allocated, length-typed UTF-8.
+///!
+///! Mutable companion to `Str`. Byte buffer plus a length; no NUL
+///! terminator, no implicit encoding assumptions beyond "the bytes
+///! are valid UTF-8". UTF-8 in, UTF-8 out.
+///!
+///! Storage comes from `RawBuffer<u8, A>`; the doubling growth curve
+///! lives there.
+
+namespace std::collections::string;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import alloc::allocator;
+import collections::raw_buffer;
+import collections::str;
+
+const INITIAL_CAPACITY: u64 = 8;
+
+type struct String<A = GlobalAlloc> {
+    buffer: RawBuffer<u8, A>;
+    length: u64;
+
+    /// Empty string. No heap storage until the first `push_*` /
+    /// `reserve`.
+    static new() -> String<GlobalAlloc> {
+        return String<GlobalAlloc> {
+            buffer: RawBuffer::new(),
+            length: 0
+        };
+    }
+
+    static new_in(alloc: A) -> String<A> {
+        return String<A> {
+            buffer: RawBuffer::new_in(alloc),
+            length: 0
+        };
+    }
+
+    /// Preallocate room for `capacity` bytes. Panics on allocation
+    /// failure.
+    static with_capacity(capacity: u64) -> String<GlobalAlloc> {
+        match (String::try_with_capacity_in(capacity, GlobalAlloc::new())) {
+            Result::Ok(string) => { return string; }
+            Result::Err(_) => {
+                intrinsics::panic("String::with_capacity: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    static try_with_capacity_in(capacity: u64, alloc: A) -> Result<String<A>, AllocError> {
+        mut string: String<A> = String<A> {
+            buffer: RawBuffer::new_in(alloc),
+            length: 0
+        };
+        if (capacity == 0) {
+            return Result::Ok(string);
+        }
+        match (string.buffer.reserve_exact(0, capacity)) {
+            Result::Ok(_) => { return Result::Ok(string); }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    /// Construct from a `Str` by copying its bytes. Panics on
+    /// allocation failure.
+    static from_str(source: Str) -> String<GlobalAlloc> {
+        mut string: String<GlobalAlloc> = String::with_capacity(source.length());
+        string.push_str(source);
+        return string;
+    }
+
+    // ========================================================================
+    // Inspection
+    // ========================================================================
+
+    length(&this) -> u64 {
+        return this.length;
+    }
+
+    capacity(&this) -> u64 {
+        return this.buffer.capacity();
+    }
+
+    is_empty(&this) -> boolean {
+        return this.length == 0;
+    }
+
+    /// Borrow as a `Str`. Invalidated by the next mutating call.
+    as_str(&this) -> Str {
+        return Str::from_raw(this.buffer.ptr(), this.length);
+    }
+
+    as_bytes(&this) -> Slice<u8> {
+        return Slice::from_raw(this.buffer.ptr(), this.length);
+    }
+
+    as_ptr(&this) -> u8* {
+        return this.buffer.ptr();
+    }
+
+    // ========================================================================
+    // Mutation
+    // ========================================================================
+
+    push_str(mut &this, source: Str) -> void {
+        match (this.try_push_str(source)) {
+            Result::Ok(_) => { return; }
+            Result::Err(_) => {
+                intrinsics::panic("String::push_str: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    try_push_str(mut &this, source: Str) -> Result<(), AllocError> {
+        const add: u64 = source.length();
+        if (add == 0) {
+            return Result::Ok(());
+        }
+        match (this.buffer.reserve(this.length, add, INITIAL_CAPACITY)) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        intrinsics::memcpy(
+            (this.buffer.ptr() + this.length) as void*,
+            source.as_ptr() as void*,
+            add
+        );
+        this.length = this.length + add;
+        return Result::Ok(());
+    }
+
+    /// Append a single byte. The caller is responsible for
+    /// maintaining valid UTF-8.
+    push_byte(mut &this, byte: u8) -> void {
+        match (this.try_push_byte(byte)) {
+            Result::Ok(_) => { return; }
+            Result::Err(_) => {
+                intrinsics::panic("String::push_byte: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    try_push_byte(mut &this, byte: u8) -> Result<(), AllocError> {
+        if (this.length == this.buffer.capacity()) {
+            match (this.buffer.reserve(this.length, 1, INITIAL_CAPACITY)) {
+                Result::Ok(_) => { }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+        this.buffer.ptr()[this.length] = byte;
+        this.length = this.length + 1;
+        return Result::Ok(());
+    }
+
+    clear(mut &this) -> void {
+        this.length = 0;
+    }
+
+    // ========================================================================
+    // Capacity management
+    // ========================================================================
+
+    reserve(mut &this, additional: u64) -> Result<(), AllocError> {
+        return this.buffer.reserve(this.length, additional, INITIAL_CAPACITY);
+    }
+
+    reserve_exact(mut &this, additional: u64) -> Result<(), AllocError> {
+        return this.buffer.reserve_exact(this.length, additional);
+    }
+
+    shrink_to_fit(mut &this) -> void {
+        this.buffer.shrink_to(this.length);
+    }
+
+    // ========================================================================
+    // Teardown
+    // ========================================================================
+
+    /// Release the backing buffer. Ownership obligation: every
+    /// String must have `drop` called before going out of scope.
+    drop(mut &this) -> void {
+        this.buffer.drop();
+        this.length = 0;
+    }
+}

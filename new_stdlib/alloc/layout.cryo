@@ -1,0 +1,60 @@
+///! Layout — size + alignment of a memory block.
+///!
+///! Every `Allocator` call takes a `Layout`. Constructing a Layout
+///! validates that alignment is a non-zero power of two, so downstream
+///! allocators can rely on that invariant without repeating the check.
+
+namespace std::alloc::layout;
+
+import core::intrinsics;
+
+type struct Layout {
+    size: u64;
+    alignment: u64;
+
+    /// Construct from raw size and alignment. Panics if `alignment` is
+    /// zero or not a power of two — that's a caller bug, not a runtime
+    /// condition to recover from. Size of zero is allowed; the allocator
+    /// decides how to treat it.
+    static new(size: u64, alignment: u64) -> Layout {
+        if (alignment == 0) {
+            intrinsics::panic("Layout::new: alignment must be non-zero", FILE, LINE);
+        }
+        if ((alignment & (alignment - 1)) != 0) {
+            intrinsics::panic("Layout::new: alignment must be a power of two", FILE, LINE);
+        }
+        return Layout { size: size, alignment: alignment };
+    }
+
+    /// Layout of a single value of type `T`.
+    static of<T>() -> Layout {
+        return Layout { size: sizeof(T), alignment: alignof(T) };
+    }
+
+    /// Layout of `count` contiguous values of type `T`. Panics on
+    /// multiplication overflow — the caller asked for more bytes than
+    /// `u64` can describe, which no allocator can satisfy.
+    static array<T>(count: u64) -> Layout {
+        const elem_size: u64 = sizeof(T);
+        const total: u64 = elem_size * count;
+        if (count != 0 && total / count != elem_size) {
+            intrinsics::panic("Layout::array: size overflow", FILE, LINE);
+        }
+        return Layout { size: total, alignment: alignof(T) };
+    }
+
+    size(&this) -> u64 {
+        return this.size;
+    }
+
+    alignment(&this) -> u64 {
+        return this.alignment;
+    }
+
+    /// `size` rounded up to the next multiple of `alignment`. The stride
+    /// to use when packing adjacent values of this layout in memory.
+    padded_size(&this) -> u64 {
+        const mask: u64 = this.alignment - 1;
+        return (this.size + mask) & ~mask;
+    }
+}

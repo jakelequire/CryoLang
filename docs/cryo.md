@@ -1422,7 +1422,6 @@ Where clauses constrain generic parameters to types that satisfy certain trait b
 function sort<T>(arr: Array<T>) -> Array<T>
     where T: Comparable {
     // The compiler knows T supports <, >, == because of the bound
-    }
 }
 ```
 

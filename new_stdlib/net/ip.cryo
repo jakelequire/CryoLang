@@ -1,0 +1,171 @@
+///! IP addresses.
+///!
+///! `IpV4Addr` is four octets; `IpV6Addr` is sixteen. `IpAddr` is the
+///! discriminated union. Parsing accepts the canonical `a.b.c.d`
+///! form for v4 — v6 parsing is stubbed; the storage type exists so
+///! downstream code can plumb v6 addresses through without a rewrite
+///! when a real parser lands.
+
+namespace std::net::ip;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import collections::str;
+import fmt::integer;
+
+// ============================================================================
+// IpV4Addr
+// ============================================================================
+
+type struct IpV4Addr {
+    public a: u8;
+    public b: u8;
+    public c: u8;
+    public d: u8;
+
+    static new(a: u8, b: u8, c: u8, d: u8) -> IpV4Addr {
+        return IpV4Addr { a: a, b: b, c: c, d: d };
+    }
+
+    /// `0.0.0.0` — "any interface" for a bound listener.
+    static unspecified() -> IpV4Addr {
+        return IpV4Addr { a: 0, b: 0, c: 0, d: 0 };
+    }
+
+    /// `127.0.0.1`.
+    static localhost() -> IpV4Addr {
+        return IpV4Addr { a: 127, b: 0, c: 0, d: 1 };
+    }
+
+    /// `255.255.255.255`.
+    static broadcast() -> IpV4Addr {
+        return IpV4Addr { a: 255, b: 255, c: 255, d: 255 };
+    }
+
+    /// Returns the four octets in big-endian (network) order.
+    octet(&this, index: u64) -> u8 {
+        if (index == 0) { return this.a; }
+        if (index == 1) { return this.b; }
+        if (index == 2) { return this.c; }
+        if (index == 3) { return this.d; }
+        intrinsics::panic("IpV4Addr::octet: index out of range", FILE, LINE);
+    }
+
+    is_loopback(&this) -> boolean {
+        return this.a == 127;
+    }
+
+    is_unspecified(&this) -> boolean {
+        return this.a == 0 && this.b == 0 && this.c == 0 && this.d == 0;
+    }
+
+    /// Host-byte-order u32 representation. High byte is `a`.
+    to_u32(&this) -> u32 {
+        return ((this.a as u32) << 24)
+             | ((this.b as u32) << 16)
+             | ((this.c as u32) << 8)
+             | (this.d as u32);
+    }
+
+    /// Parse canonical `a.b.c.d`. Returns `None` on any failure —
+    /// extra whitespace, out-of-range octets, missing or extra dots,
+    /// leading/trailing separators.
+    static parse(source: Str) -> Option<IpV4Addr> {
+        mut parts: u8[4];
+        mut part_index: u64 = 0;
+        mut segment_start: u64 = 0;
+        mut i: u64 = 0;
+        while (i < source.length()) {
+            match (source.byte_at(i)) {
+                Option::Some(byte) => {
+                    if (byte == 0x2E) { // '.'
+                        if (part_index >= 3) { return Option::None; }
+                        const segment: Str = source.sub_bytes(segment_start, i);
+                        match (integer::parse_u8(segment)) {
+                            Option::Some(octet) => {
+                                parts[part_index] = octet;
+                                part_index = part_index + 1;
+                                segment_start = i + 1;
+                            }
+                            Option::None => { return Option::None; }
+                        }
+                    }
+                }
+                Option::None => { return Option::None; }
+            }
+            i = i + 1;
+        }
+        if (part_index != 3) { return Option::None; }
+        const tail: Str = source.sub_bytes(segment_start, source.length());
+        match (integer::parse_u8(tail)) {
+            Option::Some(octet) => { parts[3] = octet; }
+            Option::None => { return Option::None; }
+        }
+        return Option::Some(IpV4Addr {
+            a: parts[0], b: parts[1], c: parts[2], d: parts[3]
+        });
+    }
+}
+
+// ============================================================================
+// IpV6Addr — storage only; parsing deferred
+// ============================================================================
+
+/// Sixteen octets in network byte order. Phase 5 does not include a
+/// parser for the v6 textual forms — addresses come in from
+/// `inet_pton` or a future parser module. The type exists so code
+/// paths that need to accept either family can be written without
+/// rework.
+type struct IpV6Addr {
+    public segments: u8[16];
+
+    static unspecified() -> IpV6Addr {
+        mut segments: u8[16];
+        mut i: u64 = 0;
+        while (i < 16) { segments[i] = 0; i = i + 1; }
+        return IpV6Addr { segments: segments };
+    }
+
+    static localhost() -> IpV6Addr {
+        mut segments: u8[16];
+        mut i: u64 = 0;
+        while (i < 15) { segments[i] = 0; i = i + 1; }
+        segments[15] = 1;
+        return IpV6Addr { segments: segments };
+    }
+}
+
+// ============================================================================
+// IpAddr
+// ============================================================================
+
+type enum IpAddr {
+    V4(IpV4Addr);
+    V6(IpV6Addr);
+}
+
+implement enum IpAddr {
+    is_ipv4(&this) -> boolean {
+        match (&this) {
+            IpAddr::V4(_) => { return true; }
+            IpAddr::V6(_) => { return false; }
+        }
+    }
+
+    is_ipv6(&this) -> boolean {
+        match (&this) {
+            IpAddr::V4(_) => { return false; }
+            IpAddr::V6(_) => { return true; }
+        }
+    }
+
+    /// Parse textual form. Tries v4 first (the common case); v6
+    /// parsing is not implemented yet and returns `None`.
+    static parse(source: Str) -> Option<IpAddr> {
+        match (IpV4Addr::parse(source)) {
+            Option::Some(v4) => { return Option::Some(IpAddr::V4(v4)); }
+            Option::None => { return Option::None; }
+        }
+    }
+}

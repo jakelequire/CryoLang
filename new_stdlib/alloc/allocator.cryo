@@ -1,0 +1,149 @@
+///! Allocator — the trait every heap strategy implements.
+///!
+///! `GlobalAlloc` is the default implementation, backed by the platform
+///! allocator via `intrinsics::aligned_alloc` / `intrinsics::free`. An
+///! arena or pool can plug in anywhere an `Allocator` is expected.
+///!
+///! Collections take `A: Allocator` as a type parameter (Phase 4) so the
+///! storage strategy is a caller decision, not hard-coded in the
+///! collection.
+
+namespace std::alloc::allocator;
+
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import alloc::layout;
+
+// ============================================================================
+// AllocError
+// ============================================================================
+
+type enum AllocErrorKind {
+    /// The underlying allocator returned null — the system is out of
+    /// memory or hit an address-space limit.
+    OutOfMemory;
+    /// The allocator refuses zero-sized requests. Callers that want a
+    /// non-null dangling pointer for a zero-sized type should handle
+    /// the zero case themselves before calling `allocate`.
+    ZeroSized;
+    /// A bounded allocator (arena, pool) has no room for this request.
+    Exhausted;
+}
+
+type struct AllocError {
+    public kind: AllocErrorKind;
+    public layout: Layout;
+
+    static new(kind: AllocErrorKind, layout: Layout) -> AllocError {
+        return AllocError { kind: kind, layout: layout };
+    }
+}
+
+// ============================================================================
+// Allocator
+// ============================================================================
+
+type trait Allocator {
+    /// Return a pointer to at least `layout.size` bytes aligned to
+    /// `layout.alignment`. The returned memory is uninitialized — the
+    /// caller writes to it before any read.
+    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocError>;
+
+    /// Return memory to the allocator. `ptr` must have come from a
+    /// previous `allocate` on **this** allocator with a matching
+    /// `layout`. Using the pointer after this call is undefined.
+    deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void;
+
+    /// Default implementation: allocate fresh memory, copy, free old.
+    /// Allocators that can grow a block in place (real `realloc`)
+    /// should override for the win.
+    reallocate(mut &this,
+               ptr: NonNull<u8>,
+               old_layout: Layout,
+               new_layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        match (this.allocate(new_layout)) {
+            Result::Ok(new_ptr) => {
+                mut copy_size: u64 = old_layout.size();
+                if (new_layout.size() < copy_size) {
+                    copy_size = new_layout.size();
+                }
+                intrinsics::memcpy(new_ptr.as_ptr(), ptr.as_ptr(), copy_size);
+                this.deallocate(ptr, old_layout);
+                return Result::Ok(new_ptr);
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+}
+
+// ============================================================================
+// GlobalAlloc — platform allocator
+// ============================================================================
+
+/// Zero-sized handle to the process-wide allocator. Construct with
+/// `GlobalAlloc::new()`; all instances dispatch through the same
+/// underlying malloc/free.
+type struct GlobalAlloc { }
+
+implement GlobalAlloc {
+    static new() -> GlobalAlloc {
+        return GlobalAlloc { };
+    }
+}
+
+implement Allocator for GlobalAlloc {
+    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        if (layout.size() == 0) {
+            return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, layout));
+        }
+        const raw: void* = intrinsics::aligned_alloc(
+            layout.alignment(),
+            layout.padded_size()
+        );
+        if (raw == null) {
+            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, layout));
+        }
+        return Result::Ok(NonNull::new(raw as u8*));
+    }
+
+    deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void {
+        intrinsics::free(ptr.as_ptr() as void*);
+    }
+
+    /// Override the default: the platform allocator has a real
+    /// `realloc` and we'd be silly not to use it.
+    reallocate(mut &this,
+               ptr: NonNull<u8>,
+               old_layout: Layout,
+               new_layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        if (new_layout.size() == 0) {
+            return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, new_layout));
+        }
+        // `realloc` handles alignment up to the platform maximum only.
+        // Fall back to allocate/copy/free when the caller wants stricter
+        // alignment than `realloc` can guarantee.
+        if (new_layout.alignment() > old_layout.alignment()) {
+            match (this.allocate(new_layout)) {
+                Result::Ok(new_ptr) => {
+                    mut copy_size: u64 = old_layout.size();
+                    if (new_layout.size() < copy_size) {
+                        copy_size = new_layout.size();
+                    }
+                    intrinsics::memcpy(new_ptr.as_ptr(), ptr.as_ptr(), copy_size);
+                    this.deallocate(ptr, old_layout);
+                    return Result::Ok(new_ptr);
+                }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+        const raw: void* = intrinsics::realloc(
+            ptr.as_ptr() as void*,
+            new_layout.padded_size()
+        );
+        if (raw == null) {
+            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
+        }
+        return Result::Ok(NonNull::new(raw as u8*));
+    }
+}

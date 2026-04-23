@@ -1,0 +1,278 @@
+///! Child — a running subprocess.
+///!
+///! Produced by `Command::spawn`. Holds the pid and any pipe ends
+///! the caller asked for. `wait` blocks until the child exits;
+///! `try_wait` polls; `kill` sends SIGKILL; `send_signal` sends any
+///! other. `ChildStdin` / `ChildStdout` / `ChildStderr` implement
+///! `Write` / `Read` over a fd.
+///!
+///! Ownership: every `Child` must have either `wait` or `kill+wait`
+///! called before it drops. Dropping an unwaited child leaks a
+///! zombie in the parent's process table. In Phase 5 `Child::drop`
+///! closes the pipe fds but does not automatically reap — a future
+///! revision can add a best-effort `try_wait` inside `drop`.
+
+namespace std::process::child;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+import io::fd;
+import io::traits;
+import process::signal;
+
+extern "C" {
+    function waitpid(pid: i32, wstatus: i32*, options: i32) -> i32;
+    function kill(pid: i32, sig: i32) -> i32;
+}
+
+const WNOHANG: i32 = 1;
+
+// ============================================================================
+// ExitStatus
+// ============================================================================
+
+/// Result of a child's termination. Either it exited normally with
+/// a code, or it was killed by a signal. POSIX encodes both into a
+/// single `wstatus` word; `ExitStatus` is the decoded form.
+type struct ExitStatus {
+    public code: i32;
+    public signal: i32;
+    public signaled: boolean;
+
+    /// Convenience: did the child exit with status 0?
+    success(&this) -> boolean {
+        return !this.signaled && this.code == 0;
+    }
+
+    /// `Some(code)` for a normal exit, `None` if the child was
+    /// killed by a signal.
+    exit_code(&this) -> Option<i32> {
+        if (this.signaled) { return Option::None; }
+        return Option::Some(this.code);
+    }
+
+    /// `Some(signal)` if the child was killed by a signal.
+    terminating_signal(&this) -> Option<i32> {
+        if (this.signaled) { return Option::Some(this.signal); }
+        return Option::None;
+    }
+}
+
+/// Decode a POSIX `wstatus` word. The low 7 bits are the terminating
+/// signal (or 0 for normal exit); bits 8..15 are the exit code when
+/// bits 0..6 are zero.
+function decode_wstatus(wstatus: i32) -> ExitStatus {
+    const termsig: i32 = wstatus & 0x7F;
+    if (termsig == 0) {
+        // Normal exit.
+        return ExitStatus {
+            code: (wstatus >> 8) & 0xFF,
+            signal: 0,
+            signaled: false
+        };
+    }
+    if (termsig == 0x7F) {
+        // Stopped (WIFSTOPPED). For Phase 5 we treat this as
+        // "still running" — callers who want ptrace semantics
+        // need more than Child can offer.
+        return ExitStatus { code: 0, signal: 0, signaled: false };
+    }
+    return ExitStatus {
+        code: 0,
+        signal: termsig,
+        signaled: true
+    };
+}
+
+// ============================================================================
+// ChildStdin / Stdout / Stderr — fd wrappers with Write / Read
+// ============================================================================
+
+/// Write end of a pipe whose read end is the child's stdin.
+type struct ChildStdin {
+    fd: i32;
+
+    static from_fd(raw_fd: i32) -> ChildStdin {
+        return ChildStdin { fd: raw_fd };
+    }
+
+    /// Close the pipe. Ownership obligation: call this (or let the
+    /// `Child` drop do it) before the handle goes out of scope.
+    /// Closing here signals EOF to the child's stdin.
+    drop(mut &this) -> void {
+        if (this.fd >= 0) {
+            fd::close_fd(this.fd);
+            this.fd = -1;
+        }
+    }
+}
+
+implement Write for ChildStdin {
+    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+        return fd::write_fd(this.fd, bytes);
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        return Result::Ok(());
+    }
+}
+
+/// Read end of a pipe whose write end is the child's stdout.
+type struct ChildStdout {
+    fd: i32;
+
+    static from_fd(raw_fd: i32) -> ChildStdout {
+        return ChildStdout { fd: raw_fd };
+    }
+
+    drop(mut &this) -> void {
+        if (this.fd >= 0) {
+            fd::close_fd(this.fd);
+            this.fd = -1;
+        }
+    }
+}
+
+implement Read for ChildStdout {
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        return fd::read_fd(this.fd, buffer, length);
+    }
+}
+
+/// Read end of a pipe whose write end is the child's stderr.
+type struct ChildStderr {
+    fd: i32;
+
+    static from_fd(raw_fd: i32) -> ChildStderr {
+        return ChildStderr { fd: raw_fd };
+    }
+
+    drop(mut &this) -> void {
+        if (this.fd >= 0) {
+            fd::close_fd(this.fd);
+            this.fd = -1;
+        }
+    }
+}
+
+implement Read for ChildStderr {
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        return fd::read_fd(this.fd, buffer, length);
+    }
+}
+
+// ============================================================================
+// Child
+// ============================================================================
+
+type struct Child {
+    pid: i32;
+    public stdin: Option<ChildStdin>;
+    public stdout: Option<ChildStdout>;
+    public stderr: Option<ChildStderr>;
+    waited: boolean;
+
+    /// Low-level constructor used by `Command::spawn`. Application
+    /// code should not call this directly.
+    static new(pid: i32,
+               stdin: Option<ChildStdin>,
+               stdout: Option<ChildStdout>,
+               stderr: Option<ChildStderr>) -> Child {
+        return Child {
+            pid: pid,
+            stdin: stdin,
+            stdout: stdout,
+            stderr: stderr,
+            waited: false
+        };
+    }
+
+    id(&this) -> i32 {
+        return this.pid;
+    }
+
+    /// Block until the child exits. Closes stdin first so the child
+    /// sees EOF — deadlock-avoidant for children that read all of
+    /// stdin before writing to stdout.
+    wait(mut &this) -> Result<ExitStatus, IoError> {
+        match (this.stdin) {
+            Option::Some(mut handle) => {
+                handle.drop();
+                this.stdin = Option::None;
+            }
+            Option::None => { }
+        }
+        mut status: i32 = 0;
+        loop {
+            const rc: i32 = waitpid(this.pid, &status, 0);
+            if (rc >= 0) {
+                this.waited = true;
+                return Result::Ok(decode_wstatus(status));
+            }
+            const err: IoError = IoError::from_errno(fd::errno());
+            match (err.kind) {
+                IoErrorKind::Interrupted => { }
+                _ => { return Result::Err(err); }
+            }
+        }
+    }
+
+    /// Non-blocking check. `Ok(Some(status))` means the child has
+    /// exited; `Ok(None)` means it's still running.
+    try_wait(mut &this) -> Result<Option<ExitStatus>, IoError> {
+        mut status: i32 = 0;
+        loop {
+            const rc: i32 = waitpid(this.pid, &status, WNOHANG);
+            if (rc > 0) {
+                this.waited = true;
+                return Result::Ok(Option::Some(decode_wstatus(status)));
+            }
+            if (rc == 0) {
+                return Result::Ok(Option::None);
+            }
+            const err: IoError = IoError::from_errno(fd::errno());
+            match (err.kind) {
+                IoErrorKind::Interrupted => { }
+                _ => { return Result::Err(err); }
+            }
+        }
+    }
+
+    /// Send SIGKILL. Does not wait — call `wait` afterwards to reap
+    /// the zombie.
+    kill(&this) -> Result<(), IoError> {
+        return this.send_signal(Signal::kill());
+    }
+
+    send_signal(&this, sig: Signal) -> Result<(), IoError> {
+        if (kill(this.pid, sig.as_i32()) < 0) {
+            return Result::Err(IoError::from_errno(fd::errno()));
+        }
+        return Result::Ok(());
+    }
+
+    /// Close any captured pipe ends. Does **not** reap the child —
+    /// forgetting to `wait` leaks a zombie in the kernel. Documented
+    /// obligation; a future revision can make this best-effort-reap
+    /// when the type system can express "must be used" linearity.
+    drop(mut &this) -> void {
+        match (this.stdin) {
+            Option::Some(mut handle) => { handle.drop(); }
+            Option::None => { }
+        }
+        this.stdin = Option::None;
+        match (this.stdout) {
+            Option::Some(mut handle) => { handle.drop(); }
+            Option::None => { }
+        }
+        this.stdout = Option::None;
+        match (this.stderr) {
+            Option::Some(mut handle) => { handle.drop(); }
+            Option::None => { }
+        }
+        this.stderr = Option::None;
+    }
+}
