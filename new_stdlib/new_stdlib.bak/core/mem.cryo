@@ -1,0 +1,314 @@
+///! Memory utilities
+///!
+///! Thin, typed wrappers over the raw memory intrinsics. Everything here
+///! operates on pointers the caller already has; this module does not
+///! allocate. For heap management see `alloc/` (Phase 3).
+///!
+///! # Audit fixes from the old stdlib
+///!
+///! - `transmute` now asserts `sizeof(From) == sizeof(To)` at runtime, so
+///!   a size mismatch aborts instead of silently reading OOB.
+///! - `volatile_read` / `volatile_write` are absent. The old versions just
+///!   dereferenced a pointer with a comment hoping the compiler would
+///!   notice the "volatile" intent; they were not actually volatile.
+///!   When the compiler gains real volatile intrinsics they go here.
+///! - `MaybeUninit` is absent. Without language-level uninitialized-state
+///!   tracking it was neither safer than a raw `T` nor cheaper. Callers
+///!   that need "blank storage" use `zeroed<T>()` or allocate directly.
+///! - `MemoryRegion` moved to `alloc/arena.cryo` where it belongs.
+///! - `MemoryOrder` and fences moved to the forthcoming `sync/atomic`
+///!   module — they are not memory-layout concerns.
+
+namespace std::core::mem;
+
+import core::intrinsics;
+import core::panic;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Size of a pointer in bytes on the current platform. 64-bit for now.
+const POINTER_SIZE: u64 = 8;
+
+/// Strictest alignment on the current ABI. Every standard type aligns to
+/// at most this many bytes.
+const MAX_ALIGN: u64 = 16;
+
+// ============================================================================
+// Size and alignment
+// ============================================================================
+
+function size_of<T>() -> u64 {
+    return sizeof(T);
+}
+
+function align_of<T>() -> u64 {
+    return alignof(T);
+}
+
+/// Same as `size_of<T>`, but takes a pointer so callers need not write the
+/// type parameter explicitly.
+function size_of_val<T>(_val: T*) -> u64 {
+    return sizeof(T);
+}
+
+function align_of_val<T>(_val: T*) -> u64 {
+    return alignof(T);
+}
+
+// ============================================================================
+// Copying
+// ============================================================================
+
+/// Copy `count` values of type `T` from `src` to `dest`. Regions must not
+/// overlap — use `copy_overlapping` when they might.
+function copy<T>(dest: T*, src: T*, count: u64) -> void {
+    intrinsics::memcpy(dest, src, count * sizeof(T));
+}
+
+/// Copy `count` values from `src` to `dest`, correctly handling overlap.
+function copy_overlapping<T>(dest: T*, src: T*, count: u64) -> void {
+    intrinsics::memmove(dest, src, count * sizeof(T));
+}
+
+/// Copy a single value.
+function copy_one<T>(dest: T*, src: T*) -> void {
+    intrinsics::memcpy(dest, src, sizeof(T));
+}
+
+// ============================================================================
+// Zeroing
+// ============================================================================
+
+/// Set every bit of `count` bytes at `dest` to zero.
+function zero_bytes(dest: void*, count: u64) -> void {
+    intrinsics::memset(dest, 0, count);
+}
+
+/// Zero `count` values of type `T` starting at `dest`.
+function zero<T>(dest: T*, count: u64) -> void {
+    intrinsics::memset(dest, 0, count * sizeof(T));
+}
+
+/// Zero a single value of type `T`.
+function zero_one<T>(dest: T*) -> void {
+    intrinsics::memset(dest, 0, sizeof(T));
+}
+
+/// Return a zeroed value of type `T`. Valid for POD types (integers,
+/// floats, pointers) where the all-zeros bit pattern is meaningful; for
+/// types where zero is not a valid state, use a proper constructor.
+function zeroed<T>() -> T {
+    mut value: T;
+    intrinsics::memset(&value, 0, sizeof(T));
+    return value;
+}
+
+// ============================================================================
+// Comparison
+// ============================================================================
+
+/// Compare two byte regions. Returns 0 if equal, negative if `a < b`
+/// lexicographically, positive if `a > b`.
+function compare_bytes(a: void*, b: void*, count: u64) -> i32 {
+    return intrinsics::memcmp(a, b, count);
+}
+
+/// Byte-equality of two `T` values. Not the same as `a == b`: this is a
+/// raw-bytes comparison, which is a meaningful distinction for types
+/// that contain padding or pointer fields.
+function bytes_equal<T>(a: T*, b: T*) -> boolean {
+    return intrinsics::memcmp(a, b, sizeof(T)) == 0;
+}
+
+// ============================================================================
+// Swap / replace / take
+// ============================================================================
+
+/// Swap the values at `a` and `b`. Both pointers must be valid.
+function swap<T>(a: T*, b: T*) -> void {
+    const temp: T = *a;
+    *a = *b;
+    *b = temp;
+}
+
+/// Write `value` to `dest` and return the previous value.
+function replace<T>(dest: T*, value: T) -> T {
+    const previous: T = *dest;
+    *dest = value;
+    return previous;
+}
+
+/// Return the value at `src`, leaving zeroed bytes in its place. For
+/// types that own resources, use a real ownership transfer — this
+/// function leaves the source in a valid-but-empty state only if
+/// zeros are valid for the type.
+function take<T>(src: T*) -> T {
+    const value: T = *src;
+    intrinsics::memset(src, 0, sizeof(T));
+    return value;
+}
+
+// ============================================================================
+// Pointer arithmetic (typed)
+// ============================================================================
+
+/// Offset a typed pointer by `count` elements (not bytes). Negative
+/// offsets are valid for `i64` input.
+function offset<T>(ptr: T*, count: i64) -> T* {
+    if (count >= 0) {
+        return intrinsics::ptr_add(ptr, (count as u64) * sizeof(T));
+    }
+    return intrinsics::ptr_sub(ptr, ((-count) as u64) * sizeof(T));
+}
+
+/// Offset a void pointer by `bytes` bytes.
+function offset_bytes(ptr: void*, bytes: i64) -> void* {
+    if (bytes >= 0) {
+        return intrinsics::ptr_add(ptr, bytes as u64);
+    }
+    return intrinsics::ptr_sub(ptr, (-bytes) as u64);
+}
+
+/// Signed element-wise distance from `start` to `end`, assuming both
+/// pointers are within the same allocation.
+function distance<T>(start: T*, end: T*) -> i64 {
+    return intrinsics::ptr_diff(end, start) / (sizeof(T) as i64);
+}
+
+/// Signed byte-wise distance from `start` to `end`.
+function distance_bytes(start: void*, end: void*) -> i64 {
+    return intrinsics::ptr_diff(end, start);
+}
+
+// ============================================================================
+// Alignment
+//
+// These operate on the integer value of a pointer. Alignment must always
+// be a power of two; passing a non-power-of-two is undefined behavior
+// and may silently return a wrong result.
+// ============================================================================
+
+/// Round `address` up to the next multiple of `alignment`.
+function align_up(ptr: void*, alignment: u64) -> void* {
+    const address: u64 = ptr;
+    const mask: u64 = alignment - 1;
+    return (address + mask) & ~mask;
+}
+
+/// Round `address` down to the previous multiple of `alignment`.
+function align_down(ptr: void*, alignment: u64) -> void* {
+    const address: u64 = ptr;
+    const mask: u64 = alignment - 1;
+    return address & ~mask;
+}
+
+/// `true` iff `ptr` is a multiple of `alignment`.
+function is_aligned(ptr: void*, alignment: u64) -> boolean {
+    const address: u64 = ptr;
+    return (address & (alignment - 1)) == 0;
+}
+
+/// `true` iff `ptr` is aligned to the natural alignment of `T`.
+function is_aligned_for<T>(ptr: void*) -> boolean {
+    return is_aligned(ptr, alignof(T));
+}
+
+/// Bytes of padding needed to bring `address` up to the next multiple of
+/// `alignment`.
+function padding_needed(address: u64, alignment: u64) -> u64 {
+    const remainder: u64 = address & (alignment - 1);
+    if (remainder == 0) {
+        return 0;
+    }
+    return alignment - remainder;
+}
+
+// ============================================================================
+// Reinterpret
+// ============================================================================
+
+/// Reinterpret the bytes of `value` as a `To`. Aborts if the two types
+/// have different sizes — the old stdlib silently read out-of-bounds
+/// on mismatch. When source and destination sizes match, this is
+/// equivalent to C's type-punning via memcpy, and no bit-pattern
+/// validity check happens: the caller is responsible for ensuring the
+/// bytes make sense as a `To`.
+function transmute<From, To>(value: From) -> To {
+    if (sizeof(From) != sizeof(To)) {
+        intrinsics::panic("mem::transmute size mismatch", FILE, LINE);
+    }
+    mut result: To;
+    intrinsics::memcpy(&result, &value, sizeof(From));
+    return result;
+}
+
+/// Reinterpret a pointer's pointee type without touching the address.
+function transmute_ptr<From, To>(ptr: From*) -> To* {
+    return ptr;
+}
+
+/// Read a `T` from a byte buffer at the given offset. The buffer region
+/// `[offset, offset + sizeof(T))` must be fully valid and contain a bit
+/// pattern that's a valid `T`.
+function read_bytes<T>(bytes: u8*, offset: u64) -> T {
+    mut result: T;
+    intrinsics::memcpy(&result, intrinsics::ptr_add(bytes, offset), sizeof(T));
+    return result;
+}
+
+/// Write a `T` into a byte buffer at the given offset.
+function write_bytes<T>(bytes: u8*, offset: u64, value: T) -> void {
+    intrinsics::memcpy(intrinsics::ptr_add(bytes, offset), &value, sizeof(T));
+}
+
+// ============================================================================
+// Search
+// ============================================================================
+
+/// Find the first byte equal to `needle` in `[haystack, haystack+count)`.
+/// Returns null if no match.
+function find_byte(haystack: void*, needle: u8, count: u64) -> void* {
+    return intrinsics::memchr(haystack, needle as i32, count);
+}
+
+/// Find the first occurrence of `needle` in `haystack`. Returns null if
+/// no match or if `needle_len > haystack_len`. A zero-length `needle`
+/// matches at the start of `haystack`.
+function find_pattern(haystack: void*, haystack_len: u64,
+                      needle: void*, needle_len: u64) -> void* {
+    if (needle_len == 0) {
+        return haystack;
+    }
+    if (needle_len > haystack_len) {
+        return null;
+    }
+
+    const end: u64 = haystack_len - needle_len + 1;
+    mut i: u64 = 0;
+    while (i < end) {
+        const candidate: void* = intrinsics::ptr_add(haystack, i);
+        if (intrinsics::memcmp(candidate, needle, needle_len) == 0) {
+            return candidate;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+// ============================================================================
+// Ownership hints
+// ============================================================================
+
+/// Suppress the (eventually automatic) destructor for `value`. In Phase 1
+/// this is a no-op because destructors are not auto-inserted; when Drop
+/// lands in cryoc this function becomes load-bearing.
+function forget<T>(_value: T) -> void {
+}
+
+/// Call the destructor for the `T` at `ptr` without freeing the storage.
+/// Phase 1 has no real destructors so this is a no-op placeholder that
+/// exists to lock in the API shape.
+function drop_in_place<T>(_ptr: T*) -> void {
+}

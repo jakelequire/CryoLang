@@ -1,0 +1,101 @@
+///! Ranges and the `Step` trait.
+///!
+///! `Step` abstracts "the successor of a value" so a single generic
+///! `Range<T>` works across integer widths. Implementing `Step` requires
+///! `Ord` — bounded iteration needs to know when we've passed `end`.
+
+namespace std::core::ops;
+
+import core::cmp;
+import core::iter;
+import core::option;
+
+// ============================================================================
+// Step
+// ============================================================================
+
+type trait Step : Ord {
+    /// The next value after `this`. Wraps on overflow at the type's
+    /// maximum; `Range` stops before reaching that case because the
+    /// bound check uses `Ord`.
+    successor(&this) -> Self;
+}
+
+implement Step for i8 { successor(&this) -> i8 { return this + 1; } }
+implement Step for i16 { successor(&this) -> i16 { return this + 1; } }
+implement Step for i32 { successor(&this) -> i32 { return this + 1; } }
+implement Step for i64 { successor(&this) -> i64 { return this + 1; } }
+implement Step for u8 { successor(&this) -> u8 { return this + 1; } }
+implement Step for u16 { successor(&this) -> u16 { return this + 1; } }
+implement Step for u32 { successor(&this) -> u32 { return this + 1; } }
+implement Step for u64 { successor(&this) -> u64 { return this + 1; } }
+implement Step for char {
+    successor(&this) -> char { return (this as i32 + 1) as char; }
+}
+
+// ============================================================================
+// Range<T> — half-open [start, end)
+// ============================================================================
+
+type struct Range<T> {
+    public start: T;
+    public end: T;
+}
+
+implement<T> Iterator<T> for Range<T> where T: Step {
+    next(mut &this) -> Option<T> {
+        match (this.start.compare(&this.end)) {
+            Ordering::Less => {
+                const value: T = this.start;
+                this.start = this.start.successor();
+                return Option::Some(value);
+            }
+            _ => { return Option::None; }
+        }
+    }
+}
+
+// ============================================================================
+// RangeInclusive<T> — [start, end]
+// ============================================================================
+
+type struct RangeInclusive<T> {
+    public start: T;
+    public end: T;
+    exhausted: boolean;
+
+    static new(start: T, end: T) -> RangeInclusive<T> {
+        return RangeInclusive<T> {
+            start: start,
+            end: end,
+            exhausted: false
+        };
+    }
+}
+
+implement<T> Iterator<T> for RangeInclusive<T> where T: Step {
+    next(mut &this) -> Option<T> {
+        if (this.exhausted) {
+            return Option::None;
+        }
+        match (this.start.compare(&this.end)) {
+            Ordering::Less => {
+                const value: T = this.start;
+                this.start = this.start.successor();
+                return Option::Some(value);
+            }
+            Ordering::Equal => {
+                // Yield the endpoint, then latch to exhausted so we
+                // don't call `successor` past `end` (overflow risk at
+                // the top of the type's range).
+                const value: T = this.start;
+                this.exhausted = true;
+                return Option::Some(value);
+            }
+            Ordering::Greater => {
+                this.exhausted = true;
+                return Option::None;
+            }
+        }
+    }
+}
