@@ -723,6 +723,36 @@ type struct Monomorphizer {
             }
             if (node.kind == NodeKind::ForStatement) {
                 const for_stmt: ForStmtNode* = stmt as ForStmtNode*;
+                // Resolve the loop's init VarDecl (e.g. `mut i: int = 0`).
+                // Without this, codegen sees `i` as an unresolved identifier
+                // and indexing like `this.keys[i]` produces a null index.
+                // The init can be either a bare VariableDeclaration or a
+                // DeclarationStatement wrapping one, depending on how it
+                // was parsed.
+                if (for_stmt.init != null) {
+                    const init_node: ASTNode* = for_stmt.init;
+                    mut for_var: VarDeclNode* = null;
+                    if (init_node.kind == NodeKind::VariableDeclaration) {
+                        for_var = for_stmt.init as VarDeclNode*;
+                    } else if (init_node.kind == NodeKind::DeclarationStatement) {
+                        const init_decl: DeclStmtNode* = for_stmt.init as DeclStmtNode*;
+                        const inner_decl: DeclarationNode* = init_decl.declaration;
+                        if (inner_decl != null) {
+                            const inner_node: ASTNode* = inner_decl as ASTNode*;
+                            if (inner_node.kind == NodeKind::VariableDeclaration) {
+                                for_var = inner_decl as VarDeclNode*;
+                            }
+                        }
+                    }
+                    if (for_var != null && for_var.type_annotation != null
+                            && !for_var.resolved_type.is_valid()) {
+                        const vtype: TypeRef = this.type_resolver.resolve(
+                            for_var.type_annotation, res_ctx);
+                        if (vtype.is_valid()) {
+                            for_var.resolved_type = vtype;
+                        }
+                    }
+                }
                 if (for_stmt.body != null) {
                     const body_node: ASTNode* = for_stmt.body as ASTNode*;
                     if (body_node.kind == NodeKind::BlockStatement) {
