@@ -1,0 +1,203 @@
+///! TCP sockets.
+///!
+///! `TcpListener` binds an address and accepts connections;
+///! `TcpStream` is a connected socket implementing `Read + Write`.
+///! Both own a POSIX file descriptor and must have `drop` called
+///! before going out of scope.
+///!
+///! `sockaddr_in` is packed by hand — 16 bytes, family + port + addr
+///! + 8 bytes padding, port/addr in network byte order. That avoids
+///! needing cryoc to model C struct layouts for every sockaddr
+///! variant.
+
+namespace std::net::tcp;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+import io::fd;
+import io::traits;
+import net::ip;
+import net::socket_addr;
+
+extern "C" {
+    function socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
+    function bind(sockfd: i32, addr: u8*, addrlen: u32) -> i32;
+    function listen(sockfd: i32, backlog: i32) -> i32;
+    function accept(sockfd: i32, addr: u8*, addrlen: u32*) -> i32;
+    function connect(sockfd: i32, addr: u8*, addrlen: u32) -> i32;
+    function setsockopt(sockfd: i32, level: i32, optname: i32,
+                        optval: u8*, optlen: u32) -> i32;
+    function shutdown(sockfd: i32, how: i32) -> i32;
+}
+
+const AF_INET: i32 = 2;
+const SOCK_STREAM: i32 = 1;
+const SOL_SOCKET: i32 = 1;
+const SO_REUSEADDR: i32 = 2;
+
+const SHUT_RD: i32 = 0;
+const SHUT_WR: i32 = 1;
+const SHUT_RDWR: i32 = 2;
+
+/// Pack a `SocketAddr` into a 16-byte `sockaddr_in` buffer. Returns
+/// the number of bytes written (always 16 for IPv4). Panics on IPv6
+/// — the v6 path will want a 28-byte `sockaddr_in6` packer.
+function pack_sockaddr_in(out: u8*, addr: &SocketAddr) -> u32 {
+    match (addr.ip) {
+        IpAddr::V4(v4) => {
+            // sin_family = AF_INET, host byte order
+            out[0] = 2;
+            out[1] = 0;
+            // sin_port, network byte order (big-endian)
+            out[2] = (addr.port >> 8) as u8;
+            out[3] = (addr.port & 0xFF) as u8;
+            // sin_addr, network byte order
+            out[4] = v4.a;
+            out[5] = v4.b;
+            out[6] = v4.c;
+            out[7] = v4.d;
+            // 8 bytes of sin_zero padding
+            mut i: u64 = 8;
+            while (i < 16) { out[i] = 0; i = i + 1; }
+            return 16;
+        }
+        IpAddr::V6(_) => {
+            intrinsics::panic("tcp: IPv6 packing not implemented", FILE, LINE);
+        }
+    }
+}
+
+// ============================================================================
+// TcpStream — connected socket
+// ============================================================================
+
+type struct TcpStream {
+    fd: i32;
+
+    /// Connect to `remote`. Fails with the mapped `errno` kind on
+    /// refusal, timeout, or an unreachable host.
+    static connect(remote: SocketAddr) -> Result<TcpStream, IoError> {
+        const sock: i32 = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            return Result::Err(IoError::from_errno(fd::errno()));
+        }
+        mut sockaddr_buf: u8[16];
+        const len: u32 = pack_sockaddr_in(&sockaddr_buf[0], &remote);
+        const rc: i32 = connect(sock, &sockaddr_buf[0], len);
+        if (rc < 0) {
+            const err: IoError = IoError::from_errno(fd::errno());
+            fd::close_fd(sock);
+            return Result::Err(err);
+        }
+        return Result::Ok(TcpStream { fd: sock });
+    }
+
+    /// Wrap a raw file descriptor. The caller transfers ownership;
+    /// `drop` will close it. Used by `TcpListener::accept`.
+    static from_fd(sock: i32) -> TcpStream {
+        return TcpStream { fd: sock };
+    }
+
+    /// Close the write half. Signals "no more from me" without tearing
+    /// down the read path. Useful for protocols where the client
+    /// sends then reads to EOF.
+    shutdown_write(mut &this) -> Result<(), IoError> {
+        if (shutdown(this.fd, SHUT_WR) < 0) {
+            return Result::Err(IoError::from_errno(fd::errno()));
+        }
+        return Result::Ok(());
+    }
+
+    /// Close both halves. Ownership obligation: every TcpStream must
+    /// have `drop` called before going out of scope.
+    drop(mut &this) -> void {
+        if (this.fd >= 0) {
+            fd::close_fd(this.fd);
+            this.fd = -1;
+        }
+    }
+}
+
+implement Read for TcpStream {
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        return fd::read_fd(this.fd, buffer, length);
+    }
+}
+
+implement Write for TcpStream {
+    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+        return fd::write_fd(this.fd, bytes);
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        return Result::Ok(());
+    }
+}
+
+// ============================================================================
+// TcpListener — bound + listening socket
+// ============================================================================
+
+type struct TcpListener {
+    fd: i32;
+
+    /// Bind + listen on `local`. Sets `SO_REUSEADDR` so restarts
+    /// don't wait out the TIME_WAIT window. Backlog defaults to 128 —
+    /// the same number Linux uses for `/proc/sys/net/core/somaxconn`
+    /// these days.
+    static bind(local: SocketAddr) -> Result<TcpListener, IoError> {
+        const sock: i32 = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            return Result::Err(IoError::from_errno(fd::errno()));
+        }
+
+        mut reuse: i32 = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse as u8*, 4);
+
+        mut sockaddr_buf: u8[16];
+        const len: u32 = pack_sockaddr_in(&sockaddr_buf[0], &local);
+        if (bind(sock, &sockaddr_buf[0], len) < 0) {
+            const err: IoError = IoError::from_errno(fd::errno());
+            fd::close_fd(sock);
+            return Result::Err(err);
+        }
+        if (listen(sock, 128) < 0) {
+            const err: IoError = IoError::from_errno(fd::errno());
+            fd::close_fd(sock);
+            return Result::Err(err);
+        }
+        return Result::Ok(TcpListener { fd: sock });
+    }
+
+    /// Block until a connection arrives, then return the accepted
+    /// `TcpStream`. The peer address is intentionally dropped — most
+    /// callers ignore it; a `accept_with_peer` variant can surface it
+    /// when a caller needs it.
+    accept(mut &this) -> Result<TcpStream, IoError> {
+        mut sockaddr_buf: u8[16];
+        mut addrlen: u32 = 16;
+        loop {
+            const client_fd: i32 = accept(this.fd, &sockaddr_buf[0], &addrlen);
+            if (client_fd >= 0) {
+                return Result::Ok(TcpStream::from_fd(client_fd));
+            }
+            const err: IoError = IoError::from_errno(fd::errno());
+            match (err.kind) {
+                IoErrorKind::Interrupted => { }
+                _ => { return Result::Err(err); }
+            }
+        }
+    }
+
+    /// Close the listening socket. Ownership obligation: every
+    /// TcpListener must have `drop` called before going out of scope.
+    drop(mut &this) -> void {
+        if (this.fd >= 0) {
+            fd::close_fd(this.fd);
+            this.fd = -1;
+        }
+    }
+}

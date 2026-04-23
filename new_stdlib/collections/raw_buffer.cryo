@@ -1,0 +1,161 @@
+///! RawBuffer — the allocator-backed storage half of a growable
+///! container.
+///!
+///! Owns `(ptr, capacity, allocator)` but tracks no length. Callers
+///! (`Array`, `String`, future `Deque`, ...) keep their own length
+///! and pass it into `reserve` / `shrink_to` so the buffer knows how
+///! many bytes to preserve across a reallocation.
+///!
+///! Why this exists: before the dedupe pass, `Array<T, A>` and
+///! `String<A>` each had ~80 lines of identical `reserve` / `grow`
+///! / `resize_buffer` / `shrink_to_fit` machinery, differing only
+///! in the element type. One bug in either copy was a bug that
+///! could only half-propagate. `RawBuffer` makes that impossible.
+
+namespace std::collections::raw_buffer;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::ptr;
+import alloc::layout;
+import alloc::allocator;
+
+type struct RawBuffer<T, A = GlobalAlloc> {
+    ptr: T*;
+    capacity: u64;
+    alloc: A;
+
+    /// Empty buffer backed by `GlobalAlloc`. No heap storage until
+    /// the first `reserve` call.
+    static new() -> RawBuffer<T, GlobalAlloc> {
+        return RawBuffer<T, GlobalAlloc> {
+            ptr: null,
+            capacity: 0,
+            alloc: GlobalAlloc::new()
+        };
+    }
+
+    /// Empty buffer with a caller-supplied allocator. Ownership of
+    /// `alloc` transfers to the buffer.
+    static new_in(alloc: A) -> RawBuffer<T, A> {
+        return RawBuffer<T, A> {
+            ptr: null,
+            capacity: 0,
+            alloc: alloc
+        };
+    }
+
+    ptr(&this) -> T* {
+        return this.ptr;
+    }
+
+    capacity(&this) -> u64 {
+        return this.capacity;
+    }
+
+    /// Ensure at least `additional` more slots past `used` fit.
+    /// Over-allocates along the doubling curve, seeded by
+    /// `min_capacity` when the buffer is small (so empty-to-nonempty
+    /// transitions don't start at a single slot).
+    reserve(mut &this,
+            used: u64,
+            additional: u64,
+            min_capacity: u64) -> Result<(), AllocError> {
+        const required: u64 = used + additional;
+        if (required <= this.capacity) {
+            return Result::Ok(());
+        }
+        mut new_cap: u64 = this.capacity;
+        if (new_cap < min_capacity) {
+            new_cap = min_capacity;
+        }
+        while (new_cap < required) {
+            new_cap = new_cap * 2;
+        }
+        return resize(this, new_cap);
+    }
+
+    /// Allocate exactly enough for `used + additional`. No over-
+    /// allocation. Useful when the caller already knows the final
+    /// size (e.g., `Array::with_capacity`).
+    reserve_exact(mut &this,
+                  used: u64,
+                  additional: u64) -> Result<(), AllocError> {
+        const required: u64 = used + additional;
+        if (required <= this.capacity) {
+            return Result::Ok(());
+        }
+        return resize(this, required);
+    }
+
+    /// Shrink capacity to `target`, which must be at least `used`.
+    /// If shrinking fails, the buffer keeps its current capacity —
+    /// losing capacity is fine, but losing data is not.
+    shrink_to(mut &this, target: u64) -> void {
+        if (target >= this.capacity) { return; }
+        if (target == 0) {
+            if (this.ptr != null) {
+                this.alloc.deallocate(
+                    NonNull::new(this.ptr as u8*),
+                    Layout::array<T>(this.capacity)
+                );
+            }
+            this.ptr = null;
+            this.capacity = 0;
+            return;
+        }
+        match (resize(this, target)) {
+            Result::Ok(_) => { }
+            Result::Err(_) => { }
+        }
+    }
+
+    /// Release the backing allocation. Callers must have already
+    /// dropped any T-owned resources — RawBuffer doesn't know which
+    /// prefix was initialized.
+    drop(mut &this) -> void {
+        if (this.ptr != null) {
+            this.alloc.deallocate(
+                NonNull::new(this.ptr as u8*),
+                Layout::array<T>(this.capacity)
+            );
+        }
+        this.ptr = null;
+        this.capacity = 0;
+    }
+}
+
+/// Reallocate to `new_capacity`. Assumes `new_capacity` is the value
+/// the caller wants; bounds against `used` are the caller's problem.
+function resize<T, A>(buffer: mut &RawBuffer<T, A>,
+                      new_capacity: u64) -> Result<(), AllocError>
+    where A: Allocator {
+    if (new_capacity == buffer.capacity) {
+        return Result::Ok(());
+    }
+    const new_layout: Layout = Layout::array<T>(new_capacity);
+    if (buffer.ptr == null) {
+        match (buffer.alloc.allocate(new_layout)) {
+            Result::Ok(raw) => {
+                buffer.ptr = raw.as_ptr() as T*;
+                buffer.capacity = new_capacity;
+                return Result::Ok(());
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+    const old_layout: Layout = Layout::array<T>(buffer.capacity);
+    match (buffer.alloc.reallocate(
+        NonNull::new(buffer.ptr as u8*),
+        old_layout,
+        new_layout
+    )) {
+        Result::Ok(raw) => {
+            buffer.ptr = raw.as_ptr() as T*;
+            buffer.capacity = new_capacity;
+            return Result::Ok(());
+        }
+        Result::Err(err) => { return Result::Err(err); }
+    }
+}

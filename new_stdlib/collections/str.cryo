@@ -1,0 +1,95 @@
+///! Str — a borrowed UTF-8 string slice.
+///!
+///! `Str` is `(bytes, length)` over UTF-8-encoded memory that the caller
+///! guarantees outlives this view. No NUL terminator — the length is
+///! authoritative. `String` (owned) exposes `as_str()` at the boundary
+///! so algorithms that only read can be written once.
+///!
+///! Byte-level access is always safe: `length()` returns the byte
+///! count, `as_bytes()` hands out the underlying `Slice<u8>`. Char
+///! iteration needs a UTF-8 decoder and is deferred until the caller
+///! shape settles — `byte_at` and `as_bytes` cover the common cases
+///! without speculating on an iterator API.
+
+namespace std::collections::str;
+
+import core::intrinsics;
+import core::option;
+import core::slice;
+
+type struct Str {
+    bytes: u8*;
+    length: u64;
+
+    /// Construct from a raw pointer + length. The caller certifies that
+    /// `[bytes, bytes + length)` is initialized UTF-8 and outlives this
+    /// view.
+    static from_raw(bytes: u8*, length: u64) -> Str {
+        return Str { bytes: bytes, length: length };
+    }
+
+    /// Construct from a byte slice. The caller certifies the bytes are
+    /// valid UTF-8; no check is performed.
+    static from_bytes(slice: Slice<u8>) -> Str {
+        return Str { bytes: slice.as_ptr(), length: slice.length() };
+    }
+
+    /// Byte length. For a UTF-8 string, `length() >= char_count`.
+    length(&this) -> u64 {
+        return this.length;
+    }
+
+    is_empty(&this) -> boolean {
+        return this.length == 0;
+    }
+
+    /// Underlying byte view. Use this for byte-granularity algorithms
+    /// (hashing, equality, substring search).
+    as_bytes(&this) -> Slice<u8> {
+        return Slice::from_raw(this.bytes, this.length);
+    }
+
+    /// Raw byte pointer. Valid as long as this `Str` is valid.
+    as_ptr(&this) -> u8* {
+        return this.bytes;
+    }
+
+    /// Bounds-checked byte lookup. For iteration by UTF-8 code point,
+    /// wait for the decoder module (not in Phase 4).
+    byte_at(&this, index: u64) -> Option<u8> {
+        if (index >= this.length) {
+            return Option::None;
+        }
+        return Option::Some(this.bytes[index]);
+    }
+
+    /// `[start, end)` byte sub-slice. Panics if the range is out of
+    /// bounds or if `start > end`. **Not UTF-8-aware** — splitting
+    /// inside a multi-byte scalar is the caller's problem (fix: use
+    /// the decoder when it lands).
+    sub_bytes(&this, start: u64, end: u64) -> Str {
+        if (start > end || end > this.length) {
+            intrinsics::panic("Str::sub_bytes: out of range", FILE, LINE);
+        }
+        return Str {
+            bytes: this.bytes + start,
+            length: end - start
+        };
+    }
+
+    /// Byte-wise equality. UTF-8 in canonical form compares as
+    /// expected; non-canonical input compares byte-by-byte.
+    equals(&this, other: &Str) -> boolean {
+        if (this.length != other.length) {
+            return false;
+        }
+        if (this.length == 0) {
+            return true;
+        }
+        return intrinsics::memcmp(
+            this.bytes as void*,
+            other.bytes as void*,
+            this.length
+        ) == 0;
+    }
+}

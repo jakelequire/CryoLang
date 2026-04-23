@@ -1,0 +1,289 @@
+///! HTTP request.
+///!
+///! A `Request` is parsed from any `Read` (typically a `TcpStream`)
+///! or built by a client and written to any `Write`. The parser is
+///! intentionally basic: request line + headers until CRLF-CRLF +
+///! body sized by `Content-Length`. Chunked transfer-encoding is
+///! not supported in Phase 5.
+
+namespace std::net::http::request;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+import io::traits;
+import collections::array;
+import collections::str;
+import collections::string;
+import fmt::integer;
+import net::http::method;
+import net::http::headers;
+
+const HTTP_VERSION: Str = Str::from_raw("HTTP/1.1" as u8*, 8);
+const MAX_HEADER_LINE: u64 = 8192;
+const MAX_BODY: u64 = 16777216;  // 16 MiB — hard cap against runaway Content-Length
+
+type struct Request {
+    public method: Method;
+    public path: String<GlobalAlloc>;
+    public version: String<GlobalAlloc>;
+    public headers: Headers;
+    public body: Array<u8, GlobalAlloc>;
+
+    /// Construct a minimal request. Clients build on top of this with
+    /// `with_header` / `with_body`.
+    static new(method: Method, path: Str) -> Request {
+        return Request {
+            method: method,
+            path: String::from_str(path),
+            version: String::from_str(HTTP_VERSION),
+            headers: Headers::new(),
+            body: Array::new()
+        };
+    }
+
+    /// Replace the body and set Content-Length accordingly.
+    set_body(mut &this, body: Array<u8, GlobalAlloc>) -> void {
+        mut old: Array<u8, GlobalAlloc> = this.body;
+        old.drop();
+        this.body = body;
+        mut buffer: u8[24];
+        const digits: u64 = integer::write_u64_decimal(&buffer[0], this.body.length());
+        this.headers.insert(
+            Str::from_raw("Content-Length" as u8*, 14),
+            Str::from_raw(&buffer[0], digits)
+        );
+    }
+
+    /// Parse from a `Read` impl. Consumes bytes up to and including
+    /// the body (if any). Fails with `InvalidData` on malformed
+    /// input; that's a protocol error the server surfaces as 400.
+    static parse<R>(reader: mut &R) -> Result<Request, IoError> where R: Read {
+        mut line: String<GlobalAlloc> = String::new();
+        match (read_line(reader, &line, MAX_HEADER_LINE)) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { line.drop(); return Result::Err(err); }
+        }
+
+        // Request-Line: METHOD SP PATH SP VERSION
+        mut first_sp: u64 = line.length();
+        mut second_sp: u64 = line.length();
+        mut i: u64 = 0;
+        while (i < line.length()) {
+            match (line.as_str().byte_at(i)) {
+                Option::Some(byte) => {
+                    if (byte == 0x20) {
+                        if (first_sp == line.length()) { first_sp = i; }
+                        else if (second_sp == line.length()) { second_sp = i; break; }
+                    }
+                }
+                Option::None => { break; }
+            }
+            i = i + 1;
+        }
+        if (first_sp == line.length() || second_sp == line.length()) {
+            line.drop();
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+
+        const method_str: Str = line.as_str().sub_bytes(0, first_sp);
+        const path_str: Str = line.as_str().sub_bytes(first_sp + 1, second_sp);
+        const version_str: Str = line.as_str().sub_bytes(second_sp + 1, line.length());
+
+        mut parsed_method: Method = Method::Get;
+        match (Method::parse(method_str)) {
+            Option::Some(m) => { parsed_method = m; }
+            Option::None => {
+                line.drop();
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+        }
+
+        mut req: Request = Request {
+            method: parsed_method,
+            path: String::from_str(path_str),
+            version: String::from_str(version_str),
+            headers: Headers::new(),
+            body: Array::new()
+        };
+        line.drop();
+
+        // Header block: lines until an empty one.
+        loop {
+            mut header_line: String<GlobalAlloc> = String::new();
+            match (read_line(reader, &header_line, MAX_HEADER_LINE)) {
+                Result::Ok(_) => { }
+                Result::Err(err) => {
+                    header_line.drop();
+                    req.drop();
+                    return Result::Err(err);
+                }
+            }
+            if (header_line.is_empty()) {
+                header_line.drop();
+                break;
+            }
+            if (!req.headers.parse_line(header_line.as_str())) {
+                header_line.drop();
+                req.drop();
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            header_line.drop();
+        }
+
+        // Body, sized by Content-Length. No Content-Length means no
+        // body for this parser — chunked encoding is out of scope.
+        match (req.headers.get(Str::from_raw("content-length" as u8*, 14))) {
+            Option::Some(mut value) => {
+                match (integer::parse_u64(value.as_str())) {
+                    Option::Some(len) => {
+                        if (len > MAX_BODY) {
+                            value.drop();
+                            req.drop();
+                            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                        }
+                        mut body: Array<u8, GlobalAlloc> = Array::with_capacity(len);
+                        // Read exactly len bytes.
+                        mut remaining: u64 = len;
+                        mut buffer: u8[4096];
+                        while (remaining > 0) {
+                            mut take: u64 = 4096;
+                            if (take > remaining) { take = remaining; }
+                            match (reader.read(&buffer[0], take)) {
+                                Result::Ok(n) => {
+                                    if (n == 0) {
+                                        value.drop();
+                                        body.drop();
+                                        req.drop();
+                                        return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
+                                    }
+                                    mut j: u64 = 0;
+                                    while (j < n) { body.push(buffer[j]); j = j + 1; }
+                                    remaining = remaining - n;
+                                }
+                                Result::Err(err) => {
+                                    value.drop();
+                                    body.drop();
+                                    req.drop();
+                                    return Result::Err(err);
+                                }
+                            }
+                        }
+                        req.body = body;
+                    }
+                    Option::None => {
+                        value.drop();
+                        req.drop();
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
+                }
+                value.drop();
+            }
+            Option::None => { }
+        }
+
+        return Result::Ok(req);
+    }
+
+    /// Write to a `Write` impl. Emits request line, headers, CRLF,
+    /// body.
+    write_to<W>(&this, writer: mut &W) -> Result<(), IoError> where W: Write {
+        const crlf: Slice<u8> = Slice::from_raw("\r\n" as u8*, 2);
+        const sp: Slice<u8> = Slice::from_raw(" " as u8*, 1);
+
+        match (writer.write_all(this.method.as_str().as_bytes())) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (writer.write_all(sp)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (writer.write_all(this.path.as_bytes())) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (writer.write_all(sp)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (writer.write_all(this.version.as_bytes())) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (writer.write_all(crlf)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+
+        // Headers — iteration isn't on HashMap yet; callers should
+        // use the provided `write_header` helper if they need custom
+        // ordering. For Phase 5 we skip header iteration here and
+        // emit only headers the caller set via `set_body` (which
+        // adds Content-Length) + any the caller writes manually
+        // before this call through the `headers` field.
+        //
+        // TODO(phase6): add HashMap iteration and emit all stored
+        // headers automatically.
+
+        match (writer.write_all(crlf)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        if (!this.body.is_empty()) {
+            match (writer.write_all(this.body.as_slice())) {
+                Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+            }
+        }
+        return Result::Ok(());
+    }
+
+    drop(mut &this) -> void {
+        this.path.drop();
+        this.version.drop();
+        this.headers.drop();
+        this.body.drop();
+    }
+}
+
+// ============================================================================
+// Shared helpers (also used by response.cryo)
+// ============================================================================
+
+/// Read bytes into `out` until CRLF. Trailing CRLF is consumed but
+/// not appended. Returns `InvalidData` if the line exceeds `max`.
+function read_line<R>(reader: mut &R,
+                      out: mut &String<GlobalAlloc>,
+                      max: u64) -> Result<(), IoError> where R: Read {
+    mut last_was_cr: boolean = false;
+    mut total: u64 = 0;
+    mut buf: u8[1];
+    loop {
+        match (reader.read(&buf[0], 1)) {
+            Result::Ok(n) => {
+                if (n == 0) {
+                    return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
+                }
+                const byte: u8 = buf[0];
+                if (last_was_cr && byte == 0x0A) {
+                    // drop the CR we provisionally appended
+                    // (`last_was_cr` is set only after we pushed one)
+                    return Result::Ok(());
+                }
+                if (last_was_cr) {
+                    out.push_byte(0x0D);
+                    total = total + 1;
+                }
+                if (byte == 0x0D) {
+                    last_was_cr = true;
+                } else {
+                    out.push_byte(byte);
+                    total = total + 1;
+                    last_was_cr = false;
+                }
+                if (total > max) {
+                    return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                }
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+}
+
+// Integer format/parse helpers live in `fmt::integer`. Callers
+// within this module reach them through the module import above.

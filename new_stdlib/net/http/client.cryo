@@ -1,0 +1,142 @@
+///! HTTP client — simple one-shot requests over plain TCP.
+///!
+///! Opens a fresh connection, sends the request, reads one response,
+///! closes. That's the whole model for Phase 5. Keep-alive,
+///! connection pooling, retries, and redirect following are caller
+///! concerns on top.
+///!
+///! The client takes a `SocketAddr` and a path directly; there's no
+///! URL parser yet. Callers that need `https://host:port/path` will
+///! resolve host + scheme themselves until DNS + URL parsing land.
+
+namespace std::net::http::client;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+import io::traits;
+import collections::array;
+import collections::str;
+import collections::string;
+import fmt::integer;
+import net::socket_addr;
+import net::tcp;
+import net::http::method;
+import net::http::request;
+import net::http::response;
+import net::http::headers;
+
+type struct Client { }
+
+implement Client {
+    static new() -> Client {
+        return Client { };
+    }
+
+    /// `GET addr/path`. Sets Host to `addr`'s address:port.
+    get(&this, addr: SocketAddr, path: Str) -> Result<Response, IoError> {
+        mut req: Request = Request::new(Method::Get, path);
+        apply_host_header(&req, &addr);
+        return send(addr, req);
+    }
+
+    /// `POST addr/path` with body bytes. Sets Host and passes the
+    /// supplied Content-Type through unchanged; if the caller didn't
+    /// set one, the server may fall back to octet-stream.
+    post(&this,
+         addr: SocketAddr,
+         path: Str,
+         content_type: Str,
+         body: Array<u8, GlobalAlloc>) -> Result<Response, IoError> {
+        mut req: Request = Request::new(Method::Post, path);
+        apply_host_header(&req, &addr);
+        req.headers.insert(
+            Str::from_raw("Content-Type" as u8*, 12),
+            content_type
+        );
+        req.set_body(body);
+        return send(addr, req);
+    }
+}
+
+/// Open a connection, write the request, parse one response, close.
+function send(addr: SocketAddr, req: Request) -> Result<Response, IoError> {
+    match (TcpStream::connect(addr)) {
+        Result::Ok(stream) => {
+            mut s: TcpStream = stream;
+            mut request_local: Request = req;
+            match (request_local.write_to(&s)) {
+                Result::Ok(_) => { }
+                Result::Err(err) => {
+                    request_local.drop();
+                    s.drop();
+                    return Result::Err(err);
+                }
+            }
+            match (s.shutdown_write()) {
+                Result::Ok(_) => { }
+                Result::Err(_) => { }
+            }
+            request_local.drop();
+
+            const parsed: Result<Response, IoError> = Response::parse(&s);
+            s.drop();
+            return parsed;
+        }
+        Result::Err(err) => {
+            mut request_local: Request = req;
+            request_local.drop();
+            return Result::Err(err);
+        }
+    }
+}
+
+/// Write `host: ip:port` into the request headers. Rendered in
+/// `a.b.c.d:port` form because that's what we can produce without a
+/// real display-formatter for IpAddr yet.
+function apply_host_header(req: mut &Request, addr: &SocketAddr) -> void {
+    mut buffer: String<GlobalAlloc> = String::with_capacity(32);
+    match (addr.ip) {
+        IpAddr::V4(v4) => {
+            push_u8_decimal(&buffer, v4.a);
+            buffer.push_byte(0x2E);
+            push_u8_decimal(&buffer, v4.b);
+            buffer.push_byte(0x2E);
+            push_u8_decimal(&buffer, v4.c);
+            buffer.push_byte(0x2E);
+            push_u8_decimal(&buffer, v4.d);
+        }
+        IpAddr::V6(_) => {
+            // Phase 5 has no v6 formatter; emit a placeholder so the
+            // header is well-formed and the server doesn't reject
+            // the request on missing Host.
+            buffer.push_str(Str::from_raw("::" as u8*, 2));
+        }
+    }
+    buffer.push_byte(0x3A);
+    push_u16_decimal(&buffer, addr.port);
+    req.headers.insert(Str::from_raw("Host" as u8*, 4), buffer.as_str());
+    buffer.drop();
+}
+
+function push_u8_decimal(buffer: mut &String<GlobalAlloc>, value: u8) -> void {
+    mut temp: u8[4];
+    const digits: u64 = integer::write_u64_decimal(&temp[0], value as u64);
+    mut i: u64 = 0;
+    while (i < digits) {
+        buffer.push_byte(temp[i]);
+        i = i + 1;
+    }
+}
+
+function push_u16_decimal(buffer: mut &String<GlobalAlloc>, value: u16) -> void {
+    mut temp: u8[8];
+    const digits: u64 = integer::write_u64_decimal(&temp[0], value as u64);
+    mut i: u64 = 0;
+    while (i < digits) {
+        buffer.push_byte(temp[i]);
+        i = i + 1;
+    }
+}
