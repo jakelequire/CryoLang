@@ -471,7 +471,7 @@ public:
         mut arm_bbs: LBasicBlock[] = [];
         for (mut i: i64 = 0; i < num_arms; i++) {
             const name: string = format("match.arm%lld", i);
-            arm_bbs = arm_bbs + [LBasicBlock::append(current_fn, name)];
+            arm_bbs.push(LBasicBlock::append(current_fn, name));
         }
         const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "match.end");
 
@@ -1190,6 +1190,40 @@ public:
                 callee_val = resolve_function(this.cg, id.name);
             }
 
+            // 3b. Class / struct constructor call — `ClassName(args)` resolves
+            //     to the method named `ClassName` on the class itself,
+            //     registered as `{qualified_class}::ClassName`.  Sema sets
+            //     the call's resolved_type to the class type for this form.
+            if (!callee_val.is_valid()) {
+                const di: DeclarationIndex* = this.cg.get_decl_index();
+                const type_ref: TypeRef = di.lookup_type(id.name);
+                mut ctor_qn: SymbolStr = SymbolStr::empty();
+                if (type_ref.is_valid()) {
+                    const arena: TypeArena* = this.cg.get_arena();
+                    ctor_qn = arena.get_qualified_name(type_ref);
+                }
+                if (!ctor_qn.is_valid()) {
+                    // Fall back to the DI bare→qualified map (covers types
+                    // whose qualified name isn't stored on the arena Type,
+                    // e.g. types reached via cross-module aliasing).
+                    const resolved: SymbolStr = di.resolve_qualified(id.name);
+                    if (resolved.is_valid() && !resolved.equals(id.name)) {
+                        ctor_qn = resolved;
+                    }
+                }
+                if (ctor_qn.is_valid()) {
+                    const qn_str: string = intern.resolve(ctor_qn);
+                    const bare_str: string = intern.resolve(id.name);
+                    const combined: string = format("%s::%s", qn_str, bare_str);
+                    const ctor_sym: SymbolStr = intern.intern(combined);
+                    const ctor_arity: u32 = node.arguments.length as u32;
+                    callee_val = resolve_function_with_arity(this.cg, ctor_sym, ctor_arity);
+                    if (!callee_val.is_valid()) {
+                        callee_val = resolve_function(this.cg, ctor_sym);
+                    }
+                }
+            }
+
             // 4. Function-typed parameter — look in named_values (local scope).
             //    If the identifier refers to a parameter of function type,
             //    it will be stored as an alloca in named_values.  Load the
@@ -1251,7 +1285,7 @@ public:
                         // Codegen arguments.
                         mut call_args: LValue[] = [];
                         for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
-                            call_args = call_args + [this.codegen_rvalue(node.arguments[ai])];
+                            call_args.push(this.codegen_rvalue(node.arguments[ai]));
                         }
                         // Build the call.
                         const void_ty: LType = LType::void_type();
@@ -1383,7 +1417,7 @@ public:
                         // Codegen the arguments first.
                         mut vargs: LValue[] = [];
                         for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
-                            vargs = vargs + [this.codegen_rvalue(node.arguments[ai])];
+                            vargs.push(this.codegen_rvalue(node.arguments[ai]));
                         }
                         const result: LValue = this.build_enum_variant(et, variant, real_ref, vargs);
                         this.last_value = result;
@@ -1400,6 +1434,78 @@ public:
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
             const di: DeclarationIndex* = this.cg.get_decl_index();
             const method_str: string = intern.resolve(ma.member);
+
+            // Function-pointer field call: `receiver.field(args)` where
+            // `field` has a Function type.  Sema sets
+            // `ma.resolved_type` to that Function; we load the field then
+            // call indirectly through the loaded pointer.  Without this,
+            // codegen would chase method lookups and bottom out on
+            // "no method found" for every callback-style stdlib field.
+            mut ma_callee_t: Type* = this.cg.lookup_type_by_id(ma.resolved_type.id);
+            // Unwrap pointer/reference to match how function-typed fields
+            // land — `fn(...) -> T` stores as a raw function-pointer so the
+            // member may resolve to a Function type directly.
+            mut ma_fn_type: FunctionType* = null;
+            if (ma_callee_t != null && ma_callee_t.kind == TypeKind::Function) {
+                ma_fn_type = ma_callee_t as FunctionType*;
+            } else if (ma_callee_t != null && ma_callee_t.kind == TypeKind::Pointer) {
+                const ppt: PointerType* = ma_callee_t as PointerType*;
+                const pin: Type* = this.cg.lookup_type_by_id(ppt.pointee.id);
+                if (pin != null && pin.kind == TypeKind::Function) {
+                    ma_fn_type = pin as FunctionType*;
+                }
+            }
+            if (ma_fn_type != null) {
+                const ft: FunctionType* = ma_fn_type;
+                const ret_ty: LType = this.cg.type_mapper.map_type(ft.return_type);
+                if (!ret_ty.is_valid()) {
+                    this.last_value = LValue::null();
+                    this.last_is_lvalue = false;
+                    return;
+                }
+                const param_count: u32 = ft.param_types.length as u32;
+                mut llvm_fn_type: LType = LType::null();
+                if (param_count == 0) {
+                    llvm_fn_type = LType::function_type(ret_ty, null, 0, false);
+                } else {
+                    const pbuf: void* = malloc(param_count as u64 * 8);
+                    const pslots: void** = pbuf as void**;
+                    mut all_valid: boolean = true;
+                    for (mut pi: u32 = 0; pi < param_count; pi++) {
+                        const pty: LType = this.cg.type_mapper.map_type(ft.param_types[pi]);
+                        if (!pty.is_valid()) { all_valid = false; break; }
+                        pslots[pi] = pty.raw;
+                    }
+                    if (!all_valid) {
+                        free(pbuf);
+                        this.last_value = LValue::null();
+                        this.last_is_lvalue = false;
+                        return;
+                    }
+                    llvm_fn_type = LType::function_type(ret_ty, pbuf, param_count, false);
+                    free(pbuf);
+                }
+                // Load the fn-pointer value from the field (rvalue).
+                const fn_ptr: LValue = this.codegen_rvalue(ma);
+                if (!fn_ptr.is_valid()) {
+                    this.last_value = LValue::null();
+                    this.last_is_lvalue = false;
+                    return;
+                }
+                // Codegen user args (no implicit `this` — the fn-pointer field
+                // is a plain function, not a bound method).
+                mut fnp_args: LValue[] = [];
+                for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
+                    fnp_args.push(this.codegen_rvalue(node.arguments[ai]));
+                }
+                const void_ty: LType = LType::void_type();
+                const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
+                mut call_result: LValue = LValue::null();
+                codegen_call(this.cg, fn_ptr, llvm_fn_type, fnp_args, call_name, &call_result);
+                this.last_value = call_result;
+                this.last_is_lvalue = false;
+                return;
+            }
 
             // Get the object's type, unwrapping pointer/reference.
             mut obj_ref: TypeRef = ma.object.resolved_type;
@@ -1654,11 +1760,11 @@ public:
         if (node.callee.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
             const obj: LValue = this.codegen_lvalue(ma.object);
-            args = args + [obj];
+            args.push(obj);
         }
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             const arg: LValue = this.codegen_rvalue(node.arguments[i]);
-            args = args + [arg];
+            args.push(arg);
         }
 
         const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
@@ -1734,8 +1840,8 @@ public:
         mut field_values: LValue[] = [];
         for (mut i: i64 = 0; i < node.field_inits.length; i++) {
             const init: FieldInit = node.field_inits[i];
-            field_names = field_names + [init.field_name];
-            field_values = field_values + [this.codegen_rvalue(init.value)];
+            field_names.push(init.field_name);
+            field_values.push(this.codegen_rvalue(init.value));
         }
         codegen_struct_literal(this.cg, type_ref, field_names, field_values,
                                &this.last_value, &this.last_is_lvalue,
@@ -2186,7 +2292,7 @@ public:
         // Create basic blocks: one per arm + merge.
         mut arm_bbs: LBasicBlock[] = [];
         for (mut i: i64 = 0; i < num_arms; i++) {
-            arm_bbs = arm_bbs + [LBasicBlock::append(current_fn, format("mexpr.arm%lld", i))];
+            arm_bbs.push(LBasicBlock::append(current_fn, format("mexpr.arm%lld", i)));
         }
         // Default block handles the "no arm matched" case — provides
         // an undef value to the phi so all predecessors are covered.
