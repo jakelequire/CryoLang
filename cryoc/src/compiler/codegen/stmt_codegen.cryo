@@ -21,6 +21,8 @@ import Compiler::AST::Pattern;
 import Compiler::Types;
 import Compiler::Types::TypeRef;
 import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
 
 
 // ============================================================================
@@ -346,9 +348,14 @@ type struct MatchBlocks {
 // ============================================================================
 
 /// Generate IR for a local variable declaration.
+/// `site_span` is the source span of the variable's declaration node; used
+/// for diagnostics when the insert block or parent function are unexpectedly
+/// null (both indicate a codegen-ordering bug, so we point the user at the
+/// declaration that tripped the check).
 function codegen_local_var(cg: CodegenContext*, name: SymbolStr,
                            ty: TypeRef, init_val: LValue,
-                           has_init: boolean) -> void {
+                           has_init: boolean,
+                           site_span: SourceSpan) -> void {
     const var_name: string = cg.resolve(name);
     const llvm_ty: LType = cg.type_mapper.map_type(ty);
     if (!llvm_ty.is_valid()) {
@@ -364,16 +371,19 @@ function codegen_local_var(cg: CodegenContext*, name: SymbolStr,
     // Get the current function for entry-block alloca.
     const current_bb: LBasicBlock = cg.builder.get_insert_block();
     if (!current_bb.is_valid()) {
-        printf("[IRGen] WARNING: local var '%s' — no insert block set\n", var_name); fflush(null);
-        cg.ctx.emit_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR,
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0607_VARIABLE_GENERATION_ERROR,
             format("codegen: local variable '%s' — builder has no insert block", var_name));
+        diag = diag.at(site_span);
+        diag = diag.with_note("the codegen builder must have an insert block active when a local is declared; this usually means a statement was visited outside of any function body");
+        cg.emit_diagnostic(diag);
         return;
     }
     const current_fn: LValue = current_bb.get_parent();
     if (!current_fn.is_valid()) {
-        printf("[IRGen] WARNING: local var '%s' — no parent function\n", var_name); fflush(null);
-        cg.ctx.emit_error(ErrorCode::E0607_VARIABLE_GENERATION_ERROR,
-            format("codegen: local variable '%s' — insert block has no parent function", var_name));
+        cg.emit_error_at_span(ErrorCode::E0607_VARIABLE_GENERATION_ERROR,
+            format("codegen: local variable '%s' — insert block has no parent function", var_name),
+            site_span);
         return;
     }
 

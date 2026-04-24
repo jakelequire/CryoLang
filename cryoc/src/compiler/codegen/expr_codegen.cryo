@@ -26,6 +26,7 @@ import Compiler::Lex;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Diag;
+import Compiler::Diag::SourceSpan;
 
 
 // ============================================================================
@@ -144,7 +145,6 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
                         op_kind: TokenType, result_type: TypeRef,
                         out_value: LValue*) -> void {
     if (!lhs_val.is_valid() || !rhs_val.is_valid()) {
-        printf("[IRGen] WARNING: binary op — null operand(s)\n"); fflush(null);
         *out_value = LValue::null();
         return;
     }
@@ -195,7 +195,6 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
                 "std::core::primitives::string::append");
             const fn_val: LValue = resolve_function(cg, fn_sym);
             if (!fn_val.is_valid()) {
-                printf("[IRGen] WARNING: string concat — append not declared\n"); fflush(null);
                 *out_value = LValue::null();
                 return;
             }
@@ -206,7 +205,6 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             codegen_call(cg, fn_val, fn_ty, args, "strcat", out_value);
             return;
         }
-        printf("[IRGen] WARNING: binary op — unsupported string operation\n"); fflush(null);
         *out_value = LValue::null();
         return;
     }
@@ -235,7 +233,6 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             }
             return;
         }
-        printf("[IRGen] WARNING: binary op — unsupported enum operation\n"); fflush(null);
         *out_value = LValue::null();
         return;
     }
@@ -245,7 +242,6 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
     if (t_kind != TypeKind::Int && t_kind != TypeKind::Float &&
         t_kind != TypeKind::Bool && t_kind != TypeKind::Pointer &&
         t_kind != TypeKind::Char) {
-        printf("[IRGen] WARNING: binary op — unsupported result type kind %d\n", t_kind as i32); fflush(null);
         *out_value = LValue::null();
         return;
     }
@@ -697,10 +693,13 @@ function codegen_cast(cg: CodegenContext*, val: LValue,
 // Member Access
 // ============================================================================
 
-/// Generate a GEP to a struct/class field.
+/// Generate a GEP to a struct/class field.  `site_span` is the source span
+/// of the access expression in the caller; used only to attach a source
+/// snippet to any diagnostic we emit.
 function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
                                object_type: TypeRef, member: SymbolStr,
-                               out_value: LValue*, out_is_lvalue: boolean*) -> void {
+                               out_value: LValue*, out_is_lvalue: boolean*,
+                               site_span: SourceSpan) -> void {
     // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmtNode*`
     // stored in an alloca), load the pointer value so we can GEP into the struct.
     // This matches C/Rust behavior where `node.field` on a pointer is an implicit
@@ -814,17 +813,17 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
 
     const struct_ty: LType = cg.type_mapper.map_type(obj_type);
     if (!struct_ty.is_valid()) {
-        printf("[IRGen] WARNING: member access — failed to map object type\n"); fflush(null);
-        cg.ctx.emit_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
-            "codegen: member access — failed to map object type to LLVM type");
+        cg.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+            "codegen: member access — failed to map object type to LLVM type",
+            site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
         return;
     }
     if (!obj_ptr.is_valid()) {
-        printf("[IRGen] WARNING: member access — object pointer is null\n"); fflush(null);
-        cg.ctx.emit_error(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
-            "codegen: member access — object pointer is null");
+        cg.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+            "codegen: member access — object pointer is null",
+            site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
         return;
@@ -852,10 +851,12 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
 // Array Access
 // ============================================================================
 
-/// Generate a GEP for array element access.
+/// Generate a GEP for array element access.  `site_span` is the source
+/// span of the access expression in the caller; used for diagnostics.
 function codegen_array_access(cg: CodegenContext*, array_val: LValue,
                               array_type: TypeRef, index_val: LValue,
-                              out_value: LValue*, out_is_lvalue: boolean*) -> void {
+                              out_value: LValue*, out_is_lvalue: boolean*,
+                              site_span: SourceSpan) -> void {
     const t: Type* = cg.lookup_type_by_id(array_type.id);
     if (t == null) {
         *out_value = LValue::null();
@@ -920,25 +921,25 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
     const arr: ArrayType* = t as ArrayType*;
     const elem_ty: LType = cg.type_mapper.map_type(arr.element);
     if (!elem_ty.is_valid()) {
-        printf("[IRGen] WARNING: array access — failed to map element type\n"); fflush(null);
-        cg.ctx.emit_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
-            "codegen: array access — failed to map element type");
+        cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+            "codegen: array access — failed to map element type",
+            site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
         return;
     }
     if (!array_val.is_valid()) {
-        printf("[IRGen] WARNING: array access — array value is null\n"); fflush(null);
-        cg.ctx.emit_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
-            "codegen: array access — array value is null");
+        cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+            "codegen: array access — array value is null",
+            site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
         return;
     }
     if (!index_val.is_valid()) {
-        printf("[IRGen] WARNING: array access — index value is null\n"); fflush(null);
-        cg.ctx.emit_error(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
-            "codegen: array access — index value is null");
+        cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+            "codegen: array access — index value is null",
+            site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
         return;
@@ -978,9 +979,12 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
 // ============================================================================
 
 /// Generate IR for a struct literal: allocate, fill fields, return address.
+/// `site_span` is the source span of the struct-literal expression in the
+/// caller; used for diagnostics.
 function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
                                 field_names: SymbolStr[], field_values: LValue[],
-                                out_value: LValue*, out_is_lvalue: boolean*) -> void {
+                                out_value: LValue*, out_is_lvalue: boolean*,
+                                site_span: SourceSpan) -> void {
     const ty: LType = cg.type_mapper.map_type(struct_type);
     if (!ty.is_valid()) {
         *out_value = LValue::null();
@@ -991,18 +995,18 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
     // Get the current function for entry block alloca.
     const current_bb: LBasicBlock = cg.builder.get_insert_block();
     if (!current_bb.is_valid()) {
-        printf("[IRGen] WARNING: struct literal — no insert block set\n"); fflush(null);
-        cg.ctx.emit_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
-            "codegen: struct literal — builder has no insert block");
+        cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+            "codegen: struct literal — builder has no insert block",
+            site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
         return;
     }
     const current_fn: LValue = current_bb.get_parent();
     if (!current_fn.is_valid()) {
-        printf("[IRGen] WARNING: struct literal — no parent function\n"); fflush(null);
-        cg.ctx.emit_error(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
-            "codegen: struct literal — insert block has no parent function");
+        cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+            "codegen: struct literal — insert block has no parent function",
+            site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
         return;

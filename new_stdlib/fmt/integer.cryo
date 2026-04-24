@@ -1,11 +1,11 @@
-///! Decimal integer formatting and parsing.
+///! Decimal / hex / octal / binary integer formatting and parsing.
 ///!
 ///! The low-level itoa / atoi routines used by the `fmt::Display`
 ///! impls, by HTTP's Content-Length header, by socket_addr port
 ///! parsing, by IP octet parsing, and by anything else that needs
-///! a decimal integer. Any new caller for "print a u64 as decimal"
-///! or "parse a decimal string" should route through this module
-///! rather than re-implement the digit loop.
+///! a fixed-radix integer. Any new caller for "print an integer" or
+///! "parse a digit string" should route through this module rather
+///! than re-implement the digit loop.
 ///!
 ///! The write path targets a caller-owned byte buffer (no heap
 ///! allocation); `Formatter::write_u64` on top of it dispatches
@@ -14,6 +14,7 @@
 
 namespace std::fmt::integer;
 
+import core::intrinsics;
 import core::option;
 import collections::str;
 
@@ -24,29 +25,45 @@ const U64_MAX_DIGITS: u64 = 20;
 /// Largest signed decimal is 20 bytes (`-` + 19 digits for `i64::MIN`).
 const I64_MAX_DIGITS: u64 = 20;
 
+/// Largest hex representation of a `u64` is 16 nibbles.
+const U64_MAX_HEX_DIGITS: u64 = 16;
+
+/// Largest octal representation of a `u64` is 22 digits.
+const U64_MAX_OCT_DIGITS: u64 = 22;
+
+/// Largest binary representation of a `u64` is 64 bits.
+const U64_MAX_BIN_DIGITS: u64 = 64;
+
+// ============================================================================
+// Decimal
+// ============================================================================
+
 /// Write `value` in base 10 into `buffer`. Returns the number of
 /// bytes written. `buffer` must hold at least `U64_MAX_DIGITS` bytes.
+///
+/// Writes into the tail of a scratch array from the least-significant
+/// end, then copies the digit span to the caller's buffer in one shot.
+/// The extra array is 20 bytes on the stack; no heap traffic.
 function write_u64_decimal(buffer: u8*, value: u64) -> u64 {
     if (value == 0) {
         buffer[0] = 0x30;
         return 1;
     }
-    mut digits: u8[20];
-    mut i: u64 = 0;
+    mut scratch: u8[20];
+    mut cursor: u64 = 20;
     mut v: u64 = value;
     while (v > 0) {
-        digits[i] = ((v % 10) as u8) + 0x30;
+        cursor = cursor - 1;
+        scratch[cursor] = ((v % 10) as u8) + 0x30;
         v = v / 10;
-        i++;
     }
-    // Digits landed least-significant-first; reverse them into the
-    // caller's buffer.
-    mut out: u64 = 0;
-    while (out < i) {
-        buffer[out] = digits[i - 1 - out];
-        out = out + 1;
-    }
-    return i;
+    const digits: u64 = 20 - cursor;
+    intrinsics::memcpy(
+        buffer as void*,
+        (&scratch[0] + cursor) as void*,
+        digits
+    );
+    return digits;
 }
 
 /// Write signed `value` in base 10. Returns bytes written.
@@ -61,6 +78,124 @@ function write_i64_decimal(buffer: u8*, value: i64) -> u64 {
     }
     return write_u64_decimal(buffer, value as u64);
 }
+
+// ============================================================================
+// Hexadecimal
+// ============================================================================
+
+const HEX_LOWER: u8* = "0123456789abcdef" as u8*;
+const HEX_UPPER: u8* = "0123456789ABCDEF" as u8*;
+
+/// Write `value` as lowercase hex. Returns bytes written.
+/// `buffer` must hold at least `U64_MAX_HEX_DIGITS` bytes.
+function write_u64_hex(buffer: u8*, value: u64) -> u64 {
+    return write_u64_hex_case(buffer, value, HEX_LOWER);
+}
+
+/// Uppercase variant.
+function write_u64_hex_upper(buffer: u8*, value: u64) -> u64 {
+    return write_u64_hex_case(buffer, value, HEX_UPPER);
+}
+
+function write_u64_hex_case(buffer: u8*, value: u64, digits_table: u8*) -> u64 {
+    if (value == 0) {
+        buffer[0] = 0x30;
+        return 1;
+    }
+    mut scratch: u8[16];
+    mut cursor: u64 = 16;
+    mut v: u64 = value;
+    while (v > 0) {
+        cursor = cursor - 1;
+        scratch[cursor] = digits_table[v & 0xF];
+        v = v >> 4;
+    }
+    const digits: u64 = 16 - cursor;
+    intrinsics::memcpy(
+        buffer as void*,
+        (&scratch[0] + cursor) as void*,
+        digits
+    );
+    return digits;
+}
+
+/// Zero-padded fixed-width hex. Writes exactly `width` characters,
+/// truncating high nibbles if the value doesn't fit. Useful for
+/// pointer formatting (`width = 16`), hash dumps, and binary
+/// protocols.
+function write_u64_hex_padded(buffer: u8*, value: u64, width: u64) -> u64 {
+    return write_u64_hex_padded_case(buffer, value, width, HEX_LOWER);
+}
+
+function write_u64_hex_padded_upper(buffer: u8*, value: u64, width: u64) -> u64 {
+    return write_u64_hex_padded_case(buffer, value, width, HEX_UPPER);
+}
+
+function write_u64_hex_padded_case(buffer: u8*, value: u64, width: u64, digits_table: u8*) -> u64 {
+    if (width == 0) { return 0; }
+    mut v: u64 = value;
+    mut i: u64 = width;
+    while (i > 0) {
+        i = i - 1;
+        buffer[i] = digits_table[v & 0xF];
+        v = v >> 4;
+    }
+    return width;
+}
+
+// ============================================================================
+// Octal and binary
+// ============================================================================
+
+/// Write `value` in base 8. Returns bytes written.
+function write_u64_oct(buffer: u8*, value: u64) -> u64 {
+    if (value == 0) {
+        buffer[0] = 0x30;
+        return 1;
+    }
+    mut scratch: u8[22];
+    mut cursor: u64 = 22;
+    mut v: u64 = value;
+    while (v > 0) {
+        cursor = cursor - 1;
+        scratch[cursor] = ((v & 0x7) as u8) + 0x30;
+        v = v >> 3;
+    }
+    const digits: u64 = 22 - cursor;
+    intrinsics::memcpy(
+        buffer as void*,
+        (&scratch[0] + cursor) as void*,
+        digits
+    );
+    return digits;
+}
+
+/// Write `value` in base 2. Returns bytes written (1–64).
+function write_u64_bin(buffer: u8*, value: u64) -> u64 {
+    if (value == 0) {
+        buffer[0] = 0x30;
+        return 1;
+    }
+    mut scratch: u8[64];
+    mut cursor: u64 = 64;
+    mut v: u64 = value;
+    while (v > 0) {
+        cursor = cursor - 1;
+        scratch[cursor] = ((v & 0x1) as u8) + 0x30;
+        v = v >> 1;
+    }
+    const digits: u64 = 64 - cursor;
+    intrinsics::memcpy(
+        buffer as void*,
+        (&scratch[0] + cursor) as void*,
+        digits
+    );
+    return digits;
+}
+
+// ============================================================================
+// Parsing
+// ============================================================================
 
 /// Parse `source` as a decimal `u64`. Returns `None` on any
 /// non-digit byte, an empty input, or overflow. The caller gets
@@ -121,4 +256,34 @@ function parse_u8(source: Str) -> Option<u8> {
         }
         Option::None => { return Option::None; }
     }
+}
+
+/// Parse `source` as a hex `u64`. Accepts both cases. No `0x` prefix
+/// — the caller strips it before calling. Returns `None` on any
+/// non-hex byte, empty input, or overflow.
+function parse_u64_hex(source: Str) -> Option<u64> {
+    if (source.length() == 0) { return Option::None; }
+    if (source.length() > 16) { return Option::None; }
+    mut value: u64 = 0;
+    mut i: u64 = 0;
+    while (i < source.length()) {
+        match (source.byte_at(i)) {
+            Option::Some(byte) => {
+                mut digit: u64 = 0;
+                if (byte >= 0x30 && byte <= 0x39) {
+                    digit = (byte - 0x30) as u64;
+                } else if (byte >= 0x41 && byte <= 0x46) {
+                    digit = (byte - 0x41 + 10) as u64;
+                } else if (byte >= 0x61 && byte <= 0x66) {
+                    digit = (byte - 0x61 + 10) as u64;
+                } else {
+                    return Option::None;
+                }
+                value = (value << 4) | digit;
+            }
+            Option::None => { return Option::None; }
+        }
+        i++;
+    }
+    return Option::Some(value);
 }

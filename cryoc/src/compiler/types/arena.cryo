@@ -68,6 +68,14 @@ type struct TypeArena {
     optional_cache:  HashMap<string, TypeRef>;
     function_cache:  HashMap<string, TypeRef>;
     tuple_cache:     HashMap<string, TypeRef>;
+    /// InstantiatedType cache key: "baseId<arg0Id,arg1Id,...>" — mirrors
+    /// GenericRegistry.cache_index so that the substituter's direct calls
+    /// (apply_instantiation in substitution.cryo) share the same arena
+    /// slot as the registry-driven instantiations.  Without this, sema
+    /// creates a fresh unresolved InstantiatedType every time a generic
+    /// annotation is substituted inside a specialized template body, and
+    /// codegen's scope-call fallback walks `resolved_type` into a dead end.
+    instantiated_cache: HashMap<string, TypeRef>;
 
     // -- User-defined type caches (SymbolStr.id → TypeRef) --
     struct_cache: HashMap<u32, TypeRef>;
@@ -127,6 +135,7 @@ type struct TypeArena {
             optional_cache:      HashMap<string, TypeRef>::new(),
             function_cache:      HashMap<string, TypeRef>::new(),
             tuple_cache:         HashMap<string, TypeRef>::new(),
+            instantiated_cache:  HashMap<string, TypeRef>::new(),
             struct_cache:        HashMap<u32, TypeRef>::new(),
             class_cache:         HashMap<u32, TypeRef>::new(),
             enum_cache:          HashMap<u32, TypeRef>::new(),
@@ -451,9 +460,74 @@ type struct TypeArena {
         return ref;
     }
 
-    /// Create a generic type instantiation.
+    /// Create a generic type instantiation.  Deduplicates by
+    /// (generic_base, type_args) so that the same (base, args) tuple
+    /// always returns the same arena slot, regardless of whether the
+    /// caller is GenericRegistry.instantiate (which has its own cache)
+    /// or the substituter's apply_instantiation (which creates
+    /// InstantiatedTypes directly during template body rewrites).
+    /// Sharing the arena slot means `set_resolved_type` done by the
+    /// monomorphizer for one caller automatically satisfies the other.
     create_instantiation(mut &this, base: TypeRef, args: TypeRef[]) -> TypeRef {
-        return this.alloc_type(new InstantiatedType(this.next_id, base, args));
+        mut key: string = format("%llu<", base.id);
+        for (mut i: i64 = 0; i < args.length; i++) {
+            if (i > 0) {
+                key = format("%s,%llu", key, args[i].id);
+            } else {
+                key = format("%s%llu", key, args[i].id);
+            }
+        }
+        key = format("%s>", key);
+        const h: u64 = hash_str(key);
+
+        const cached: Option<TypeRef> = this.instantiated_cache.get(key, h);
+        if (cached.is_some()) {
+            return cached.unwrap();
+        }
+
+        const ref: TypeRef = this.alloc_type(new InstantiatedType(this.next_id, base, args));
+        this.instantiated_cache.insert(key, ref, h);
+        return ref;
+    }
+
+    /// After the monomorphizer finalizes a specialization, every other
+    /// InstantiatedType in the arena that shares the same (generic_base,
+    /// type_args) should point at the same concrete resolved type so that
+    /// codegen walks `resolved_type` into a real struct/enum/class instead of
+    /// bottoming out on an unresolved placeholder.
+    ///
+    /// `create_instantiation` does NOT dedupe (the bootstrap HashMap<string,V>
+    /// pointer-compare bug would make a format()-keyed cache useless), so
+    /// sema creates a fresh InstantiatedType at every call site.  Without
+    /// propagation, only the single InstantiatedType handed to the
+    /// monomorphizer via `request.generic_type` gets its resolved_type set;
+    /// every other textual occurrence of `HashMap<string, u32>` stays
+    /// unresolved and breaks `fallback 2` in codegen scope-call resolution.
+    propagate_instantiated_resolution(mut &this, base: TypeRef,
+                                       type_args: TypeRef[],
+                                       resolved: TypeRef) -> i64 {
+        mut count: i64 = 0;
+        for (mut i: i64 = 0; i < this.types.length; i++) {
+            const t: Type* = this.types[i];
+            if (t == null) { continue; }
+            if (t.kind != TypeKind::InstantiatedType) { continue; }
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) { continue; }
+            if (inst.generic_base.id != base.id) { continue; }
+            if (inst.type_args.length != type_args.length) { continue; }
+            mut matches: boolean = true;
+            for (mut j: i64 = 0; j < type_args.length; j++) {
+                if (inst.type_args[j].id != type_args[j].id) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                inst.set_resolved_type(resolved);
+                count = count + 1;
+            }
+        }
+        return count;
     }
 
     /// Create an error type for type resolution failures.

@@ -1,0 +1,443 @@
+///! Buffered readers and writers.
+///!
+///! `Stdout`, `File`, and `TcpStream` go through a syscall on every
+///! `write` call, which is expensive when callers emit bytes in small
+///! increments (every digit of an integer, every field of a struct).
+///! Wrapping the sink in a `BufWriter` coalesces those writes into
+///! one syscall per buffer-full.
+///!
+///! These types borrow the inner reader/writer via pointer — the
+///! caller retains ownership of the underlying sink and is responsible
+///! for eventually dropping it. Wrapping and unwrapping is free.
+///!
+///! Ownership protocol: every type in this module exposes
+///! `drop(mut &this)` that releases the heap buffer. `BufWriter::drop`
+///! also flushes any pending bytes; call it before the wrapped sink
+///! goes away, or buffered writes are lost.
+
+namespace std::io::buf;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import core::ptr;
+import alloc::layout;
+import alloc::allocator;
+import collections::str;
+import collections::string;
+import io::error;
+import io::traits;
+
+/// Default buffer size. Matches stdio's block-buffered default on
+/// most Unixes. Large enough that a typical line of output fits in
+/// one flush; small enough that many concurrent BufWriters don't eat
+/// the heap.
+const DEFAULT_BUFFER_SIZE: u64 = 8192;
+
+/// ASCII line feed. `LineWriter` flushes after any chunk that
+/// contains this byte.
+const BYTE_LF: u8 = 0x0A;
+
+// ============================================================================
+// BufWriter<W>
+// ============================================================================
+
+/// Coalesces writes destined for `W` into larger flushes. The inner
+/// writer is borrowed via pointer — the caller owns it and drops it.
+type struct BufWriter<W> {
+    writer: W*;
+    buffer: u8*;
+    capacity: u64;
+    length: u64;
+
+    /// Wrap `writer` with a `DEFAULT_BUFFER_SIZE`-byte buffer. Panics
+    /// on allocation failure.
+    ///
+    /// The `W: Write` bound lives on construction — instance methods
+    /// don't restate it since no `BufWriter<W>` can exist without
+    /// having gone through here first.
+    static new(writer: W*) -> BufWriter<W>
+    where W: Write {
+        return BufWriter::with_capacity(writer, DEFAULT_BUFFER_SIZE);
+    }
+
+    /// Wrap with an explicit buffer size. `capacity == 0` is permitted
+    /// but degenerate — every write hits the sink directly. Panics on
+    /// allocation failure.
+    static with_capacity(writer: W*, capacity: u64) -> BufWriter<W>
+    where W: Write {
+        mut buffer: u8* = null;
+        if (capacity > 0) {
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            match (alloc.allocate(Layout::array<u8>(capacity))) {
+                Result::Ok(raw) => { buffer = raw.as_ptr(); }
+                Result::Err(_) => {
+                    intrinsics::panic("BufWriter::with_capacity: allocation failed", FILE, LINE);
+                }
+            }
+        }
+        return BufWriter<W> {
+            writer: writer,
+            buffer: buffer,
+            capacity: capacity,
+            length: 0
+        };
+    }
+
+    /// Borrow the inner writer. Useful for operations that bypass
+    /// buffering (e.g., a direct `flush` on the underlying fd).
+    /// Callers mutating through this must call `BufWriter::flush`
+    /// first, or buffered bytes will land out of order.
+    get_ref(&this) -> W* {
+        return this.writer;
+    }
+
+    /// Number of bytes currently buffered but not yet flushed.
+    buffered(&this) -> u64 {
+        return this.length;
+    }
+
+    capacity(&this) -> u64 {
+        return this.capacity;
+    }
+
+    /// Discard buffered bytes without writing them. Useful on error
+    /// paths where the caller knows the output is garbage.
+    clear(mut &this) -> void {
+        this.length = 0;
+    }
+
+    /// Write buffered bytes to the sink and reset. Retries are
+    /// delegated to the sink's `write_all`.
+    flush_buffer(mut &this) -> Result<(), IoError> {
+        if (this.length == 0) {
+            return Result::Ok(());
+        }
+        const bytes: Slice<u8> = Slice::from_raw(this.buffer, this.length);
+        match (this.writer.write_all(bytes)) {
+            Result::Ok(_) => {
+                this.length = 0;
+                return Result::Ok(());
+            }
+            Result::Err(err) => {
+                // Leave `length` intact — a follow-up retry still has
+                // the bytes. Callers that want to give up call `clear`.
+                return Result::Err(err);
+            }
+        }
+    }
+
+    /// Release the buffer. Flushes first so no bytes are dropped
+    /// silently. The inner writer is **not** closed — the caller owns
+    /// and drops it.
+    drop(mut &this) -> void {
+        match (this.flush_buffer()) {
+            Result::Ok(_) => { }
+            Result::Err(_) => { }
+        }
+        if (this.buffer != null) {
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            alloc.deallocate(
+                NonNull::new(this.buffer),
+                Layout::array<u8>(this.capacity)
+            );
+            this.buffer = null;
+            this.capacity = 0;
+            this.length = 0;
+        }
+    }
+}
+
+implement<W> trait Write for struct BufWriter<W>
+where W: Write {
+    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+        const incoming: u64 = bytes.length();
+        // Buffer would overflow — flush what we have.
+        if (this.length + incoming > this.capacity) {
+            match (this.flush_buffer()) {
+                Result::Ok(_) => { }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+        // After flushing, if the incoming chunk is itself larger than
+        // the buffer there's no point double-copying — send straight
+        // to the sink.
+        if (incoming >= this.capacity) {
+            return this.writer.write(bytes);
+        }
+        intrinsics::memcpy(
+            (this.buffer + this.length) as void*,
+            bytes.as_ptr() as void*,
+            incoming
+        );
+        this.length = this.length + incoming;
+        return Result::Ok(incoming);
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        match (this.flush_buffer()) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        return this.writer.flush();
+    }
+}
+
+// ============================================================================
+// LineWriter<W>
+// ============================================================================
+
+/// A `BufWriter` that flushes after any write containing a `\n`.
+/// Appropriate for interactive stdout on a TTY, where "the user saw
+/// the line as soon as it was emitted" matters more than coalescing.
+///
+/// Internally a thin layer over `BufWriter` — holds one, delegates
+/// to it. Caller drops this; the inner `BufWriter::drop` (driven by
+/// our `drop`) flushes the remainder.
+type struct LineWriter<W> {
+    inner: BufWriter<W>;
+
+    static new(writer: W*) -> LineWriter<W>
+    where W: Write {
+        return LineWriter::with_capacity(writer, DEFAULT_BUFFER_SIZE);
+    }
+
+    static with_capacity(writer: W*, capacity: u64) -> LineWriter<W>
+    where W: Write {
+        return LineWriter<W> {
+            inner: BufWriter::with_capacity(writer, capacity)
+        };
+    }
+
+    get_ref(&this) -> W* {
+        return this.inner.get_ref();
+    }
+
+    drop(mut &this) -> void {
+        this.inner.drop();
+    }
+}
+
+implement<W> trait Write for struct LineWriter<W>
+where W: Write {
+    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+        // Find the last newline in the incoming chunk. Everything up
+        // to and including that newline is flushed immediately; the
+        // tail goes through the normal buffer path. This gives the
+        // "lines appear as they are completed" behaviour without
+        // paying a flush per byte.
+        mut last_nl: i64 = -1;
+        mut i: u64 = 0;
+        while (i < bytes.length()) {
+            match (bytes.get(i)) {
+                Option::Some(byte) => {
+                    if (byte == BYTE_LF) {
+                        last_nl = i as i64;
+                    }
+                }
+                Option::None => { break; }
+            }
+            i++;
+        }
+
+        if (last_nl < 0) {
+            return this.inner.write(bytes);
+        }
+
+        const head_len: u64 = (last_nl as u64) + 1;
+        const head: Slice<u8> = bytes.subslice(0, head_len);
+        match (this.inner.write(head)) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        match (this.inner.flush_buffer()) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        if (head_len == bytes.length()) {
+            return Result::Ok(head_len);
+        }
+        const tail: Slice<u8> = bytes.subslice(head_len, bytes.length());
+        match (this.inner.write(tail)) {
+            Result::Ok(n) => { return Result::Ok(head_len + n); }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        return this.inner.flush();
+    }
+}
+
+// ============================================================================
+// BufReader<R>
+// ============================================================================
+
+/// Pulls from `R` in buffer-sized chunks and serves reads from the
+/// buffer. Transforms a stream of small reads into a few large ones
+/// and makes `read_line` fast: no per-byte syscall.
+///
+/// Borrows the inner reader via pointer. Caller owns it.
+type struct BufReader<R> {
+    reader: R*;
+    buffer: u8*;
+    capacity: u64;
+    /// First unread byte in the buffer.
+    position: u64;
+    /// One past the last filled byte.
+    filled: u64;
+
+    static new(reader: R*) -> BufReader<R>
+    where R: Read {
+        return BufReader::with_capacity(reader, DEFAULT_BUFFER_SIZE);
+    }
+
+    static with_capacity(reader: R*, capacity: u64) -> BufReader<R>
+    where R: Read {
+        if (capacity == 0) {
+            intrinsics::panic("BufReader::with_capacity: capacity must be > 0", FILE, LINE);
+        }
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut buffer: u8* = null;
+        match (alloc.allocate(Layout::array<u8>(capacity))) {
+            Result::Ok(raw) => { buffer = raw.as_ptr(); }
+            Result::Err(_) => {
+                intrinsics::panic("BufReader::with_capacity: allocation failed", FILE, LINE);
+            }
+        }
+        return BufReader<R> {
+            reader: reader,
+            buffer: buffer,
+            capacity: capacity,
+            position: 0,
+            filled: 0
+        };
+    }
+
+    get_ref(&this) -> R* {
+        return this.reader;
+    }
+
+    capacity(&this) -> u64 {
+        return this.capacity;
+    }
+
+    /// Bytes currently buffered and unread.
+    available(&this) -> u64 {
+        return this.filled - this.position;
+    }
+
+    /// Advance the buffer cursor past `amount` bytes. `amount` must
+    /// not exceed `available()`; a larger value is a caller bug.
+    consume(mut &this, amount: u64) -> void {
+        if (amount > this.filled - this.position) {
+            intrinsics::panic("BufReader::consume: overran filled region", FILE, LINE);
+        }
+        this.position = this.position + amount;
+    }
+
+    /// Fill the buffer from the source if empty, then surface the
+    /// filled region. Returns an empty slice at EOF. Paired with
+    /// `consume` for zero-copy parsing — read a prefix, decide how
+    /// many bytes are actually wanted, consume that many.
+    fill_buf(mut &this) -> Result<Slice<u8>, IoError> {
+        if (this.position >= this.filled) {
+            match (this.reader.read(this.buffer, this.capacity)) {
+                Result::Ok(n) => {
+                    this.position = 0;
+                    this.filled = n;
+                }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+        return Result::Ok(Slice::from_raw(
+            this.buffer + this.position,
+            this.filled - this.position
+        ));
+    }
+
+    drop(mut &this) -> void {
+        if (this.buffer != null) {
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            alloc.deallocate(
+                NonNull::new(this.buffer),
+                Layout::array<u8>(this.capacity)
+            );
+            this.buffer = null;
+            this.capacity = 0;
+            this.position = 0;
+            this.filled = 0;
+        }
+    }
+}
+
+implement<R> trait Read for struct BufReader<R>
+where R: Read {
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        // Buffer empty and caller wants more than we'd hold anyway —
+        // bypass the buffer to avoid the copy.
+        if (this.position >= this.filled && length >= this.capacity) {
+            return this.reader.read(buffer, length);
+        }
+        match (this.fill_buf()) {
+            Result::Ok(filled) => {
+                mut n: u64 = filled.length();
+                if (n > length) { n = length; }
+                if (n > 0) {
+                    intrinsics::memcpy(
+                        buffer as void*,
+                        filled.as_ptr() as void*,
+                        n
+                    );
+                    this.consume(n);
+                }
+                return Result::Ok(n);
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    /// Override the trait default — line-reading is the whole point
+    /// of `BufReader`, so we do it the fast way: scan the filled
+    /// region for `\n`, copy the prefix wholesale, consume, refill
+    /// only if we didn't hit the newline.
+    read_line(mut &this, out: mut &String) -> Result<u64, IoError> {
+        const start: u64 = out.length();
+        loop {
+            match (this.fill_buf()) {
+                Result::Ok(filled) => {
+                    if (filled.is_empty()) {
+                        return Result::Ok(out.length() - start);
+                    }
+                    mut scan: u64 = 0;
+                    mut hit_nl: boolean = false;
+                    while (scan < filled.length()) {
+                        match (filled.get(scan)) {
+                            Option::Some(byte) => {
+                                scan++;
+                                if (byte == BYTE_LF) {
+                                    hit_nl = true;
+                                    break;
+                                }
+                            }
+                            Option::None => { break; }
+                        }
+                    }
+                    const prefix: Slice<u8> = filled.subslice(0, scan);
+                    match (out.try_push_str(Str::from_bytes(prefix))) {
+                        Result::Ok(_) => { }
+                        Result::Err(_) => {
+                            return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+                        }
+                    }
+                    this.consume(scan);
+                    if (hit_nl) {
+                        return Result::Ok(out.length() - start);
+                    }
+                }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+    }
+}

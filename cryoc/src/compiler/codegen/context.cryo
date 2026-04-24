@@ -11,6 +11,10 @@ import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
 import Compiler::CompilationContext;
 import Compiler::DeclIndex;
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::Diag::Sink;
 import Compiler::Types;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Type;
@@ -171,6 +175,36 @@ type struct CodegenContext {
         const c: CompilationContext* = this.ctx;
         const a: TypeArena* = c.type_arena;
         return a.lookup(id);
+    }
+
+    // ========================================================================
+    // Diagnostic helpers (codegen-local shorthand)
+    // ========================================================================
+
+    /// Emit an error with a source span. Shorthand for
+    /// `this.ctx.emit_error_at(code, msg, span)`; prefer this over
+    /// `ctx.emit_error` whenever the triggering AST node is in scope — the
+    /// span gives the renderer a file:line arrow and source snippet.
+    emit_error_at_span(&this, code: ErrorCode, message: string, span: SourceSpan) -> void {
+        this.ctx.emit_error_at(code, message, span);
+    }
+
+    /// Emit a warning with a source span.
+    emit_warning_at_span(&this, code: ErrorCode, message: string, span: SourceSpan) -> void {
+        mut diag: Diagnostic = Diagnostic::warning(code, message);
+        diag = diag.at(span);
+        this.emit_diagnostic(diag);
+    }
+
+    /// Emit a pre-built Diagnostic.  Use this when you need the builder
+    /// API (secondary labels, notes, suggestions) that the `_at_span`
+    /// helpers don't expose.  Breaks the chained access through
+    /// `this.ctx.diagnostics` via intermediate locals, which the C++
+    /// compiler's type resolver can't handle inline.
+    emit_diagnostic(&this, diag: Diagnostic) -> void {
+        const c: CompilationContext* = this.ctx;
+        const sink: DiagnosticSink* = c.diagnostics;
+        sink.emit(diag);
     }
 
     /// Strip all basic blocks from a function, reverting it to a declare.
@@ -415,11 +449,9 @@ type struct CodegenContext {
     /// promotion by LLVM's optimization passes.
     create_entry_alloca(mut &this, func: LValue, name: string, ty: LType) -> LValue {
         if (!func.is_valid()) {
-            printf("[IRGen] WARNING: create_entry_alloca — function is null for '%s'\n", name); fflush(null);
             return LValue::null();
         }
         if (!ty.is_valid()) {
-            printf("[IRGen] WARNING: create_entry_alloca — type is null for '%s'\n", name); fflush(null);
             return LValue::null();
         }
 
@@ -427,7 +459,6 @@ type struct CodegenContext {
         // Use LLVMGetTypeKind (returns 0 for VoidTypeKind) instead of pointer
         // comparison, because the C++ compiler's == on void* uses strcmp.
         if (llvm::LLVMGetTypeKind(ty.raw) == 0) {
-            printf("[IRGen] WARNING: create_entry_alloca — cannot alloca void type for '%s'\n", name); fflush(null);
             return LValue::null();
         }
 
@@ -437,7 +468,6 @@ type struct CodegenContext {
         // Position at the start of the entry block.
         const entry: LBasicBlock = LBasicBlock { raw: llvm::LLVMGetEntryBasicBlock(func.raw) };
         if (!entry.is_valid()) {
-            printf("[IRGen] WARNING: create_entry_alloca — entry block is null for '%s'\n", name); fflush(null);
             return LValue::null();
         }
         // If the entry block already has a terminator (e.g., the function
