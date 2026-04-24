@@ -175,8 +175,12 @@ type struct Monomorphizer {
             const key: string = this.make_key(request);
 
             // Already cached — mark in mono_set so collect_unmonomorphized()
-            // won't return it again on the next module.
+            // won't return it again on the next module.  Propagate the
+            // cached concrete type to this module's fresh InstantiatedType
+            // (sema creates a new one per call site, and the cache hit
+            // bypasses the set_resolved_type path in specialize_with_entry).
             if (this.is_cached(key)) {
+                this.propagate_cached_resolution(key, request);
                 this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
                 continue;
             }
@@ -235,6 +239,7 @@ type struct Monomorphizer {
                 this.pending_cursor = this.pending_cursor + 1;
                 const rkey: string = this.make_key(req);
                 if (this.is_cached(rkey)) {
+                    this.propagate_cached_resolution(rkey, req);
                     this.generic_registry.mark_monomorphized(req.base_type, req.type_args);
                     continue;
                 }
@@ -423,6 +428,13 @@ type struct Monomorphizer {
                 const inst: InstantiatedType* = inst_t as InstantiatedType*;
                 inst.set_resolved_type(concrete_type);
             }
+            // Sema can create an InstantiatedType for a generic before the
+            // monomorphizer hands its own `request.generic_type` to this
+            // path, and the arena cache keeps them as one slot — but on
+            // rare substituter-driven paths multiple slots still exist, so
+            // propagate to any others with the same (base, args).
+            this.arena.propagate_instantiated_resolution(
+                request.base_type, request.type_args, concrete_type);
         } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
             // Function templates don't create named arena types (no struct/enum),
             // but we still create a concrete FunctionType from the resolved
@@ -436,6 +448,8 @@ type struct Monomorphizer {
                     const inst: InstantiatedType* = inst_t as InstantiatedType*;
                     inst.set_resolved_type(func_type);
                 }
+                this.arena.propagate_instantiated_resolution(
+                    request.base_type, request.type_args, func_type);
             }
         }
 
@@ -470,8 +484,8 @@ type struct Monomorphizer {
             instantiated_type: request.generic_type,
         };
         const idx: i64 = this.spec_entries.length;
-        this.spec_keys    = this.spec_keys + [key];
-        this.spec_entries = this.spec_entries + [spec_entry];
+        this.spec_keys.push(key);
+        this.spec_entries.push(spec_entry);
         const cache_h: u64 = hash_str(key);
         this.spec_index.insert(key, idx, cache_h);
 
@@ -1173,7 +1187,7 @@ type struct Monomorphizer {
             base_type:    inst.generic_base,
             span:         SourceSpan::none(),
         };
-        this.pending = this.pending + [request];
+        this.pending.push(request);
     }
 
     /// Build a cache key from a request.
@@ -1187,6 +1201,26 @@ type struct Monomorphizer {
     is_cached(&this, key: string) -> boolean {
         const h: u64 = hash_str(key);
         return this.spec_index.get(key, h).is_some();
+    }
+
+    /// Link a cache-hit request's InstantiatedType(s) to the previously
+    /// computed concrete type.  Sema creates a fresh InstantiatedType per
+    /// call site, so when a later module revisits an already-specialized
+    /// pair (base, args) the new placeholder stays unresolved unless we
+    /// explicitly propagate.  Codegen's scope-call fallback walks
+    /// `resolved_type` to reach the concrete struct name, so without this
+    /// link it emits E0147 for calls like `HashMap<string, u32>::new()`
+    /// in any module that isn't the first to specialize the pair.
+    propagate_cached_resolution(mut &this, key: string, request: MonomorphRequest) -> void {
+        const h: u64 = hash_str(key);
+        const idx_opt: Option<i64> = this.spec_index.get(key, h);
+        if (!idx_opt.is_some()) { return; }
+        const idx: i64 = idx_opt.unwrap();
+        if (idx < 0 || idx >= this.spec_entries.length) { return; }
+        const entry: SpecializationEntry = this.spec_entries[idx];
+        if (!entry.specialized_type.is_valid()) { return; }
+        this.arena.propagate_instantiated_resolution(
+            request.base_type, request.type_args, entry.specialized_type);
     }
 
     /// Check if a key is currently being processed (cycle detection).

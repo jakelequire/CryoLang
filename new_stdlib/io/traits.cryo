@@ -5,14 +5,31 @@
 ///! `read` / `write` is the number actually transferred: fewer than
 ///! requested is normal (a partial read at EOF, a partial write due
 ///! to a full pipe). Callers that need an all-or-nothing transfer
-///! use `write_all`, which loops internally.
+///! use `write_all` / `read_exact`, which loop internally.
+///!
+///! The default methods here (`read_all`, `read_exact`, `read_line`,
+///! `read_to_end`, `write_all`) are written once against the required
+///! `read` / `write` so every sink or source inherits them for free.
 
 namespace std::io::traits;
 
+import core::intrinsics;
 import core::option;
 import core::result;
 import core::slice;
 import io::error;
+import collections::str;
+import collections::string;
+import collections::array;
+import alloc::allocator;
+
+/// Initial capacity bump for `read_to_end` when the caller hasn't
+/// pre-reserved. Large enough that a one-call read from a small file
+/// doesn't grow; small enough that tiny reads don't over-commit.
+const READ_TO_END_CHUNK: u64 = 4096;
+
+/// ASCII line feed. Terminator for `read_line`.
+const BYTE_LF: u8 = 0x0A;
 
 type trait Read {
     /// Fill up to `length` bytes starting at `buffer`. Returns the
@@ -24,6 +41,7 @@ type trait Read {
 
     /// Read until the buffer is full or the source returns 0 (EOF).
     /// Returns the total bytes read; short returns mean EOF reached.
+    /// Retries on `Interrupted`.
     read_all(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
         mut total: u64 = 0;
         while (total < length) {
@@ -41,6 +59,89 @@ type trait Read {
             }
         }
         return Result::Ok(total);
+    }
+
+    /// Read exactly `length` bytes. A short read at EOF is a failure,
+    /// reported as `UnexpectedEof`. Use this when the caller knows the
+    /// precise number of bytes that must be present.
+    read_exact(mut &this, buffer: u8*, length: u64) -> Result<(), IoError> {
+        match (this.read_all(buffer, length)) {
+            Result::Ok(n) => {
+                if (n < length) {
+                    return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
+                }
+                return Result::Ok(());
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    /// Read every remaining byte into `out`, growing the array as
+    /// needed. Returns the number of bytes appended. EOF terminates
+    /// the loop; other errors abort and surface.
+    ///
+    /// Unbounded — a pathological source (e.g., `/dev/zero`) will
+    /// exhaust memory. Callers that need a ceiling wrap the source in
+    /// a limiting adapter or cap `out.capacity()` before calling.
+    read_to_end(mut &this, out: mut &Array<u8>) -> Result<u64, IoError> {
+        const start: u64 = out.length();
+        mut scratch: u8[READ_TO_END_CHUNK];
+        loop {
+            match (this.read(&scratch[0], READ_TO_END_CHUNK)) {
+                Result::Ok(n) => {
+                    if (n == 0) {
+                        return Result::Ok(out.length() - start);
+                    }
+                    match (out.try_push_slice(Slice::from_raw(&scratch[0], n))) {
+                        Result::Ok(_) => { }
+                        Result::Err(_) => {
+                            return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+                        }
+                    }
+                }
+                Result::Err(err) => {
+                    match (err.kind) {
+                        IoErrorKind::Interrupted => { }
+                        _ => { return Result::Err(err); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read bytes into `out` until a `\n` or EOF. The newline byte is
+    /// included in `out`. Returns the number of bytes appended (0 only
+    /// if the very first read hit EOF).
+    ///
+    /// **Byte-level**, not UTF-8-aware: the loop runs `read(..., 1)` so
+    /// the boundary check is precise. Sources that are expensive to
+    /// byte-read (sockets, files) should be wrapped in `BufReader`
+    /// from `io::buf` — its `read_line` override is the fast path.
+    read_line(mut &this, out: mut &String) -> Result<u64, IoError> {
+        const start: u64 = out.length();
+        mut byte: u8 = 0;
+        loop {
+            match (this.read(&byte, 1)) {
+                Result::Ok(n) => {
+                    if (n == 0) { return Result::Ok(out.length() - start); }
+                    match (out.try_push_byte(byte)) {
+                        Result::Ok(_) => { }
+                        Result::Err(_) => {
+                            return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+                        }
+                    }
+                    if (byte == BYTE_LF) {
+                        return Result::Ok(out.length() - start);
+                    }
+                }
+                Result::Err(err) => {
+                    match (err.kind) {
+                        IoErrorKind::Interrupted => { }
+                        _ => { return Result::Err(err); }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -1,0 +1,207 @@
+///! Floating-point formatting.
+///!
+///! Values in the "normal" magnitude range are written as fixed-point
+///! decimal with six fractional digits. Anything beyond
+///! |v| >= 1e16 or 0 < |v| < 1e-4 falls back to scientific notation
+///! so no precision vanishes into a giant zero-prefix or trailing-zero
+///! string.
+///!
+///! This is a first-cut formatter — correct for human-readable output
+///! but **not round-trippable**. A round-trip `f64 -> str -> f64` needs
+///! a Grisu or Ryu implementation; that's a follow-up.
+///!
+///! NaN / ±Infinity / ±0 are all handled explicitly. Negative zero
+///! prints as `-0` so the sign isn't lost.
+
+namespace std::fmt::float;
+
+import core::intrinsics;
+import core::slice;
+import fmt::integer;
+
+/// Default fractional digits for fixed-point output.
+const DEFAULT_DECIMALS: u64 = 6;
+
+/// Above this magnitude, switch to scientific.
+const LARGE_THRESHOLD: f64 = 1.0e16;
+
+/// Below this magnitude (and nonzero), switch to scientific.
+const SMALL_THRESHOLD: f64 = 1.0e-4;
+
+/// Largest buffer any of the writers below will ever touch. A
+/// scientific-notation f64 with 6 fractional digits and a 4-digit
+/// exponent fits well inside this. Callers who stack-allocate pick
+/// this size.
+const F64_MAX_DIGITS: u64 = 32;
+
+extern "C" {
+    function fabs(value: f64) -> f64;
+    function floor(value: f64) -> f64;
+    function log10(value: f64) -> f64;
+    function pow(base: f64, exponent: f64) -> f64;
+    function __isnan(value: f64) -> i32;
+    function __isinf(value: f64) -> i32;
+}
+
+// ============================================================================
+// Public entry points
+// ============================================================================
+
+/// Write `value` into `buffer`. Returns bytes written. `buffer` must
+/// hold at least `F64_MAX_DIGITS` bytes.
+function write_f64(buffer: u8*, value: f64) -> u64 {
+    return write_f64_with(buffer, value, DEFAULT_DECIMALS);
+}
+
+/// Variant with caller-chosen precision. `decimals` applies to the
+/// fixed-point form and to the mantissa of the scientific form.
+function write_f64_with(buffer: u8*, value: f64, decimals: u64) -> u64 {
+    if (__isnan(value) != 0) {
+        return write_literal(buffer, "NaN" as u8*, 3);
+    }
+    if (__isinf(value) != 0) {
+        if (value < 0.0) {
+            return write_literal(buffer, "-inf" as u8*, 4);
+        }
+        return write_literal(buffer, "inf" as u8*, 3);
+    }
+
+    mut cursor: u64 = 0;
+    mut absolute: f64 = value;
+    if (value < 0.0 || is_negative_zero(value)) {
+        buffer[cursor] = 0x2D; // '-'
+        cursor = cursor + 1;
+        absolute = fabs(value);
+    }
+
+    if (absolute == 0.0) {
+        buffer[cursor] = 0x30; // '0'
+        return cursor + 1;
+    }
+
+    if (absolute >= LARGE_THRESHOLD || absolute < SMALL_THRESHOLD) {
+        return cursor + write_scientific(buffer + cursor, absolute, decimals);
+    }
+    return cursor + write_fixed(buffer + cursor, absolute, decimals);
+}
+
+// ============================================================================
+// Implementation
+// ============================================================================
+
+function write_literal(buffer: u8*, literal: u8*, length: u64) -> u64 {
+    intrinsics::memcpy(buffer as void*, literal as void*, length);
+    return length;
+}
+
+/// IEEE 754: `-0.0` has bit pattern 0x8000_0000_0000_0000. The cheap
+/// check is `1.0 / v == -Infinity`, but we'd rather not divide; the
+/// direct comparison relies on `value == 0.0` being true for both
+/// ±0 while the sign bit still drives the output branch.
+function is_negative_zero(value: f64) -> boolean {
+    if (value != 0.0) { return false; }
+    // `1.0 / 0.0` is +Infinity, `1.0 / -0.0` is -Infinity.
+    return (1.0 / value) < 0.0;
+}
+
+/// Fixed-point: integer part, `.`, zero-padded fraction. Assumes
+/// `value >= 0` and is within LARGE/SMALL thresholds — caller has
+/// routed NaN/Inf/zero/scientific cases already.
+function write_fixed(buffer: u8*, value: f64, decimals: u64) -> u64 {
+    const integer_part: u64 = value as u64;
+    mut cursor: u64 = integer::write_u64_decimal(buffer, integer_part);
+
+    if (decimals == 0) { return cursor; }
+
+    buffer[cursor] = 0x2E; // '.'
+    cursor = cursor + 1;
+
+    const scale: f64 = pow_of_ten(decimals);
+    // Truncate the fractional part at the requested precision.
+    // Round-toward-zero matches `value as u64` on the integer side
+    // for consistency — a half-up bias here would make the integer
+    // and fraction halves use different rounding modes.
+    const frac_scaled: u64 = ((value - (integer_part as f64)) * scale) as u64;
+    cursor = cursor + write_u64_decimal_padded(buffer + cursor, frac_scaled, decimals);
+    return cursor;
+}
+
+/// Zero-padded fixed-width decimal. Writes exactly `width` digits,
+/// truncating the high end if the value doesn't fit. Used for the
+/// fractional piece of a float where we know the digit count ahead
+/// of time.
+function write_u64_decimal_padded(buffer: u8*, value: u64, width: u64) -> u64 {
+    if (width == 0) { return 0; }
+    mut v: u64 = value;
+    mut i: u64 = width;
+    while (i > 0) {
+        i = i - 1;
+        buffer[i] = ((v % 10) as u8) + 0x30;
+        v = v / 10;
+    }
+    return width;
+}
+
+/// Scientific: `<mantissa>e<sign><exponent>`. Assumes `value > 0`.
+function write_scientific(buffer: u8*, value: f64, decimals: u64) -> u64 {
+    const exponent: i64 = log10(value) as i64;
+    // `log10` rounds toward nearest, not toward zero; if the floor
+    // landed one step high we end up with mantissa < 1. Correct by
+    // walking the exponent down.
+    mut e: i64 = exponent;
+    mut mantissa: f64 = value / pow_of_ten_signed(e);
+    if (mantissa < 1.0) {
+        e = e - 1;
+        mantissa = value / pow_of_ten_signed(e);
+    } else if (mantissa >= 10.0) {
+        e = e + 1;
+        mantissa = value / pow_of_ten_signed(e);
+    }
+
+    mut cursor: u64 = write_fixed(buffer, mantissa, decimals);
+    buffer[cursor] = 0x65; // 'e'
+    cursor = cursor + 1;
+
+    mut exp_magnitude: u64 = 0;
+    if (e < 0) {
+        buffer[cursor] = 0x2D; // '-'
+        cursor = cursor + 1;
+        exp_magnitude = (0 - e) as u64;
+    } else {
+        buffer[cursor] = 0x2B; // '+'
+        cursor = cursor + 1;
+        exp_magnitude = e as u64;
+    }
+    cursor = cursor + integer::write_u64_decimal(buffer + cursor, exp_magnitude);
+    return cursor;
+}
+
+/// 10^n for small non-negative `n`. Table lookup beats calling
+/// `pow` for every formatter invocation.
+function pow_of_ten(n: u64) -> f64 {
+    return match (n) {
+        0  => { 1.0 }
+        1  => { 10.0 }
+        2  => { 100.0 }
+        3  => { 1000.0 }
+        4  => { 10000.0 }
+        5  => { 100000.0 }
+        6  => { 1000000.0 }
+        7  => { 10000000.0 }
+        8  => { 100000000.0 }
+        9  => { 1000000000.0 }
+        10 => { 10000000000.0 }
+        11 => { 100000000000.0 }
+        12 => { 1000000000000.0 }
+        13 => { 10000000000000.0 }
+        14 => { 100000000000000.0 }
+        15 => { 1000000000000000.0 }
+        _  => { pow(10.0, n as f64) }
+    }
+}
+
+/// 10^n for signed `n`. Scientific notation needs the negative side.
+function pow_of_ten_signed(n: i64) -> f64 {
+    if (n >= 0) { return pow_of_ten(n as u64); }
+    return 1.0 / pow_of_ten((0 - n) as u64);
+}

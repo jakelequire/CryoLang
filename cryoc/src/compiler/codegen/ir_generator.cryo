@@ -15,6 +15,8 @@ import Compiler::Codegen::ExprCodegen;
 import Compiler::Codegen::StmtCodegen;
 import Compiler::CompilationContext;
 import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
 import Compiler::Types;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Type;
@@ -80,7 +82,6 @@ public:
     get_current_function(mut &this) -> LValue {
         const bb: LBasicBlock = this.cg.builder.get_insert_block();
         if (!bb.is_valid()) {
-            printf("[IRGen] ERROR: get_current_function — no insert block set\n"); fflush(null);
             this.cg.ctx.emit_error(ErrorCode::E0600_CODEGEN_FAILED,
                 "codegen: builder has no insert block — cannot determine current function");
             return LValue::null();
@@ -347,9 +348,9 @@ public:
             const unsafe_node: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
             this.generate_block(unsafe_node.block);
         } else {
-            printf("[IRGen] WARNING: unhandled statement kind %d — skipping\n", kind as i32); fflush(null);
-            this.cg.ctx.emit_warning(ErrorCode::E0600_CODEGEN_FAILED,
-                format("codegen: unhandled statement kind %d — skipping (not yet implemented)", kind as i32));
+            this.cg.emit_warning_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+                format("codegen: unhandled statement kind %d — skipping (not yet implemented)", kind as i32),
+                stmt.span);
         }
     }
 
@@ -820,7 +821,7 @@ public:
             init_val = this.codegen_rvalue(node.initializer);
         }
         codegen_local_var(this.cg, node.name, node.resolved_type,
-                          init_val, has_init);
+                          init_val, has_init, node.span);
     }
 
 
@@ -917,13 +918,15 @@ public:
             const ma: MemberAccessNode* = expr as MemberAccessNode*;
             const obj: LValue = this.codegen_lvalue(ma.object);
             codegen_member_access(this.cg, obj, ma.object.resolved_type,
-                                  ma.member, &this.last_value, &this.last_is_lvalue);
+                                  ma.member, &this.last_value, &this.last_is_lvalue,
+                                  expr.span);
         } else if (kind == NodeKind::ArrayAccess) {
             const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
             const arr: LValue = this.codegen_lvalue(aa.array);
             const idx: LValue = this.codegen_rvalue(aa.index);
             codegen_array_access(this.cg, arr, aa.array.resolved_type,
-                                 idx, &this.last_value, &this.last_is_lvalue);
+                                 idx, &this.last_value, &this.last_is_lvalue,
+                                 expr.span);
         } else if (kind == NodeKind::CastExpression) {
             const cast_node: CastExprNode* = expr as CastExprNode*;
             const src_t: Type* = this.cg.lookup_type_by_id(cast_node.expression.resolved_type.id);
@@ -1015,9 +1018,9 @@ public:
             this.visit_match_expr(expr as MatchExprNode*);
         } else {
             // Unsupported expression — leave last_value as null.
-            printf("[IRGen] WARNING: unhandled expression kind %d — returning null\n", kind as i32); fflush(null);
-            this.cg.ctx.emit_warning(ErrorCode::E0600_CODEGEN_FAILED,
-                format("codegen: unhandled expression kind %d — not yet implemented", kind as i32));
+            this.cg.emit_warning_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+                format("codegen: unhandled expression kind %d — not yet implemented", kind as i32),
+                expr.span);
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
         }
@@ -1037,9 +1040,17 @@ public:
             const addr: LValue = this.codegen_lvalue(node.left);
             const val: LValue = this.codegen_rvalue(node.right);
             if (!addr.is_valid() || !val.is_valid()) {
-                printf("[IRGen] WARNING: assignment — lvalue or rvalue is null\n"); fflush(null);
-                this.cg.ctx.emit_error(ErrorCode::E0614_ASSIGNMENT_ERROR,
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0614_ASSIGNMENT_ERROR,
                     "codegen: assignment — target or value produced null");
+                diag = diag.at(node.span);
+                if (!addr.is_valid()) {
+                    diag = diag.also_at(node.left.span, "left-hand side did not produce a valid lvalue");
+                }
+                if (!val.is_valid()) {
+                    diag = diag.also_at(node.right.span, "right-hand side did not produce a valid rvalue");
+                }
+                this.cg.emit_diagnostic(diag);
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
                 return;
@@ -1067,18 +1078,21 @@ public:
             op == TokenType::PercentEqual) {
             const addr: LValue = this.codegen_lvalue(node.left);
             if (!addr.is_valid()) {
-                printf("[IRGen] WARNING: compound assignment — lvalue is null\n"); fflush(null);
-                this.cg.ctx.emit_error(ErrorCode::E0614_ASSIGNMENT_ERROR,
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0614_ASSIGNMENT_ERROR,
                     "codegen: compound assignment target produced null lvalue");
+                diag = diag.at(node.span);
+                diag = diag.also_at(node.left.span, "this expression must be assignable");
+                this.cg.emit_diagnostic(diag);
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
                 return;
             }
             const lhs_ty: LType = this.cg.type_mapper.map_type(node.left.resolved_type);
             if (!lhs_ty.is_valid()) {
-                printf("[IRGen] WARNING: compound assignment — failed to map lhs type\n"); fflush(null);
-                this.cg.ctx.emit_error(ErrorCode::E0609_TYPE_MAPPING_ERROR,
-                    "codegen: compound assignment — failed to map left-hand side type");
+                this.cg.emit_error_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                    "codegen: compound assignment — failed to map left-hand side type",
+                    node.left.span);
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
                 return;
@@ -1593,29 +1607,44 @@ public:
         }
 
         if (!callee_val.is_valid()) {
-            // Log which call path failed and what name was tried.
+            // Build a rich diagnostic that names the callee (when available)
+            // and labels the receiver for member/scope calls.
+            mut msg: string = "codegen: call expression — callee function not found";
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, msg);
+            diag = diag.at(node.span);
+
             if (node.callee.kind == NodeKind::Identifier) {
                 const id: IdentifierNode* = node.callee as IdentifierNode*;
-                printf("[IRGen] WARNING: call — callee not found (ident '%s')\n", this.cg.resolve(id.name)); fflush(null);
+                const id_str: string = this.cg.resolve(id.name);
+                diag = Diagnostic::error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    format("codegen: cannot resolve function '%s'", id_str));
+                diag = diag.at(node.span);
+                diag = diag.also_at(node.callee.span, "no function with this name is in scope");
             } else if (node.callee.kind == NodeKind::ScopeResolution) {
                 const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
-                printf("[IRGen] WARNING: call — callee not found (scope '%s::%s')\n",
-                    intern.resolve(sr.scope_name), intern.resolve(sr.member_name)); fflush(null);
+                const scope_str: string = intern.resolve(sr.scope_name);
+                const member_str: string = intern.resolve(sr.member_name);
+                diag = Diagnostic::error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    format("codegen: cannot resolve '%s::%s'", scope_str, member_str));
+                diag = diag.at(node.span);
+                diag = diag.also_at(node.callee.span, "no such associated function");
             } else if (node.callee.kind == NodeKind::MemberAccess) {
                 const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
-                // Diagnostic: show the type we tried resolving against.
-                mut dbg_type_str: string = "<unknown>";
+                mut type_str: string = "<unknown>";
                 const dbg_t: Type* = this.cg.lookup_type_by_id(ma.object.resolved_type.id);
                 if (dbg_t != null) {
-                    dbg_type_str = dbg_t.display_name();
+                    type_str = dbg_t.display_name();
                 }
-                printf("[IRGen] WARNING: call — callee not found (member '.%s' on type '%s' id=%llu)\n",
-                    intern.resolve(ma.member), dbg_type_str, ma.object.resolved_type.id); fflush(null);
-            } else {
-                printf("[IRGen] WARNING: call — callee not found (kind=%d)\n", node.callee.kind as i32); fflush(null);
+                const member_str: string = intern.resolve(ma.member);
+                diag = Diagnostic::error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    format("codegen: no method '%s' found on type '%s'", member_str, type_str));
+                diag = diag.at(node.span);
+                diag = diag.also_at(ma.object.span, format("receiver has type '%s'", type_str));
+                diag = diag.with_note("method lookup walks the class inheritance chain; neither the concrete type nor any base defines this method");
             }
-            this.cg.ctx.emit_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                "codegen: call expression — callee function not found");
+
+            this.cg.emit_diagnostic(diag);
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
@@ -1634,9 +1663,9 @@ public:
 
         const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
         if (!fn_ty.is_valid()) {
-            printf("[IRGen] WARNING: call — LLVMGlobalGetValueType returned null\n"); fflush(null);
-            this.cg.ctx.emit_error(ErrorCode::E0602_INVALID_LLVM_TYPE,
-                "codegen: call expression — failed to retrieve function type from callee");
+            this.cg.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                "codegen: call expression — failed to retrieve function type from callee",
+                node.span);
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
@@ -1709,7 +1738,8 @@ public:
             field_values = field_values + [this.codegen_rvalue(init.value)];
         }
         codegen_struct_literal(this.cg, type_ref, field_names, field_values,
-                               &this.last_value, &this.last_is_lvalue);
+                               &this.last_value, &this.last_is_lvalue,
+                               node.span);
     }
 
     /// Array literal — direct dispatch.
@@ -1744,9 +1774,9 @@ public:
 
         const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         if (!ty.is_valid()) {
-            printf("[IRGen] WARNING: array literal — failed to map type\n"); fflush(null);
-            this.cg.ctx.emit_error(ErrorCode::E0609_TYPE_MAPPING_ERROR,
-                "codegen: array literal — failed to map array type");
+            this.cg.emit_error_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                "codegen: array literal — failed to map array type",
+                node.span);
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
@@ -1786,7 +1816,6 @@ public:
                                  arr_type: ArrayType*) -> void {
         const elem_ty: LType = this.cg.type_mapper.map_type(arr_type.element);
         if (!elem_ty.is_valid()) {
-            printf("[IRGen] WARNING: dynamic array literal — failed to map element type\n"); fflush(null);
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
@@ -1821,7 +1850,6 @@ public:
 
             const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
             if (!malloc_fn.is_valid()) {
-                printf("[IRGen] WARNING: dynamic array literal — malloc not declared\n"); fflush(null);
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
                 return;
@@ -1868,7 +1896,6 @@ public:
     visit_fill_array_literal(mut &this, node: ArrayLiteralNode*) -> void {
         const arr_t_raw: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
         if (arr_t_raw == null || arr_t_raw.kind != TypeKind::Array) {
-            printf("[IRGen] WARNING: fill array — resolved_type isn't Array\n"); fflush(null);
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
@@ -1876,7 +1903,6 @@ public:
         const arr_type: ArrayType* = arr_t_raw as ArrayType*;
         const elem_ty: LType = this.cg.type_mapper.map_type(arr_type.element);
         if (!elem_ty.is_valid()) {
-            printf("[IRGen] WARNING: fill array — failed to map element type\n"); fflush(null);
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
@@ -1964,7 +1990,6 @@ public:
 
             const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
             if (!malloc_fn.is_valid()) {
-                printf("[IRGen] WARNING: fill array — malloc not declared\n"); fflush(null);
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
                 return;
@@ -2394,10 +2419,10 @@ public:
 
         const t: Type* = this.cg.lookup_type_by_id(type_ref.id);
         if (t == null) {
-            printf("[IRGen] WARNING: new — type '%s' not found\n",
-                intern.resolve(node.type_name)); fflush(null);
-            this.cg.ctx.emit_error(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
-                "codegen: new expression — target type not found");
+            this.cg.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
+                format("codegen: 'new' — target type '%s' not found",
+                    intern.resolve(node.type_name)),
+                node.span);
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
@@ -2405,18 +2430,18 @@ public:
 
         const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
         if (!malloc_fn.is_valid()) {
-            printf("[IRGen] WARNING: new — malloc not declared\n"); fflush(null);
-            this.cg.ctx.emit_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                "codegen: new expression — 'malloc' not declared");
+            this.cg.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                "codegen: 'new' expression — 'malloc' not declared",
+                node.span);
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
         }
         const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
         if (!malloc_ty.is_valid()) {
-            printf("[IRGen] WARNING: new — malloc function type is null\n"); fflush(null);
-            this.cg.ctx.emit_error(ErrorCode::E0602_INVALID_LLVM_TYPE,
-                "codegen: new expression — failed to retrieve malloc function type");
+            this.cg.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                "codegen: 'new' expression — failed to retrieve malloc function type",
+                node.span);
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
@@ -2526,9 +2551,9 @@ public:
                 mut result: LValue = LValue::null();
                 codegen_call(this.cg, free_fn, free_ty, [void_ptr], "", &result);
             } else {
-                printf("[IRGen] WARNING: delete — free function type is null\n"); fflush(null);
-                this.cg.ctx.emit_error(ErrorCode::E0602_INVALID_LLVM_TYPE,
-                    "codegen: delete expression — failed to retrieve free function type");
+                this.cg.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                    "codegen: 'delete' expression — failed to retrieve free function type",
+                    node.span);
             }
         }
         this.last_value = LValue::null();

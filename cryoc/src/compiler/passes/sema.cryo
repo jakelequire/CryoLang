@@ -1017,7 +1017,20 @@ public:
 
     resolve_binary(mut &this, bin: BinaryExprNode*) -> TypeRef {
         const lhs: TypeRef = this.resolve_expr(bin.left);
-        const rhs: TypeRef = this.resolve_expr(bin.right);
+        // Push the LHS type as the expected type while resolving the RHS
+        // so that shape-less literals (empty array `[]`, bare struct
+        // literals, generic calls without explicit args) can adopt the
+        // slot they are being written into.  Restore afterward so sibling
+        // expressions don't inherit a stale expectation.
+        mut rhs: TypeRef = TypeRef::invalid();
+        if (bin.op.kind.is_assignment_op() && lhs.is_valid()) {
+            const saved_exp: TypeRef = this.expected_type;
+            this.expected_type = lhs;
+            rhs = this.resolve_expr(bin.right);
+            this.expected_type = saved_exp;
+        } else {
+            rhs = this.resolve_expr(bin.right);
+        }
 
         if (bin.op.kind.is_assignment_op()) { return lhs; }
 
@@ -1691,7 +1704,7 @@ public:
             lookup_sym, scope.member_name);
         if (method_ret.is_valid()) {
             const resolved: TypeRef = this.try_resolve_generic_return(
-                method_ret, scope.scope_name, scope.member_name);
+                method_ret, scope.scope_name, scope.member_name, scope);
             scope.set_resolved_type(resolved);
             return resolved;
         }
@@ -1701,7 +1714,7 @@ public:
                 scope.scope_name, scope.member_name);
             if (base_ret.is_valid()) {
                 const resolved: TypeRef = this.try_resolve_generic_return(
-                    base_ret, scope.scope_name, scope.member_name);
+                    base_ret, scope.scope_name, scope.member_name, scope);
                 scope.set_resolved_type(resolved);
                 return resolved;
             }
@@ -1726,7 +1739,7 @@ public:
                 di_name, scope.member_name);
             if (di_method_ret.is_valid()) {
                 const resolved: TypeRef = this.try_resolve_generic_return(
-                    di_method_ret, scope.scope_name, scope.member_name);
+                    di_method_ret, scope.scope_name, scope.member_name, scope);
                 scope.set_resolved_type(resolved);
                 return resolved;
             }
@@ -1802,22 +1815,52 @@ public:
 
     /// When a scope call (e.g. Result::ok) returns a generic InstantiatedType
     /// (Result<T, E>), try to resolve it to the concrete specialized return
-    /// type using the expected_type hint from the enclosing variable declaration.
+    /// type.  Concrete type args come from two sources, in priority order:
+    ///   1. Explicit scope generic args on the call — `HashMap<string, u32>::new()`
+    ///      binds K=string, V=u32 at the call site; the scope already carries
+    ///      resolved annotations for them, so the method return type gets
+    ///      rewritten into a concrete InstantiatedType with those exact args.
+    ///   2. `expected_type` hint from the enclosing variable declaration —
+    ///      `const x: Result<int, string> = Result::ok(42)` — used when the
+    ///      call has no explicit scope args.
     ///
-    /// E.g. `const x: Result<int, string> = Result::ok(42)` — expected_type
-    /// is Result<i32, string>, so we build "Result_i32_string" and look up
-    /// the concrete method return type from decl_index.
-    try_resolve_generic_return(&this, ret: TypeRef,
+    /// Without (1) the return type stays as the template's self-reference
+    /// (e.g. `HashMap<K, V>`) and codegen hits an unresolved InstantiatedType
+    /// that no downstream fallback can recover from.
+    try_resolve_generic_return(mut &this, ret: TypeRef,
                                 scope_name: SymbolStr,
-                                member_name: SymbolStr) -> TypeRef {
-        // Only applies when expected_type is set and return type is generic
-        if (!this.expected_type.is_valid()) { return ret; }
-
+                                member_name: SymbolStr,
+                                scope: ScopeResolutionNode*) -> TypeRef {
         // Check that the return type is an unresolved InstantiatedType
         const ret_t: Type* = this.arena.lookup(ret.id);
         if (ret_t == null || ret_t.kind != TypeKind::InstantiatedType) { return ret; }
         const ret_inst: InstantiatedType* = ret_t as InstantiatedType*;
         if (ret_inst.is_resolved()) { return ret; }
+
+        // Priority 1: explicit scope generic args — `Type<A, B>::method()`.
+        if (scope != null && scope.scope_generic_args.length > 0
+                && scope.scope_generic_args.length == ret_inst.type_args.length) {
+            mut resolved_args: TypeRef[] = [];
+            mut all_valid: boolean = true;
+            mut res_ctx: ResolutionContext = ResolutionContext::new(
+                this.ctx.source_file, "");
+            for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
+                const arg_ref: TypeRef = this.ctx.type_resolver.resolve(
+                    scope.scope_generic_args[i], &res_ctx);
+                if (!arg_ref.is_valid()) { all_valid = false; break; }
+                resolved_args.push(arg_ref);
+            }
+            if (all_valid) {
+                // Build a concrete InstantiatedType for (generic_base, explicit args).
+                // Goes through the registry cache so the monomorphizer's
+                // `set_resolved_type` call is visible to this TypeRef.
+                return this.ctx.generic_registry.instantiate(
+                    ret_inst.generic_base, resolved_args);
+            }
+        }
+
+        // Priority 2: fall back to expected_type from the enclosing decl.
+        if (!this.expected_type.is_valid()) { return ret; }
 
         // Check that expected_type is a concrete InstantiatedType with the same base.
         // Dereference TypeAlias first (e.g., StringPair → Pair<string>).
@@ -1841,7 +1884,7 @@ public:
         for (mut i: i64 = 0; i < exp_inst.type_args.length; i++) {
             const arg_t: Type* = this.arena.lookup(exp_inst.type_args[i].id);
             if (arg_t == null) { return ret; }
-            arg_displays = arg_displays + [this.arena.format_display(arg_t)];
+            arg_displays.push(this.arena.format_display(arg_t));
         }
 
         const scope_str: string = this.intern.resolve(scope_name);

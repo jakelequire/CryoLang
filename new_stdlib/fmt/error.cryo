@@ -1,0 +1,52 @@
+///! FmtError — the failure kind for formatted-text writes.
+///!
+///! `Display::fmt` and `Debug::fmt` target a `FmtWrite` sink, which
+///! can fail two ways:
+///!   - the underlying byte sink returned an `IoError` (fd write
+///!     failed, socket closed, disk full, ...)
+///!   - a heap-backed sink ran out of memory growing its buffer
+///!
+///! Collapsing both into `IoError::Other` would throw away kind
+///! information — a format that failed because `String::push_str`
+///! couldn't reallocate is not the same shape of problem as a
+///! closed socket. Callers branch on the variant.
+
+namespace std::fmt::error;
+
+import io::error;
+import alloc::allocator;
+
+type enum FmtError {
+    /// The byte sink rejected the write. `IoError` carries kind + errno.
+    Io(IoError);
+    /// A heap-backed sink (`String`, `Array<u8>`) could not grow.
+    Alloc(AllocError);
+}
+
+implement enum FmtError {
+    /// Lift an `IoError` into the fmt layer. Used by every `FmtWrite`
+    /// impl that sits on top of an `io::Write` sink.
+    static from_io(err: IoError) -> FmtError {
+        return FmtError::Io(err);
+    }
+
+    /// Lift an `AllocError` into the fmt layer. Used by `String`'s
+    /// `FmtWrite` impl.
+    static from_alloc(err: AllocError) -> FmtError {
+        return FmtError::Alloc(err);
+    }
+
+    is_io(&this) -> boolean {
+        match (&this) {
+            FmtError::Io(_) => { return true; }
+            FmtError::Alloc(_) => { return false; }
+        }
+    }
+
+    is_alloc(&this) -> boolean {
+        match (&this) {
+            FmtError::Io(_) => { return false; }
+            FmtError::Alloc(_) => { return true; }
+        }
+    }
+}
