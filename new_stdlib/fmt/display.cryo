@@ -1,0 +1,279 @@
+///! Display / Debug / Formatter.
+///!
+///! Every type that wants to be printable implements `Display` (for
+///! user output) or `Debug` (for inspection). Both write through a
+///! `Formatter<W>` that sits on top of any `Write` impl, so
+///! formatting a value to `Stdout`, to a `String` buffer, or to a
+///! file all share the same code path.
+
+namespace std::fmt::display;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+import io::traits;
+import io::stdio;
+import collections::str;
+import collections::string;
+import fmt::integer;
+
+// ============================================================================
+// Formatter
+// ============================================================================
+
+type struct Formatter<W> {
+    writer: W;
+
+    static new(writer: W) -> Formatter<W> {
+        return Formatter<W> { writer: writer };
+    }
+
+    /// Write raw bytes. The low-level escape hatch every other method
+    /// routes through.
+    write_bytes(mut &this, bytes: Slice<u8>) -> Result<(), IoError> 
+    where W: Write {
+        return this.writer.write_all(bytes);
+    }
+
+    /// Write a `Str`. The usual path for fixed text.
+    write_str(mut &this, source: Str) -> Result<(), IoError> 
+    where W: Write {
+        return this.write_bytes(source.as_bytes());
+    }
+
+    /// Write a single byte. Useful for punctuation.
+    write_byte(mut &this, byte: u8) -> Result<(), IoError> 
+    where W: Write {
+        const local: u8[1] = [byte];
+        return this.write_bytes(Slice::from_raw(&local[0], 1));
+    }
+
+    /// Surface the underlying writer — e.g., to flush after a batch
+    /// of writes.
+    writer(mut &this) -> mut &W {
+        return &this.writer;
+    }
+}
+
+// ============================================================================
+// Traits
+// ============================================================================
+
+type trait Display {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError> where W: Write;
+}
+
+type trait Debug {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError> where W: Write;
+}
+
+// ============================================================================
+// Integer formatting — dispatches through `fmt::integer`
+// ============================================================================
+
+/// Format `value` into a stack buffer via `fmt::integer`, then hand
+/// the bytes to the Formatter's writer. No heap allocation.
+function write_u64<W>(f: mut &Formatter<W>, value: u64) -> Result<(), IoError>
+where W: Write {
+    mut buffer: u8[20];
+    const digits: u64 = integer::write_u64_decimal(&buffer[0], value);
+    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+}
+
+function write_i64<W>(f: mut &Formatter<W>, value: i64) -> Result<(), IoError>
+where W: Write {
+    mut buffer: u8[20];
+    const digits: u64 = integer::write_i64_decimal(&buffer[0], value);
+    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+}
+
+// ============================================================================
+// Primitive Display impls
+// ============================================================================
+
+implement Display for u8 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_u64(f, this as u64);
+    }
+}
+implement Display for u16 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_u64(f, this as u64);
+    }
+}
+implement Display for u32 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_u64(f, this as u64);
+    }
+}
+implement Display for u64 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_u64(f, this);
+    }
+}
+
+implement Display for i8 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_i64(f, this as i64);
+    }
+}
+implement Display for i16 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_i64(f, this as i64);
+    }
+}
+implement Display for i32 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_i64(f, this as i64);
+    }
+}
+implement Display for i64 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_i64(f, this);
+    }
+}
+
+implement Display for boolean {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        if (this) {
+            return f.write_bytes(Slice::from_raw("true" as u8*, 4));
+        }
+        return f.write_bytes(Slice::from_raw("false" as u8*, 5));
+    }
+}
+
+implement Display for char {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return f.write_byte(this as u8);
+    }
+}
+
+implement Display for Str {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return f.write_str(this);
+    }
+}
+
+// ============================================================================
+// Debug — default to Display for primitives
+// ============================================================================
+
+implement Debug for u8 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_u64(f, this as u64);
+    }
+}
+implement Debug for u16 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_u64(f, this as u64);
+    }
+}
+implement Debug for u32 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_u64(f, this as u64);
+    }
+}
+implement Debug for u64 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_u64(f, this);
+    }
+}
+implement Debug for i8 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_i64(f, this as i64);
+    }
+}
+implement Debug for i16 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_i64(f, this as i64);
+    }
+}
+implement Debug for i32 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_i64(f, this as i64);
+    }
+}
+implement Debug for i64 {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        return write_i64(f, this);
+    }
+}
+
+/// `Debug for Str` wraps the content in quotes so inspection output
+/// survives embedded whitespace. Interior quotes are not escaped;
+/// callers who need strict roundtripping should build their own escaper.
+implement Debug for Str {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), IoError>
+    where W: Write {
+        match (f.write_byte(0x22)) { // '"'
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        match (f.write_str(this)) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        return f.write_byte(0x22);
+    }
+}
+
+// ============================================================================
+// print / println helpers
+// ============================================================================
+
+/// Write `value` to stdout. Returns an `IoError` on write failure —
+/// most callers should use `println` instead and let short writes
+/// there surface the error.
+function print<T>(value: &T) -> Result<(), IoError>
+where T: Display {
+    mut f: Formatter<Stdout> = Formatter::new(stdout());
+    return value.fmt(&f);
+}
+
+/// Write `value` to stdout followed by a newline.
+function println<T>(value: &T) -> Result<(), IoError>
+where T: Display {
+    mut f: Formatter<Stdout> = Formatter::new(stdout());
+    match (value.fmt(&f)) {
+        Result::Ok(_) => { }
+        Result::Err(err) => { return Result::Err(err); }
+    }
+    return f.write_byte(0x0A); // '\n'
+}
+
+function eprint<T>(value: &T) -> Result<(), IoError>
+where T: Display {
+    mut f: Formatter<Stderr> = Formatter::new(stderr());
+    return value.fmt(&f);
+}
+
+function eprintln<T>(value: &T) -> Result<(), IoError>
+where T: Display {
+    mut f: Formatter<Stderr> = Formatter::new(stderr());
+    match (value.fmt(&f)) {
+        Result::Ok(_) => { }
+        Result::Err(err) => { return Result::Err(err); }
+    }
+    return f.write_byte(0x0A);
+}

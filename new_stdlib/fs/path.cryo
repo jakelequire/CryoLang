@@ -1,0 +1,182 @@
+///! Path / PathBuf — filesystem paths as length-typed UTF-8.
+///!
+///! `Path` borrows; `PathBuf` owns. Both are byte sequences with no
+///! NUL terminator; crossing into libc uses `ffi::cstr::CString`.
+///!
+///! Path semantics are POSIX-flavored: `/` is the separator, leading
+///! `/` means absolute. Windows-specific path forms such as drive
+///! letters and UNC paths are not currently supported.
+
+namespace std::fs::path;
+
+import core::option;
+import core::result;
+import core::slice;
+import collections::str;
+import collections::string;
+import alloc::allocator;
+
+const SEPARATOR: u8 = 0x2F;  // '/'
+
+// ============================================================================
+// Path — borrowed
+// ============================================================================
+
+type struct Path {
+    inner: Str;
+
+    static from_str(source: Str) -> Path {
+        return Path { inner: source };
+    }
+
+    as_str(&this) -> Str {
+        return this.inner;
+    }
+
+    length(&this) -> u64 {
+        return this.inner.length();
+    }
+
+    is_empty(&this) -> boolean {
+        return this.inner.is_empty();
+    }
+
+    /// Absolute paths start with `/`.
+    is_absolute(&this) -> boolean {
+        if (this.inner.length() == 0) { return false; }
+        match (this.inner.byte_at(0)) {
+            Option::Some(byte) => { return byte == SEPARATOR; }
+            Option::None => { return false; }
+        }
+    }
+
+    /// Last path segment, or `None` if the path ends with `/` or is
+    /// empty. Does not consult the filesystem.
+    file_name(&this) -> Option<Str> {
+        if (this.inner.length() == 0) { return Option::None; }
+        mut i: u64 = this.inner.length();
+        while (i > 0) {
+            const j: u64 = i - 1;
+            match (this.inner.byte_at(j)) {
+                Option::Some(byte) => {
+                    if (byte == SEPARATOR) {
+                        if (j == this.inner.length() - 1) {
+                            return Option::None;
+                        }
+                        return Option::Some(
+                            this.inner.sub_bytes(j + 1, this.inner.length())
+                        );
+                    }
+                }
+                Option::None => { return Option::None; }
+            }
+            i = j;
+        }
+        return Option::Some(this.inner);
+    }
+
+    /// Path minus its final segment, or `None` if there is no parent
+    /// (single-segment, root, or empty).
+    parent(&this) -> Option<Path> {
+        if (this.inner.length() == 0) { return Option::None; }
+        mut i: u64 = this.inner.length();
+        while (i > 0) {
+            const j: u64 = i - 1;
+            match (this.inner.byte_at(j)) {
+                Option::Some(byte) => {
+                    if (byte == SEPARATOR) {
+                        if (j == 0) {
+                            // Path is `/something` — parent is `/`.
+                            return Option::Some(Path {
+                                inner: this.inner.sub_bytes(0, 1)
+                            });
+                        }
+                        return Option::Some(Path {
+                            inner: this.inner.sub_bytes(0, j)
+                        });
+                    }
+                }
+                Option::None => { return Option::None; }
+            }
+            i = j;
+        }
+        return Option::None;
+    }
+}
+
+// ============================================================================
+// PathBuf — owned
+// ============================================================================
+
+type struct PathBuf<A = GlobalAlloc> {
+    inner: String<A>;
+
+    static new() -> PathBuf {
+        return PathBuf { inner: String::new() };
+    }
+
+    static from_str(source: Str) -> PathBuf {
+        return PathBuf { inner: String::from_str(source) };
+    }
+
+    as_path(&this) -> Path {
+        return Path::from_str(this.inner.as_str());
+    }
+
+    length(&this) -> u64 {
+        return this.inner.length();
+    }
+
+    is_empty(&this) -> boolean {
+        return this.inner.is_empty();
+    }
+
+    /// Append `segment`, inserting a `/` separator if needed. If
+    /// `segment` is absolute, it replaces the current path entirely.
+    push(mut &this, segment: Str) -> void {
+        const abs: boolean = is_absolute_bytes(segment);
+        if (abs) {
+            this.inner.clear();
+            this.inner.push_str(segment);
+            return;
+        }
+        if (!this.inner.is_empty()) {
+            match (this.inner.as_bytes().get(this.inner.length() - 1)) {
+                Option::Some(byte) => {
+                    if (byte != SEPARATOR) {
+                        this.inner.push_byte(SEPARATOR);
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        this.inner.push_str(segment);
+    }
+
+    /// Remove the last segment. Returns `true` if anything was
+    /// popped.
+    pop(mut &this) -> boolean {
+        match (this.as_path().parent()) {
+            Option::Some(parent) => {
+                const new_len: u64 = parent.length();
+                // Rewind the String's length. The backing buffer keeps
+                // its capacity so subsequent `push` is cheap.
+                this.inner = String::from_str(parent.as_str());
+                return true;
+            }
+            Option::None => { return false; }
+        }
+    }
+
+    drop(mut &this) -> void {
+        this.inner.drop();
+    }
+}
+
+function is_absolute_bytes(source: Str) -> boolean {
+    if (source.length() == 0) { return false; }
+    match (source.byte_at(0)) {
+        Option::Some(byte) => { return byte == SEPARATOR; }
+        Option::None => { return false; }
+    }
+}

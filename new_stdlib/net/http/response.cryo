@@ -1,0 +1,256 @@
+///! HTTP response.
+///!
+///! Built by handlers, written to any `Write`. The client side parses
+///! one from a `Read` the same way the server parses a `Request`.
+
+namespace std::net::http::response;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+import io::traits;
+import collections::array;
+import collections::str;
+import collections::string;
+import fmt::integer;
+import net::http::status;
+import net::http::headers;
+import net::http::request;
+
+type struct Response {
+    public status: StatusCode;
+    public version: String;
+    public headers: Headers;
+    public body: Array<u8>;
+
+    static new(status: StatusCode) -> Response {
+        return Response {
+            status: status,
+            version: String::from_str(request::HTTP_VERSION),
+            headers: Headers::new(),
+            body: Array::new()
+        };
+    }
+
+    /// Convenience: `Response::text(StatusCode::ok(), "hello")` with
+    /// Content-Type text/plain; charset=utf-8 and Content-Length set.
+    static text(status: StatusCode, body: Str) -> Response {
+        mut resp: Response = Response::new(status);
+        resp.headers.insert(
+            Str::from_raw("Content-Type" as u8*, 12),
+            Str::from_raw("text/plain; charset=utf-8" as u8*, 25)
+        );
+        mut bytes: Array<u8> = Array::with_capacity(body.length());
+        bytes.push_slice(body.as_bytes());
+        resp.set_body(bytes);
+        return resp;
+    }
+
+    /// Convenience for JSON: sets Content-Type and Content-Length.
+    /// The caller is responsible for producing valid JSON; no
+    /// validation is performed.
+    static json(status: StatusCode, body: Array<u8>) -> Response {
+        mut resp: Response = Response::new(status);
+        resp.headers.insert(
+            Str::from_raw("Content-Type" as u8*, 12),
+            Str::from_raw("application/json" as u8*, 16)
+        );
+        resp.set_body(body);
+        return resp;
+    }
+
+    /// Install `body` and set Content-Length to match. Ownership of
+    /// the array transfers to the response.
+    set_body(mut &this, body: Array<u8>) -> void {
+        mut old: Array<u8> = this.body;
+        old.drop();
+        this.body = body;
+        mut buffer: u8[24];
+        const digits: u64 = integer::write_u64_decimal(&buffer[0], this.body.length());
+        this.headers.insert(
+            Str::from_raw("Content-Length" as u8*, 14),
+            Str::from_raw(&buffer[0], digits)
+        );
+    }
+
+    /// Write to any `Write` impl — typically a `TcpStream`.
+    write_to<W>(&this, writer: mut &W) -> Result<(), IoError>
+    where W: Write {
+        const crlf: Slice<u8> = Slice::from_raw("\r\n" as u8*, 2);
+        const sp: Slice<u8> = Slice::from_raw(" " as u8*, 1);
+
+        // Status line: HTTP/1.1 <code> <reason>CRLF
+        match (writer.write_all(this.version.as_bytes())) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (writer.write_all(sp)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        mut code_buf: u8[4];
+        const code_digits: u64 = integer::write_u64_decimal(&code_buf[0], this.status.as_u16() as u64);
+        match (writer.write_all(Slice::from_raw(&code_buf[0], code_digits))) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (writer.write_all(sp)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (writer.write_all(this.status.reason_phrase().as_bytes())) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (writer.write_all(crlf)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+
+        // Headers: emit every stored header as `name: value\r\n`.
+        match (this.headers.write_to(writer)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+
+        // Blank line separating headers from body.
+        match (writer.write_all(crlf)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        if (!this.body.is_empty()) {
+            match (writer.write_all(this.body.as_slice())) {
+                Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+            }
+        }
+        return Result::Ok(());
+    }
+
+    /// Parse a response from a `Read`. Used by the HTTP client.
+    static parse<R>(reader: mut &R) -> Result<Response, IoError>
+    where R: Read {
+        mut status_line: String = String::new();
+        match (request::read_line(reader, &status_line, 8192)) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { status_line.drop(); return Result::Err(err); }
+        }
+
+        // Status-Line: HTTP/x.y SP code SP reason
+        mut first_sp: u64 = status_line.length();
+        mut second_sp: u64 = status_line.length();
+        mut i: u64 = 0;
+        while (i < status_line.length()) {
+            match (status_line.as_str().byte_at(i)) {
+                Option::Some(byte) => {
+                    if (byte == 0x20) {
+                        if (first_sp == status_line.length()) { first_sp = i; }
+                        else if (second_sp == status_line.length()) { second_sp = i; break; }
+                    }
+                }
+                Option::None => { break; }
+            }
+            i++;
+        }
+        if (first_sp == status_line.length()) {
+            status_line.drop();
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+        mut code_end: u64 = second_sp;
+        if (code_end == status_line.length()) { code_end = status_line.length(); }
+
+        const version_str: Str = status_line.as_str().sub_bytes(0, first_sp);
+        const code_str: Str = status_line.as_str().sub_bytes(first_sp + 1, code_end);
+
+        mut code: u16 = 0;
+        match (integer::parse_u64(code_str)) {
+            Option::Some(value) => {
+                if (value > 65535) {
+                    status_line.drop();
+                    return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                }
+                code = value as u16;
+            }
+            Option::None => {
+                status_line.drop();
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+        }
+
+        mut resp: Response = Response {
+            status: StatusCode::from_u16(code),
+            version: String::from_str(version_str),
+            headers: Headers::new(),
+            body: Array::new()
+        };
+        status_line.drop();
+
+        // Headers.
+        loop {
+            mut header_line: String = String::new();
+            match (request::read_line(reader, &header_line, 8192)) {
+                Result::Ok(_) => { }
+                Result::Err(err) => {
+                    header_line.drop();
+                    resp.drop();
+                    return Result::Err(err);
+                }
+            }
+            if (header_line.is_empty()) {
+                header_line.drop();
+                break;
+            }
+            if (!resp.headers.parse_line(header_line.as_str())) {
+                header_line.drop();
+                resp.drop();
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            header_line.drop();
+        }
+
+        // Body (Content-Length sized only).
+        match (resp.headers.get(Str::from_raw("content-length" as u8*, 14))) {
+            Option::Some(mut value) => {
+                match (integer::parse_u64(value.as_str())) {
+                    Option::Some(len) => {
+                        mut body: Array<u8> = Array::with_capacity(len);
+                        mut remaining: u64 = len;
+                        mut chunk: u8[4096];
+                        while (remaining > 0) {
+                            mut take: u64 = 4096;
+                            if (take > remaining) { take = remaining; }
+                            match (reader.read(&chunk[0], take)) {
+                                Result::Ok(n) => {
+                                    if (n == 0) {
+                                        value.drop();
+                                        body.drop();
+                                        resp.drop();
+                                        return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
+                                    }
+                                    mut j: u64 = 0;
+                                    while (j < n) { body.push(chunk[j]); j = j + 1; }
+                                    remaining = remaining - n;
+                                }
+                                Result::Err(err) => {
+                                    value.drop();
+                                    body.drop();
+                                    resp.drop();
+                                    return Result::Err(err);
+                                }
+                            }
+                        }
+                        resp.body = body;
+                    }
+                    Option::None => {
+                        value.drop();
+                        resp.drop();
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
+                }
+                value.drop();
+            }
+            Option::None => { }
+        }
+
+        return Result::Ok(resp);
+    }
+
+    drop(mut &this) -> void {
+        this.version.drop();
+        this.headers.drop();
+        this.body.drop();
+    }
+}

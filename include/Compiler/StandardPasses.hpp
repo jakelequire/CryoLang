@@ -18,6 +18,8 @@ namespace Cryo
     class MemberAccessNode;
     class StructDeclarationNode;
     class ClassDeclarationNode;
+    class PatternNode;
+    class EnumType;
 
     // ============================================================================
     // Stage 1: Frontend Passes
@@ -637,6 +639,18 @@ namespace Cryo
 
         // Resolve the type of a member access expression (e.g., this.field, var.field)
         TypeRef resolve_member_access_type(MemberAccessNode *member_access, PassContext &ctx);
+
+        // Infer the enum type of a match expression's subject.  Handles common
+        // shapes — identifier lookup, pointer/reference deref via UnaryExpression,
+        // member access chains — that resolve_expression doesn't set a
+        // resolved_type on (so get_resolved_type() alone is insufficient).
+        TypeRef infer_match_subject_enum_type(ExpressionNode *subject, PassContext &ctx);
+
+        // Register the bindings introduced by an enum pattern into
+        // _local_variable_types, using the subject enum's variant payload types.
+        // Shared by MatchExpression and MatchStatement sema so nested matches
+        // carry type info down into deeper arm bodies.
+        void register_pattern_bindings(PatternNode *pattern, const EnumType *subject_enum);
     };
 
     // ============================================================================

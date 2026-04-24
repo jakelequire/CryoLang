@@ -142,10 +142,34 @@ type struct ASTSpecializer {
         for (mut i: i64 = 0; i < entry.impl_blocks.length; i++) {
             const cloned_impl: ASTNode* = cloner.clone_node(entry.impl_blocks[i]);
             if (cloned_impl != null) {
+                const impl_node: ImplBlockNode* = cloned_impl as ImplBlockNode*;
+
+                // Filter out methods whose `this` parameter is a Generic
+                // instantiation of the outer template with modified args
+                // (e.g. `this: Result<T*, E>` on `implement Result<T, E>`).
+                // Such methods apply only to specific outer T — monomorphizing
+                // them for arbitrary T produces invalid code, since the body
+                // uses the modified shape (`*ptr` where ptr is actually T, not
+                // T*).  The C++ reference compiler skips unused methods via
+                // lazy monomorphization; for our eager pipeline we skip at
+                // specialization time based on the structural self-match.
+                mut kept: MethodNode*[] = [];
+                for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
+                    const mthd: MethodNode* = impl_node.methods[mi];
+                    const mname: string = this.intern_table.resolve(mthd.func.name);
+                    const ename: string = this.intern_table.resolve(entry.name);
+                    const is_modified: boolean = this.method_has_modified_self_type(mthd, entry);
+                    printf("[specfilter] entry=%s method=%s modified=%d\n", ename, mname, is_modified);
+                    if (is_modified) {
+                        continue;
+                    }
+                    kept.push(mthd);
+                }
+                impl_node.methods = kept;
+
                 cloned_impl.accept(substituter);
                 // Rename impl block target to specialized name and
                 // clear generic params — the specialization is concrete.
-                const impl_node: ImplBlockNode* = cloned_impl as ImplBlockNode*;
                 impl_node.set_target_type(spec_sym);
                 impl_node.generic_params = [];
                 impl_asts = impl_asts + [cloned_impl];
@@ -157,4 +181,72 @@ type struct ASTSpecializer {
     }
 
 
+    /// Detect methods whose `this` parameter is a Generic(base, args) where
+    /// base matches the outer template name AND the args are NOT the identity
+    /// mapping of the template's params.  Example: on `implement Result<T, E>`,
+    /// `this: Result<T*, E>` has `T*` (not bare `T`) — a modified self-type.
+    method_has_modified_self_type(&this, method: MethodNode*, entry: TemplateEntry*) -> boolean {
+        if (method == null || method.func == null) { return false; }
+        const func: FunctionDeclNode* = method.func;
+
+        const this_amp:  SymbolStr = this.intern_table.intern("&this");
+        const this_bare: SymbolStr = this.intern_table.intern("this");
+
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null) { continue; }
+            if (!param.name.equals(this_amp) && !param.name.equals(this_bare)) {
+                continue;
+            }
+            if (param.type_annotation == null) { continue; }
+            if (this.annotation_is_modified_outer(param.type_annotation, entry)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Recursively unwrap Reference/Pointer and return true iff the inner
+    /// annotation is Generic(Named(entry.name), args) where any arg is NOT
+    /// the bare outer param in its position.
+    annotation_is_modified_outer(&this, ann: TypeAnnotation*, entry: TemplateEntry*) -> boolean {
+        if (ann == null) { return false; }
+        match (*ann) {
+            TypeAnnotation::Reference(ref) => {
+                return this.annotation_is_modified_outer(ref.inner, entry);
+            }
+            TypeAnnotation::Pointer(ptr) => {
+                return this.annotation_is_modified_outer(ptr.inner, entry);
+            }
+            TypeAnnotation::Generic(gen) => {
+                match (*gen.base) {
+                    TypeAnnotation::Named(named) => {
+                        const matches_bare: boolean = named.name.equals(entry.name);
+                        const matches_qual: boolean = named.name.equals(entry.qualified_name);
+                        if (!matches_bare && !matches_qual) { return false; }
+                        if (gen.args.length != entry.param_count) { return false; }
+                        for (mut i: i64 = 0; i < gen.args.length; i++) {
+                            if (!this.annotation_is_bare_param(gen.args[i], entry.param_names[i])) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    _ => { return false; }
+                }
+            }
+            _ => { return false; }
+        }
+        return false;
+    }
+
+    /// True iff `ann` is exactly `Named(expected_name)` with no wrappers.
+    annotation_is_bare_param(&this, ann: TypeAnnotation*, expected_name: SymbolStr) -> boolean {
+        if (ann == null) { return false; }
+        match (*ann) {
+            TypeAnnotation::Named(named) => { return named.name.equals(expected_name); }
+            _ => { return false; }
+        }
+        return false;
+    }
 }

@@ -556,6 +556,37 @@ namespace Cryo::Codegen
                     if (it != var_types.end())
                         operand_type = it->second;
                 }
+                // MemberAccess operand (e.g., *gen.base): resolve the member's
+                // type through variable_types_map so the dereference knows the
+                // correct pointee type.  Without this, opaque-pointer mode has
+                // no way to determine what to load and falls back to i32.
+                else if (auto *ma = dynamic_cast<Cryo::MemberAccessNode *>(node->operand()))
+                {
+                    // Walk the member chain to determine the type.
+                    // For a.b, look up a's type, unwrap pointer, find field b's type.
+                    if (auto *base_id = dynamic_cast<Cryo::IdentifierNode *>(ma->object()))
+                    {
+                        auto &var_types = ctx().variable_types_map();
+                        auto it = var_types.find(base_id->name());
+                        if (it != var_types.end() && it->second.is_valid())
+                        {
+                            TypeRef base_type = it->second;
+                            // Unwrap pointer/reference to get to the struct type
+                            if (base_type->kind() == Cryo::TypeKind::Pointer)
+                                base_type = static_cast<const Cryo::PointerType *>(base_type.get())->pointee();
+                            else if (base_type->kind() == Cryo::TypeKind::Reference)
+                                base_type = static_cast<const Cryo::ReferenceType *>(base_type.get())->referent();
+
+                            if (base_type.is_valid() && base_type->kind() == Cryo::TypeKind::Struct)
+                            {
+                                auto *st = static_cast<const Cryo::StructType *>(base_type.get());
+                                auto field_opt = st->field_type(ma->member());
+                                if (field_opt)
+                                    operand_type = *field_opt;
+                            }
+                        }
+                    }
+                }
             }
 
             // Extract the actual pointee type from the pointer type

@@ -9,6 +9,8 @@ namespace Compiler::Codegen::StmtCodegen;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::Context;
+import Compiler::Codegen::ExprCodegen;
+import Compiler::Codegen::DeclCodegen;
 import Compiler::CompilationContext;
 import Compiler::AST;
 import Compiler::AST::Node;
@@ -65,8 +67,10 @@ function codegen_return(cg: CodegenContext*, val: LValue, has_value: boolean) ->
         // Handles common implicit conversions like u64↔ptr (stdlib uses this
         // in `align_up`/`align_down`) and narrower integer returns.
         const coerced: LValue = coerce_return_value(cg, val);
+        emit_va_end_if_variadic(cg, current_variadic_arg(cg));
         cg.builder.build_ret(coerced);
     } else if (!has_value) {
+        emit_va_end_if_variadic(cg, current_variadic_arg(cg));
         cg.builder.build_ret_void();
     }
     // If has_value but val is null, expression codegen failed.
@@ -115,6 +119,55 @@ function coerce_return_value(cg: CodegenContext*, val: LValue) -> LValue {
         if (want_bits < got_bits) {
             return cg.builder.build_trunc(val, want_lty, "ret.trunc");
         }
+    }
+
+    // Fixed-size array `[N x T]` → dynamic fat pointer `{T*, i64}`.  Happens
+    // when a function typed `T[]` returns `[a, b, ...]` and sema didn't
+    // propagate the dynamic expected_type into the array-literal's resolved
+    // shape.  Stash the loaded array on the stack, malloc N*sizeof(T), memcpy
+    // the contents, and build the fat pointer — keeping IR verifiable even
+    // when upstream inference is incomplete.
+    // want_kind 10 = Struct, got_kind 11 = Array (LLVM kind codes).
+    if (want_kind == 10 && got_kind == 11) {
+        const len: u32 = llvm::LLVMGetArrayLength(got_ty_raw);
+        const elem_ty_raw: void* = llvm::LLVMGetElementType(got_ty_raw);
+        const elem_size_val: LValue = LValue { raw: llvm::LLVMSizeOf(elem_ty_raw) };
+        const len_val: LValue = LType::const_int(LType::i64(), len as u64, false);
+        const byte_count: LValue = cg.builder.build_mul(
+            len_val, elem_size_val, "ret.bytecnt");
+
+        const src_alloca: LValue = cg.create_entry_alloca(
+            fn, "ret.src", LType { raw: got_ty_raw });
+        cg.builder.build_store(val, src_alloca);
+
+        const malloc_fn: LValue = resolve_function(cg, cg.intern_str("malloc"));
+        if (!malloc_fn.is_valid()) {
+            return val;
+        }
+        const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+        mut malloc_args: LValue[] = [];
+        malloc_args.push(byte_count);
+        mut data_ptr: LValue = LValue::null();
+        codegen_call(cg, malloc_fn, malloc_ty, malloc_args, "ret.data", &data_ptr);
+        if (!data_ptr.is_valid()) {
+            return val;
+        }
+
+        llvm::LLVMBuildMemCpy(cg.builder.raw,
+                              data_ptr.raw, 1,
+                              src_alloca.raw, 1,
+                              byte_count.raw);
+
+        const fat_alloca: LValue = cg.create_entry_alloca(fn, "ret.fat", want_lty);
+        const ptr_slot: LValue = cg.builder.build_struct_gep(
+            want_lty, fat_alloca, 0, "ret.fat.ptr");
+        cg.builder.build_store(data_ptr, ptr_slot);
+        const len_slot: LValue = cg.builder.build_struct_gep(
+            want_lty, fat_alloca, 1, "ret.fat.len");
+        cg.builder.build_store(len_val, len_slot);
+
+        const loaded: LValue = cg.builder.build_load(want_lty, fat_alloca, "ret.fat.val");
+        return loaded;
     }
 
     return val;

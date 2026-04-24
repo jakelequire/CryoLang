@@ -1,0 +1,124 @@
+///! Decimal integer formatting and parsing.
+///!
+///! The low-level itoa / atoi routines used by the `fmt::Display`
+///! impls, by HTTP's Content-Length header, by socket_addr port
+///! parsing, by IP octet parsing, and by anything else that needs
+///! a decimal integer. Any new caller for "print a u64 as decimal"
+///! or "parse a decimal string" should route through this module
+///! rather than re-implement the digit loop.
+///!
+///! The write path targets a caller-owned byte buffer (no heap
+///! allocation); `Formatter::write_u64` on top of it dispatches
+///! through `Write`. Callers producing longer strings build on a
+///! `String<A>` or an `Array<u8>`.
+
+namespace std::fmt::integer;
+
+import core::option;
+import collections::str;
+
+/// Largest decimal representation of a `u64` is 20 digits. Callers
+/// pick a buffer of at least this many bytes for `write_u64_decimal`.
+const U64_MAX_DIGITS: u64 = 20;
+
+/// Largest signed decimal is 20 bytes (`-` + 19 digits for `i64::MIN`).
+const I64_MAX_DIGITS: u64 = 20;
+
+/// Write `value` in base 10 into `buffer`. Returns the number of
+/// bytes written. `buffer` must hold at least `U64_MAX_DIGITS` bytes.
+function write_u64_decimal(buffer: u8*, value: u64) -> u64 {
+    if (value == 0) {
+        buffer[0] = 0x30;
+        return 1;
+    }
+    mut digits: u8[20];
+    mut i: u64 = 0;
+    mut v: u64 = value;
+    while (v > 0) {
+        digits[i] = ((v % 10) as u8) + 0x30;
+        v = v / 10;
+        i++;
+    }
+    // Digits landed least-significant-first; reverse them into the
+    // caller's buffer.
+    mut out: u64 = 0;
+    while (out < i) {
+        buffer[out] = digits[i - 1 - out];
+        out = out + 1;
+    }
+    return i;
+}
+
+/// Write signed `value` in base 10. Returns bytes written.
+/// `buffer` must hold at least `I64_MAX_DIGITS` bytes.
+function write_i64_decimal(buffer: u8*, value: i64) -> u64 {
+    if (value < 0) {
+        buffer[0] = 0x2D; // '-'
+        // `-i64::MIN` overflows in i64 but wraps to the correct u64
+        // magnitude.
+        const magnitude: u64 = (0 - value) as u64;
+        return 1 + write_u64_decimal(buffer + 1, magnitude);
+    }
+    return write_u64_decimal(buffer, value as u64);
+}
+
+/// Parse `source` as a decimal `u64`. Returns `None` on any
+/// non-digit byte, an empty input, or overflow. The caller gets
+/// either a valid value or nothing — no "parsed as much as I could".
+function parse_u64(source: Str) -> Option<u64> {
+    if (source.length() == 0) { return Option::None; }
+    mut value: u64 = 0;
+    mut i: u64 = 0;
+    while (i < source.length()) {
+        match (source.byte_at(i)) {
+            Option::Some(byte) => {
+                if (byte < 0x30 || byte > 0x39) { return Option::None; }
+                const digit: u64 = (byte - 0x30) as u64;
+                // Overflow check: value * 10 + digit must fit in u64.
+                // u64::MAX / 10 == 1844674407370955161 (remainder 5).
+                if (value > 1844674407370955161) { return Option::None; }
+                if (value == 1844674407370955161 && digit > 5) {
+                    return Option::None;
+                }
+                value = value * 10 + digit;
+            }
+            Option::None => { return Option::None; }
+        }
+        i++;
+    }
+    return Option::Some(value);
+}
+
+/// Convenience wrapper for parsing into a narrower type. Returns
+/// `None` if the parse fails OR the value exceeds `u32::MAX`.
+function parse_u32(source: Str) -> Option<u32> {
+    match (parse_u64(source)) {
+        Option::Some(value) => {
+            if (value > 4294967295) { return Option::None; }
+            return Option::Some(value as u32);
+        }
+        Option::None => { return Option::None; }
+    }
+}
+
+/// Same for `u16`. Common for parsing ports.
+function parse_u16(source: Str) -> Option<u16> {
+    match (parse_u64(source)) {
+        Option::Some(value) => {
+            if (value > 65535) { return Option::None; }
+            return Option::Some(value as u16);
+        }
+        Option::None => { return Option::None; }
+    }
+}
+
+/// Same for `u8`. Common for parsing IP octets.
+function parse_u8(source: Str) -> Option<u8> {
+    match (parse_u64(source)) {
+        Option::Some(value) => {
+            if (value > 255) { return Option::None; }
+            return Option::Some(value as u8);
+        }
+        Option::None => { return Option::None; }
+    }
+}

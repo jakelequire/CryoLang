@@ -32,6 +32,8 @@ import Compiler::AST::Pattern;
 import Compiler::Lex;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
+import Compiler::Resolver::QualifiedName;
+import Compiler::Resolver::MangledName;
 
 
 // ============================================================================
@@ -230,11 +232,15 @@ public:
             return;
         }
 
-        // If specialization already set a fully-qualified arena name
-        // (contains "::"), use it directly — re-qualifying would
-        // double-prefix and mismatch the DI registration key.
+        // Qualify the target type, matching declare_impl_block's logic:
+        //   1. Already qualified — use as-is.
+        //   2. Bare name known to the DI as a type — keep bare.
+        //   3. Otherwise — qualify with namespace.
         const impl_target_str: string = this.cg.resolve(node.target_type);
+        const di_ptr: DeclarationIndex* = this.cg.get_decl_index();
         if (strstr(impl_target_str, "::") != null) {
+            this.current_impl_target = node.target_type;
+        } else if (di_ptr.lookup_type(node.target_type).is_valid()) {
             this.current_impl_target = node.target_type;
         } else {
             this.current_impl_target = this.cg.qualify(node.target_type);
@@ -307,7 +313,7 @@ public:
     generate_statement(mut &this, stmt: StatementNode*) -> void {
         if (stmt == null) { return; }
         const kind: NodeKind = stmt.kind;
-        printf("[IRGen]           stmt kind=%d\n", kind as i32); fflush(null);
+        printf("[IRGen]           stmt kind=%s\n", kind.to_string()); fflush(null);
 
         if (kind == NodeKind::BlockStatement) {
             this.generate_block(stmt as BlockStmtNode*);
@@ -493,34 +499,46 @@ public:
                     matched = true;
                     break;
                 } else if (pat.pattern_kind == PatternKind::Literal) {
-                    // Literal pattern: compare subject == literal value.
-                    const pat_val: LValue = this.codegen_pattern_value(pat);
-                    if (pat_val.is_valid()) {
-                        mut cmp: LValue = LValue::null();
-                        if (is_string_subj) {
-                            codegen_string_compare(this.cg, subject, pat_val,
-                                TokenType::EqualEqual, &cmp);
-                        } else {
+                    // For string subjects, build the pattern as a global
+                    // string pointer and compare via strcmp.  The default
+                    // `codegen_pattern_value` treats every literal as an
+                    // `atoi`-parsed i32 which is correct for int/char
+                    // matches but produces `const i32 0` for any string
+                    // pattern — neither typed nor useful for content
+                    // comparison against a string subject.
+                    mut cmp: LValue = LValue::null();
+                    if (is_string_subj) {
+                        const pat_text: string = this.cg.resolve(pat.value);
+                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
+                        codegen_string_compare(this.cg, subject, pat_val,
+                            TokenType::EqualEqual, &cmp);
+                    } else {
+                        const pat_val: LValue = this.codegen_pattern_value(pat);
+                        if (pat_val.is_valid()) {
                             cmp = this.cg.builder.build_icmp(
                                 32, subject, pat_val, "match.cmp");
                         }
+                    }
+                    if (cmp.is_valid()) {
                         this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
                         matched = true;
                         break;
                     }
                 } else if (pat.pattern_kind == PatternKind::Identifier) {
-                    // Identifier pattern: enum variant or named constant.
-                    // Treat as a literal comparison (the value is the enum discriminant).
-                    const pat_val: LValue = this.codegen_pattern_value(pat);
-                    if (pat_val.is_valid()) {
-                        mut cmp: LValue = LValue::null();
-                        if (is_string_subj) {
-                            codegen_string_compare(this.cg, subject, pat_val,
-                                TokenType::EqualEqual, &cmp);
-                        } else {
+                    mut cmp: LValue = LValue::null();
+                    if (is_string_subj) {
+                        const pat_text: string = this.cg.resolve(pat.value);
+                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
+                        codegen_string_compare(this.cg, subject, pat_val,
+                            TokenType::EqualEqual, &cmp);
+                    } else {
+                        const pat_val: LValue = this.codegen_pattern_value(pat);
+                        if (pat_val.is_valid()) {
                             cmp = this.cg.builder.build_icmp(
                                 32, subject, pat_val, "match.cmp");
                         }
+                    }
+                    if (cmp.is_valid()) {
                         this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
                         matched = true;
                         break;
@@ -841,6 +859,20 @@ public:
                     return this.last_value;
                 }
             }
+            // Variadic bucket: `args` in a variadic function body is
+            // bound to a `[24 x i8]` va_list alloca.  When referenced
+            // as an rvalue (e.g., forwarded to `vformat(fmt, args)`),
+            // return the alloca pointer directly rather than loading
+            // — loading the raw [24 x i8] array value isn't meaningful
+            // for va_list forwarding, which always takes a pointer.
+            if (expr.kind == NodeKind::Identifier) {
+                const ident: IdentifierNode* = expr as IdentifierNode*;
+                if (this.cg.current_variadic_arg_id != 0 &&
+                    ident.name.id == this.cg.current_variadic_arg_id) {
+                    this.last_is_lvalue = false;
+                    return this.last_value;
+                }
+            }
             const ty: LType = this.cg.type_mapper.map_type(expr.resolved_type);
             if (ty.is_valid()) {
                 const loaded: LValue = this.cg.builder.build_load(ty, this.last_value, "load");
@@ -866,7 +898,7 @@ public:
     /// Dispatch an expression directly by kind (bypass vtable).
     generate_expression(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
-        printf("[IRGen]             expr kind=%d\n", expr.kind as i32); fflush(null);
+        printf("[IRGen]             expr kind=%s\n", expr.kind.to_string()); fflush(null);
         const kind: NodeKind = expr.kind;
 
         if (kind == NodeKind::Literal) {
@@ -1129,19 +1161,19 @@ public:
 
             // 1. Try current module's qualified name.
             const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(id.name);
-            callee_val = this.cg.get_function(qualified);
+            callee_val = resolve_function(this.cg, qualified);
 
             // 2. Try the DI's bare→qualified mapping (resolves auto-imports
             //    like printf → std::core::intrinsics::printf).
             if (!callee_val.is_valid()) {
                 const di: DeclarationIndex* = this.cg.get_decl_index();
                 const resolved: SymbolStr = di.resolve_qualified(id.name);
-                callee_val = this.cg.get_function(resolved);
+                callee_val = resolve_function(this.cg, resolved);
             }
 
             // 3. Bare name (for extern C functions registered without qualification).
             if (!callee_val.is_valid()) {
-                callee_val = this.cg.get_function(id.name);
+                callee_val = resolve_function(this.cg, id.name);
             }
 
             // 4. Function-typed parameter — look in named_values (local scope).
@@ -1238,16 +1270,16 @@ public:
             // arity equals the user-arg count.  Try arity-specific lookup
             // first so `Array::new()` and `Array::new(u64)` stay distinct.
             const sr_arity: u32 = node.arguments.length as u32;
-            callee_val = this.cg.get_function_with_arity(sym, sr_arity);
+            callee_val = resolve_function_with_arity(this.cg, sym, sr_arity);
             if (!callee_val.is_valid()) {
-                callee_val = this.cg.get_function(sym);
+                callee_val = resolve_function(this.cg, sym);
             }
 
             // Fallback 1: try the bare member name.  Extern "C" functions
             // (e.g., llvm::LLVMGetTypeKind) are registered under their
             // unqualified C name, not the scope-qualified form.
             if (!callee_val.is_valid()) {
-                callee_val = this.cg.get_function(sr.member_name);
+                callee_val = resolve_function(this.cg, sr.member_name);
             }
 
             // Fallback 2: use node.resolved_type to find the concrete
@@ -1283,9 +1315,9 @@ public:
                         const conc_combined: string = format("%s::%s", conc_name, member_str);
                         const conc_sym: SymbolStr = intern.intern(conc_combined);
                         const conc_arity: u32 = node.arguments.length as u32;
-                        callee_val = this.cg.get_function_with_arity(conc_sym, conc_arity);
+                        callee_val = resolve_function_with_arity(this.cg, conc_sym, conc_arity);
                         if (!callee_val.is_valid()) {
-                            callee_val = this.cg.get_function(conc_sym);
+                            callee_val = resolve_function(this.cg, conc_sym);
                         }
                     }
                 }
@@ -1448,13 +1480,59 @@ public:
             // `total_params` registration key.
             const ma_arity: u32 = (node.arguments.length + 1) as u32;
 
-            if (type_sym.is_valid()) {
+            // Strategy 0: if sema resolved the overload, compute the exact
+            // mangled name from the method's declared param types and look
+            // it up directly.  This is the only strategy that disambiguates
+            // overloads like `String::push(string)` vs `String::push(String)`
+            // — the arity-keyed lookup collapses them to whichever was
+            // registered first.
+            if (node.resolved_method != null) {
+                const rm: MethodNode* = node.resolved_method as MethodNode*;
+                if (rm != null && rm.func != null) {
+                    const rm_fn: FunctionDeclNode* = rm.func;
+                    mut owner_str: string = "";
+                    if (type_sym.is_valid()) {
+                        owner_str = intern.resolve(type_sym);
+                    } else if (t != null) {
+                        if (t.kind == TypeKind::Struct) {
+                            const ost: StructType* = t as StructType*;
+                            owner_str = intern.resolve(ost.qualified_name);
+                        } else if (t.kind == TypeKind::Class) {
+                            const oct: ClassType* = t as ClassType*;
+                            owner_str = intern.resolve(oct.qualified_name);
+                        }
+                    }
+                    if (strlen(owner_str) > 0) {
+                        const arena_ptr: TypeArena* = this.cg.get_arena();
+                        const type_qn: QualifiedName = QualifiedName::single(intern, owner_str);
+                        const type_mn: MangledName = MangledName::from_qualified(intern, type_qn);
+                        mut pd: string[] = [];
+                        const this_amp: SymbolStr = intern.intern("&this");
+                        const this_val: SymbolStr = intern.intern("this");
+                        for (mut pi: i64 = 0; pi < rm_fn.parameters.length; pi++) {
+                            const pp: VarDeclNode* = rm_fn.parameters[pi];
+                            if (pp == null) { continue; }
+                            if (pp.name.equals(this_amp)) { continue; }
+                            if (pp.name.equals(this_val)) { continue; }
+                            if (pp.resolved_type.is_valid()) {
+                                const pt: Type* = arena_ptr.lookup(pp.resolved_type.id);
+                                if (pt != null) { pd.push(pt.display_name()); }
+                            }
+                        }
+                        const mn: MangledName = MangledName::for_method(
+                            intern, type_mn, method_str, pd);
+                        callee_val = resolve_function(this.cg, mn.value);
+                    }
+                }
+            }
+
+            if (!callee_val.is_valid() && type_sym.is_valid()) {
                 const type_str: string = intern.resolve(type_sym);
                 const combined: string = format("%s::%s", type_str, method_str);
                 const sym: SymbolStr = intern.intern(combined);
-                callee_val = this.cg.get_function_with_arity(sym, ma_arity);
+                callee_val = resolve_function_with_arity(this.cg, sym, ma_arity);
                 if (!callee_val.is_valid()) {
-                    callee_val = this.cg.get_function(sym);
+                    callee_val = resolve_function(this.cg, sym);
                 }
             }
 
@@ -1476,9 +1554,9 @@ public:
                 if (strlen(type_str) > 0) {
                     const combined: string = format("%s::%s", type_str, method_str);
                     const sym: SymbolStr = intern.intern(combined);
-                    callee_val = this.cg.get_function_with_arity(sym, ma_arity);
+                    callee_val = resolve_function_with_arity(this.cg, sym, ma_arity);
                     if (!callee_val.is_valid()) {
-                        callee_val = this.cg.get_function(sym);
+                        callee_val = resolve_function(this.cg, sym);
                     }
                 }
             }
@@ -1503,9 +1581,9 @@ public:
                     if (strlen(parent_str) > 0) {
                         const pcombined: string = format("%s::%s", parent_str, method_str);
                         const psym: SymbolStr = intern.intern(pcombined);
-                        callee_val = this.cg.get_function_with_arity(psym, ma_arity);
+                        callee_val = resolve_function_with_arity(this.cg, psym, ma_arity);
                         if (!callee_val.is_valid()) {
-                            callee_val = this.cg.get_function(psym);
+                            callee_val = resolve_function(this.cg, psym);
                         }
                     }
                 }
@@ -1650,6 +1728,20 @@ public:
             return;
         }
 
+        const arr_t_raw: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+        mut is_dynamic: boolean = false;
+        mut arr_type_ptr: ArrayType* = null;
+        if (arr_t_raw != null && arr_t_raw.kind == TypeKind::Array) {
+            arr_type_ptr = arr_t_raw as ArrayType*;
+            if (!arr_type_ptr.is_fixed()) {
+                is_dynamic = true;
+            }
+        }
+        if (is_dynamic) {
+            this.visit_dynamic_array_literal(node, arr_type_ptr);
+            return;
+        }
+
         const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         if (!ty.is_valid()) {
             printf("[IRGen] WARNING: array literal — failed to map type\n"); fflush(null);
@@ -1681,6 +1773,93 @@ public:
         }
 
         this.last_value = alloca;
+        this.last_is_lvalue = true;
+    }
+
+    /// Emit element-form `[a, b, c]` where the expected type is a dynamic
+    /// array `T[]` (fat pointer `{T*, i64}`).  Malloc a buffer for N elements,
+    /// store each element into it, then stash (data, len) into the fat
+    /// pointer alloca.  Without this path, we'd alloca `[N x T]` and hand
+    /// back a fixed-size array to a caller expecting `{ptr, i64}`, failing
+    /// LLVM verification.
+    visit_dynamic_array_literal(mut &this, node: ArrayLiteralNode*,
+                                 arr_type: ArrayType*) -> void {
+        const elem_ty: LType = this.cg.type_mapper.map_type(arr_type.element);
+        if (!elem_ty.is_valid()) {
+            printf("[IRGen] WARNING: dynamic array literal — failed to map element type\n"); fflush(null);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        const current_fn: LValue = this.get_current_function();
+        if (!current_fn.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        const fat_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        if (!fat_ty.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        const fat: LValue = this.cg.create_entry_alloca(current_fn, "arrlit", fat_ty);
+
+        const count: i64 = node.elements.length;
+        const count_val: LValue = LType::const_int(LType::i64(), count as u64, false);
+
+        mut data_ptr: LValue = LValue::null();
+        if (count > 0) {
+            const elem_t: Type* = this.cg.lookup_type_by_id(arr_type.element.id);
+            mut elem_size: u64 = 1;
+            if (elem_t != null && elem_t.size_bytes() > 0) {
+                elem_size = elem_t.size_bytes();
+            }
+            const elem_size_val: LValue = LType::const_int(LType::i64(), elem_size, false);
+            const byte_count: LValue = this.cg.builder.build_mul(
+                count_val, elem_size_val, "bytecnt");
+
+            const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
+            if (!malloc_fn.is_valid()) {
+                printf("[IRGen] WARNING: dynamic array literal — malloc not declared\n"); fflush(null);
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
+            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+            mut malloc_args: LValue[] = [];
+            malloc_args.push(byte_count);
+            codegen_call(this.cg, malloc_fn, malloc_ty, malloc_args, "arrdata", &data_ptr);
+            if (!data_ptr.is_valid()) {
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
+
+            for (mut i: i64 = 0; i < count; i++) {
+                const elem: LValue = this.codegen_rvalue(node.elements[i]);
+                if (!elem.is_valid()) { continue; }
+                const idx: LValue = LType::const_int(LType::i64(), i as u64, false);
+                const buf: void* = malloc(8);
+                const buf_arr: void** = buf as void**;
+                buf_arr[0] = idx.raw;
+                const slot: LValue = this.cg.builder.build_gep(
+                    elem_ty, data_ptr, buf, 1, "arrelem");
+                free(buf);
+                this.cg.builder.build_store(elem, slot);
+            }
+        } else {
+            data_ptr = LType::const_null(LType::pointer_to(elem_ty));
+        }
+
+        const ptr_slot: LValue = this.cg.builder.build_struct_gep(
+            fat_ty, fat, 0, "fat.ptr");
+        this.cg.builder.build_store(data_ptr, ptr_slot);
+        const len_slot: LValue = this.cg.builder.build_struct_gep(
+            fat_ty, fat, 1, "fat.len");
+        this.cg.builder.build_store(count_val, len_slot);
+
+        this.last_value = fat;
         this.last_is_lvalue = true;
     }
 
@@ -1783,7 +1962,7 @@ public:
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 
-            const malloc_fn: LValue = this.cg.llvm_module.get_named_function("malloc");
+            const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
             if (!malloc_fn.is_valid()) {
                 printf("[IRGen] WARNING: fill array — malloc not declared\n"); fflush(null);
                 this.last_value = LValue::null();
@@ -1902,13 +2081,13 @@ public:
             this.cg.resolve(node.scope_name),
             this.cg.resolve(node.member_name));
         const sym: SymbolStr = this.cg.intern_str(combined);
-        const fn_val: LValue = this.cg.get_function(sym);
+        const fn_val: LValue = resolve_function(this.cg, sym);
         if (fn_val.is_valid()) {
             this.last_value = fn_val;
             this.last_is_lvalue = false;
             return;
         }
-        const global: LValue = this.cg.get_global(sym);
+        const global: LValue = resolve_global(this.cg, sym);
         if (global.is_valid()) {
             this.last_value = global;
             this.last_is_lvalue = true;
@@ -2009,29 +2188,37 @@ public:
                     matched = true;
                     break;
                 } else if (pat.pattern_kind == PatternKind::Literal) {
-                    const pat_val: LValue = this.codegen_pattern_value(pat);
-                    if (pat_val.is_valid()) {
-                        mut cmp: LValue = LValue::null();
-                        if (is_string_subj_e) {
-                            codegen_string_compare(this.cg, subject, pat_val,
-                                TokenType::EqualEqual, &cmp);
-                        } else {
+                    mut cmp: LValue = LValue::null();
+                    if (is_string_subj_e) {
+                        const pat_text: string = this.cg.resolve(pat.value);
+                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
+                        codegen_string_compare(this.cg, subject, pat_val,
+                            TokenType::EqualEqual, &cmp);
+                    } else {
+                        const pat_val: LValue = this.codegen_pattern_value(pat);
+                        if (pat_val.is_valid()) {
                             cmp = this.cg.builder.build_icmp(32, subject, pat_val, "mexpr.cmp");
                         }
+                    }
+                    if (cmp.is_valid()) {
                         this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
                         matched = true;
                         break;
                     }
                 } else if (pat.pattern_kind == PatternKind::Identifier) {
-                    const pat_val: LValue = this.codegen_pattern_value(pat);
-                    if (pat_val.is_valid()) {
-                        mut cmp: LValue = LValue::null();
-                        if (is_string_subj_e) {
-                            codegen_string_compare(this.cg, subject, pat_val,
-                                TokenType::EqualEqual, &cmp);
-                        } else {
+                    mut cmp: LValue = LValue::null();
+                    if (is_string_subj_e) {
+                        const pat_text: string = this.cg.resolve(pat.value);
+                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
+                        codegen_string_compare(this.cg, subject, pat_val,
+                            TokenType::EqualEqual, &cmp);
+                    } else {
+                        const pat_val: LValue = this.codegen_pattern_value(pat);
+                        if (pat_val.is_valid()) {
                             cmp = this.cg.builder.build_icmp(32, subject, pat_val, "mexpr.cmp");
                         }
+                    }
+                    if (cmp.is_valid()) {
                         this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
                         matched = true;
                         break;
@@ -2102,7 +2289,13 @@ public:
             // by return/break). Every predecessor of merge_bb needs a phi entry.
             if (!arm_terminated && arm_end.is_valid()) {
                 if (arm_val.is_valid()) {
-                    phi_vals_arr[phi_count] = arm_val.raw;
+                    // LLVM requires all phi operands to have the phi's result
+                    // type.  Arms often produce narrower (or otherwise convertible)
+                    // values than the declared match type — e.g. a `Result<i32,_>`
+                    // payload bound to `fd` in one arm vs a widened integer in
+                    // another.  Widen/narrow/inttoptr as needed before adding.
+                    phi_vals_arr[phi_count] = coerce_to_phi_type(
+                        this.cg, arm_val, result_ty).raw;
                 } else if (result_ty.is_valid()) {
                     // Arm produced no value — use undef as placeholder.
                     phi_vals_arr[phi_count] = llvm::LLVMGetUndef(result_ty.raw);
@@ -2210,7 +2403,7 @@ public:
             return;
         }
 
-        const malloc_fn: LValue = this.cg.llvm_module.get_named_function("malloc");
+        const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
         if (!malloc_fn.is_valid()) {
             printf("[IRGen] WARNING: new — malloc not declared\n"); fflush(null);
             this.cg.ctx.emit_error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
@@ -2298,9 +2491,9 @@ public:
         const ctor_sym: SymbolStr = intern.intern(ctor_combined);
         // Constructor LLVM arity = user args + 1 for the implicit `this`.
         const ctor_arity: u32 = (node.arguments.length + 1) as u32;
-        mut ctor_fn: LValue = this.cg.get_function_with_arity(ctor_sym, ctor_arity);
+        mut ctor_fn: LValue = resolve_function_with_arity(this.cg, ctor_sym, ctor_arity);
         if (!ctor_fn.is_valid()) {
-            ctor_fn = this.cg.get_function(ctor_sym);
+            ctor_fn = resolve_function(this.cg, ctor_sym);
         }
         if (ctor_fn.is_valid() && obj_ptr.is_valid()) {
             const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
@@ -2324,7 +2517,7 @@ public:
     /// Delete expression (heap free) — direct dispatch.
     visit_delete_expr(mut &this, node: DeleteExprNode*) -> void {
         const ptr: LValue = this.codegen_rvalue(node.operand);
-        const free_fn: LValue = this.cg.llvm_module.get_named_function("free");
+        const free_fn: LValue = resolve_function(this.cg, this.cg.intern_str("free"));
         if (free_fn.is_valid() && ptr.is_valid()) {
             const void_ptr: LValue = this.cg.builder.build_pointer_cast(
                 ptr, LType::pointer_to(LType::i8()), "delcast");
@@ -2467,4 +2660,55 @@ public:
         // Load and return the complete enum value.
         return this.cg.builder.build_load(enum_llvm, alloca, "enum.val");
     }
+}
+
+
+// ============================================================================
+// Phi-operand coercion
+// ============================================================================
+
+/// Coerce `val` to match `expected` for use as a phi-node operand.  LLVM
+/// requires every phi incoming to have the phi's result type exactly, and
+/// match arms routinely produce differently-sized integers (e.g. an i32
+/// payload binding in one arm vs an i64 literal in another, both feeding a
+/// phi typed by the outer `const x: i64 =` declaration).  Mirrors the
+/// widening/narrowing logic in `coerce_return_value`; returns the original
+/// value when no cheap conversion applies.  LLVM kind codes: 0=void, 8=int,
+/// 10=struct, 12=pointer.
+function coerce_to_phi_type(cg: CodegenContext*, val: LValue,
+                             expected: LType) -> LValue {
+    if (!val.is_valid() || !expected.is_valid()) { return val; }
+
+    // NB: do NOT compare `void*`-typed LLVMTypeRef values with `==` — the
+    // C++ Cryo bootstrap compiler lowers that to strcmp, which returns
+    // "equal" for structurally-different types and short-circuits the
+    // coercion path.  Dispatch on kind + width instead.
+    const got_ty: void* = llvm::LLVMTypeOf(val.raw);
+    const want_ty: void* = expected.raw;
+    const gk: i32 = llvm::LLVMGetTypeKind(got_ty);
+    const wk: i32 = llvm::LLVMGetTypeKind(want_ty);
+
+    // int ↔ int: widen or narrow.
+    if (gk == 8 && wk == 8) {
+        const gw: u32 = llvm::LLVMGetIntTypeWidth(got_ty);
+        const ww: u32 = llvm::LLVMGetIntTypeWidth(want_ty);
+        if (gw == ww) { return val; }
+        if (gw < ww) {
+            return cg.builder.build_zext(val, expected, "mexpr.widen");
+        }
+        return cg.builder.build_trunc(val, expected, "mexpr.trunc");
+    }
+
+    // int → ptr / ptr → int — match the `coerce_return_value` conventions.
+    if (gk == 8 && wk == 12) {
+        return LValue { raw: llvm::LLVMBuildIntToPtr(cg.builder.raw, val.raw, want_ty, "mexpr.i2p") };
+    }
+    if (gk == 12 && wk == 8) {
+        return LValue { raw: llvm::LLVMBuildPtrToInt(cg.builder.raw, val.raw, want_ty, "mexpr.p2i") };
+    }
+
+    // Same-kind struct/ptr/etc with different SHAPE is not safely
+    // convertible at this level — return as-is and let LLVM verification
+    // surface the mismatch.
+    return val;
 }

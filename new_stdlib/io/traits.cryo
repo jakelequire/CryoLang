@@ -1,0 +1,80 @@
+///! Read / Write — the two traits every byte sink or source
+///! implements.
+///!
+///! Both report failure as `Result<_, IoError>`. The byte count in
+///! `read` / `write` is the number actually transferred: fewer than
+///! requested is normal (a partial read at EOF, a partial write due
+///! to a full pipe). Callers that need an all-or-nothing transfer
+///! use `write_all`, which loops internally.
+
+namespace std::io::traits;
+
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+
+type trait Read {
+    /// Fill up to `length` bytes starting at `buffer`. Returns the
+    /// number of bytes actually read. Zero means EOF; a value less
+    /// than `length` means the underlying source had no more bytes
+    /// available at this moment (not necessarily EOF — callers decide
+    /// whether to retry).
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError>;
+
+    /// Read until the buffer is full or the source returns 0 (EOF).
+    /// Returns the total bytes read; short returns mean EOF reached.
+    read_all(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        mut total: u64 = 0;
+        while (total < length) {
+            match (this.read(buffer + total, length - total)) {
+                Result::Ok(n) => {
+                    if (n == 0) { return Result::Ok(total); }
+                    total = total + n;
+                }
+                Result::Err(err) => {
+                    match (err.kind) {
+                        IoErrorKind::Interrupted => { }
+                        _ => { return Result::Err(err); }
+                    }
+                }
+            }
+        }
+        return Result::Ok(total);
+    }
+}
+
+type trait Write {
+    /// Write up to `length` bytes. Returns the number actually
+    /// written — may be less than `length` on slow sinks. Callers
+    /// that need all bytes written use `write_all`.
+    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError>;
+
+    /// Push any buffered bytes to the underlying sink. Unbuffered
+    /// writers override with a no-op.
+    flush(mut &this) -> Result<(), IoError>;
+
+    /// Write every byte of `bytes`, retrying short writes and
+    /// `Interrupted` errors. Fails with `WriteZero` if the sink
+    /// repeatedly refuses progress — better to surface that than spin.
+    write_all(mut &this, bytes: Slice<u8>) -> Result<(), IoError> {
+        mut remaining: Slice<u8> = bytes;
+        while (!remaining.is_empty()) {
+            match (this.write(remaining)) {
+                Result::Ok(n) => {
+                    if (n == 0) {
+                        return Result::Err(IoError::new(IoErrorKind::WriteZero, 0));
+                    }
+                    remaining = remaining.subslice(n, remaining.length());
+                }
+                Result::Err(err) => {
+                    match (err.kind) {
+                        IoErrorKind::Interrupted => { }
+                        _ => { return Result::Err(err); }
+                    }
+                }
+            }
+        }
+        return Result::Ok(());
+    }
+}

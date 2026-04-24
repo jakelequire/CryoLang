@@ -3026,15 +3026,8 @@ namespace Cryo
         // Auto-detect stdlib root instead of using hardcoded path
         if (!_module_loader->auto_detect_stdlib_root())
         {
-            // Fallback to relative paths - try new_stdlib first, then stdlib for compatibility
-            if (std::filesystem::exists("./new_stdlib"))
-            {
-                _module_loader->set_stdlib_root("./new_stdlib");
-            }
-            else
-            {
-                _module_loader->set_stdlib_root("./stdlib");
-            }
+            // Fallback to relative path
+            _module_loader->set_stdlib_root("./stdlib");
         }
         _module_loader->set_current_file(_source_file);
 

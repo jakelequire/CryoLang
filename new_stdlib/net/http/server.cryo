@@ -1,0 +1,84 @@
+///! HTTP server — blocking, connection-per-request.
+///!
+///! `serve(addr, handler)` binds, accepts connections in a loop, and
+///! for each one parses a `Request`, calls `handler(req)`, writes
+///! the `Response`, and closes. Handler type is `(Request) -> Response`
+///! — routing lives inside the handler, because a single catch-all
+///! function keeps the server surface tiny and lets users pick
+///! whichever router they want (an enum match, a `HashMap` of paths,
+///! or a full tree matcher).
+///!
+///! Connection-per-request rules out keep-alive and pipelining, on
+///! purpose: it's enough for a dev server and simple tooling, and
+///! it's trivial to reason about.
+
+namespace std::net::http::server;
+
+import core::result;
+import io::error;
+import net::socket_addr;
+import net::tcp;
+import net::http::request;
+import net::http::response;
+
+/// Bind to `addr` and run `handler` for each incoming connection
+/// until a fatal error occurs on the listener. Per-connection errors
+/// (parse failures, client hangups, write errors) are swallowed so
+/// one bad client can't kill the server. Callers who need that
+/// telemetry should instrument `handler` itself.
+function serve(addr: SocketAddr, handler: (Request) -> Response) -> Result<(), IoError> {
+    match (TcpListener::bind(addr)) {
+        Result::Ok(listener) => {
+            mut l: TcpListener = listener;
+            loop {
+                match (l.accept()) {
+                    Result::Ok(stream) => {
+                        mut s: TcpStream = stream;
+                        handle_connection(&s, handler);
+                        s.drop();
+                    }
+                    Result::Err(err) => {
+                        // Listener-level errors (e.g., EMFILE, ENFILE)
+                        // are fatal — return so the caller can log
+                        // and either retry or bail.
+                        l.drop();
+                        return Result::Err(err);
+                    }
+                }
+            }
+        }
+        Result::Err(err) => { return Result::Err(err); }
+    }
+}
+
+/// Parse one request, run the handler, write one response. Errors
+/// are dropped on the floor — a parse failure writes a canned 400,
+/// a handler-level failure writes a canned 500. Writes that fail
+/// mean the peer went away and there's nothing useful to do.
+function handle_connection(stream: mut &TcpStream,
+                           handler: (Request) -> Response) -> void {
+    match (Request::parse(stream)) {
+        Result::Ok(req) => {
+            mut request_local: Request = req;
+            mut response: Response = handler(request_local);
+            match (response.write_to(stream)) {
+                Result::Ok(_) => { }
+                Result::Err(_) => { }
+            }
+            response.drop();
+            // `handler` took ownership of the request; we don't drop it.
+        }
+        Result::Err(_) => {
+            // Malformed request — canned 400.
+            mut bad: Response = Response::text(
+                StatusCode::bad_request(),
+                Str::from_raw("bad request" as u8*, 11)
+            );
+            match (bad.write_to(stream)) {
+                Result::Ok(_) => { }
+                Result::Err(_) => { }
+            }
+            bad.drop();
+        }
+    }
+}

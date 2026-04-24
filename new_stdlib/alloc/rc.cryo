@@ -1,0 +1,103 @@
+///! Rc<T> — single-threaded reference counting.
+///!
+///! `Rc<T>` shares ownership of a heap-allocated value among many
+///! holders. The value lives until the last `Rc` pointing at it calls
+///! `drop`, at which point the storage is freed.
+///!
+///! **Not thread-safe.** The reference count is a plain `u64` with no
+///! synchronization. Sending an `Rc` across threads, or cloning one
+///! from multiple threads at once, is a data race. Use a mutex-wrapped
+///! value when shared mutable access across threads is required.
+///!
+///! `Rc` does not support weak references. Cycles through `Rc` pointers
+///! will leak; callers are responsible for breaking reference cycles
+///! manually.
+
+namespace std::alloc::rc;
+
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import alloc::layout;
+import alloc::allocator;
+
+// ============================================================================
+// RcInner — the heap-allocated header + value
+// ============================================================================
+
+type struct RcInner<T> {
+    count: u64;
+    value: T;
+}
+
+// ============================================================================
+// Rc<T>
+// ============================================================================
+
+type struct Rc<T> {
+    inner: NonNull<RcInner<T>>;
+
+    /// Allocate a new `Rc` with an initial count of 1. Panics if the
+    /// allocator refuses the request — use `try_new` to handle OOM.
+    static new(value: T) -> Rc<T> {
+        match (Rc::try_new(value)) {
+            Result::Ok(r) => { return r; }
+            Result::Err(_) => {
+                intrinsics::panic("Rc::new: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Fallible constructor. Returns `Err(AllocError)` if the allocator
+    /// refuses the request.
+    static try_new(value: T) -> Result<Rc<T>, AllocError> {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const header: Layout = Layout::of<RcInner<T>>();
+        match (alloc.allocate(header)) {
+            Result::Ok(raw) => {
+                const typed: NonNull<RcInner<T>> = raw.cast<RcInner<T>>();
+                const inner_ptr: RcInner<T>* = typed.as_ptr();
+                inner_ptr.count = 1;
+                inner_ptr.value = value;
+                return Result::Ok(Rc<T> { inner: typed });
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    /// Produce another `Rc` pointing at the same value. Increments the
+    /// reference count; the two handles are interchangeable.
+    clone(&this) -> Rc<T> {
+        const inner_ptr: RcInner<T>* = this.inner.as_ptr();
+        inner_ptr.count = inner_ptr.count + 1;
+        return Rc<T> { inner: this.inner };
+    }
+
+    /// Current strong-reference count. Primarily useful for tests and
+    /// assertions — acting on this value in a running program is rarely
+    /// the right move.
+    strong_count(&this) -> u64 {
+        return this.inner.as_ptr().count;
+    }
+
+    /// Raw pointer to the shared value. Valid for as long as *any*
+    /// clone of this `Rc` is still alive; dereferencing after the last
+    /// `drop` is undefined.
+    as_ptr(&this) -> T* {
+        return &this.inner.as_ptr().value;
+    }
+
+    /// Decrement the refcount. When the count reaches zero, the
+    /// underlying storage is freed. Ownership obligation: every `Rc`
+    /// handle must have `drop` called exactly once before it goes out
+    /// of scope.
+    drop(mut &this) -> void {
+        const inner_ptr: RcInner<T>* = this.inner.as_ptr();
+        inner_ptr.count = inner_ptr.count - 1;
+        if (inner_ptr.count == 0) {
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            const header: Layout = Layout::of<RcInner<T>>();
+            alloc.deallocate(this.inner.cast<u8>(), header);
+        }
+    }
+}
