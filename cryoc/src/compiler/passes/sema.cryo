@@ -1157,6 +1157,60 @@ public:
         return merged;
     }
 
+    /// For a scope-resolution callee that denotes an enum variant constructor
+    /// (e.g. `IoResult::Err`, `Option::Some`), return the variant's payload
+    /// types so that args can be resolved with proper expected_type hints.
+    /// Generic enum templates don't populate variants on the template (see
+    /// StructFieldTypeSync), so when the scope resolves to an unspecialized
+    /// generic enum we consult the expected_type to find the concrete
+    /// specialization whose variants carry resolved payload types.
+    lookup_scope_variant_payload_types(&this, scope: ScopeResolutionNode*) -> TypeRef[] {
+        mut type_ref: TypeRef = this.lookup_type_by_sym(scope.scope_name);
+        // If the scope has explicit generic args (e.g., IoResult<u8>::Err),
+        // resolve them to the specialized type.
+        if (scope.scope_generic_args.length > 0) {
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(
+                scope.scope_name, scope.scope_generic_args);
+            if (spec_sym.is_valid()) {
+                const spec_ref: TypeRef = this.lookup_type_by_sym(spec_sym);
+                if (spec_ref.is_valid()) { type_ref = spec_ref; }
+            }
+        }
+        if (!type_ref.is_valid()) { return []; }
+        mut enum_t: Type* = this.arena.lookup(type_ref.id);
+        if (enum_t == null) { return []; }
+        // If the looked-up type is generic (template variants are not
+        // populated per StructFieldTypeSync), try to find the specialized
+        // instantiation via expected_type.  e.g. expected_type =
+        // Option<IoResult<u8>> for outer Option::Some; for inner
+        // IoResult::Err the caller has pushed expected_type = IoResult<u8>.
+        if (enum_t.kind == TypeKind::Enum) {
+            const et: EnumType* = enum_t as EnumType*;
+            if (et.variants.length == 0 && this.expected_type.is_valid()) {
+                mut exp_ref: TypeRef = this.expected_type;
+                mut exp_t: Type* = this.arena.lookup(exp_ref.id);
+                if (exp_t != null && exp_t.kind == TypeKind::TypeAlias) {
+                    const alias: TypeAliasType* = exp_t as TypeAliasType*;
+                    if (alias.has_target()) {
+                        exp_ref = alias.target;
+                        exp_t = this.arena.lookup(exp_ref.id);
+                    }
+                }
+                if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
+                    const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
+                    if (exp_inst.generic_base.id == type_ref.id && exp_inst.has_resolved_type()) {
+                        enum_t = this.arena.lookup(exp_inst.resolved_type.id);
+                    }
+                }
+            }
+        }
+        if (enum_t == null || enum_t.kind != TypeKind::Enum) { return []; }
+        const et: EnumType* = enum_t as EnumType*;
+        const variant: EnumVariantInfo* = et.get_variant(scope.member_name);
+        if (variant == null) { return []; }
+        return variant.payload_types;
+    }
+
     lookup_callee_function_type(&this, callee: ExpressionNode*) -> TypeRef {
         if (callee == null) { return TypeRef::invalid(); }
         const n: ASTNode* = callee as ASTNode*;
@@ -1224,6 +1278,19 @@ public:
                     call.arguments.length);
             }
         }
+        // Enum variant constructors (`Option::Some`, `IoResult::Err`) carry
+        // their param types as the variant's payload_types.  Without this,
+        // nested calls like `Option::Some(IoResult::Err(e))` resolve the
+        // inner `IoResult::Err` with no expected_type — `promote_to_expected_instantiation`
+        // then returns the generic template whose variants were left empty
+        // by StructFieldTypeSync, and codegen bottoms out on a NULL variant.
+        if (param_types.length == 0) {
+            const callee_node: ASTNode* = call.callee as ASTNode*;
+            if (callee_node.kind == NodeKind::ScopeResolution) {
+                param_types = this.lookup_scope_variant_payload_types(
+                    call.callee as ScopeResolutionNode*);
+            }
+        }
         const saved_expected: TypeRef = this.expected_type;
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
             mut push_expected: boolean = false;
@@ -1240,6 +1307,15 @@ public:
                     // fat pointer.  The dynamic-shape branch in
                     // resolve_array_literal adopts the param's shape
                     // when assignable, so the literal lands as `T[]`.
+                    push_expected = true;
+                } else if (arg_node.kind == NodeKind::CallExpression
+                        || arg_node.kind == NodeKind::ScopeResolution) {
+                    // Nested calls and scope references need the param type
+                    // so generic variant/static-method calls can reach their
+                    // concrete instantiation instead of the raw template.
+                    // Only call/scope kinds — Literal, Identifier, etc., have
+                    // their own types and would only get confused (e.g. i32
+                    // literal widening to i64 under a u64 param slot).
                     push_expected = true;
                 }
             }
@@ -1549,11 +1625,14 @@ public:
 
         // Before giving up, check if the member is a field with function type.
         // This handles patterns like `this.read_fn(args)` where read_fn is a
-        // function pointer field, not a method.  Use the unwrapped
-        // type_ref so field lookup works on pointer-of-struct receivers.
-        const field_ret: TypeRef = this.try_field_function_call(lookup_ref, member.member);
+        // function pointer field, not a method.  The MemberAccess node's
+        // resolved_type must stay as the Function type so codegen can emit
+        // an indirect call through the loaded field — we return the
+        // function's return type for the wrapping CallExpression, but
+        // `try_field_function_call` tags the member directly.
+        const field_ret: TypeRef = this.try_field_function_call(
+            lookup_ref, member.member, member);
         if (field_ret.is_valid()) {
-            member.set_resolved_type(field_ret);
             return field_ret;
         }
 
@@ -1571,10 +1650,14 @@ public:
     }
 
     /// Check if a member is a field with function type on a struct/class.
-    /// Returns the function's return type if found, invalid otherwise.
-    /// Handles patterns like `this.read_fn(args)` where read_fn is a
-    /// function pointer field.
-    try_field_function_call(&this, obj_type: TypeRef, field_name: SymbolStr) -> TypeRef {
+    /// Returns the function's return type (for the wrapping CallExpression)
+    /// and, when `member` is non-null, tags it with the field's Function
+    /// type so codegen can emit an indirect call through the loaded field.
+    /// Without the member tag the MemberAccess would look like a regular
+    /// value-typed expression and codegen would chase method lookups for
+    /// the wrapping call instead of loading and calling the field.
+    try_field_function_call(&this, obj_type: TypeRef, field_name: SymbolStr,
+                             member: MemberAccessNode*) -> TypeRef {
         // Dereference through references to get the underlying type
         const t: Type* = this.arena.lookup(obj_type.id);
         if (t == null) { return TypeRef::invalid(); }
@@ -1597,6 +1680,7 @@ public:
                     const ft: Type* = this.arena.lookup(f_type.id);
                     if (ft != null && ft.kind == TypeKind::Function) {
                         const fn_t: FunctionType* = ft as FunctionType*;
+                        if (member != null) { member.set_resolved_type(f_type); }
                         return fn_t.return_type;
                     }
                     return TypeRef::invalid();
@@ -1611,6 +1695,7 @@ public:
                     const ft: Type* = this.arena.lookup(f_type.id);
                     if (ft != null && ft.kind == TypeKind::Function) {
                         const fn_t: FunctionType* = ft as FunctionType*;
+                        if (member != null) { member.set_resolved_type(f_type); }
                         return fn_t.return_type;
                     }
                     return TypeRef::invalid();
@@ -1798,7 +1883,7 @@ public:
             if (arg_ref.is_valid()) {
                 const arg_t: Type* = this.arena.lookup(arg_ref.id);
                 if (arg_t != null) {
-                    arg_displays = arg_displays + [this.arena.format_display(arg_t)];
+                    arg_displays.push(this.arena.format_display(arg_t));
                 } else {
                     return SymbolStr::empty();
                 }
@@ -1918,12 +2003,39 @@ public:
                 exp_t = this.arena.lookup(exp_ref.id);
             }
         }
-        if (exp_t == null || exp_t.kind != TypeKind::InstantiatedType) { return found; }
+        if (exp_t == null) { return found; }
 
-        // Check that the expected type's generic base matches what we found
-        const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
-        if (exp_inst.generic_base.equals(found)) {
-            return exp_ref;
+        // Standard case: expected_type is still an InstantiatedType carrying
+        // the same generic_base as `found` — return it directly.
+        if (exp_t.kind == TypeKind::InstantiatedType) {
+            const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
+            if (exp_inst.generic_base.equals(found)) {
+                return exp_ref;
+            }
+            return found;
+        }
+
+        // Expected_type was already collapsed to the concrete specialization
+        // (Enum/Struct/Class) via `resolved_type`.  Callers that set
+        // expected_type straight from a monomorphized slot land here.  Find
+        // an arena InstantiatedType with generic_base == found whose resolved
+        // type matches exp_ref and return that specialization directly —
+        // that way codegen's enum-variant branch reaches an Enum whose
+        // variants were populated by the monomorphizer instead of bottoming
+        // out on the (empty-variants) template.
+        if (exp_t.kind == TypeKind::Enum || exp_t.kind == TypeKind::Struct
+                || exp_t.kind == TypeKind::Class) {
+            const count: i64 = this.arena.type_count();
+            for (mut i: i64 = 0; i < count; i++) {
+                const t: Type* = this.arena.types[i];
+                if (t == null || t.kind != TypeKind::InstantiatedType) { continue; }
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                if (!inst.generic_base.equals(found)) { continue; }
+                if (!inst.has_resolved_type()) { continue; }
+                if (inst.resolved_type.id == exp_ref.id) {
+                    return exp_ref;
+                }
+            }
         }
 
         return found;

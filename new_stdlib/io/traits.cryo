@@ -61,6 +61,125 @@ type trait Read {
         return Result::Ok(total);
     }
 
+    /// Read a single byte. `None` means EOF — the source is empty
+    /// and no more reads will yield data. Retries on `Interrupted`.
+    read_byte(mut &this) -> Result<Option<u8>, IoError> {
+        mut byte: u8 = 0;
+        loop {
+            match (this.read(&byte, 1)) {
+                Result::Ok(n) => {
+                    if (n == 0) { return Result::Ok(Option::None); }
+                    return Result::Ok(Option::Some(byte));
+                }
+                Result::Err(err) => {
+                    match (err.kind) {
+                        IoErrorKind::Interrupted => { }
+                        _ => { return Result::Err(err); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read a single UTF-8 Unicode scalar and return its codepoint.
+    /// `None` is EOF before the first byte of the scalar. A partial
+    /// scalar (first byte read, continuation missing) fails with
+    /// `UnexpectedEof`; a malformed leading byte or continuation
+    /// fails with `InvalidData`. Surrogates (0xD800..=0xDFFF)
+    /// likewise fail with `InvalidData` — they are not valid Unicode
+    /// scalars.
+    read_char(mut &this) -> Result<Option<u32>, IoError> {
+        mut lead: u8 = 0;
+        match (this.read_byte()) {
+            Result::Ok(maybe) => {
+                match (maybe) {
+                    Option::None => { return Result::Ok(Option::None); }
+                    Option::Some(byte) => { lead = byte; }
+                }
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+
+        // ASCII fast path.
+        if (lead < 0x80) {
+            return Result::Ok(Option::Some(lead as u32));
+        }
+
+        // Decide continuation count and starting scalar bits from
+        // the leading byte's high prefix.
+        mut needed: u64 = 0;
+        mut scalar: u32 = 0;
+        if ((lead & 0xE0) == 0xC0) {
+            needed = 1;
+            scalar = (lead & 0x1F) as u32;
+        } else if ((lead & 0xF0) == 0xE0) {
+            needed = 2;
+            scalar = (lead & 0x0F) as u32;
+        } else if ((lead & 0xF8) == 0xF0) {
+            needed = 3;
+            scalar = (lead & 0x07) as u32;
+        } else {
+            // 10xxxxxx (orphan continuation) or 11111xxx (out of range).
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+
+        mut continuation: u8[3];
+        match (this.read_exact(&continuation[0], needed)) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        mut i: u64 = 0;
+        while (i < needed) {
+            const byte: u8 = continuation[i];
+            if ((byte & 0xC0) != 0x80) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            scalar = (scalar << 6) | ((byte & 0x3F) as u32);
+            i++;
+        }
+
+        // Reject surrogates and values above the Unicode range.
+        if (scalar >= 0xD800 && scalar <= 0xDFFF) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+        if (scalar > 0x10FFFF) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+        return Result::Ok(Option::Some(scalar));
+    }
+
+    /// Read bytes into `out` until `delimiter` is seen or EOF. The
+    /// delimiter byte is included in `out`. Returns the number of
+    /// bytes appended.
+    ///
+    /// Byte-level; the loop runs `read(..., 1)` so the stop point is
+    /// precise. Use `BufReader::read_until` for a fast-path version
+    /// over a buffered source.
+    read_until(mut &this, delimiter: u8, out: mut &Array<u8>) -> Result<u64, IoError> {
+        const start: u64 = out.length();
+        loop {
+            match (this.read_byte()) {
+                Result::Ok(maybe) => {
+                    match (maybe) {
+                        Option::None => { return Result::Ok(out.length() - start); }
+                        Option::Some(byte) => {
+                            match (out.try_push(byte)) {
+                                Result::Ok(_) => { }
+                                Result::Err(_) => {
+                                    return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+                                }
+                            }
+                            if (byte == delimiter) {
+                                return Result::Ok(out.length() - start);
+                            }
+                        }
+                    }
+                }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+    }
+
     /// Read exactly `length` bytes. A short read at EOF is a failure,
     /// reported as `UnexpectedEof`. Use this when the caller knows the
     /// precise number of bytes that must be present.
@@ -98,6 +217,36 @@ type trait Read {
                             return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
                         }
                     }
+                }
+                Result::Err(err) => {
+                    match (err.kind) {
+                        IoErrorKind::Interrupted => { }
+                        _ => { return Result::Err(err); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read every remaining byte into `out` as UTF-8. Convenience
+    /// wrapper around `read_to_end` for the common "slurp text from
+    /// this source" case. The bytes are **not** validated — the
+    /// caller certifies the source is UTF-8 (or accepts the
+    /// consequences of invalid continuation bytes in a `String`).
+    read_to_string(mut &this, out: mut &String) -> Result<u64, IoError> {
+        mut scratch: u8[READ_TO_END_CHUNK];
+        mut total: u64 = 0;
+        loop {
+            match (this.read(&scratch[0], READ_TO_END_CHUNK)) {
+                Result::Ok(n) => {
+                    if (n == 0) { return Result::Ok(total); }
+                    match (out.try_push_str(Str::from_raw(&scratch[0], n))) {
+                        Result::Ok(_) => { }
+                        Result::Err(_) => {
+                            return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+                        }
+                    }
+                    total = total + n;
                 }
                 Result::Err(err) => {
                     match (err.kind) {
@@ -177,5 +326,24 @@ type trait Write {
             }
         }
         return Result::Ok(());
+    }
+
+    /// Write every byte of `source`. Convenience over `write_all` for
+    /// the common "write a pre-formatted string" case — the bytes are
+    /// the `Str`'s underlying UTF-8, no extra work.
+    write_str(mut &this, source: Str) -> Result<(), IoError> {
+        return this.write_all(source.as_bytes());
+    }
+
+    /// Write `source` followed by `\n`. Single logical line of text;
+    /// whether it arrives in one syscall depends on the sink's
+    /// buffering strategy.
+    write_line(mut &this, source: Str) -> Result<(), IoError> {
+        match (this.write_all(source.as_bytes())) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        const lf: u8[1] = [0x0A];
+        return this.write_all(Slice::from_raw(&lf[0], 1));
     }
 }

@@ -1,32 +1,191 @@
 ///! Standard streams — `stdin`, `stdout`, `stderr`.
 ///!
-///! Thin wrappers over the POSIX file descriptors 0, 1, 2. All three
-///! go through `io::fd::read_fd` / `write_fd` directly; no
-///! buffering, because the caller composes a buffered writer on top
-///! when they need one. That keeps the base types honest and
-///! composable — a buffered writer is just `Write + storage`.
+///! Three thin handles over POSIX file descriptors 0, 1, 2. Each
+///! implements `Read` or `Write` (or both conceptually, in the case
+///! of `/dev/tty`-backed terminal I/O), inheriting every default
+///! method on those traits — `read_line`, `read_to_string`,
+///! `read_to_end`, `write_line`, `write_all`, etc. — without repeat
+///! boilerplate per handle.
+///!
+///! No buffering at this layer. `stdout()` and `stderr()` translate
+///! to raw `write(2)` calls. Callers who want buffering compose it
+///! explicitly:
+///!
+///! ```cryo
+///! mut out: Stdout = stdout();
+///! mut buffered: LineWriter<Stdout> = LineWriter::new(&out);
+///! // ... use buffered ...
+///! buffered.drop();  // flushes before releasing the heap buffer
+///! ```
+///!
+///! That composition stays honest: the base types are cheap
+///! (zero-sized, free to construct, free to copy) and the buffering
+///! cost appears where it actually happens.
+///!
+///! # What lives on the handles vs. on `Read` / `Write`
+///!
+///! The handles add only the things that are genuinely
+///! stdio-specific: `is_tty`, `as_fd`, and (on `Stdin`) the
+///! interactive shortcuts `line` and `prompt`. Everything else —
+///! `read_byte`, `read_char`, `read_until`, `read_line`,
+///! `read_to_string`, `write_str`, `write_line`, `write_all` — lives
+///! on the `Read` / `Write` traits as defaults, because `Stdin` is
+///! not special in its byte-pumping behaviour. A `File` or a
+///! `TcpStream` or a `BufReader` gets the same methods for free.
+///!
+///! # Locking — future work
+///!
+///! Cryo is single-threaded today, so interleaving between
+///! concurrent writers is not yet a concern. When threads arrive,
+///! this module gains `Stdout::lock() -> StdoutLock` and
+///! `Stdin::lock() -> StdinLock` that serialize access through a
+///! process-global mutex (matching Rust's surface). Handle methods
+///! today are forward-compatible with that model — callers that
+///! only hold the bare handle still get the right behaviour because
+///! the lock is acquired per-syscall.
 
 namespace std::io::stdio;
 
 import core::option;
 import core::result;
 import core::slice;
+import collections::str;
+import collections::string;
 import io::error;
 import io::fd;
 import io::traits;
 
-const STDIN_FD: i32 = 0;
+// ============================================================================
+// FD constants
+// ============================================================================
+
+const STDIN_FD:  i32 = 0;
 const STDOUT_FD: i32 = 1;
 const STDERR_FD: i32 = 2;
+
+// ============================================================================
+// Line-ending primitives
+// ============================================================================
+
+/// ASCII line feed byte. Emitted by every `write_line` /
+/// `println` path in the stdlib.
+const LINE_FEED: u8 = 0x0A;
+
+/// Single-byte newline slice. Callers use this for explicit
+/// "terminate this line" writes without constructing a one-element
+/// stack array at each site.
+const NEWLINE_BYTES: u8* = "\n" as u8*;
+const NEWLINE: Str = Str::from_raw("\n" as u8*, 1);
+
+// ============================================================================
+// libc bindings
+// ============================================================================
+
+extern "C" {
+    /// Returns 1 iff `fd` refers to a terminal device, 0 otherwise.
+    /// Errno on failure is not distinguished — callers treat any
+    /// non-1 return as "not a TTY".
+    function isatty(fd: i32) -> i32;
+}
+
+/// True iff `fd` is a terminal. Used to choose line-buffered vs
+/// block-buffered output, to enable ANSI color, or to gate
+/// interactive prompts.
+function is_tty(fd: i32) -> boolean {
+    return isatty(fd) == 1;
+}
 
 // ============================================================================
 // Stdin
 // ============================================================================
 
-type struct Stdin { }
-
 /// Handle to process standard input. Construction is free — all
-/// instances dispatch to file descriptor 0.
+/// instances dispatch to file descriptor 0. Unbuffered: a line
+/// read that needs minimum syscalls should wrap this in a
+/// `BufReader<Stdin>` from `io::buf`.
+type struct Stdin {
+    /// True if stdin is attached to a terminal. False when piped,
+    /// redirected, or closed.
+    is_tty(&this) -> boolean {
+        return isatty(STDIN_FD) == 1;
+    }
+
+    /// Underlying file descriptor. Exposed for interop with code
+    /// that still needs to pass fd 0 to a system call directly.
+    as_fd(&this) -> i32 {
+        return STDIN_FD;
+    }
+
+    /// Read one line of input and return it as an owned `String`
+    /// with the trailing `\n` (and a preceding `\r`, if any)
+    /// stripped. `None` means EOF before any bytes were read.
+    ///
+    /// This is the handle-level shortcut for the common "ask the
+    /// user a thing" pattern — stripping newlines is what callers
+    /// almost always want and forgetting to do so is a common bug.
+    /// Callers who need the raw line go through the `Read` trait's
+    /// `read_line` instead.
+    line(mut &this) -> Result<Option<String>, IoError> {
+        mut buffer: String = String::new();
+        match (this.read_line(&buffer)) {
+            Result::Ok(n) => {
+                if (n == 0) {
+                    buffer.drop();
+                    return Result::Ok(Option::None);
+                }
+                mut trimmed: u64 = buffer.length();
+                if (trimmed > 0) {
+                    match (buffer.as_bytes().get(trimmed - 1)) {
+                        Option::Some(byte) => {
+                            if (byte == 0x0A) {
+                                trimmed = trimmed - 1;
+                                if (trimmed > 0) {
+                                    match (buffer.as_bytes().get(trimmed - 1)) {
+                                        Option::Some(prev) => {
+                                            if (prev == 0x0D) {
+                                                trimmed = trimmed - 1;
+                                            }
+                                        }
+                                        Option::None => { }
+                                    }
+                                }
+                            }
+                        }
+                        Option::None => { }
+                    }
+                }
+                buffer.truncate(trimmed);
+                return Result::Ok(Option::Some(buffer));
+            }
+            Result::Err(err) => {
+                buffer.drop();
+                return Result::Err(err);
+            }
+        }
+    }
+
+    /// Write `prompt_msg` to **stderr** and read one line from
+    /// stdin, trailing newline stripped. The prompt goes to stderr
+    /// (not stdout) so piping the program's output doesn't capture
+    /// the prompt text — the convention every well-behaved CLI
+    /// follows.
+    ///
+    /// `None` if the user closed stdin (Ctrl-D) before typing.
+    prompt(mut &this, prompt_msg: Str) -> Result<Option<String>, IoError> {
+        mut err_handle: Stderr = stderr();
+        match (err_handle.write_all(prompt_msg.as_bytes())) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        match (err_handle.flush()) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        return this.line();
+    }
+}
+
+/// Handle for process standard input.
 function stdin() -> Stdin {
     return Stdin { };
 }
@@ -41,7 +200,18 @@ implement trait Read for struct Stdin {
 // Stdout
 // ============================================================================
 
-type struct Stdout { }
+/// Handle to process standard output. Unbuffered — wrap in
+/// `LineWriter<Stdout>` or `BufWriter<Stdout>` from `io::buf` for
+/// the common "coalesce many small writes" case.
+type struct Stdout {
+    is_tty(&this) -> boolean {
+        return isatty(STDOUT_FD) == 1;
+    }
+
+    as_fd(&this) -> i32 {
+        return STDOUT_FD;
+    }
+}
 
 function stdout() -> Stdout {
     return Stdout { };
@@ -63,7 +233,19 @@ implement trait Write for struct Stdout {
 // Stderr
 // ============================================================================
 
-type struct Stderr { }
+/// Handle to process standard error. Unbuffered by convention so
+/// diagnostics appear immediately — do **not** wrap in `BufWriter`
+/// unless you also guarantee a flush on every path that might
+/// panic or `exit`.
+type struct Stderr {
+    is_tty(&this) -> boolean {
+        return isatty(STDERR_FD) == 1;
+    }
+
+    as_fd(&this) -> i32 {
+        return STDERR_FD;
+    }
+}
 
 function stderr() -> Stderr {
     return Stderr { };
