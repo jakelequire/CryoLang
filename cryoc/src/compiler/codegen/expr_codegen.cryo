@@ -114,7 +114,7 @@ function codegen_identifier(cg: CodegenContext*, node: IdentifierNode*,
     }
 
     // Try global.
-    const global: LValue = cg.get_global(node.name);
+    const global: LValue = resolve_global(cg, node.name);
     if (global.is_valid()) {
         *out_value = global;
         *out_is_lvalue = true;
@@ -122,7 +122,7 @@ function codegen_identifier(cg: CodegenContext*, node: IdentifierNode*,
     }
 
     // Try function (for function references / first-class functions).
-    const func: LValue = cg.get_function(node.name);
+    const func: LValue = resolve_function(cg, node.name);
     if (func.is_valid()) {
         *out_value = func;
         *out_is_lvalue = false;
@@ -193,7 +193,7 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             const intern: InternTable* = cg.get_intern();
             const fn_sym: SymbolStr = intern.intern(
                 "std::core::primitives::string::append");
-            const fn_val: LValue = cg.get_function(fn_sym);
+            const fn_val: LValue = resolve_function(cg, fn_sym);
             if (!fn_val.is_valid()) {
                 printf("[IRGen] WARNING: string concat — append not declared\n"); fflush(null);
                 *out_value = LValue::null();
@@ -248,6 +248,30 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
         printf("[IRGen] WARNING: binary op — unsupported result type kind %d\n", t_kind as i32); fflush(null);
         *out_value = LValue::null();
         return;
+    }
+
+    // Pointer + int / Pointer - int → GEP over the pointee type.
+    // LLVM rejects `add ptr, i64`; the arithmetic must be expressed
+    // as a getelementptr with a scaled integer index.  Matches the
+    // string-plus-int path above but for typed pointers (`i8*`, `u8*`
+    // etc. used for C-string or buffer walking).
+    if (t_kind == TypeKind::Pointer &&
+        (op_kind == TokenType::Plus || op_kind == TokenType::Minus)) {
+        const ptr_t: PointerType* = t as PointerType*;
+        const pointee_lty: LType = cg.type_mapper.map_type(ptr_t.pointee);
+        if (pointee_lty.is_valid()) {
+            mut idx: LValue = rhs_val;
+            if (op_kind == TokenType::Minus) {
+                idx = cg.builder.build_neg(rhs_val, "gep.neg");
+            }
+            const buf: void* = malloc(8);
+            const slots: void** = buf as void**;
+            slots[0] = idx.raw;
+            *out_value = cg.builder.build_gep(
+                pointee_lty, lhs_val, buf, 1, "ptradv");
+            free(buf);
+            return;
+        }
     }
 
     const is_float: boolean = t_kind == TypeKind::Float;
@@ -473,6 +497,15 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                     const tmp: LValue = cg.builder.build_alloca(st, "arg.ref");
                     cg.builder.build_store(arg_val, tmp);
                     arg_val = tmp;
+                } else if (ek == 10 && ak == 12) {
+                    // Expected struct by value (10), actual ptr (12): load
+                    // the struct from the pointer.  Handles by-value struct
+                    // args where the caller has the struct via a pointer
+                    // field or local (e.g. `ctx.diagnostics` typed as
+                    // `DiagnosticSink*` being passed to a function that
+                    // takes `DiagnosticSink` by value).
+                    const st: LType = LType { raw: expected_ty };
+                    arg_val = cg.builder.build_load(st, arg_val, "arg.deref");
                 } else if (ek == 12 && ak == 8) {
                     // Expected ptr (12), actual integer: inttoptr.
                     const target: LType = LType { raw: expected_ty };
@@ -1007,7 +1040,7 @@ function codegen_string_compare(cg: CodegenContext*, lhs: LValue, rhs: LValue,
     const intern: InternTable* = cg.get_intern();
     const strcmp_name: string = "strcmp";
     const strcmp_sym: SymbolStr = intern.intern(strcmp_name);
-    mut strcmp_fn: LValue = cg.get_function(strcmp_sym);
+    mut strcmp_fn: LValue = resolve_function(cg, strcmp_sym);
     if (!strcmp_fn.is_valid()) {
         const i8_ptr: LType = LType::pointer_to(LType::i8());
         const param_buf: void* = malloc(16);

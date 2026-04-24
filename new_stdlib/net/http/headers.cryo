@@ -1,0 +1,150 @@
+///! HTTP headers — case-insensitive name/value map.
+///!
+///! Names are canonicalized to lowercase on insert so case-insensitive
+///! lookup is just `HashMap::get` with a lowercase key. Values are
+///! stored verbatim — folding, whitespace collapsing, and multi-value
+///! comma-splitting are caller concerns.
+
+namespace std::net::http::headers;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::hash;
+import core::cmp;
+import core::slice;
+import io::error;
+import io::traits;
+import collections::str;
+import collections::string;
+import collections::hash_map;
+
+type struct Headers {
+    inner: HashMap<String, String>;
+
+    static new() -> Headers {
+        return Headers { inner: HashMap::new() };
+    }
+
+    length(&this) -> u64 {
+        return this.inner.length();
+    }
+
+    is_empty(&this) -> boolean {
+        return this.inner.is_empty();
+    }
+
+    /// Insert or replace. Name is normalized to lowercase; value is
+    /// stored verbatim. Ownership of both values transfers to the
+    /// headers map.
+    insert(mut &this, name: Str, value: Str) -> void {
+        mut key: String = name.to_ascii_lowercase();
+        mut val: String = String::from_str(value);
+        this.inner.insert(key, val);
+    }
+
+    /// Case-insensitive lookup. Returns an owned copy of the stored
+    /// value — header values are small, so copy-on-read is cheap and
+    /// keeps the API simple.
+    get(&this, name: Str) -> Option<String> {
+        mut key: String = name.to_ascii_lowercase();
+        const result: Option<String> = this.inner.get(&key);
+        key.drop();
+        return result;
+    }
+
+    contains(&this, name: Str) -> boolean {
+        return this.get(name).is_some();
+    }
+
+    remove(mut &this, name: Str) -> boolean {
+        mut key: String = name.to_ascii_lowercase();
+        const result: Option<String> = this.inner.remove(&key);
+        key.drop();
+        match (result) {
+            Option::Some(mut value) => {
+                value.drop();
+                return true;
+            }
+            Option::None => { return false; }
+        }
+    }
+
+    /// Parse a single `Name: Value` header line (no CRLF). Used by
+    /// the request parser. Returns `None` on malformed input; the
+    /// caller turns that into a 400.
+    parse_line(mut &this, line: Str) -> boolean {
+        mut colon: u64 = line.length();
+        mut i: u64 = 0;
+        while (i < line.length()) {
+            match (line.byte_at(i)) {
+                Option::Some(byte) => {
+                    if (byte == 0x3A) { colon = i; break; }
+                }
+                Option::None => { return false; }
+            }
+            i++;
+        }
+        if (colon == line.length()) { return false; }
+        const name_part: Str = line.sub_bytes(0, colon);
+        // Skip any leading whitespace in the value.
+        mut start: u64 = colon + 1;
+        while (start < line.length()) {
+            match (line.byte_at(start)) {
+                Option::Some(byte) => {
+                    if (byte != 0x20 && byte != 0x09) { break; }
+                }
+                Option::None => { return false; }
+            }
+            start = start + 1;
+        }
+        const value_part: Str = line.sub_bytes(start, line.length());
+        this.insert(name_part, value_part);
+        return true;
+    }
+
+    /// Serialize all stored headers as HTTP/1.1 field lines:
+    /// `name: value\r\n` for every entry. The caller is responsible
+    /// for writing the trailing blank-line CRLF that separates
+    /// headers from the message body.
+    write_to<W>(&this, writer: mut &W) -> Result<(), IoError>
+    where W: Write {
+        const colon_sp: Slice<u8> = Slice::from_raw(": " as u8*, 2);
+        const crlf: Slice<u8> = Slice::from_raw("\r\n" as u8*, 2);
+        const count: u64 = this.inner.bucket_count();
+        mut i: u64 = 0;
+        while (i < count) {
+            mut node: hash_map::Entry<String, String>* = this.inner.get_bucket(i);
+            loop {
+                if (node == null) { break; }
+                match (writer.write_all(node.key.as_bytes())) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                match (writer.write_all(colon_sp)) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                match (writer.write_all(node.value.as_bytes())) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                match (writer.write_all(crlf)) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                node = node.next;
+            }
+            i++;
+        }
+        return Result::Ok(());
+    }
+
+    /// Drop every stored header. Ownership obligation: every Headers
+    /// must have `drop` called before going out of scope.
+    drop(mut &this) -> void {
+        // HashMap::clear doesn't drop K/V; do it ourselves.
+        // Walk the map by repeatedly removing
+        // an arbitrary entry. Chaining + first-bucket traversal would
+        // be faster but needs iterator support.
+        this.inner.drop();
+    }
+}
+
+// `to_lowercase` now lives as `Str::to_ascii_lowercase` in `collections::str`.

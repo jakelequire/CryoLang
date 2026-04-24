@@ -1,0 +1,655 @@
+///! Command — builder for spawning a subprocess.
+///!
+///! The typical flow:
+///!
+///! ```cryo
+///! mut cmd: Command = Command::new(Str::from_raw("ls" as u8*, 2));
+///! cmd.arg(Str::from_raw("-la" as u8*, 3));
+///! cmd.stdout(Stdio::Piped);
+///! mut child: Child = cmd.spawn().unwrap();
+///! // read from child.stdout, wait, etc.
+///! cmd.drop();
+///! ```
+///!
+///! Under the hood: fork(), adjust fds and env in the child, execvp.
+///! If execvp fails the child `_exit(127)`s so the parent sees a
+///! status of 127 — the standard "exec not found" code.
+
+namespace std::process::command;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+import io::fd;
+import io::traits;
+import collections::array;
+import collections::str;
+import collections::string;
+import alloc::allocator;
+import ffi::cstr;
+import process::child;
+import env;
+
+extern "C" {
+    function fork() -> i32;
+    function execvp(file: u8*, argv: u8**) -> i32;
+    function pipe(fds: i32*) -> i32;
+    function dup2(oldfd: i32, newfd: i32) -> i32;
+    function chdir(path: u8*) -> i32;
+    function _exit(status: i32) -> void;
+}
+
+// ============================================================================
+// Stdio
+// ============================================================================
+
+/// How a child's stdin / stdout / stderr is wired up.
+type enum Stdio {
+    /// Share the parent's fd (the default).
+    Inherit;
+    /// Redirect to / from `/dev/null`.
+    Null;
+    /// Create a pipe; the parent keeps its end in the resulting
+    /// `Child::stdin` / `stdout` / `stderr`.
+    Piped;
+    /// Use a specific fd. Ownership transfers — the spawn closes
+    /// the fd in the parent after duping it into the child.
+    Fd(i32);
+}
+
+// ============================================================================
+// EnvEntry
+// ============================================================================
+
+type struct EnvEntry {
+    key: String;
+    value: String;
+
+    drop(mut &this) -> void {
+        this.key.drop();
+        this.value.drop();
+    }
+}
+
+// ============================================================================
+// Command
+// ============================================================================
+
+type struct Command {
+    program: String;
+    args: Array<String>;
+    envs: Array<EnvEntry>;
+    clear_env_flag: boolean;
+    cwd: Option<String>;
+    stdin_cfg: Stdio;
+    stdout_cfg: Stdio;
+    stderr_cfg: Stdio;
+
+    /// Start a new command targeting `program`. The program name is
+    /// resolved against `$PATH` by `execvp` at spawn time — pass an
+    /// absolute path to skip the lookup.
+    static new(program: Str) -> Command {
+        return Command {
+            program: String::from_str(program),
+            args: Array::new(),
+            envs: Array::new(),
+            clear_env_flag: false,
+            cwd: Option::None,
+            stdin_cfg: Stdio::Inherit,
+            stdout_cfg: Stdio::Inherit,
+            stderr_cfg: Stdio::Inherit
+        };
+    }
+
+    arg(mut &this, value: Str) -> void {
+        this.args.push(String::from_str(value));
+    }
+
+    env(mut &this, key: Str, value: Str) -> void {
+        this.envs.push(EnvEntry {
+            key: String::from_str(key),
+            value: String::from_str(value)
+        });
+    }
+
+    /// Don't inherit the parent's environment. Only the entries added
+    /// with `env()` reach the child.
+    env_clear(mut &this) -> void {
+        this.clear_env_flag = true;
+    }
+
+    cwd(mut &this, path: Str) -> void {
+        match (this.cwd) {
+            Option::Some(mut old) => { old.drop(); }
+            Option::None => { }
+        }
+        this.cwd = Option::Some(String::from_str(path));
+    }
+
+    stdin(mut &this, setting: Stdio) -> void { this.stdin_cfg = setting; }
+    stdout(mut &this, setting: Stdio) -> void { this.stdout_cfg = setting; }
+    stderr(mut &this, setting: Stdio) -> void { this.stderr_cfg = setting; }
+
+    // ========================================================================
+    // Spawning
+    // ========================================================================
+
+    /// fork + configure fds/env + execvp. Returns a `Child` the
+    /// caller must eventually `wait` on.
+    spawn(&this) -> Result<Child, IoError> {
+        return spawn_impl(this);
+    }
+
+    /// spawn + wait + collect stdout/stderr into arrays. Stdin is
+    /// left `Inherit` (or whatever the caller set). Use this for the
+    /// common "run this and tell me what it printed" case.
+    output(&this) -> Result<Output, IoError> {
+        // Force stdout + stderr to Piped so we can capture them.
+        mut configured: Command = clone_command(this);
+        configured.stdout_cfg = Stdio::Piped;
+        configured.stderr_cfg = Stdio::Piped;
+        const spawned: Result<Child, IoError> = configured.spawn();
+        configured.drop();
+        match (spawned) {
+            Result::Ok(handle) => {
+                mut c: Child = handle;
+                return collect_output(&c);
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    /// spawn + wait. Stdin/out/err go wherever the caller configured
+    /// (typically Inherit).
+    status(&this) -> Result<ExitStatus, IoError> {
+        match (this.spawn()) {
+            Result::Ok(handle) => {
+                mut c: Child = handle;
+                const result: Result<ExitStatus, IoError> = c.wait();
+                c.drop();
+                return result;
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    drop(mut &this) -> void {
+        this.program.drop();
+        // Drain + drop args.
+        loop {
+            match (this.args.pop()) {
+                Option::Some(mut s) => { s.drop(); }
+                Option::None => { break; }
+            }
+        }
+        this.args.drop();
+        loop {
+            match (this.envs.pop()) {
+                Option::Some(mut entry) => { entry.drop(); }
+                Option::None => { break; }
+            }
+        }
+        this.envs.drop();
+        match (this.cwd) {
+            Option::Some(mut path) => { path.drop(); }
+            Option::None => { }
+        }
+        this.cwd = Option::None;
+    }
+}
+
+// ============================================================================
+// Output — the result of `Command::output()`
+// ============================================================================
+
+type struct Output {
+    public status: ExitStatus;
+    public stdout: Array<u8>;
+    public stderr: Array<u8>;
+
+    drop(mut &this) -> void {
+        this.stdout.drop();
+        this.stderr.drop();
+    }
+}
+
+// ============================================================================
+// Implementation
+// ============================================================================
+
+/// Pipe-pair struct. `read_end` is what the reader uses;
+/// `write_end` is what the writer uses. Both `-1` means no pipe was
+/// created (Stdio was Inherit/Null/Fd).
+type struct PipePair {
+    read_end: i32;
+    write_end: i32;
+}
+
+function make_pipe_pair() -> PipePair {
+    return PipePair { read_end: -1, write_end: -1 };
+}
+
+/// Call pipe(2) and populate `pair`. Returns an IoError on failure.
+function create_pipe() -> Result<PipePair, IoError> {
+    mut fds: i32[2];
+    if (pipe(&fds[0]) < 0) {
+        return Result::Err(IoError::from_errno(fd::errno()));
+    }
+    return Result::Ok(PipePair { read_end: fds[0], write_end: fds[1] });
+}
+
+/// Build the pipe pair for a given Stdio setting. No-op for
+/// Inherit/Null/Fd.
+function prepare_stdio(setting: Stdio) -> Result<PipePair, IoError> {
+    return match (setting) {
+        Stdio::Piped => { create_pipe() }
+        _            => { Result::Ok(make_pipe_pair()) }
+    }
+}
+
+/// After fork, in the child: replace `target_fd` (0/1/2) according
+/// to `setting`. Returns false if the remap failed.
+function child_remap(setting: Stdio, pipe: &PipePair, target_fd: i32,
+                     is_input: boolean) -> boolean {
+    match (setting) {
+        Stdio::Inherit => { return true; }
+        Stdio::Null => {
+            const flags: i32 = 0;
+            mut nullfd: i32 = 0;
+            if (is_input) {
+                nullfd = fd::open("/dev/null" as u8*, fd::O_RDONLY, 0);
+            } else {
+                nullfd = fd::open("/dev/null" as u8*, fd::O_WRONLY, 0);
+            }
+            if (nullfd < 0) { return false; }
+            if (dup2(nullfd, target_fd) < 0) { return false; }
+            fd::close_fd(nullfd);
+            return true;
+        }
+        Stdio::Piped => {
+            const src: i32 = (is_input ? pipe.read_end : pipe.write_end);
+            if (dup2(src, target_fd) < 0) { return false; }
+            // Close both ends after dup2 — the target_fd now refers
+            // to whichever end we wanted.
+            if (pipe.read_end >= 0) { fd::close_fd(pipe.read_end); }
+            if (pipe.write_end >= 0) { fd::close_fd(pipe.write_end); }
+            return true;
+        }
+        Stdio::Fd(raw) => {
+            if (dup2(raw, target_fd) < 0) { return false; }
+            fd::close_fd(raw);
+            return true;
+        }
+    }
+}
+
+/// Build an argv u8** array from (program, args). `storage` keeps
+/// the CStrings alive; the returned Array<u8*> aliases into them.
+function build_argv(program: &String,
+                    args: &Array<String>,
+                    storage: mut &Array<CString>,
+                    argv: mut &Array<u8*>) -> Result<(), IoError> {
+    match (CString::from_str(program.as_str())) {
+        Result::Ok(c_program) => {
+            storage.push(c_program);
+            argv.push(storage.get(storage.length() - 1).unwrap().as_ptr());
+        }
+        Result::Err(_) => {
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
+    }
+    mut i: u64 = 0;
+    while (i < args.length()) {
+        match (args.get(i)) {
+            Option::Some(arg) => {
+                match (CString::from_str(arg.as_str())) {
+                    Result::Ok(c_arg) => {
+                        storage.push(c_arg);
+                        argv.push(storage.get(storage.length() - 1).unwrap().as_ptr());
+                    }
+                    Result::Err(_) => {
+                        return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+                    }
+                }
+            }
+            Option::None => { break; }
+        }
+        i++;
+    }
+    argv.push(null);
+    return Result::Ok(());
+}
+
+/// Apply env overrides inside the child. `clear_env` wipes the
+/// inherited environment first. Called after fork, before exec.
+function apply_env(clear_env: boolean,
+                   envs: &Array<EnvEntry>) -> boolean {
+    if (clear_env) {
+        env::clearenv();
+    }
+    mut i: u64 = 0;
+    while (i < envs.length()) {
+        match (envs.get(i)) {
+            Option::Some(entry) => {
+                // CString is heap — but this is post-fork, single-
+                // threaded, so malloc is fine. If it fails we just
+                // propagate the error.
+                match (CString::from_str(entry.key.as_str())) {
+                    Result::Ok(c_key) => {
+                        mut key: CString = c_key;
+                        match (CString::from_str(entry.value.as_str())) {
+                            Result::Ok(c_value) => {
+                                mut value: CString = c_value;
+                                if (env::setenv(key.as_ptr(), value.as_ptr(), 1) < 0) {
+                                    key.drop();
+                                    value.drop();
+                                    return false;
+                                }
+                                key.drop();
+                                value.drop();
+                            }
+                            Result::Err(_) => {
+                                key.drop();
+                                return false;
+                            }
+                        }
+                    }
+                    Result::Err(_) => { return false; }
+                }
+            }
+            Option::None => { break; }
+        }
+        i++;
+    }
+    return true;
+}
+
+function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
+    // 1. Prepare pipes in the parent.
+    mut stdin_pipe: PipePair = make_pipe_pair();
+    match (prepare_stdio(cmd.stdin_cfg)) {
+        Result::Ok(p) => { stdin_pipe = p; }
+        Result::Err(err) => { return Result::Err(err); }
+    }
+    mut stdout_pipe: PipePair = make_pipe_pair();
+    match (prepare_stdio(cmd.stdout_cfg)) {
+        Result::Ok(p) => { stdout_pipe = p; }
+        Result::Err(err) => {
+            close_pipe(&stdin_pipe);
+            return Result::Err(err);
+        }
+    }
+    mut stderr_pipe: PipePair = make_pipe_pair();
+    match (prepare_stdio(cmd.stderr_cfg)) {
+        Result::Ok(p) => { stderr_pipe = p; }
+        Result::Err(err) => {
+            close_pipe(&stdin_pipe);
+            close_pipe(&stdout_pipe);
+            return Result::Err(err);
+        }
+    }
+
+    // 2. Build argv (parent-side; child inherits via fork COW).
+    mut argv_storage: Array<CString> = Array::new();
+    mut argv: Array<u8*> = Array::new();
+    match (build_argv(&cmd.program, &cmd.args, &argv_storage, &argv)) {
+        Result::Ok(_) => { }
+        Result::Err(err) => {
+            close_pipe(&stdin_pipe);
+            close_pipe(&stdout_pipe);
+            close_pipe(&stderr_pipe);
+            drop_cstring_array(&argv_storage);
+            argv.drop();
+            return Result::Err(err);
+        }
+    }
+
+    // 3. Prepare an optional cwd CString.
+    mut cwd_cstr: Option<CString> = Option::None;
+    match (cmd.cwd) {
+        Option::Some(path) => {
+            match (CString::from_str(path.as_str())) {
+                Result::Ok(c_path) => { cwd_cstr = Option::Some(c_path); }
+                Result::Err(_) => {
+                    close_pipe(&stdin_pipe);
+                    close_pipe(&stdout_pipe);
+                    close_pipe(&stderr_pipe);
+                    drop_cstring_array(&argv_storage);
+                    argv.drop();
+                    return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+                }
+            }
+        }
+        Option::None => { }
+    }
+
+    // 4. fork.
+    const pid: i32 = fork();
+    if (pid < 0) {
+        const err: IoError = IoError::from_errno(fd::errno());
+        close_pipe(&stdin_pipe);
+        close_pipe(&stdout_pipe);
+        close_pipe(&stderr_pipe);
+        drop_cstring_array(&argv_storage);
+        argv.drop();
+        match (cwd_cstr) {
+            Option::Some(mut c) => { c.drop(); }
+            Option::None => { }
+        }
+        return Result::Err(err);
+    }
+
+    if (pid == 0) {
+        // -------- child --------
+        // Only async-signal-safe operations from here until exec or
+        // _exit. setenv/chdir/dup2/close/open/execvp are all safe.
+        if (!child_remap(cmd.stdin_cfg, &stdin_pipe, 0, true)) { _exit(127); }
+        if (!child_remap(cmd.stdout_cfg, &stdout_pipe, 1, false)) { _exit(127); }
+        if (!child_remap(cmd.stderr_cfg, &stderr_pipe, 2, false)) { _exit(127); }
+
+        // cwd change.
+        match (cwd_cstr) {
+            Option::Some(path) => {
+                if (chdir(path.as_ptr()) < 0) { _exit(127); }
+            }
+            Option::None => { }
+        }
+
+        if (!apply_env(cmd.clear_env_flag, &cmd.envs)) { _exit(127); }
+
+        execvp(argv.get(0).unwrap(), argv.as_ptr());
+        // If we got here, exec failed.
+        _exit(127);
+    }
+
+    // -------- parent --------
+    // Close the ends of each pipe that belong to the child.
+    match (cmd.stdin_cfg) {
+        Stdio::Piped => {
+            if (stdin_pipe.read_end >= 0) { fd::close_fd(stdin_pipe.read_end); }
+            stdin_pipe.read_end = -1;
+        }
+        _ => { }
+    }
+    match (cmd.stdout_cfg) {
+        Stdio::Piped => {
+            if (stdout_pipe.write_end >= 0) { fd::close_fd(stdout_pipe.write_end); }
+            stdout_pipe.write_end = -1;
+        }
+        _ => { }
+    }
+    match (cmd.stderr_cfg) {
+        Stdio::Piped => {
+            if (stderr_pipe.write_end >= 0) { fd::close_fd(stderr_pipe.write_end); }
+            stderr_pipe.write_end = -1;
+        }
+        _ => { }
+    }
+
+    mut stdin_handle: Option<ChildStdin> = Option::None;
+    mut stdout_handle: Option<ChildStdout> = Option::None;
+    mut stderr_handle: Option<ChildStderr> = Option::None;
+    match (cmd.stdin_cfg) {
+        Stdio::Piped => {
+            stdin_handle = Option::Some(ChildStdin::from_fd(stdin_pipe.write_end));
+        }
+        _ => { }
+    }
+    match (cmd.stdout_cfg) {
+        Stdio::Piped => {
+            stdout_handle = Option::Some(ChildStdout::from_fd(stdout_pipe.read_end));
+        }
+        _ => { }
+    }
+    match (cmd.stderr_cfg) {
+        Stdio::Piped => {
+            stderr_handle = Option::Some(ChildStderr::from_fd(stderr_pipe.read_end));
+        }
+        _ => { }
+    }
+
+    // Free CStrings / pointer array — child has its own COW copies,
+    // which are either replaced by exec or abandoned on _exit.
+    drop_cstring_array(&argv_storage);
+    argv.drop();
+    match (cwd_cstr) {
+        Option::Some(mut c) => { c.drop(); }
+        Option::None => { }
+    }
+
+    return Result::Ok(Child::new(pid, stdin_handle, stdout_handle, stderr_handle));
+}
+
+function close_pipe(pair: &PipePair) -> void {
+    if (pair.read_end >= 0) { fd::close_fd(pair.read_end); }
+    if (pair.write_end >= 0) { fd::close_fd(pair.write_end); }
+}
+
+function drop_cstring_array(array: &Array<CString>) -> void {
+    mut i: u64 = 0;
+    while (i < array.length()) {
+        match (array.get(i)) {
+            Option::Some(mut c) => { c.drop(); }
+            Option::None => { break; }
+        }
+        i++;
+    }
+}
+
+/// Shallow clone of `cmd` so `output()` can override stdout/stderr
+/// without mutating the caller's Command. Copies owned strings.
+function clone_command(cmd: &Command) -> Command {
+    mut out: Command = Command {
+        program: String::from_str(cmd.program.as_str()),
+        args: Array::new(),
+        envs: Array::new(),
+        clear_env_flag: cmd.clear_env_flag,
+        cwd: Option::None,
+        stdin_cfg: cmd.stdin_cfg,
+        stdout_cfg: cmd.stdout_cfg,
+        stderr_cfg: cmd.stderr_cfg
+    };
+    mut i: u64 = 0;
+    while (i < cmd.args.length()) {
+        match (cmd.args.get(i)) {
+            Option::Some(arg) => { out.args.push(String::from_str(arg.as_str())); }
+            Option::None => { break; }
+        }
+        i++;
+    }
+    mut j: u64 = 0;
+    while (j < cmd.envs.length()) {
+        match (cmd.envs.get(j)) {
+            Option::Some(entry) => {
+                out.envs.push(EnvEntry {
+                    key: String::from_str(entry.key.as_str()),
+                    value: String::from_str(entry.value.as_str())
+                });
+            }
+            Option::None => { break; }
+        }
+        j = j + 1;
+    }
+    match (cmd.cwd) {
+        Option::Some(path) => {
+            out.cwd = Option::Some(String::from_str(path.as_str()));
+        }
+        Option::None => { }
+    }
+    return out;
+}
+
+/// Drain a `Child`'s captured stdout/stderr into buffers, then
+/// `wait()` for it. Used by `Command::output()`. Reads both streams
+/// in sequence — good enough for small outputs; processes that
+/// produce a lot of stderr while stdout is slow to drain could
+/// deadlock. A real async-capable `select` would fix that, but
+/// that's a separate module.
+function collect_output(c: mut &Child) -> Result<Output, IoError> {
+    mut stdout_buffer: Array<u8> = Array::new();
+    mut stderr_buffer: Array<u8> = Array::new();
+    mut chunk: u8[4096];
+
+    match (c.stdout) {
+        Option::Some(mut handle) => {
+            loop {
+                match (handle.read(&chunk[0], 4096)) {
+                    Result::Ok(n) => {
+                        if (n == 0) { break; }
+                        mut i: u64 = 0;
+                        while (i < n) { stdout_buffer.push(chunk[i]); i++; }
+                    }
+                    Result::Err(err) => {
+                        handle.drop();
+                        stdout_buffer.drop();
+                        stderr_buffer.drop();
+                        return Result::Err(err);
+                    }
+                }
+            }
+            handle.drop();
+            c.stdout = Option::None;
+        }
+        Option::None => { }
+    }
+
+    match (c.stderr) {
+        Option::Some(mut handle) => {
+            loop {
+                match (handle.read(&chunk[0], 4096)) {
+                    Result::Ok(n) => {
+                        if (n == 0) { break; }
+                        mut i: u64 = 0;
+                        while (i < n) { stderr_buffer.push(chunk[i]); i++; }
+                    }
+                    Result::Err(err) => {
+                        handle.drop();
+                        stdout_buffer.drop();
+                        stderr_buffer.drop();
+                        return Result::Err(err);
+                    }
+                }
+            }
+            handle.drop();
+            c.stderr = Option::None;
+        }
+        Option::None => { }
+    }
+
+    match (c.wait()) {
+        Result::Ok(status) => {
+            return Result::Ok(Output {
+                status: status,
+                stdout: stdout_buffer,
+                stderr: stderr_buffer
+            });
+        }
+        Result::Err(err) => {
+            stdout_buffer.drop();
+            stderr_buffer.drop();
+            return Result::Err(err);
+        }
+    }
+}

@@ -42,6 +42,7 @@ import Compiler::Resolver::MangledName;
 import Compiler::Resolver::Resolver;
 import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
+import Compiler::Types::Substitution;
 import Compiler::ModuleGraph;
 import std::collections::hashmap;
 import Utils::Logger;
@@ -357,6 +358,30 @@ public:
         return t;
     }
 
+    /// Peel Reference/Pointer wrappers and return the innermost InstantiatedType
+    /// (if any), even when its `resolved_type` is still invalid.  Used by
+    /// bind_arm_patterns to substitute generic params in variant payload types
+    /// when the instantiation hasn't been monomorphized yet — for example,
+    /// methods whose this-param type differs from the outer enum instantiation
+    /// (`copied(this: Result<T*, E>)` on Result<i32, string>).
+    peel_to_instantiation(&this, ty: TypeRef) -> InstantiatedType* {
+        if (!ty.is_valid()) { return null; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return null; }
+        if (t.kind == TypeKind::Reference) {
+            const ref_t: ReferenceType* = t as ReferenceType*;
+            return this.peel_to_instantiation(ref_t.referent);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            const ptr_t: PointerType* = t as PointerType*;
+            return this.peel_to_instantiation(ptr_t.pointee);
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            return t as InstantiatedType*;
+        }
+        return null;
+    }
+
     bind_arm_patterns(mut &this, arm: MatchArmNode*, subject_type: TypeRef) -> void {
         for (mut i: i64 = 0; i < arm.patterns.length; i++) {
             const pat: PatternNode* = arm.patterns[i];
@@ -385,7 +410,20 @@ public:
             // InstantiatedType(Option, [string]) → Option_string.
             enum_ty = this.unwrap_to_enum(subject_type);
 
-            // Fallback: look up by pattern's enum name (works for non-generic
+            // Capture the instantiation (even if not yet monomorphized) so we
+            // can substitute generic params into payload_types below.
+            const peeled_inst: InstantiatedType* = this.peel_to_instantiation(subject_type);
+
+            // Fallback A: if we have an InstantiatedType but no concrete enum
+            // yet, use the generic base enum template directly.
+            if ((enum_ty == null || enum_ty.kind != TypeKind::Enum) && peeled_inst != null) {
+                const base_t: Type* = this.arena.lookup(peeled_inst.generic_base.id);
+                if (base_t != null && base_t.kind == TypeKind::Enum) {
+                    enum_ty = base_t;
+                }
+            }
+
+            // Fallback B: look up by pattern's enum name (works for non-generic
             // enums where the pattern name matches the type name exactly).
             if (enum_ty == null || enum_ty.kind != TypeKind::Enum) {
                 const enum_type_ref: TypeRef = this.lookup_type_by_sym(enum_pat.enum_name);
@@ -399,6 +437,30 @@ public:
                 const variant: EnumVariantInfo* = et.get_variant(enum_pat.variant_name);
                 if (variant != null) {
                     payload_types = variant.payload_types;
+
+                    // When the subject is a generic instantiation whose concrete
+                    // specialization hasn't been monomorphized yet (or when the
+                    // enum template we're looking at still carries GenericParam
+                    // payload types), substitute the template's generic params
+                    // with the instantiation's type_args so the binding resolves
+                    // to the correct concrete type.  Without this, methods like
+                    // `copied(this: Result<T*, E>)` bind `ptr` to GenericParam T
+                    // (mapped as the raw payload byte type) instead of T*.
+                    const gr: GenericRegistry* = this.ctx.get_generic_registry();
+                    if (peeled_inst != null && gr != null) {
+                        const tmpl: TemplateEntry* = gr.get_template_by_type_id(
+                            peeled_inst.generic_base.id);
+                        if (tmpl != null &&
+                            tmpl.param_type_ids.length == peeled_inst.type_args.length) {
+                            mut subst: TypeSubstitution = TypeSubstitution::from_params(
+                                tmpl.param_type_ids, peeled_inst.type_args);
+                            mut substituted: TypeRef[] = [];
+                            for (mut k: i64 = 0; k < payload_types.length; k++) {
+                                substituted.push(subst.apply(payload_types[k], this.arena));
+                            }
+                            payload_types = substituted;
+                        }
+                    }
                 }
             }
 
@@ -629,12 +691,33 @@ public:
         this.resolve_expr(node.expression);
     }
 
-    visit_decl_stmt(node: DeclStmtNode*) -> void {
+    visit_decl_stmt(mut &this, node: DeclStmtNode*) -> void {
         if (node.declaration == null) { return; }
         const decl: ASTNode* = node.declaration;
         if (decl.kind != NodeKind::VariableDeclaration) { return; }
 
         const var_node: VarDeclNode* = decl as VarDeclNode*;
+
+        // Lazy-resolve the type annotation if earlier passes missed it — e.g.
+        // VarDecls living inside a match-expression arm body (like
+        // `const te: TypeofExprNode* = ...` in resolve_expr's Typeof arm).
+        // `resolve_body_locals` in the monomorphizer recurses into match
+        // STATEMENTS but not match EXPRESSIONS, so those VarDecls arrive
+        // here with `resolved_type` invalid.  Without this, codegen's
+        // `codegen_local_var` skips the alloca (map_type on invalid
+        // TypeRef returns null) and downstream member-accesses on the
+        // binding evaluate to null.
+        if (!var_node.has_resolved_type() && var_node.type_annotation != null
+                && this.ctx.type_resolver != null) {
+            mut res_ctx: ResolutionContext = ResolutionContext::new(
+                this.ctx.source_file, "");
+            const vtype: TypeRef = this.ctx.type_resolver.resolve(
+                var_node.type_annotation, &res_ctx);
+            if (vtype.is_valid()) {
+                var_node.resolved_type = vtype;
+            }
+        }
+
         if (var_node.has_initializer()) {
             // Set expected_type hint so generic calls can resolve to concrete types.
             // E.g. `const x: Result<int, string> = Result::ok(42)` —
@@ -980,6 +1063,87 @@ public:
     /// `resolve_call` to push expected parameter types during arg
     /// resolution.  Returns invalid when the callee isn't statically
     /// resolvable (first-class function pointers, unresolved methods).
+    /// Pick up the declared parameter types for a method call of the form
+    /// `receiver.method(args)`.  Mirrors the receiver-type unwrap used by
+    /// `resolve_method_overload` / `resolve_method_call`; walks the method
+    /// table on the underlying struct/class and returns the matching
+    /// MethodInfo's param_types when every matching overload agrees on
+    /// the type at each position — otherwise returns an empty list so
+    /// ambiguous overloads don't produce misleading hints.
+    lookup_method_param_types(mut &this, member: MemberAccessNode*,
+                               arg_count: i64) -> TypeRef[] {
+        const obj_type: TypeRef = this.resolve_expr(member.object);
+        if (!obj_type.is_valid()) { return []; }
+        mut base_t: Type* = this.arena.lookup(obj_type.id);
+        mut depth: i32 = 0;
+        while (base_t != null && depth < 5) {
+            if (base_t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = base_t as PointerType*;
+                base_t = this.arena.lookup(pt.pointee.id);
+            } else if (base_t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = base_t as ReferenceType*;
+                base_t = this.arena.lookup(rt.referent.id);
+            } else if (base_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = base_t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { break; }
+                base_t = this.arena.lookup(inst.resolved_type.id);
+            } else {
+                break;
+            }
+            depth = depth + 1;
+        }
+        if (base_t == null) { return []; }
+
+        mut methods: MethodInfo[] = [];
+        if (base_t.kind == TypeKind::Class) {
+            const ct: ClassType* = base_t as ClassType*;
+            methods = ct.methods;
+        } else if (base_t.kind == TypeKind::Struct) {
+            const st: StructType* = base_t as StructType*;
+            methods = st.methods;
+        } else {
+            return [];
+        }
+
+        // Narrow to overloads whose arity matches the call — an overload
+        // with a different param count can't participate in this call's
+        // type-checking, so it shouldn't influence the hint.
+        mut found: MethodInfo[] = [];
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            if (methods[i].name.equals(member.member) &&
+                methods[i].param_types.length == arg_count) {
+                found.push(methods[i]);
+            }
+        }
+        if (found.length == 0) { return []; }
+        if (found.length == 1) { return found[0].param_types; }
+
+        // Multiple arity-matching overloads: return a position-wise hint
+        // only where every overload agrees on the type.  A TypeRef::invalid()
+        // at a given slot disables the hint for that arg (caller only
+        // pushes when param_types[i].is_valid()).
+        mut merged: TypeRef[] = [];
+        for (mut p: i64 = 0; p < arg_count; p++) {
+            const first_info: MethodInfo = found[0];
+            const first_ty: TypeRef = first_info.param_types[p];
+            mut agree: boolean = true;
+            for (mut j: i64 = 1; j < found.length; j++) {
+                const j_info: MethodInfo = found[j];
+                const j_ty: TypeRef = j_info.param_types[p];
+                if (j_ty.id != first_ty.id) {
+                    agree = false;
+                    break;
+                }
+            }
+            if (agree) {
+                merged.push(first_ty);
+            } else {
+                merged.push(TypeRef::invalid());
+            }
+        }
+        return merged;
+    }
+
     lookup_callee_function_type(&this, callee: ExpressionNode*) -> TypeRef {
         if (callee == null) { return TypeRef::invalid(); }
         const n: ASTNode* = callee as ASTNode*;
@@ -1035,6 +1199,18 @@ public:
                 param_types = ft.param_types;
             }
         }
+        // Method calls (MemberAccess callee) don't go through the
+        // function-type registry — their signatures live on the
+        // receiver type's MethodInfo.  Walk the method table to
+        // pick up param types for expected-type propagation.
+        if (param_types.length == 0) {
+            const callee_node: ASTNode* = call.callee as ASTNode*;
+            if (callee_node.kind == NodeKind::MemberAccess) {
+                param_types = this.lookup_method_param_types(
+                    call.callee as MemberAccessNode*,
+                    call.arguments.length);
+            }
+        }
         const saved_expected: TypeRef = this.expected_type;
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
             mut push_expected: boolean = false;
@@ -1042,12 +1218,16 @@ public:
             if (arg != null && i < param_types.length && param_types[i].is_valid()) {
                 const arg_node: ASTNode* = arg as ASTNode*;
                 if (arg_node.kind == NodeKind::ArrayLiteral) {
-                    const alit: ArrayLiteralNode* = arg as ArrayLiteralNode*;
-                    if (alit.elements.length == 0 &&
-                        alit.repeat_count == 0 &&
-                        alit.repeat_count_expr == null) {
-                        push_expected = true;
-                    }
+                    // Push the param type for ANY array-literal arg, not
+                    // just empty ones.  For element-form literals the
+                    // dynamic-vs-fixed shape is otherwise inferred from
+                    // elements.length, which produces `[T; N]` when the
+                    // callee expects `T[]` — call-arg coercion has no
+                    // natural way to reinterpret a fixed array as a
+                    // fat pointer.  The dynamic-shape branch in
+                    // resolve_array_literal adopts the param's shape
+                    // when assignable, so the literal lands as `T[]`.
+                    push_expected = true;
                 }
             }
             if (push_expected) {
@@ -1178,8 +1358,22 @@ public:
             }
             unwrap_depth = unwrap_depth + 1;
         }
-        if (base_t == null || base_t.kind != TypeKind::Class) { return; }
-        const start_cls: ClassType* = base_t as ClassType*;
+        // Accept both classes (with inheritance) and structs (flat).
+        // Structs don't have vtables or a base chain, but they DO have
+        // overloaded methods (`String::push(string)` vs `String::push(String)`)
+        // and codegen needs `resolved_method` to pick the right mangled
+        // name at the call site.
+        mut methods_ref: MethodInfo[] = [];
+        mut start_cls: ClassType* = null;
+        if (base_t.kind == TypeKind::Class) {
+            start_cls = base_t as ClassType*;
+            methods_ref = start_cls.methods;
+        } else if (base_t.kind == TypeKind::Struct) {
+            const sst: StructType* = base_t as StructType*;
+            methods_ref = sst.methods;
+        } else {
+            return;
+        }
 
         // Gather the call's arg TypeRefs.
         mut arg_types: TypeRef[] = [];
@@ -1198,11 +1392,14 @@ public:
         // `visitor` is a concrete subclass passed as the base visitor
         // parameter.  Exact matches win over conversions — if pass 1
         // finds a match we never run pass 2.
+        // For structs, walk is null and the loop runs once against
+        // `methods_ref`.  For classes, walk inherits through base_class.
         mut walk: ClassType* = start_cls;
         mut depth: i32 = 0;
-        while (walk != null && depth < 16) {
-            for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
-                const m: MethodInfo = walk.methods[mi];
+        mut cur_methods: MethodInfo[] = methods_ref;
+        while (depth < 16) {
+            for (mut mi: i64 = 0; mi < cur_methods.length; mi++) {
+                const m: MethodInfo = cur_methods[mi];
                 if (!m.name.equals(member.member)) { continue; }
                 if (m.param_types.length != arg_types.length) { continue; }
                 mut exact: boolean = true;
@@ -1217,10 +1414,12 @@ public:
                     return;
                 }
             }
+            if (walk == null) { break; }
             if (!walk.has_base || !walk.base_class.is_valid()) { break; }
             const parent_t: Type* = this.arena.lookup(walk.base_class.id);
             if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
             walk = parent_t as ClassType*;
+            cur_methods = walk.methods;
             depth = depth + 1;
         }
 
@@ -1236,9 +1435,10 @@ public:
         // or `Reference<T>`).
         walk = start_cls;
         depth = 0;
-        while (walk != null && depth < 16) {
-            for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
-                const m: MethodInfo = walk.methods[mi];
+        cur_methods = methods_ref;
+        while (depth < 16) {
+            for (mut mi: i64 = 0; mi < cur_methods.length; mi++) {
+                const m: MethodInfo = cur_methods[mi];
                 if (!m.name.equals(member.member)) { continue; }
                 if (m.param_types.length != arg_types.length) { continue; }
                 mut compat: boolean = true;
@@ -1272,10 +1472,12 @@ public:
                     return;
                 }
             }
+            if (walk == null) { break; }
             if (!walk.has_base || !walk.base_class.is_valid()) { break; }
             const parent_t: Type* = this.arena.lookup(walk.base_class.id);
             if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
             walk = parent_t as ClassType*;
+            cur_methods = walk.methods;
             depth = depth + 1;
         }
         // Still no match — leave resolved_method null; codegen falls
@@ -1288,7 +1490,37 @@ public:
         // Input invalid → upstream error already emitted, stay silent
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
 
-        const type_sym: SymbolStr = this.lookup_type_sym(obj_type);
+        // Unwrap Pointer / Reference / InstantiatedType so method lookup
+        // works on `this.intern_table.resolve(name)` where `intern_table`
+        // is declared as `InternTable*`.  Without this the type-symbol
+        // reverse-lookup fails on the pointer wrapper and the call's
+        // return type silently stays invalid, starving downstream
+        // codegen of the info needed to pick the right path (e.g.,
+        // match-on-string subject detection).
+        mut lookup_ref: TypeRef = obj_type;
+        mut base_t: Type* = this.arena.lookup(obj_type.id);
+        mut unwrap_depth: i32 = 0;
+        while (base_t != null && unwrap_depth < 5) {
+            if (base_t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = base_t as PointerType*;
+                lookup_ref = pt.pointee;
+                base_t = this.arena.lookup(lookup_ref.id);
+            } else if (base_t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = base_t as ReferenceType*;
+                lookup_ref = rt.referent;
+                base_t = this.arena.lookup(lookup_ref.id);
+            } else if (base_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = base_t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { break; }
+                lookup_ref = inst.resolved_type;
+                base_t = this.arena.lookup(lookup_ref.id);
+            } else {
+                break;
+            }
+            unwrap_depth = unwrap_depth + 1;
+        }
+
+        const type_sym: SymbolStr = this.lookup_type_sym(lookup_ref);
         if (!type_sym.is_valid()) {
             // Valid type but no reverse mapping — internal gap, not user error
             return TypeRef::invalid();
@@ -1296,7 +1528,7 @@ public:
 
         // Try direct method lookup, then walk class hierarchy
         const ret: TypeRef = this.lookup_method_with_inheritance(
-            obj_type, type_sym, member.member);
+            lookup_ref, type_sym, member.member);
         if (ret.is_valid()) {
             member.set_resolved_type(ret);
             return ret;
@@ -1304,8 +1536,9 @@ public:
 
         // Before giving up, check if the member is a field with function type.
         // This handles patterns like `this.read_fn(args)` where read_fn is a
-        // function pointer field, not a method.
-        const field_ret: TypeRef = this.try_field_function_call(obj_type, member.member);
+        // function pointer field, not a method.  Use the unwrapped
+        // type_ref so field lookup works on pointer-of-struct receivers.
+        const field_ret: TypeRef = this.try_field_function_call(lookup_ref, member.member);
         if (field_ret.is_valid()) {
             member.set_resolved_type(field_ret);
             return field_ret;
@@ -1737,6 +1970,14 @@ public:
     resolve_match_expr(mut &this, match_expr: MatchExprNode*) -> TypeRef {
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
 
+        // Propagate the outer expected_type (from `const x: T = match ...`,
+        // return types, etc.) into each arm's last expression so integer
+        // literals like `-1` adopt the declared type instead of defaulting
+        // to i32.  Without this, codegen's phi sees mixed arm types (e.g.,
+        // i64 for one arm's bound variable vs i32 for another arm's literal)
+        // and fails verification.
+        const outer_expected: TypeRef = this.expected_type;
+
         mut result_type: TypeRef = TypeRef::invalid();
         for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
             const arm: MatchArmNode* = match_expr.arms[i];
@@ -1748,8 +1989,18 @@ public:
             const body_node: ASTNode* = arm.body as ASTNode*;
             if (body_node.kind == NodeKind::BlockStatement) {
                 const block: BlockStmtNode* = arm.body as BlockStmtNode*;
+                const last_idx: i64 = block.statements.length - 1;
                 for (mut j: i64 = 0; j < block.statements.length; j++) {
+                    // For the final statement of the block (the arm's
+                    // yielded value), push the outer expected_type hint so
+                    // integer/float literals resolve to the declared type.
+                    if (j == last_idx && outer_expected.is_valid()) {
+                        this.expected_type = outer_expected;
+                    }
                     this.dispatch_stmt(block.statements[j]);
+                    if (j == last_idx) {
+                        this.expected_type = outer_expected;
+                    }
                 }
                 // Infer arm type from the last expression statement
                 if (!result_type.is_valid() && block.statements.length > 0) {
@@ -1771,6 +2022,12 @@ public:
             this.restore_scope(save);
         }
 
+        // Restore caller's expected_type and prefer its hint over our own
+        // inference — a more specific context-driven type wins.
+        this.expected_type = outer_expected;
+        if (outer_expected.is_valid()) {
+            return outer_expected;
+        }
         return result_type;
     }
 
@@ -1902,6 +2159,29 @@ public:
                 size = arr.repeat_count;
             } else if (arr.repeat_count_expr != null) {
                 size = -1;  // dynamic size
+            }
+            // Propagate a dynamic-array expected type: when the surrounding
+            // context expects `T[]` (e.g. `return [a, b]` in a function
+            // returning `T[]`), make the literal adopt the dynamic shape
+            // instead of the fixed `[T; N]` inferred from elements.length.
+            // Otherwise the return/assign sees a `[N x T]` value against a
+            // `{ptr, i64}` slot and LLVM verification fails.
+            if (this.expected_type.is_valid() && arr.repeat_count == 0 &&
+                arr.repeat_count_expr == null) {
+                mut exp_t: Type* = this.arena.lookup(this.expected_type.id);
+                if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
+                    const inst: InstantiatedType* = exp_t as InstantiatedType*;
+                    if (inst.has_resolved_type()) {
+                        exp_t = this.arena.lookup(inst.resolved_type.id);
+                    }
+                }
+                if (exp_t != null && exp_t.kind == TypeKind::Array) {
+                    const exp_arr: ArrayType* = exp_t as ArrayType*;
+                    if (!exp_arr.is_fixed() &&
+                        this.checker.can_assign(elem_type, exp_arr.element)) {
+                        return this.expected_type;
+                    }
+                }
             }
             return this.arena.get_array_of(elem_type, size);
         }

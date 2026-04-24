@@ -97,20 +97,15 @@ namespace Cryo
             auto &os = Cryo::Utils::OS::instance();
             std::string cwd = os.get_working_directory();
 
-            // Common development and project patterns - try new_stdlib first, then stdlib:
-            search_paths.push_back(os.join_path(cwd, "new_stdlib"));       // ./new_stdlib (new structure)
-            search_paths.push_back(os.join_path(cwd, "stdlib"));           // ./stdlib (legacy)
-            search_paths.push_back(os.join_path(cwd, "../new_stdlib"));    // ../new_stdlib (for project dirs)
-            search_paths.push_back(os.join_path(cwd, "../stdlib"));        // ../stdlib (legacy)
-            search_paths.push_back(os.join_path(cwd, "../../new_stdlib")); // ../../new_stdlib (for nested dirs)
-            search_paths.push_back(os.join_path(cwd, "../../stdlib"));     // ../../stdlib (legacy)
+            // Common development and project patterns:
+            search_paths.push_back(os.join_path(cwd, "stdlib"));
+            search_paths.push_back(os.join_path(cwd, "../stdlib"));
+            search_paths.push_back(os.join_path(cwd, "../../stdlib"));
         }
         catch (const std::exception &)
         {
             // If current_path fails, add basic fallbacks
-            search_paths.push_back("./new_stdlib");
             search_paths.push_back("./stdlib");
-            search_paths.push_back("../new_stdlib");
             search_paths.push_back("../stdlib");
         }
 

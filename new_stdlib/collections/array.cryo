@@ -1,0 +1,237 @@
+///! Array<T, A> — growable, heap-backed, contiguous sequence.
+///!
+///! Owns a `RawBuffer<T, A>` plus a length. Indexing, `push`, and
+///! `pop` operate at the end in amortized O(1); `get` and `set` are
+///! O(1). Algorithms that don't need ownership take `Slice<T>` —
+///! call `as_slice()` at the boundary.
+///!
+///! Growth doubles capacity (min 4 on first allocation) via
+///! `RawBuffer`, so the curve matches `String` and any future
+///! growable container.
+
+namespace std::collections::array;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import core::mem;
+import alloc::allocator;
+import collections::raw_buffer;
+
+/// First-allocation capacity. Small enough that near-empty arrays
+/// don't waste memory; large enough to amortize the first few
+/// pushes.
+const INITIAL_CAPACITY: u64 = 4;
+
+type struct Array<T, A = GlobalAlloc> {
+    buffer: RawBuffer<T, A>;
+    length: u64;
+
+    /// Empty array backed by `GlobalAlloc`.
+    static new() -> Array<T> {
+        return Array<T> {
+            buffer: RawBuffer::new(),
+            length: 0
+        };
+    }
+
+    /// Empty array with a caller-supplied allocator.
+    static new_in(alloc: A) -> Array<T, A> {
+        return Array<T, A> {
+            buffer: RawBuffer::new_in(alloc),
+            length: 0
+        };
+    }
+
+    /// Preallocate room for `capacity` elements. Panics on
+    /// allocation failure; use `try_with_capacity_in` to recover.
+    static with_capacity(capacity: u64) -> Array<T> {
+        match (Array::try_with_capacity_in(capacity, GlobalAlloc::new())) {
+            Result::Ok(array) => { return array; }
+            Result::Err(_) => {
+                intrinsics::panic("Array::with_capacity: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    static with_capacity_in(capacity: u64, alloc: A) -> Array<T, A> {
+        match (Array::try_with_capacity_in(capacity, alloc)) {
+            Result::Ok(array) => { return array; }
+            Result::Err(_) => {
+                intrinsics::panic("Array::with_capacity_in: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    static try_with_capacity_in(capacity: u64, alloc: A) -> Result<Array<T, A>, AllocError> {
+        mut array: Array<T, A> = Array<T, A> {
+            buffer: RawBuffer::new_in(alloc),
+            length: 0
+        };
+        if (capacity == 0) {
+            return Result::Ok(array);
+        }
+        match (array.buffer.reserve_exact(0, capacity)) {
+            Result::Ok(_) => { return Result::Ok(array); }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    // ========================================================================
+    // Inspection
+    // ========================================================================
+
+    length(&this) -> u64 {
+        return this.length;
+    }
+
+    capacity(&this) -> u64 {
+        return this.buffer.capacity();
+    }
+
+    is_empty(&this) -> boolean {
+        return this.length == 0;
+    }
+
+    /// Bounds-checked read by value.
+    get(&this, index: u64) -> Option<T> {
+        if (index >= this.length) {
+            return Option::None;
+        }
+        return Option::Some(this.buffer.ptr()[index]);
+    }
+
+    /// Raw pointer. Invalidated by any method that may reallocate
+    /// (`push`, `reserve`, `shrink_to_fit`).
+    as_ptr(&this) -> T* {
+        return this.buffer.ptr();
+    }
+
+    /// Borrow the initialized prefix. Slice is invalidated by any
+    /// reallocating method.
+    as_slice(&this) -> Slice<T> {
+        return Slice::from_raw(this.buffer.ptr(), this.length);
+    }
+
+    // ========================================================================
+    // Mutation
+    // ========================================================================
+
+    push(mut &this, value: T) -> void {
+        match (this.try_push(value)) {
+            Result::Ok(_) => { return; }
+            Result::Err(_) => {
+                intrinsics::panic("Array::push: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    try_push(mut &this, value: T) -> Result<(), AllocError> {
+        if (this.length == this.buffer.capacity()) {
+            match (this.buffer.reserve(this.length, 1, INITIAL_CAPACITY)) {
+                Result::Ok(_) => { }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+        this.buffer.ptr()[this.length] = value;
+        this.length = this.length + 1;
+        return Result::Ok(());
+    }
+
+    pop(mut &this) -> Option<T> {
+        if (this.length == 0) {
+            return Option::None;
+        }
+        this.length = this.length - 1;
+        return Option::Some(this.buffer.ptr()[this.length]);
+    }
+
+    set(mut &this, index: u64, value: T) -> void {
+        if (index >= this.length) {
+            intrinsics::panic("Array::set: index out of range", FILE, LINE);
+        }
+        this.buffer.ptr()[index] = value;
+    }
+
+    /// Remove at `index` by swapping in the last element. O(1) but
+    /// doesn't preserve order. Panics on out-of-range.
+    swap_remove(mut &this, index: u64) -> T {
+        if (index >= this.length) {
+            intrinsics::panic("Array::swap_remove: index out of range", FILE, LINE);
+        }
+        const removed: T = this.buffer.ptr()[index];
+        const last: u64 = this.length - 1;
+        if (index != last) {
+            this.buffer.ptr()[index] = this.buffer.ptr()[last];
+        }
+        this.length = last;
+        return removed;
+    }
+
+    /// Forget every element without releasing capacity. Pair with
+    /// `shrink_to_fit` when the memory matters; use `drop` when the
+    /// array is going away entirely.
+    clear(mut &this) -> void {
+        this.length = 0;
+    }
+
+    /// Append every element of `source` to the end of this array.
+    /// Panics on allocation failure; use `try_push_slice` to recover.
+    push_slice(mut &this, source: Slice<T>) -> void {
+        match (this.try_push_slice(source)) {
+            Result::Ok(_) => { return; }
+            Result::Err(_) => {
+                intrinsics::panic("Array::push_slice: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Fallible bulk append. Reserves space for all elements first so
+    /// partial copies are impossible — either all elements are appended
+    /// or none are.
+    try_push_slice(mut &this, source: Slice<T>) -> Result<(), AllocError> {
+        const add: u64 = source.length();
+        if (add == 0) { return Result::Ok(()); }
+        match (this.buffer.reserve(this.length, add, INITIAL_CAPACITY)) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        intrinsics::memcpy(
+            mem::offset(this.buffer.ptr(), this.length as i64) as void*,
+            source.as_ptr() as void*,
+            add * sizeof(T)
+        );
+        this.length = this.length + add;
+        return Result::Ok(());
+    }
+
+    // ========================================================================
+    // Capacity management
+    // ========================================================================
+
+    reserve(mut &this, additional: u64) -> Result<(), AllocError> {
+        return this.buffer.reserve(this.length, additional, INITIAL_CAPACITY);
+    }
+
+    reserve_exact(mut &this, additional: u64) -> Result<(), AllocError> {
+        return this.buffer.reserve_exact(this.length, additional);
+    }
+
+    shrink_to_fit(mut &this) -> void {
+        this.buffer.shrink_to(this.length);
+    }
+
+    // ========================================================================
+    // Teardown
+    // ========================================================================
+
+    /// Release the backing storage. Ownership obligation: every
+    /// Array must have `drop` called before going out of scope. If
+    /// `T` owns resources, drain elements (e.g., loop `pop` and
+    /// drop each) before calling.
+    drop(mut &this) -> void {
+        this.buffer.drop();
+        this.length = 0;
+    }
+}

@@ -1128,7 +1128,7 @@ If you're familiar with Rust's `enum` or Haskell's algebraic data types, Cryo's 
 The simplest form: variants with no data. This is equivalent to a C enum.
 
 ```cryo
-enum Color {
+type enum Color {
     Red;
     Green;
     Blue;
@@ -1142,7 +1142,7 @@ Variants are accessed through the enum name using `::`. This prevents name colli
 Variants may have explicit integer values for FFI compatibility or protocol encoding:
 
 ```cryo
-enum ErrorCode {
+type enum ErrorCode {
     Ok = 0;
     NotFound = 404;
     Internal = 500;
@@ -1154,7 +1154,7 @@ enum ErrorCode {
 Variants can carry payloads of one or more values. This is what makes Cryo enums truly powerful: a single type can represent multiple shapes of data.
 
 ```cryo
-enum Shape {
+type enum Shape {
     Circle(f64);              // carries a radius
     Rectangle(f64, f64);     // carries width and height
     Point;                    // carries nothing
@@ -1172,12 +1172,12 @@ This pattern is used throughout the standard library. The compiler's own AST use
 Enums can be parameterized over types, which is how the standard library defines its two most important types:
 
 ```cryo
-enum Option<T> {
+type enum Option<T> {
     Some(T);
     None;
 }
 
-enum Result<T, E> {
+type enum Result<T, E> {
     Ok(T);
     Err(E);
 }
@@ -1352,7 +1352,7 @@ When you write `Box<int>`, the compiler generates a version of this struct where
 Enums with type parameters are how the standard library models optional values and error handling:
 
 ```cryo
-enum Result<T, E> {
+type enum Result<T, E> {
     Ok(T);
     Err(E);
 }

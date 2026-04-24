@@ -274,6 +274,31 @@ private:
     // Dispatch helpers
     // ----------------------------------------------------------------
 
+    /// Unwrap non-generic TypeAlias wrappers so downstream passes never see
+    /// an alias in a resolved type.  Aliases are a naming convenience at the
+    /// source level, not a semantic entity — operations like "is this an
+    /// enum?" and "does this type have field X?" must answer based on the
+    /// target, not the alias.  Generic aliases (e.g. `type Stack<T> = Array<T>`)
+    /// are preserved — they're expanded by `resolve_generic`'s
+    /// alias-expansion path, which needs the template entry intact.
+    /// Transitive aliases are followed to a bounded depth; self-referential
+    /// or unresolved aliases short-circuit at the first invalid target.
+    follow_alias(&this, ty: TypeRef) -> TypeRef {
+        mut current: TypeRef = ty;
+        mut depth: i32 = 0;
+        while (depth < 8) {
+            if (!current.is_valid()) { return current; }
+            const t: Type* = this.arena.lookup(current.id);
+            if (t == null || t.kind != TypeKind::TypeAlias) { return current; }
+            const alias: TypeAliasType* = t as TypeAliasType*;
+            if (alias.is_generic) { return current; }
+            if (!alias.has_target()) { return current; }
+            current = alias.target;
+            depth = depth + 1;
+        }
+        return current;
+    }
+
     /// Resolve a primitive type name to its arena singleton.
     resolve_primitive(&this, name: SymbolStr) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_primitive() name='%s'", this.intern_table.resolve(name));
@@ -365,6 +390,9 @@ private:
         //    After TypeResolution (order 9) populates the index, this is the
         //    primary lookup path.  Falls through to arena for types not yet
         //    registered (e.g., during early resolution phases).
+        //    TypeAlias types are transparent — callers of `resolve_named`
+        //    should never see them in `resolved_type` fields, so the helper
+        //    `follow_alias` unwraps to the alias target before returning.
         if (this.decl_index != null) {
             // Try qualified name first
             if (this.name_resolver != null) {
@@ -372,14 +400,14 @@ private:
                 if (qualified.is_valid()) {
                     const di_found: TypeRef = this.decl_index.lookup_type(qualified);
                     if (di_found.is_valid()) {
-                        return di_found;
+                        return this.follow_alias(di_found);
                     }
                 }
             }
             // Try bare name
             const di_bare: TypeRef = this.decl_index.lookup_type(name);
             if (di_bare.is_valid()) {
-                return di_bare;
+                return this.follow_alias(di_bare);
             }
         }
 
@@ -454,7 +482,12 @@ private:
     }
 
     /// Resolve a tuple type annotation.
+    /// Empty tuple `()` is the unit type — a distinct arena singleton,
+    /// not a zero-element TupleType.
     resolve_tuple(&this, t: TupleAnnotation*, ctx: ResolutionContext*) -> TypeRef {
+        if (t.elements.length == 0) {
+            return this.arena.get_unit();
+        }
         mut elements: TypeRef[] = [];
         for (mut i: i64 = 0; i < t.elements.length; i++) {
             elements.push(this.resolve(t.elements[i], ctx));

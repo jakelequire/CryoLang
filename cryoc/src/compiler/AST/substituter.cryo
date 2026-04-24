@@ -84,6 +84,17 @@ function rewrite_to_array(ann: TypeAnnotation*, inner_name: SymbolStr, span: Sou
     memcpy(ann, temp, sizeof(TypeAnnotation));
 }
 
+/// Rewrite a TypeAnnotation* in-place to the empty-tuple (unit) annotation.
+/// Used when a generic param is substituted with `()`, which is not a Named
+/// type and cannot survive as Named("()") through the resolver.
+function rewrite_to_unit(ann: TypeAnnotation*, span: SourceSpan) -> void {
+    mut empty_elems: TypeAnnotation*[] = [];
+    const tup: TupleAnnotation* = new TupleAnnotation { elements: empty_elems, span: span };
+    const temp: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+    *temp = TypeAnnotation::Tuple(tup);
+    memcpy(ann, temp, sizeof(TypeAnnotation));
+}
+
 
 // ============================================================================
 // ASTTypeSubstituter — Rewrites type annotations and names on a cloned AST
@@ -177,6 +188,12 @@ public:
                 const display: string = this.intern_table.resolve(this.type_arg_displays[i]);
                 const display_len: i64 = strlen(display) as i64;
 
+                // Unit type `()` — has no Named form, must become an empty Tuple
+                // annotation so resolve_tuple produces a valid unit TypeRef.
+                if (display_len == 2 && display[0] == '(' && display[1] == ')') {
+                    rewrite_to_unit(ann, named.span);
+                    return ann;
+                }
                 // Primitive type? → Primitive annotation
                 if (is_primitive_type_name(display)) {
                     rewrite_to_primitive(ann, this.type_arg_displays[i], named.span);

@@ -1,0 +1,242 @@
+///! std — the Cryo standard library.
+///!
+///! This file is the root manifest: it declares every module in the stdlib
+///! and places a short description beside each. Each module's own `_module.cryo`
+///! repeats the sub-module list with more context; this file gives the
+///! 30-second overview that helps you decide where to look.
+///!
+///! # Design principles
+///!
+///! - **No magic numbers.** Every numeric constant is named; bare literals
+///!   in source code are a sign of missing abstraction.
+///! - **No NUL-terminated strings outside `ffi/`.** All other modules work
+///!   in length-typed `Str` and `String` values. The translation to and from
+///!   C strings happens at the boundary in `ffi::cstr`.
+///! - **`Result` for fallible operations, `panic` for broken invariants.**
+///!   Callers get `Result<T, E>` whenever failure is expected; a function
+///!   panics only when the contract truly cannot be preserved.
+///! - **Explicit resource management.** Every owning type exposes a
+///!   `drop(mut &this)` method. The doc comment on each type identifies
+///!   who is responsible for calling it.
+///! - **Allocator-generic containers.** `Array<T>`, `HashMap<K,V>`, etc.
+///!   default to `GlobalAlloc` but accept any type implementing `Allocator`.
+///!
+///! # Module hierarchy
+///!
+///! ```
+///! std
+///! ├── prelude        — names auto-imported into every file
+///! ├── core           — language foundations (no heap, no I/O)
+///! ├── alloc          — heap allocation primitives
+///! ├── collections    — growable containers
+///! ├── io             — byte-level I/O traits and standard streams
+///! ├── fmt            — Display/Debug traits and integer formatting
+///! ├── fs             — filesystem: paths and files
+///! ├── ffi            — the C ABI boundary (NUL-string helpers)
+///! ├── env            — process environment and arguments
+///! ├── math           — libm float operations
+///! ├── net            — TCP sockets and HTTP/1.1
+///! │   └── http       — HTTP method, status, headers, request/response,
+///! │                    connection-per-request server and client
+///! └── process        — subprocess spawning (fork + execve, POSIX)
+///! ```
+
+namespace std;
+
+// ============================================================================
+// Prelude
+// ============================================================================
+
+/// Names automatically imported into every Cryo source file.
+///
+/// The set is deliberately small — every name here competes for user
+/// attention. Currently re-exports:
+///   • `core::panic`  — `panic(message, file, line) -> !`
+///   • `core::option` — `Option<T>` (`Some` / `None`)
+///   • `core::result` — `Result<T, E>` (`Ok` / `Err`)
+public module prelude;
+
+// ============================================================================
+// core — language foundations
+// ============================================================================
+
+/// Language foundations. Nothing in `core` allocates or performs I/O;
+/// all higher-level modules build on what lives here.
+///
+/// Sub-modules:
+///   • `intrinsics`  — compiler-backed `memcpy`, `memset`, `sizeof`, `alignof`
+///   • `panic`       — `panic(message, file, line) -> !`
+///   • `primitives`  — `min_value`, `max_value`, `BITS` for every numeric type
+///   • `option`      — `Option<T>` (`Some` / `None`)
+///   • `result`      — `Result<T, E>` (`Ok` / `Err`)
+///   • `error`       — `CrError { code, message }` lightweight error value
+///   • `slice`       — `Slice<T>` borrowed contiguous view; `SliceIter<T>`
+///   • `ptr`         — `NonNull<T>` guaranteed non-null pointer
+///   • `mem`         — `copy`, `zero`, `swap`, `offset`, `transmute`, align helpers
+///   • `marker`      — `Sized`, `Send`, `Sync` (bound-only, no methods)
+///   • `clone`       — `Clone` trait; primitive impls
+///   • `default`     — `Default` trait; primitive impls (zero / false / '\0')
+///   • `cmp`         — `Ordering`, `Eq`, `Ord`; `min`, `max`, `clamp`
+///   • `convert`     — `From`, `Into`, `TryFrom`, `TryInto`, `ConversionError`
+///   • `iter`        — `Iterator<Item>`, `IntoIterator`
+///   • `ops`         — `Range<T>`, `RangeInclusive<T>`, `Step`
+///   • `hash`        — `Hasher`, `Hash`, `DefaultHasher` (FNV-1a)
+public module core;
+
+// ============================================================================
+// alloc — heap allocation
+// ============================================================================
+
+/// Heap allocation primitives. Every type in `alloc` owns storage and
+/// must have `drop(mut &this)` called before going out of scope.
+///
+/// Sub-modules:
+///   • `layout`     — `Layout { size, align }`; `new<T>()`, `array<T>(n)`
+///   • `allocator`  — `Allocator` trait; `AllocError`; `AllocErrorKind`
+///                    (`OutOfMemory`, `Exhausted`, `InvalidLayout`); `GlobalAlloc`
+///   • `box`        — `Box<T>` unique heap ownership
+///   • `arena`      — bump allocator (64 KiB chunks, `reset`, `drop`)
+///   • `pool`       — fixed-slot slab allocator; layout mismatch → `InvalidLayout`
+///   • `rc`         — `Rc<T>` single-threaded reference-counted pointer
+public module alloc;
+
+// ============================================================================
+// collections — growable containers
+// ============================================================================
+
+/// Growable containers built on `alloc`. Every container owns heap
+/// storage and exposes a manual `drop`. Allocator choice is a type
+/// parameter with a `GlobalAlloc` default.
+///
+/// Sub-modules:
+///   • `raw_buffer` — `RawBuffer<T, A>` untyped backing store (internal)
+///   • `array`      — `Array<T, A>` contiguous growable sequence;
+///                    `push`, `pop`, `push_slice`, `try_push_slice`, …
+///   • `str`        — `Str` borrowed length-typed UTF-8 slice;
+///                    `to_ascii_lowercase`, `equals`, `starts_with`, …;
+///                    implements `Eq + Hash`
+///   • `string`     — `String` owned growable UTF-8; implements `Eq + Hash`
+///   • `hash_map`   — `HashMap<K, V, A>` separate-chaining hash table;
+///                    `K: Hash + Eq`; `get_bucket` for bucket traversal
+///   • `hash_set`   — `HashSet<T, A>` backed by `HashMap<T, ()>`
+public module collections;
+
+// ============================================================================
+// io — byte-level input / output
+// ============================================================================
+
+/// Byte-level I/O. Every byte source or sink implements `Read` or
+/// `Write`; `IoError` is the failure channel for all I/O operations.
+///
+/// Sub-modules:
+///   • `error`  — `IoError { kind, os_code }`; `IoErrorKind` enum;
+///               `from_errno(code)` maps POSIX errno
+///   • `fd`     — `O_RDONLY/WRONLY/RDWR`; `read_fd`, `write_fd`,
+///               `close_fd`, `errno()`
+///   • `traits` — `Read` and `Write` traits; `read_all`, `write_all`
+///   • `stdio`  — `stdin()`, `stdout()`, `stderr()`; fd constants 0/1/2
+public module io;
+
+// ============================================================================
+// fmt — text formatting
+// ============================================================================
+
+/// Human- and developer-readable text formatting.
+///
+/// Sub-modules:
+///   • `integer`  — `write_u64_decimal`, `write_i64_decimal` (no heap);
+///                  `parse_u64`, `parse_u32`, `parse_u16`, `parse_u8`
+///   • `display`  — `Display` and `Debug` traits; `Formatter<W>`;
+///                  `print`, `println`, `eprint`, `eprintln`
+public module fmt;
+
+// ============================================================================
+// fs — filesystem
+// ============================================================================
+
+/// Filesystem access. `File` implements `Read + Write` so any code
+/// already targeting the I/O traits works against files without glue.
+///
+/// Sub-modules:
+///   • `path`  — `Path` (borrowed), `PathBuf` (owned);
+///              `extension`, `file_name`, `parent`, `join`, `is_absolute`
+///   • `file`  — `OpenOptions` builder; `File` (`Read + Write`);
+///              convenience `read(path)` and `write(path, bytes)`;
+///              `O_CREAT/EXCL/TRUNC/APPEND`; `SEEK_SET/CUR/END`
+public module fs;
+
+// ============================================================================
+// ffi — C ABI boundary
+// ============================================================================
+
+/// The C ABI boundary. The only place in the stdlib where NUL-terminated
+/// strings and raw platform types are allowed. Every other module works
+/// in `Str` / `String`; FFI helpers translate at the boundary.
+///
+/// Sub-modules:
+///   • `cstr`  — `CStr` (borrowed `*u8`), `CString` (owned),
+///              `NulError`; `CString::from_str(s)` → `Result<CString, NulError>`
+public module ffi;
+
+// ============================================================================
+// env — process environment
+// ============================================================================
+
+/// Process environment and argument access.
+/// `args() -> Array<Str>`, `var(name) -> Option<Str>`,
+/// `set_var(name, value)`, `exit(code) -> !`.
+public module env;
+
+// ============================================================================
+// math — libm float operations
+// ============================================================================
+
+/// Thin wrappers over libm. Inherits platform behavior (rounding mode,
+/// errno on domain errors, subnormal handling). Naming follows C:
+/// `sqrt`, `cbrt`, `pow`, `exp`, `ln`, `log2`, `log10`,
+/// `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`,
+/// `sinh`, `cosh`, `tanh`, `floor`, `ceil`, `round`, `trunc`, `fabs`.
+/// f32 variants use C's `*f` names surfaced as `*_f32` (e.g. `sqrt_f32`).
+public module math;
+
+// ============================================================================
+// net — network primitives and HTTP
+// ============================================================================
+
+/// Network primitives (IP addresses, sockets, TCP) and an HTTP/1.1
+/// layer. TLS, UDP, HTTP/2, and WebSocket are explicitly out of scope.
+///
+/// Sub-modules:
+///   • `ip`          — `IpV4Addr`, `IpV6Addr`, `IpAddr`
+///   • `socket_addr` — `SocketAddr { ip, port }`; `parse_v4`
+///   • `tcp`         — `TcpStream` (`Read + Write`), `TcpListener`
+///   • `http`        — HTTP/1.1 layer (see below)
+///
+/// `http` sub-modules:
+///   • `http::method`   — `Method` enum (`Get`, `Post`, `Put`, …)
+///   • `http::status`   — `StatusCode`; named constructors; `reason_phrase`
+///   • `http::headers`  — `Headers` case-insensitive map; `write_to`
+///                        serializes all headers as `name: value\r\n`
+///   • `http::request`  — `Request`; `parse`, `write_to`;
+///                        `HTTP_VERSION`, `MAX_HEADER_LINE`, `MAX_BODY`
+///   • `http::response` — `Response`; `text`, `json`, `set_body`,
+///                        `write_to` (complete HTTP/1.1 message)
+///   • `http::server`   — `serve(addr, handler)` connection-per-request
+///   • `http::client`   — `Client::get/post`; `send(addr, req)`
+public module net;
+
+// ============================================================================
+// process — subprocess spawning
+// ============================================================================
+
+/// POSIX subprocess spawning (`fork + execve`). Windows is not yet supported.
+///
+/// Sub-modules:
+///   • `signal`  — `Signal { number }`; `hup`, `int`, `quit`, `kill`, `term`
+///   • `child`   — `ExitStatus`, `Child`; `wait`, `try_wait`, `kill`;
+///                `ChildStdin` (`Write`), `ChildStdout`/`ChildStderr` (`Read`)
+///   • `command` — `Command` builder (`arg`, `env`, `stdin`, `stdout`, …);
+///                `spawn`, `output`, `status`;
+///                `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`);
+///                `Output { status, stdout, stderr }`
+public module process;
