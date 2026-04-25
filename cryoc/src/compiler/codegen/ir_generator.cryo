@@ -516,8 +516,10 @@ public:
                     } else {
                         const pat_val: LValue = this.codegen_pattern_value(pat);
                         if (pat_val.is_valid()) {
+                            const pat_val_coerced: LValue =
+                                coerce_icmp_operands(this.cg, subject, pat_val);
                             cmp = this.cg.builder.build_icmp(
-                                32, subject, pat_val, "match.cmp");
+                                32, subject, pat_val_coerced, "match.cmp");
                         }
                     }
                     if (cmp.is_valid()) {
@@ -535,8 +537,10 @@ public:
                     } else {
                         const pat_val: LValue = this.codegen_pattern_value(pat);
                         if (pat_val.is_valid()) {
+                            const pat_val_coerced: LValue =
+                                coerce_icmp_operands(this.cg, subject, pat_val);
                             cmp = this.cg.builder.build_icmp(
-                                32, subject, pat_val, "match.cmp");
+                                32, subject, pat_val_coerced, "match.cmp");
                         }
                     }
                     if (cmp.is_valid()) {
@@ -577,6 +581,7 @@ public:
         }
 
         // Generate each arm's body.
+        mut any_arm_falls_through: boolean = false;
         for (mut i: i64 = 0; i < num_arms; i++) {
             const arm: MatchArmNode* = node.arms[i];
             if (arm == null) { continue; }
@@ -590,11 +595,24 @@ public:
             if (arm.body != null) {
                 this.generate_statement(arm.body);
             }
+            const cur_after: LBasicBlock = this.cg.builder.get_insert_block();
+            const arm_falls: boolean = cur_after.is_valid() && !cur_after.has_terminator();
+            if (arm_falls) { any_arm_falls_through = true; }
             branch_if_not_terminated(this.cg, merge_bb);
             this.cg.pop_scope();
         }
 
         this.cg.builder.position_at_end(merge_bb);
+        // The last arm's pattern test still branches into merge_bb when
+        // no pattern matched — a "neither arm fired" edge that cryoc
+        // currently can't prove unreachable.  If every arm terminated
+        // internally (return/break), nothing else follows the match, so
+        // `merge_bb` would otherwise sit without a terminator and the
+        // function-body validator would strip the whole body to a
+        // bare declare.  Emit `unreachable` to keep the IR verifiable.
+        if (!any_arm_falls_through && !merge_bb.has_terminator()) {
+            this.cg.builder.build_unreachable();
+        }
     }
 
     /// Prepare a match subject: resolve its enum type (if any), normalize to
@@ -1194,32 +1212,83 @@ public:
             //     to the method named `ClassName` on the class itself,
             //     registered as `{qualified_class}::ClassName`.  Sema sets
             //     the call's resolved_type to the class type for this form.
+            //     Unlike the `new` form (which heap-allocates), this emits
+            //     a stack-local construction: alloca the object, call the
+            //     constructor with the alloca pointer as `this`, then load
+            //     the populated value so the caller sees an rvalue of the
+            //     class type.
             if (!callee_val.is_valid()) {
                 const di: DeclarationIndex* = this.cg.get_decl_index();
-                const type_ref: TypeRef = di.lookup_type(id.name);
+                mut type_ref: TypeRef = di.lookup_type(id.name);
                 mut ctor_qn: SymbolStr = SymbolStr::empty();
                 if (type_ref.is_valid()) {
                     const arena: TypeArena* = this.cg.get_arena();
                     ctor_qn = arena.get_qualified_name(type_ref);
                 }
                 if (!ctor_qn.is_valid()) {
-                    // Fall back to the DI bare→qualified map (covers types
-                    // whose qualified name isn't stored on the arena Type,
-                    // e.g. types reached via cross-module aliasing).
                     const resolved: SymbolStr = di.resolve_qualified(id.name);
                     if (resolved.is_valid() && !resolved.equals(id.name)) {
                         ctor_qn = resolved;
+                        // Refetch the type through the qualified alias
+                        // (cross-module types only reachable via DI's
+                        // bare→qualified map).
+                        if (!type_ref.is_valid()) {
+                            type_ref = di.lookup_type(ctor_qn);
+                        }
                     }
                 }
-                if (ctor_qn.is_valid()) {
+                if (ctor_qn.is_valid() && type_ref.is_valid()) {
                     const qn_str: string = intern.resolve(ctor_qn);
                     const bare_str: string = intern.resolve(id.name);
                     const combined: string = format("%s::%s", qn_str, bare_str);
                     const ctor_sym: SymbolStr = intern.intern(combined);
-                    const ctor_arity: u32 = node.arguments.length as u32;
-                    callee_val = resolve_function_with_arity(this.cg, ctor_sym, ctor_arity);
-                    if (!callee_val.is_valid()) {
-                        callee_val = resolve_function(this.cg, ctor_sym);
+                    // Constructor LLVM arity = user args + 1 for `this`.
+                    const ctor_arity: u32 = (node.arguments.length + 1) as u32;
+                    mut ctor_fn: LValue = resolve_function_with_arity(this.cg, ctor_sym, ctor_arity);
+                    if (!ctor_fn.is_valid()) {
+                        ctor_fn = resolve_function(this.cg, ctor_sym);
+                    }
+                    if (ctor_fn.is_valid()) {
+                        const mapped: LType = this.cg.type_mapper.map_type(type_ref);
+                        const current_fn: LValue = this.get_current_function();
+                        if (mapped.is_valid() && current_fn.is_valid()) {
+                            const obj_alloca: LValue = this.cg.create_entry_alloca(
+                                current_fn, "ctor.tmp", mapped);
+                            // Vtable slot for classes with virtual methods.
+                            const t_for_vtbl: Type* = this.cg.lookup_type_by_id(type_ref.id);
+                            if (t_for_vtbl != null && t_for_vtbl.kind == TypeKind::Class) {
+                                const cls_vtbl: ClassType* = t_for_vtbl as ClassType*;
+                                if (cls_vtbl.has_virtual_methods) {
+                                    const qname: QualifiedName = QualifiedName::from_symbol(ctor_qn);
+                                    const vtbl_name: string = MangledName::for_vtable(
+                                        intern, qname).resolve(intern);
+                                    const vtbl_global: LValue = this.cg.llvm_module.get_named_global(vtbl_name);
+                                    if (vtbl_global.is_valid()) {
+                                        const vptr_slot: LValue = this.cg.builder.build_struct_gep(
+                                            mapped, obj_alloca, 0, "vptr.slot");
+                                        if (vptr_slot.is_valid()) {
+                                            this.cg.builder.build_store(vtbl_global, vptr_slot);
+                                        }
+                                    }
+                                }
+                            }
+                            const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
+                            if (ctor_ty.is_valid() && llvm::LLVMGetTypeKind(ctor_ty.raw) == 9) {
+                                mut ctor_args: LValue[] = [];
+                                ctor_args.push(obj_alloca);
+                                for (mut ci: i64 = 0; ci < node.arguments.length; ci++) {
+                                    ctor_args.push(this.codegen_rvalue(node.arguments[ci]));
+                                }
+                                mut ctor_res: LValue = LValue::null();
+                                codegen_call(this.cg, ctor_fn, ctor_ty, ctor_args, "", &ctor_res);
+                            }
+                            // Load the constructed value as the expression result.
+                            const loaded: LValue = this.cg.builder.build_load(
+                                mapped, obj_alloca, "ctor.val");
+                            this.last_value = loaded;
+                            this.last_is_lvalue = false;
+                            return;
+                        }
                     }
                 }
             }
@@ -2328,7 +2397,9 @@ public:
                     } else {
                         const pat_val: LValue = this.codegen_pattern_value(pat);
                         if (pat_val.is_valid()) {
-                            cmp = this.cg.builder.build_icmp(32, subject, pat_val, "mexpr.cmp");
+                            const pat_val_coerced: LValue =
+                                coerce_icmp_operands(this.cg, subject, pat_val);
+                            cmp = this.cg.builder.build_icmp(32, subject, pat_val_coerced, "mexpr.cmp");
                         }
                     }
                     if (cmp.is_valid()) {
@@ -2346,7 +2417,9 @@ public:
                     } else {
                         const pat_val: LValue = this.codegen_pattern_value(pat);
                         if (pat_val.is_valid()) {
-                            cmp = this.cg.builder.build_icmp(32, subject, pat_val, "mexpr.cmp");
+                            const pat_val_coerced: LValue =
+                                coerce_icmp_operands(this.cg, subject, pat_val);
+                            cmp = this.cg.builder.build_icmp(32, subject, pat_val_coerced, "mexpr.cmp");
                         }
                     }
                     if (cmp.is_valid()) {
