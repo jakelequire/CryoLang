@@ -57,6 +57,8 @@ type struct ProjectConfig {
     no_std:       boolean;
     emit_llvm:    boolean;
     project_root: string;      // directory containing cryoconfig
+    link_libs:    string[];    // e.g. ["LLVM-20"]       → `-lLLVM-20`
+    link_paths:   string[];    // e.g. ["/usr/lib/x"]    → `-L/usr/lib/x`
 
     /// Create a default configuration.
     static default() -> ProjectConfig {
@@ -71,6 +73,8 @@ type struct ProjectConfig {
             no_std:       false,
             emit_llvm:    false,
             project_root: ".",
+            link_libs:    [],
+            link_paths:   [],
         };
     }
 
@@ -170,6 +174,12 @@ type struct ProjectConfig {
                         config.emit_llvm = true;
                     }
                 }
+                else if (strcmp(key, "link_libs") == 0) {
+                    config.link_libs = parse_string_array(raw_val);
+                }
+                else if (strcmp(key, "link_paths") == 0) {
+                    config.link_paths = parse_string_array(raw_val);
+                }
             }
         }
 
@@ -259,6 +269,49 @@ function parse_bool(s: string) -> boolean {
     if (strcmp(s, "yes") == 0)   { return true;  }
     if (strcmp(s, "1") == 0)     { return true;  }
     return false;
+}
+
+/// Parse a TOML-like string array value: `["a", "b", "c"]` → ["a","b","c"].
+/// Lenient — ignores whitespace and missing brackets, handles single- and
+/// double-quoted entries, returns an empty array when nothing parses.
+function parse_string_array(raw: string) -> string[] {
+    mut result: string[] = [];
+    const len: i64 = strlen(raw) as i64;
+    mut i: i64 = 0;
+    while (i < len) {
+        const c: i8 = raw[i];
+        // Skip opening bracket, commas, whitespace.
+        if (c == '[' || c == ',' || c == ' ' || c == '\t') {
+            i = i + 1;
+            continue;
+        }
+        // Stop at closing bracket.
+        if (c == ']') { break; }
+        // A quoted string.
+        if (c == '"' || c == '\'') {
+            const quote: i8 = c;
+            i = i + 1;
+            const start: i64 = i;
+            while (i < len && raw[i] != quote) { i = i + 1; }
+            if (i > start) {
+                result.push(substr(raw, start, i - start));
+            }
+            if (i < len) { i = i + 1; }  // skip closing quote
+            continue;
+        }
+        // Unquoted token — scan to next delimiter.
+        const t_start: i64 = i;
+        while (i < len && raw[i] != ',' && raw[i] != ']') { i = i + 1; }
+        mut end: i64 = i;
+        // Trim trailing whitespace.
+        while (end > t_start && (raw[end - 1] == ' ' || raw[end - 1] == '\t')) {
+            end = end - 1;
+        }
+        if (end > t_start) {
+            result.push(substr(raw, t_start, end - t_start));
+        }
+    }
+    return result;
 }
 
 /// Find the first occurrence of a character in a string. Returns -1 if not found.

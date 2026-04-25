@@ -12,6 +12,7 @@ import Compiler::Codegen::Context;
 import Compiler::Codegen::IRGenerator;
 import Compiler::Codegen::DeclCodegen;
 import Compiler::CompilationContext;
+import Compiler::ProjectConfig;
 import Compiler::Artifacts;
 import Compiler::Diag;
 import Compiler::Diag::Diagnostic;
@@ -299,6 +300,12 @@ type struct CodegenPasses {
         // NOTE: Deep nested struct assignment (ctx.artifacts.linked.object_file_path)
         // is not supported by the C++ compiler. Use a LinkedOutput replacement instead.
         ctx.artifacts.linked = LinkedOutput { object_file_path: obj_name };
+        // Accumulate every module's object path so the linker pass can
+        // invoke `cc` once over all of them at the end of Phase 7.
+        // Route through `register_object_file` — directly calling
+        // `.push()` on a multi-deref field chain lands on a temp copy
+        // in the bootstrap codegen (known push-through-pointer limitation).
+        ctx.artifacts.register_object_file(obj_name);
 
         if (ctx.debug_mode) {
             printf("[Codegen] Emitted: %s\n", obj_name);
@@ -308,34 +315,71 @@ type struct CodegenPasses {
     }
 
 
-    /// Linking pass.  Invokes the system linker to combine all object files.
+    /// Linking pass.  Invokes the system linker (`cc`) to combine all
+    /// per-module object files emitted during Phase 7 into the final
+    /// executable at `{output_dir}/bin/{project_name}`.  Pulls link
+    /// libs/paths from the parsed cryoconfig, and tacks on the stdlib
+    /// archive whenever `no_std` is not set.
     static run_linking(ctx: CompilationContext*) -> PassResult {
-        const obj_path: string = ctx.artifacts.linked.object_file_path;
-        if (obj_path == "") {
+        if (ctx.artifacts.object_files.length == 0) {
+            // Nothing to link — library/stdlib batch build, or codegen
+            // was disabled (LSP mode).  Not an error.
+            return PassResult::ok();
+        }
+        if (ctx.project_config == null) {
+            return PassResult::ok();
+        }
+        if (!ctx.project_config.requires_entry_point()) {
+            // Library/stdlib target — no final binary, just the .o files.
             return PassResult::ok();
         }
 
-        if (ctx.debug_mode) {
-            printf("[Codegen] Linking: %s\n", obj_path);
+        const cfg: ProjectConfig* = ctx.project_config;
+        const output_dir: string = cfg.output_dir;
+        const bin_dir: string = format("%s/bin", output_dir);
+        mkdir(bin_dir, 493);  // 0755
+        const exe_path: string = format("%s/%s", bin_dir, cfg.project_name);
+
+        // Build the link command.  Use string accumulation via format so
+        // the arg list stays on one process-level invocation — libc's
+        // system(3) runs `sh -c` so shell quoting rules apply.
+        mut cmd: string = format("cc -o %s", exe_path);
+        for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
+            cmd = format("%s %s", cmd, ctx.artifacts.object_files[i]);
         }
-
-        // Determine output executable name.
-        mut exe_name: string = "build/output";
-        if (ctx.project_config != null) {
-            exe_name = format("build/%s", ctx.project_config.project_name);
+        // Project-configured -L paths and -l libs.
+        for (mut i: i64 = 0; i < cfg.link_paths.length; i++) {
+            cmd = format("%s -L%s", cmd, cfg.link_paths[i]);
         }
-
-        // Build linker command.
-        const cmd: string = format("cc -o %s %s -lm", exe_name, obj_path);
+        for (mut i: i64 = 0; i < cfg.link_libs.length; i++) {
+            cmd = format("%s -l%s", cmd, cfg.link_libs[i]);
+        }
+        // Stdlib archive: the bootstrap writes `stdlib/.bin/libcryo.a`,
+        // which holds every stdlib namespace's .o.  Pull it in unless
+        // the project opted out via `no_std`.
+        if (!cfg.no_std) {
+            const stdlib_archive: string = format("%s/../stdlib/.bin/libcryo.a",
+                cfg.project_root);
+            cmd = format("%s %s", cmd, stdlib_archive);
+        }
+        // System libs every cryoc binary needs: libm for math intrinsics,
+        // libstdc++ for LLVM's C++ internals (dragged in through -lLLVM-*).
+        cmd = format("%s -lm -lstdc++", cmd);
 
         if (ctx.debug_mode) {
+            printf("[Codegen] Linking %lld objects → %s\n",
+                ctx.artifacts.object_files.length, exe_path);
             printf("[Codegen] Link command: %s\n", cmd);
         }
 
-        // TODO: Execute the link command via system().
-        // For now, just print the command.
-        printf("[Codegen] TODO: execute link command\n");
+        const rc: i32 = system(cmd);
+        if (rc != 0) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("linker invocation failed (cc exited with %d): %s", rc, cmd));
+            return PassResult::failure(1);
+        }
 
+        printf("[Codegen] Linked executable: %s\n", exe_path);
         return PassResult::ok();
     }
 }

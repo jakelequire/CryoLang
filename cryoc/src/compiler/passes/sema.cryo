@@ -1793,6 +1793,28 @@ public:
             scope.set_resolved_type(resolved);
             return resolved;
         }
+        // Try the specialized type's DI-registered qualified name.  Generic
+        // struct/class templates (e.g. `Utils::Map<K, V>`) register their
+        // specialized methods under the arena's qualified name for the
+        // specialization, not under the plain mangled base.  Without this
+        // lookup the fallback below returns the template's return type —
+        // which, for a method declared `-> Self` (just `Map`), is the
+        // template struct, and callers emit a call to the unspecialized
+        // symbol that the linker can't resolve.
+        if (scope.scope_generic_args.length > 0) {
+            const spec_ref: TypeRef = this.lookup_type_by_sym(lookup_sym);
+            if (spec_ref.is_valid()) {
+                const spec_qn: SymbolStr = this.ctx.decl_index.lookup_type_name(spec_ref);
+                if (spec_qn.is_valid() && !spec_qn.equals(lookup_sym)) {
+                    const qn_ret: TypeRef = this.ctx.decl_index.lookup_method_return(
+                        spec_qn, scope.member_name);
+                    if (qn_ret.is_valid()) {
+                        scope.set_resolved_type(qn_ret);
+                        return qn_ret;
+                    }
+                }
+            }
+        }
         // Try base name if we used a specialized one (e.g., Pair::new)
         if (lookup_sym.id != scope.scope_name.id) {
             const base_ret: TypeRef = this.lookup_method_return(
@@ -2194,7 +2216,26 @@ public:
         // `aliases: []` need the field type to pick up their element
         // type.  Limited to empty ArrayLiterals to avoid side-effects
         // on other literal kinds.
-        const struct_ref: TypeRef = this.lookup_type_by_sym(lit.struct_type);
+        //
+        // Prefer the specialized type when the literal carries explicit
+        // generic args (`HashMapIter<string, u32> { ... }`): the
+        // substituter rewrites the args from T→concrete but leaves
+        // `struct_type` as the bare template name, so a plain
+        // `lookup_type_by_sym` gets the template and downstream IR
+        // emission signs the function body as returning the wrong
+        // arena type.  Build the mangled specialized name first and
+        // fall back to the bare lookup only when that misses.
+        mut struct_ref: TypeRef = TypeRef::invalid();
+        if (lit.generic_args.length > 0 && this.ctx.type_resolver != null) {
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(
+                lit.struct_type, lit.generic_args);
+            if (spec_sym.is_valid()) {
+                struct_ref = this.lookup_type_by_sym(spec_sym);
+            }
+        }
+        if (!struct_ref.is_valid()) {
+            struct_ref = this.lookup_type_by_sym(lit.struct_type);
+        }
         mut struct_t: Type* = if (struct_ref.is_valid()) {
             this.arena.lookup(struct_ref.id)
         } else {

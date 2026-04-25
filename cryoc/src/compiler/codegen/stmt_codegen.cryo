@@ -65,6 +65,26 @@ function codegen_block(cg: CodegenContext*, node: BlockStmtNode*,
 
 function codegen_return(cg: CodegenContext*, val: LValue, has_value: boolean) -> void {
     if (has_value && val.is_valid()) {
+        // Unit-returning functions lower to `void` in LLVM (see
+        // map_return_type), so a source-level `return unit_expr;`
+        // must emit `ret void` rather than `ret {} %unit` — the
+        // verifier rejects the latter.  Detect the mismatch by
+        // looking at the current function's LLVM return type.
+        const cur_bb: LBasicBlock = cg.builder.get_insert_block();
+        if (cur_bb.is_valid()) {
+            const fn: LValue = cur_bb.get_parent();
+            if (fn.is_valid()) {
+                const fn_ty_raw: void* = llvm::LLVMGlobalGetValueType(fn.raw);
+                if (llvm::LLVMGetTypeKind(fn_ty_raw) == 9) {
+                    const ret_ty_raw: void* = llvm::LLVMGetReturnType(fn_ty_raw);
+                    if (llvm::LLVMGetTypeKind(ret_ty_raw) == 0) {
+                        emit_va_end_if_variadic(cg, current_variadic_arg(cg));
+                        cg.builder.build_ret_void();
+                        return;
+                    }
+                }
+            }
+        }
         // Coerce the return value to the function's declared return type.
         // Handles common implicit conversions like u64↔ptr (stdlib uses this
         // in `align_up`/`align_down`) and narrower integer returns.
@@ -407,4 +427,30 @@ function branch_if_not_terminated(cg: CodegenContext*, target: LBasicBlock) -> v
     if (current.is_valid() && !current.has_terminator()) {
         cg.builder.build_br(target);
     }
+}
+
+/// Reshape an icmp RHS to match the LHS width when the subject is a
+/// narrower integer than the pattern value.  `codegen_pattern_value`
+/// always produces i32 literals (char literals, atoi'd ints), but the
+/// subject can be i8/i16 (u8/char matches) or i64 (wide counters).
+/// Truncate or sign-extend to keep LLVM's verifier happy.
+function coerce_icmp_operands(cg: CodegenContext*, lhs: LValue, rhs: LValue) -> LValue {
+    if (!lhs.is_valid() || !rhs.is_valid()) { return rhs; }
+    const lhs_ty_raw: void* = llvm::LLVMTypeOf(lhs.raw);
+    const rhs_ty_raw: void* = llvm::LLVMTypeOf(rhs.raw);
+    // Only reshape when both are integer — pointer/float cases hit
+    // distinct error paths.  LLVMGetTypeKind code 8 = Integer.  We avoid
+    // `lhs_ty_raw == rhs_ty_raw` for the early-out because the bootstrap
+    // lowers `==` on `void*` to strcmp, which would read from the LLVM
+    // type objects as if they were strings.
+    if (llvm::LLVMGetTypeKind(lhs_ty_raw) != 8) { return rhs; }
+    if (llvm::LLVMGetTypeKind(rhs_ty_raw) != 8) { return rhs; }
+    const lhs_bits: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty_raw);
+    const rhs_bits: u32 = llvm::LLVMGetIntTypeWidth(rhs_ty_raw);
+    if (lhs_bits == rhs_bits) { return rhs; }
+    const lhs_ty: LType = LType { raw: lhs_ty_raw };
+    if (rhs_bits > lhs_bits) {
+        return cg.builder.build_trunc(rhs, lhs_ty, "match.coerce.trunc");
+    }
+    return cg.builder.build_zext(rhs, lhs_ty, "match.coerce.zext");
 }
