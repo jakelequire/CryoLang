@@ -1426,7 +1426,6 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::EnumDeclaration => {
                     const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                    if (node.is_generic()) { continue; }
 
                     const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
                     mut type_ref: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
@@ -1445,10 +1444,25 @@ type struct TypeResolutionPasses {
                     // Only populate if not already populated (avoid double-populating)
                     if (et.variants.length > 0) { continue; }
 
-                    // Resolve variant associated types and populate
+                    // Build a resolution context.  For generic enums, bind each
+                    // generic parameter to its GenericParam TypeRef so that
+                    // variant payload annotations referencing `T` resolve to the
+                    // enum's own GenericParam_T.  Without this, generic enums had
+                    // empty variant info — and the monomorphizer's substitution
+                    // path falls back to AST re-resolution on partially-
+                    // specialized clones (e.g., Option<T*> where the outer T is
+                    // still generic), which can't find `T` in a binding-free
+                    // context.  Populating the base lets specialization apply
+                    // substitution to a known-good source.
                     const module_name: string = ctx.has_namespace()
                         ? ctx.namespace_display() : ctx.source_file;
                     mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, ctx.source_file);
+                    for (mut gpi: i64 = 0; gpi < node.generic_params.length; gpi++) {
+                        const gp: GenericParamNode* = node.generic_params[gpi];
+                        if (gp == null) { continue; }
+                        const gp_ref: TypeRef = arena.create_generic_param(gp.name, gpi as u64);
+                        res_ctx.add_binding(gp.name, gp_ref);
+                    }
 
                     for (mut j: i64 = 0; j < node.variants.length; j++) {
                         const variant: EnumVariantNode* = node.variants[j];
