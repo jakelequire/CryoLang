@@ -260,6 +260,10 @@ void         LLVMAddCase(LLVMValueRef Switch, LLVMValueRef OnVal,
                          LLVMBasicBlockRef Dest);
 LLVMValueRef LLVMBuildUnreachable(LLVMBuilderRef B);
 
+/* Atomic fence — used by IntrinsicsCodegen to lower atomic_fence(order). */
+LLVMValueRef LLVMBuildFence(LLVMBuilderRef B, int Ordering, int SingleThread,
+                            const char *Name);
+
 
 /* ===================================================================
  * Builder — Arithmetic
