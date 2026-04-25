@@ -23,6 +23,72 @@ import Compiler::Resolver::QualifiedName;
 
 
 // ============================================================================
+// Cross-module shared type cache
+// ============================================================================
+//
+// Why this is a module-level singleton:
+// One CodegenContext (and one TypeMapper) is constructed per Cryo module.
+// `map_struct` / `map_class` / `forward_declare_struct` all call
+// `LLVMStructCreateNamed(global_ctx, mangled_name)`.  LLVM's global context
+// is process-wide, and creating a second named struct with the same name in
+// it auto-renames the second to `<name>.N`.  So without sharing, module A
+// emits `%C$3CLI.7Command` while module B emits `%C$3CLI.7Command.1` — and
+// the linker can't merge them back together.
+//
+// The fix: every TypeMapper across every module reads/writes the SAME
+// cache.  The first module that maps `MyStruct` calls LLVMStructCreateNamed
+// once and stashes the handle here; every subsequent module hits the cache
+// and references the existing handle, so all per-module IR uses the same
+// `%MyStruct` identifier.
+//
+// Cryo compilation is single-threaded, so no synchronization is needed.
+// Stored as a heap-allocated TypeMapperCache* rather than two raw arrays
+// so we sidestep the question of whether module-level dynamic-array
+// globals are robust in the bootstrap.
+
+type struct TypeMapperCache {
+    keys:   u64[];
+    values: void*[];
+
+    static new() -> TypeMapperCache {
+        return TypeMapperCache { keys: [], values: [] };
+    }
+
+    lookup(&this, id: u64) -> LType {
+        for (mut i: i64 = 0; i < this.keys.length; i++) {
+            if (this.keys[i] == id) {
+                return LType { raw: this.values[i] };
+            }
+        }
+        return LType::null();
+    }
+
+    store(mut &this, id: u64, ty: LType) -> void {
+        for (mut i: i64 = 0; i < this.keys.length; i++) {
+            if (this.keys[i] == id) {
+                this.values[i] = ty.raw;
+                return;
+            }
+        }
+        this.keys.push(id);
+        this.values.push(ty.raw);
+    }
+}
+
+mut g_shared_type_cache: TypeMapperCache* = null;
+
+/// Lazy-init accessor for the cross-module type cache.  Idempotent;
+/// every call after the first returns the same handle.
+function get_shared_type_cache() -> TypeMapperCache* {
+    if (g_shared_type_cache == null) {
+        const _box: Box<TypeMapperCache> = Box<TypeMapperCache>::new(TypeMapperCache::new());
+        g_shared_type_cache = _box.leak();
+    }
+    return g_shared_type_cache;
+}
+
+
+// ============================================================================
 // TypeMapper
 // ============================================================================
 
@@ -480,24 +546,19 @@ type struct TypeMapper {
     // Cache
     // ========================================================================
 
+    /// Cache reads / writes go through the module-level shared cache so
+    /// every module's TypeMapper participates in one cross-module dedup
+    /// pool.  The per-instance cache_keys / cache_values arrays are kept
+    /// only to preserve TypeMapper's struct shape (the bootstrap is
+    /// sensitive to layout shifts on heavily-used types) — they are no
+    /// longer read or written.
     lookup_cache(&this, id: u64) -> LType {
-        for (mut i: i64 = 0; i < this.cache_keys.length; i++) {
-            if (this.cache_keys[i] == id) {
-                return LType { raw: this.cache_values[i] };
-            }
-        }
-        return LType::null();
+        const cache: TypeMapperCache* = get_shared_type_cache();
+        return cache.lookup(id);
     }
 
     store_cache(mut &this, id: u64, ty: LType) -> void {
-        // Check if already present (update in place).
-        for (mut i: i64 = 0; i < this.cache_keys.length; i++) {
-            if (this.cache_keys[i] == id) {
-                this.cache_values[i] = ty.raw;
-                return;
-            }
-        }
-        this.cache_keys.push(id);
-        this.cache_values.push(ty.raw);
+        const cache: TypeMapperCache* = get_shared_type_cache();
+        cache.store(id, ty);
     }
 }
