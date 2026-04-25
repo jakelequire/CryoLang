@@ -181,7 +181,7 @@ function declare_struct_type(cg: CodegenContext*, node: StructDeclNode*) -> void
 
     const name: string = cg.resolve(node.name);
     const qname: QualifiedName = QualifiedName::single(cg.get_intern(), name);
-    const mangled: string = MangledName::for_struct(cg.get_intern(), qname).resolve(cg.get_intern());
+    const mangled: string = MangledName::for_struct_type(cg.get_intern(), qname).resolve(cg.get_intern());
 
     // Look up the Cryo StructType to get field info.
     const type_ref: TypeRef = cg.ctx.decl_index.lookup_type(node.name);
@@ -266,9 +266,18 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
     const di: DeclarationIndex* = ctx_ptr.decl_index;
     mut mangled_sym: SymbolStr = di.lookup_mangled_name(qualified);
     if (!mangled_sym.is_valid()) {
-        // Compute and register on first use.
+        // Compute and register on first use using the v0.2 mangler.
         const qname: QualifiedName = QualifiedName::from_symbol(qualified);
-        const computed: MangledName = MangledName::for_function(intern, qname);
+        mut params: TypeRef[] = [];
+        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+            const param: VarDeclNode* = node.parameters[pi];
+            if (param != null && param.resolved_type.is_valid()) {
+                params.push(param.resolved_type);
+            }
+        }
+        const computed: MangledName = MangledName::for_free_function(
+            intern, cg.get_arena(), qname, params,
+            node.resolved_return_type, node.is_variadic);
         mangled_sym = computed.value;
         di.register_mangled_name(qualified, mangled_sym);
     }
@@ -509,15 +518,29 @@ function find_vtable_slot_impl(cg: CodegenContext*, cls: ClassType*,
                 }
             }
             const type_qname: QualifiedName = QualifiedName::from_symbol(walk.qualified_name);
-            const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
             const method_str: string = intern.resolve(slot_name);
-            mut pd: string[] = [];
-            for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
-                const pt: Type* = arena.lookup(m.param_types[pi].id);
-                if (pt != null) { pd.push(pt.display_name()); }
-                else { pd.push("?"); }
+            // Resolve method's full signature for the v0.2 mangler.
+            mut method_ret: TypeRef = TypeRef::invalid();
+            mut method_variadic: boolean = false;
+            const fn_t: Type* = arena.lookup(m.function_type.id);
+            if (fn_t != null && fn_t.kind == TypeKind::Function) {
+                const fn_ty: FunctionType* = fn_t as FunctionType*;
+                method_ret = fn_ty.return_type;
+                method_variadic = fn_ty.is_variadic;
             }
-            const computed: MangledName = MangledName::for_method(intern, type_mangled, method_str, pd);
+            // MethodInfo.param_types already excludes the receiver.  Default
+            // to ImmutRef receiver for virtual methods; if the method has
+            // a `mut &this` receiver we recover it from the AST node.
+            mut recv_kind: ReceiverKind = ReceiverKind::ImmutRef;
+            if (m.ast_node != null) {
+                const mn: MethodNode* = m.ast_node as MethodNode*;
+                if (mn != null && mn.func != null) {
+                    recv_kind = method_receiver_kind(mn.func, mn.is_static, intern);
+                }
+            }
+            const computed: MangledName = MangledName::for_method(
+                intern, arena, type_qname, slot_name, recv_kind,
+                m.param_types, method_ret, method_variadic);
             mut fn_val: LValue = resolve_function(cg, computed.value);
             if (!fn_val.is_valid()) {
                 const type_str: string = intern.resolve(walk.qualified_name);
@@ -622,21 +645,11 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     const di: DeclarationIndex* = ctx_ptr.decl_index;
     const arena: TypeArena* = cg.get_arena();
     const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
-    const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
-    mut pd: string[] = [];
-    const this_sym_amp: SymbolStr = intern.intern("&this");
-    const this_sym_val: SymbolStr = intern.intern("this");
-    for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
-        const pp: VarDeclNode* = func.parameters[pi];
-        if (pp == null) { continue; }
-        if (pp.name.equals(this_sym_amp)) { continue; }
-        if (pp.name.equals(this_sym_val)) { continue; }
-        if (pp.resolved_type.is_valid()) {
-            const pt: Type* = arena.lookup(pp.resolved_type.id);
-            if (pt != null) { pd.push(pt.display_name()); }
-        }
-    }
-    const computed: MangledName = MangledName::for_method(intern, type_mangled, method_str, pd);
+    const recv_kind: ReceiverKind = method_receiver_kind(func, node.is_static, intern);
+    const method_param_refs: TypeRef[] = method_non_receiver_params(func, intern);
+    const computed: MangledName = MangledName::for_method(
+        intern, arena, type_qname, func.name, recv_kind,
+        method_param_refs, func.resolved_return_type, func.is_variadic);
     const mangled_sym: SymbolStr = computed.value;
     // Cache into DI only if this is the first overload — preserves the
     // existing single-slot behavior for call sites that don't disambiguate.
@@ -1054,21 +1067,11 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
     // the computation in `declare_method` exactly.
     const arena: TypeArena* = cg.get_arena();
     const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
-    const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
-    mut pd: string[] = [];
-    const this_sym_amp: SymbolStr = intern.intern("&this");
-    const this_sym_val: SymbolStr = intern.intern("this");
-    for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
-        const pp: VarDeclNode* = func.parameters[pi];
-        if (pp == null) { continue; }
-        if (pp.name.equals(this_sym_amp)) { continue; }
-        if (pp.name.equals(this_sym_val)) { continue; }
-        if (pp.resolved_type.is_valid()) {
-            const pt: Type* = arena.lookup(pp.resolved_type.id);
-            if (pt != null) { pd.push(pt.display_name()); }
-        }
-    }
-    const computed: MangledName = MangledName::for_method(intern, type_mangled, method_str, pd);
+    const recv_kind: ReceiverKind = method_receiver_kind(func, node.is_static, intern);
+    const method_param_refs: TypeRef[] = method_non_receiver_params(func, intern);
+    const computed: MangledName = MangledName::for_method(
+        intern, arena, type_qname, func.name, recv_kind,
+        method_param_refs, func.resolved_return_type, func.is_variadic);
     const mangled_sym: SymbolStr = computed.value;
 
     // Prefer mangled_sym for overload-correct lookup; fall back to the

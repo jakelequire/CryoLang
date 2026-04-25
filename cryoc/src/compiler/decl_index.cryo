@@ -23,7 +23,9 @@ import Compiler::Resolver::MangledName;
 import Compiler::Resolver::QualifiedName;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Type;
+import Compiler::Types::Compound;
 import Compiler::Types::Arena;
+import Compiler::Types;
 import std::collections::hashmap;
 
 
@@ -37,6 +39,61 @@ import std::collections::hashmap;
 /// literal 4294967296 overflows i32 and silently becomes 0.
 function pack_method_key(type_sym: SymbolStr, method_sym: SymbolStr) -> u64 {
     return ((type_sym.id as u64) << 32) | (method_sym.id as u64);
+}
+
+
+// ============================================================================
+// Helper: Determine receiver shape for the v0.2 mangler from an AST node
+// ============================================================================
+
+/// Decode the receiver kind for a method given its AST.  This is the
+/// single source of truth used by every mangler call site so the
+/// produced symbol names converge.
+///
+///   `&this`          → ImmutRef        (encoded as $s)
+///   `mut &this`      → MutRef          (encoded as $m)
+///   `this` (by value)→ None            (regular first param)
+///   no explicit self → ImmutRef        (implicit `&this` for non-static)
+///   static method    → None
+function method_receiver_kind(func: FunctionDeclNode*, is_static: boolean,
+                              intern: InternTable*) -> ReceiverKind {
+    if (is_static || func == null) { return ReceiverKind::None; }
+
+    const this_ref_name: SymbolStr = intern.intern("&this");
+    const this_val_name: SymbolStr = intern.intern("this");
+
+    for (mut i: i64 = 0; i < func.parameters.length; i++) {
+        const param: VarDeclNode* = func.parameters[i];
+        if (param == null) { continue; }
+        if (param.name.equals(this_ref_name)) {
+            if (param.is_mutable) { return ReceiverKind::MutRef; }
+            return ReceiverKind::ImmutRef;
+        }
+        if (param.name.equals(this_val_name)) {
+            return ReceiverKind::None;
+        }
+    }
+    // Non-static method with no explicit receiver — implicit `&this`.
+    return ReceiverKind::ImmutRef;
+}
+
+/// Collect the non-receiver parameter TypeRefs for use with the v0.2
+/// `for_method` mangler.  Strips out `&this` (always a marker) but
+/// keeps `this` (since its by-value form is encoded as a regular param).
+function method_non_receiver_params(func: FunctionDeclNode*,
+                                    intern: InternTable*) -> TypeRef[] {
+    mut out: TypeRef[] = [];
+    if (func == null) { return out; }
+
+    const this_ref_name: SymbolStr = intern.intern("&this");
+
+    for (mut i: i64 = 0; i < func.parameters.length; i++) {
+        const param: VarDeclNode* = func.parameters[i];
+        if (param == null || !param.resolved_type.is_valid()) { continue; }
+        if (param.name.equals(this_ref_name)) { continue; }
+        out.push(param.resolved_type);
+    }
+    return out;
 }
 
 
@@ -374,23 +431,18 @@ type struct DeclarationIndex {
             this.register_function(combined_sym, func.resolved_return_type);
             this.register_function_type(combined_sym, func_type_ref);
 
-            // Compute and store the mangled LLVM symbol name.
+            // Compute and store the v0.2 mangled LLVM symbol name.  The
+            // receiver-kind / non-receiver-params split is shared with the
+            // codegen vtable-resolution path (see method_receiver_kind).
             const type_qname: QualifiedName = QualifiedName::from_symbol(type_sym);
-            const type_mangled: MangledName = MangledName::from_qualified(intern, type_qname);
-            mut param_displays: string[] = [];
-            for (mut pd: i64 = 0; pd < func.parameters.length; pd++) {
-                const pdp: VarDeclNode* = func.parameters[pd];
-                if (pdp != null && pdp.resolved_type.is_valid()
-                    && !pdp.name.equals(this_name)
-                    && !pdp.name.equals(this_val_name)) {
-                    const pdt: Type* = arena.lookup(pdp.resolved_type.id);
-                    if (pdt != null) {
-                        param_displays.push(pdt.display_name());
-                    }
-                }
-            }
+            const receiver_kind: ReceiverKind = method_receiver_kind(
+                func, method.is_static, intern);
+            const method_param_refs: TypeRef[] = method_non_receiver_params(
+                func, intern);
+            const method_sym: SymbolStr = func.name;
             const mangled: MangledName = MangledName::for_method(
-                intern, type_mangled, method_str, param_displays);
+                intern, arena, type_qname, method_sym, receiver_kind,
+                method_param_refs, func.resolved_return_type, func.is_variadic);
             this.register_mangled_name(combined_sym, mangled.value);
 
             // Also associate this overload's mangled name with its
@@ -513,13 +565,25 @@ type struct DeclarationIndex {
     /// Also computes and stores the mangled LLVM symbol name.
     register_function_type_with_module(mut &this, name: SymbolStr,
                                        return_type: TypeRef, func_type_ref: TypeRef,
-                                       module: SymbolStr, intern: InternTable*) -> void {
+                                       module: SymbolStr, intern: InternTable*,
+                                       arena: TypeArena*) -> void {
         this.register_function(name, return_type);
         this.register_function_type(name, func_type_ref);
 
-        // Compute mangled name for free functions (no param suffixes).
+        // Compute the v0.2 mangled name including the full signature.
         const qname: QualifiedName = QualifiedName::from_symbol(name);
-        const mangled: MangledName = MangledName::for_function(intern, qname);
+        mut params: TypeRef[] = [];
+        mut is_variadic: boolean = false;
+        const ft: Type* = arena.lookup(func_type_ref.id);
+        if (ft != null && ft.kind == TypeKind::Function) {
+            const fn_ty: FunctionType* = ft as FunctionType*;
+            for (mut i: i64 = 0; i < fn_ty.param_types.length; i++) {
+                params.push(fn_ty.param_types[i]);
+            }
+            is_variadic = fn_ty.is_variadic;
+        }
+        const mangled: MangledName = MangledName::for_free_function(
+            intern, arena, qname, params, return_type, is_variadic);
         this.register_mangled_name(name, mangled.value);
 
         this.module_func_keys.push(name.id);
