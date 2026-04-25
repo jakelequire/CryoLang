@@ -857,38 +857,39 @@ type struct Monomorphizer {
         ct.set_fields(field_infos);
     }
 
-    /// Populate a specialized EnumType's variants from the specialized AST.
-    /// Enum variant associated types are now structured TypeAnnotation* trees
-    /// (already substituted by ASTTypeSubstituter), so we resolve them directly
-    /// via the TypeResolver — no string parsing needed.
+    /// Populate a specialized EnumType's variants by applying the
+    /// substitution to the base generic enum's variant payload types.
+    ///
+    /// The earlier approach walked the (cloned + substituted) AST and
+    /// re-resolved each variant annotation via the TypeResolver.  That
+    /// failed for "partial" specializations like `Option<T*>` whose
+    /// substituted variant annotation is `T` — referring to an outer
+    /// generic param that has no binding in the local ResolutionContext.
+    ///
+    /// Substituting against the base's already-resolved payload TypeRefs
+    /// avoids the binding gap entirely: subst maps the base's
+    /// GenericParam_T to whatever the caller specified (e.g.,
+    /// `Pointer(GenericParam_T_outer)`), producing a valid TypeRef
+    /// without needing the resolver to know about outer scopes.
     populate_enum_variants(mut &this, et: EnumType*, decl: EnumDeclNode*,
                            subst: TypeSubstitution*, entry: TemplateEntry*) -> void {
-        if (decl == null) { return; }
+        if (entry == null || subst == null) { return; }
 
-        // Build ResolutionContext once for all variants
-        mut module_str: string = "";
-        if (entry != null && entry.module_name.is_valid()) {
-            module_str = this.intern_table.resolve(entry.module_name);
-        }
-        mut res_ctx: ResolutionContext = ResolutionContext::new(module_str, "");
+        // Look up the base generic enum.  Its variants were populated by
+        // type_resolution.cryo's EnumDeclaration handler with GenericParam
+        // payloads (`Some(T)` → `payload_types = [GenericParam_T]`).
+        const base_t: Type* = this.arena.lookup(entry.base_type.id);
+        if (base_t == null || base_t.kind != TypeKind::Enum) { return; }
+        const base_et: EnumType* = base_t as EnumType*;
 
-        for (mut i: i64 = 0; i < decl.variants.length; i++) {
-            const variant: EnumVariantNode* = decl.variants[i];
-            if (variant == null) { continue; }
-
+        for (mut i: i64 = 0; i < base_et.variants.length; i++) {
+            const base_variant: EnumVariantInfo = base_et.variants[i];
             mut payload_types: TypeRef[] = [];
-            for (mut j: i64 = 0; j < variant.associated_types.length; j++) {
-                const ann: TypeAnnotation* = variant.associated_types[j];
-                mut resolved: TypeRef = TypeRef::invalid();
-
-                if (ann != null && this.type_resolver != null) {
-                    resolved = this.type_resolver.resolve(ann, &res_ctx);
-                }
-
-                payload_types.push(resolved);
+            for (mut j: i64 = 0; j < base_variant.payload_types.length; j++) {
+                const substituted: TypeRef = subst.apply(base_variant.payload_types[j], this.arena);
+                payload_types.push(substituted);
             }
-
-            et.add_variant(EnumVariantInfo::new(variant.name, payload_types, i as u64));
+            et.add_variant(EnumVariantInfo::new(base_variant.name, payload_types, i as u64));
         }
     }
 
