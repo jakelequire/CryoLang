@@ -38,6 +38,7 @@ import Compiler::Types::Arena;
 import Compiler::Types::Checker;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
+import Compiler::Resolver::QualifiedName;
 import Compiler::Resolver::MangledName;
 import Compiler::Resolver::Resolver;
 import Compiler::Types::Resolver;
@@ -1898,26 +1899,19 @@ public:
 
         mut res_ctx: ResolutionContext = ResolutionContext::new(
             this.ctx.source_file, "");
-        mut arg_displays: string[] = [];
+        mut arg_refs: TypeRef[] = [];
         for (mut i: i64 = 0; i < generic_args.length; i++) {
             const arg_ref: TypeRef = this.ctx.type_resolver.resolve(
                 generic_args[i], &res_ctx);
-            if (arg_ref.is_valid()) {
-                const arg_t: Type* = this.arena.lookup(arg_ref.id);
-                if (arg_t != null) {
-                    arg_displays.push(this.arena.format_display(arg_t));
-                } else {
-                    return SymbolStr::empty();
-                }
-            } else {
-                return SymbolStr::empty();
-            }
+            if (!arg_ref.is_valid()) { return SymbolStr::empty(); }
+            arg_refs.push(arg_ref);
         }
 
-        const base_str: string = this.intern.resolve(base_name);
-        const mangled: MangledName = MangledName::from_generic(
-            this.intern, base_str, arg_displays);
-        return mangled.value;
+        // Centralized specialized-identifier mangling — same encoding the
+        // ASTSpecializer used when registering the clone, so lookups match.
+        const base_qname: QualifiedName = QualifiedName::from_symbol(base_name);
+        return MangledName::specialized_identifier(
+            this.intern, this.arena, base_qname, arg_refs);
     }
 
     /// When a scope call (e.g. Result::ok) returns a generic InstantiatedType
@@ -1986,18 +1980,11 @@ public:
         // Same generic base type? (e.g., both Result)
         if (ret_inst.generic_base.id != exp_inst.generic_base.id) { return ret; }
 
-        // Build the specialized type name from expected_type's concrete args
-        mut arg_displays: string[] = [];
-        for (mut i: i64 = 0; i < exp_inst.type_args.length; i++) {
-            const arg_t: Type* = this.arena.lookup(exp_inst.type_args[i].id);
-            if (arg_t == null) { return ret; }
-            arg_displays.push(this.arena.format_display(arg_t));
-        }
-
-        const scope_str: string = this.intern.resolve(scope_name);
-        const mangled: MangledName = MangledName::from_generic(
-            this.intern, scope_str, arg_displays);
-        const spec_sym: SymbolStr = mangled.value;
+        // Centralized specialized-identifier mangling.  See note on
+        // resolve_generic_scope_name above — never roll your own.
+        const scope_qname: QualifiedName = QualifiedName::from_symbol(scope_name);
+        const spec_sym: SymbolStr = MangledName::specialized_identifier(
+            this.intern, this.arena, scope_qname, exp_inst.type_args);
 
         // Look up the specialized method return type
         const spec_ret: TypeRef = this.lookup_method_return(spec_sym, member_name);
