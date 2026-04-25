@@ -13,6 +13,7 @@ import Compiler::Codegen::Context;
 import Compiler::Codegen::DeclCodegen;
 import Compiler::Codegen::ExprCodegen;
 import Compiler::Codegen::StmtCodegen;
+import Compiler::Codegen::IntrinsicsCodegen;
 import Compiler::CompilationContext;
 import Compiler::DeclIndex;
 import Compiler::Diag;
@@ -1192,6 +1193,30 @@ public:
         if (node.callee.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = node.callee as IdentifierNode*;
 
+            // 0. Inline-lower intrinsics by bare name (i32_to_i64, ptr_add,
+            //    bswap32, etc.).  These previously linked against cryort.c;
+            //    we now emit the equivalent LLVM IR directly so no runtime
+            //    function symbol is referenced.  Args are codegen'd as
+            //    rvalues since intrinsics expect by-value operands.
+            const intr_name_str: string = intern.resolve(id.name);
+            mut intr_args: LValue[] = [];
+            mut intr_args_evaluated: boolean = false;
+            mut intr_result: LValue = LValue::null();
+            // Try the intrinsic dispatcher; if it claims the name we set
+            // last_value and return.  Args are only codegen'd once we
+            // confirm the dispatcher will handle this name.
+            if (is_intrinsic_name(intr_name_str)) {
+                for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
+                    intr_args.push(this.codegen_rvalue(node.arguments[ai]));
+                }
+                intr_args_evaluated = true;
+                if (try_emit_intrinsic_call(this.cg, intr_name_str, intr_args, &intr_result)) {
+                    this.last_value = intr_result;
+                    this.last_is_lvalue = false;
+                    return;
+                }
+            }
+
             // 1. Try current module's qualified name.
             const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(id.name);
             callee_val = resolve_function(this.cg, qualified);
@@ -1376,6 +1401,25 @@ public:
             // qualified type name, then build the combined key.
             const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
             const di: DeclarationIndex* = this.cg.get_decl_index();
+
+            // Inline-lower intrinsics referenced via a namespace prefix
+            // (e.g., `intrinsics::isfinite`).  The leaf name uniquely
+            // identifies the intrinsic; the prefix is ignored because
+            // intrinsics live in the global LLVM namespace, not in the
+            // source-level module they were declared in.
+            const sr_leaf_str: string = intern.resolve(sr.member_name);
+            if (is_intrinsic_name(sr_leaf_str)) {
+                mut sr_args: LValue[] = [];
+                for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
+                    sr_args.push(this.codegen_rvalue(node.arguments[sai]));
+                }
+                mut sr_intr_result: LValue = LValue::null();
+                if (try_emit_intrinsic_call(this.cg, sr_leaf_str, sr_args, &sr_intr_result)) {
+                    this.last_value = sr_intr_result;
+                    this.last_is_lvalue = false;
+                    return;
+                }
+            }
 
             // Resolve the scope name (e.g., "LValue") to its qualified form
             // (e.g., "Compiler::Codegen::LLVMTypes::LValue") via the DI mapping.

@@ -1,0 +1,823 @@
+/// Intrinsic Codegen
+///
+/// Inline-lowering for the bare-name intrinsics declared in
+/// `stdlib/core/intrinsics.cryo` that the C++ bootstrap inline-lowers but
+/// the self-hosted cryoc previously emitted as plain function calls.  By
+/// emitting the equivalent LLVM IR directly here, we eliminate the
+/// undefined-symbol references that used to require `runtime/cryort.c`.
+///
+/// Layout:
+///   - `IntrinsicKind`         — one variant per recognized intrinsic.
+///   - `lookup_intrinsic_kind` — name → kind (single source of truth).
+///   - `try_emit_intrinsic_call` — kind-driven LLVM IR emission.
+///
+/// Adding a new intrinsic: add an enum variant, one row in
+/// `lookup_intrinsic_kind`, one match arm in the dispatcher.
+
+namespace Compiler::Codegen::IntrinsicsCodegen;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::Context;
+import Compiler::Codegen::ExprCodegen;
+
+
+// ============================================================================
+// IntrinsicKind — every intrinsic the dispatcher knows how to emit
+// ============================================================================
+
+type enum IntrinsicKind {
+    NotIntrinsic;            // sentinel: unrecognized name
+
+    // Pointer arithmetic
+    PtrAdd; PtrSub; PtrDiff;
+
+    // Signed integer widening (sext)
+    SExt8To16; SExt8To32; SExt8To64;
+    SExt16To32; SExt16To64;
+    SExt32To64;
+
+    // Signed integer narrowing (trunc) — same primitive used for unsigned
+    Trunc64To32; Trunc64To16; Trunc64To8;
+    Trunc32To16; Trunc32To8;
+    Trunc16To8;
+
+    // Unsigned integer widening (zext)
+    ZExt8To16; ZExt8To32; ZExt8To64;
+    ZExt16To32; ZExt16To64;
+    ZExt32To64;
+
+    // Unsigned narrowing — distinct variants so the dispatcher's name-to-IR
+    // mapping stays explicit; emitted IR is the same `trunc`.
+    UTrunc64To32; UTrunc64To16; UTrunc64To8;
+    UTrunc32To16; UTrunc32To8;
+    UTrunc16To8;
+
+    // Same-width sign conversions (no-op IR; LLVM doesn't distinguish
+    // signed from unsigned at the type level).  Split by width so the
+    // auto-deref step loads the correct number of bits when the caller
+    // passes `&this`.
+    SignBitcast8;
+    SignBitcast32;
+    SignBitcast64;
+
+    // Float widening / narrowing
+    FpExt32To64; FpTrunc64To32;
+
+    // Signed int → float
+    SiToF32; SiToF64Fromi32; SiToF64Fromi64;
+
+    // Unsigned int → float
+    UiToF32; UiToF64Fromu32; UiToF64Fromu64;
+
+    // Float → signed int
+    FpToSi32Fromf32; FpToSi32Fromf64; FpToSi64Fromf64;
+
+    // Float → unsigned int
+    FpToUi32Fromf32; FpToUi32Fromf64; FpToUi64Fromf64;
+
+    // Bit operations (LLVM intrinsics)
+    Bswap16; Bswap32; Bswap64;
+    Popcount32; Popcount64;
+    Clz32; Clz64; Ctz32; Ctz64;
+    Rotl32; Rotl64; Rotr32; Rotr64;
+
+    // Memory ordering — `fence seq_cst`.  cryort.c's atomic_fence took
+    // an order arg but always used SeqCst; we keep the same semantics.
+    AtomicFence;
+
+    // Float predicate: `(x - x) == 0` is true iff x is finite (NaN and
+    // ±inf both produce NaN in `x - x`, and NaN compares unequal to 0).
+    IsFinite;
+
+    // Linux dirent struct field accessors.  Layout assumed: d_type at
+    // offset 18 (i8), d_name at offset 19 (char[256]).  Matches glibc.
+    DirentName;
+    DirentType;
+}
+
+
+// ============================================================================
+// Name → kind (single source of truth)
+// ============================================================================
+
+function lookup_intrinsic_kind(name: string) -> IntrinsicKind {
+    // Pointer arithmetic
+    if (name == "ptr_add")  { return IntrinsicKind::PtrAdd; }
+    if (name == "ptr_sub")  { return IntrinsicKind::PtrSub; }
+    if (name == "ptr_diff") { return IntrinsicKind::PtrDiff; }
+
+    // Signed widening
+    if (name == "i8_to_i16")  { return IntrinsicKind::SExt8To16; }
+    if (name == "i8_to_i32")  { return IntrinsicKind::SExt8To32; }
+    if (name == "i8_to_i64")  { return IntrinsicKind::SExt8To64; }
+    if (name == "i16_to_i32") { return IntrinsicKind::SExt16To32; }
+    if (name == "i16_to_i64") { return IntrinsicKind::SExt16To64; }
+    if (name == "i32_to_i64") { return IntrinsicKind::SExt32To64; }
+
+    // Signed narrowing
+    if (name == "i64_to_i32") { return IntrinsicKind::Trunc64To32; }
+    if (name == "i64_to_i16") { return IntrinsicKind::Trunc64To16; }
+    if (name == "i64_to_i8")  { return IntrinsicKind::Trunc64To8; }
+    if (name == "i32_to_i16") { return IntrinsicKind::Trunc32To16; }
+    if (name == "i32_to_i8")  { return IntrinsicKind::Trunc32To8; }
+    if (name == "i16_to_i8")  { return IntrinsicKind::Trunc16To8; }
+
+    // Unsigned widening
+    if (name == "u8_to_u16")  { return IntrinsicKind::ZExt8To16; }
+    if (name == "u8_to_u32")  { return IntrinsicKind::ZExt8To32; }
+    if (name == "u8_to_u64")  { return IntrinsicKind::ZExt8To64; }
+    if (name == "u16_to_u32") { return IntrinsicKind::ZExt16To32; }
+    if (name == "u16_to_u64") { return IntrinsicKind::ZExt16To64; }
+    if (name == "u32_to_u64") { return IntrinsicKind::ZExt32To64; }
+
+    // Unsigned narrowing
+    if (name == "u64_to_u32") { return IntrinsicKind::UTrunc64To32; }
+    if (name == "u64_to_u16") { return IntrinsicKind::UTrunc64To16; }
+    if (name == "u64_to_u8")  { return IntrinsicKind::UTrunc64To8; }
+    if (name == "u32_to_u16") { return IntrinsicKind::UTrunc32To16; }
+    if (name == "u32_to_u8")  { return IntrinsicKind::UTrunc32To8; }
+    if (name == "u16_to_u8")  { return IntrinsicKind::UTrunc16To8; }
+
+    // Same-width sign conversions
+    if (name == "i32_to_u32" || name == "u32_to_i32") { return IntrinsicKind::SignBitcast32; }
+    if (name == "i64_to_u64" || name == "u64_to_i64") { return IntrinsicKind::SignBitcast64; }
+    if (name == "i8_to_u8"   || name == "u8_to_i8")   { return IntrinsicKind::SignBitcast8; }
+
+    // Float widening / narrowing
+    if (name == "f32_to_f64") { return IntrinsicKind::FpExt32To64; }
+    if (name == "f64_to_f32") { return IntrinsicKind::FpTrunc64To32; }
+
+    // Signed int → float
+    if (name == "i32_to_f32") { return IntrinsicKind::SiToF32; }
+    if (name == "i32_to_f64") { return IntrinsicKind::SiToF64Fromi32; }
+    if (name == "i64_to_f64") { return IntrinsicKind::SiToF64Fromi64; }
+
+    // Unsigned int → float
+    if (name == "u32_to_f32") { return IntrinsicKind::UiToF32; }
+    if (name == "u32_to_f64") { return IntrinsicKind::UiToF64Fromu32; }
+    if (name == "u64_to_f64") { return IntrinsicKind::UiToF64Fromu64; }
+
+    // Float → signed int
+    if (name == "f32_to_i32") { return IntrinsicKind::FpToSi32Fromf32; }
+    if (name == "f64_to_i32") { return IntrinsicKind::FpToSi32Fromf64; }
+    if (name == "f64_to_i64") { return IntrinsicKind::FpToSi64Fromf64; }
+
+    // Float → unsigned int
+    if (name == "f32_to_u32") { return IntrinsicKind::FpToUi32Fromf32; }
+    if (name == "f64_to_u32") { return IntrinsicKind::FpToUi32Fromf64; }
+    if (name == "f64_to_u64") { return IntrinsicKind::FpToUi64Fromf64; }
+
+    // Bit ops
+    if (name == "bswap16") { return IntrinsicKind::Bswap16; }
+    if (name == "bswap32") { return IntrinsicKind::Bswap32; }
+    if (name == "bswap64") { return IntrinsicKind::Bswap64; }
+    if (name == "popcount32") { return IntrinsicKind::Popcount32; }
+    if (name == "popcount64") { return IntrinsicKind::Popcount64; }
+    if (name == "clz32") { return IntrinsicKind::Clz32; }
+    if (name == "clz64") { return IntrinsicKind::Clz64; }
+    if (name == "ctz32") { return IntrinsicKind::Ctz32; }
+    if (name == "ctz64") { return IntrinsicKind::Ctz64; }
+    if (name == "rotl32") { return IntrinsicKind::Rotl32; }
+    if (name == "rotl64") { return IntrinsicKind::Rotl64; }
+    if (name == "rotr32") { return IntrinsicKind::Rotr32; }
+    if (name == "rotr64") { return IntrinsicKind::Rotr64; }
+
+    // Memory ordering / float predicate / dirent
+    if (name == "atomic_fence") { return IntrinsicKind::AtomicFence; }
+    if (name == "isfinite")     { return IntrinsicKind::IsFinite; }
+    if (name == "dirent_name")  { return IntrinsicKind::DirentName; }
+    if (name == "dirent_type")  { return IntrinsicKind::DirentType; }
+
+    return IntrinsicKind::NotIntrinsic;
+}
+
+/// Fast prefilter for the call site — avoids paying argument-codegen cost
+/// for normal (non-intrinsic) function calls.  Just delegates to the kind
+/// lookup so the recognized-name set has exactly one definition.
+function is_intrinsic_name(name: string) -> boolean {
+    return match (lookup_intrinsic_kind(name)) {
+        IntrinsicKind::NotIntrinsic => { false }
+        _                           => { true  }
+    };
+}
+
+
+// ============================================================================
+// Argument coercion
+// ============================================================================
+//
+// Stdlib code (primitives.cryo) routinely calls these intrinsics with
+// `&this` rather than `this` — passing a primitive by reference instead
+// of by value.  The C++ bootstrap auto-deref'd that pattern; we need to
+// match it.  When an intrinsic expects an integer/float value but the
+// caller passed a pointer, load through the pointer first.
+
+function auto_deref_to(cg: CodegenContext*, val: LValue, expected: LType) -> LValue {
+    if (!val.is_valid() || !expected.is_valid()) { return val; }
+    const actual_ty: void* = llvm::LLVMTypeOf(val.raw);
+    if (actual_ty == null) { return val; }
+    // 12 = LLVMPointerTypeKind; codegen_call uses the same magic numbers.
+    if (llvm::LLVMGetTypeKind(actual_ty) == 12) {
+        return cg.builder.build_load(expected, val, "deref");
+    }
+    return val;
+}
+
+/// Source-type lookup for the unary cast / bit-op intrinsics — used by
+/// the dispatcher to auto-deref `&this`-style pointer args before
+/// emitting the LLVM cast/intrinsic.
+function intrinsic_src_type(kind: IntrinsicKind) -> LType {
+    return match (kind) {
+        // Signed casts
+        IntrinsicKind::SExt8To16   => { LType::i8() }
+        IntrinsicKind::SExt8To32   => { LType::i8() }
+        IntrinsicKind::SExt8To64   => { LType::i8() }
+        IntrinsicKind::SExt16To32  => { LType::i16() }
+        IntrinsicKind::SExt16To64  => { LType::i16() }
+        IntrinsicKind::SExt32To64  => { LType::i32() }
+        IntrinsicKind::Trunc64To32 => { LType::i64() }
+        IntrinsicKind::Trunc64To16 => { LType::i64() }
+        IntrinsicKind::Trunc64To8  => { LType::i64() }
+        IntrinsicKind::Trunc32To16 => { LType::i32() }
+        IntrinsicKind::Trunc32To8  => { LType::i32() }
+        IntrinsicKind::Trunc16To8  => { LType::i16() }
+        // Unsigned casts (LLVM-untyped ints share width with signed)
+        IntrinsicKind::ZExt8To16    => { LType::i8() }
+        IntrinsicKind::ZExt8To32    => { LType::i8() }
+        IntrinsicKind::ZExt8To64    => { LType::i8() }
+        IntrinsicKind::ZExt16To32   => { LType::i16() }
+        IntrinsicKind::ZExt16To64   => { LType::i16() }
+        IntrinsicKind::ZExt32To64   => { LType::i32() }
+        IntrinsicKind::UTrunc64To32 => { LType::i64() }
+        IntrinsicKind::UTrunc64To16 => { LType::i64() }
+        IntrinsicKind::UTrunc64To8  => { LType::i64() }
+        IntrinsicKind::UTrunc32To16 => { LType::i32() }
+        IntrinsicKind::UTrunc32To8  => { LType::i32() }
+        IntrinsicKind::UTrunc16To8  => { LType::i16() }
+        // Float
+        IntrinsicKind::FpExt32To64   => { LType::f32() }
+        IntrinsicKind::FpTrunc64To32 => { LType::f64() }
+        IntrinsicKind::SiToF32         => { LType::i32() }
+        IntrinsicKind::SiToF64Fromi32  => { LType::i32() }
+        IntrinsicKind::SiToF64Fromi64  => { LType::i64() }
+        IntrinsicKind::UiToF32         => { LType::i32() }
+        IntrinsicKind::UiToF64Fromu32  => { LType::i32() }
+        IntrinsicKind::UiToF64Fromu64  => { LType::i64() }
+        IntrinsicKind::FpToSi32Fromf32 => { LType::f32() }
+        IntrinsicKind::FpToSi32Fromf64 => { LType::f64() }
+        IntrinsicKind::FpToSi64Fromf64 => { LType::f64() }
+        IntrinsicKind::FpToUi32Fromf32 => { LType::f32() }
+        IntrinsicKind::FpToUi32Fromf64 => { LType::f64() }
+        IntrinsicKind::FpToUi64Fromf64 => { LType::f64() }
+        // Bit ops — source is the same width as the operation
+        IntrinsicKind::Bswap16    => { LType::i16() }
+        IntrinsicKind::Bswap32    => { LType::i32() }
+        IntrinsicKind::Bswap64    => { LType::i64() }
+        IntrinsicKind::Popcount32 => { LType::i32() }
+        IntrinsicKind::Popcount64 => { LType::i64() }
+        IntrinsicKind::Clz32      => { LType::i32() }
+        IntrinsicKind::Clz64      => { LType::i64() }
+        IntrinsicKind::Ctz32      => { LType::i32() }
+        IntrinsicKind::Ctz64      => { LType::i64() }
+        IntrinsicKind::Rotl32     => { LType::i32() }
+        IntrinsicKind::Rotl64     => { LType::i64() }
+        IntrinsicKind::Rotr32     => { LType::i32() }
+        IntrinsicKind::Rotr64     => { LType::i64() }
+        // Same-width sign conversions
+        IntrinsicKind::SignBitcast8  => { LType::i8() }
+        IntrinsicKind::SignBitcast32 => { LType::i32() }
+        IntrinsicKind::SignBitcast64 => { LType::i64() }
+        // isfinite consumes an f64 by value
+        IntrinsicKind::IsFinite      => { LType::f64() }
+        // Pointer args (atomic_fence's i32 order, dirent's void*): no
+        // auto-deref needed — handled directly by the match arm.
+        _ => { LType::null() }
+    };
+}
+
+
+// ============================================================================
+// LLVM intrinsic declaration helpers
+// ============================================================================
+
+function get_or_decl_unary_intrinsic(cg: CodegenContext*, name: string, ty: LType) -> LValue {
+    mut fn: LValue = cg.llvm_module.get_named_function(name);
+    if (fn.is_valid()) { return fn; }
+    const param_buf: void* = malloc(8);
+    const param_slots: void** = param_buf as void**;
+    param_slots[0] = ty.raw;
+    const fn_ty: LType = LType::function_type(ty, param_buf, 1, false);
+    free(param_buf);
+    return cg.llvm_module.add_function(name, fn_ty);
+}
+
+function get_or_decl_ctlz_cttz(cg: CodegenContext*, name: string, ty: LType) -> LValue {
+    mut fn: LValue = cg.llvm_module.get_named_function(name);
+    if (fn.is_valid()) { return fn; }
+    const param_buf: void* = malloc(16);
+    const param_slots: void** = param_buf as void**;
+    param_slots[0] = ty.raw;
+    param_slots[1] = LType::i1().raw;
+    const fn_ty: LType = LType::function_type(ty, param_buf, 2, false);
+    free(param_buf);
+    return cg.llvm_module.add_function(name, fn_ty);
+}
+
+function get_or_decl_funnel_shift(cg: CodegenContext*, name: string, ty: LType) -> LValue {
+    mut fn: LValue = cg.llvm_module.get_named_function(name);
+    if (fn.is_valid()) { return fn; }
+    const param_buf: void* = malloc(24);
+    const param_slots: void** = param_buf as void**;
+    param_slots[0] = ty.raw;
+    param_slots[1] = ty.raw;
+    param_slots[2] = ty.raw;
+    const fn_ty: LType = LType::function_type(ty, param_buf, 3, false);
+    free(param_buf);
+    return cg.llvm_module.add_function(name, fn_ty);
+}
+
+function call1(cg: CodegenContext*, fn: LValue, fn_ty: LType, a: LValue, name: string) -> LValue {
+    const buf: void* = malloc(8);
+    const slots: void** = buf as void**;
+    slots[0] = a.raw;
+    const r: LValue = cg.builder.build_call(fn_ty, fn, buf, 1, name);
+    free(buf);
+    return r;
+}
+
+function call2(cg: CodegenContext*, fn: LValue, fn_ty: LType, a: LValue, b: LValue, name: string) -> LValue {
+    const buf: void* = malloc(16);
+    const slots: void** = buf as void**;
+    slots[0] = a.raw;
+    slots[1] = b.raw;
+    const r: LValue = cg.builder.build_call(fn_ty, fn, buf, 2, name);
+    free(buf);
+    return r;
+}
+
+function call3(cg: CodegenContext*, fn: LValue, fn_ty: LType, a: LValue, b: LValue, c: LValue, name: string) -> LValue {
+    const buf: void* = malloc(24);
+    const slots: void** = buf as void**;
+    slots[0] = a.raw;
+    slots[1] = b.raw;
+    slots[2] = c.raw;
+    const r: LValue = cg.builder.build_call(fn_ty, fn, buf, 3, name);
+    free(buf);
+    return r;
+}
+
+
+// ============================================================================
+// Per-shape emit helpers
+// ============================================================================
+
+function emit_ptr_offset(cg: CodegenContext*, base: LValue, off: LValue, label: string) -> LValue {
+    const idx_buf: void* = malloc(8);
+    const idx_slots: void** = idx_buf as void**;
+    idx_slots[0] = off.raw;
+    const r: LValue = cg.builder.build_gep(LType::i8(), base, idx_buf, 1, label);
+    free(idx_buf);
+    return r;
+}
+
+function emit_ptr_diff(cg: CodegenContext*, a: LValue, b: LValue) -> LValue {
+    const i64_ty: LType = LType::i64();
+    const ai: LValue = cg.builder.build_ptr_to_int(a, i64_ty, "p.a");
+    const bi: LValue = cg.builder.build_ptr_to_int(b, i64_ty, "p.b");
+    return cg.builder.build_sub(ai, bi, "ptr.diff");
+}
+
+function emit_unary_llvm(cg: CodegenContext*, iname: string, ty: LType, x: LValue,
+                         narrow_to_i32: boolean, label: string) -> LValue {
+    const fn: LValue = get_or_decl_unary_intrinsic(cg, iname, ty);
+    if (!fn.is_valid()) { return LValue::null(); }
+    const param_buf: void* = malloc(8);
+    const param_slots: void** = param_buf as void**;
+    param_slots[0] = ty.raw;
+    const fn_ty: LType = LType::function_type(ty, param_buf, 1, false);
+    free(param_buf);
+    const raw: LValue = call1(cg, fn, fn_ty, x, label);
+    if (narrow_to_i32 && llvm::LLVMGetIntTypeWidth(ty.raw) != 32) {
+        return cg.builder.build_trunc(raw, LType::i32(), "narrow.i32");
+    }
+    return raw;
+}
+
+function emit_clz_or_ctz(cg: CodegenContext*, iname: string, ty: LType, x: LValue) -> LValue {
+    const fn: LValue = get_or_decl_ctlz_cttz(cg, iname, ty);
+    if (!fn.is_valid()) { return LValue::null(); }
+    const param_buf: void* = malloc(16);
+    const param_slots: void** = param_buf as void**;
+    param_slots[0] = ty.raw;
+    param_slots[1] = LType::i1().raw;
+    const fn_ty: LType = LType::function_type(ty, param_buf, 2, false);
+    free(param_buf);
+    // is_zero_undef = false: zero input returns the bit width.  Matches
+    // the cryort.c semantics callers were depending on.
+    const flag: LValue = LType::const_int(LType::i1(), 0, false);
+    const raw: LValue = call2(cg, fn, fn_ty, x, flag, "clztmp");
+    if (llvm::LLVMGetIntTypeWidth(ty.raw) != 32) {
+        return cg.builder.build_trunc(raw, LType::i32(), "narrow.i32");
+    }
+    return raw;
+}
+
+function emit_rotate(cg: CodegenContext*, iname: string, ty: LType, x: LValue, n: LValue) -> LValue {
+    const fn: LValue = get_or_decl_funnel_shift(cg, iname, ty);
+    if (!fn.is_valid()) { return LValue::null(); }
+    const param_buf: void* = malloc(24);
+    const param_slots: void** = param_buf as void**;
+    param_slots[0] = ty.raw;
+    param_slots[1] = ty.raw;
+    param_slots[2] = ty.raw;
+    const fn_ty: LType = LType::function_type(ty, param_buf, 3, false);
+    free(param_buf);
+    // Rotate signature is `(value, n: u32)`; funnel-shift wants the
+    // shift amount in the same width as the value.  For 64-bit rotates,
+    // widen the i32 shift count to i64.  Note: cryoc's `void*` equality
+    // is documented as broken (always true), so we compare integer
+    // widths via LLVMGetIntTypeWidth instead of `ty.raw == ...raw`.
+    mut shift: LValue = n;
+    const target_width: u32 = llvm::LLVMGetIntTypeWidth(ty.raw);
+    if (target_width == 64) {
+        shift = cg.builder.build_zext(shift, LType::i64(), "rot.shift.zext");
+    }
+    return call3(cg, fn, fn_ty, x, x, shift, "rot");
+}
+
+
+// ============================================================================
+// Main dispatcher
+// ============================================================================
+
+/// Inline-lower a bare-name function call to LLVM IR.  Returns true if
+/// `name` matches a known intrinsic and *out_value was set; false if
+/// the call should fall through to the normal function-resolution path.
+function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue[],
+                                 out_value: LValue*) -> boolean {
+    const kind: IntrinsicKind = lookup_intrinsic_kind(name);
+
+    // Argument-count checks — every recognized intrinsic has a fixed
+    // arity, so this is a single guard.
+    const expected: i64 = match (kind) {
+        IntrinsicKind::NotIntrinsic => { -1 }
+        IntrinsicKind::PtrAdd       => { 2 }
+        IntrinsicKind::PtrSub       => { 2 }
+        IntrinsicKind::PtrDiff      => { 2 }
+        IntrinsicKind::Rotl32       => { 2 }
+        IntrinsicKind::Rotl64       => { 2 }
+        IntrinsicKind::Rotr32       => { 2 }
+        IntrinsicKind::Rotr64       => { 2 }
+        // atomic_fence(order: i32) — single arg.  isfinite, dirent_*
+        // also single arg, so they fall through to the default below.
+        _                           => { 1 }
+    };
+    if (expected < 0)            { return false; }
+    if (args.length != expected) { return false; }
+
+    // Auto-deref pointer args for value-arg intrinsics — handles the
+    // pervasive `intrinsic(&this)` pattern in stdlib's primitives.cryo
+    // that the C++ bootstrap silently coerced via `codegen_call`'s
+    // pointer-vs-value mismatch path.  No-op for the pointer-arg
+    // intrinsics (PtrAdd/PtrSub/PtrDiff) since intrinsic_src_type
+    // returns null for those.
+    const src_ty: LType = intrinsic_src_type(kind);
+    mut a0: LValue = args[0];
+    if (src_ty.is_valid()) {
+        a0 = auto_deref_to(cg, a0, src_ty);
+    }
+    // Second argument (rotate count) is i32 — auto-deref if pointer.
+    mut a1: LValue = if (args.length >= 2) { args[1] } else { LValue::null() };
+    const is_rotate: boolean = match (kind) {
+        IntrinsicKind::Rotl32 => { true }
+        IntrinsicKind::Rotl64 => { true }
+        IntrinsicKind::Rotr32 => { true }
+        IntrinsicKind::Rotr64 => { true }
+        _                     => { false }
+    };
+    if (is_rotate && a1.is_valid()) {
+        a1 = auto_deref_to(cg, a1, LType::i32());
+    }
+
+    *out_value = match (kind) {
+        IntrinsicKind::NotIntrinsic => { LValue::null() }   // unreachable
+
+        // -- Pointer arithmetic (no auto-deref of args[0] — these
+        //    intentionally accept and produce pointers). --
+        IntrinsicKind::PtrAdd  => { emit_ptr_offset(cg, args[0], args[1], "ptr.add") }
+        IntrinsicKind::PtrSub  => {
+            const negged: LValue = cg.builder.build_neg(args[1], "ptr.off.neg");
+            emit_ptr_offset(cg, args[0], negged, "ptr.sub")
+        }
+        IntrinsicKind::PtrDiff => { emit_ptr_diff(cg, args[0], args[1]) }
+
+        // -- Signed widening (sext) --
+        IntrinsicKind::SExt8To16   => { cg.builder.build_sext(a0, LType::i16(), "sext") }
+        IntrinsicKind::SExt8To32   => { cg.builder.build_sext(a0, LType::i32(), "sext") }
+        IntrinsicKind::SExt8To64   => { cg.builder.build_sext(a0, LType::i64(), "sext") }
+        IntrinsicKind::SExt16To32  => { cg.builder.build_sext(a0, LType::i32(), "sext") }
+        IntrinsicKind::SExt16To64  => { cg.builder.build_sext(a0, LType::i64(), "sext") }
+        IntrinsicKind::SExt32To64  => { cg.builder.build_sext(a0, LType::i64(), "sext") }
+
+        // -- Signed narrowing (trunc) --
+        IntrinsicKind::Trunc64To32 => { cg.builder.build_trunc(a0, LType::i32(), "trunc") }
+        IntrinsicKind::Trunc64To16 => { cg.builder.build_trunc(a0, LType::i16(), "trunc") }
+        IntrinsicKind::Trunc64To8  => { cg.builder.build_trunc(a0, LType::i8(),  "trunc") }
+        IntrinsicKind::Trunc32To16 => { cg.builder.build_trunc(a0, LType::i16(), "trunc") }
+        IntrinsicKind::Trunc32To8  => { cg.builder.build_trunc(a0, LType::i8(),  "trunc") }
+        IntrinsicKind::Trunc16To8  => { cg.builder.build_trunc(a0, LType::i8(),  "trunc") }
+
+        // -- Unsigned widening (zext) --
+        IntrinsicKind::ZExt8To16   => { cg.builder.build_zext(a0, LType::i16(), "zext") }
+        IntrinsicKind::ZExt8To32   => { cg.builder.build_zext(a0, LType::i32(), "zext") }
+        IntrinsicKind::ZExt8To64   => { cg.builder.build_zext(a0, LType::i64(), "zext") }
+        IntrinsicKind::ZExt16To32  => { cg.builder.build_zext(a0, LType::i32(), "zext") }
+        IntrinsicKind::ZExt16To64  => { cg.builder.build_zext(a0, LType::i64(), "zext") }
+        IntrinsicKind::ZExt32To64  => { cg.builder.build_zext(a0, LType::i64(), "zext") }
+
+        // -- Unsigned narrowing (trunc — LLVM doesn't distinguish signed
+        //    from unsigned at the type level, so this emits the same
+        //    instruction as the signed variants above) --
+        IntrinsicKind::UTrunc64To32 => { cg.builder.build_trunc(a0, LType::i32(), "trunc") }
+        IntrinsicKind::UTrunc64To16 => { cg.builder.build_trunc(a0, LType::i16(), "trunc") }
+        IntrinsicKind::UTrunc64To8  => { cg.builder.build_trunc(a0, LType::i8(),  "trunc") }
+        IntrinsicKind::UTrunc32To16 => { cg.builder.build_trunc(a0, LType::i16(), "trunc") }
+        IntrinsicKind::UTrunc32To8  => { cg.builder.build_trunc(a0, LType::i8(),  "trunc") }
+        IntrinsicKind::UTrunc16To8  => { cg.builder.build_trunc(a0, LType::i8(),  "trunc") }
+
+        // -- Same-width sign conversions (no-op) --
+        IntrinsicKind::SignBitcast8  => { a0 }
+        IntrinsicKind::SignBitcast32 => { a0 }
+        IntrinsicKind::SignBitcast64 => { a0 }
+
+        // -- Float widening / narrowing --
+        IntrinsicKind::FpExt32To64   => { cg.builder.build_fp_ext(a0, LType::f64(), "fpext") }
+        IntrinsicKind::FpTrunc64To32 => { cg.builder.build_fp_trunc(a0, LType::f32(), "fptrunc") }
+
+        // -- Signed int → float --
+        IntrinsicKind::SiToF32         => { cg.builder.build_si_to_fp(a0, LType::f32(), "sitofp") }
+        IntrinsicKind::SiToF64Fromi32  => { cg.builder.build_si_to_fp(a0, LType::f64(), "sitofp") }
+        IntrinsicKind::SiToF64Fromi64  => { cg.builder.build_si_to_fp(a0, LType::f64(), "sitofp") }
+
+        // -- Unsigned int → float --
+        IntrinsicKind::UiToF32         => { cg.builder.build_ui_to_fp(a0, LType::f32(), "uitofp") }
+        IntrinsicKind::UiToF64Fromu32  => { cg.builder.build_ui_to_fp(a0, LType::f64(), "uitofp") }
+        IntrinsicKind::UiToF64Fromu64  => { cg.builder.build_ui_to_fp(a0, LType::f64(), "uitofp") }
+
+        // -- Float → signed int --
+        IntrinsicKind::FpToSi32Fromf32 => { cg.builder.build_fp_to_si(a0, LType::i32(), "fptosi") }
+        IntrinsicKind::FpToSi32Fromf64 => { cg.builder.build_fp_to_si(a0, LType::i32(), "fptosi") }
+        IntrinsicKind::FpToSi64Fromf64 => { cg.builder.build_fp_to_si(a0, LType::i64(), "fptosi") }
+
+        // -- Float → unsigned int --
+        IntrinsicKind::FpToUi32Fromf32 => { cg.builder.build_fp_to_ui(a0, LType::i32(), "fptoui") }
+        IntrinsicKind::FpToUi32Fromf64 => { cg.builder.build_fp_to_ui(a0, LType::i32(), "fptoui") }
+        IntrinsicKind::FpToUi64Fromf64 => { cg.builder.build_fp_to_ui(a0, LType::i64(), "fptoui") }
+
+        // -- Bit operations --
+        IntrinsicKind::Bswap16    => { emit_unary_llvm(cg, "llvm.bswap.i16", LType::i16(), a0, false, "bswap") }
+        IntrinsicKind::Bswap32    => { emit_unary_llvm(cg, "llvm.bswap.i32", LType::i32(), a0, false, "bswap") }
+        IntrinsicKind::Bswap64    => { emit_unary_llvm(cg, "llvm.bswap.i64", LType::i64(), a0, false, "bswap") }
+        IntrinsicKind::Popcount32 => { emit_unary_llvm(cg, "llvm.ctpop.i32", LType::i32(), a0, true, "ctpop") }
+        IntrinsicKind::Popcount64 => { emit_unary_llvm(cg, "llvm.ctpop.i64", LType::i64(), a0, true, "ctpop") }
+        IntrinsicKind::Clz32 => { emit_clz_or_ctz(cg, "llvm.ctlz.i32", LType::i32(), a0) }
+        IntrinsicKind::Clz64 => { emit_clz_or_ctz(cg, "llvm.ctlz.i64", LType::i64(), a0) }
+        IntrinsicKind::Ctz32 => { emit_clz_or_ctz(cg, "llvm.cttz.i32", LType::i32(), a0) }
+        IntrinsicKind::Ctz64 => { emit_clz_or_ctz(cg, "llvm.cttz.i64", LType::i64(), a0) }
+        IntrinsicKind::Rotl32 => { emit_rotate(cg, "llvm.fshl.i32", LType::i32(), a0, a1) }
+        IntrinsicKind::Rotl64 => { emit_rotate(cg, "llvm.fshl.i64", LType::i64(), a0, a1) }
+        IntrinsicKind::Rotr32 => { emit_rotate(cg, "llvm.fshr.i32", LType::i32(), a0, a1) }
+        IntrinsicKind::Rotr64 => { emit_rotate(cg, "llvm.fshr.i64", LType::i64(), a0, a1) }
+
+        // -- atomic_fence(order) — emit `fence seq_cst`.  cryort.c
+        //    ignored the order arg and always used SeqCst, matching that
+        //    here.  Returns void; we synthesize a void value.  The
+        //    Ordering enum value 7 = SequentiallyConsistent. --
+        IntrinsicKind::AtomicFence => {
+            llvm::LLVMBuildFence(cg.builder.raw, 7, 0, "");
+            LValue::null()
+        }
+
+        // -- isfinite(x) → fcmp oeq (x - x), 0 — true iff x is finite.
+        //    NaN/±inf produce NaN in `x - x`, and oeq with NaN is false. --
+        IntrinsicKind::IsFinite => {
+            const diff: LValue = cg.builder.build_fsub(a0, a0, "is_fin.diff");
+            const zero: LValue = LType::const_real(LType::f64(), 0.0);
+            // FCmp predicate OEQ = 1 in the LLVMRealPredicate enum.
+            cg.builder.build_fcmp(1, diff, zero, "is_fin")
+        }
+
+        // -- dirent_name(entry) → entry == null ? "" : (entry + 19).
+        //    d_name is at byte offset 19 in glibc's struct dirent.  The
+        //    GEP returns a `char *` which is exactly Cryo's `string`. --
+        IntrinsicKind::DirentName  => { emit_dirent_name(cg, args[0]) }
+        IntrinsicKind::DirentType  => { emit_dirent_type(cg, args[0]) }
+    };
+
+    return true;
+}
+
+
+// ============================================================================
+// dirent emit helpers (Linux glibc layout)
+// ============================================================================
+//
+// struct dirent {
+//     ino_t          d_ino;       // offset  0, size 8
+//     off_t          d_off;       // offset  8, size 8
+//     unsigned short d_reclen;    // offset 16, size 2
+//     unsigned char  d_type;      // offset 18, size 1
+//     char           d_name[256]; // offset 19, size up to 256
+// };
+//
+// We hardcode the offsets matching cryort.c's behavior.  Both helpers
+// guard against a null entry pointer (cryort.c returned "" / 0).
+
+function emit_dirent_name(cg: CodegenContext*, entry: LValue) -> LValue {
+    const i8_ty: LType = LType::i8();
+    const ptr_ty: LType = LType::pointer_to(i8_ty);
+    // GEP entry, +19 → ptr to d_name
+    const off: LValue = LType::const_int(LType::i64(), 19, false);
+    const idx_buf: void* = malloc(8);
+    const idx_slots: void** = idx_buf as void**;
+    idx_slots[0] = off.raw;
+    const name_ptr: LValue = cg.builder.build_gep(i8_ty, entry, idx_buf, 1, "d_name");
+    free(idx_buf);
+    // Null guard: if entry is null, return "" (a global empty string).
+    const empty: LValue = cg.builder.build_global_string_ptr("", "d_name.empty");
+    const is_null: LValue = cg.builder.build_icmp(
+        // ICmp predicate EQ = 32.
+        32, entry, LType::const_pointer_null(ptr_ty), "d_name.is_null");
+    return cg.builder.build_select(is_null, empty, name_ptr, "d_name.sel");
+}
+
+function emit_dirent_type(cg: CodegenContext*, entry: LValue) -> LValue {
+    const i8_ty: LType = LType::i8();
+    const ptr_ty: LType = LType::pointer_to(i8_ty);
+    // GEP entry, +18 → ptr to d_type (i8)
+    const off: LValue = LType::const_int(LType::i64(), 18, false);
+    const idx_buf: void* = malloc(8);
+    const idx_slots: void** = idx_buf as void**;
+    idx_slots[0] = off.raw;
+    const type_ptr: LValue = cg.builder.build_gep(i8_ty, entry, idx_buf, 1, "d_type.ptr");
+    free(idx_buf);
+    const type_byte: LValue = cg.builder.build_load(i8_ty, type_ptr, "d_type.byte");
+    const widened: LValue = cg.builder.build_zext(type_byte, LType::i32(), "d_type.i32");
+    // Null guard: return 0 if entry is null.
+    const zero: LValue = LType::const_int(LType::i32(), 0, false);
+    const is_null: LValue = cg.builder.build_icmp(
+        32, entry, LType::const_pointer_null(ptr_ty), "d_type.is_null");
+    return cg.builder.build_select(is_null, zero, widened, "d_type.sel");
+}
+
+
+// ============================================================================
+// `format` runtime helper
+// ============================================================================
+//
+// `format(fmt, args...) -> string` was previously defined in cryort.c; this
+// emits an equivalent definition into every module that's compiled.  With
+// linkonce_odr linkage the linker keeps one copy across all 100+ modules.
+//
+// Body (vasprintf-based — single call, no va_copy gymnastics):
+//
+//   define linkonce_odr ptr @format(ptr %fmt, ...) {
+//   entry:
+//     %va   = alloca [24 x i8], align 1
+//     %strp = alloca ptr,        align 8
+//     store ptr null, ptr %strp
+//     call void @llvm.va_start.p0(ptr %va)
+//     %n   = call i32 @vasprintf(ptr %strp, ptr %fmt, ptr %va)
+//     call void @llvm.va_end.p0(ptr %va)
+//     %neg = icmp slt i32 %n, 0
+//     %buf = load ptr, ptr %strp
+//     %ret = select i1 %neg, ptr null, ptr %buf
+//     ret ptr %ret
+//   }
+//
+// vasprintf is GNU/BSD libc (glibc, macOS, ucrt-on-Windows-via-mingw).  If
+// portability beyond Linux/macOS becomes important later, switch to a
+// vsnprintf+malloc body with @llvm.va_copy.
+
+function get_or_decl_vasprintf(cg: CodegenContext*) -> LValue {
+    mut fn: LValue = cg.llvm_module.get_named_function("vasprintf");
+    if (fn.is_valid()) { return fn; }
+    const ptr_ty: LType = LType::pointer_to(LType::i8());
+    const buf: void* = malloc(24);
+    const slots: void** = buf as void**;
+    slots[0] = ptr_ty.raw;   // char**
+    slots[1] = ptr_ty.raw;   // const char* fmt
+    slots[2] = ptr_ty.raw;   // va_list (pointer-to-bucket on SysV)
+    const fty: LType = LType::function_type(LType::i32(), buf, 3, false);
+    free(buf);
+    return cg.llvm_module.add_function("vasprintf", fty);
+}
+
+function get_or_decl_va_start(cg: CodegenContext*) -> LValue {
+    mut fn: LValue = cg.llvm_module.get_named_function("llvm.va_start.p0");
+    if (fn.is_valid()) { return fn; }
+    const ptr_ty: LType = LType::pointer_to(LType::i8());
+    const buf: void* = malloc(8);
+    const slots: void** = buf as void**;
+    slots[0] = ptr_ty.raw;
+    const fty: LType = LType::function_type(LType::void_type(), buf, 1, false);
+    free(buf);
+    return cg.llvm_module.add_function("llvm.va_start.p0", fty);
+}
+
+function get_or_decl_va_end(cg: CodegenContext*) -> LValue {
+    mut fn: LValue = cg.llvm_module.get_named_function("llvm.va_end.p0");
+    if (fn.is_valid()) { return fn; }
+    const ptr_ty: LType = LType::pointer_to(LType::i8());
+    const buf: void* = malloc(8);
+    const slots: void** = buf as void**;
+    slots[0] = ptr_ty.raw;
+    const fty: LType = LType::function_type(LType::void_type(), buf, 1, false);
+    free(buf);
+    return cg.llvm_module.add_function("llvm.va_end.p0", fty);
+}
+
+/// Emit the `@format` runtime function into the current module if it
+/// hasn't been emitted yet.  Idempotent.  Called once per module before
+/// user IR-gen; the linkonce_odr linkage means the linker collapses all
+/// 100+ copies down to one.
+function emit_format_runtime(cg: CodegenContext*) -> void {
+    // If `format` already has a basic block, it's already defined here.
+    mut fmt_fn: LValue = cg.llvm_module.get_named_function("format");
+    if (fmt_fn.is_valid()) {
+        const first_bb: void* = llvm::LLVMGetFirstBasicBlock(fmt_fn.raw);
+        if (first_bb != null) { return; }
+    }
+
+    // Declare format as `(ptr, ...) -> ptr` if it doesn't exist yet.
+    const ptr_ty: LType = LType::pointer_to(LType::i8());
+    if (!fmt_fn.is_valid()) {
+        const param_buf: void* = malloc(8);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ptr_ty.raw;
+        const fty: LType = LType::function_type(ptr_ty, param_buf, 1, true);
+        free(param_buf);
+        fmt_fn = cg.llvm_module.add_function("format", fty);
+    }
+    if (!fmt_fn.is_valid()) { return; }
+
+    // linkonce_odr = 3 in the LLVM-C linkage enum (matches the header
+    // we read above).  All copies emitted across modules merge to one.
+    fmt_fn.set_linkage(3);
+
+    // Save & restore the builder's insertion position so we don't
+    // disturb whatever else is being generated for this module.
+    const saved_bb: LBasicBlock = cg.builder.get_insert_block();
+
+    const entry_bb: LBasicBlock = LBasicBlock::append(fmt_fn, "entry");
+    cg.builder.position_at_end(entry_bb);
+
+    // Allocate va_list (24 bytes — System V x86-64 layout) and the
+    // string out-pointer.
+    const va_list_ty: LType = LType::array_of(LType::i8(), 24);
+    const va_alloca: LValue = cg.builder.build_alloca(va_list_ty, "va");
+    const strp_alloca: LValue = cg.builder.build_alloca(ptr_ty, "strp");
+    cg.builder.build_store(LType::const_pointer_null(ptr_ty), strp_alloca);
+
+    // va_start(&va)
+    const va_start_fn: LValue = get_or_decl_va_start(cg);
+    const va_start_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(va_start_fn.raw) };
+    mut vs_args: LValue[] = [];
+    vs_args.push(va_alloca);
+    mut vs_res: LValue = LValue::null();
+    codegen_call(cg, va_start_fn, va_start_ty, vs_args, "", &vs_res);
+
+    // n = vasprintf(strp, fmt, &va)
+    const vasprintf_fn: LValue = get_or_decl_vasprintf(cg);
+    const vasprintf_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(vasprintf_fn.raw) };
+    const fmt_param: LValue = LValue { raw: llvm::LLVMGetParam(fmt_fn.raw, 0) };
+    mut va_args: LValue[] = [];
+    va_args.push(strp_alloca);
+    va_args.push(fmt_param);
+    va_args.push(va_alloca);
+    mut n_result: LValue = LValue::null();
+    codegen_call(cg, vasprintf_fn, vasprintf_ty, va_args, "n", &n_result);
+
+    // va_end(&va)
+    const va_end_fn: LValue = get_or_decl_va_end(cg);
+    const va_end_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(va_end_fn.raw) };
+    mut ve_args: LValue[] = [];
+    ve_args.push(va_alloca);
+    mut ve_res: LValue = LValue::null();
+    codegen_call(cg, va_end_fn, va_end_ty, ve_args, "", &ve_res);
+
+    // %neg = (n < 0); %buf = load strp; %ret = select neg, null, buf
+    const zero32: LValue = LType::const_int(LType::i32(), 0, false);
+    // ICmp predicate SLT = 40 (LLVMIntSLT in the LLVM-C enum).
+    const is_neg: LValue = cg.builder.build_icmp(40, n_result, zero32, "neg");
+    const buf_loaded: LValue = cg.builder.build_load(ptr_ty, strp_alloca, "buf");
+    const null_ret: LValue = LType::const_pointer_null(ptr_ty);
+    const ret_val: LValue = cg.builder.build_select(is_neg, null_ret, buf_loaded, "ret");
+    cg.builder.build_ret(ret_val);
+
+    // Restore builder.
+    if (saved_bb.is_valid()) {
+        cg.builder.position_at_end(saved_bb);
+    }
+}
