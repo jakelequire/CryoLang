@@ -69,6 +69,8 @@ const char    *LLVMGetValueName(LLVMValueRef Val);
 void           LLVMGetParamTypes(LLVMTypeRef FunctionTy, LLVMTypeRef *Dest);
 int            LLVMGetInstructionOpcode(LLVMValueRef Inst);
 LLVMTypeRef    LLVMGetAllocatedType(LLVMValueRef Alloca);
+LLVMValueRef   LLVMGetOperand(LLVMValueRef Val, unsigned Index);
+int            LLVMGetNumOperands(LLVMValueRef Val);
 
 
 /* ===================================================================

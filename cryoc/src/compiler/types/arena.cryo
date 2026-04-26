@@ -87,9 +87,11 @@ type struct TypeArena {
     // -- Function template placeholder cache (SymbolStr.id → TypeRef) --
     func_template_cache: HashMap<u32, TypeRef>;
 
-    // -- Generic parameter dedup cache (key: "name_id:index" → TypeRef) --
-    generic_param_cache:   HashMap<string, TypeRef>;
-    bounded_param_cache:   HashMap<string, TypeRef>;
+    // -- Generic parameter dedup cache (key: (name.id << 32) | index → TypeRef) --
+    // Integer key avoids the bootstrap-bug pointer-compare on string keys
+    // that left every (name, index) call producing a fresh TypeRef.
+    generic_param_cache:   HashMap<u64, TypeRef>;
+    bounded_param_cache:   HashMap<u64, TypeRef>;
 
     // -- Reverse index: bare leaf name → qualified name --
     // Populated by create_struct/class/enum/trait/alias.
@@ -142,8 +144,8 @@ type struct TypeArena {
             trait_cache:         HashMap<u32, TypeRef>::new(),
             alias_cache:         HashMap<u32, TypeRef>::new(),
             func_template_cache: HashMap<u32, TypeRef>::new(),
-            generic_param_cache: HashMap<string, TypeRef>::new(),
-            bounded_param_cache: HashMap<string, TypeRef>::new(),
+            generic_param_cache: HashMap<u64, TypeRef>::new(),
+            bounded_param_cache: HashMap<u64, TypeRef>::new(),
             leaf_index:          HashMap<u32, u32>::new(),
         };
 
@@ -435,8 +437,8 @@ type struct TypeArena {
     /// Deduplicated by (name.id, index) so that multiple passes resolving
     /// the same generic parameter T at index 0 always get the same TypeRef.
     create_generic_param(mut &this, name: SymbolStr, index: u64) -> TypeRef {
-        mut key: string = format("gp_%u_%lu", name.id, index);
-        const h: u64 = hash_str(key);
+        const key: u64 = ((name.id as u64) << 32) | (index & 0xFFFFFFFF);
+        const h: u64 = hash_int(key);
 
         const cached: Option<TypeRef> = this.generic_param_cache.get(key, h);
         if (cached.is_some()) { return cached.unwrap(); }
@@ -449,8 +451,8 @@ type struct TypeArena {
     /// Get or create a bounded generic parameter type.
     /// Deduplicated by (name.id, index) — bounds are set on first creation.
     create_bounded_param(mut &this, name: SymbolStr, index: u64, bounds: TypeRef[]) -> TypeRef {
-        mut key: string = format("bp_%u_%lu", name.id, index);
-        const h: u64 = hash_str(key);
+        const key: u64 = ((name.id as u64) << 32) | (index & 0xFFFFFFFF);
+        const h: u64 = hash_int(key);
 
         const cached: Option<TypeRef> = this.bounded_param_cache.get(key, h);
         if (cached.is_some()) { return cached.unwrap(); }

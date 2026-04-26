@@ -155,9 +155,12 @@ type struct TypeResolutionRunner {
     }
 
     /// Resolves all method signatures (MethodNode*[]) on a struct/class/impl.
+    /// `owner_type` lets the resolver back-fill `this`/`&this` resolved_type
+    /// (the parser leaves the receiver param's type unset).
     resolve_method_signatures(&this, methods: MethodNode*[],
-                              res_ctx: ResolutionContext*) -> void {
-        this.resolver.resolve_method_signatures(methods, res_ctx);
+                              res_ctx: ResolutionContext*,
+                              owner_type: TypeRef) -> void {
+        this.resolver.resolve_method_signatures(methods, res_ctx, owner_type);
     }
 
     /// Resolves all function signatures (FunctionDeclNode*[]) on a trait.
@@ -673,6 +676,12 @@ type struct TypeResolutionPasses {
                         const q_mangled: SymbolStr = ctx.decl_index.lookup_mangled_name(q_name);
                         if (q_mangled.is_valid()) {
                             ctx.decl_index.register_mangled_name(func.name, q_mangled);
+                            // Pin per-overload too — bare-name's single
+                            // mangled-name slot is overwritten across modules
+                            // (last-wins) and would otherwise hand out the
+                            // wrong symbol when this overload gets picked.
+                            ctx.decl_index.register_overload_mangled(
+                                func.name, func_type_ref, q_mangled);
                         }
                     }
                 }
@@ -757,14 +766,18 @@ type struct TypeResolutionPasses {
                     const node: StructDeclNode* = stmt as StructDeclNode*;
                     mut struct_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
-                    runner.resolve_method_signatures(node.methods, &struct_ctx);
+                    const struct_owner: TypeRef = ctx.decl_index.lookup_type(
+                        ctx.qualify_symbol_sym(node.name));
+                    runner.resolve_method_signatures(node.methods, &struct_ctx, struct_owner);
                     sig_count = sig_count + node.methods.length;
                 }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     mut class_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
-                    runner.resolve_method_signatures(node.methods, &class_ctx);
+                    const class_owner: TypeRef = ctx.decl_index.lookup_type(
+                        ctx.qualify_symbol_sym(node.name));
+                    runner.resolve_method_signatures(node.methods, &class_ctx, class_owner);
                     sig_count = sig_count + node.methods.length;
                 }
                 NodeKind::TraitDeclaration => {
@@ -778,7 +791,14 @@ type struct TypeResolutionPasses {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
                     mut impl_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
-                    runner.resolve_method_signatures(node.methods, &impl_ctx);
+                    // Look up the owner type — try qualified first, then bare
+                    // (primitive impls like `implement string` use bare).
+                    mut impl_owner: TypeRef = ctx.decl_index.lookup_type(
+                        ctx.qualify_symbol_sym(node.target_type));
+                    if (impl_owner.is_invalid()) {
+                        impl_owner = ctx.decl_index.lookup_type(node.target_type);
+                    }
+                    runner.resolve_method_signatures(node.methods, &impl_ctx, impl_owner);
                     sig_count = sig_count + node.methods.length;
                 }
                 NodeKind::ExternBlock => {
@@ -868,6 +888,11 @@ type struct TypeResolutionPasses {
                         const bare_name_str: string = ctx.intern_table.resolve(node.name);
                         const bare_mangled: SymbolStr = ctx.intern_table.intern(bare_name_str);
                         ctx.decl_index.register_mangled_name(q_name, bare_mangled);
+                        // register_function_type_with_module registered the
+                        // overload-mangled to a C$ form; intrinsics use the
+                        // bare C name instead, so re-pin per overload.
+                        ctx.decl_index.register_overload_mangled(
+                            q_name, i_func_type_ref, bare_mangled);
 
                         // Also register bare name for lookups.
                         if (!q_name.equals(node.name)) {
@@ -876,6 +901,8 @@ type struct TypeResolutionPasses {
                             ctx.decl_index.register_name_mapping(node.name, q_name);
                             // Bare name also needs its own mangled entry.
                             ctx.decl_index.register_mangled_name(node.name, bare_mangled);
+                            ctx.decl_index.register_overload_mangled(
+                                node.name, i_func_type_ref, bare_mangled);
                         }
                     }
                     sig_count++;
@@ -1010,7 +1037,12 @@ type struct TypeResolutionPasses {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
                     mut impl_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
-                    runner.resolve_method_signatures(node.methods, &impl_ctx);
+                    mut impl_owner2: TypeRef = ctx.decl_index.lookup_type(
+                        ctx.qualify_symbol_sym(node.target_type));
+                    if (impl_owner2.is_invalid()) {
+                        impl_owner2 = ctx.decl_index.lookup_type(node.target_type);
+                    }
+                    runner.resolve_method_signatures(node.methods, &impl_ctx, impl_owner2);
                 }
                 _ => {
                     // Enum variant associated types (now TypeAnnotation*) are resolved
