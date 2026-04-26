@@ -306,9 +306,11 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
     if (!is_float) {
         const lhs_ty: void* = llvm::LLVMTypeOf(lhs.raw);
         const rhs_ty: void* = llvm::LLVMTypeOf(rhs.raw);
-        // LLVMIntegerTypeKind = 8
+        // LLVMIntegerTypeKind = 8, LLVMPointerTypeKind = 12
+        const lhs_kind: i32 = llvm::LLVMGetTypeKind(lhs_ty);
+        const rhs_kind: i32 = llvm::LLVMGetTypeKind(rhs_ty);
         if (lhs_ty != null && rhs_ty != null &&
-            llvm::LLVMGetTypeKind(lhs_ty) == 8 && llvm::LLVMGetTypeKind(rhs_ty) == 8) {
+            lhs_kind == 8 && rhs_kind == 8) {
             const lhs_w: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty);
             const rhs_w: u32 = llvm::LLVMGetIntTypeWidth(rhs_ty);
             if (lhs_w < rhs_w) {
@@ -326,6 +328,19 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
                     rhs = cg.builder.build_zext(rhs, target, "widen");
                 }
             }
+        } else if (lhs_ty != null && rhs_ty != null &&
+                   lhs_kind == 8 && rhs_kind == 12) {
+            // int <op> ptr — coerce int to ptr so icmp on two pointers
+            // succeeds.  Mirrors the bootstrap's ensure_compatible_types
+            // path; address comparisons in stdlib (e.g., aligned_addr <
+            // base + offset where the int side holds a ptrtoint'd address)
+            // depend on this.
+            const ptr_ty: LType = LType { raw: rhs_ty };
+            lhs = cg.builder.build_int_to_ptr(lhs, ptr_ty, "int2ptr");
+        } else if (lhs_ty != null && rhs_ty != null &&
+                   lhs_kind == 12 && rhs_kind == 8) {
+            const ptr_ty: LType = LType { raw: lhs_ty };
+            rhs = cg.builder.build_int_to_ptr(rhs, ptr_ty, "int2ptr");
         }
     }
 
@@ -521,6 +536,21 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                     // takes `DiagnosticSink` by value).
                     const st: LType = LType { raw: expected_ty };
                     arg_val = cg.builder.build_load(st, arg_val, "arg.deref");
+                } else if ((ek == 2 || ek == 3) && ak == 12) {
+                    // Expected float (2) or double (3), actual ptr (12):
+                    // load the float through the pointer.  Happens for
+                    // by-value primitive receivers — e.g. `f64::trunc(this) -> f64`
+                    // called as `(&this).trunc()` where `&this` is a ptr to f64.
+                    const ft: LType = LType { raw: expected_ty };
+                    arg_val = cg.builder.build_load(ft, arg_val, "arg.deref");
+                } else if (ek == 8 && ak == 12 && expected_count > 0 && i == 0) {
+                    // Expected integer (8), actual ptr (12) for the receiver
+                    // (i==0): same scenario — by-value primitive `this` on
+                    // an integer-kind type.  Load the integer.  We restrict
+                    // to i==0 (the receiver slot) to avoid colliding with
+                    // the legitimate ptrtoint coercion for non-receiver args.
+                    const it: LType = LType { raw: expected_ty };
+                    arg_val = cg.builder.build_load(it, arg_val, "arg.deref");
                 } else if (ek == 12 && ak == 8) {
                     // Expected ptr (12), actual integer: inttoptr.
                     const target: LType = LType { raw: expected_ty };

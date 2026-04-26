@@ -132,6 +132,23 @@ function coerce_return_value(cg: CodegenContext*, val: LValue) -> LValue {
     if (want_kind == 8 && got_kind == 12) {
         return cg.builder.build_ptr_to_int(val, want_lty, "ret.ptrtoint");
     }
+
+    // Struct → ptr: arises from `return this` / `return some_lvalue` in a
+    // method whose return type is `&Self` (or any reference).  codegen_rvalue
+    // dutifully loads the struct from the receiver pointer; the function
+    // signature wants the pointer back.  If `val` is a load instruction, we
+    // can recover the pre-load address (the load's only operand) and
+    // return that, leaving the dead load to be DCE'd by LLVM.
+    // LLVMOpcode::Load = 27 (LLVM-C enum, stable across LLVM 14-20).
+    if (want_kind == 12 && got_kind == 10) {
+        const opcode: i32 = llvm::LLVMGetInstructionOpcode(val.raw);
+        if (opcode == 27) {
+            const ptr_operand: void* = llvm::LLVMGetOperand(val.raw, 0);
+            if (ptr_operand != null) {
+                return LValue { raw: ptr_operand };
+            }
+        }
+    }
     if (want_kind == 8 && got_kind == 8) {
         const want_bits: u32 = llvm::LLVMGetIntTypeWidth(want_ty_raw);
         const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(got_ty_raw);

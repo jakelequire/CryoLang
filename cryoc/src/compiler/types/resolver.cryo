@@ -226,8 +226,18 @@ type struct TypeResolver {
     }
 
     /// Resolve all method signatures (MethodNode*[]) on a struct/class/impl.
+    /// `owner_type` is the receiver type — used to back-fill the
+    /// `this`/`&this` parameter's resolved_type, which the parser leaves
+    /// unset because the receiver is implicit-typed.  Without this, by-value
+    /// `this` on primitive impls (e.g. `f64::trunc(this) -> f64`) reaches
+    /// codegen with no resolved_type and gets dropped from the function's
+    /// LLVM signature, producing a 0-arg `define` for what should be a
+    /// 1-arg method.
     resolve_method_signatures(&this, methods: MethodNode*[],
-                              res_ctx: ResolutionContext*) -> void {
+                              res_ctx: ResolutionContext*,
+                              owner_type: TypeRef) -> void {
+        const this_ref_name: SymbolStr = this.intern_table.intern("&this");
+        const this_val_name: SymbolStr = this.intern_table.intern("this");
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
@@ -243,6 +253,22 @@ type struct TypeResolver {
                 this.resolve_func_signature(method.func, &method_ctx);
             } else {
                 this.resolve_func_signature(method.func, res_ctx);
+            }
+
+            // Back-fill `this`/`&this` resolved_type from owner_type when
+            // the param has no annotation (parser leaves it null on the
+            // receiver — there's nothing to write there at parse time).
+            // `&this` resolves to a Pointer to owner; bare `this` resolves
+            // to owner directly.
+            if (method.is_static || !owner_type.is_valid()) { continue; }
+            for (mut p: i64 = 0; p < method.func.parameters.length; p++) {
+                const param: VarDeclNode* = method.func.parameters[p];
+                if (param == null || param.resolved_type.is_valid()) { continue; }
+                if (param.name.equals(this_val_name)) {
+                    param.resolved_type = owner_type;
+                } else if (param.name.equals(this_ref_name)) {
+                    param.resolved_type = this.arena.get_pointer_to(owner_type);
+                }
             }
         }
     }

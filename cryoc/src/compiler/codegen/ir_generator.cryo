@@ -190,12 +190,9 @@ public:
                     printf("[IRGen]   [%lld] class methods done\n", i); fflush(null);
                 }
             } else if (kind == NodeKind::VariableDeclaration) {
-                const var_decl: VarDeclNode* = stmt as VarDeclNode*;
-                if (var_decl.is_global) {
-                    const var_name: string = this.cg.resolve(var_decl.name);
-                    printf("[IRGen]   [%lld] global var: %s\n", i, var_name); fflush(null);
-                    codegen_global_var(this.cg, var_decl);
-                }
+                // Globals are emitted in Phase 2 (declare_functions) so they
+                // are visible to function bodies regardless of source order.
+                // Nothing to do here.
             }
         }
 
@@ -1217,21 +1214,42 @@ public:
                 }
             }
 
-            // 1. Try current module's qualified name.
+            // 1. Try current module's qualified name.  Prefer the arity-
+            //    aware lookup so same-bare-name overloads from different
+            //    modules (e.g. `pipe()` free function in std::os vs the
+            //    `pipe(int*)` intrinsic in std::core::intrinsics) get
+            //    discriminated by the call's argument count.  The non-arity
+            //    fallback is the last-wins bucket and would otherwise hand
+            //    out whichever module registered most recently.
+            const id_arity: u32 = node.arguments.length as u32;
             const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(id.name);
-            callee_val = resolve_function(this.cg, qualified);
+            callee_val = resolve_function_with_arity(this.cg, qualified, id_arity);
+            if (!callee_val.is_valid()) {
+                callee_val = resolve_function(this.cg, qualified);
+            }
 
             // 2. Try the DI's bare→qualified mapping (resolves auto-imports
-            //    like printf → std::core::intrinsics::printf).
+            //    like printf → std::core::intrinsics::printf).  The mapping
+            //    is last-wins per bare name, so it can point at the wrong
+            //    overload (e.g., bare `pipe` → `std::os::pipe()` 0-arg even
+            //    when the call has 1 arg meaning `intrinsics::pipe(int*)`).
+            //    Restrict to the arity-aware lookup here so a wrong-arity
+            //    match doesn't shadow the correct one available via Step 3's
+            //    bare-name overload-set lookup.
             if (!callee_val.is_valid()) {
                 const di: DeclarationIndex* = this.cg.get_decl_index();
                 const resolved: SymbolStr = di.resolve_qualified(id.name);
-                callee_val = resolve_function(this.cg, resolved);
+                callee_val = resolve_function_with_arity(this.cg, resolved, id_arity);
             }
 
-            // 3. Bare name (for extern C functions registered without qualification).
+            // 3. Bare name (for extern C functions registered without
+            //    qualification, and for picking the right overload across
+            //    cross-module bare-name aliases).  Arity-aware first.
             if (!callee_val.is_valid()) {
-                callee_val = resolve_function(this.cg, id.name);
+                callee_val = resolve_function_with_arity(this.cg, id.name, id_arity);
+                if (!callee_val.is_valid()) {
+                    callee_val = resolve_function(this.cg, id.name);
+                }
             }
 
             // 3b. Class / struct constructor call — `ClassName(args)` resolves
@@ -1440,8 +1458,16 @@ public:
             // Fallback 1: try the bare member name.  Extern "C" functions
             // (e.g., llvm::LLVMGetTypeKind) are registered under their
             // unqualified C name, not the scope-qualified form.
+            // Use arity-aware lookup first to discriminate between overloads
+            // that share a bare name (e.g., the `read` intrinsic vs the free
+            // `std::fs::file::read(path: string)` — both reachable under bare
+            // "read" via type_resolution's bare-alias registration).
             if (!callee_val.is_valid()) {
-                callee_val = resolve_function(this.cg, sr.member_name);
+                callee_val = resolve_function_with_arity(
+                    this.cg, sr.member_name, sr_arity);
+                if (!callee_val.is_valid()) {
+                    callee_val = resolve_function(this.cg, sr.member_name);
+                }
             }
 
             // Fallback 2: use node.resolved_type to find the concrete

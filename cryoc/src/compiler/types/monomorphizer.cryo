@@ -875,6 +875,15 @@ type struct Monomorphizer {
                            subst: TypeSubstitution*, entry: TemplateEntry*) -> void {
         if (entry == null || subst == null) { return; }
 
+        // Idempotency guard: partial specs (e.g., `Option<T*>` for two outer
+        // generics T_a and T_b) collapse to the same spec_name `Option_LPN_L1T_G_G`
+        // and therefore the same EnumType in the arena.  Without this guard,
+        // populate runs once per outer caller and accumulates duplicate
+        // variants ([Some, None, Some, None, ...]), which then breaks
+        // `et.get_variant("Some")` (returns the first match — possibly the
+        // wrong substitution).
+        if (et.variants.length > 0) { return; }
+
         // Look up the base generic enum.  Its variants were populated by
         // type_resolution.cryo's EnumDeclaration handler with GenericParam
         // payloads (`Some(T)` → `payload_types = [GenericParam_T]`).
@@ -1153,32 +1162,70 @@ type struct Monomorphizer {
             return;
         }
 
-        // Skip if any type arg is or contains an unresolved generic parameter.
-        // Check two levels deep: the direct arg, and if it's an InstantiatedType,
-        // its own type_args (catches Option<Result<T, E>> where Result<T, E>'s
-        // args T and E are GenericParams).
+        // Skip partial specs — any type arg that *contains* an unresolved
+        // GenericParam at any depth (including nested through Pointer,
+        // Reference, Array, Optional, Tuple, Function, InstantiatedType) is
+        // not yet concrete.  Mono should only process fully-concrete specs;
+        // partial ones get further substituted when the *outer* template is
+        // monomorphized, and would otherwise collide on spec_name and produce
+        // miscompiled bodies (e.g., return type doubled to T**).
         for (mut i: i64 = 0; i < inst.type_args.length; i++) {
-            const arg_t: Type* = this.arena.lookup(inst.type_args[i].id);
-            if (arg_t != null) {
-                if (arg_t.kind == TypeKind::GenericParam ||
-                    arg_t.kind == TypeKind::BoundedParam) {
-                    return;
-                }
-                if (arg_t.kind == TypeKind::InstantiatedType) {
-                    const inner: InstantiatedType* = arg_t as InstantiatedType*;
-                    for (mut j: i64 = 0; j < inner.type_args.length; j++) {
-                        const inner_t: Type* = this.arena.lookup(inner.type_args[j].id);
-                        if (inner_t != null &&
-                            (inner_t.kind == TypeKind::GenericParam ||
-                             inner_t.kind == TypeKind::BoundedParam)) {
-                            return;
-                        }
-                    }
-                }
+            if (this.type_contains_generic_param(inst.type_args[i])) {
+                return;
             }
         }
 
         this.enqueue_from_inst(ty, inst);
+    }
+
+    /// Recursively check if a type contains any unresolved GenericParam or
+    /// BoundedParam at any depth.  Used to filter partial specs out of
+    /// monomorphization (see enqueue_from_type_ref).
+    type_contains_generic_param(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::GenericParam) { return true; }
+        if (t.kind == TypeKind::BoundedParam) { return true; }
+        if (t.kind == TypeKind::Pointer) {
+            const ptr: PointerType* = t as PointerType*;
+            return this.type_contains_generic_param(ptr.pointee);
+        }
+        if (t.kind == TypeKind::Reference) {
+            const ref: ReferenceType* = t as ReferenceType*;
+            return this.type_contains_generic_param(ref.referent);
+        }
+        if (t.kind == TypeKind::Array) {
+            const arr: ArrayType* = t as ArrayType*;
+            return this.type_contains_generic_param(arr.element);
+        }
+        if (t.kind == TypeKind::Optional) {
+            const opt: OptionalType* = t as OptionalType*;
+            return this.type_contains_generic_param(opt.wrapped);
+        }
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t as TupleType*;
+            for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                if (this.type_contains_generic_param(tup.elements[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::Function) {
+            const func: FunctionType* = t as FunctionType*;
+            if (this.type_contains_generic_param(func.return_type)) { return true; }
+            for (mut i: i64 = 0; i < func.param_types.length; i++) {
+                if (this.type_contains_generic_param(func.param_types[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (this.type_contains_generic_param(inst.type_args[i])) { return true; }
+            }
+            return false;
+        }
+        return false;
     }
 
     enqueue_from_inst(mut &this, ty: TypeRef, inst: InstantiatedType*) -> void {

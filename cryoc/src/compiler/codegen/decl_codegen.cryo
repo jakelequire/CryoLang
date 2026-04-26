@@ -227,7 +227,10 @@ function declare_enum_type(cg: CodegenContext*, node: EnumDeclNode*) -> void {
 // ============================================================================
 
 /// Walk the program and create LLVM function declarations for all
-/// functions, methods, and extern blocks.
+/// functions, methods, and extern blocks.  Also emits module-level global
+/// variable declarations so any function body that references a global
+/// (regardless of source order — e.g. `clock_gettime(CLOCK_REALTIME, ...)`
+/// where the const is declared later in the file) can resolve it.
 function declare_functions(cg: CodegenContext*, program: ProgramNode*) -> void {
     const stmts: ASTNode*[] = program.statements;
     for (mut i: i64 = 0; i < stmts.length; i++) {
@@ -248,6 +251,11 @@ function declare_functions(cg: CodegenContext*, program: ProgramNode*) -> void {
             declare_struct_methods(cg, stmt as StructDeclNode*);
         } else if (kind == NodeKind::ClassDeclaration) {
             declare_class_methods(cg, stmt as ClassDeclNode*);
+        } else if (kind == NodeKind::VariableDeclaration) {
+            const var_decl: VarDeclNode* = stmt as VarDeclNode*;
+            if (var_decl.is_global) {
+                codegen_global_var(cg, var_decl);
+            }
         }
     }
 }
@@ -336,20 +344,15 @@ function declare_impl_block(cg: CodegenContext*, node: ImplBlockNode*) -> void {
     }
 
     // Qualify the target type — node.target_type may be bare ("CompileMode")
-    // but the DI and type system use qualified names.
-    // Three cases:
-    //   1. Already qualified ("Compiler::CompileMode") — use as-is.
-    //   2. Bare name that the DI already knows as a type ("i32", "boolean") —
-    //      keep the bare name so lookups match the DI registration.
-    //   3. Bare name not in the DI — qualify with the current namespace.
+    // but the DI and type system use qualified names.  Always qualify so
+    // the definition's mangled name matches the form that call sites
+    // compute via `lookup_type_name(obj_ref)` (which returns the qualified
+    // name for primitives in namespaced modules).
     const ctx_ptr: CompilationContext* = cg.ctx;
     const target_str: string = ctx_ptr.intern_table.resolve(node.target_type);
     mut qualified_target: SymbolStr = node.target_type;
     if (strstr(target_str, "::") == null) {
-        const di: DeclarationIndex* = ctx_ptr.decl_index;
-        if (di.lookup_type(node.target_type).is_invalid()) {
-            qualified_target = ctx_ptr.qualify_symbol_sym(node.target_type);
-        }
+        qualified_target = ctx_ptr.qualify_symbol_sym(node.target_type);
     }
 
     for (mut i: i64 = 0; i < node.methods.length; i++) {
