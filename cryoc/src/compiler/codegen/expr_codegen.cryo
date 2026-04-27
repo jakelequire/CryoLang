@@ -56,9 +56,43 @@ function codegen_literal(cg: CodegenContext*, node: LiteralNode*,
     } else if (kind == LiteralKind::String) {
         *out_value = cg.get_or_create_string_literal(node.value);
     } else if (kind == LiteralKind::Char) {
-        // Char is stored as i32.
+        // Char is stored as i32.  The lexer hands us the raw lexeme between
+        // the surrounding quotes — for `'\n'` that's the two-char string
+        // "\\n" (backslash + n), not the resolved 0x0A.  Decode the standard
+        // C-style escapes here so `'\n' == 10`, `'\0' == 0`, etc.  Without
+        // this, every character-literal escape in cryoc source is wrong
+        // (e.g., `c == '\n'` in skip_whitespace never matches).
         mut char_val: u64 = 0;
-        if (strlen(node.value) > 0) {
+        const len: i64 = strlen(node.value) as i64;
+        if (len >= 2 && node.value[0] == '\\') {
+            const esc: char = node.value[1];
+            if      (esc == 'n')  { char_val = 10; }
+            else if (esc == 't')  { char_val = 9; }
+            else if (esc == 'r')  { char_val = 13; }
+            else if (esc == '0')  { char_val = 0; }
+            else if (esc == '\\') { char_val = 92; }
+            else if (esc == '\'') { char_val = 39; }
+            else if (esc == '"')  { char_val = 34; }
+            else if (esc == 'a')  { char_val = 7; }
+            else if (esc == 'b')  { char_val = 8; }
+            else if (esc == 'f')  { char_val = 12; }
+            else if (esc == 'v')  { char_val = 11; }
+            else if (esc == 'x' && len >= 4) {
+                // `\xHH` — two hex digits
+                mut hi: u64 = 0;
+                const c2: char = node.value[2];
+                if (c2 >= '0' && c2 <= '9') { hi = (c2 - '0') as u64; }
+                else if (c2 >= 'a' && c2 <= 'f') { hi = (c2 - 'a' + 10) as u64; }
+                else if (c2 >= 'A' && c2 <= 'F') { hi = (c2 - 'A' + 10) as u64; }
+                mut lo: u64 = 0;
+                const c3: char = node.value[3];
+                if (c3 >= '0' && c3 <= '9') { lo = (c3 - '0') as u64; }
+                else if (c3 >= 'a' && c3 <= 'f') { lo = (c3 - 'a' + 10) as u64; }
+                else if (c3 >= 'A' && c3 <= 'F') { lo = (c3 - 'A' + 10) as u64; }
+                char_val = hi * 16 + lo;
+            }
+            else { char_val = esc as u64; }
+        } else if (len > 0) {
             char_val = node.value[0] as u64;
         }
         *out_value = LType::const_int(LType::i32(), char_val, false);
