@@ -1162,6 +1162,26 @@ public:
             this.last_is_lvalue = false;
             return;
         }
+        if (op == TokenType::PlusPlus || op == TokenType::MinusMinus) {
+            const addr: LValue = this.codegen_lvalue(node.operand);
+            const ty: LType = this.cg.type_mapper.map_type(node.operand.resolved_type);
+            if (!addr.is_valid() || !ty.is_valid()) {
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
+            const old: LValue = this.cg.builder.build_load(ty, addr, "incdec.old");
+            const one: LValue = LType::const_int(ty, 1, false);
+            const updated: LValue = if (op == TokenType::PlusPlus) {
+                this.cg.builder.build_add(old, one, "inctmp")
+            } else {
+                this.cg.builder.build_sub(old, one, "dectmp")
+            };
+            this.cg.builder.build_store(updated, addr);
+            this.last_value = old;
+            this.last_is_lvalue = false;
+            return;
+        }
         const operand: LValue = this.codegen_rvalue(node.operand);
         mut result: LValue = LValue::null();
         codegen_unary(this.cg, operand, op, node.operand.resolved_type, &result);
@@ -1894,7 +1914,18 @@ public:
         mut args: LValue[] = [];
         if (node.callee.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
-            const obj: LValue = this.codegen_lvalue(ma.object);
+            // For pointer/reference receivers (e.g. `runner: Runner*`),
+            // the receiver value is itself the `this` pointer — load it
+            // out of the local slot.  For value receivers (`runner: Runner`),
+            // take the lvalue address as `this`.
+            const recv_t: Type* = this.cg.lookup_type_by_id(ma.object.resolved_type.id);
+            mut obj: LValue = LValue::null();
+            if (recv_t != null && (recv_t.kind == TypeKind::Pointer
+                                || recv_t.kind == TypeKind::Reference)) {
+                obj = this.codegen_rvalue(ma.object);
+            } else {
+                obj = this.codegen_lvalue(ma.object);
+            }
             args.push(obj);
         }
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
@@ -2160,6 +2191,9 @@ public:
         const len_slot: LValue = this.cg.builder.build_struct_gep(
             fat_ty, fat, 1, "fat.len");
         this.cg.builder.build_store(count_val, len_slot);
+        const cap_slot: LValue = this.cg.builder.build_struct_gep(
+            fat_ty, fat, 2, "fat.cap");
+        this.cg.builder.build_store(count_val, cap_slot);
 
         this.last_value = fat;
         this.last_is_lvalue = true;
@@ -2287,6 +2321,9 @@ public:
             const len_slot: LValue = this.cg.builder.build_struct_gep(
                 fat_ty, fat, 1, "fat.len");
             this.cg.builder.build_store(count_val, len_slot);
+            const cap_slot: LValue = this.cg.builder.build_struct_gep(
+                fat_ty, fat, 2, "fat.cap");
+            this.cg.builder.build_store(count_val, cap_slot);
 
             this.last_value = fat;
             this.last_is_lvalue = true;
