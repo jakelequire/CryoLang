@@ -224,6 +224,18 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             // string + string → call std::core::primitives::string::append.
             // The stdlib already provides this as a method on `string`;
             // every module gets it via cross-module extern declarations.
+            //
+            // append's signature is `(&this, other: string) -> string`.  Per
+            // cryoc's convention, `&this` on a primitive lowers to a pointer
+            // to the storage holding the string (i8**).  The body opens with
+            // `load ptr, ptr %0` to deref it back to the string.  Method-call
+            // codegen passes the receiver's lvalue for value-typed receivers
+            // (see ir_generator.cryo:visit_call_expr); the binary `+` path
+            // arrives here with `lhs_val` already loaded as an rvalue (i8*),
+            // so spill it back to a temp slot and pass that slot's address.
+            // Without this, the callee derefs i8* expecting i8** and reads
+            // the first 8 bytes of string content as a "pointer", crashing
+            // in strlen.
             const intern: InternTable* = cg.get_intern();
             const fn_sym: SymbolStr = intern.intern(
                 "std::core::primitives::string::append");
@@ -233,8 +245,11 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
                 return;
             }
             const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(fn_val.raw) };
+            const this_ty: LType = LType::pointer_to(LType::i8());
+            const this_slot: LValue = cg.builder.build_alloca(this_ty, "strcat.this");
+            cg.builder.build_store(lhs_val, this_slot);
             mut args: LValue[] = [];
-            args.push(lhs_val);
+            args.push(this_slot);
             args.push(rhs_val);
             codegen_call(cg, fn_val, fn_ty, args, "strcat", out_value);
             return;
@@ -605,9 +620,30 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                     const it: LType = LType { raw: expected_ty };
                     arg_val = cg.builder.build_load(it, arg_val, "arg.deref");
                 } else if (ek == 12 && ak == 8) {
-                    // Expected ptr (12), actual integer: inttoptr.
-                    const target: LType = LType { raw: expected_ty };
-                    arg_val = LValue { raw: llvm::LLVMBuildIntToPtr(cg.builder.raw, arg_val.raw, expected_ty, "arg.i2p") };
+                    // Expected ptr (12), actual integer.
+                    //
+                    // For the receiver slot (i==0) this is a primitive method
+                    // on an rvalue — `this.current().kind.is_unary_prefix_op()`
+                    // extracts the `kind` i32 from the returned Token, and the
+                    // method's `&this` parameter wants the address of that i32,
+                    // not the i32 value itself.  Spill to a stack temp and pass
+                    // the slot's address.  Without this, cryoc inttoptr'd the
+                    // raw i32 ordinal and the callee dereferenced it as if it
+                    // were a pointer (`mov (%rdi), %ecx`), reading from
+                    // whatever low-address page the ordinal happens to point
+                    // into and segfaulting.
+                    //
+                    // For non-receiver args we still want the legitimate
+                    // ptrtoint-style cast — keep inttoptr there.
+                    if (i == 0) {
+                        const slot_lty: LType = LType { raw: actual_ty };
+                        const slot: LValue = cg.builder.build_alloca(slot_lty, "recv.slot");
+                        cg.builder.build_store(arg_val, slot);
+                        arg_val = slot;
+                    } else {
+                        const target: LType = LType { raw: expected_ty };
+                        arg_val = LValue { raw: llvm::LLVMBuildIntToPtr(cg.builder.raw, arg_val.raw, expected_ty, "arg.i2p") };
+                    }
                 } else if (ek == 8 && ak == 12) {
                     // Expected integer, actual ptr: ptrtoint.
                     const target: LType = LType { raw: expected_ty };
@@ -1241,6 +1277,30 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
                 mut val: LValue = field_values[i];
                 if (val.is_valid()) {
                     val = coerce_fixed_array_to_fat_ptr(cg, val, st.fields[fidx].field_type);
+                    // Widen/narrow integer literals to the field's declared
+                    // width before storing.  `HashMap { len: 0, cap: 0, ... }`
+                    // arrives with each `0` as `i32 0` (codegen_literal defaults
+                    // integer literals to i32 when sema doesn't propagate the
+                    // expected type) but `len`/`cap`/`deleted` are u64 fields
+                    // — a direct `store i32` writes only the low 4 bytes,
+                    // leaving the high 4 uninitialised.  Mirrors the same fix
+                    // in stmt_codegen.cryo:codegen_local_var so subsequent
+                    // i64 reads through the field don't see stack garbage in
+                    // the upper bits.  LLVMIntegerTypeKind = 8.
+                    const field_llvm_ty: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, fidx as u32);
+                    const val_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
+                    if (field_llvm_ty != null && val_ty_raw != null
+                            && llvm::LLVMGetTypeKind(field_llvm_ty) == 8
+                            && llvm::LLVMGetTypeKind(val_ty_raw) == 8) {
+                        const want_bits: u32 = llvm::LLVMGetIntTypeWidth(field_llvm_ty);
+                        const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
+                        const field_lty: LType = LType { raw: field_llvm_ty };
+                        if (want_bits > got_bits) {
+                            val = cg.builder.build_zext(val, field_lty, "field.widen");
+                        } else if (want_bits < got_bits) {
+                            val = cg.builder.build_trunc(val, field_lty, "field.trunc");
+                        }
+                    }
                 }
                 cg.builder.build_store(val, gep);
             }
