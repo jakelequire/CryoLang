@@ -174,6 +174,7 @@ LLVMValueRef LLVMConstInt(LLVMTypeRef IntTy, unsigned long long N, LLVMBool Sign
 LLVMValueRef LLVMConstReal(LLVMTypeRef RealTy, double N);
 LLVMValueRef LLVMConstNull(LLVMTypeRef Ty);
 LLVMBool LLVMIsNull(LLVMValueRef Val);
+LLVMBool LLVMIsConstant(LLVMValueRef Val);
 LLVMValueRef LLVMConstAllOnes(LLVMTypeRef Ty);
 LLVMValueRef LLVMGetUndef(LLVMTypeRef Ty);
 LLVMValueRef LLVMConstPointerNull(LLVMTypeRef Ty);

@@ -26,6 +26,7 @@ import Compiler::Types::Arena;
 import Compiler::Types::Compound;
 import Compiler::Types::UserDefined;
 import Compiler::Types::Generic;
+import Compiler::Types::Resolver;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Visitor;
@@ -95,6 +96,21 @@ public:
     lookup_type(mut &this, name: SymbolStr) -> TypeRef {
         const ctx_ptr: CompilationContext* = this.cg.ctx;
         return ctx_ptr.decl_index.lookup_type(name);
+    }
+
+    /// Resolve a sizeof/alignof operand TypeAnnotation to a concrete TypeRef
+    /// at codegen time.  Drives the operand through the type_resolver so that
+    /// generic args (e.g., `HashMapEntry<K, V>` after substitution by the
+    /// monomorphizer) are honoured.  Returns invalid if the resolver is
+    /// unavailable or the annotation can't be resolved — callers fall back
+    /// to a name-based lookup.
+    resolve_sizeof_operand_type(mut &this, ann: TypeAnnotation*) -> TypeRef {
+        if (ann == null) { return TypeRef::invalid(); }
+        const ctx_ptr: CompilationContext* = this.cg.ctx;
+        if (ctx_ptr.type_resolver == null) { return TypeRef::invalid(); }
+        mut res_ctx: ResolutionContext = ResolutionContext::new(
+            ctx_ptr.source_file, "");
+        return ctx_ptr.type_resolver.resolve(ann, &res_ctx);
     }
 
     // ========================================================================
@@ -1008,13 +1024,19 @@ public:
             }
         } else if (kind == NodeKind::SizeofExpression) {
             const sz: SizeofExprNode* = expr as SizeofExprNode*;
-            const type_ref: TypeRef = this.lookup_type(sz.type_name);
-            codegen_sizeof(this.cg, type_ref, &this.last_value);
+            mut sz_type_ref: TypeRef = this.resolve_sizeof_operand_type(sz.type_ann);
+            if (!sz_type_ref.is_valid()) {
+                sz_type_ref = this.lookup_type(sz.type_name);
+            }
+            codegen_sizeof(this.cg, sz_type_ref, &this.last_value);
             this.last_is_lvalue = false;
         } else if (kind == NodeKind::AlignofExpression) {
             const al: AlignofExprNode* = expr as AlignofExprNode*;
-            const type_ref: TypeRef = this.lookup_type(al.type_name);
-            codegen_alignof(this.cg, type_ref, &this.last_value);
+            mut al_type_ref: TypeRef = this.resolve_sizeof_operand_type(al.type_ann);
+            if (!al_type_ref.is_valid()) {
+                al_type_ref = this.lookup_type(al.type_name);
+            }
+            codegen_alignof(this.cg, al_type_ref, &this.last_value);
             this.last_is_lvalue = false;
         } else if (kind == NodeKind::StructLiteral) {
             this.visit_struct_literal(expr as StructLiteralNode*);
