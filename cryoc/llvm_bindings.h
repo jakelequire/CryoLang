@@ -71,6 +71,8 @@ int            LLVMGetInstructionOpcode(LLVMValueRef Inst);
 LLVMTypeRef    LLVMGetAllocatedType(LLVMValueRef Alloca);
 LLVMValueRef   LLVMGetOperand(LLVMValueRef Val, unsigned Index);
 int            LLVMGetNumOperands(LLVMValueRef Val);
+LLVMValueRef   LLVMGetFirstInstruction(LLVMBasicBlockRef BB);
+LLVMValueRef   LLVMGetNextInstruction(LLVMValueRef Inst);
 
 
 /* ===================================================================

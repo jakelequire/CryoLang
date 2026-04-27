@@ -82,6 +82,16 @@ type struct CodegenContext {
     // means the current function is not variadic.
     current_variadic_arg_id: u32;
 
+    // -- Stripped-functions set --
+    // Mangled LLVM names of functions whose body was attempted-but-stripped
+    // in this module (`is_function_body_valid` returned false →
+    // `strip_function_body` deleted all blocks).  Used by the post-codegen
+    // cascade-strip pass to identify same-module declare-only callees and
+    // strip their callers too, so an `Array<T>::quicksort` body that calls
+    // a stripped `partition` doesn't emit a dangling extern at link time.
+    // Cross-module externs are NOT in this set, so they're unaffected.
+    stripped_func_names: string[];
+
     /// Create a new codegen context for a module.
     static new(ctx: CompilationContext*, module_name: string) -> CodegenContext {
         const mod: LModule = LModule::create(module_name);
@@ -119,6 +129,7 @@ type struct CodegenContext {
             intern: ctx.intern_table,
 
             current_variadic_arg_id: 0,
+            stripped_func_names: [],
         };
     }
 
@@ -209,9 +220,15 @@ type struct CodegenContext {
 
     /// Strip all basic blocks from a function, reverting it to a declare.
     /// Used when body generation fails — better a clean declare than
-    /// a half-built define that fails LLVM verification.
-    strip_function_body(&this, fn_val: LValue) -> void {
+    /// a half-built define that fails LLVM verification.  Also records the
+    /// function's mangled LLVM name in `stripped_func_names` so the
+    /// post-codegen cascade pass can strip callers in the same module.
+    strip_function_body(mut &this, fn_val: LValue) -> void {
         if (!fn_val.is_valid()) { return; }
+        const fn_name: string = llvm::LLVMGetValueName(fn_val.raw) as string;
+        if (fn_name != null) {
+            this.stripped_func_names.push(fn_name);
+        }
         mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
         while (bb != null) {
             const next: void* = llvm::LLVMGetNextBasicBlock(bb);

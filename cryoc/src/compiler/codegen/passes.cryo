@@ -26,6 +26,87 @@ import Compiler::Resolver::SymbolStr;
 
 
 // ============================================================================
+// Cascade-strip helper
+// ============================================================================
+
+/// Returns true if `name` is in `cg.stripped_func_names`.
+function is_stripped(cg: CodegenContext*, name: string) -> boolean {
+    if (name == null) { return false; }
+    const list: string[] = cg.stripped_func_names;
+    for (mut i: i64 = 0; i < list.length; i++) {
+        if (strcmp(list[i], name) == 0) { return true; }
+    }
+    return false;
+}
+
+/// Walk a function's basic blocks and instructions; if any call instruction
+/// targets a function whose mangled name is in `cg.stripped_func_names`,
+/// return true.  Used by the cascade-strip pass to identify callers of
+/// stripped same-module siblings (e.g. `Array<T>::quicksort` calling a
+/// stripped `Array<T>::partition`).
+function function_calls_stripped(cg: CodegenContext*, fn_val: void*) -> boolean {
+    if (fn_val == null) { return false; }
+    mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val);
+    while (bb != null) {
+        mut inst: void* = llvm::LLVMGetFirstInstruction(bb);
+        while (inst != null) {
+            // LLVMOpcode::Call = 45 in the LLVM-C enum (verify via
+            // `<llvm-c/Core.h>` — same value across LLVM 14-20).  CallBr
+            // (asm goto) is 67 but doesn't appear in cryoc-generated IR.
+            const op: i32 = llvm::LLVMGetInstructionOpcode(inst);
+            if (op == 45) {
+                // Last operand of a call instruction is the called value.
+                const n: i32 = llvm::LLVMGetNumOperands(inst);
+                if (n > 0) {
+                    const callee: void* = llvm::LLVMGetOperand(inst, (n - 1) as u32);
+                    if (callee != null) {
+                        const callee_name: string = llvm::LLVMGetValueName(callee) as string;
+                        if (callee_name != null && is_stripped(cg, callee_name)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            inst = llvm::LLVMGetNextInstruction(inst);
+        }
+        bb = llvm::LLVMGetNextBasicBlock(bb);
+    }
+    return false;
+}
+
+/// Iterate the module's functions until no more cascade-strips happen.
+/// For each function with a body that calls a stripped sibling, strip it
+/// (which adds it to the stripped set, potentially triggering more
+/// strips on its own callers in the next iteration).
+function cascade_strip_dependents(cg: CodegenContext*) -> void {
+    mut iterations: i32 = 0;
+    while (iterations < 16) {
+        mut newly_stripped: i32 = 0;
+        mut fn_val: void* = llvm::LLVMGetFirstFunction(cg.llvm_module.raw);
+        while (fn_val != null) {
+            const next_fn: void* = llvm::LLVMGetNextFunction(fn_val);
+            // Only consider functions WITH a body.
+            const first_bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val);
+            if (first_bb != null) {
+                if (function_calls_stripped(cg, fn_val)) {
+                    // Don't double-strip a name that's already in the set.
+                    const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
+                    if (!is_stripped(cg, fn_name)) {
+                        const wrap: LValue = LValue { raw: fn_val };
+                        cg.strip_function_body(wrap);
+                        newly_stripped = newly_stripped + 1;
+                    }
+                }
+            }
+            fn_val = next_fn;
+        }
+        if (newly_stripped == 0) { break; }
+        iterations = iterations + 1;
+    }
+}
+
+
+// ============================================================================
 // Codegen Pass Implementations
 // ============================================================================
 
@@ -76,11 +157,12 @@ type struct CodegenPasses {
         // from this module — avoids the O(modules × funcs × overloads) bulk
         // pre-declaration loop that used to run here.
 
-        // Emit cryoc's runtime helpers (`format`, etc.) into this module
-        // with linkonce_odr linkage.  Replaces the equivalent definitions
-        // that used to come from cryort.c.  Idempotent and per-module —
-        // the linker collapses the 100+ copies down to one.
+        // Emit cryoc's runtime helpers (`format`, `panic`, etc.) into
+        // this module with linkonce_odr linkage.  Replaces the equivalent
+        // definitions that used to come from cryort.c.  Idempotent and
+        // per-module — the linker collapses the 100+ copies down to one.
         emit_format_runtime(cg);
+        emit_panic_runtime(cg);
 
         // Create the visitor and generate IR.
         printf("[Codegen] Step 12: Creating IRGeneratorVisitor...\n");
@@ -99,6 +181,22 @@ type struct CodegenPasses {
             tm.dispose();
             return PassResult::from_snapshot(ctx.diagnostics, snap);
         }
+
+        // Cascade-strip: a method body that fails codegen (e.g.
+        // `Array<T>::partition` with a non-numeric T whose `T < T` doesn't
+        // lower) gets stripped to a `declare`-only.  But other methods in
+        // the same impl block (e.g. `Array<T>::quicksort` which calls
+        // `partition`, and `Array<T>::sort` which calls `quicksort`)
+        // already emitted their bodies with a call to the now-empty
+        // partition.  At link time, that call is an undefined reference.
+        //
+        // Walk all defined functions; for each that still has a body but
+        // calls a same-module declare (a stripped sibling), strip it too.
+        // Iterate until the strip set stabilizes.  Functions that were
+        // intentionally cross-module externs are unaffected because the
+        // strip set only contains symbols whose body was attempted in
+        // this module.
+        cascade_strip_dependents(cg);
 
         // Pre-verify: scan all functions for corrupt types before calling
         // LLVMVerifyModule (which crashes on null function types).
