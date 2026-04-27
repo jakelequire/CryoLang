@@ -523,13 +523,29 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
             const ak: i32 = llvm::LLVMGetTypeKind(actual_ty);
             if (ek != ak) {
                 if (ek == 12 && ak == 10) {
-                    // Expected ptr (12), actual struct (10): store struct to
-                    // temp alloca and pass its address.  This handles passing
-                    // `this` (struct value) to a function expecting &this (ptr).
-                    const st: LType = LType { raw: actual_ty };
-                    const tmp: LValue = cg.builder.build_alloca(st, "arg.ref");
-                    cg.builder.build_store(arg_val, tmp);
-                    arg_val = tmp;
+                    // Expected ptr (12), actual struct (10): the struct value
+                    // came from `codegen_rvalue` loading through some lvalue.
+                    // If we can recover that pre-load address (`val` is a
+                    // Load whose only operand is the original pointer), use
+                    // it directly — that preserves identity so callees that
+                    // mutate the struct see the caller's memory.  Otherwise
+                    // fall back to a fresh temp alloca + store + addr-of.
+                    // LLVMOpcode::Load = 27.
+                    mut handled: boolean = false;
+                    const opcode: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
+                    if (opcode == 27) {
+                        const ptr_operand: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
+                        if (ptr_operand != null) {
+                            arg_val = LValue { raw: ptr_operand };
+                            handled = true;
+                        }
+                    }
+                    if (!handled) {
+                        const st: LType = LType { raw: actual_ty };
+                        const tmp: LValue = cg.builder.build_alloca(st, "arg.ref");
+                        cg.builder.build_store(arg_val, tmp);
+                        arg_val = tmp;
+                    }
                 } else if (ek == 10 && ak == 12) {
                     // Expected struct by value (10), actual ptr (12): load
                     // the struct from the pointer.  Handles by-value struct
@@ -593,10 +609,25 @@ function codegen_sizeof(cg: CodegenContext*, type_ref: TypeRef,
                         out_value: LValue*) -> void {
     const t: Type* = cg.lookup_type_by_id(type_ref.id);
     if (t != null) {
-        *out_value = LType::const_int(LType::i64(), t.size_bytes(), false);
-    } else {
-        *out_value = LType::const_int(LType::i64(), 0, false);
+        const cryo_size: u64 = t.size_bytes();
+        if (cryo_size > 0) {
+            *out_value = LType::const_int(LType::i64(), cryo_size, false);
+            return;
+        }
+        // size_bytes() returned 0 — typically because TypeLowering hasn't
+        // computed the layout for this Type (common for InstantiatedType
+        // wrappers like `HashMapEntry<K, V>` that route through a resolved
+        // StructType but the wrapper's computed_size never gets propagated).
+        // Fall back to LLVM's authoritative size — `LLVMSizeOf` returns a
+        // ConstantExpr with the data-layout-correct byte count, which is
+        // exactly what `calloc(N, sizeof(T))` needs.
+        const lty: LType = cg.type_mapper.map_type(type_ref);
+        if (lty.is_valid()) {
+            *out_value = LValue { raw: llvm::LLVMSizeOf(lty.raw) };
+            return;
+        }
     }
+    *out_value = LType::const_int(LType::i64(), 0, false);
 }
 
 function codegen_alignof(cg: CodegenContext*, type_ref: TypeRef,
@@ -1107,6 +1138,19 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
 /// Returns i1: true if equal (==) or not equal (!=).
 function codegen_string_compare(cg: CodegenContext*, lhs: LValue, rhs: LValue,
                                  op_kind: TokenType, out_value: LValue*) -> void {
+    // `string == null` / `string != null` must NOT call strcmp — strcmp
+    // dereferences both operands, so passing a null operand is undefined
+    // behaviour (typically a segfault).  Detect the null-literal case and
+    // lower it as a pointer-equality icmp instead.  LLVMIsNull returns 1
+    // for the constant null pointer.
+    const lhs_is_null: i32 = llvm::LLVMIsNull(lhs.raw);
+    const rhs_is_null: i32 = llvm::LLVMIsNull(rhs.raw);
+    if (lhs_is_null != 0 || rhs_is_null != 0) {
+        const pred: i32 = if (op_kind == TokenType::EqualEqual) { 32 } else { 33 };
+        *out_value = cg.builder.build_icmp(pred, lhs, rhs, "strnullcmp");
+        return;
+    }
+
     // Ensure strcmp is declared: i32 strcmp(i8*, i8*)
     const intern: InternTable* = cg.get_intern();
     const strcmp_name: string = "strcmp";

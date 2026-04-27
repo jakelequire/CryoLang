@@ -173,6 +173,7 @@ int            LLVMGetLinkage(LLVMValueRef Global);
 LLVMValueRef LLVMConstInt(LLVMTypeRef IntTy, unsigned long long N, LLVMBool SignExtend);
 LLVMValueRef LLVMConstReal(LLVMTypeRef RealTy, double N);
 LLVMValueRef LLVMConstNull(LLVMTypeRef Ty);
+LLVMBool LLVMIsNull(LLVMValueRef Val);
 LLVMValueRef LLVMConstAllOnes(LLVMTypeRef Ty);
 LLVMValueRef LLVMGetUndef(LLVMTypeRef Ty);
 LLVMValueRef LLVMConstPointerNull(LLVMTypeRef Ty);
