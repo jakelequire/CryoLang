@@ -430,7 +430,29 @@ function codegen_local_var(cg: CodegenContext*, name: SymbolStr,
     const alloca: LValue = cg.create_entry_alloca(current_fn, var_name, llvm_ty);
 
     if (has_init && init_val.is_valid()) {
-        cg.builder.build_store(init_val, alloca);
+        // Coerce integer literals to the variable's declared width before
+        // storing.  `mut i: i64 = 0` arrives with `init_val` as `i32 0`
+        // (codegen_literal defaults integer literals to i32 when sema
+        // doesn't propagate the expected type) and the i64 alloca is
+        // 8 bytes — a direct `store i32` writes only the low 4 bytes,
+        // leaving the high 4 uninitialised.  zext/sext to the alloca
+        // type so the full slot is written; same idea for the trunc
+        // direction (an i64 expression initialising an i32 local).
+        // LLVMIntegerTypeKind = 8.
+        mut store_val: LValue = init_val;
+        const init_ty_raw: void* = llvm::LLVMTypeOf(init_val.raw);
+        if (init_ty_raw != null
+                && llvm::LLVMGetTypeKind(init_ty_raw) == 8
+                && llvm::LLVMGetTypeKind(llvm_ty.raw) == 8) {
+            const want_bits: u32 = llvm::LLVMGetIntTypeWidth(llvm_ty.raw);
+            const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(init_ty_raw);
+            if (want_bits > got_bits) {
+                store_val = cg.builder.build_zext(init_val, llvm_ty, "init.widen");
+            } else if (want_bits < got_bits) {
+                store_val = cg.builder.build_trunc(init_val, llvm_ty, "init.trunc");
+            }
+        }
+        cg.builder.build_store(store_val, alloca);
     }
 
     cg.set_named_value(name, alloca);
