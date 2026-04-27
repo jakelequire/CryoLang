@@ -1079,6 +1079,83 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
 /// Generate IR for a struct literal: allocate, fill fields, return address.
 /// `site_span` is the source span of the struct-literal expression in the
 /// caller; used for diagnostics.
+/// If `val` is a fixed-size LLVM array (`[N x T]`) but `field_type` resolves
+/// to a dynamic array (`T[]` → `{T*, i64, i64}`), promote the fixed array
+/// to a fat pointer: alloca holding the array → malloc'd heap copy →
+/// `{ptr, len=N, cap=N}`.  Otherwise return `val` unchanged.  Mirrors
+/// the C++ bootstrap's behaviour for struct-literal field initialisation
+/// where the source literal `[a, b, c]` resolved to fixed but the field
+/// expects dynamic.
+function coerce_fixed_array_to_fat_ptr(cg: CodegenContext*, val: LValue,
+                                       field_type: TypeRef) -> LValue {
+    if (!val.is_valid()) { return val; }
+    const ft: Type* = cg.lookup_type_by_id(field_type.id);
+    if (ft == null || ft.kind != TypeKind::Array) { return val; }
+    const arr_t: ArrayType* = ft as ArrayType*;
+    if (arr_t.is_fixed()) { return val; }
+
+    const got_ty: void* = llvm::LLVMTypeOf(val.raw);
+    // LLVMArrayTypeKind = 11 (LLVM-C enum, stable across versions).
+    if (llvm::LLVMGetTypeKind(got_ty) != 11) { return val; }
+
+    const elem_count: u32 = llvm::LLVMGetArrayLength(got_ty);
+    const elem_lty: LType = LType { raw: llvm::LLVMGetElementType(got_ty) };
+
+    const elem_t_raw: Type* = cg.lookup_type_by_id(arr_t.element.id);
+    mut elem_size: u64 = 1;
+    if (elem_t_raw != null && elem_t_raw.size_bytes() > 0) {
+        elem_size = elem_t_raw.size_bytes();
+    }
+    const total_bytes: u64 = elem_size * (elem_count as u64);
+    const total_bytes_val: LValue = LType::const_int(LType::i64(), total_bytes, false);
+
+    const current_bb: LBasicBlock = cg.builder.get_insert_block();
+    if (!current_bb.is_valid()) { return val; }
+    const fn_val: LValue = current_bb.get_parent();
+    if (!fn_val.is_valid()) { return val; }
+
+    // Stash the fixed array on the stack so we have a source pointer for memcpy.
+    const src: LValue = cg.create_entry_alloca(fn_val, "arrlit.src", LType { raw: got_ty });
+    cg.builder.build_store(val, src);
+
+    // malloc(N * sizeof(T)) for the fat-pointer's owned buffer.
+    const malloc_fn: LValue = resolve_function(cg, cg.intern_str("malloc"));
+    if (!malloc_fn.is_valid()) { return val; }
+    const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+    mut malloc_args: LValue[] = [];
+    malloc_args.push(total_bytes_val);
+    mut data_ptr: LValue = LValue::null();
+    codegen_call(cg, malloc_fn, malloc_ty, malloc_args, "arrlit.heap", &data_ptr);
+    if (!data_ptr.is_valid()) { return val; }
+
+    llvm::LLVMBuildMemCpy(cg.builder.raw,
+                          data_ptr.raw, 1,
+                          src.raw, 1,
+                          total_bytes_val.raw);
+
+    // Build the fat-pointer struct: { data_ptr, count, count }.
+    const elem_ptr_lty: LType = LType::pointer_to(elem_lty);
+    const i64_ty: LType = LType::i64();
+    const buf: void* = malloc(24);
+    const slots: void** = buf as void**;
+    slots[0] = elem_ptr_lty.raw;
+    slots[1] = i64_ty.raw;
+    slots[2] = i64_ty.raw;
+    const fat_ty: LType = LType::literal_struct(buf, 3, false);
+    free(buf);
+
+    const fat: LValue = cg.create_entry_alloca(fn_val, "arrlit.fat", fat_ty);
+    const ptr_slot: LValue = cg.builder.build_struct_gep(fat_ty, fat, 0, "fat.ptr");
+    cg.builder.build_store(data_ptr, ptr_slot);
+    const len_slot: LValue = cg.builder.build_struct_gep(fat_ty, fat, 1, "fat.len");
+    const count_val: LValue = LType::const_int(LType::i64(), elem_count as u64, false);
+    cg.builder.build_store(count_val, len_slot);
+    const cap_slot: LValue = cg.builder.build_struct_gep(fat_ty, fat, 2, "fat.cap");
+    cg.builder.build_store(count_val, cap_slot);
+
+    return cg.builder.build_load(fat_ty, fat, "arrlit.fat.val");
+}
+
 function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
                                 field_names: SymbolStr[], field_values: LValue[],
                                 out_value: LValue*, out_is_lvalue: boolean*,
@@ -1112,7 +1189,14 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
 
     const alloca: LValue = cg.create_entry_alloca(current_fn, "structlit", ty);
 
-    // Store each field value at its GEP index.
+    // Store each field value at its GEP index.  If a field expects a
+    // dynamic-array fat pointer (`{T*, i64, i64}`) but the value is a
+    // fixed LLVM array (`[N x T]` — happens when the source literal
+    // `[a, b, c]` resolved to a fixed ArrayType but the field is
+    // dynamic), convert by malloc'ing a buffer, memcpy'ing the literal
+    // contents, and packaging into a fat pointer.  Without this, the
+    // store writes only the first few bytes of the field, leaving the
+    // rest uninitialised, and downstream `provisions[k]` reads garbage.
     const t: Type* = cg.lookup_type_by_id(struct_type.id);
     if (t != null && t.kind == TypeKind::Struct) {
         const st: StructType* = t as StructType*;
@@ -1120,7 +1204,11 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
             const fidx: i64 = st.field_index(field_names[i]);
             if (fidx >= 0) {
                 const gep: LValue = cg.builder.build_struct_gep(ty, alloca, fidx as u32, "field");
-                cg.builder.build_store(field_values[i], gep);
+                mut val: LValue = field_values[i];
+                if (val.is_valid()) {
+                    val = coerce_fixed_array_to_fat_ptr(cg, val, st.fields[fidx].field_type);
+                }
+                cg.builder.build_store(val, gep);
             }
         }
     }

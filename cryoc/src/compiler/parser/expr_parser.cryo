@@ -839,21 +839,18 @@ public:
         const type_tok: Token = this.current();
         const type_name: SymbolStr = this.intern_lexeme(type_tok);
         const type_span: SourceSpan = this.span_from_token(type_tok);
-        this.advance();
 
-        // Handle qualified names: sizeof(Foo::Bar)
-        while (this.check(TokenType::ColonColon)) {
-            this.advance();
-            this.advance();  // consume member name
-        }
-
-        // Handle generic type args: sizeof(RcControlBlock<T>)
-        if (this.check(TokenType::LAngle)) {
-            this.parse_generic_args();  // consumes <...> including >> splitting
-        }
+        // Parse the full type expression (with generics, references, etc.)
+        // and stash it on the node so that monomorphization can substitute
+        // generic params and type_resolution can produce a concrete
+        // resolved_type for codegen.  Without this, `sizeof(HashMapEntry<K, V>)`
+        // collapses to bare `HashMapEntry` at codegen and the spec lookup fails.
+        const ann: TypeAnnotation* = this.parse_type_annotation();
 
         this.consume(TokenType::RParen, "')'");
-        return new SizeofExprNode(type_name, type_span, this.span_from(start));
+        const node: SizeofExprNode* = new SizeofExprNode(type_name, type_span, this.span_from(start));
+        if (ann != null) { node.set_type_ann(ann); }
+        return node;
     }
 
     /// Parse alignof(Type) — supports qualified names and generic args.
@@ -863,21 +860,15 @@ public:
         const type_tok: Token = this.current();
         const type_name: SymbolStr = this.intern_lexeme(type_tok);
         const type_span: SourceSpan = this.span_from_token(type_tok);
-        this.advance();
 
-        // Handle qualified names
-        while (this.check(TokenType::ColonColon)) {
-            this.advance();
-            this.advance();
-        }
-
-        // Handle generic type args
-        if (this.check(TokenType::LAngle)) {
-            this.parse_generic_args();
-        }
+        // Parse the full type expression — see parse_sizeof_expression for
+        // why we don't just consume and discard the generic args.
+        const ann: TypeAnnotation* = this.parse_type_annotation();
 
         this.consume(TokenType::RParen, "')'");
-        return new AlignofExprNode(type_name, type_span, this.span_from(start));
+        const node: AlignofExprNode* = new AlignofExprNode(type_name, type_span, this.span_from(start));
+        if (ann != null) { node.set_type_ann(ann); }
+        return node;
     }
 
     /// Parse typeof(expr)

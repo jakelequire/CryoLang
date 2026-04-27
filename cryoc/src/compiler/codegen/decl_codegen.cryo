@@ -970,8 +970,35 @@ function codegen_global_var(cg: CodegenContext*, node: VarDeclNode*) -> void {
 
     const global: LValue = cg.llvm_module.add_global(ty, mangled);
 
-    // Set default initializer (zeroinitializer).
-    const init: LValue = LType::const_null(ty);
+    // Initializer: if the source declaration has a literal initializer
+    // (e.g., `const BUCKET_OCCUPIED: u8 = 1`), emit it as the constant
+    // initializer typed against the global's own type so consumers see
+    // the right value.  LLVM globals require a constant initializer, so
+    // anything more complex than a literal falls back to zeroinitializer
+    // (more involved cases would need a runtime ctor, out of scope here).
+    mut init: LValue = LValue::null();
+    if (node.has_initializer()
+            && node.initializer.kind == NodeKind::Literal) {
+        const lit: LiteralNode* = node.initializer as LiteralNode*;
+        const tk: i32 = llvm::LLVMGetTypeKind(ty.raw);
+        if (lit.literal_kind == LiteralKind::Integer && tk == 8) {
+            const ival: i32 = atoi(lit.value);
+            init = LType::const_int(ty, ival as u64, true);
+        } else if (lit.literal_kind == LiteralKind::Boolean && tk == 8) {
+            const bval: u64 = if (lit.value == "true") { 1 } else { 0 };
+            init = LType::const_int(ty, bval, false);
+        } else if (lit.literal_kind == LiteralKind::Float
+                   && (tk == 2 || tk == 3)) {
+            mut fval: f64 = 0.0;
+            sscanf(lit.value, "%lf", &fval);
+            init = LType::const_real(ty, fval);
+        } else if (lit.literal_kind == LiteralKind::Null && tk == 12) {
+            init = LType::const_pointer_null(ty);
+        }
+    }
+    if (!init.is_valid()) {
+        init = LType::const_null(ty);
+    }
     global.set_initializer(init);
 
     if (!node.is_mutable) {
