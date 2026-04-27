@@ -292,6 +292,16 @@ public:
             return;
         }
 
+        // Constructor with base-class delegation (`Parser(...) : ExprParser(...)`):
+        // emit the base-class constructor call before the body so the inherited
+        // fields (e.g. ParserBase's `tokens`/`pos`) are properly initialised.
+        // Without this, every derived-class constructor returns immediately
+        // after storing its params into locals, and downstream uses of inherited
+        // fields read garbage.
+        if (node.is_constructor && node.has_base_ctor()) {
+            this.emit_base_ctor_call(node, fn_val);
+        }
+
         printf("[IRGen]       method body block...\n"); fflush(null);
         this.generate_block(func.body);
         printf("[IRGen]       method body done, epilogue...\n"); fflush(null);
@@ -300,6 +310,66 @@ public:
         if (!this.cg.is_function_body_valid(fn_val)) {
             this.cg.strip_function_body(fn_val);
         }
+    }
+
+    /// Emit the immediate base-class constructor call for a derived-class
+    /// constructor with `: BaseClass(args)` initialisation.  `this` (the LLVM
+    /// param 0 of the enclosing constructor) is passed as the receiver, and
+    /// `node.base_ctor_args` are codegen'd as rvalues for the remaining args.
+    emit_base_ctor_call(mut &this, node: MethodNode*, fn_val: LValue) -> void {
+        const intern: InternTable* = this.cg.get_intern();
+        const di: DeclarationIndex* = this.cg.get_decl_index();
+        const ctx_ptr: CompilationContext* = this.cg.ctx;
+
+        // Resolve the base class name (e.g. bare "ExprParser") to its
+        // qualified form so we can build the constructor's mangled lookup
+        // key (`QualifiedBase::BareBase`).
+        mut base_qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.base_ctor_name);
+        mut base_type: TypeRef = di.lookup_type(base_qualified);
+        if (base_type.is_invalid()) {
+            base_qualified = di.resolve_qualified(node.base_ctor_name);
+            base_type = di.lookup_type(base_qualified);
+        }
+        if (base_type.is_invalid()) {
+            base_qualified = node.base_ctor_name;
+            base_type = di.lookup_type(base_qualified);
+        }
+        if (base_type.is_invalid()) { return; }
+
+        const base_qualified_str: string = intern.resolve(base_qualified);
+        const base_bare_str: string = intern.resolve(node.base_ctor_name);
+        const ctor_combined: string = format("%s::%s", base_qualified_str, base_bare_str);
+        const ctor_sym: SymbolStr = intern.intern(ctor_combined);
+
+        // Constructor LLVM arity = user args + 1 for the implicit `this`.
+        const ctor_arity: u32 = (node.base_ctor_args.length + 1) as u32;
+        mut ctor_fn: LValue = resolve_function_with_arity(this.cg, ctor_sym, ctor_arity);
+        if (!ctor_fn.is_valid()) {
+            ctor_fn = resolve_function(this.cg, ctor_sym);
+        }
+        if (!ctor_fn.is_valid()) { return; }
+
+        const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
+        if (!ctor_ty.is_valid()) { return; }
+
+        // `this` is LLVM param 0 of the enclosing constructor.
+        const this_arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
+
+        mut ctor_args: LValue[] = [];
+        ctor_args.push(this_arg);
+        mut any_arg_invalid: boolean = false;
+        for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
+            const arg: LValue = this.codegen_rvalue(node.base_ctor_args[i]);
+            if (!arg.is_valid()) {
+                any_arg_invalid = true;
+                break;
+            }
+            ctor_args.push(arg);
+        }
+        if (any_arg_invalid) { return; }
+
+        mut ctor_result: LValue = LValue::null();
+        codegen_call(this.cg, ctor_fn, ctor_ty, ctor_args, "", &ctor_result);
     }
 
     /// Generate a block of statements directly (no virtual dispatch).
