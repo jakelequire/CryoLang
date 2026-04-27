@@ -738,6 +738,65 @@ function get_or_decl_va_end(cg: CodegenContext*) -> LValue {
     return cg.llvm_module.add_function("llvm.va_end.p0", fty);
 }
 
+/// Declare libc `abort` extern: `void abort(void) __attribute__((noreturn))`.
+function get_or_decl_abort(cg: CodegenContext*) -> LValue {
+    mut fn: LValue = cg.llvm_module.get_named_function("abort");
+    if (fn.is_valid()) { return fn; }
+    const fty: LType = LType::function_type(LType::void_type(), null, 0, false);
+    return cg.llvm_module.add_function("abort", fty);
+}
+
+/// Emit the `@panic(msg, file, line)` runtime function into the current
+/// module if it hasn't been emitted yet.  Idempotent.  Backs the bare
+/// `intrinsics::panic` calls emitted by `std::prelude::panic` and the
+/// `Option::unwrap`/`Result::unwrap` family — those produce a direct
+/// `call @panic(...)` with no body; without this, the linker fails on
+/// `undefined reference to 'panic'`.
+///
+/// The body just calls libc `abort()` and emits `unreachable`; on a
+/// future iteration we can route through `fprintf(stderr, ...)` to print
+/// the message, but that requires extra externs.
+function emit_panic_runtime(cg: CodegenContext*) -> void {
+    mut panic_fn: LValue = cg.llvm_module.get_named_function("panic");
+    if (panic_fn.is_valid()) {
+        const first_bb: void* = llvm::LLVMGetFirstBasicBlock(panic_fn.raw);
+        if (first_bb != null) { return; }
+    }
+
+    // Declare panic as `(ptr msg, ptr file, i32 line) -> void` if not
+    // already present.
+    const ptr_ty: LType = LType::pointer_to(LType::i8());
+    if (!panic_fn.is_valid()) {
+        const param_buf: void* = malloc(24);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ptr_ty.raw;
+        param_slots[1] = ptr_ty.raw;
+        param_slots[2] = LType::i32().raw;
+        const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
+        free(param_buf);
+        panic_fn = cg.llvm_module.add_function("panic", fty);
+    }
+    if (!panic_fn.is_valid()) { return; }
+
+    // linkonce_odr — every module gets a copy; linker collapses them.
+    panic_fn.set_linkage(3);
+
+    const saved_bb: LBasicBlock = cg.builder.get_insert_block();
+    const entry_bb: LBasicBlock = LBasicBlock::append(panic_fn, "entry");
+    cg.builder.position_at_end(entry_bb);
+
+    const abort_fn: LValue = get_or_decl_abort(cg);
+    const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
+    mut a_args: LValue[] = [];
+    mut a_res: LValue = LValue::null();
+    codegen_call(cg, abort_fn, abort_ty, a_args, "", &a_res);
+    cg.builder.build_unreachable();
+
+    if (saved_bb.is_valid()) {
+        cg.builder.position_at_end(saved_bb);
+    }
+}
+
 /// Emit the `@format` runtime function into the current module if it
 /// hasn't been emitted yet.  Idempotent.  Called once per module before
 /// user IR-gen; the linkonce_odr linkage means the linker collapses all

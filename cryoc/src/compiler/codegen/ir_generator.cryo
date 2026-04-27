@@ -1443,16 +1443,61 @@ public:
             // (e.g., "Compiler::Codegen::LLVMTypes::LValue") via the DI mapping.
             const resolved_scope: SymbolStr = di.resolve_qualified(sr.scope_name);
             const scope_str: string = intern.resolve(resolved_scope);
+            const sr_arity: u32 = node.arguments.length as u32;
+
+            // Spec-first: when `node.resolved_type` is a generic instantiation,
+            // the call resolves to the spec'd method (e.g.
+            // `Map<string, Argument>::new`), not the bare template (`Map::new`).
+            // The bare template is also registered in the DI when the source
+            // contains `type struct Map<K,V> { static new() ... }` — the inner
+            // `Map` return type resolves to the bare struct, and a bare-mangled
+            // declaration ends up in the function table.  Without trying the
+            // spec name first, the bare-name lookup at the next step finds
+            // that template and emits a call to a symbol nobody defines.
+            mut conc_ref0: TypeRef = node.resolved_type;
+            mut conc_t0: Type* = this.cg.lookup_type_by_id(conc_ref0.id);
+            mut fc0: i32 = 0;
+            while (conc_t0 != null && conc_t0.kind == TypeKind::InstantiatedType && fc0 < 5) {
+                const ci0: InstantiatedType* = conc_t0 as InstantiatedType*;
+                if (ci0.has_resolved_type()) {
+                    conc_ref0 = ci0.resolved_type;
+                    conc_t0 = this.cg.lookup_type_by_id(conc_ref0.id);
+                } else { break; }
+                fc0 = fc0 + 1;
+            }
+            if (conc_t0 != null) {
+                mut conc_name0: string = "";
+                if (conc_t0.kind == TypeKind::Struct) {
+                    const cst0: StructType* = conc_t0 as StructType*;
+                    conc_name0 = intern.resolve(cst0.qualified_name);
+                } else if (conc_t0.kind == TypeKind::Class) {
+                    const cct0: ClassType* = conc_t0 as ClassType*;
+                    conc_name0 = intern.resolve(cct0.qualified_name);
+                } else if (conc_t0.kind == TypeKind::Enum) {
+                    const cet0: EnumType* = conc_t0 as EnumType*;
+                    conc_name0 = intern.resolve(cet0.qualified_name);
+                }
+                if (strlen(conc_name0) > 0) {
+                    const member_str0: string = intern.resolve(sr.member_name);
+                    const conc_combined0: string = format("%s::%s", conc_name0, member_str0);
+                    const conc_sym0: SymbolStr = intern.intern(conc_combined0);
+                    callee_val = resolve_function_with_arity(this.cg, conc_sym0, sr_arity);
+                    if (!callee_val.is_valid()) {
+                        callee_val = resolve_function(this.cg, conc_sym0);
+                    }
+                }
+            }
 
             const combined: string = format("%s::%s", scope_str, intern.resolve(sr.member_name));
             const sym: SymbolStr = intern.intern(combined);
             // ScopeResolution calls are static — no receiver, so the LLVM
             // arity equals the user-arg count.  Try arity-specific lookup
             // first so `Array::new()` and `Array::new(u64)` stay distinct.
-            const sr_arity: u32 = node.arguments.length as u32;
-            callee_val = resolve_function_with_arity(this.cg, sym, sr_arity);
             if (!callee_val.is_valid()) {
-                callee_val = resolve_function(this.cg, sym);
+                callee_val = resolve_function_with_arity(this.cg, sym, sr_arity);
+                if (!callee_val.is_valid()) {
+                    callee_val = resolve_function(this.cg, sym);
+                }
             }
 
             // Fallback 1: try the bare member name.  Extern "C" functions
@@ -1467,47 +1512,6 @@ public:
                     this.cg, sr.member_name, sr_arity);
                 if (!callee_val.is_valid()) {
                     callee_val = resolve_function(this.cg, sr.member_name);
-                }
-            }
-
-            // Fallback 2: use node.resolved_type to find the concrete
-            // monomorphized type name.  For generic constructors like
-            // HashMap::new(), the scope "HashMap" is the template name
-            // but the function is registered as "HashMap_K_V::new".
-            if (!callee_val.is_valid()) {
-                mut conc_ref: TypeRef = node.resolved_type;
-                mut conc_t: Type* = this.cg.lookup_type_by_id(conc_ref.id);
-                mut fc: i32 = 0;
-                while (conc_t != null && conc_t.kind == TypeKind::InstantiatedType && fc < 5) {
-                    const ci: InstantiatedType* = conc_t as InstantiatedType*;
-                    if (ci.has_resolved_type()) {
-                        conc_ref = ci.resolved_type;
-                        conc_t = this.cg.lookup_type_by_id(conc_ref.id);
-                    } else { break; }
-                    fc = fc + 1;
-                }
-                if (conc_t != null) {
-                    mut conc_name: string = "";
-                    if (conc_t.kind == TypeKind::Struct) {
-                        const cst: StructType* = conc_t as StructType*;
-                        conc_name = intern.resolve(cst.qualified_name);
-                    } else if (conc_t.kind == TypeKind::Class) {
-                        const cct: ClassType* = conc_t as ClassType*;
-                        conc_name = intern.resolve(cct.qualified_name);
-                    } else if (conc_t.kind == TypeKind::Enum) {
-                        const cet: EnumType* = conc_t as EnumType*;
-                        conc_name = intern.resolve(cet.qualified_name);
-                    }
-                    if (strlen(conc_name) > 0) {
-                        const member_str: string = intern.resolve(sr.member_name);
-                        const conc_combined: string = format("%s::%s", conc_name, member_str);
-                        const conc_sym: SymbolStr = intern.intern(conc_combined);
-                        const conc_arity: u32 = node.arguments.length as u32;
-                        callee_val = resolve_function_with_arity(this.cg, conc_sym, conc_arity);
-                        if (!callee_val.is_valid()) {
-                            callee_val = resolve_function(this.cg, conc_sym);
-                        }
-                    }
                 }
             }
 
@@ -1953,6 +1957,39 @@ public:
         const call_name: string = if (is_void) { "" } else { "calltmp" };
         mut result: LValue = LValue::null();
         codegen_call(this.cg, callee_val, fn_ty, args, call_name, &result);
+
+        // Emit `unreachable` after calls to divergent functions.  Two
+        // cases handled here:
+        //   1. The callee's resolved return type is `never` — works for
+        //      future `-> never` annotations once the bootstrap can grok
+        //      them.
+        //   2. The callee's LLVM name matches a known divergent function
+        //      from the stdlib runtime (`panic` intrinsic; `prelude::panic`
+        //      wrapper).  These are declared `-> void` in the source for
+        //      bootstrap compatibility but semantically diverge.
+        // Without this, calls in a non-void-returning context (e.g. the
+        // `None` arm of `Option<T>::unwrap`) leave the block without a
+        // terminator and the body-validator strips the entire function.
+        mut should_unreachable: boolean = false;
+        if (node.resolved_type.is_valid()) {
+            const _ret_t: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+            if (_ret_t != null && _ret_t.kind == TypeKind::Never) {
+                should_unreachable = true;
+            }
+        }
+        if (!should_unreachable && callee_val.is_valid()) {
+            const _cn: string = llvm::LLVMGetValueName(callee_val.raw) as string;
+            if (_cn != null) {
+                if (strcmp(_cn, "panic") == 0) { should_unreachable = true; }
+                else if (strcmp(_cn, "C$3std.7prelude.5panic$FS_S_j$Rv") == 0) {
+                    should_unreachable = true;
+                }
+            }
+        }
+        if (should_unreachable) {
+            this.cg.builder.build_unreachable();
+        }
+
         this.last_value = result;
         this.last_is_lvalue = false;
     }
@@ -2547,6 +2584,19 @@ public:
 
             const arm_end: LBasicBlock = this.cg.builder.get_insert_block();
             const arm_terminated: boolean = arm_end.is_valid() && arm_end.has_terminator();
+
+            // Coerce the arm value to the phi's result type BEFORE emitting
+            // the branch.  `coerce_to_phi_type` may insert a `zext`/`sext`/
+            // `inttoptr` at the builder's current position; if we br first,
+            // those coercion instructions land AFTER the terminator, which
+            // (a) makes the block end with a non-terminator instruction so
+            // `LLVMGetBasicBlockTerminator` returns null, (b) gets the body
+            // stripped by `is_function_body_valid`.  Coerce-then-branch
+            // keeps the order valid.
+            mut coerced_val: LValue = LValue::null();
+            if (!arm_terminated && arm_end.is_valid() && arm_val.is_valid()) {
+                coerced_val = coerce_to_phi_type(this.cg, arm_val, result_ty);
+            }
             if (!arm_terminated && arm_end.is_valid()) {
                 this.cg.builder.build_br(merge_bb);
             }
@@ -2554,14 +2604,8 @@ public:
             // Only add to phi for arms that branch to merge (not terminated
             // by return/break). Every predecessor of merge_bb needs a phi entry.
             if (!arm_terminated && arm_end.is_valid()) {
-                if (arm_val.is_valid()) {
-                    // LLVM requires all phi operands to have the phi's result
-                    // type.  Arms often produce narrower (or otherwise convertible)
-                    // values than the declared match type — e.g. a `Result<i32,_>`
-                    // payload bound to `fd` in one arm vs a widened integer in
-                    // another.  Widen/narrow/inttoptr as needed before adding.
-                    phi_vals_arr[phi_count] = coerce_to_phi_type(
-                        this.cg, arm_val, result_ty).raw;
+                if (coerced_val.is_valid()) {
+                    phi_vals_arr[phi_count] = coerced_val.raw;
                 } else if (result_ty.is_valid()) {
                     // Arm produced no value — use undef as placeholder.
                     phi_vals_arr[phi_count] = llvm::LLVMGetUndef(result_ty.raw);
@@ -2825,6 +2869,24 @@ public:
         const rhs: LValue = this.codegen_rvalue(node.right);
         const rhs_end_bb: LBasicBlock = this.cg.builder.get_insert_block();
         branch_if_not_terminated(this.cg, merge_bb);
+
+        // If either operand failed to lower (e.g. `entry.key == key` where K
+        // is a struct that doesn't support `==`, or any expression that
+        // codegen_rvalue couldn't reduce to a value), don't synthesize a
+        // phi with a null incoming — that produces invalid IR that LLVM
+        // verification rejects. Leave merge_bb unterminated and signal
+        // failure so the caller's downstream codegen also bails, which
+        // ultimately leaves the function body unterminated and triggers
+        // `is_function_body_valid` to strip the whole body. That's the
+        // pre-existing "give up cleanly on lowering errors" path; before
+        // this guard the SC branch was the one place that emitted broken
+        // IR instead of bailing.
+        if (!lhs.is_valid() || !rhs.is_valid()) {
+            this.cg.builder.position_at_end(merge_bb);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
 
         // Merge with phi.
         this.cg.builder.position_at_end(merge_bb);

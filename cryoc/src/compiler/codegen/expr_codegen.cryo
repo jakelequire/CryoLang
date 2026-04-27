@@ -256,11 +256,14 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
         return;
     }
 
-    // Bail out if the result type is not a numeric or pointer type.
-    // Operating on void/error/unresolved types crashes LLVM.
+    // Bail out if the operand type is not numeric, pointer, or function.
+    // Operating on void/error/unresolved types crashes LLVM.  Function
+    // types are included so that `fn_ptr != null` and `fn_ptr == fn_ptr`
+    // checks reach the icmp path below — both lower to LLVM `ptr`, so the
+    // existing pointer-comparison logic works unchanged.
     if (t_kind != TypeKind::Int && t_kind != TypeKind::Float &&
         t_kind != TypeKind::Bool && t_kind != TypeKind::Pointer &&
-        t_kind != TypeKind::Char) {
+        t_kind != TypeKind::Char && t_kind != TypeKind::Function) {
         *out_value = LValue::null();
         return;
     }
@@ -793,6 +796,21 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
                                                 obj_ptr, "autoderef");
             }
         }
+    }
+
+    // The pointee of a Pointer/Reference may itself be an InstantiatedType
+    // (e.g. `HashMapEntry<u32, i64>` sitting in the arena as the pointee of a
+    // `HashMapEntry<u32, i64>*`). Mirror the pre-Pointer unwrap above so the
+    // kind dispatch below sees the concrete Struct/Class/Array; without this,
+    // field_idx stays -1, the access silently emits no IR, and the
+    // half-emitted basic block gets stripped by `is_function_body_valid`.
+    mut inst_depth2: i32 = 0;
+    while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth2 < 5) {
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        if (!inst.has_resolved_type()) { break; }
+        obj_type = inst.resolved_type;
+        t = cg.lookup_type_by_id(obj_type.id);
+        inst_depth2 = inst_depth2 + 1;
     }
 
     if (t == null) {
