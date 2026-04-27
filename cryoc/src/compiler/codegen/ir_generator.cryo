@@ -893,6 +893,24 @@ public:
                     return this.last_value;
                 }
             }
+            // Same special case for `*string`: lex_token does
+            // `mut c: char = *this.current as char` to read one ASCII byte.
+            // The generic load reads `map_type(char) = i32` (4 bytes), which
+            // is wrong for an i8-sized backing store.  Emit i8-load + zext-to-i32.
+            if (expr.kind == NodeKind::UnaryExpression) {
+                const ue: UnaryExprNode* = expr as UnaryExprNode*;
+                if (ue.op.kind == TokenType::Star) {
+                    const op_t: Type* = this.cg.lookup_type_by_id(ue.operand.resolved_type.id);
+                    if (op_t != null && op_t.kind == TypeKind::String) {
+                        const byte: LValue = this.cg.builder.build_load(
+                            LType::i8(), this.last_value, "strbyte");
+                        this.last_value = this.cg.builder.build_zext(
+                            byte, LType::i32(), "char");
+                        this.last_is_lvalue = false;
+                        return this.last_value;
+                    }
+                }
+            }
             // Variadic bucket: `args` in a variadic function body is
             // bound to a `[24 x i8]` va_list alloca.  When referenced
             // as an rvalue (e.g., forwarded to `vformat(fmt, args)`),
