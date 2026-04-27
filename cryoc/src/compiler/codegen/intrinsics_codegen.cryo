@@ -654,6 +654,7 @@ function emit_dirent_name(cg: CodegenContext*, entry: LValue) -> LValue {
 
 function emit_dirent_type(cg: CodegenContext*, entry: LValue) -> LValue {
     const i8_ty: LType = LType::i8();
+    const i32_ty: LType = LType::i32();
     const ptr_ty: LType = LType::pointer_to(i8_ty);
     // GEP entry, +18 → ptr to d_type (i8)
     const off: LValue = LType::const_int(LType::i64(), 18, false);
@@ -663,12 +664,66 @@ function emit_dirent_type(cg: CodegenContext*, entry: LValue) -> LValue {
     const type_ptr: LValue = cg.builder.build_gep(i8_ty, entry, idx_buf, 1, "d_type.ptr");
     free(idx_buf);
     const type_byte: LValue = cg.builder.build_load(i8_ty, type_ptr, "d_type.byte");
-    const widened: LValue = cg.builder.build_zext(type_byte, LType::i32(), "d_type.i32");
-    // Null guard: return 0 if entry is null.
-    const zero: LValue = LType::const_int(LType::i32(), 0, false);
+    const widened: LValue = cg.builder.build_zext(type_byte, i32_ty, "d_type.i32");
+
+    // Map POSIX DT_* values to FileType enum ordinals.  The intrinsic
+    // contract (see stdlib/fs/dir.cryo and stdlib/core/intrinsics.cryo:
+    // "returns i32 mapped to FileType ordinals") expects ordinals, not
+    // raw d_type bytes.  The C++ bootstrap performs this mapping in
+    // src/Codegen/Intrinsics.cpp:generate_dirent_type; cryoc previously
+    // returned the raw byte, so callers like module_loader.cryo's
+    // `if (dtype == 1)` (directory) and `else if (dtype == 0)` (file)
+    // never matched anything (Linux returns DT_DIR=4 / DT_REG=8) and
+    // every .cryo entry was silently skipped during pre-scan.
+    //
+    //   DT_REG(8)   → FileType::File(0)
+    //   DT_DIR(4)   → FileType::Directory(1)
+    //   DT_LNK(10)  → FileType::Symlink(2)
+    //   DT_BLK(6)   → FileType::BlockDevice(3)
+    //   DT_CHR(2)   → FileType::CharDevice(4)
+    //   DT_FIFO(1)  → FileType::Fifo(5)
+    //   DT_SOCK(12) → FileType::Socket(6)
+    //   otherwise   → FileType::Unknown(7)
+    const c_dt_fifo: LValue = LType::const_int(i32_ty, 1,  false);
+    const c_dt_chr:  LValue = LType::const_int(i32_ty, 2,  false);
+    const c_dt_dir:  LValue = LType::const_int(i32_ty, 4,  false);
+    const c_dt_blk:  LValue = LType::const_int(i32_ty, 6,  false);
+    const c_dt_reg:  LValue = LType::const_int(i32_ty, 8,  false);
+    const c_dt_lnk:  LValue = LType::const_int(i32_ty, 10, false);
+    const c_dt_sock: LValue = LType::const_int(i32_ty, 12, false);
+
+    const ft_file:    LValue = LType::const_int(i32_ty, 0, false);
+    const ft_dir:     LValue = LType::const_int(i32_ty, 1, false);
+    const ft_symlink: LValue = LType::const_int(i32_ty, 2, false);
+    const ft_block:   LValue = LType::const_int(i32_ty, 3, false);
+    const ft_char:    LValue = LType::const_int(i32_ty, 4, false);
+    const ft_fifo:    LValue = LType::const_int(i32_ty, 5, false);
+    const ft_socket:  LValue = LType::const_int(i32_ty, 6, false);
+    const ft_unknown: LValue = LType::const_int(i32_ty, 7, false);
+
+    // Chain of selects, defaulting to Unknown.  LLVMIntPredicate::IntEQ = 32.
+    mut mapped: LValue = ft_unknown;
+    const is_sock: LValue = cg.builder.build_icmp(32, widened, c_dt_sock, "is_sock");
+    mapped = cg.builder.build_select(is_sock, ft_socket,  mapped, "ft.sock");
+    const is_lnk:  LValue = cg.builder.build_icmp(32, widened, c_dt_lnk,  "is_lnk");
+    mapped = cg.builder.build_select(is_lnk,  ft_symlink, mapped, "ft.lnk");
+    const is_reg:  LValue = cg.builder.build_icmp(32, widened, c_dt_reg,  "is_reg");
+    mapped = cg.builder.build_select(is_reg,  ft_file,    mapped, "ft.reg");
+    const is_blk:  LValue = cg.builder.build_icmp(32, widened, c_dt_blk,  "is_blk");
+    mapped = cg.builder.build_select(is_blk,  ft_block,   mapped, "ft.blk");
+    const is_dir:  LValue = cg.builder.build_icmp(32, widened, c_dt_dir,  "is_dir");
+    mapped = cg.builder.build_select(is_dir,  ft_dir,     mapped, "ft.dir");
+    const is_chr:  LValue = cg.builder.build_icmp(32, widened, c_dt_chr,  "is_chr");
+    mapped = cg.builder.build_select(is_chr,  ft_char,    mapped, "ft.chr");
+    const is_fifo: LValue = cg.builder.build_icmp(32, widened, c_dt_fifo, "is_fifo");
+    mapped = cg.builder.build_select(is_fifo, ft_fifo,    mapped, "ft.fifo");
+
+    // Null guard: return File(0) if entry is null (matches the prior
+    // behaviour where the null check yielded 0).
+    const zero: LValue = LType::const_int(i32_ty, 0, false);
     const is_null: LValue = cg.builder.build_icmp(
         32, entry, LType::const_pointer_null(ptr_ty), "d_type.is_null");
-    return cg.builder.build_select(is_null, zero, widened, "d_type.sel");
+    return cg.builder.build_select(is_null, zero, mapped, "d_type.sel");
 }
 
 

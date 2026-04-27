@@ -359,10 +359,51 @@ public:
         ctor_args.push(this_arg);
         mut any_arg_invalid: boolean = false;
         for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
-            const arg: LValue = this.codegen_rvalue(node.base_ctor_args[i]);
+            mut arg: LValue = this.codegen_rvalue(node.base_ctor_args[i]);
             if (!arg.is_valid()) {
                 any_arg_invalid = true;
                 break;
+            }
+            // codegen_rvalue's load step short-circuits when the arg's
+            // `resolved_type` doesn't map to a valid LType — base ctor
+            // args from `Parser(...) : ExprParser(tokens, source_file, ctx)`
+            // are AST identifiers wired up by the parser before sema fully
+            // resolves them, so we sometimes get the alloca address back
+            // instead of the loaded value.  With opaque pointers the
+            // mismatch is invisible to LLVM (`ptr` either way), and the
+            // chain Parser → ExprParser → ParserBase ends up storing the
+            // OUTER constructor's local-`%ctx` alloca address into
+            // `this.ctx`, leaving the parser's `ctx` field pointing at
+            // dead stack frame data the moment from_context returns.
+            //
+            // codegen_rvalue's load step short-circuits when the arg's
+            // `resolved_type` doesn't map to a valid LType — base ctor
+            // args from `Parser(...) : ExprParser(tokens, source_file, ctx)`
+            // are AST identifiers wired up by the parser before sema fully
+            // resolves them, so we sometimes get the alloca address back
+            // instead of the loaded value.  codegen_rvalue clears
+            // last_is_lvalue unconditionally before returning, so we
+            // can't use that flag — check the value's opcode directly.
+            // If `arg.raw` is still an alloca instruction (opcode 26),
+            // codegen_rvalue skipped its load and we need to deref here
+            // before passing to the base ctor.  Restrict to pointer /
+            // integer / float allocas; aggregate (struct) allocas get
+            // the load via codegen_call's ek=10/ak=12 coercion, so
+            // pre-loading would double-deref.
+            const opcode: i32 = llvm::LLVMGetInstructionOpcode(arg.raw);
+            if (opcode == 26) {
+                const alloc_ty: void* = llvm::LLVMGetAllocatedType(arg.raw);
+                if (alloc_ty != null) {
+                    const alloc_kind: i32 = llvm::LLVMGetTypeKind(alloc_ty);
+                    // 12 = LLVMPointerTypeKind, 8 = LLVMIntegerTypeKind,
+                    // 2 = LLVMFloatTypeKind, 3 = LLVMDoubleTypeKind
+                    if (alloc_kind == 12 || alloc_kind == 8
+                            || alloc_kind == 2 || alloc_kind == 3) {
+                        const alloc_lty: LType = LType { raw: alloc_ty };
+                        arg = this.cg.builder.build_load(
+                            alloc_lty, arg, "base.arg.load");
+                    }
+                }
             }
             ctor_args.push(arg);
         }
@@ -1185,13 +1226,31 @@ public:
             // String-index special case: the lvalue is an i8* but the
             // char rvalue is i32 — truncate before storing.  Mirrors
             // the load-and-zext path on the read side.
+            //
+            // The same applies to `*(buf + wi) = c` (UnaryExpr Star deref
+            // of a string).  Without this branch the store emits a 4-byte
+            // i32 write into a 1-byte i8 slot, smashing the next 3 bytes
+            // — which is exactly what the lexer's process_escape_sequences
+            // hits when it walks past the end of its malloc'd buffer.
             mut store_val: LValue = val;
+            mut needs_chartrunc: boolean = false;
             if (node.left.kind == NodeKind::ArrayAccess) {
                 const aa: ArrayAccessNode* = node.left as ArrayAccessNode*;
                 const arr_t: Type* = this.cg.lookup_type_by_id(aa.array.resolved_type.id);
                 if (arr_t != null && arr_t.kind == TypeKind::String) {
-                    store_val = this.cg.builder.build_trunc(val, LType::i8(), "chartrunc");
+                    needs_chartrunc = true;
                 }
+            } else if (node.left.kind == NodeKind::UnaryExpression) {
+                const ue: UnaryExprNode* = node.left as UnaryExprNode*;
+                if (ue.op.kind == TokenType::Star) {
+                    const op_t: Type* = this.cg.lookup_type_by_id(ue.operand.resolved_type.id);
+                    if (op_t != null && op_t.kind == TypeKind::String) {
+                        needs_chartrunc = true;
+                    }
+                }
+            }
+            if (needs_chartrunc) {
+                store_val = this.cg.builder.build_trunc(val, LType::i8(), "chartrunc");
             }
             this.cg.builder.build_store(store_val, addr);
             this.last_value = val;
