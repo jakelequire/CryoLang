@@ -447,7 +447,20 @@ function codegen_local_var(cg: CodegenContext*, name: SymbolStr,
             const want_bits: u32 = llvm::LLVMGetIntTypeWidth(llvm_ty.raw);
             const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(init_ty_raw);
             if (want_bits > got_bits) {
-                store_val = cg.builder.build_zext(init_val, llvm_ty, "init.widen");
+                // Widen with the variable's signedness — `mut x: i64 = -1`
+                // would otherwise zext the i32 -1 into 0xFFFFFFFF (a huge
+                // positive i64) instead of -1.
+                mut signed_target: boolean = false;
+                const ty_t: Type* = cg.lookup_type_by_id(ty.id);
+                if (ty_t != null && ty_t.kind == TypeKind::Int) {
+                    const ti: IntType* = ty_t as IntType*;
+                    signed_target = ti.int_kind.is_signed();
+                }
+                if (signed_target) {
+                    store_val = cg.builder.build_sext(init_val, llvm_ty, "init.widen");
+                } else {
+                    store_val = cg.builder.build_zext(init_val, llvm_ty, "init.widen");
+                }
             } else if (want_bits < got_bits) {
                 store_val = cg.builder.build_trunc(init_val, llvm_ty, "init.trunc");
             }
