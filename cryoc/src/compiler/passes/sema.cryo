@@ -1533,66 +1533,65 @@ public:
         // pointer-to-pointer hierarchy upcasts, int widening, etc.)
         // and a narrow take-address match (arg `T` → param `Pointer<T>`
         // or `Reference<T>`).
-        walk = start_cls;
-        depth = 0;
-        cur_methods = methods_ref;
-        while (depth < 16) {
-            for (mut mi: i64 = 0; mi < cur_methods.length; mi++) {
-                const m: MethodInfo = cur_methods[mi];
-                if (!m.name.equals(member.member)) { continue; }
-                if (m.param_types.length != arg_types.length) { continue; }
-                mut compat: boolean = true;
-                for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
-                    if (this.checker.can_implicit_convert(
-                        arg_types[pi], m.param_types[pi])) {
-                        continue;
-                    }
-                    // Take-address: arg is bare T, param is Pointer<T>
-                    // or Reference<T>.  Compare by arena ID so the
-                    // match is canonical, not string-based.
-                    const pt: Type* = this.arena.lookup(m.param_types[pi].id);
-                    if (pt != null) {
-                        mut pointee: TypeRef = TypeRef::invalid();
-                        if (pt.kind == TypeKind::Pointer) {
-                            const ptr: PointerType* = pt as PointerType*;
-                            pointee = ptr.pointee;
-                        } else if (pt.kind == TypeKind::Reference) {
-                            const rt: ReferenceType* = pt as ReferenceType*;
-                            pointee = rt.referent;
-                        }
-                        if (pointee.is_valid() && pointee.id == arg_types[pi].id) {
+        //
+        // CRITICAL: this pass runs in two sub-passes.  Pass 2a accepts
+        // EXACT pointee matches only; pass 2b also accepts subclass
+        // upcasts.  Without this split, `visitor.visit(this)` where
+        // `this: EnumDeclNode` would resolve to `visit(DeclarationNode*)`
+        // (a subclass match found earlier in declaration order) instead
+        // of `visit(EnumDeclNode*)` (the exact-pointee match).  C++
+        // overload resolution always prefers most-specific; cryoc
+        // emulates that by trying exact first.
+        for (mut sub_pass: i32 = 0; sub_pass < 2; sub_pass++) {
+            const allow_subclass: boolean = (sub_pass == 1);
+            walk = start_cls;
+            depth = 0;
+            cur_methods = methods_ref;
+            while (depth < 16) {
+                for (mut mi: i64 = 0; mi < cur_methods.length; mi++) {
+                    const m: MethodInfo = cur_methods[mi];
+                    if (!m.name.equals(member.member)) { continue; }
+                    if (m.param_types.length != arg_types.length) { continue; }
+                    mut compat: boolean = true;
+                    for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
+                        if (this.checker.can_implicit_convert(
+                            arg_types[pi], m.param_types[pi])) {
                             continue;
                         }
-                        // Take-address + class upcast: arg is bare `Derived`
-                        // (a class value), param is `Base*` / `&Base` where
-                        // `Base` is an ancestor of `Derived`.  Without this,
-                        // calls like `node.accept(this)` from inside an
-                        // `ASTCloner` method (where `this` resolves to the
-                        // bare `ASTCloner` class) fail to match the
-                        // `accept(visitor: ASTVisitor*)` signature, sema
-                        // leaves `resolved_method` null, and codegen falls
-                        // back to a direct call on the base class — which
-                        // is undeclared because `accept` is pure-virtual.
-                        if (pointee.is_valid() &&
-                            this.checker.is_subclass_of(arg_types[pi], pointee)) {
-                            continue;
+                        const pt: Type* = this.arena.lookup(m.param_types[pi].id);
+                        if (pt != null) {
+                            mut pointee: TypeRef = TypeRef::invalid();
+                            if (pt.kind == TypeKind::Pointer) {
+                                const ptr: PointerType* = pt as PointerType*;
+                                pointee = ptr.pointee;
+                            } else if (pt.kind == TypeKind::Reference) {
+                                const rt: ReferenceType* = pt as ReferenceType*;
+                                pointee = rt.referent;
+                            }
+                            if (pointee.is_valid() && pointee.id == arg_types[pi].id) {
+                                continue;
+                            }
+                            if (allow_subclass && pointee.is_valid() &&
+                                this.checker.is_subclass_of(arg_types[pi], pointee)) {
+                                continue;
+                            }
                         }
+                        compat = false;
+                        break;
                     }
-                    compat = false;
-                    break;
+                    if (compat) {
+                        call.set_resolved_method(m.ast_node as ASTNode*);
+                        return;
+                    }
                 }
-                if (compat) {
-                    call.set_resolved_method(m.ast_node as ASTNode*);
-                    return;
-                }
+                if (walk == null) { break; }
+                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+                const parent_t: Type* = this.arena.lookup(walk.base_class.id);
+                if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+                walk = parent_t as ClassType*;
+                cur_methods = walk.methods;
+                depth = depth + 1;
             }
-            if (walk == null) { break; }
-            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-            const parent_t: Type* = this.arena.lookup(walk.base_class.id);
-            if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
-            walk = parent_t as ClassType*;
-            cur_methods = walk.methods;
-            depth = depth + 1;
         }
         // Still no match — leave resolved_method null; codegen falls
         // back to direct (non-virtual) dispatch via the usual name-based
