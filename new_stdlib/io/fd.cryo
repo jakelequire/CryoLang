@@ -17,34 +17,16 @@ import core::option;
 import core::result;
 import core::slice;
 import io::error;
-
-extern "C" {
-    function read(fd: i32, buffer: u8*, count: u64) -> i64;
-    function write(fd: i32, buffer: u8*, count: u64) -> i64;
-    function close(fd: i32) -> i32;
-    function open(path: u8*, flags: i32, mode: u32) -> i32;
-    function __errno_location() -> i32*;
-}
-
-// Access mode flags. Centralised here because both fs::File and
-// process::Command open file descriptors independently.
-const O_RDONLY: i32 = 0;
-const O_WRONLY: i32 = 1;
-const O_RDWR: i32 = 2;
-
-/// Current thread's `errno`.
-function errno() -> i32 {
-    return *__errno_location();
-}
+import ffi::libc;
 
 /// `read(2)` wrapper: retries on `EINTR`, maps every other failure
 /// through `IoError::from_errno`. Returns the number of bytes
 /// actually read; zero means EOF.
 function read_fd(fd: i32, buffer: u8*, length: u64) -> Result<u64, IoError> {
     loop {
-        const n: i64 = read(fd, buffer, length);
+        const n: i64 = libc::read(fd, buffer, length);
         if (n >= 0) { return Result::Ok(n as u64); }
-        const err: IoError = IoError::from_errno(errno());
+        const err: IoError = IoError::from_errno(libc::errno());
         match (err.kind) {
             IoErrorKind::Interrupted => { }
             _ => { return Result::Err(err); }
@@ -58,9 +40,9 @@ function read_fd(fd: i32, buffer: u8*, length: u64) -> Result<u64, IoError> {
 /// `Write::write_all`.
 function write_fd(fd: i32, bytes: Slice<u8>) -> Result<u64, IoError> {
     loop {
-        const n: i64 = write(fd, bytes.as_ptr(), bytes.length());
+        const n: i64 = libc::write(fd, bytes.as_ptr(), bytes.length());
         if (n >= 0) { return Result::Ok(n as u64); }
-        const err: IoError = IoError::from_errno(errno());
+        const err: IoError = IoError::from_errno(libc::errno());
         match (err.kind) {
             IoErrorKind::Interrupted => { }
             _ => { return Result::Err(err); }
@@ -72,5 +54,5 @@ function write_fd(fd: i32, bytes: Slice<u8>) -> Result<u64, IoError> {
 /// sensible can be done with a close failure — the fd is gone from
 /// the process's perspective either way.
 function close_fd(fd: i32) -> void {
-    close(fd);
+    libc::close(fd);
 }

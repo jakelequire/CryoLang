@@ -248,7 +248,15 @@ type struct CodegenPasses {
                 if (mn_bytes[si] == 58) { mn_bytes[si] = 95; }
             }
             mn_bytes[mn_len] = 0;
-            const ll_path: string = format("build/obj/%s.ll", mn_buf as string);
+            // Honour project_config.output_dir so `--build-dir=...` lands
+            // here too — hardcoded "build/obj/" would otherwise spill .ll
+            // dumps into the default path even when the rest of codegen
+            // is writing under a different directory.
+            mut ll_dir: string = "build/obj";
+            if (ctx.project_config != null) {
+                ll_dir = format("%s/obj", ctx.project_config.output_dir);
+            }
+            const ll_path: string = format("%s/%s.ll", ll_dir, mn_buf as string);
             mut ll_err: i8* = null;
             llvm::LLVMPrintModuleToFile(cg.llvm_module.raw, ll_path, &ll_err as void*);
             if (ll_err != null) { llvm::LLVMDisposeMessage(ll_err as void*); }
@@ -372,6 +380,11 @@ type struct CodegenPasses {
         // Determine output path: {build_dir}/obj/{module_name}.o
         mut output_dir: string = "build/obj";
         if (ctx.project_config != null) {
+            // mkdir() doesn't create parent dirs — ensure the parent
+            // exists first.  Custom `--build-dir=...` paths often don't
+            // pre-exist; the bare `mkdir` then fails silently and the
+            // object emission errors with "No such file or directory".
+            mkdir(ctx.project_config.output_dir, 493);
             output_dir = format("%s/obj", ctx.project_config.output_dir);
         }
         // Ensure output directory exists.
@@ -447,6 +460,9 @@ type struct CodegenPasses {
 
         const cfg: ProjectConfig* = ctx.project_config;
         const output_dir: string = cfg.output_dir;
+        // Ensure parent dir exists for custom `--build-dir=...` paths
+        // that haven't been pre-created.
+        mkdir(output_dir, 493);
         const bin_dir: string = format("%s/bin", output_dir);
         mkdir(bin_dir, 493);  // 0755
         const exe_path: string = format("%s/%s", bin_dir, cfg.project_name);

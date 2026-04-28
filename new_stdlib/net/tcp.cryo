@@ -19,28 +19,12 @@ import core::slice;
 import io::error;
 import io::fd;
 import io::traits;
+import ffi::libc;
 import net::ip;
 import net::socket_addr;
 
-extern "C" {
-    function socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
-    function bind(sockfd: i32, addr: u8*, addrlen: u32) -> i32;
-    function listen(sockfd: i32, backlog: i32) -> i32;
-    function accept(sockfd: i32, addr: u8*, addrlen: u32*) -> i32;
-    function connect(sockfd: i32, addr: u8*, addrlen: u32) -> i32;
-    function setsockopt(sockfd: i32, level: i32, optname: i32,
-                        optval: u8*, optlen: u32) -> i32;
-    function shutdown(sockfd: i32, how: i32) -> i32;
-}
-
-const AF_INET: i32 = 2;
-const SOCK_STREAM: i32 = 1;
-const SOL_SOCKET: i32 = 1;
-const SO_REUSEADDR: i32 = 2;
-
-const SHUT_RD: i32 = 0;
-const SHUT_WR: i32 = 1;
-const SHUT_RDWR: i32 = 2;
+// Socket-domain / type / level / option / shutdown constants and
+// the `ShutdownHow` enum live in `ffi::libc`.
 
 /// Pack a `SocketAddr` into a 16-byte `sockaddr_in` buffer. Returns
 /// the number of bytes written (always 16 for IPv4). Panics on IPv6
@@ -80,15 +64,15 @@ type struct TcpStream {
     /// Connect to `remote`. Fails with the mapped `errno` kind on
     /// refusal, timeout, or an unreachable host.
     static connect(remote: SocketAddr) -> Result<TcpStream, IoError> {
-        const sock: i32 = socket(AF_INET, SOCK_STREAM, 0);
+        const sock: i32 = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
         if (sock < 0) {
-            return Result::Err(IoError::from_errno(fd::errno()));
+            return Result::Err(IoError::from_errno(libc::errno()));
         }
         mut sockaddr_buf: u8[16];
         const len: u32 = pack_sockaddr_in(&sockaddr_buf[0], &remote);
-        const rc: i32 = connect(sock, &sockaddr_buf[0], len);
+        const rc: i32 = libc::connect(sock, &sockaddr_buf[0], len);
         if (rc < 0) {
-            const err: IoError = IoError::from_errno(fd::errno());
+            const err: IoError = IoError::from_errno(libc::errno());
             fd::close_fd(sock);
             return Result::Err(err);
         }
@@ -105,8 +89,8 @@ type struct TcpStream {
     /// down the read path. Useful for protocols where the client
     /// sends then reads to EOF.
     shutdown_write(mut &this) -> Result<(), IoError> {
-        if (shutdown(this.fd, SHUT_WR) < 0) {
-            return Result::Err(IoError::from_errno(fd::errno()));
+        if (libc::shutdown(this.fd, libc::ShutdownHow::SHUT_WR) < 0) {
+            return Result::Err(IoError::from_errno(libc::errno()));
         }
         return Result::Ok(());
     }
@@ -149,23 +133,23 @@ type struct TcpListener {
     /// the same number Linux uses for `/proc/sys/net/core/somaxconn`
     /// these days.
     static bind(local: SocketAddr) -> Result<TcpListener, IoError> {
-        const sock: i32 = socket(AF_INET, SOCK_STREAM, 0);
+        const sock: i32 = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
         if (sock < 0) {
-            return Result::Err(IoError::from_errno(fd::errno()));
+            return Result::Err(IoError::from_errno(libc::errno()));
         }
 
         mut reuse: i32 = 1;
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse as u8*, 4);
+        libc::setsockopt(sock, libc::SOL_SOCKET, libc::SO_REUSEADDR, &reuse as u8*, 4);
 
         mut sockaddr_buf: u8[16];
         const len: u32 = pack_sockaddr_in(&sockaddr_buf[0], &local);
-        if (bind(sock, &sockaddr_buf[0], len) < 0) {
-            const err: IoError = IoError::from_errno(fd::errno());
+        if (libc::bind(sock, &sockaddr_buf[0], len) < 0) {
+            const err: IoError = IoError::from_errno(libc::errno());
             fd::close_fd(sock);
             return Result::Err(err);
         }
-        if (listen(sock, 128) < 0) {
-            const err: IoError = IoError::from_errno(fd::errno());
+        if (libc::listen(sock, 128) < 0) {
+            const err: IoError = IoError::from_errno(libc::errno());
             fd::close_fd(sock);
             return Result::Err(err);
         }
@@ -180,11 +164,11 @@ type struct TcpListener {
         mut sockaddr_buf: u8[16];
         mut addrlen: u32 = 16;
         loop {
-            const client_fd: i32 = accept(this.fd, &sockaddr_buf[0], &addrlen);
+            const client_fd: i32 = libc::accept(this.fd, &sockaddr_buf[0], &addrlen);
             if (client_fd >= 0) {
                 return Result::Ok(TcpStream::from_fd(client_fd));
             }
-            const err: IoError = IoError::from_errno(fd::errno());
+            const err: IoError = IoError::from_errno(libc::errno());
             match (err.kind) {
                 IoErrorKind::Interrupted => { }
                 _ => { return Result::Err(err); }

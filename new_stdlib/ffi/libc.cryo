@@ -1,0 +1,235 @@
+///! libc — raw C ABI bindings.
+///!
+///! Single home for every `extern "C"` declaration the stdlib needs.
+///! Modules consume libc through `import ffi::libc;` and call
+///! `libc::read(...)`, `libc::sqrt(...)`, etc., keeping the rest of
+///! the tree free of inline `extern` blocks.
+///!
+///! The functions here mirror libc / POSIX headers verbatim — same
+///! names, same signatures, same errno semantics. Cryo-idiomatic
+///! wrappers (returning `Result`, working in `Slice<u8>`, retrying on
+///! `EINTR`, etc.) live at the call site, not here. Code above the
+///! stdlib should rarely need to reach into this module directly.
+///!
+///! Sections are grouped by libc header so a reader can skim for the
+///! function they need the same way they would in `man 3` or
+///! `/usr/include`.
+
+namespace std::ffi::libc;
+
+// ============================================================================
+// Standard file descriptors
+// ============================================================================
+
+const STDIN_FILENO:  i32 = 0;
+const STDOUT_FILENO: i32 = 1;
+const STDERR_FILENO: i32 = 2;
+
+// ============================================================================
+// fcntl.h — open() flags
+// ============================================================================
+//
+// The low two bits of `flags` are the access mode (`O_RDONLY` /
+// `O_WRONLY` / `O_RDWR`); the rest are bitwise-ORed creation /
+// status flags. Numeric values are the Linux x86_64 ABI; other
+// platforms re-derive from `<bits/fcntl-linux.h>` equivalents.
+
+const O_RDONLY:   i32 = 0;
+const O_WRONLY:   i32 = 1;
+const O_RDWR:     i32 = 2;
+
+const O_CREAT:    i32 = 64;
+const O_EXCL:     i32 = 128;
+const O_NOCTTY:   i32 = 256;
+const O_TRUNC:    i32 = 512;
+const O_APPEND:   i32 = 1024;
+const O_NONBLOCK: i32 = 2048;
+const O_SYNC:     i32 = 1052672;
+
+// ============================================================================
+// unistd.h — lseek() whence
+// ============================================================================
+
+/// Anchor for `lseek`'s `offset`. Mutually exclusive — these are
+/// not bit flags.
+type enum Whence : i32 {
+    SEEK_SET = 0;
+    SEEK_CUR = 1;
+    SEEK_END = 2;
+}
+
+// ============================================================================
+// sys/wait.h — waitpid() options (bit flags)
+// ============================================================================
+
+const WNOHANG:    i32 = 1;
+const WUNTRACED:  i32 = 2;
+const WCONTINUED: i32 = 8;
+
+// ============================================================================
+// sys/socket.h — domain / type / level / option / shutdown
+// ============================================================================
+
+const AF_UNSPEC: i32 = 0;
+const AF_UNIX:   i32 = 1;
+const AF_INET:   i32 = 2;
+const AF_INET6:  i32 = 10;
+
+const SOCK_STREAM:    i32 = 1;
+const SOCK_DGRAM:     i32 = 2;
+const SOCK_RAW:       i32 = 3;
+const SOCK_SEQPACKET: i32 = 5;
+
+const SOL_SOCKET: i32 = 1;
+
+const SO_REUSEADDR: i32 = 2;
+const SO_BROADCAST: i32 = 6;
+const SO_SNDBUF:    i32 = 7;
+const SO_RCVBUF:    i32 = 8;
+const SO_KEEPALIVE: i32 = 9;
+
+/// Direction(s) `shutdown` tears down on a socket. Mutually exclusive.
+type enum ShutdownHow : i32 {
+    SHUT_RD   = 0;
+    SHUT_WR   = 1;
+    SHUT_RDWR = 2;
+}
+
+// ============================================================================
+// string.h
+// ============================================================================
+
+extern "C" {
+    function strlen(s: u8*) -> u64;
+}
+
+// ============================================================================
+// stdlib.h
+// ============================================================================
+
+extern "C" {
+    function getenv(name: u8*) -> u8*;
+    function setenv(name: u8*, value: u8*, overwrite: i32) -> i32;
+    function unsetenv(name: u8*) -> i32;
+    function clearenv() -> i32;
+    function exit(code: i32) -> void;
+    function _exit(code: i32) -> void;
+}
+
+// ============================================================================
+// unistd.h — POSIX file/process operations
+// ============================================================================
+
+extern "C" {
+    function read(fd: i32, buffer: u8*, count: u64) -> i64;
+    function write(fd: i32, buffer: u8*, count: u64) -> i64;
+    function close(fd: i32) -> i32;
+    function lseek(fd: i32, offset: i64, whence: Whence) -> i64;
+    function isatty(fd: i32) -> i32;
+    function fork() -> i32;
+    function execvp(file: u8*, argv: u8**) -> i32;
+    function pipe(fds: i32*) -> i32;
+    function dup2(oldfd: i32, newfd: i32) -> i32;
+    function chdir(path: u8*) -> i32;
+}
+
+// ============================================================================
+// fcntl.h
+// ============================================================================
+
+extern "C" {
+    function open(path: u8*, flags: i32, mode: u32) -> i32;
+}
+
+// ============================================================================
+// errno.h
+// ============================================================================
+
+extern "C" {
+    function __errno_location() -> i32*;
+}
+
+/// Current thread's `errno`. Thin convenience over the platform's
+/// thread-local indirection — every `IoError::from_errno(...)` in the
+/// stdlib funnels through here.
+function errno() -> i32 {
+    return *__errno_location();
+}
+
+// ============================================================================
+// sys/wait.h
+// ============================================================================
+
+extern "C" {
+    function waitpid(pid: i32, wstatus: i32*, options: i32) -> i32;
+}
+
+// ============================================================================
+// signal.h — raw `kill(2)`. The high-level `Signal` struct lives in
+// `process::signal`; this is the bare syscall.
+// ============================================================================
+
+extern "C" {
+    function kill(pid: i32, sig: i32) -> i32;
+}
+
+// ============================================================================
+// sys/socket.h
+// ============================================================================
+
+extern "C" {
+    function socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
+    function bind(sockfd: i32, addr: u8*, addrlen: u32) -> i32;
+    function listen(sockfd: i32, backlog: i32) -> i32;
+    function accept(sockfd: i32, addr: u8*, addrlen: u32*) -> i32;
+    function connect(sockfd: i32, addr: u8*, addrlen: u32) -> i32;
+    function setsockopt(sockfd: i32, level: i32, optname: i32,
+                        optval: u8*, optlen: u32) -> i32;
+    function shutdown(sockfd: i32, how: ShutdownHow) -> i32;
+}
+
+// ============================================================================
+// math.h — libm. `__isnan` / `__isinf` are the underlying glibc
+// primitives behind libc's NaN/Inf classification macros.
+// ============================================================================
+
+extern "C" {
+    function sqrt(value: f64) -> f64;
+    function sqrtf(value: f32) -> f32;
+    function cbrt(value: f64) -> f64;
+    function pow(base: f64, exponent: f64) -> f64;
+    function powf(base: f32, exponent: f32) -> f32;
+
+    function exp(value: f64) -> f64;
+    function expf(value: f32) -> f32;
+    function exp2(value: f64) -> f64;
+    function log(value: f64) -> f64;
+    function logf(value: f32) -> f32;
+    function log2(value: f64) -> f64;
+    function log10(value: f64) -> f64;
+
+    function sin(value: f64) -> f64;
+    function cos(value: f64) -> f64;
+    function tan(value: f64) -> f64;
+    function asin(value: f64) -> f64;
+    function acos(value: f64) -> f64;
+    function atan(value: f64) -> f64;
+    function atan2(y: f64, x: f64) -> f64;
+
+    function sinh(value: f64) -> f64;
+    function cosh(value: f64) -> f64;
+    function tanh(value: f64) -> f64;
+
+    function floor(value: f64) -> f64;
+    function ceil(value: f64) -> f64;
+    function round(value: f64) -> f64;
+    function trunc(value: f64) -> f64;
+    function fabs(value: f64) -> f64;
+    function fabsf(value: f32) -> f32;
+
+    function fmod(x: f64, y: f64) -> f64;
+    function copysign(magnitude: f64, sign: f64) -> f64;
+
+    function __isnan(value: f64) -> i32;
+    function __isinf(value: f64) -> i32;
+}
