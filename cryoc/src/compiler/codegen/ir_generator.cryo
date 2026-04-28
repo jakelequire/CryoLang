@@ -3082,6 +3082,25 @@ public:
             }
         }
 
+        // Initialize fields for `new T { fields }`. Without this the malloc'd
+        // struct's fields are left uninitialized — every TypeAnnotation* the
+        // parser produces would be a pointer to garbage. See HANDOFF Bug #15.
+        if (node.struct_init != null && t.kind == TypeKind::Struct && mapped.is_valid()) {
+            const lit: StructLiteralNode* = node.struct_init;
+            const st: StructType* = t as StructType*;
+            for (mut sfi: i64 = 0; sfi < lit.field_inits.length; sfi++) {
+                const finit: FieldInit = lit.field_inits[sfi];
+                const sf_fidx: i64 = st.field_index(finit.field_name);
+                if (sf_fidx >= 0) {
+                    const gep: LValue = this.cg.builder.build_struct_gep(mapped, obj_ptr, sf_fidx as u32, "field");
+                    const val: LValue = this.codegen_rvalue(finit.value);
+                    if (val.is_valid() && gep.is_valid()) {
+                        this.cg.builder.build_store(val, gep);
+                    }
+                }
+            }
+        }
+
         // Call the constructor.  Cryo constructors are named like the class
         // itself (e.g. `VoidType(id: u64)` on `class VoidType`).  The DI
         // registered the method under `QualifiedClass::BareClassName`.

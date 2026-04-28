@@ -129,7 +129,10 @@ namespace Cryo
     {
     private:
         TokenKind _kind;
-        std::string_view _text;
+        // Owned: the source buffer the lexer reads from is freed long before
+        // codegen runs, so a string_view into it would dangle. Token instances
+        // live in the AST and outlast the source buffer.
+        std::string _text;
         SourceLocation _location;
 
     public:
