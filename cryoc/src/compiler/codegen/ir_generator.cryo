@@ -298,6 +298,9 @@ public:
         // Without this, every derived-class constructor returns immediately
         // after storing its params into locals, and downstream uses of inherited
         // fields read garbage.
+        const dbg_ic: i32 = node.is_constructor as i32;
+        const dbg_hb: i32 = node.has_base_ctor() as i32;
+        printf("[CTOR-CHECK] is_ctor=%d has_base=%d\n", dbg_ic, dbg_hb);
         if (node.is_constructor && node.has_base_ctor()) {
             this.emit_base_ctor_call(node, fn_val);
         }
@@ -317,6 +320,7 @@ public:
     /// param 0 of the enclosing constructor) is passed as the receiver, and
     /// `node.base_ctor_args` are codegen'd as rvalues for the remaining args.
     emit_base_ctor_call(mut &this, node: MethodNode*, fn_val: LValue) -> void {
+        printf("[BCTOR-START]\n");
         const intern: InternTable* = this.cg.get_intern();
         const di: DeclarationIndex* = this.cg.get_decl_index();
         const ctx_ptr: CompilationContext* = this.cg.ctx;
@@ -334,7 +338,9 @@ public:
             base_qualified = node.base_ctor_name;
             base_type = di.lookup_type(base_qualified);
         }
-        if (base_type.is_invalid()) { return; }
+        printf("[BCTOR-T1]\n");
+        if (base_type.is_invalid()) { printf("[BCTOR-BAIL] type invalid\n"); return; }
+        printf("[BCTOR-T2]\n");
 
         const base_qualified_str: string = intern.resolve(base_qualified);
         const base_bare_str: string = intern.resolve(node.base_ctor_name);
@@ -347,10 +353,16 @@ public:
         if (!ctor_fn.is_valid()) {
             ctor_fn = resolve_function(this.cg, ctor_sym);
         }
-        if (!ctor_fn.is_valid()) { return; }
+        printf("[BCTOR-T3]\n");
+        if (!ctor_fn.is_valid()) {
+            printf("[BCTOR-BAIL] ctor not found: '%s' arity=%u\n", ctor_combined, ctor_arity);
+            return;
+        }
+        printf("[BCTOR-T4]\n");
 
         const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
-        if (!ctor_ty.is_valid()) { return; }
+        if (!ctor_ty.is_valid()) { printf("[BCTOR-BAIL] ctor_ty invalid\n"); return; }
+        printf("[BCTOR-T5]\n");
 
         // `this` is LLVM param 0 of the enclosing constructor.
         const this_arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
@@ -358,8 +370,21 @@ public:
         mut ctor_args: LValue[] = [];
         ctor_args.push(this_arg);
         mut any_arg_invalid: boolean = false;
+        const dbg_args_len: i64 = node.base_ctor_args.length;
+        printf("[BCTOR-ARGS-LEN] len=%lld\n", dbg_args_len);
         for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
-            mut arg: LValue = this.codegen_rvalue(node.base_ctor_args[i]);
+            const arg_node: ExpressionNode* = node.base_ctor_args[i];
+            const dbg_arg_ptr: void* = arg_node as void*;
+            // Read the first 16 bytes raw to see what's actually at the pointer.
+            const dbg_raw_ptr: u64* = dbg_arg_ptr as u64*;
+            const dbg_w0: u64 = if (dbg_arg_ptr != null) { dbg_raw_ptr[0] } else { 0 };
+            const dbg_w1: u64 = if (dbg_arg_ptr != null) { dbg_raw_ptr[1] } else { 0 };
+            const dbg_arg_kind_chained: i32 = node.base_ctor_args[i].kind as i32;
+            const dbg_arg_kind_local: i32 = arg_node.kind as i32;
+            mut arg: LValue = this.codegen_rvalue(arg_node);
+            const dbg_arg_valid: i32 = arg.is_valid() as i32;
+            printf("[BCTOR-ARG] i=%lld ptr=%p w0=0x%llx w1=0x%llx kind_chained=%d kind_local=%d valid=%d\n",
+                   i, dbg_arg_ptr, dbg_w0, dbg_w1, dbg_arg_kind_chained, dbg_arg_kind_local, dbg_arg_valid);
             if (!arg.is_valid()) {
                 any_arg_invalid = true;
                 break;
@@ -407,10 +432,34 @@ public:
             }
             ctor_args.push(arg);
         }
-        if (any_arg_invalid) { return; }
+        if (any_arg_invalid) { printf("[BCTOR-BAIL] any_arg_invalid\n"); return; }
+        printf("[BCTOR-T6]\n");
 
         mut ctor_result: LValue = LValue::null();
         codegen_call(this.cg, ctor_fn, ctor_ty, ctor_args, "", &ctor_result);
+
+        // Diagnostic: dump the enclosing function's blocks/instructions so
+        // we can see whether codegen_call's emitted call survived past this
+        // point.  Print one line per instruction with its opcode.
+        const dbg_fn: void* = fn_val.raw;
+        const dbg_fn_name_v: void* = llvm::LLVMGetValueName(dbg_fn);
+        const dbg_fn_name: string = dbg_fn_name_v as string;
+        printf("[BCTOR-DUMP] enclosing fn='%s' after codegen_call:\n", dbg_fn_name);
+        mut dbg_bb: void* = llvm::LLVMGetFirstBasicBlock(dbg_fn);
+        mut dbg_bb_idx: i32 = 0;
+        while (dbg_bb != null) {
+            printf("[BCTOR-DUMP]   bb#%d:\n", dbg_bb_idx);
+            mut dbg_inst: void* = llvm::LLVMGetFirstInstruction(dbg_bb);
+            mut dbg_inst_idx: i32 = 0;
+            while (dbg_inst != null) {
+                const dbg_op: i32 = llvm::LLVMGetInstructionOpcode(dbg_inst);
+                printf("[BCTOR-DUMP]     inst#%d opcode=%d\n", dbg_inst_idx, dbg_op);
+                dbg_inst = llvm::LLVMGetNextInstruction(dbg_inst);
+                dbg_inst_idx = dbg_inst_idx + 1;
+            }
+            dbg_bb = llvm::LLVMGetNextBasicBlock(dbg_bb);
+            dbg_bb_idx = dbg_bb_idx + 1;
+        }
     }
 
     /// Generate a block of statements directly (no virtual dispatch).
@@ -922,13 +971,12 @@ public:
             // The pattern's value SymbolStr contains the literal text.
             const intern: InternTable* = this.cg.get_intern();
             const text: string = intern.resolve(pat.value);
-            // Try parsing as integer.
-            const ival: i32 = atoi(text);
             // Check if it's a character literal (single char in quotes).
             if (strlen(text) == 1) {
                 return LType::const_int(LType::i32(), text[0] as u64, false);
             }
-            return LType::const_int(LType::i32(), ival as u64, true);
+            const ival: u64 = parse_int_lexeme(text);
+            return LType::const_int(LType::i32(), ival, true);
         } else if (pat.pattern_kind == PatternKind::Identifier) {
             // Identifier pattern — could be an enum variant name.
             // Look it up as a named value or try to resolve as an enum discriminant.
