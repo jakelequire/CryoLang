@@ -1409,3 +1409,60 @@ function codegen_string_compare(cg: CodegenContext*, lhs: LValue, rhs: LValue,
         *out_value = cg.builder.build_icmp(33 /* IntNE */, cmp_result, zero, "strne");
     }
 }
+
+
+// ============================================================================
+// `new` expression helpers
+// ============================================================================
+
+// Heap-box an enum variant value for `new T::V(...)`. Allocates et.computed_size
+// bytes, bitcasts to the enum struct pointer type, and stores the loaded
+// variant struct value at offset 0. Returns the typed pointer.
+function heap_box_enum_variant(cg: CodegenContext*, et: EnumType*,
+                                enum_ref: TypeRef, variant_val: LValue,
+                                span: SourceSpan) -> LValue {
+    const malloc_fn: LValue = resolve_function(cg, cg.intern_str("malloc"));
+    if (!malloc_fn.is_valid()) {
+        cg.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+            "codegen: new T::V: malloc not declared",
+            span);
+        return LValue::null();
+    }
+    const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+    if (!malloc_ty.is_valid()) {
+        cg.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+            "codegen: new T::V: failed to retrieve malloc function type",
+            span);
+        return LValue::null();
+    }
+
+    const size: u64 = et.computed_size;
+    if (size == 0) {
+        cg.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            "codegen: enum computed_size is 0 reaching codegen (TypeLowering bug)",
+            span);
+        return LValue::null();
+    }
+
+    const size_val: LValue = LType::const_int(LType::i64(), size, false);
+    mut malloc_args: LValue[] = [];
+    malloc_args.push(size_val);
+    mut raw_ptr: LValue = LValue::null();
+    codegen_call(cg, malloc_fn, malloc_ty, malloc_args, "newenum", &raw_ptr);
+
+    const enum_llvm: LType = cg.type_mapper.map_type(enum_ref);
+    if (!enum_llvm.is_valid()) {
+        cg.emit_error_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+            "codegen: new T::V: failed to map enum type",
+            span);
+        return LValue::null();
+    }
+    const obj_ptr: LValue = cg.builder.build_pointer_cast(
+        raw_ptr, LType::pointer_to(enum_llvm), "newenumcast");
+
+    if (variant_val.is_valid() && obj_ptr.is_valid()) {
+        cg.builder.build_store(variant_val, obj_ptr);
+    }
+
+    return obj_ptr;
+}
