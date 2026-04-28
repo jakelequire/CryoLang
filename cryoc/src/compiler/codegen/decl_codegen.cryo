@@ -449,10 +449,33 @@ type struct VTableSlot {
 function param_types_equal(a: TypeRef[], b: TypeRef[]) -> boolean {
     if (a.length != b.length) { return false; }
     for (mut i: i64 = 0; i < a.length; i++) {
-        if (a[i].id != b[i].id) {
-            printf("[VFSI:PT-NEQ] i=%lld a.id=%llu b.id=%llu\n", i, a[i].id, b[i].id);
-            return false;
-        }
+        if (a[i].id != b[i].id) { return false; }
+    }
+    return true;
+}
+
+/// Like `param_types_equal` but goes through the arena so two TypeRefs
+/// that represent the same shape but happen to live under different IDs
+/// (e.g., a `ASTVisitor*` registered while ASTVisitor was still a forward
+/// declaration vs after the body resolved) compare equal.  Vtable slot
+/// matching needs this lenience because override methods declared in a
+/// subclass may resolve their parameter types in a slightly different
+/// resolution context than the virtual base they override.
+function param_types_equal_structural(arena: TypeArena*, intern: InternTable*,
+                                       a: TypeRef[], b: TypeRef[]) -> boolean {
+    if (a.length != b.length) { return false; }
+    for (mut i: i64 = 0; i < a.length; i++) {
+        if (a[i].id == b[i].id) { continue; }
+        const ta: Type* = arena.lookup(a[i].id);
+        const tb: Type* = arena.lookup(b[i].id);
+        if (ta == null || tb == null) { return false; }
+        if (ta.kind != tb.kind) { return false; }
+        // Compare by formatted display so two distinct PointerType IDs
+        // that point at the same nominal class compare equal — display
+        // names are the canonical source-level identity for these types.
+        const sa: string = arena.format_display(ta);
+        const sb: string = arena.format_display(tb);
+        if (strcmp(sa, sb) != 0) { return false; }
     }
     return true;
 }
@@ -512,25 +535,22 @@ function find_vtable_slot_impl(cg: CodegenContext*, cls: ClassType*,
                                 slot_name: SymbolStr, slot_params: TypeRef[]) -> LValue {
     const arena: TypeArena* = cg.get_arena();
     const intern: InternTable* = cg.get_intern();
-    const _vfsi_dbg_cls: string = intern.resolve(cls.qualified_name);
-    const _vfsi_dbg_slot: string = intern.resolve(slot_name);
-    printf("[VFSI] find class='%s' slot='%s' slot_params.len=%lld\n",
-           _vfsi_dbg_cls, _vfsi_dbg_slot, slot_params.length);
     mut walk: ClassType* = cls;
     mut depth: i32 = 0;
     while (walk != null && depth < 16) {
-        const _vfsi_walk: string = intern.resolve(walk.qualified_name);
-        printf("[VFSI]   walk='%s' methods.len=%lld\n", _vfsi_walk, walk.methods.length);
         for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
             const m: MethodInfo = walk.methods[mi];
-            const _mname: string = intern.resolve(m.name);
-            const name_eq: boolean = m.name.equals(slot_name);
-            printf("[VFSI]     method[%lld] name='%s' name_eq=%d virt=%d over=%d params.len=%lld\n",
-                   mi, _mname, name_eq as i32, m.is_virtual as i32, m.is_override as i32, m.param_types.length);
-            if (!name_eq) { continue; }
-            const params_eq: boolean = param_types_equal(m.param_types, slot_params);
-            printf("[VFSI]     params_eq=%d\n", params_eq as i32);
-            if (!params_eq) { continue; }
+            if (!m.name.equals(slot_name)) { continue; }
+            // Use structural (display-name) equality on params instead of
+            // raw-ID matching: an override method's params can resolve to
+            // different TypeRef IDs than the virtual base's params even
+            // though they're semantically the same type (e.g. `ASTVisitor*`
+            // registered before vs. after the visitor module finished
+            // resolving).  Strict ID matching here misses every override
+            // and the whole vtable bails (every `new <DerivedClass>` then
+            // skips the vtable store; runtime virtual dispatch crashes
+            // reading a null vtable pointer).
+            if (!param_types_equal_structural(arena, intern, m.param_types, slot_params)) { continue; }
             if (!m.is_virtual && !m.is_override) { continue; }
             // Skip pure virtual declarations (virtual without body).
             // Their LLVM function is a bare `declare` that links as an
@@ -607,21 +627,14 @@ function vtable_slot_index(cg: CodegenContext*, cls: ClassType*,
 /// override wins, inherited base implementation otherwise).
 function codegen_vtable_for_class(cg: CodegenContext*, cls: ClassType*) -> void {
     const intern: InternTable* = cg.get_intern();
-    const _vt_dbg_name: string = intern.resolve(cls.qualified_name);
-    printf("[VT-EMIT] enter class='%s' has_virt=%d\n",
-           _vt_dbg_name, cls.has_virtual_methods as i32);
 
     const slots: VTableSlot[] = collect_vtable_slots(cg, cls);
-    printf("[VT-EMIT] class='%s' slots=%lld\n", _vt_dbg_name, slots.length);
     if (slots.length == 0) { return; }
 
     mut impls: LValue[] = [];
     for (mut i: i64 = 0; i < slots.length; i++) {
         const impl: LValue = find_vtable_slot_impl(cg, cls, slots[i].name, slots[i].param_types);
         if (!impl.is_valid()) {
-            const _slot_name: string = intern.resolve(slots[i].name);
-            printf("[VT-EMIT] class='%s' slot=%lld name='%s' impl invalid -> skip\n",
-                   _vt_dbg_name, i, _slot_name);
             // If the slot's implementation isn't declared in this module,
             // skip vtable emission entirely — a half-populated vtable would
             // misdispatch.  Cross-module vtables are handled when the owning
@@ -630,7 +643,6 @@ function codegen_vtable_for_class(cg: CodegenContext*, cls: ClassType*) -> void 
         }
         impls.push(impl);
     }
-    printf("[VT-EMIT] class='%s' all slots resolved, emitting global\n", _vt_dbg_name);
 
     const n: u32 = impls.length as u32;
     const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
