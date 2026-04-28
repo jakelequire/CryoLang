@@ -560,6 +560,57 @@ type struct SpecializationPasses {
 //   - inst.type_args.length          (array length, no vtable)
 // ============================================================================
 
+/// Recursively check whether a type contains any GenericParam or BoundedParam
+/// at any depth.  Mirrors Monomorphizer::type_contains_generic_param but uses
+/// only non-virtual field access on Type* subclass pointers, so it is safe to
+/// call from the validator free function.
+function type_contains_generic_param_v(arena: TypeArena*, ty: TypeRef) -> boolean {
+    if (!ty.is_valid()) { return false; }
+    const t: Type* = arena.lookup(ty.id);
+    if (t == null) { return false; }
+    if (t.kind == TypeKind::GenericParam) { return true; }
+    if (t.kind == TypeKind::BoundedParam) { return true; }
+    if (t.kind == TypeKind::Pointer) {
+        const ptr: PointerType* = t as PointerType*;
+        return type_contains_generic_param_v(arena, ptr.pointee);
+    }
+    if (t.kind == TypeKind::Reference) {
+        const ref: ReferenceType* = t as ReferenceType*;
+        return type_contains_generic_param_v(arena, ref.referent);
+    }
+    if (t.kind == TypeKind::Array) {
+        const arr: ArrayType* = t as ArrayType*;
+        return type_contains_generic_param_v(arena, arr.element);
+    }
+    if (t.kind == TypeKind::Optional) {
+        const opt: OptionalType* = t as OptionalType*;
+        return type_contains_generic_param_v(arena, opt.wrapped);
+    }
+    if (t.kind == TypeKind::Tuple) {
+        const tup: TupleType* = t as TupleType*;
+        for (mut i: i64 = 0; i < tup.elements.length; i++) {
+            if (type_contains_generic_param_v(arena, tup.elements[i])) { return true; }
+        }
+        return false;
+    }
+    if (t.kind == TypeKind::Function) {
+        const func: FunctionType* = t as FunctionType*;
+        if (type_contains_generic_param_v(arena, func.return_type)) { return true; }
+        for (mut i: i64 = 0; i < func.param_types.length; i++) {
+            if (type_contains_generic_param_v(arena, func.param_types[i])) { return true; }
+        }
+        return false;
+    }
+    if (t.kind == TypeKind::InstantiatedType) {
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (type_contains_generic_param_v(arena, inst.type_args[i])) { return true; }
+        }
+        return false;
+    }
+    return false;
+}
+
 function run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {
     const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
@@ -585,18 +636,18 @@ function run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {
         // resolved_type is a TypeRef (plain struct) — is_valid() is non-virtual.
         if (inst.resolved_type.is_valid()) { continue; }
 
-        // Skip template-internal references whose type args are still generic
-        // parameters (e.g., Pair<T>, Optional<E>).  These are created when a
-        // generic declaration references itself with its own params and are
-        // never meant to be monomorphized.
+        // Skip template-internal references whose type args contain generic
+        // parameters at any depth (e.g., Pair<T>, Option<Result<T, E>>).
+        // These are created when a generic declaration references another
+        // generic with its own params and are never meant to be monomorphized
+        // until the *outer* template is specialized.  The shallow direct-arg
+        // check used to miss nested cases like Option<Result<T,E>> where the
+        // direct arg is an InstantiatedType, not a GenericParam.  Mirrors
+        // the recursive filter in Monomorphizer::type_contains_generic_param.
         mut has_generic_arg: boolean = false;
         for (mut j: i64 = 0; j < inst.type_args.length; j++) {
-            const arg_ty: Type* = arena.lookup(inst.type_args[j].id);
-            if (arg_ty != null) {
-                if (arg_ty.kind == TypeKind::GenericParam ||
-                    arg_ty.kind == TypeKind::BoundedParam) {
-                    has_generic_arg = true;
-                }
+            if (type_contains_generic_param_v(arena, inst.type_args[j])) {
+                has_generic_arg = true;
             }
         }
         if (has_generic_arg) { continue; }

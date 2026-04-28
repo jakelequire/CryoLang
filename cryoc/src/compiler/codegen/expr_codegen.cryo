@@ -1338,7 +1338,26 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
                         const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
                         const field_lty: LType = LType { raw: field_llvm_ty };
                         if (want_bits > got_bits) {
-                            val = cg.builder.build_zext(val, field_lty, "field.widen");
+                            // Widen with the field's signedness — using zext
+                            // for a signed i64 field stored a negative i32
+                            // literal (`-1`) as `0x00000000FFFFFFFF`, which
+                            // is `4294967295` not `-1`.  This is what made
+                            // `new ArrayAnnotation { size: -1, ... }` lose
+                            // its sign and turn dynamic arrays into giant
+                            // fixed ones (the size sentinel was treated as
+                            // a positive i64).  Mirrors the local-var fix.
+                            mut signed_target: boolean = false;
+                            const field_t: Type* = cg.lookup_type_by_id(
+                                st.fields[fidx].field_type.id);
+                            if (field_t != null && field_t.kind == TypeKind::Int) {
+                                const ft_int: IntType* = field_t as IntType*;
+                                signed_target = ft_int.int_kind.is_signed();
+                            }
+                            if (signed_target) {
+                                val = cg.builder.build_sext(val, field_lty, "field.widen");
+                            } else {
+                                val = cg.builder.build_zext(val, field_lty, "field.widen");
+                            }
                         } else if (want_bits < got_bits) {
                             val = cg.builder.build_trunc(val, field_lty, "field.trunc");
                         }

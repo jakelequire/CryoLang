@@ -1271,28 +1271,31 @@ public:
                 this.last_is_lvalue = false;
                 return;
             }
-            // String-index special case: the lvalue is an i8* but the
-            // char rvalue is i32 — truncate before storing.  Mirrors
-            // the load-and-zext path on the read side.
+            // Narrow-store fix: the LHS may be an i8 slot (string char,
+            // pointer-to-i8 element, array-of-i8 element) while the RHS
+            // is an i32 char or other wider int.  LLVM's `store` writes
+            // the value's full width — without truncation we'd emit a
+            // 4-byte i32 store over a 1-byte slot, clobbering the next
+            // 3 bytes.  This is what produced the `name_buf[k] = '_'`
+            // miscompile in passes.cryo (only the first colon was
+            // replaced; the next 3 bytes became zeros).
             //
-            // The same applies to `*(buf + wi) = c` (UnaryExpr Star deref
-            // of a string).  Without this branch the store emits a 4-byte
-            // i32 write into a 1-byte i8 slot, smashing the next 3 bytes
-            // — which is exactly what the lexer's process_escape_sequences
-            // hits when it walks past the end of its malloc'd buffer.
+            // Decide based on the destination element's *resolved type*
+            // (i.e. the type of `node.left` itself) so this covers
+            // String, Pointer-to-i8, and Array-of-i8 in a single check.
             mut store_val: LValue = val;
+            const dest_t: Type* = this.cg.lookup_type_by_id(node.left.resolved_type.id);
             mut needs_chartrunc: boolean = false;
-            if (node.left.kind == NodeKind::ArrayAccess) {
-                const aa: ArrayAccessNode* = node.left as ArrayAccessNode*;
-                const arr_t: Type* = this.cg.lookup_type_by_id(aa.array.resolved_type.id);
-                if (arr_t != null && arr_t.kind == TypeKind::String) {
+            if (dest_t != null) {
+                if (dest_t.kind == TypeKind::Char) {
+                    // `s[i] = c` where the indexable is a Cryo `string`:
+                    // the destination type maps to char (i32 at semantic
+                    // level) but the underlying byte slot is i8.
                     needs_chartrunc = true;
-                }
-            } else if (node.left.kind == NodeKind::UnaryExpression) {
-                const ue: UnaryExprNode* = node.left as UnaryExprNode*;
-                if (ue.op.kind == TokenType::Star) {
-                    const op_t: Type* = this.cg.lookup_type_by_id(ue.operand.resolved_type.id);
-                    if (op_t != null && op_t.kind == TypeKind::String) {
+                } else if (dest_t.kind == TypeKind::Int) {
+                    const it: IntType* = dest_t as IntType*;
+                    if (it.int_kind == IntegerKind::I8 ||
+                        it.int_kind == IntegerKind::U8) {
                         needs_chartrunc = true;
                     }
                 }
@@ -3093,8 +3096,41 @@ public:
                 const sf_fidx: i64 = st.field_index(finit.field_name);
                 if (sf_fidx >= 0) {
                     const gep: LValue = this.cg.builder.build_struct_gep(mapped, obj_ptr, sf_fidx as u32, "field");
-                    const val: LValue = this.codegen_rvalue(finit.value);
+                    mut val: LValue = this.codegen_rvalue(finit.value);
                     if (val.is_valid() && gep.is_valid()) {
+                        // Widen/narrow integer literal to field's declared
+                        // width before storing.  `new ArrayAnnotation { size: -1, ... }`
+                        // arrives with `-1` as `i32 -1` but `size` is `i64`
+                        // — a direct `store i32` writes 4 bytes leaving the
+                        // upper 4 bytes of the i64 slot uninitialised, and
+                        // `is_dynamic()`'s `size < 0` check then sees a huge
+                        // positive number.  Mirrors codegen_struct_literal
+                        // and codegen_local_var.
+                        const field_llvm_ty: void* = llvm::LLVMStructGetTypeAtIndex(mapped.raw, sf_fidx as u32);
+                        const val_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
+                        if (field_llvm_ty != null && val_ty_raw != null
+                                && llvm::LLVMGetTypeKind(field_llvm_ty) == 8
+                                && llvm::LLVMGetTypeKind(val_ty_raw) == 8) {
+                            const want_bits: u32 = llvm::LLVMGetIntTypeWidth(field_llvm_ty);
+                            const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
+                            const field_lty: LType = LType { raw: field_llvm_ty };
+                            if (want_bits > got_bits) {
+                                mut signed_target: boolean = false;
+                                const field_t: Type* = this.cg.lookup_type_by_id(
+                                    st.fields[sf_fidx].field_type.id);
+                                if (field_t != null && field_t.kind == TypeKind::Int) {
+                                    const ft_int: IntType* = field_t as IntType*;
+                                    signed_target = ft_int.int_kind.is_signed();
+                                }
+                                if (signed_target) {
+                                    val = this.cg.builder.build_sext(val, field_lty, "field.widen");
+                                } else {
+                                    val = this.cg.builder.build_zext(val, field_lty, "field.widen");
+                                }
+                            } else if (want_bits < got_bits) {
+                                val = this.cg.builder.build_trunc(val, field_lty, "field.trunc");
+                            }
+                        }
                         this.cg.builder.build_store(val, gep);
                     }
                 }
