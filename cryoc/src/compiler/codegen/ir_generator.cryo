@@ -2967,6 +2967,28 @@ public:
             return;
         }
 
+        // Heap-allocated enum variant: see HANDOFF.md Bug #15.  INCOMPLETE.
+        if (t.kind == TypeKind::Enum && node.has_variant()) {
+            const et: EnumType* = t as EnumType*;
+            const variant: EnumVariantInfo* = et.get_variant(node.variant_name);
+            if (variant == null) {
+                this.cg.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
+                    "codegen: enum variant not found in `new T::V(...)`",
+                    node.span);
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
+            mut vargs: LValue[] = [];
+            for (mut i: i64 = 0; i < node.arguments.length; i++) {
+                vargs.push(this.codegen_rvalue(node.arguments[i]));
+            }
+            const variant_val: LValue = this.build_enum_variant(et, variant, type_ref, vargs);
+            this.last_value = variant_val;
+            this.last_is_lvalue = false;
+            return;
+        }
+
         const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
         if (!malloc_fn.is_valid()) {
             this.cg.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
@@ -3028,14 +3050,28 @@ public:
         }
 
         // Store the vtable pointer at slot 0 for classes with virtual methods.
-        // The vtable global is emitted by codegen_vtable_from_ast during the
-        // declare_class_methods phase.
+        // The vtable global is emitted by codegen_vtable_for_class in the
+        // owning module's codegen pass.  When `new` is used in a different
+        // module than the class declaration, the vtable global isn't yet in
+        // the current LLVM module's symbol table — declare it as an extern
+        // (no initializer) so the link step resolves it to the owning
+        // module's definition.
         if (t.kind == TypeKind::Class) {
             const cls: ClassType* = t as ClassType*;
             if (cls.has_virtual_methods && mapped.is_valid() && obj_ptr.is_valid()) {
                 const qname: QualifiedName = QualifiedName::from_symbol(qualified_sym);
                 const vtbl_name: string = MangledName::for_vtable(intern, qname).resolve(intern);
-                const vtbl_global: LValue = this.cg.llvm_module.get_named_global(vtbl_name);
+                mut vtbl_global: LValue = this.cg.llvm_module.get_named_global(vtbl_name);
+                if (!vtbl_global.is_valid()) {
+                    // Cross-module reference — emit an extern declaration.
+                    // The placeholder type doesn't have to match the
+                    // definition exactly: opaque pointers mean we only
+                    // store the global's address, and the linker resolves
+                    // by symbol name regardless of the IR-level type.
+                    const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
+                    const placeholder_ty: LType = LType::array_of(fn_ptr_ty, 1);
+                    vtbl_global = this.cg.llvm_module.add_global(placeholder_ty, vtbl_name);
+                }
                 if (vtbl_global.is_valid()) {
                     const vptr_slot: LValue = this.cg.builder.build_struct_gep(
                         mapped, obj_ptr, 0, "vptr.slot");

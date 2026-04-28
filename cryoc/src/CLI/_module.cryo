@@ -43,6 +43,20 @@ public:
         return false;
     }
 
+    /// Returns the string value of a `--key=value` arg, or empty
+    /// string if the key wasn't provided.  Uses the same strcmp
+    /// workaround as has_arg/has_flag (Map<string,…>::get is broken
+    /// for string keys built from different sources).
+    get_value(&this, key: string) -> string {
+        for (mut i: int = 0; i < this.args.keys.length; i++) {
+            if (strcmp(this.args.keys[i], key) == 0) {
+                const arg: Argument = this.args.values[i];
+                return arg.default_value;
+            }
+        }
+        return "";
+    }
+
     set_flag(mut &this, key: string, value: string) -> void {
         const flag: Argument = Argument {
             name:          key,
@@ -145,6 +159,31 @@ type struct ArgumentParser {
 
             // Flags: anything starting with '-'
             if (len >= 2 && strncmp(arg, "-", 1) == 0) {
+                // Detect `--key=value` form: split on '=' and store
+                // as a value-bearing arg in the `args` map.  The bare
+                // `--key` form (no '=') stays as a boolean flag.
+                mut eq_idx: int = -1;
+                for (mut k: int = 0; k < len; k++) {
+                    if (arg[k] == '=') { eq_idx = k; break; }
+                }
+                if (eq_idx > 0) {
+                    const key_buf: void* = malloc((eq_idx + 1) as u64);
+                    memcpy(key_buf, arg as void*, eq_idx as u64);
+                    const key_term: u8* = ptr_add(key_buf, eq_idx as i64) as u8*;
+                    *key_term = 0;
+                    const raw_key: string = key_buf as string;
+                    const name: string = ArgumentParser::normalize_flag_name(raw_key);
+                    const value: string = ptr_add(arg as void*, (eq_idx + 1) as i64) as string;
+                    result.set_arg(name, Argument {
+                        name:          name,
+                        description:   "",
+                        default_value: value,
+                        aliases:       [],
+                        required:      false,
+                        is_flag:       false,
+                    });
+                    continue;
+                }
                 const name: string = ArgumentParser::normalize_flag_name(arg);
                 result.set_flag(name, "true");
                 continue;

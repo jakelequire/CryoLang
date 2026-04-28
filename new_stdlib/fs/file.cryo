@@ -18,22 +18,11 @@ import io::error;
 import io::fd;
 import io::traits;
 import ffi::cstr;
+import ffi::libc;
 import fs::path;
 
-extern "C" {
-    function lseek(fd: i32, offset: i64, whence: i32) -> i32;
-}
-
-// POSIX open flags (access mode flags O_RDONLY/O_WRONLY/O_RDWR live in io::fd).
-const O_CREAT: i32 = 64;
-const O_EXCL: i32 = 128;
-const O_TRUNC: i32 = 512;
-const O_APPEND: i32 = 1024;
-
-// lseek whence.
-const SEEK_SET: i32 = 0;
-const SEEK_CUR: i32 = 1;
-const SEEK_END: i32 = 2;
+// POSIX `open` flags and `lseek` whence values live in `ffi::libc`
+// (`O_RDONLY`/`O_WRONLY`/`O_RDWR`/`O_CREAT`/… and `Whence::SEEK_*`).
 
 // Default mode for newly created files: 0644.
 const DEFAULT_CREATE_MODE: u32 = 420;
@@ -99,13 +88,13 @@ type struct OpenOptions {
     /// `File::open_with` doesn't grow an `if` ladder.
     to_flags(&this) -> i32 {
         mut flags: i32 = 0;
-        if (this.read && this.write) { flags = fd::O_RDWR; }
-        else if (this.write) { flags = fd::O_WRONLY; }
-        else { flags = fd::O_RDONLY; }
-        if (this.append) { flags = flags | O_APPEND; }
-        if (this.truncate) { flags = flags | O_TRUNC; }
-        if (this.create) { flags = flags | O_CREAT; }
-        if (this.create_new) { flags = flags | O_CREAT | O_EXCL; }
+        if (this.read && this.write) { flags = libc::O_RDWR; }
+        else if (this.write) { flags = libc::O_WRONLY; }
+        else { flags = libc::O_RDONLY; }
+        if (this.append) { flags = flags | libc::O_APPEND; }
+        if (this.truncate) { flags = flags | libc::O_TRUNC; }
+        if (this.create) { flags = flags | libc::O_CREAT; }
+        if (this.create_new) { flags = flags | libc::O_CREAT | libc::O_EXCL; }
         return flags;
     }
 }
@@ -135,11 +124,11 @@ type struct File {
     static open_with(p: Path, options: &OpenOptions) -> Result<File, IoError> {
         match (CString::from_str(p.as_str())) {
             Result::Ok(c_path) => {
-                const raw_fd: i32 = fd::open(c_path.as_ptr(), options.to_flags(), DEFAULT_CREATE_MODE);
+                const raw_fd: i32 = libc::open(c_path.as_ptr(), options.to_flags(), DEFAULT_CREATE_MODE);
                 mut c_local: CString = c_path;
                 c_local.drop();
                 if (raw_fd < 0) {
-                    return Result::Err(IoError::from_errno(fd::errno()));
+                    return Result::Err(IoError::from_errno(libc::errno()));
                 }
                 return Result::Ok(File { fd: raw_fd });
             }
@@ -152,9 +141,9 @@ type struct File {
     /// Seek to `offset` bytes from the start. Returns the new absolute
     /// position.
     seek_set(mut &this, offset: i64) -> Result<u64, IoError> {
-        const pos: i64 = lseek(this.fd, offset, SEEK_SET);
+        const pos: i64 = libc::lseek(this.fd, offset, libc::Whence::SEEK_SET);
         if (pos < 0) {
-            return Result::Err(IoError::from_errno(fd::errno()));
+            return Result::Err(IoError::from_errno(libc::errno()));
         }
         return Result::Ok(pos as u64);
     }

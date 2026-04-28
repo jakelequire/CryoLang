@@ -39,26 +39,34 @@ import Utils::Logger;
 // ============================================================================
 
 type struct CompilerConfig {
-    debug:          boolean;
-    show_ast:       boolean;
-    verbose_passes: boolean;
-    emit_llvm:      boolean;
+    debug:              boolean;
+    show_ast:           boolean;
+    verbose_passes:     boolean;
+    emit_llvm:          boolean;
+    /// CLI override for project output_dir.  Empty string ("") means
+    /// "use whatever the cryoconfig says".  Set from `--build-dir=...`
+    /// in cmd_project.  Lets stage 3/4 self-host runs land in distinct
+    /// directories so their emitted IR/.o can be diff'd for fixed-point
+    /// equivalence.
+    output_dir_override: string;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
-            debug:          false,
-            show_ast:       false,
-            verbose_passes: false,
-            emit_llvm:      false,
+            debug:               false,
+            show_ast:            false,
+            verbose_passes:      false,
+            emit_llvm:           false,
+            output_dir_override: "",
         };
     }
 
     static debug_config() -> CompilerConfig {
         return CompilerConfig {
-            debug:          true,
-            show_ast:       true,
-            verbose_passes: true,
-            emit_llvm:      false,
+            debug:               true,
+            show_ast:            true,
+            verbose_passes:      true,
+            emit_llvm:           false,
+            output_dir_override: "",
         };
     }
 }
@@ -292,7 +300,15 @@ type struct CompilerInstance {
         LOG_DEBUG(LogComponent::General, "[Compiler] compile_project: %s", config_path);
 
         // Phase 0: Parse project configuration
-        const config: ProjectConfig = ProjectConfig::parse(config_path);
+        mut config: ProjectConfig = ProjectConfig::parse(config_path);
+        // CLI `--build-dir=PATH` overrides the cryoconfig output_dir
+        // before any consumer (codegen .ll/.o paths, link bin path)
+        // reads it.  Required for self-host fixed-point testing
+        // (S3 → S4 vs S4 → S5) where each stage needs its own output tree.
+        if (this.config.output_dir_override != ""
+                && strlen(this.config.output_dir_override) > 0) {
+            config.output_dir = this.config.output_dir_override;
+        }
         const root_path: string = config.discovery_root_path();
 
         if (this.config.debug) {

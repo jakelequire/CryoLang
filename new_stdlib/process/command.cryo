@@ -29,17 +29,8 @@ import collections::str;
 import collections::string;
 import alloc::allocator;
 import ffi::cstr;
+import ffi::libc;
 import process::child;
-import env;
-
-extern "C" {
-    function fork() -> i32;
-    function execvp(file: u8*, argv: u8**) -> i32;
-    function pipe(fds: i32*) -> i32;
-    function dup2(oldfd: i32, newfd: i32) -> i32;
-    function chdir(path: u8*) -> i32;
-    function _exit(status: i32) -> void;
-}
 
 // ============================================================================
 // Stdio
@@ -234,8 +225,8 @@ function make_pipe_pair() -> PipePair {
 /// Call pipe(2) and populate `pair`. Returns an IoError on failure.
 function create_pipe() -> Result<PipePair, IoError> {
     mut fds: i32[2];
-    if (pipe(&fds[0]) < 0) {
-        return Result::Err(IoError::from_errno(fd::errno()));
+    if (libc::pipe(&fds[0]) < 0) {
+        return Result::Err(IoError::from_errno(libc::errno()));
     }
     return Result::Ok(PipePair { read_end: fds[0], write_end: fds[1] });
 }
@@ -259,18 +250,18 @@ function child_remap(setting: Stdio, pipe: &PipePair, target_fd: i32,
             const flags: i32 = 0;
             mut nullfd: i32 = 0;
             if (is_input) {
-                nullfd = fd::open("/dev/null" as u8*, fd::O_RDONLY, 0);
+                nullfd = libc::open("/dev/null" as u8*, libc::O_RDONLY, 0);
             } else {
-                nullfd = fd::open("/dev/null" as u8*, fd::O_WRONLY, 0);
+                nullfd = libc::open("/dev/null" as u8*, libc::O_WRONLY, 0);
             }
             if (nullfd < 0) { return false; }
-            if (dup2(nullfd, target_fd) < 0) { return false; }
+            if (libc::dup2(nullfd, target_fd) < 0) { return false; }
             fd::close_fd(nullfd);
             return true;
         }
         Stdio::Piped => {
             const src: i32 = (is_input ? pipe.read_end : pipe.write_end);
-            if (dup2(src, target_fd) < 0) { return false; }
+            if (libc::dup2(src, target_fd) < 0) { return false; }
             // Close both ends after dup2 — the target_fd now refers
             // to whichever end we wanted.
             if (pipe.read_end >= 0) { fd::close_fd(pipe.read_end); }
@@ -278,7 +269,7 @@ function child_remap(setting: Stdio, pipe: &PipePair, target_fd: i32,
             return true;
         }
         Stdio::Fd(raw) => {
-            if (dup2(raw, target_fd) < 0) { return false; }
+            if (libc::dup2(raw, target_fd) < 0) { return false; }
             fd::close_fd(raw);
             return true;
         }
@@ -327,7 +318,7 @@ function build_argv(program: &String,
 function apply_env(clear_env: boolean,
                    envs: &Array<EnvEntry>) -> boolean {
     if (clear_env) {
-        env::clearenv();
+        libc::clearenv();
     }
     mut i: u64 = 0;
     while (i < envs.length()) {
@@ -342,7 +333,7 @@ function apply_env(clear_env: boolean,
                         match (CString::from_str(entry.value.as_str())) {
                             Result::Ok(c_value) => {
                                 mut value: CString = c_value;
-                                if (env::setenv(key.as_ptr(), value.as_ptr(), 1) < 0) {
+                                if (libc::setenv(key.as_ptr(), value.as_ptr(), 1) < 0) {
                                     key.drop();
                                     value.drop();
                                     return false;
@@ -426,9 +417,9 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     }
 
     // 4. fork.
-    const pid: i32 = fork();
+    const pid: i32 = libc::fork();
     if (pid < 0) {
-        const err: IoError = IoError::from_errno(fd::errno());
+        const err: IoError = IoError::from_errno(libc::errno());
         close_pipe(&stdin_pipe);
         close_pipe(&stdout_pipe);
         close_pipe(&stderr_pipe);
@@ -445,23 +436,23 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         // -------- child --------
         // Only async-signal-safe operations from here until exec or
         // _exit. setenv/chdir/dup2/close/open/execvp are all safe.
-        if (!child_remap(cmd.stdin_cfg, &stdin_pipe, 0, true)) { _exit(127); }
-        if (!child_remap(cmd.stdout_cfg, &stdout_pipe, 1, false)) { _exit(127); }
-        if (!child_remap(cmd.stderr_cfg, &stderr_pipe, 2, false)) { _exit(127); }
+        if (!child_remap(cmd.stdin_cfg, &stdin_pipe, 0, true)) { libc::_exit(127); }
+        if (!child_remap(cmd.stdout_cfg, &stdout_pipe, 1, false)) { libc::_exit(127); }
+        if (!child_remap(cmd.stderr_cfg, &stderr_pipe, 2, false)) { libc::_exit(127); }
 
         // cwd change.
         match (cwd_cstr) {
             Option::Some(path) => {
-                if (chdir(path.as_ptr()) < 0) { _exit(127); }
+                if (libc::chdir(path.as_ptr()) < 0) { libc::_exit(127); }
             }
             Option::None => { }
         }
 
-        if (!apply_env(cmd.clear_env_flag, &cmd.envs)) { _exit(127); }
+        if (!apply_env(cmd.clear_env_flag, &cmd.envs)) { libc::_exit(127); }
 
-        execvp(argv.get(0).unwrap(), argv.as_ptr());
+        libc::execvp(argv.get(0).unwrap(), argv.as_ptr());
         // If we got here, exec failed.
-        _exit(127);
+        libc::_exit(127);
     }
 
     // -------- parent --------

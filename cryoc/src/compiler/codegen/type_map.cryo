@@ -478,43 +478,89 @@ type struct TypeMapper {
         return llvm_ty;
     }
 
-    /// EnumType → simple: i32; ADT: { i32, [max_payload x i8] }
+    /// EnumType → simple: i32; ADT: { i32, [N x int_align] payload }
+    /// where the payload's element type is chosen to match the largest
+    /// variant's alignment.  Using `[N x i8]` for ptr-payloads broke
+    /// because LLVM gives the struct only 4-byte alignment, putting the
+    /// payload at offset 4 — but `compute_enum_layout` (and therefore
+    /// `sizeof`/malloc/clone) places the payload at offset 8 with 8-byte
+    /// alignment.  Match the alignment by promoting the array element
+    /// type so LLVM's struct layout agrees with the source-side layout.
     map_enum(mut &this, t: EnumType*) -> LType {
         if (t.is_simple_enum()) {
             return LType::i32();
         }
 
-        // ADT enum: find max payload size across variants.
-        mut max_payload: u64 = 0;
+        // ADT enum: walk variants, computing each one's aligned payload
+        // size (mirroring compute_enum_layout in passes/type_lowering)
+        // so the LLVM struct lines up with the source-language layout.
+        mut max_payload_size:  u64 = 0;
+        mut max_payload_align: u64 = 1;
         for (mut i: i64 = 0; i < t.variants.length; i++) {
             const v: EnumVariantInfo = t.variants[i];
-            if (v.has_payload()) {
-                mut variant_size: u64 = 0;
-                for (mut j: i64 = 0; j < v.payload_types.length; j++) {
-                    const pt: Type* = this.arena.lookup(v.payload_types[j].id);
-                    if (pt != null) {
-                        variant_size = variant_size + pt.size_bytes();
-                    }
+            if (!v.has_payload()) { continue; }
+
+            mut v_offset: u64 = 0;
+            mut v_align:  u64 = 1;
+            for (mut j: i64 = 0; j < v.payload_types.length; j++) {
+                const pt: Type* = this.arena.lookup(v.payload_types[j].id);
+                if (pt == null) { continue; }
+                const p_size:  u64 = pt.size_bytes();
+                const p_align: u64 = pt.alignment();
+                if (p_align > 0) {
+                    // align_up for the field's offset within the variant
+                    const rem: u64 = v_offset % p_align;
+                    if (rem != 0) { v_offset = v_offset + (p_align - rem); }
+                    if (p_align > v_align) { v_align = p_align; }
                 }
-                if (variant_size > max_payload) {
-                    max_payload = variant_size;
-                }
+                v_offset = v_offset + p_size;
             }
+            // Round variant total up to its own alignment.
+            const v_rem: u64 = v_offset % v_align;
+            const v_total: u64 = if (v_align > 1 && v_rem != 0) {
+                v_offset + (v_align - v_rem)
+            } else { v_offset };
+
+            if (v_total > max_payload_size)  { max_payload_size  = v_total; }
+            if (v_align > max_payload_align) { max_payload_align = v_align; }
         }
 
-        // { i32 tag, [max_payload x i8] }.  ADT enums ALWAYS lower to a
-        // struct so `build_enum_variant` can struct-gep the tag field at
-        // index 0 and the payload at index 1.  When every variant's
-        // payload is zero-sized (e.g. Option<()>), keep the payload slot
-        // as `[0 x i8]` instead of collapsing to a raw i32 — otherwise
-        // the callsite's GEP runs against an integer and the verifier
-        // rejects the indexing.
+        // Round payload size up to overall alignment so it splits cleanly
+        // into `elem_count` array elements of size `elem_align`.
+        const overall_rem: u64 = max_payload_size % max_payload_align;
+        const padded_payload: u64 = if (max_payload_align > 1 && overall_rem != 0) {
+            max_payload_size + (max_payload_align - overall_rem)
+        } else { max_payload_size };
+
+        // Pick payload element type to match alignment.  An i64 element
+        // forces LLVM to align field 1 to 8, which inserts the 4 bytes
+        // of padding after the i32 tag exactly where the source layout
+        // expects it.  Falls back to i8 only when no payload variant
+        // exists or alignment is 1 (no padding needed).
+        mut elem_align: u64 = 1;
+        mut elem_ty: LType = LType::i8();
+        if (max_payload_align >= 8) {
+            elem_align = 8;
+            elem_ty    = LType::i64();
+        } else if (max_payload_align >= 4) {
+            elem_align = 4;
+            elem_ty    = LType::i32();
+        } else if (max_payload_align >= 2) {
+            elem_align = 2;
+            elem_ty    = LType::i16();
+        }
+        const elem_count: u32 = (padded_payload / elem_align) as u32;
+
+        // { i32 tag, [elem_count x elem_ty] payload }.  ADT enums ALWAYS
+        // lower to a struct so `build_enum_variant` can struct-gep the
+        // tag field at index 0 and the payload at index 1.  When every
+        // variant's payload is zero-sized, elem_count=0 keeps the layout
+        // as a 2-field struct rather than collapsing to a raw i32.
         const i32_ty: LType = LType::i32();
         const buf: void* = malloc(16);
         const slots: void** = buf as void**;
         slots[0] = i32_ty.raw;
-        const i8_ty: LType = LType::i8();
-        const payload_ty: LType = LType::array_of(i8_ty, max_payload as u32);
+        const payload_ty: LType = LType::array_of(elem_ty, elem_count);
         slots[1] = payload_ty.raw;
         const result: LType = LType::literal_struct(buf, 2, false);
         free(buf);
