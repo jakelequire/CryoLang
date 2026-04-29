@@ -625,12 +625,24 @@ function find_vtable_slot_impl(cg: CodegenContext*, cls: ClassType*,
 /// from codegen dispatch after sema has identified the exact overload
 /// via `CallExprNode.resolved_method` — this function just maps that
 /// declaration to its slot position.
+///
+/// Uses *structural* param-type equality (display-name match) rather than
+/// strict arena-ID match: an override method's parameter `Foo*` may be
+/// registered under a different arena ID than the base method's `Foo*` if
+/// the two declarations were resolved before/after `Foo`'s body was sealed,
+/// even though they denote the same nominal pointer type.  Without this,
+/// `node.accept(this)` on a base-class pointer falls back to a static call
+/// to the base accept (which targets vtable slot 0 — the no-op base
+/// `visit(BaseNode*)` — silently dropping every visitor traversal).
 function vtable_slot_index(cg: CodegenContext*, cls: ClassType*,
                             method_name: SymbolStr, param_types: TypeRef[]) -> i32 {
     const slots: VTableSlot[] = collect_vtable_slots(cg, cls);
+    const arena: TypeArena* = cg.get_arena();
+    const intern: InternTable* = cg.get_intern();
     for (mut i: i32 = 0; i < slots.length as i32; i++) {
         if (slots[i].name.equals(method_name) &&
-            param_types_equal(slots[i].param_types, param_types)) {
+            param_types_equal_structural(arena, intern,
+                slots[i].param_types, param_types)) {
             return i;
         }
     }

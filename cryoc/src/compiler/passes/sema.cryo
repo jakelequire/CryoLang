@@ -1554,7 +1554,28 @@ public:
                     if (m.param_types.length != arg_types.length) { continue; }
                     mut compat: boolean = true;
                     for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
-                        if (this.checker.can_implicit_convert(
+                        // Gate `can_implicit_convert` to skip pointer-subclass
+                        // upcasts in sub_pass=0.  `check_compatibility` treats
+                        // `Derived* → Base*` as ImplicitConvert, which would
+                        // pick `visit(Base*)` for a `Derived*` arg whenever
+                        // Base's overload is declared earlier — defeating the
+                        // most-specific-wins comment above.  Subclass matches
+                        // are deferred to sub_pass=1 (allow_subclass=true).
+                        mut allow_implicit: boolean = true;
+                        if (!allow_subclass) {
+                            const at: Type* = this.arena.lookup(arg_types[pi].id);
+                            const ppt: Type* = this.arena.lookup(m.param_types[pi].id);
+                            if (at != null && ppt != null
+                                    && at.kind == TypeKind::Pointer
+                                    && ppt.kind == TypeKind::Pointer) {
+                                const arg_ptr: PointerType* = at as PointerType*;
+                                const param_ptr2: PointerType* = ppt as PointerType*;
+                                if (arg_ptr.pointee.id != param_ptr2.pointee.id) {
+                                    allow_implicit = false;
+                                }
+                            }
+                        }
+                        if (allow_implicit && this.checker.can_implicit_convert(
                             arg_types[pi], m.param_types[pi])) {
                             continue;
                         }
