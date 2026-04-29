@@ -1,310 +1,295 @@
-# CryoLang Stage-3 Self-Host — Handoff
+# Cryo — handoff for next agent
 
-**Date:** 2026-04-28, end of session.
-**Branch:** `main`. Tip: `26e0266`.
-**Working tree:** unstaged fixes in 5 cryoc files (see §3). User handles commits.
+**Date:** 2026-04-29, end of session.
+**Branch:** `main` at `3d880760` (selfhost-check shifted to stage-4 fixed point).
+**Working tree:** clean.
 
----
+The user is preparing for a 0.1.0 tag and an install/distribution story. They want repo cleanup, CI, and a usable install path before tagging.
 
-## 1. State
-
-🟢 **Stage-3 cryoc compiles the stdlib end-to-end.** All 53 modules → `stdlib/.bin-s3/libcryo.a` (645 KB). Steps 1–4 of the build chain are green. This is a new milestone — the prior handoff bottomed out at module 52 with `E0167: unresolved generic instantiation`.
-
-Four cryoc-source bugs were diagnosed and fixed this session (details in §3). All four are real codegen / pass-pipeline bugs, no workarounds. The build chain `bootstrap → stage-2 → stage-3 → stdlib` is fully closed.
-
-**Not yet verified this session:** stage-3 cryoc compiling cryoc itself (a "stage-4" run). The session's focus was the stdlib path; rerunning `stage-2 build` against the cryoc source with the stage-3 binary (or just `STAGE3 build` from `cryoc/`) would close the loop. See §7.
+> **NOTE:** This handoff is being read on a different machine than where the prior session ran, so it deliberately repeats project context that would otherwise live in agent memory. If you've worked on Cryo before, skim sections 1–3; everything load-bearing is in §4 onward.
 
 ---
 
-## 2. Build chain (do not "fix" the layout)
+## 1. About the user
+
+Self-taught dev (4 years), works as a banker, building Cryo as a portfolio capstone to break into the software industry. Cryo is a passion project — they've been working on it for years and care deeply about getting it right. They take feedback well but **don't want band-aids or workarounds**; root-cause fixes only. They prefer terse, technical communication.
+
+They handle git pushes, force-pushes, and most rebuilds themselves unless explicitly told otherwise. In auto mode you can build and commit, but err on the side of asking when destructive or strategic decisions are involved.
+
+## 2. About the project
+
+Cryo is a statically-typed, compiled programming language. Two compilers exist:
+
+- **Bootstrap** (`bootstrap/`): the original C++23 implementation, ~LLVM-20 backend (clang++-20). Treated as **frozen fallback** — see §3.
+- **cryoc** (`cryoc/`): the self-hosted compiler, written in Cryo itself. This is what gets shipped going forward. The output binary is named `cryo` (at `cryoc/build/bin/cryo`); the directory is still called `cryoc/` for now.
+
+The compiler self-hosts at a true byte-level fixed point (verified — see §6).
+
+### Cryo language quirks (don't fight these)
+
+- **Variables MUST declare their type with `:`** — `const x: int = 10;` is required. No type inference shorthand on bindings.
+- **Trait-method `Self` is spelled `This`** — `function len(this: This*) -> u64` for the implementing-type reference. Not `Self`.
+- **No function-pointer parameters in the C++ bootstrap** — callback-style helpers fail codegen there. Keep match blocks inline rather than passing closures. (cryoc-the-compiler handles them fine; this is bootstrap-only.)
+- **Struct literals**: `new T { field: value, ... }` syntax. cryoc has had bugs with field-init missing values in the past — fixed in commit `8a743407`.
+
+## 3. Strategic direction — Path 2 → Path 3
+
+The user has decided a path. Read this section before doing any compiler work.
+
+### Where we are now (Path 2)
+
+- **Daily dev**: bootstrap → stage-2 → stage-3, where stage-3 (`cryoc/build/bin/cryo`) is "the working compiler". `make cryo` produces this in ~5 minutes.
+- **Verification gate**: `make selfhost-check` (8-stage chain through stage-5, ~10 min) verifies stage-4 == stage-5 byte-identical IR. Run before tagging or pre-commit, **not per-edit**.
+- **Bootstrap is frozen**. Don't touch C++ code in `bootstrap/` unless something is genuinely broken. Two known harmless bootstrap quirks (see §6) push the fixed point from stage-3 to stage-4. **Don't fix them** — we're throwing bootstrap away soon.
+
+### Where we're going (Path 3, near-term)
+
+When the user tags 0.1.0:
+- The known-good `cryo` binary will be **committed to the repo** (or distributed via GitHub Releases) as the new starting point for builds.
+- The C++ bootstrap becomes archeology — kept around for "I have no cryo binary at all" emergencies.
+- All future releases use **only** `cryoc` to build `cryoc`. Two stages instead of three: pre-built-cryo → cryoc → verify (== pre-built-cryo).
+- At that point, the selfhost-check naturally drops to stage-2 vs stage-3 byte-identity (no bootstrap noise), and the chain shrinks.
+
+**The thing to avoid:** spending time fixing bootstrap bugs that get thrown away in weeks. The user said: "I really want to avoid the bootstrap compiler as much as possible. I just want it to work enough so I can build with it if needed for 0.1.0, but then soon after, I will only use cryoc for future releases."
+
+## 4. Repo layout
 
 ```
-bin/cryo (C++ bootstrap)  ──┐
-                             ▶  cryoc/build/cryoc          (stage 2)
-                             │
-stage-2 cryoc           ────┴──┐
-                                ▶  cryoc/build/bin/cryoc   (stage 3)
-                                │
-stage-3 cryoc          ────────┴──▶ stage-3 self-host of stdlib  ✅
+.
+├── bootstrap/         C++ bootstrap compiler. FROZEN. Don't edit unless emergency.
+│   ├── bin/cryo       The bootstrap binary (66MB, in .gitignore)
+│   ├── include/, src/, libs/, scripts/, tests/
+│   └── makefile       `cd bootstrap && make compiler` builds bin/cryo
+├── cryoc/             Self-hosted Cryo compiler (written in Cryo)
+│   ├── src/           cryoc source — `compiler/`, `CLI/`, `utils/`
+│   ├── build/         stage-2 + stage-3 outputs (gitignored)
+│   ├── build-s4/      stage-4 outputs (gitignored)
+│   ├── build-s5/      stage-5 outputs (gitignored)
+│   ├── cryoconfig     project_name = "cryo", target = executable
+│   └── llvm_bindings.h
+├── stdlib/            CURRENT stdlib (~25k LOC, 53 modules) — what cryoc compiles
+├── new_stdlib/        FUTURE-spec stdlib (~10k LOC) — parked; cryoc can't compile it yet
+├── tools/             CryoLSP, CryoFormat, CryoAnalyzer (all C++; deferred until post-0.1)
+├── docs/              cryo.md, grammar.md, mangling-spec.md, syntax JSON (stale, needs audit)
+├── examples/, scripts/, assets/
+├── Makefile           Top-level orchestration (NEW this session — see §5)
+├── install.sh         BROKEN — references dead `./bin/cryo` path (see §7 punch list)
+└── README.md          BROKEN paths — references ./bin/cryo
 ```
 
-Resume script (lives only in `/tmp` on this machine — **uses separate build dirs for stage-2 vs stage-3 stdlib output**, so the IRs can be diffed without overwriting):
+No `.github/`. No `CHANGELOG.md`. No release artifacts yet.
 
-```bash
-cat > /tmp/full_build.sh <<'EOF'
-#!/bin/bash
-set +e
-ROOT=/workspaces/CryoLang
-BOOT=$ROOT/bin/cryo
-STAGE2=$ROOT/cryoc/build/cryoc
-STAGE3=$ROOT/cryoc/build/bin/cryoc
+### Stdlib decision
 
-run_stage3_stdlib() {
-    echo "=== STAGE-3 SELF-HOST: stdlib via stage 3 (build-dir=.bin-s3) ==="
-    [ -x "$STAGE3" ] || { echo "  stage-3 missing — skipping"; return; }
-    cd "$ROOT/stdlib"
-    rm -rf .bin-s3 && mkdir -p .bin-s3/obj
-    "$STAGE3" build --build-dir=.bin-s3 > /tmp/stage3_stdlib.log 2>&1
-    local rc=$?
-    echo "stage3-stdlib exit $rc"
-    if [ "$rc" -ne 0 ]; then
-        echo "  highest module reached:"
-        grep 'Phase 2: Processing module' /tmp/stage3_stdlib.log | tail -1 | sed 's/^/    /'
-        echo "  last 10 lines:"
-        tail -10 /tmp/stage3_stdlib.log | sed 's/^/    /'
-    fi
-}
-[ "$1" = "stage3" ] && { run_stage3_stdlib; exit; }
+Per the user (this session): keep both stdlibs as-is for now. cryoc currently depends on `./stdlib`. `new_stdlib/` is parked — when cryoc gains the features it requires, `new_stdlib/` will replace `stdlib/` (and `stdlib/` will become `stdlib-legacy/`). For 0.1.0, only `./stdlib` ships. **Don't try to merge them or migrate now.**
 
-echo "=== STEP 1: stdlib via bootstrap (.bin) ==="
-cd "$ROOT/stdlib" && rm -rf .bin && mkdir -p .bin/obj
-"$BOOT" build > /tmp/step1.log 2>&1; echo "step1 exit $?"
+## 5. Top-level Makefile (committed `de0a16fd` + `3d880760`)
 
-echo "=== STEP 2: cryoc via bootstrap ==="
-cd "$ROOT/cryoc"
-"$BOOT" build > /tmp/step2.log 2>&1; echo "step2 exit $?"
-
-echo "=== STEP 3: stdlib via stage-2 (.bin-s2) ==="
-cd "$ROOT/stdlib" && rm -rf .bin-s2 && mkdir -p .bin-s2/obj
-"$STAGE2" build --build-dir=.bin-s2 > /tmp/step3.log 2>&1; echo "step3 exit $?"
-
-echo "=== STEP 4: cryoc → stage-3 ==="
-cd "$ROOT/cryoc" && rm -rf build/obj build/bin
-"$STAGE2" build > /tmp/step4.log 2>&1; echo "step4 exit $?"
-
-echo "=== TRACES (stage 4) ==="
-echo "  BCTOR-T6 successes: $(grep -c BCTOR-T6 /tmp/step4.log)"
-echo "  BCTOR-BAIL distribution:"
-grep BCTOR-BAIL /tmp/step4.log | sort | uniq -c | sed 's/^/    /'
-
-echo
-run_stage3_stdlib
-echo "=== DONE ==="
-EOF
-chmod +x /tmp/full_build.sh
-```
-
-**Key dirs after a green build:**
-- `stdlib/.bin/`     — bootstrap stdlib build (step 1)
-- `stdlib/.bin-s2/`  — stage-2 stdlib build (step 3) — `obj/*.ll` for diff
-- `stdlib/.bin-s3/`  — stage-3 stdlib build (final) — `obj/*.ll` for diff
-- `cryoc/build/cryoc.ll` — IR of stage-2 (bootstrap-emitted)
-- `cryoc/build/obj/*.ll` — IR of stage-3 (stage-2-emitted)
-
-`--build-dir=...` was added by the user mid-session so stage-2 and stage-3 stdlib outputs don't overwrite each other. Use it.
-
-Bootstrap rebuild (only after editing C++ in `src/` or `include/`):
-
-```bash
-rm -rf bin/.o && rm -f bin/cryo && make compiler
-```
-
-The makefile doesn't track header dependencies — clean the .o tree on header changes.
-
----
-
-## 3. Bugs fixed this session (uncommitted)
-
-All four are diagnosed root causes, no workarounds. Order is the order they were unblocked.
-
-### Bug A — `E0167: unresolved generic instantiation after monomorphization`
-**File:** `cryoc/src/compiler/passes/specialization.cryo`
-
-The `GenericValidation` pass walks every `InstantiatedType` in the arena and reports any whose `resolved_type` is unset. It used to skip "template-internal" instantiations by checking only the **direct** type args for `GenericParam`/`BoundedParam`. That missed nested cases like `Option<Result<T, E>>` — the direct arg is an `InstantiatedType` (Result), and Result's own args are `GenericParam`s.
-
-The validator now uses `type_contains_generic_param_v` (added as a free function to keep the non-virtual-dispatch property required by the C++ codegen's vtable bug), which mirrors `Monomorphizer::type_contains_generic_param` and recurses through `Pointer`, `Reference`, `Array`, `Optional`, `Tuple`, `Function`, and nested `InstantiatedType`.
-
-Diagnosis pivot: enriching the validator's error message with `[id=… kind=…]` for each type arg revealed `id=455: Option<Result<T, E>>` with `T,E` still as `GenericParam`s — exactly the case the shallow filter missed.
-
-### Bug B — `declare_intrinsic` SIGSEGV during Phase 7
-**File:** `cryoc/src/compiler/codegen/decl_codegen.cryo`
-
-`declare_intrinsic` was calling `fixed_param_count(node)` where `node` is `IntrinsicDeclNode*`, but `fixed_param_count`'s parameter type is `FunctionDeclNode*`. The two classes both inherit from `DeclarationNode` but have different field layouts. Reading `func.is_variadic` lands past the end of an `IntrinsicDeclNode`'s allocation; on stage-3 that read landed in unmapped memory and SIGSEGV'd inside the very first stdlib codegen module (`std::core::intrinsics`).
-
-Added a separately-typed `fixed_param_count_intrinsic(node: IntrinsicDeclNode*)`. Same logic, correct type.
-
-This is a **latent** bug — the prior pass-6 failure (Bug A) gated codegen, so it never surfaced. With Bug A fixed, it triggered immediately.
-
-### Bug C — Narrow-store miscompile for `i8` array element assignment
-**File:** `cryoc/src/compiler/codegen/ir_generator.cryo` (`visit_binary_expr`)
-
-`name_buf[k] = '_'` (where `name_buf: i8*` and `'_'` is a `char` lowering to `i32`) emitted a 4-byte `store i32` into a 1-byte slot, clobbering the next 3 bytes. The existing `chartrunc` branch only fired for `String`-typed indexables — it didn't cover `Pointer-to-i8` or `Array-of-i8`.
-
-The fix decides on truncation by the **destination element type** (`node.left.resolved_type`): truncate to `i8` whenever it's `Char`, `i8`, or `u8`. Catches all three indexable forms (string, ptr-to-i8, array-of-i8) in a single check.
-
-Diagnosis pivot: in-loop probes revealed the corruption pattern. Storing `'_'` (95) at index 3 left bytes 4/5/6 reading as 0:
-```
-k=3 before=58 (':')  after=95 ('_')
-k=4 before=0         after=0      <-- should have been ':' (58)
-k=5 before=0         after=0      <-- should have been 'c' (99)
-k=6 before=0         after=0      <-- should have been 'o' (111)
-```
-That's the i32 store stomping the neighbours.
-
-### Bug D — Sign-unaware integer widening in struct-field initialization
-**Files:** `cryoc/src/compiler/codegen/expr_codegen.cryo`, `cryoc/src/compiler/codegen/stmt_codegen.cryo`, `cryoc/src/compiler/codegen/ir_generator.cryo` (`visit_new_expr`'s `struct_init` path)
-
-This was the OOM-blow-up that surfaced after Bug C: stage-3's stdlib emit hung in `LLVMTargetMachineEmitToFile` for `std::core::primitives` and the process climbed to 9 GB RSS before Codespaces SIGTERM'd it.
-
-The IR diff between stage-2 (`{ ptr, i64, i64 }`) and stage-3 (`[4294967295 x i32]`) for the parameter type of `string::new(value: char[])` showed stage-3 was producing a 4 GB **fixed** array because `t.is_fixed()` returned `true` for what should have been a dynamic array (sentinel size = `-1`).
-
-Root cause: `new ArrayAnnotation { size: -1, ... }` was being miscompiled. `-1` is parsed as `i32 -1`, and the field-init store was emitted as a literal `store i32 -1` into the `i64` slot — leaving the upper 4 bytes uninitialised. After malloc those 4 bytes happened to be zero, so `size` came out as `0x00000000FFFFFFFF` = **4294967295**, a positive i64. `is_fixed()`'s signed `>= 0` then returned `true`. `map_array` did `t.size as u32` (truncating back to 4294967295), and asked LLVM for `[4294967295 x i32]`.
-
-There were three sites that did integer-width widening with `build_zext`. All three now pick `sext` vs `zext` based on the destination's signedness:
-- `expr_codegen.cryo::codegen_struct_literal` — struct literals (`Foo { a: -1 }`)
-- `stmt_codegen.cryo::codegen_local_var` — local `mut x: i64 = -1`
-- `ir_generator.cryo::visit_new_expr`'s `struct_init` block — `new T { fields }`
-
-Diagnosis pivot: dumping `*.pre.ll` from the object emitter and diffing stage-2 vs stage-3 IR showed the bad parameter type. Then grepping `store i32 -1` in stage-3 IR pointed straight at the `ArrayAnnotation` malloc-init.
-
-This is the same family as the prior `feedback_int_widening_assignment_bug.md` (i32 → i64 leaving upper bits uncleared) but extended: **signed** widening also needs `sext`, not just zero-aware `zext`.
-
----
-
-## 4. Hard rules (carry forward)
-
-These have come up repeatedly — keep honouring them.
-
-- **No workarounds, fallbacks, or hacks.** Diagnose root causes; never relocate code "where it builds" to dodge a tooling bug. (`feedback_no_workarounds.md`)
-- **No safe-fallback defaults for invariant violations.** Bail with a real diagnostic, don't silently substitute placeholders.
-- **No fallback chains in lookups.** Bare-name DI lookups are reserved for C externs.
-- **No inline string manipulation in codegen.** Add a method to `CodegenContext`/`DeclarationIndex`/`InternTable` instead.
-- **Variables must declare their type with `:`.** `const x: int = 10;`, no inference shorthand.
-- **Trait `This`, not `Self`.** (`feedback_this_not_self_keyword.md`)
-- **`GenericValidation` and similar passes must avoid virtual dispatch on `Type*`.** Use only `t.kind` (plain enum field) plus subclass casts and field reads. The C++ codegen has a known vtable offset bug. The new `type_contains_generic_param_v` helper is a free function for exactly this reason — do not "refactor" it onto `TypeArena` as a virtual method.
-
----
-
-## 5. Investigation discipline
-
-- **Use IR for debugging — and keep stage-2 vs stage-3 outputs in separate dirs.** `--build-dir=...` is the right tool. The session's biggest unblock came from dumping `*.pre.ll` from the object emitter and `diff -u`-ing the two:
-  - `stdlib/.bin-s2/obj/<module>.ll` vs `stdlib/.bin-s3/obj/<module>.o.pre.ll`
-  - or `cryoc/build/cryoc.ll` (bootstrap-emitted) vs `cryoc/build/obj/<module>.ll` (stage-2-emitted)
-- **Stop iterating blindly.** Each full build chain is ~3 minutes. Prefer to add **many** probes per build cycle, then look — don't add one-line probes one at a time. The user will (correctly) interrupt if you do; this rule was reinforced mid-session.
-- **gdb works on stage-3** (the bootstrap is fast enough that signals fire before any timeout). Use `gdb -batch -ex 'set pagination off' -ex 'attach <PID>' -ex 'thread 1' -ex 'bt 30' -ex 'detach' -ex 'quit'` for live attach to a hung run.
-- **`ps -o ...| grep VmRSS`-loop** worked well to confirm an OOM-blow-up vs a true hang.
-- **The user handles all rebuilds and commits** unless explicitly told otherwise. In auto mode, build/commit yourself, but err on the side of asking when in doubt.
-
----
-
-## 6. Bootstrap is a trapdoor — but patchable when needed
-
-Long-term aim: replace `bin/cryo` with stage-3 cryoc. **But** specific narrow bugs in the bootstrap can be patched when they block progress (the previous session did this for the Token UAF). The makefile doesn't track header deps — clean the .o tree on header changes (`rm -rf bin/.o`).
-
-C++ source layout:
-- `src/Codegen/` — bootstrap codegen (CodegenVisitor.cpp dispatches; per-expression / per-statement subdirs)
-- `src/AST/` — bootstrap AST builder
-- `src/Parser/Parser.cpp` — bootstrap parser (single 8000-line file)
-- `src/Lexer/lexer.cpp` + `include/Lexer/lexer.hpp` — Token, Lexer, tokenization
-- `src/Compiler/` — pass manager, compiler instance, module loader
-
----
-
-## 7. Next steps
-
-In rough priority order:
-
-1. **Verify stage-3 compiles cryoc itself.** The build chain checks stage-3 against stdlib but not against cryoc source. A simple test:
-   ```bash
-   cd cryoc && rm -rf build/obj build/bin && /workspaces/CryoLang/cryoc/build/bin/cryoc build
-   ```
-   If that succeeds, the bootstrap is genuinely replaceable.
-
-2. **Audit other `build_zext` sites for sign-awareness.** I found three (codegen_struct_literal, codegen_local_var, visit_new_expr). Possible others:
-   - `cryoc/src/compiler/codegen/stmt_codegen.cryo:156` (`ret.zext`)
-   - `cryoc/src/compiler/codegen/stmt_codegen.cryo:497` (`match.coerce.zext`)
-   - `cryoc/src/compiler/codegen/expr_codegen.cryo:703` (`arg.trunc` is fine; check the matching widen path)
-   - `coerce_icmp_operands` always-zext for `match` patterns (line 497 above) — likely wrong for negative subjects too.
-   Each `zext`-only call is a latent bug for any signed source whose value happens to look "non-negative" because the upper bits zeroed out by accident. Audit and add the `sext` branch where the destination is signed.
-
-3. **Stop the diff-emit `.pre.ll` dump leak.** I removed it before declaring success; if you re-add it for further debugging, gate it on `ctx.debug_mode` so non-debug runs don't write 17 MB per module to disk.
-
-4. **Strip session-only diagnostic prints once stage-3 is stable across cryoc + stdlib.** The pre-existing prints listed in §8 are still load-bearing for ongoing debugging. Don't strip them yet.
-
-5. **`5 [BCTOR-BAIL]` on `BaseASTVisitor::BaseASTVisitor` arity=1** is still cosmetic — no functional impact. Investigate when convenient; not blocking.
-
-6. **Commit the four fixes.** The user said they'd handle commits; a sensible split:
-   - One commit for Bug A (specialization filter) + diagnostic enrichment.
-   - One commit for Bug B (`fixed_param_count_intrinsic`).
-   - One commit for Bug C (narrow-store chartrunc generalisation).
-   - One commit for Bug D (signed widening — three files).
-
----
-
-## 8. Diagnostic prints to keep / remove
-
-These were already in source before this session and are load-bearing for ongoing debugging:
-
-| File | Prefix | Purpose |
+Targets:
+| Target | Time | What it does |
 |---|---|---|
-| `cryoc/src/compiler/parser/parser.cryo` | `[PARSE-DBG]` | Parser node creation tracking |
-| `cryoc/src/compiler/passes/type_resolution.cryo` | `[VT-DBG]` | Vtable/method registration |
-| `cryoc/src/compiler/codegen/ir_generator.cryo` | `[BCTOR-*]`, `[CTOR-CHECK]` | Base-ctor call wiring |
-| `cryoc/src/compiler/passes/pass_registry.cryo` | `[TypeDecl]` | Pass-stage tracing |
+| `make help` | instant | Lists targets |
+| `make bootstrap` | ~30s if cached, ~3min cold | Builds C++ bootstrap → `bootstrap/bin/cryo` |
+| `make stdlib` | ~30s | Builds stdlib via bootstrap → `stdlib/.bin/libcryo.a` |
+| `make cryo` | ~5min | Full daily build: stdlib + bootstrap → stage-2 → stage-3. Output: `cryoc/build/bin/cryo` |
+| `make selfhost-check` | ~10min | 8-stage chain through stage-5; diffs stage-4 vs stage-5 IR for byte identity |
+| `make clean` | instant | Wipes cryoc + stdlib build outputs (keeps bootstrap binary) |
+| `make distclean` | instant | Also runs `make -C bootstrap clean` |
 
-Don't strip them until stage-3 fully self-hosts cryoc itself (i.e. step #1 in §7 is green).
+**Why 8 stages instead of 6**: Bootstrap (C++) has two harmless codegen quirks that bake into stage-3's IR but don't affect runtime. Real fixed point is stage-4. Building stage-5 confirms it. Going away once we drop bootstrap (Path 3). See §6 for the gory detail.
 
-This session added and **already removed** probes in `passes.cryo`, `instance.cryo`, `llvm_types.cryo`, `expr_codegen.cryo`, `ir_generator.cryo` (chartrunc/widen instrumentation, `DISPOSE-DBG`/`OBJ-DBG`/`EMIT-DBG`/in-loop char traces).
+Variables in Makefile:
+- `BOOT = $(ROOT)/bootstrap/bin/cryo`
+- `STAGE2 = $(ROOT)/cryoc/build/cryo`
+- `STAGE3 = $(ROOT)/cryoc/build/bin/cryo`
+- `STAGE4 = $(ROOT)/cryoc/build-s4/bin/cryo`
+- `STAGE5 = $(ROOT)/cryoc/build-s5/bin/cryo`
 
----
+## 6. Self-host state
 
-## 9. Memory entries to consider writing
+🟢 **The compiler self-hosts at a true byte-level fixed point at stage-4.**
 
-Worth saving to `~/.claude/projects/-workspaces-CryoLang/memory/` before context turns over:
+- `bootstrap` (C++) → `cryoc/build/cryo` (stage-2)
+- stage-2 → `cryoc/build/bin/cryo` (stage-3)
+- stage-3 → `cryoc/build-s4/bin/cryo` (stage-4)
+- stage-4 → `cryoc/build-s5/bin/cryo` (stage-5)
 
-- **`feedback_widen_signedness.md`** — `i32 -1 → i64` must `sext`, not `zext`. Three sites fixed; audit for more (see §7.2). Same family as `feedback_int_widening_assignment_bug.md` but for signed sources.
-- **`feedback_distinct_decl_layouts.md`** — `IntrinsicDeclNode` and `FunctionDeclNode` both inherit from `DeclarationNode` but have different field layouts. Don't pass one where the other is expected; reading past the end is a SIGSEGV waiting to happen.
-- **`feedback_validator_recurse.md`** — Pass filters that mirror monomorphizer behaviour must recurse through compound types the same way; shallow direct-arg checks miss `Outer<Inner<T>>` patterns.
+**stage-4 and stage-5 are byte-identical**: linked `cryo.ll` MD5 `a6b1a2910054e3cbad854b2bf53c6525` either way, all 103 per-module `.ll` files match, all 103 `.o` files match. 0 errors at every stage.
 
-Each is a real recurring trap and worth one entry.
+### Why not stage-3 == stage-4 (the bootstrap quirks)
 
----
+Bootstrap emits stage-2 with two codegen quirks that bake into stage-3 IR but don't affect runtime:
 
-## 10. Commands cheatsheet
+1. **Dead `@FILE.str` globals**: `bootstrap/src/Codegen/Expressions/ExpressionCodegen.cpp:430-438` calls `CreateGlobalStringPtr` on every visit to a `FILE` identifier with no caching, AND something in bootstrap's monomorphization pipeline visits `FILE` identifier nodes ~3.5× more times than cryoc does. Result: stage-3 IR for `Compiler__CompileMode` has 3206 `@FILE.str` declarations but only 900 references — 2306 orphan globals. They become dead read-only data in the binary; nothing references them at runtime.
+2. **Unmangled `@panic` call** in `std__prelude.o`: `bootstrap/src/Compiler/StandardPasses.cpp:2426` special-cases `panic`/`unreachable`/`abort`/`todo` and emits `call void @panic(...)` (bare name) where cryoc-built code emits `call void @"C$3std.7prelude.5panic$FS_S_j$Rv"(...)` (mangled). Linker resolves both correctly.
+
+Stage-3's *behavior* is identical to stage-4's (same call counts, same definition counts). So stage-3 → stage-4 produces clean IR, and stage-4 → stage-5 confirms the fixed point. Per §3, **don't fix these in bootstrap** — we're dropping bootstrap soon.
+
+### Path 3 transition: when bootstrap goes away
+
+Once the user commits a known-good `cryo` binary as a starting point:
+- Drop the 8-stage chain back to 4 stages: `pre-built-cryo` builds stdlib + cryoc → stage-A; stage-A builds stdlib + cryoc → stage-B; verify A == B byte-identical.
+- The bootstrap-induced FILE.str / panic-mangling quirks vanish (they only existed because bootstrap emitted stage-2).
+- Selfhost-check time drops back to ~5min.
+- Update Makefile: replace `BOOT := $(ROOT)/bootstrap/bin/cryo` with `BOOT := $(ROOT)/path/to/committed/cryo`. Stages 1-2 collapse.
+
+## 7. 0.1.0 readiness — punch list
+
+Status of the punch list, ordered by what blocks the next thing.
+
+**Done this session:**
+- ✅ Top-level Makefile orchestration (commit `de0a16fd`)
+- ✅ `selfhost-check` target with byte-identity gate (commit `3d880760`)
+- ✅ cryoc binary renamed → `cryo` (commit `de0a16fd`)
+- ✅ History rewrite: 70MB `bootstrap/bin/cryolsp` purged from all git history (was bloating clones forever)
+- ✅ History rewrite: ~330MB of build/debug logs purged (`full_build_log_after_fix.txt` 84MB, `clean_build.txt` 76MB, `stdlib/debug2.txt` 52MB, etc.)
+- ✅ History rewrite: all `*.old` backup files purged
+- ✅ 12 stale local branches deleted (8 `claude/*` + `codegen-rewrite` + `lsp-rewrite` + `optimize-cryo-codegen-UUapt` + `stdlib-integration` — all 0 commits ahead of main)
+- ✅ Repo size: was ~500MB+ in git (with cryolsp + logs), now `.git` is 8.1M, pack 7.4 MiB
+- ✅ Force-push to `origin/main` happened (user authorized)
+- ✅ `.gitignore` updated: `cryolsp` matches at any depth (was root-only `/bin/cryolsp`)
+- ✅ Memory finding: stage-4 is the real fixed point, not stage-3
+
+**Must do before tagging 0.1.0:**
+
+1. **Fix the post-move dead references**: `README.md` and `install.sh:389` still reference `./bin/cryo` (pre-move). Quick win, ~15 min, but the repo currently doesn't pass a "follow the README and try it" smoke test. Both should reference `bootstrap/bin/cryo` for the bootstrap or (better) `cryoc/build/bin/cryo` for the self-hosted binary, depending on which the user wants users to encounter first.
+
+2. **Decide and commit `0.1.0` cryo binary** (Path 3 prep). This is the user's near-term goal. Need to figure out:
+   - Where does the binary live? (`bin/cryo` at root? `releases/v0.1.0/cryo`? GitHub Releases asset?)
+   - How big is it? (Currently `cryoc/build/bin/cryo` = 2.6MB — small enough to commit if desired.)
+   - What .gitignore changes are needed if it goes in-repo?
+   - Update Makefile to support "use committed binary" as the bootstrap path.
+
+3. **`install.sh` rewrite for the new layout**. Currently broken. Decide install layout — typical: `/usr/local/bin/cryo`, `/usr/local/lib/cryo/libcryo.a`, `/usr/local/include/cryo/`. Ship the cryo binary (not bootstrap) by default.
+
+4. **CHANGELOG.md stub** with a 0.1.0 section.
+
+5. **CI workflow** (single GitHub Actions YAML): on push/PR, run `make cryo` + `make selfhost-check`. Without this, regressions sneak in. Path 2 means selfhost-check is the gate — if stage-4 != stage-5, refuse the merge. Note: ~10min CI run is borderline; you can split into two jobs (`make cryo` fast for PRs, full `selfhost-check` only on main pushes).
+
+**0.1.0 polish (nice-to-have):**
+
+6. **README** must have an example that compiles and runs end-to-end (smoke test).
+7. **`docs/cryo.md`, `docs/grammar.md`** accuracy pass — both predate recent compiler work.
+8. **tools/ disposition**: in 0.1 or "coming in 0.2"? If they ship, they need build targets and install paths. If not, README must say so. Recommend deferring to 0.2.
+9. **scripts/ audit**: `scripts/build-stdlib.py` was used by old layout, may not be relevant now.
+10. **`cryo --help` audit**: make sure flags like `--build-dir=...`, `--debug`, `--ast` are either documented or hidden. Confirmed `cryo --version` works (returns "cryo 0.1.0").
+
+**Post-0.1.0:**
+
+- Real test suite. Current: only `cryoc/BattleTest.cryo.test` exists.
+- Strip the now-redundant cloner workarounds in `cryoc/src/compiler/AST/cloner.cryo` (`clone_match_arm`, `clone_stmt` explicit kind dispatch) — only after Path 3 transition, when CI is guarding the fixed point.
+- Package management story.
+- Cross-compilation / Windows.
+- Decide what to do with `bootstrap/` long-term (delete? archive? keep as escape hatch?).
+
+## 8. Hard rules — carry forward
+
+These came up across sessions; honor them.
+
+- **No workarounds, fallbacks, or hacks.** Diagnose root causes; never relocate code "where it builds" to dodge a tooling bug. The vtable/cloner fixes in commits `f65e1737` and `d86f37ed` are canonical examples of doing it right.
+- **No safe-fallback defaults for invariant violations.** Bail with a real diagnostic, don't silently substitute placeholders.
+- **No fallback chains in lookups.** Bare-name DI lookups are reserved for C externs only; for Cryo types use `node.resolved_type` not name-based lookups.
+- **No inline string manipulation in codegen.** Add a method to `CodegenContext`/`DeclarationIndex`/`InternTable` instead.
+- **The user prefers foreground execution** for builds. Don't run the build chain as `run_in_background=true`. Run it synchronously.
+- **The user handles all rebuilds and commits** by default. In auto mode, build/commit yourself, but err on the side of asking when in doubt — especially for destructive or strategic actions.
+- **Don't push `--force` to `main`** unless the user explicitly authorizes that specific push.
+- **Bootstrap is FROZEN.** Don't fix bootstrap bugs unless they actively block 0.1.0 shipping. The user is committed to Path 3 — bootstrap goes away soon.
+
+## 9. Investigation discipline
+
+- **Use IR for debugging — keep stage outputs in separate dirs.** `--build-dir=...` is the right tool. Pattern that works:
+  - `cryoc/build/cryo.ll` (bootstrap-emitted stage-2) vs `cryoc/build/obj/<module>.ll` (stage-2-emitted) — for spotting "stage-2 emits this code wrong".
+  - `stdlib/.bin-s2/obj/<module>.ll` vs `stdlib/.bin-s3/obj/<module>.o.pre.ll` — for spotting "stage-3 emits this code wrong".
+- **Stop iterating blindly.** Each full chain is ~10 min. Add many probes per build cycle, then look — don't add one-line probes one at a time.
+- **`gdb -batch -ex 'attach <PID>' -ex 'thread 1' -ex 'bt 30' -ex 'detach' -ex 'quit'`** works on stage-3 for live SIGSEGV/hang diagnosis.
+- **Use `param_types_equal_structural` over `param_types_equal`** when comparing AST-derived types in cryoc — arena-dedup misses are common across resolution-context boundaries (this was one of yesterday's two bug fixes).
+
+## 10. Build commands cheatsheet
 
 ```bash
-# Stage-3-only re-test (faster than full chain when stage-2 hasn't changed)
-/tmp/full_build.sh stage3
+ROOT=/workspaces/CryoLang     # adapt to your machine
+cd $ROOT
 
-# Full build chain
-/tmp/full_build.sh
+# === Daily dev ===
+make cryo                     # ~5min: full bootstrap -> stage-2 -> stage-3 -> cryoc/build/bin/cryo
 
-# Backtrace from a fresh stage-3 hang/segfault
-cd $ROOT/stdlib && rm -rf .bin-s3 && mkdir -p .bin-s3/obj
-/workspaces/CryoLang/cryoc/build/bin/cryoc build --build-dir=.bin-s3 > /tmp/stage3_stdlib.log 2>&1 &
-PID=$!
-sleep 20  # wait for it to enter the bug
-gdb -batch -ex 'set pagination off' -ex 'attach '$PID -ex 'thread 1' -ex 'bt 30' \
-    -ex 'detach' -ex 'quit' 2>&1 | grep -E '^#|signal'
-kill -9 $PID
+# Sanity:
+./cryoc/build/bin/cryo --version    # "cryo 0.1.0"
+./cryoc/build/bin/cryo --help
 
-# Watch RSS for OOM diagnosis
-while kill -0 $PID 2>/dev/null; do
-    grep VmRSS /proc/$PID/status 2>/dev/null
-    sleep 3
-done
+# === Verification (pre-commit / pre-tag) ===
+make selfhost-check           # ~10min: 8 stages, diffs stage-4 vs stage-5 IR
 
-# Compare stage-2 vs stage-3 IR for a specific stdlib module
-diff stdlib/.bin-s2/obj/std__core__primitives.ll \
-     stdlib/.bin-s3/obj/std__core__primitives.o.pre.ll | head -100
+# === Cleanup ===
+make clean                    # wipes cryoc + stdlib outputs, keeps bootstrap binary
+make distclean                # also nukes bootstrap/bin/cryo + bootstrap intermediates
 
-# Find error-emit sites in cryoc
-grep -rn 'E0167\|unresolved generic instantiation' cryoc/src/
+# === Bootstrap (only if bootstrap binary missing or you absolutely must rebuild) ===
+make bootstrap                # ~3min cold, no-op if bootstrap/bin/cryo exists
 
-# Spot stage-2-vs-stage-3 differences in a function's IR
-grep -A20 'C\$.*string-3new\$F' cryoc/build/cryoc.ll cryoc/build/obj/*.ll
+# === Manual stage-by-stage (matches what selfhost-check does internally) ===
+BOOT=$ROOT/bootstrap/bin/cryo
+STAGE2=$ROOT/cryoc/build/cryo
+STAGE3=$ROOT/cryoc/build/bin/cryo
+STAGE4=$ROOT/cryoc/build-s4/bin/cryo
+
+# 1. stdlib via bootstrap
+cd $ROOT/stdlib && rm -rf .bin && mkdir -p .bin/obj && "$BOOT" build
+
+# 2. cryoc via bootstrap → stage-2
+cd $ROOT/cryoc && "$BOOT" build
+
+# 3. stdlib via stage-2
+cd $ROOT/stdlib && rm -rf .bin-s2 && mkdir -p .bin-s2/obj && "$STAGE2" build --build-dir=.bin-s2
+
+# 4. cryoc via stage-2 → stage-3
+cd $ROOT/cryoc && rm -rf build/obj build/bin && "$STAGE2" build
+
+# 5. stdlib via stage-3
+cd $ROOT/stdlib && rm -rf .bin-s3 && mkdir -p .bin-s3/obj && "$STAGE3" build --build-dir=.bin-s3
+
+# 6. cryo via stage-3 → stage-4
+cd $ROOT/cryoc && rm -rf build-s4 && "$STAGE3" build --build-dir=build-s4
+
+# 7. stdlib via stage-4
+cd $ROOT/stdlib && rm -rf .bin-s4 && mkdir -p .bin-s4/obj && "$STAGE4" build --build-dir=.bin-s4
+
+# 8. cryo via stage-4 → stage-5 + verify byte identity
+cd $ROOT/cryoc && rm -rf build-s5 && "$STAGE4" build --build-dir=build-s5
+diff -q $ROOT/cryoc/build-s4/bin/cryo.ll $ROOT/cryoc/build-s5/bin/cryo.ll && echo "FIXED POINT OK"
 ```
-
----
 
 ## 11. Don'ts
 
-- Don't push `--force` to main.
-- Don't delete the bootstrap binary without a working `make compiler` path.
-- Don't strip the existing `[BCTOR-*]` / `[PARSE-DBG]` / `[VT-DBG]` / `[TypeDecl]` printfs.
-- Don't try to fix bugs by adding "safe defaults" — emit a real diagnostic and bail.
-- Don't relocate code to a non-natural file just because the bootstrap is sensitive.
-- Don't drop the `--build-dir=...` separation between stage-2 and stage-3 stdlib outputs — without it, IR diffs are useless.
-- **Don't add probes one or two lines at a time.** Each cycle is 3 minutes; batch a comprehensive set per build.
+- **Don't fix bootstrap bugs.** Per §3, bootstrap is going away. Two known harmless quirks (FILE.str dead globals, unmangled @panic) are documented in §6 — leave them. The 8-stage chain handles them correctly.
+- **Don't try to make stage-3 == stage-4** without fixing bootstrap (which you shouldn't fix). The fixed point is at stage-4.
+- **Don't push `--force` to `main`.** User authorizes individual force-pushes only.
+- **Don't drop the `--build-dir=...` separation between stage outputs** — without it, IR diffs across stages are useless.
+- **Don't add probes one or two lines at a time.** Each cycle is ~10 min. Batch a comprehensive set per build.
+- **Don't strip the cloner workarounds** (`clone_match_arm`, `clone_stmt` explicit kind dispatch in `cryoc/src/compiler/AST/cloner.cryo`) until after 0.1.0 ships and CI is guarding the fixed point.
+- **Don't merge `stdlib/` and `new_stdlib/`** — the user has a plan for that, it's not now.
+- **Don't add features to bootstrap.** Frozen means frozen.
+- **Don't try to add the `tools/` (CryoLSP, CryoFormat, CryoAnalyzer) to the 0.1.0 release** without asking — they're deferred to 0.2 unless the user says otherwise.
+
+## 12. Recent commits worth knowing
+
+- `3d880760` (this session) — `build: shift selfhost-check fixed point from stage-3 to stage-4`. Why: bootstrap noise (see §6).
+- `de0a16fd` (this session) — `build: top-level Makefile + rename self-hosted binary cryoc -> cryo`. Adds Makefile, renames `project_name = "cryo"` in `cryoc/cryoconfig`, updates CLI banner in `cryoc/src/main.cryo:9`.
+- `7281a6f4` (this session) — `.gitignore`: `cryolsp` now matches at any depth.
+- `f65e1737` — `fix: enhance vtable slot index lookup with structural parameter type equality`. Fixed virtual dispatch breaking on overrides where param types had different arena IDs but same display name. Use `param_types_equal_structural` for AST-derived comparisons.
+- `d86f37ed` — `fix: improve statement node cloning to avoid C++ vtable bug and enhance error reporting`. Cloner now uses explicit kind dispatch in `clone_match_arm`/`clone_stmt` to dodge a bootstrap C++ vtable issue. Workaround can be stripped post-0.1.0 once Path 3 is in.
+- `8a743407` — `fix: initialize struct fields in struct literals to prevent uninitialized memory access`. Recent struct-init bug fix.
+
+## 13. Why this handoff exists
+
+Yesterday's session fixed two real cryoc bugs at the source level (vtable + cloner) and confirmed self-hosting reaches a byte-identical fixed point at HEAD. Today's session:
+
+1. Cleaned up the repo (history rewrite, stale branches, broken references)
+2. Created top-level build orchestration (`Makefile`)
+3. Renamed `cryoc` binary → `cryo`
+4. Discovered that the "byte-identical fixed point" was actually at stage-4 not stage-3 due to bootstrap codegen quirks; updated `selfhost-check` accordingly
+5. Reached strategic alignment: Path 2 (selfhost-check at stage-4) → Path 3 (drop bootstrap entirely, ship pre-built cryo as starting point)
+
+The next agent should focus on the §7 punch list, **not on bootstrap fixes**. The fastest path to 0.1.0 is README/install.sh fixes, then Path 3 transition (commit a cryo binary, retire bootstrap), then CI.
 
 Good luck.
