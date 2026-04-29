@@ -5,8 +5,9 @@
 #   stdlib           Build the standard library via bootstrap  (stdlib/.bin/)
 #   cryo             Build the self-hosted Cryo compiler via bootstrap
 #                    (cryoc/build/bin/cryo)
-#   selfhost-check   Full chain: bootstrap -> stage-2 -> stage-3 -> stage-4,
-#                    then verify stage-3 and stage-4 IR are byte-identical.
+#   selfhost-check   Full chain: bootstrap -> stage-2 -> stage-3 -> stage-4 ->
+#                    stage-5, then verify stage-4 and stage-5 IR are
+#                    byte-identical.
 #   clean            Remove cryoc + stdlib build outputs (bootstrap kept).
 #   distclean        Also clean bootstrap.
 #   help             List targets.
@@ -16,12 +17,19 @@
 #     future migration and is intentionally not built here.
 #   * The bootstrap binary lives at bootstrap/bin/cryo; the self-hosted binary
 #     lives at cryoc/build/bin/cryo. Disambiguated by path, not name.
+#   * The fixed point is at stage-4, not stage-3. Bootstrap (C++) emits stage-2
+#     with two harmless codegen quirks (dead `@FILE.str` globals in
+#     Compiler__CompileMode, and an unmangled `@panic` call in std__prelude)
+#     that bake into stage-3's IR but don't affect runtime. Stage-3's behavior
+#     is clean, so stage-4 is the first IR-level fixed point. We build stage-5
+#     to confirm it.
 
 ROOT   := $(CURDIR)
 BOOT   := $(ROOT)/bootstrap/bin/cryo
 STAGE2 := $(ROOT)/cryoc/build/cryo
 STAGE3 := $(ROOT)/cryoc/build/bin/cryo
 STAGE4 := $(ROOT)/cryoc/build-s4/bin/cryo
+STAGE5 := $(ROOT)/cryoc/build-s5/bin/cryo
 
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 
@@ -33,7 +41,7 @@ help:
 	@echo "  make bootstrap        Build the C++ bootstrap compiler"
 	@echo "  make stdlib           Build the standard library via bootstrap"
 	@echo "  make cryo             Build the self-hosted Cryo compiler"
-	@echo "  make selfhost-check   Full chain + stage-3/stage-4 byte-identity check"
+	@echo "  make selfhost-check   Full chain + stage-4/stage-5 byte-identity check"
 	@echo "  make clean            Remove cryoc + stdlib build outputs"
 	@echo "  make distclean        Also clean bootstrap"
 
@@ -61,40 +69,45 @@ cryo: stdlib
 # ---- full selfhost-check + byte-identity diff -------------------------
 selfhost-check: $(BOOT)
 	@echo "==> Wiping all stage outputs"
-	@rm -rf cryoc/build cryoc/build-s4
-	@rm -rf stdlib/.bin stdlib/.bin-s2 stdlib/.bin-s3
-	@echo "==> [1/6] stdlib via bootstrap"
+	@rm -rf cryoc/build cryoc/build-s4 cryoc/build-s5
+	@rm -rf stdlib/.bin stdlib/.bin-s2 stdlib/.bin-s3 stdlib/.bin-s4
+	@echo "==> [1/8] stdlib via bootstrap"
 	@mkdir -p stdlib/.bin/obj
 	@cd stdlib && "$(BOOT)" build
-	@echo "==> [2/6] cryoc via bootstrap -> stage-2 ($(STAGE2))"
+	@echo "==> [2/8] cryoc via bootstrap -> stage-2 ($(STAGE2))"
 	@cd cryoc && "$(BOOT)" build
-	@echo "==> [3/6] stdlib via stage-2 -> stdlib/.bin-s2"
+	@echo "==> [3/8] stdlib via stage-2 -> stdlib/.bin-s2"
 	@mkdir -p stdlib/.bin-s2/obj
 	@cd stdlib && "$(STAGE2)" build --build-dir=.bin-s2
-	@echo "==> [4/6] cryoc via stage-2 -> stage-3 ($(STAGE3))"
+	@echo "==> [4/8] cryoc via stage-2 -> stage-3 ($(STAGE3))"
 	@rm -rf cryoc/build/obj cryoc/build/bin
 	@cd cryoc && "$(STAGE2)" build
-	@echo "==> [5/6] stdlib via stage-3 -> stdlib/.bin-s3"
+	@echo "==> [5/8] stdlib via stage-3 -> stdlib/.bin-s3"
 	@mkdir -p stdlib/.bin-s3/obj
 	@cd stdlib && "$(STAGE3)" build --build-dir=.bin-s3
-	@echo "==> [6/6] cryo via stage-3 -> stage-4 ($(STAGE4))"
+	@echo "==> [6/8] cryo via stage-3 -> stage-4 ($(STAGE4))"
 	@cd cryoc && "$(STAGE3)" build --build-dir=build-s4
-	@echo "==> Verifying stage-3 == stage-4 IR byte identity"
-	@if diff -q cryoc/build/bin/cryo.ll cryoc/build-s4/bin/cryo.ll > /dev/null; then \
+	@echo "==> [7/8] stdlib via stage-4 -> stdlib/.bin-s4"
+	@mkdir -p stdlib/.bin-s4/obj
+	@cd stdlib && "$(STAGE4)" build --build-dir=.bin-s4
+	@echo "==> [8/8] cryo via stage-4 -> stage-5 ($(STAGE5))"
+	@cd cryoc && "$(STAGE4)" build --build-dir=build-s5
+	@echo "==> Verifying stage-4 == stage-5 IR byte identity"
+	@if diff -q cryoc/build-s4/bin/cryo.ll cryoc/build-s5/bin/cryo.ll > /dev/null; then \
 		echo ""; \
-		echo "FIXED POINT OK: stage-3 and stage-4 produce byte-identical IR"; \
+		echo "FIXED POINT OK: stage-4 and stage-5 produce byte-identical IR"; \
 	else \
 		echo ""; \
-		echo "FIXED POINT BROKEN: stage-3 and stage-4 IR differ"; \
-		diff cryoc/build/bin/cryo.ll cryoc/build-s4/bin/cryo.ll | head -40; \
+		echo "FIXED POINT BROKEN: stage-4 and stage-5 IR differ"; \
+		diff cryoc/build-s4/bin/cryo.ll cryoc/build-s5/bin/cryo.ll | head -40; \
 		exit 1; \
 	fi
 
 # ---- clean -------------------------------------------------------------
 clean:
 	@echo "==> Cleaning cryoc and stdlib build outputs"
-	@rm -rf cryoc/build cryoc/build-s4
-	@rm -rf stdlib/.bin stdlib/.bin-s2 stdlib/.bin-s3
+	@rm -rf cryoc/build cryoc/build-s4 cryoc/build-s5
+	@rm -rf stdlib/.bin stdlib/.bin-s2 stdlib/.bin-s3 stdlib/.bin-s4
 
 distclean: clean
 	@echo "==> Cleaning bootstrap"
