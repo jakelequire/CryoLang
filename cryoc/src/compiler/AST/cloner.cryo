@@ -109,10 +109,41 @@ public:
         return this.result as ExpressionNode*;
     }
 
-    /// Clone a statement node (cast wrapper).
+    /// Clone a statement node — uses explicit kind dispatch instead of
+    /// accept() virtual dispatch to dodge the C++ codegen overloaded-vtable
+    /// bug.  Without this, `node.accept(this)` on a MatchStmtNode can
+    /// resolve to visit(EnumDeclNode*) (or some other adjacent vtable
+    /// slot), which then writes a freshly-allocated EnumDecl into
+    /// this.result.  The resulting "method body" is a block containing
+    /// the original enum declaration as its sole statement, which IRGen
+    /// can't lower — so the function body is stripped, producing
+    /// undefined references at link.
     clone_stmt(node: StatementNode*) -> StatementNode* {
         if (node == null) { return null; }
-        node.accept(this);
+        match (node.kind) {
+            NodeKind::BlockStatement       => { this.visit(node as BlockStmtNode*); }
+            NodeKind::UnsafeBlockStatement => { this.visit(node as UnsafeBlockStmtNode*); }
+            NodeKind::ReturnStatement      => { this.visit(node as ReturnStmtNode*); }
+            NodeKind::IfStatement          => { this.visit(node as IfStmtNode*); }
+            NodeKind::WhileStatement       => { this.visit(node as WhileStmtNode*); }
+            NodeKind::DoWhileStatement     => { this.visit(node as DoWhileStmtNode*); }
+            NodeKind::ForStatement         => { this.visit(node as ForStmtNode*); }
+            NodeKind::MatchStatement       => { this.visit(node as MatchStmtNode*); }
+            NodeKind::SwitchStatement      => { this.visit(node as SwitchStmtNode*); }
+            NodeKind::CaseStatement        => { this.visit(node as CaseStmtNode*); }
+            NodeKind::BreakStatement       => { this.visit(node as BreakStmtNode*); }
+            NodeKind::ContinueStatement    => { this.visit(node as ContinueStmtNode*); }
+            NodeKind::ExpressionStatement  => { this.visit(node as ExprStmtNode*); }
+            NodeKind::DeclarationStatement => { this.visit(node as DeclStmtNode*); }
+            NodeKind::LoopStatement        => { this.visit(node as LoopStmtNode*); }
+            NodeKind::VariableDeclaration  => { this.visit(node as VarDeclNode*); }
+            _ => {
+                // Fall back to virtual dispatch for unhandled kinds — better
+                // than dropping the node entirely, even though dispatch may
+                // pick the wrong overload under the C++ vtable bug.
+                node.accept(this);
+            }
+        }
         return this.result as StatementNode*;
     }
 
