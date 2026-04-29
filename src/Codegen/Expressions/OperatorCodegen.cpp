@@ -505,7 +505,11 @@ namespace Cryo::Codegen
         }
 
         TokenKind op = node->operator_token().kind();
-        std::string op_str = std::string(node->operator_token().text());
+        // Defer op_str construction: when the unary node was synthesized by a
+        // pass without populating the token text, accessing text() copies from
+        // a dangling string_view and segfaults.  Only build op_str on the
+        // unsupported-operator error path (which already has a TokenKind to
+        // describe the operator).
 
         // Handle increment/decrement specially (they modify lvalues)
         if (op == TokenKind::TK_PLUSPLUS)
@@ -610,7 +614,8 @@ namespace Cryo::Codegen
         }
 
         report_error(ErrorCode::E0616_UNARY_OPERATION_ERROR, node,
-                     "Unsupported unary operator: " + op_str);
+                     "Unsupported unary operator: TokenKind=" +
+                         std::to_string(static_cast<int>(op)));
         return nullptr;
     }
 
