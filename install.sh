@@ -1,429 +1,257 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Cryo Programming Language — installer (v0.1.0).
+#
+# Scope: this script is a PATH wrapper, not a system install. It builds the
+# self-hosted cryo compiler in place and exposes `cryo` on your PATH by
+# appending an export to a shell rc file. It does NOT copy binaries to
+# /usr/local/bin or install the stdlib outside the repo. See the
+# "in-tree limitation" note at the end of this script for why.
+#
+# Usage: ./install.sh [options]
+#   -y, --yes          Skip the interactive confirmation
+#       --no-build     Assume compiler/build/bin/cryo already exists
+#       --shell=NAME   Pick which shell rc to update: bash | zsh | fish | none
+#                      Default: detect from $SHELL.
+#   -h, --help         Show usage and exit
+#
 
-# Exit immediately if a command exits with a non-zero status
-set -e
-# Set the IFS to only split on newlines and tabs
-IFS=$'\n\t'
-# Set the shell options
-shopt -s nullglob
-# Set the trap to cleanup on termination
-trap EXIT
+set -euo pipefail
 
-# Console Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-TEAL='\033[0;36m'
-PURPLE='\033[0;35m'
-BLUE='\033[0;34m'
-YELLOW='\033[0;33m'
-GREY='\033[0;37m'
-BOLD='\033[1m'
-ITALIC='\033[3m'
-UNDERLINE='\033[4m'
-COLOR_RESET='\033[0m'
-NEW_LINE=$'\n'
+# ----------------------------------------------------------------------------
+# Colors
+# ----------------------------------------------------------------------------
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+TEAL=$'\033[0;36m'
+BLUE=$'\033[0;34m'
+YELLOW=$'\033[0;33m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
 
-echo -e "$TEAL"
-echo -e "                  #               "
-echo -e "                = #^.             "
-echo -e "      =        ^# # #.            "
-echo -e "       ## ^##^# ##### #           "
-echo -e "       # ## # ## ### ## #         "
-echo -e "        ###^^# #(###=# #(=#       "
-echo -e "        ## # ## #   # ## #.#<     :::::::::  :::   :::  ::::::::   "
-echo -e "      ## # ## #       # ## # #.   :+:    :+: :+:   :+: :+:    :+:  "
-echo -e "   # # #-## #^                    +:+    +:+  +:+ +:+  +:+    +:+  "
-echo -e "   # # #=}# #<                    +#++:++#:    +#++:   +#+    +:+  "
-echo -e "      ## # ## #       # ## # #.   +#+    +#+    +#+    +#+    +#+  "
-echo -e "        ## # ## #   # ## #-#<     #+#    #+#    #+#    #+#    #+#  "
-echo -e "        ###<=# #(###=# #<^#       ###    ###    ###     ########   "
-echo -e "       # ## # ## ### ## #         "
-echo -e "       ## =##(# ##@## # "
-echo -e "      =        ^# # #.  "
-echo -e "                =.#<-  "
-echo -e "                  #   "
-echo -e "$COLOR_RESET"
-echo -e "$TEAL$BOLD                         Cryo Programming Language Installer $COLOR_RESET"
-echo " "
-echo "This script will install the Cryo Programming Language on your system."
-echo "It will install/compile the following components:"
-echo " "
-echo -e "$BLUE$BOLD  1. Cryo CLI$COLOR_RESET"
-echo -e "$BLUE$BOLD  2. Cryo Compiler$COLOR_RESET"
-echo -e "$BLUE$BOLD  3. cryo-path$COLOR_RESET"
-echo -e "$BLUE$BOLD  4. LSP Debug Server$COLOR_RESET"
-echo " "
-echo "In the installation process, the Cryo Compiler will be built from the source code."
-echo "After the compilation, it will also link the Cryo CLI to the global path."
-echo " "
-echo "This script will also install the following dependencies if they are not already installed:"
-echo " "
-echo -e "$GREEN$BOLD  1. LLVM 20$COLOR_RESET"
-echo -e "$GREEN$BOLD  2. Clang 20$COLOR_RESET"
-echo -e "$GREEN$BOLD  3. Make$COLOR_RESET"
-echo " "
-echo " "
-# Get confirmation from the user
-read -p "Do you want to continue with the installation? (Y/n): " choice
-if [ "$choice" != "Y" ] && [ "$choice" != "y" ]; then
-    echo -e "$RED $BOLD Installation cancelled! $COLOR_RESET"
-    exit 1
-fi
+log_info()    { echo "${BLUE}${BOLD}[info]${RESET}    $*"; }
+log_ok()      { echo "${GREEN}${BOLD}[ok]${RESET}      $*"; }
+log_warn()    { echo "${YELLOW}${BOLD}[warn]${RESET}    $*"; }
+log_error()   { echo "${RED}${BOLD}[error]${RESET}   $*" >&2; }
 
-# ================================================================================
-# Helper Functions
-# ================================================================================
+die() { log_error "$*"; exit 1; }
 
-log_info() {
-    echo -e "$BLUE$BOLD[INFO]$COLOR_RESET $1"
+# ----------------------------------------------------------------------------
+# Banner — the only piece kept from the original install.sh
+# ----------------------------------------------------------------------------
+print_banner() {
+    echo -e "${TEAL}"
+    echo -e "                  #               "
+    echo -e "                = #^.             "
+    echo -e "      =        ^# # #.            "
+    echo -e "       ## ^##^# ##### #           "
+    echo -e "       # ## # ## ### ## #         "
+    echo -e "        ###^^# #(###=# #(=#       "
+    echo -e "        ## # ## #   # ## #.#<     :::::::::  :::   :::  ::::::::   "
+    echo -e "      ## # ## #       # ## # #.   :+:    :+: :+:   :+: :+:    :+:  "
+    echo -e "   # # #-## #^                    +:+    +:+  +:+ +:+  +:+    +:+  "
+    echo -e "   # # #=}# #<                    +#++:++#:    +#++:   +#+    +:+  "
+    echo -e "      ## # ## #       # ## # #.   +#+    +#+    +#+    +#+    +#+  "
+    echo -e "        ## # ## #   # ## #-#<     #+#    #+#    #+#    #+#    #+#  "
+    echo -e "        ###<=# #(###=# #<^#       ###    ###    ###     ########   "
+    echo -e "       # ## # ## ### ## #         "
+    echo -e "       ## =##(# ##@## # "
+    echo -e "      =        ^# # #.  "
+    echo -e "                =.#<-  "
+    echo -e "                  #   "
+    echo -e "${RESET}"
+    echo "${TEAL}${BOLD}                         Cryo Programming Language Installer${RESET}"
+    echo
 }
 
-log_success() {
-    echo -e "$GREEN$BOLD[SUCCESS]$COLOR_RESET $1"
+# ----------------------------------------------------------------------------
+# Args
+# ----------------------------------------------------------------------------
+ASSUME_YES=0
+DO_BUILD=1
+SHELL_TARGET=""
+
+usage() {
+    sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
 }
 
-log_error() {
-    echo -e "$RED$BOLD[ERROR]$COLOR_RESET $1"
-}
-
-log_warning() {
-    echo -e "$YELLOW$BOLD[WARNING]$COLOR_RESET $1"
-}
-
-check_command() {
-    if command -v "$1" &> /dev/null; then
-        log_success "$1 is installed"
-        return 0
-    else
-        log_warning "$1 is not installed"
-        return 1
-    fi
-}
-
-# Detect the OS
-detect_os() {
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        OS="linux"
-        # Detect Linux distribution
-        if [ -f /etc/os-release ]; then
-            . /etc/os-release
-            DISTRO=$ID
-        else
-            DISTRO="unknown"
-        fi
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        OS="macos"
-        DISTRO="macos"
-    else
-        log_error "Unsupported operating system: $OSTYPE"
-        exit 1
-    fi
-    log_info "Detected OS: $OS ($DISTRO)"
-}
-
-# Install dependencies based on OS
-install_dependencies() {
-    log_info "Installing dependencies..."
-    
-    case $DISTRO in
-        "ubuntu"|"debian")
-            log_info "Installing dependencies for Ubuntu/Debian..."
-            sudo apt-get update
-            sudo apt-get install -y build-essential cmake git curl wget
-            
-            # Install LLVM 20
-            if ! check_command "clang-20"; then
-                log_info "Installing LLVM 20..."
-                wget -O - https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
-                sudo apt-get install -y clang-20 clang++-20 lldb-20 lld-20
-            fi
-            ;;
-        "fedora"|"rhel"|"centos")
-            log_info "Installing dependencies for Red Hat based systems..."
-            sudo dnf install -y gcc gcc-c++ make cmake git curl wget
-            
-            # Install LLVM 20
-            if ! check_command "clang-20"; then
-                log_info "Installing LLVM 20..."
-                sudo dnf install -y clang llvm-devel
-            fi
-            ;;
-        "arch")
-            log_info "Installing dependencies for Arch Linux..."
-            sudo pacman -Syu --noconfirm
-            sudo pacman -S --noconfirm base-devel cmake git curl wget clang llvm
-            ;;
-        "macos")
-            log_info "Installing dependencies for macOS..."
-            if ! command -v brew &> /dev/null; then
-                log_info "Installing Homebrew..."
-                /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-            fi
-            
-            brew update
-            brew install cmake git curl wget
-            
-            # Install LLVM
-            if ! check_command "clang"; then
-                log_info "Installing LLVM..."
-                brew install llvm
-                # Add LLVM to PATH
-                echo 'export PATH="/opt/homebrew/opt/llvm/bin:$PATH"' >> ~/.bashrc
-                echo 'export PATH="/opt/homebrew/opt/llvm/bin:$PATH"' >> ~/.zshrc
-                export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
-            fi
-            ;;
-        *)
-            log_warning "Unknown distribution. Please install build-essential, cmake, git, clang, and llvm manually."
-            ;;
-    esac
-}
-
-# Verify dependencies
-verify_dependencies() {
-    log_info "Verifying dependencies..."
-    
-    local missing_deps=()
-    
-    if ! check_command "make"; then
-        missing_deps+=("make")
-    fi
-    
-    if ! check_command "cmake"; then
-        missing_deps+=("cmake")
-    fi
-    
-    if ! check_command "git"; then
-        missing_deps+=("git")
-    fi
-    
-    # Check for clang (with various possible names)
-    if ! check_command "clang-20" && ! check_command "clang"; then
-        missing_deps+=("clang")
-    fi
-    
-    if [ ${#missing_deps[@]} -gt 0 ]; then
-        log_error "Missing dependencies: ${missing_deps[*]}"
-        log_info "Please install the missing dependencies manually or run with --install-deps"
-        exit 1
-    fi
-    
-    log_success "All dependencies are installed"
-}
-
-# Build the project
-build_project() {
-    log_info "Building Cryo Programming Language..."
-    
-    # Clean previous builds
-    log_info "Cleaning previous builds..."
-    make clean || true
-    
-    # Build the runtime libraries first
-    log_info "Building runtime libraries..."
-    make -C runtime all
-    make -C runtime install
-    
-    # Build main compiler
-    log_info "Building main compiler..."
-    make all -j$(nproc)
-    
-    # Build LSP server
-    log_info "Building LSP server..."
-    make lsp
-    
-    log_success "Build completed successfully!"
-}
-
-# Add binaries to PATH
-install_binaries() {
-    log_info "Adding Cryo binaries to system PATH..."
-    
-    # Use the current project's bin directory
-    local project_bin_dir="$(pwd)/bin"
-    
-    # Verify that binaries exist
-    if [ ! -f "$project_bin_dir/cryo" ]; then
-        log_error "cryo binary not found in $project_bin_dir"
-        return 1
-    fi
-    log_success "Found cryo at $project_bin_dir/cryo"
-    
-    # Check for LSP server binary
-    if [ -f "$project_bin_dir/cryo-lsp" ]; then
-        log_success "Found cryo-lsp at $project_bin_dir/cryo-lsp"
-    else
-        log_warning "cryo-lsp not found at $project_bin_dir/cryo-lsp - LSP server may not be available"
-    fi
-    
-    # Check for runtime libraries
-    if [ -f "$project_bin_dir/libcryoruntime.so" ] || [ -f "$project_bin_dir/libcryoruntime.a" ]; then
-        log_success "Found runtime libraries in $project_bin_dir"
-    fi
-    
-    # Make binaries executable
-    chmod +x "$project_bin_dir/cryo" 2>/dev/null || true
-    chmod +x "$project_bin_dir/cryo-lsp" 2>/dev/null || true
-    
-    # Add to shell configuration files
-    local shell_configs=("$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile")
-    local path_export_line="export PATH=\"$project_bin_dir:\$PATH\""
-    local added_to_config=false
-    
-    for config_file in "${shell_configs[@]}"; do
-        if [ -f "$config_file" ] || [ "$config_file" == "$HOME/.bashrc" ]; then
-            # Check if already added
-            if [ -f "$config_file" ] && grep -q "$project_bin_dir" "$config_file"; then
-                log_success "$project_bin_dir already in $config_file"
-            else
-                # Add to shell config
-                echo "" >> "$config_file"
-                echo "# Added by Cryo Programming Language installer" >> "$config_file"
-                echo "$path_export_line" >> "$config_file"
-                log_success "Added $project_bin_dir to $config_file"
-                added_to_config=true
-            fi
-        fi
-    done
-    
-    if [ "$added_to_config" = false ]; then
-        log_warning "Could not find shell configuration files. Please manually add to PATH:"
-        log_info "$path_export_line"
-    fi
-    
-    # Update current session PATH
-    export PATH="$project_bin_dir:$PATH"
-    
-    log_success "Cryo binaries are now accessible from: $project_bin_dir"
-    
-    return 0
-}
-
-# Verify installation
-verify_installation() {
-    log_info "Verifying installation..."
-    
-    local project_bin_dir="$(pwd)/bin"
-    
-    # Check if the project bin directory is in PATH
-    if [[ ":$PATH:" == *":$project_bin_dir:"* ]]; then
-        log_success "Project bin directory ($project_bin_dir) is in PATH"
-    else
-        log_warning "Project bin directory may not be properly added to PATH"
-    fi
-    
-    if command -v cryo &> /dev/null; then
-        local cryo_path=$(command -v cryo)
-        log_success "cryo is accessible at: $cryo_path"
-        
-        # Try to get version
-        local version=$(cryo --version 2>/dev/null || echo "")
-        if [ -n "$version" ]; then
-            log_success "cryo version: $version"
-        else
-            log_info "cryo is accessible but version check failed (this is normal if --version is not implemented)"
-        fi
-    else
-        log_error "cryo is not accessible in PATH"
-        log_info "Expected location: $project_bin_dir/cryo"
-        if [ -f "$project_bin_dir/cryo" ]; then
-            log_info "Binary exists but PATH may need to be refreshed. Try opening a new terminal or run:"
-            log_info "source ~/.bashrc"
-        fi
-        return 1
-    fi
-    
-    if command -v cryo-lsp &> /dev/null; then
-        local lsp_path=$(command -v cryo-lsp)
-        log_success "cryo-lsp is accessible at: $lsp_path"
-    else
-        log_warning "cryo-lsp is not accessible in PATH"
-        if [ -f "$project_bin_dir/cryo-lsp" ]; then
-            log_info "cryo-lsp binary exists but may not be in PATH. Try opening a new terminal or run:"
-            log_info "source ~/.bashrc"
-        fi
-    fi
-    
-    return 0
-}
-
-# ================================================================================
-# Main Installation Process
-# ================================================================================
-
-log_info "Starting Cryo Programming Language installation..."
-
-# Parse command line arguments
-INSTALL_DEPS=false
 for arg in "$@"; do
     case $arg in
-        --install-deps)
-            INSTALL_DEPS=true
-            shift
-            ;;
-        --help)
-            echo "Cryo Programming Language Installer"
-            echo ""
-            echo "Usage: $0 [options]"
-            echo ""
-            echo "Options:"
-            echo "  --install-deps    Install system dependencies automatically"
-            echo "  --help           Show this help message"
-            exit 0
-            ;;
+        -y|--yes)        ASSUME_YES=1 ;;
+        --no-build)      DO_BUILD=0 ;;
+        --shell=*)       SHELL_TARGET="${arg#--shell=}" ;;
+        -h|--help)       usage ;;
+        *)               die "unknown argument: $arg (try --help)" ;;
     esac
 done
 
-# Step 1: Detect operating system
-detect_os
+# ----------------------------------------------------------------------------
+# Locate repo root (resolve the script's own directory, follow symlinks)
+# ----------------------------------------------------------------------------
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")"
+REPO_ROOT="$(dirname "$SCRIPT_PATH")"
+CRYO_BIN="${REPO_ROOT}/compiler/build/bin/cryo"
+BIN_DIR="$(dirname "$CRYO_BIN")"
 
-# Step 2: Install dependencies if requested
-if [ "$INSTALL_DEPS" = true ]; then
-    install_dependencies
-fi
+[ -f "${REPO_ROOT}/Makefile" ] || die "could not find Makefile at ${REPO_ROOT} — is this script next to it?"
 
-# Step 3: Verify dependencies
-verify_dependencies
+# ----------------------------------------------------------------------------
+# Pre-flight summary
+# ----------------------------------------------------------------------------
+print_banner
 
-# Step 4: Build the project if needed
-if [ ! -f "bin/cryo" ]; then
-    log_info "Binary not found - building project..."
-    build_project
+echo "This installer will:"
+echo "  1. Verify your toolchain (clang++-20, LLVM 20, GNU make)"
+if [ $DO_BUILD -eq 1 ]; then
+    echo "  2. Build the self-hosted cryo compiler via 'make cryo'  (~5 min the first time)"
+    echo "  3. Add ${BIN_DIR} to your PATH via your shell rc"
 else
-    log_success "Found existing cryo binary - skipping build step"
+    echo "  2. (skipping build — --no-build was passed)"
+    echo "  3. Add ${BIN_DIR} to your PATH via your shell rc"
+fi
+echo
+echo "Repo root:       ${REPO_ROOT}"
+echo "Compiler binary: ${CRYO_BIN}"
+echo
+
+if [ $ASSUME_YES -ne 1 ]; then
+    read -r -p "Continue? [y/N] " reply
+    case "$reply" in
+        y|Y|yes|YES) ;;
+        *) die "cancelled" ;;
+    esac
 fi
 
-# Step 5: Add to PATH
-install_binaries
+# ----------------------------------------------------------------------------
+# OS check
+# ----------------------------------------------------------------------------
+case "$(uname -s)" in
+    Linux)   OS="linux" ;;
+    Darwin)  OS="macos"; log_warn "macOS support is untested on this revision; proceeding anyway." ;;
+    *)       die "unsupported OS: $(uname -s)" ;;
+esac
+log_info "OS detected: $OS"
 
-# Step 6: Verify installation
-if verify_installation; then
-    echo " "
-    echo -e "$GREEN$BOLD Installation Complete! $COLOR_RESET"
-    echo " "
-    echo "The Cryo Programming Language has been successfully installed on your system."
-    echo "You can now start using the Cryo CLI to compile and run Cryo programs."
-    echo " "
-    echo "To get started, you can run the following command:"
-    echo " "
-    echo "cryo --help"
-    echo " "
-    echo "This will display the help menu for the Cryo CLI."
-    echo " "
-    echo "I hope you enjoy using this passion project of mine."
-    echo "This is not a full-fledged programming language, but it's a start!"
-    echo "You can find documentation and examples on the GitHub repository."
-    echo " "
-    echo -e "$TEAL$BOLD https://github.com/jakelequire/cryo $COLOR_RESET"
-    echo " "
-    echo "Please feel free to reach out to me if you have any questions or feedback!"
-    echo " "
-    echo "Happy Coding with Cryo! ❄️"
-    echo " "
+# ----------------------------------------------------------------------------
+# Toolchain checks (verify only — never auto-install)
+# ----------------------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+require_cmd() {
+    if have "$1"; then
+        log_ok "found: $1  ($(command -v "$1"))"
+    else
+        log_error "missing required command: $1"
+        echo "    Install hint:"
+        case "$1" in
+            clang++-20) echo "      Debian/Ubuntu: see https://apt.llvm.org/  ('wget -O - https://apt.llvm.org/llvm.sh | sudo bash -s -- 20')" ;;
+            llvm-config-20) echo "      Debian/Ubuntu: 'sudo apt-get install llvm-20-dev'" ;;
+            make)       echo "      'sudo apt-get install build-essential'  /  'brew install make'" ;;
+        esac
+        return 1
+    fi
+}
+
+missing=0
+require_cmd make            || missing=1
+require_cmd clang++-20      || missing=1
+require_cmd llvm-config-20  || missing=1
+
+if [ $missing -ne 0 ]; then
+    die "one or more required tools are missing — install them and re-run."
+fi
+
+# ----------------------------------------------------------------------------
+# Build
+# ----------------------------------------------------------------------------
+if [ $DO_BUILD -eq 1 ]; then
+    if [ -x "$CRYO_BIN" ]; then
+        log_ok "cryo binary already exists at ${CRYO_BIN}; will re-run 'make cryo' for a no-op confirmation."
+    fi
+    log_info "running 'make cryo' (this is the slow step — ~5 min on a first build)..."
+    ( cd "$REPO_ROOT" && make cryo )
+    [ -x "$CRYO_BIN" ] || die "build finished but ${CRYO_BIN} is missing — something is wrong."
+    log_ok "build complete: ${CRYO_BIN}"
 else
-    log_error "Installation verification failed. Please check the installation manually."
-    exit 1
+    [ -x "$CRYO_BIN" ] || die "--no-build was passed but ${CRYO_BIN} does not exist."
+    log_ok "using existing binary: ${CRYO_BIN}"
 fi
 
-# ================================================================================
-# End of Script
+# ----------------------------------------------------------------------------
+# PATH wiring
+# ----------------------------------------------------------------------------
+detect_shell_rc() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        case "$(basename "${SHELL:-}")" in
+            zsh)  target="zsh" ;;
+            fish) target="fish" ;;
+            *)    target="bash" ;;
+        esac
+    fi
+    case "$target" in
+        bash) echo "$HOME/.bashrc" ;;
+        zsh)  echo "$HOME/.zshrc" ;;
+        fish) echo "$HOME/.config/fish/config.fish" ;;
+        none) echo "" ;;
+        *)    die "unknown --shell value: $target  (expected: bash|zsh|fish|none)" ;;
+    esac
+}
+
+RC_FILE="$(detect_shell_rc "$SHELL_TARGET")"
+
+if [ -z "$RC_FILE" ]; then
+    log_info "skipping PATH wiring (--shell=none). Add this to your shell rc manually:"
+    echo "    export PATH=\"${BIN_DIR}:\$PATH\""
+else
+    MARKER="# Added by Cryo installer"
+    if [ -f "$RC_FILE" ] && grep -Fq "$BIN_DIR" "$RC_FILE"; then
+        log_ok "PATH entry already present in ${RC_FILE}"
+    else
+        mkdir -p "$(dirname "$RC_FILE")"
+        {
+            echo
+            echo "$MARKER"
+            if [[ "$RC_FILE" == *fish* ]]; then
+                echo "set -gx PATH ${BIN_DIR} \$PATH"
+            else
+                echo "export PATH=\"${BIN_DIR}:\$PATH\""
+            fi
+        } >> "$RC_FILE"
+        log_ok "appended PATH entry to ${RC_FILE}"
+        log_info "open a new shell or run: source \"${RC_FILE}\""
+    fi
+fi
+
+# ----------------------------------------------------------------------------
+# Verify
+# ----------------------------------------------------------------------------
+if "${CRYO_BIN}" --version >/dev/null 2>&1; then
+    log_ok "cryo --version: $("${CRYO_BIN}" --version)"
+else
+    log_warn "cryo --version exited non-zero — binary built but version check failed."
+fi
+
+# ----------------------------------------------------------------------------
+# Done
+# ----------------------------------------------------------------------------
+echo
+echo "${GREEN}${BOLD}Done.${RESET}"
+echo
+echo "${BOLD}In-tree limitation (read this):${RESET}"
+echo "  cryo currently locates the standard library via a relative path"
+echo "  ('<project_root>/../stdlib'). That means the compiler binary expects"
+echo "  the repo's stdlib/ tree to live next to your project. Until that"
+echo "  resolution is fixed (see the 0.1.0 distribution plan), this install is"
+echo "  effectively 'cryo lives in this repo, and your projects must be set up"
+echo "  so that ../stdlib/ resolves to ${REPO_ROOT}/stdlib'."
+echo
+echo "  For now, the safest pattern is to put your projects inside this repo"
+echo "  (e.g. ${REPO_ROOT}/sandbox/myapp) so ../stdlib resolves correctly."
+echo
+echo "Try it out:"
+echo "  cryo --help"
+echo
+echo "${TEAL}${BOLD}https://github.com/jakelequire/cryo${RESET}"
+echo
