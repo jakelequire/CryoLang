@@ -336,15 +336,11 @@ namespace Cryo::Utils
             valid = false;
         }
 
-        if (!path_exists(_bin_directory))
-        {
-            std::cerr << "Warning: Bin directory not found: " << _bin_directory << std::endl;
-        }
-
-        if (!path_exists(_stdlib_directory))
-        {
-            std::cerr << "Warning: Stdlib directory not found: " << _stdlib_directory << std::endl;
-        }
+        // _bin_directory and _stdlib_directory are diagnostic conveniences
+        // populated by walking up from the executable; they are not the
+        // paths used by compilation (those are set per-invocation from
+        // cryoconfig). Don't print warnings if they happen to be absent —
+        // they only add noise to every cryo --version / cryo --help call.
 
         // Try to create logs directory if it doesn't exist
         if (!path_exists(_logs_directory))
@@ -486,17 +482,21 @@ namespace Cryo::Utils
     std::string OS::find_project_root_from_executable(const std::string& executable_path) const
     {
         std::filesystem::path current = std::filesystem::path(executable_path).parent_path();
-        
+
         // Look for project markers going up the directory tree
         for (int depth = 0; depth < 10; ++depth) // Limit search depth
         {
-            // Check for project markers
+            // Check for project markers. Require a stdlib/ sibling so we
+            // walk past sub-project makefiles (e.g., legacy/bootstrap/makefile
+            // since this binary lives in legacy/bootstrap/bin/) and land on
+            // the actual repo root.
             std::vector<std::string> markers = {"makefile", "Makefile", "cryoconfig", "README.md"};
-            
+
             for (const auto& marker : markers)
             {
                 std::filesystem::path marker_path = current / marker;
-                if (std::filesystem::exists(marker_path))
+                if (std::filesystem::exists(marker_path) &&
+                    std::filesystem::is_directory(current / "stdlib"))
                 {
                     return current.string();
                 }
