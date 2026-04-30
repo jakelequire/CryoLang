@@ -684,7 +684,7 @@ than error for any input that doesn't start with `C$`.
 ## 13. Implementation Notes
 
 ### 13.1 Mangler
-The mangler lives in `cryoc/src/compiler/resolver/mangled_name.cryo`
+The mangler lives in `compiler/src/compiler/resolver/mangled_name.cryo`
 and replaces the current underscore-joined scheme. It takes a
 fully-resolved, post-monomorphization symbol (where all generics are
 concrete types) and produces a string.
