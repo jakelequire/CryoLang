@@ -67,41 +67,12 @@ cryo: stdlib
 	@echo "==> Self-hosted cryo built: $(STAGE3)"
 
 # ---- full selfhost-check + byte-identity diff -------------------------
+# Implementation lives in scripts/selfhost-check.py — that gives us
+# per-stage progress + timings, per-stage logs in build-logs/, and a
+# tail-on-failure dump. Run the script directly with --verbose for
+# streaming subprocess output.
 selfhost-check: $(BOOT)
-	@echo "==> Wiping all stage outputs"
-	@rm -rf compiler/build compiler/build-s4 compiler/build-s5
-	@rm -rf stdlib/.bin stdlib/.bin-s2 stdlib/.bin-s3 stdlib/.bin-s4
-	@echo "==> [1/8] stdlib via bootstrap"
-	@mkdir -p stdlib/.bin/obj
-	@cd stdlib && "$(BOOT)" build
-	@echo "==> [2/8] compiler via bootstrap -> stage-2 ($(STAGE2))"
-	@cd compiler && "$(BOOT)" build
-	@echo "==> [3/8] stdlib via stage-2 -> stdlib/.bin-s2"
-	@mkdir -p stdlib/.bin-s2/obj
-	@cd stdlib && "$(STAGE2)" build --build-dir=.bin-s2
-	@echo "==> [4/8] compiler via stage-2 -> stage-3 ($(STAGE3))"
-	@rm -rf compiler/build/obj compiler/build/bin
-	@cd compiler && "$(STAGE2)" build
-	@echo "==> [5/8] stdlib via stage-3 -> stdlib/.bin-s3"
-	@mkdir -p stdlib/.bin-s3/obj
-	@cd stdlib && "$(STAGE3)" build --build-dir=.bin-s3
-	@echo "==> [6/8] cryo via stage-3 -> stage-4 ($(STAGE4))"
-	@cd compiler && "$(STAGE3)" build --build-dir=build-s4
-	@echo "==> [7/8] stdlib via stage-4 -> stdlib/.bin-s4"
-	@mkdir -p stdlib/.bin-s4/obj
-	@cd stdlib && "$(STAGE4)" build --build-dir=.bin-s4
-	@echo "==> [8/8] cryo via stage-4 -> stage-5 ($(STAGE5))"
-	@cd compiler && "$(STAGE4)" build --build-dir=build-s5
-	@echo "==> Verifying stage-4 == stage-5 IR byte identity"
-	@if diff -q compiler/build-s4/bin/cryo.ll compiler/build-s5/bin/cryo.ll > /dev/null; then \
-		echo ""; \
-		echo "FIXED POINT OK: stage-4 and stage-5 produce byte-identical IR"; \
-	else \
-		echo ""; \
-		echo "FIXED POINT BROKEN: stage-4 and stage-5 IR differ"; \
-		diff compiler/build-s4/bin/cryo.ll compiler/build-s5/bin/cryo.ll | head -40; \
-		exit 1; \
-	fi
+	@python3 scripts/selfhost-check.py
 
 # ---- clean -------------------------------------------------------------
 clean:
