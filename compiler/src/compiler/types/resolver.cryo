@@ -315,6 +315,35 @@ type struct TypeResolver {
         }
     }
 
+    /// Fill missing trailing args from a TemplateEntry's default annotations.
+    /// `args` may be shorter than `entry.param_count`; for each missing
+    /// trailing param, resolve its `default_annotation` in a context that
+    /// has the args resolved so far bound to their param names. Returns
+    /// the args list unchanged when `args.length >= entry.param_count`,
+    /// when a missing param has no default, or when a default annotation
+    /// fails to resolve.
+    expand_default_type_args(&this, entry: TemplateEntry*, args: TypeRef[],
+                             ctx: ResolutionContext*) -> TypeRef[] {
+        if (entry == null) { return args; }
+        if (args.length >= entry.param_count) { return args; }
+        const params: GenericParamNode*[] = entry.get_generic_params();
+        const start: i64 = args.length;
+        mut filled: TypeRef[] = args;
+        for (mut i: i64 = start; i < entry.param_count; i++) {
+            if (i >= params.length) { return filled; }
+            const gp: GenericParamNode* = params[i];
+            if (gp == null || !gp.has_default_annotation()) { return filled; }
+            mut def_ctx: ResolutionContext = *ctx;
+            for (mut j: i64 = 0; j < filled.length; j++) {
+                def_ctx.add_binding(entry.param_names[j], filled[j]);
+            }
+            const def_type: TypeRef = this.resolve(gp.default_annotation, &def_ctx);
+            if (!def_type.is_valid()) { return filled; }
+            filled.push(def_type);
+        }
+        return filled;
+    }
+
     /// Resolve all function signatures (FunctionDeclNode*[]) on a trait.
     ///
     /// Inside a trait body, `This` is a symbolic placeholder for the type
@@ -626,28 +655,7 @@ private:
             // each missing param's default annotation. Defaults can
             // reference earlier params, so re-bind on every iteration.
             if (args.length < entry.param_count) {
-                const params: GenericParamNode*[] = entry.get_generic_params();
-                const start: i64 = args.length;
-                for (mut i: i64 = start; i < entry.param_count; i++) {
-                    if (i >= params.length) { break; }
-                    const gp: GenericParamNode* = params[i];
-                    if (gp == null || !gp.has_default_annotation()) {
-                        LOG_DEBUG(LogComponent::TypeChecker,
-                            "[TypeResolver] resolve_generic() missing arg %lld and no default", i);
-                        return TypeRef::invalid();
-                    }
-                    mut def_ctx: ResolutionContext = *ctx;
-                    for (mut j: i64 = 0; j < args.length; j++) {
-                        def_ctx.add_binding(entry.param_names[j], args[j]);
-                    }
-                    const def_type: TypeRef = this.resolve(gp.default_annotation, &def_ctx);
-                    if (!def_type.is_valid()) {
-                        LOG_DEBUG(LogComponent::TypeChecker,
-                            "[TypeResolver] resolve_generic() failed to resolve default for param %lld", i);
-                        return TypeRef::invalid();
-                    }
-                    args.push(def_type);
-                }
+                args = this.expand_default_type_args(entry, args, ctx);
             }
 
             if (args.length != entry.param_count) {
