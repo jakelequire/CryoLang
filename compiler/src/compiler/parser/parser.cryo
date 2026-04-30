@@ -1477,7 +1477,9 @@ public:
         return params;
     }
 
-    /// Parse trait bounds: where T: Trait, U: OtherTrait
+    /// Parse trait bounds: `where T: Trait, U: A + B, W: io::Write`.
+    /// Each bound is one type parameter with one or more `+`-separated trait
+    /// refs. Each ref may itself be a `::`-qualified path.
     parse_trait_bounds() -> TraitBound[] {
         mut bounds: TraitBound[] = [];
         this.advance(); // consume 'where'
@@ -1485,11 +1487,16 @@ public:
         while (true) {
             const type_param_tok: Token = this.consume(TokenType::Identifier, "type parameter");
             this.consume(TokenType::Colon, "':'");
-            const trait_tok: Token = this.consume(TokenType::Identifier, "trait name");
+
+            mut refs: TraitRef[] = [];
+            while (true) {
+                refs.push(this.parse_trait_ref());
+                if (!this.match_tok(TokenType::Plus)) { break; }
+            }
 
             const bound: TraitBound = TraitBound {
                 type_parameter: this.intern_lexeme(type_param_tok),
-                trait_name:     this.intern_lexeme(trait_tok),
+                trait_refs:     refs,
                 span:           this.span_from(type_param_tok),
             };
             bounds.push(bound);
@@ -1498,6 +1505,26 @@ public:
         }
 
         return bounds;
+    }
+
+    /// Parse a single (possibly qualified) trait reference: `Name` or
+    /// `path::to::Name`. Returns the captured path segments + span.
+    parse_trait_ref() -> TraitRef {
+        const start: Token = this.current();
+        const head_tok: Token = this.consume(TokenType::Identifier, "trait name");
+        mut path: SymbolStr[] = [];
+        path.push(this.intern_lexeme(head_tok));
+
+        while (this.check(TokenType::ColonColon)) {
+            this.advance(); // consume '::'
+            const seg_tok: Token = this.consume(TokenType::Identifier, "trait path segment");
+            path.push(this.intern_lexeme(seg_tok));
+        }
+
+        return TraitRef {
+            path: path,
+            span: this.span_from(start),
+        };
     }
 
     /// Parse a directive: #[attr] or #[attr(args)]
