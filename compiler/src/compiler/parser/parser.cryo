@@ -1195,14 +1195,43 @@ public:
         return new ModuleDeclNode(qn.display(this.ctx.get_intern_table()), is_public, span);
     }
 
-    /// Parse an implementation block: implement enum/struct Name { methods }
-    /// Also handles: implement boolean { ... }, implement i32 { ... }, etc.
+    /// Parse an implementation block. Two shapes:
+    ///
+    ///   Inherent (existing):
+    ///     implement [enum|struct|class] Name[<T>] { ... }
+    ///     implement boolean { ... }
+    ///
+    ///   Trait impl (G1, G2):
+    ///     implement [<T, ...>] trait <TraitPath>[<args>] for [enum|struct|class]
+    ///         Name[<args>] [where T: Bound + Bound2, U: Other] { ... }
+    ///
+    /// The leading `<T, ...>` after `implement` carries the impl's own generic
+    /// parameters and is only used for generic trait impls. For inherent impls
+    /// the existing `Name<T>` form continues to populate generic_params.
     parse_implementation_block() -> ImplBlockNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_implementation_block()");
         const start: Token = this.advance(); // consume 'implement'
 
-        // Optional type keyword (enum, struct)
-        if (this.check(TokenType::KwEnum) || this.check(TokenType::KwStruct)) {
+        // (G2) Optional `<T, ...>` directly after `implement` — generic params
+        // for a trait impl head: `implement<T> trait Iter<T> for Range<T>`.
+        mut leading_gen_params: GenericParamNode*[] = [];
+        if (this.check(TokenType::LAngle)) {
+            leading_gen_params = this.parse_generic_params();
+        }
+
+        // (G1) Optional `trait <Path>[<args>] for` — the trait-impl prefix.
+        // MUST sit before the existing keyword/identifier consume so that
+        // `trait` (a keyword) is not mistaken for the target type name.
+        mut trait_ann: TypeAnnotation* = null;
+        if (this.check(TokenType::KwTrait)) {
+            this.advance(); // consume 'trait'
+            trait_ann = this.parse_type_annotation();
+            this.consume(TokenType::KwFor, "'for'");
+        }
+
+        // Optional type keyword (enum, struct, class)
+        if (this.check(TokenType::KwEnum) || this.check(TokenType::KwStruct)
+            || this.check(TokenType::KwClass)) {
             this.advance();
         }
 
@@ -1217,13 +1246,39 @@ public:
         const type_name: SymbolStr = this.intern_lexeme(type_tok);
         mut node: ImplBlockNode* = new ImplBlockNode(type_name, this.span_from_token(start));
         this.current_type_name = type_tok.lexeme;
-        // Parse implement block body
 
-        // Optional generic parameters: implement enum Optional<T> { ... }
+        // Attach the trait annotation and the leading generic params (if any)
+        // collected before the target name was known.
+        if (trait_ann != null) {
+            node.set_trait_annotation(trait_ann);
+        }
+        for (mut lgi: int = 0; lgi < leading_gen_params.length; lgi++) {
+            node.add_generic_param(leading_gen_params[lgi]);
+        }
+
+        // Optional generic params/args after target name.
+        // For inherent impls (no leading trait annotation), `Name<T>` is the
+        // existing generic-params form — keep populating generic_params.
+        // For trait impls, `Bar<T>` are the target's type args; the binding
+        // already lives in the leading generic_params, so we consume the
+        // tokens but discard the structured args. Sema (Phase B) re-derives
+        // them from the impl's generic_params and the target's declaration.
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
-            for (mut gi: int = 0; gi < gen_params.length; gi++) {
-                node.add_generic_param(gen_params[gi]);
+            if (trait_ann == null) {
+                const gen_params: GenericParamNode*[] = this.parse_generic_params();
+                for (mut gi: int = 0; gi < gen_params.length; gi++) {
+                    node.add_generic_param(gen_params[gi]);
+                }
+            } else {
+                const _target_args: TypeAnnotation*[] = this.parse_generic_args();
+            }
+        }
+
+        // (G2) Optional `where T: Bound, ...` clause.
+        if (this.check(TokenType::KwWhere)) {
+            const bounds: TraitBound[] = this.parse_trait_bounds();
+            for (mut wi: int = 0; wi < bounds.length; wi++) {
+                node.add_where_bound(bounds[wi]);
             }
         }
 
