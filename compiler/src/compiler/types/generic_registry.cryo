@@ -146,6 +146,15 @@ type struct GenericRegistry {
     trait_impl_blocks:  ImplBlockNode*[];
     trait_impl_index:   HashMap<u64, i64>;
 
+    // -- Trait-decl registry (Phase B.6) --
+    // Maps a bare trait name (SymbolStr.id) to its TraitDeclNode*. Used by
+    // default-method synthesis: when an impl block names a trait, we look
+    // up the trait's AST to clone any default-bodied methods the impl
+    // didn't override.  Populated during FunctionSignature for ALL traits
+    // (generic or not) — non-generic traits aren't in `entries`.
+    trait_decl_index:   HashMap<u32, i64>;
+    trait_decl_nodes:   TraitDeclNode*[];
+
 
     // ----------------------------------------------------------------
     // Construction
@@ -168,6 +177,8 @@ type struct GenericRegistry {
             trait_impl_keys:   [],
             trait_impl_blocks: [],
             trait_impl_index:  HashMap<u64, i64>::new(),
+            trait_decl_index:  HashMap<u32, i64>::new(),
+            trait_decl_nodes:  [],
         };
     }
 
@@ -281,6 +292,35 @@ type struct GenericRegistry {
             result.push(SymbolStr::from_id(trait_id));
         }
         return result;
+    }
+
+    /// Register a trait declaration's AST so default-method synthesis can
+    /// find it cross-module when an impl block names the trait. Idempotent:
+    /// later calls with the same bare name overwrite earlier ones.
+    register_trait_decl(mut &this, name: SymbolStr, node: TraitDeclNode*) -> void {
+        if (node == null || !name.is_valid()) { return; }
+        const h: u64 = hash_int(name.id as u64);
+        const existing: Option<i64> = this.trait_decl_index.get(name.id, h);
+        if (existing.is_some()) {
+            this.trait_decl_nodes[existing.unwrap()] = node;
+            return;
+        }
+        const idx: i64 = this.trait_decl_nodes.length;
+        this.trait_decl_nodes.push(node);
+        this.trait_decl_index.insert(name.id, idx, h);
+    }
+
+    /// Look up a trait declaration's AST by bare name. Returns null when the
+    /// trait wasn't registered — most commonly because it's in a module
+    /// that hasn't been processed yet.
+    get_trait_decl(&this, name: SymbolStr) -> TraitDeclNode* {
+        if (!name.is_valid()) { return null; }
+        const h: u64 = hash_int(name.id as u64);
+        const opt: Option<i64> = this.trait_decl_index.get(name.id, h);
+        if (opt.is_some()) {
+            return this.trait_decl_nodes[opt.unwrap()];
+        }
+        return null;
     }
 
     /// Look up a template entry by qualified name.  The single lookup path.

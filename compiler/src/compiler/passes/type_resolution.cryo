@@ -39,6 +39,8 @@ import Compiler::Resolver::SymbolID;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::Symbol;
 import Compiler::Resolver::Resolver;
+import Compiler::AST::Cloner;
+import Compiler::Types::GenericRegistry;
 import Utils::Logger;
 
 
@@ -757,6 +759,125 @@ type struct TypeResolutionPasses {
 
 
     // ========================================================================
+    // Default trait-method synthesis (Phase B.6)
+    //
+    // When an impl block names a trait and the trait declares a default body
+    // for some method, the impl inherits that default unless it overrides.
+    // This helper clones every default-bodied trait method that the impl
+    // doesn't override and adds it as a MethodNode on the impl. The clone
+    // goes through the rest of FunctionSignature/TypeResolution/Sema in the
+    // same loop, picking up the impl's `this_type` (= owner_type) so any
+    // `This` annotations in the body resolve to the impl target.
+    //
+    // Cross-module: traits register themselves in the GenericRegistry's
+    // trait-decl index from their own module's FunctionSignature pass.
+    // A consumer module's pass runs after the trait's, so the lookup
+    // finds the trait's AST.  Same-module impls work because traits are
+    // declared before their impls in source order.
+    //
+    // Limitations: trait must be reachable as a bare leaf name. Generic
+    // traits (e.g. `Iterator<T>`) work for the leaf-name path but the
+    // generic params don't propagate yet — that's left for a follow-up.
+    // Returns the number of methods synthesized.
+    // ========================================================================
+
+    /// Walk a trait_annotation to its leaf identifier — the bare trait name.
+    /// Mirrors `Specialization::extract_root_name` but is duplicated here
+    /// to keep type_resolution.cryo self-contained.
+    static extract_trait_leaf(ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Named(n) => { n.name }
+            TypeAnnotation::Generic(g) => {
+                TypeResolutionPasses::extract_trait_leaf(g.base)
+            }
+            TypeAnnotation::Reference(r) => {
+                TypeResolutionPasses::extract_trait_leaf(r.inner)
+            }
+            TypeAnnotation::Pointer(p) => {
+                TypeResolutionPasses::extract_trait_leaf(p.inner)
+            }
+            _ => { SymbolStr::empty() }
+        };
+    }
+
+    /// Clone every default-bodied trait method that `impl_node` doesn't
+    /// override. Returns the number of methods added.
+    static synthesize_default_trait_methods(impl_node: ImplBlockNode*,
+                                             ctx: CompilationContext*) -> i64 {
+        if (impl_node == null) { return 0; }
+        if (!impl_node.is_trait_impl()) { return 0; }
+        if (ctx.generic_registry == null) { return 0; }
+
+        const trait_name: SymbolStr = TypeResolutionPasses::extract_trait_leaf(
+            impl_node.trait_annotation);
+        if (!trait_name.is_valid()) { return 0; }
+
+        const trait_decl: TraitDeclNode* = ctx.generic_registry.get_trait_decl(
+            trait_name);
+        if (trait_decl == null) { return 0; }
+
+        // Quick scan: is there at least one default-bodied trait method
+        // not overridden by this impl?  If not, return 0 without doing
+        // any allocation.  Most stdlib trait impls hit this path.
+        mut needs_synthesis: boolean = false;
+        for (mut ti: i64 = 0; ti < trait_decl.methods.length; ti++) {
+            const tfunc: FunctionDeclNode* = trait_decl.methods[ti];
+            if (tfunc == null) { continue; }
+            if (!tfunc.has_body()) { continue; }
+            mut overridden: boolean = false;
+            for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
+                const m: MethodNode* = impl_node.methods[mi];
+                if (m != null && m.func != null && m.func.name.equals(tfunc.name)) {
+                    overridden = true;
+                    break;
+                }
+            }
+            if (!overridden) {
+                needs_synthesis = true;
+                break;
+            }
+        }
+        if (!needs_synthesis) { return 0; }
+
+        // Clone each not-overridden default method into the impl block.
+        // The clones go through the rest of FunctionSignature/TypeResolution/
+        // Sema in the same loop, picking up the impl's `this_type` so any
+        // `This` annotations resolve to the implementing type.  We use the
+        // `new_plain` static constructor — the equivalent value-construction
+        // (`ASTCloner()` at function scope) miscompiles under cryoc and
+        // segfaults later in resolution.
+        mut cloner: ASTCloner = ASTCloner::new_plain();
+        mut synthesized: i64 = 0;
+
+        for (mut ti: i64 = 0; ti < trait_decl.methods.length; ti++) {
+            const tfunc: FunctionDeclNode* = trait_decl.methods[ti];
+            if (tfunc == null) { continue; }
+            if (!tfunc.has_body()) { continue; }
+
+            mut already_present: boolean = false;
+            for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
+                const m: MethodNode* = impl_node.methods[mi];
+                if (m != null && m.func != null && m.func.name.equals(tfunc.name)) {
+                    already_present = true;
+                    break;
+                }
+            }
+            if (already_present) { continue; }
+
+            const cloned: FunctionDeclNode* = cloner.clone_func_decl(tfunc);
+            if (cloned == null) { continue; }
+            mut method: MethodNode* = new MethodNode(cloned, cloned.span);
+            method.set_static(cloned.is_static);
+            impl_node.add_method(method);
+            synthesized = synthesized + 1;
+        }
+
+        return synthesized;
+    }
+
+
+    // ========================================================================
     // Pass 1: FunctionSignature (order 7)
     // ========================================================================
 
@@ -824,6 +945,11 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::TraitDeclaration => {
                     const node: TraitDeclNode* = stmt as TraitDeclNode*;
+
+                    if (ctx.generic_registry != null) {
+                        ctx.generic_registry.register_trait_decl(node.name, node);
+                    }
+
                     mut trait_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_trait_method_signatures(node.methods, &trait_ctx);
@@ -863,6 +989,10 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::ImplementationBlock => {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
+
+                    const _added: i64 = TypeResolutionPasses::synthesize_default_trait_methods(
+                        node, ctx);
+
                     const _tgt: string = ctx.intern_table.resolve(node.target_type);
                     printf("[FuncSig] impl block: target='%s' methods.length=%lld node=%p\n",
                            _tgt, node.methods.length, node);
