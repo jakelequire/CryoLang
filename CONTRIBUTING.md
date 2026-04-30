@@ -16,12 +16,39 @@ expect rough edges and ongoing churn.
 ## Building
 
 ```bash
-make cryo                # ~5 min cold; produces compiler/build/bin/cryo
+make cryo                # ~5 min cold; canonical path through bootstrap
+make cryo-fast           # ~30 s; uses the pinned bin/cryo, skips bootstrap
 make selfhost-check      # ~3-10 min; full 8-stage byte-identity gate
 ```
 
 To run the resulting compiler from anywhere on your `PATH`, run
 `./install.sh` after `make cryo`.
+
+### Pinned binary (`bin/cryo`)
+
+`bin/cryo` is a known-good self-hosted compiler committed to the repo. It's
+the fast rung for `make cryo-fast` and skips the C++ bootstrap entirely.
+
+The pin is **stale** by design — it understands the dialect of `compiler/src/`
+at the moment it was committed, nothing more. When `compiler/src/` adopts
+new parser syntax that the pinned binary can't read, you'll see parse errors
+on `make cryo-fast`.
+
+To refresh the pin:
+
+```bash
+make cryo                # build canonically through bootstrap
+make pin-cryo            # copy compiler/build/bin/cryo to bin/cryo, stripped
+git add bin/cryo
+git commit -m "build: refresh pinned cryo binary"
+```
+
+Refresh **only** when compiler/src/ has actually adopted new syntax. Do not
+refresh just because a new build exists — the pin is for syntax compatibility,
+not freshness.
+
+The canonical `make cryo` path through bootstrap remains the source of truth
+and is what CI runs. `make selfhost-check` always uses bootstrap.
 
 ## Filing issues
 

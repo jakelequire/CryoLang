@@ -26,6 +26,7 @@
 
 ROOT   := $(CURDIR)
 BOOT   := $(ROOT)/legacy/bootstrap/bin/cryo
+PIN    := $(ROOT)/bin/cryo
 STAGE2 := $(ROOT)/compiler/build/cryo
 STAGE3 := $(ROOT)/compiler/build/bin/cryo
 STAGE4 := $(ROOT)/compiler/build-s4/bin/cryo
@@ -34,13 +35,15 @@ STAGE5 := $(ROOT)/compiler/build-s5/bin/cryo
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap stdlib cryo selfhost-check clean distclean
+.PHONY: help bootstrap stdlib cryo cryo-fast stdlib-fast pin-cryo selfhost-check clean distclean
 
 help:
 	@echo "Cryo build targets:"
 	@echo "  make bootstrap        Build the C++ bootstrap compiler"
 	@echo "  make stdlib           Build the standard library via bootstrap"
-	@echo "  make cryo             Build the self-hosted Cryo compiler"
+	@echo "  make cryo             Build the self-hosted Cryo compiler (canonical)"
+	@echo "  make cryo-fast        Build via the pinned bin/cryo (fast dev loop)"
+	@echo "  make pin-cryo         Refresh bin/cryo from compiler/build/bin/cryo"
 	@echo "  make selfhost-check   Full chain + stage-4/stage-5 byte-identity check"
 	@echo "  make clean            Remove compiler + stdlib build outputs"
 	@echo "  make distclean        Also clean bootstrap"
@@ -65,6 +68,42 @@ cryo: stdlib
 	@rm -rf compiler/build/obj compiler/build/bin
 	@cd compiler && "$(STAGE2)" build
 	@echo "==> Self-hosted cryo built: $(STAGE3)"
+
+# ---- fast dev loop via the pinned binary at bin/cryo ------------------
+# The pinned binary is built from a known-good cryoc and committed to the
+# repo. As long as compiler/src/ stays in a dialect bin/cryo can parse, we
+# can skip the slow bootstrap rung entirely.
+#
+# When compiler/src/ adopts new syntax that bin/cryo can no longer parse,
+# refresh the pin: run `make cryo` (canonical path through bootstrap), then
+# `make pin-cryo` to update bin/cryo, then commit. See CONTRIBUTING.md.
+stdlib-fast:
+	@if [ ! -x "$(PIN)" ]; then \
+		echo "ERROR: $(PIN) does not exist. Run 'make cryo && make pin-cryo' first."; \
+		exit 1; \
+	fi
+	@echo "==> Building stdlib via pinned bin/cryo"
+	@rm -rf stdlib/.bin && mkdir -p stdlib/.bin/obj
+	@cd stdlib && "$(PIN)" build
+
+cryo-fast: stdlib-fast
+	@echo "==> Building self-hosted cryo via pinned bin/cryo (stage-2)"
+	@cd compiler && "$(PIN)" build
+	@echo "==> Bootstrapping to stage-3"
+	@rm -rf compiler/build/obj compiler/build/bin
+	@cd compiler && "$(STAGE2)" build
+	@echo "==> Self-hosted cryo built: $(STAGE3)"
+
+pin-cryo:
+	@if [ ! -x "$(STAGE3)" ]; then \
+		echo "ERROR: $(STAGE3) does not exist. Run 'make cryo' first."; \
+		exit 1; \
+	fi
+	@echo "==> Refreshing pinned binary at $(PIN)"
+	@mkdir -p "$(ROOT)/bin"
+	@cp "$(STAGE3)" "$(PIN)"
+	@strip "$(PIN)"
+	@echo "==> Pinned: $(PIN) ($$(stat -c%s '$(PIN)' 2>/dev/null || stat -f%z '$(PIN)') bytes, stripped)"
 
 # ---- full selfhost-check + byte-identity diff -------------------------
 # Implementation lives in scripts/selfhost-check.py — that gives us
