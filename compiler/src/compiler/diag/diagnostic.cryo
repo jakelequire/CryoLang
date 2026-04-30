@@ -64,12 +64,24 @@ type struct Diagnostic {
     /// Attach a source span and return a new diagnostic (builder pattern).
     at(mut &this, span: SourceSpan) -> Diagnostic {
         this.span = span;
+        // Build the new labels array via push() rather than the `arr +
+        // [elem]` concat operator. The concat operator on an array of
+        // structs containing further arrays/strings (like SpanLabel's
+        // `message: string`) emits a malformed result in cryoc's bootstrap
+        // — the resulting Array<T>'s length field reads as a heap pointer.
+        // Push works because it reuses the receiver's storage and grows
+        // by a known step.
+        mut new_labels: SpanLabel[] = [];
+        for (mut i: i64 = 0; i < this.labels.length; i++) {
+            new_labels.push(this.labels[i]);
+        }
+        new_labels.push(SpanLabel::primary(span, this.message));
         return Diagnostic {
             severity:    this.severity,
             code:        this.code,
             message:     this.message,
             span:        span,
-            labels:      this.labels + [SpanLabel::primary(span, this.message)],
+            labels:      new_labels,
             children:    this.children,
             suggestions: this.suggestions,
         };
@@ -86,35 +98,48 @@ type struct Diagnostic {
             children:    [],
             suggestions: [],
         };
+        // See `at()` for why we use push() instead of `arr + [elem]`.
+        mut new_children: Diagnostic[] = [];
+        for (mut i: i64 = 0; i < this.children.length; i++) {
+            new_children.push(this.children[i]);
+        }
+        new_children.push(child);
         return Diagnostic {
             severity:    this.severity,
             code:        this.code,
             message:     this.message,
             span:        this.span,
             labels:      this.labels,
-            children:    this.children + [child],
+            children:    new_children,
             suggestions: this.suggestions,
         };
     }
 
     /// Append a note child diagnostic with a source location.
     with_note_at(&this, message: string, span: SourceSpan) -> Diagnostic {
+        mut child_labels: SpanLabel[] = [];
+        child_labels.push(SpanLabel::primary(span, message));
         const child: Diagnostic = Diagnostic {
             severity:    Severity::Note,
             code:        ErrorCode::E0000_UNKNOWN,
             message:     message,
             span:        span,
-            labels:      [SpanLabel::primary(span, message)],
+            labels:      child_labels,
             children:    [],
             suggestions: [],
         };
+        mut new_children: Diagnostic[] = [];
+        for (mut i: i64 = 0; i < this.children.length; i++) {
+            new_children.push(this.children[i]);
+        }
+        new_children.push(child);
         return Diagnostic {
             severity:    this.severity,
             code:        this.code,
             message:     this.message,
             span:        this.span,
             labels:      this.labels,
-            children:    this.children + [child],
+            children:    new_children,
             suggestions: this.suggestions,
         };
     }
@@ -130,25 +155,37 @@ type struct Diagnostic {
             children:    [],
             suggestions: [],
         };
+        mut new_children: Diagnostic[] = [];
+        for (mut i: i64 = 0; i < this.children.length; i++) {
+            new_children.push(this.children[i]);
+        }
+        new_children.push(child);
         return Diagnostic {
             severity:    this.severity,
             code:        this.code,
             message:     this.message,
             span:        this.span,
             labels:      this.labels,
-            children:    this.children + [child],
+            children:    new_children,
             suggestions: this.suggestions,
         };
     }
 
     /// Append a secondary span label (e.g. "also defined here").
     also_at(&this, span: SourceSpan, message: string) -> Diagnostic {
+        // See `at()` above — the `arr + [elem]` concat operator
+        // produces a malformed result for SpanLabel[]; build via push().
+        mut new_labels: SpanLabel[] = [];
+        for (mut i: i64 = 0; i < this.labels.length; i++) {
+            new_labels.push(this.labels[i]);
+        }
+        new_labels.push(SpanLabel::secondary(span, message));
         return Diagnostic {
             severity:    this.severity,
             code:        this.code,
             message:     this.message,
             span:        this.span,
-            labels:      this.labels + [SpanLabel::secondary(span, message)],
+            labels:      new_labels,
             children:    this.children,
             suggestions: this.suggestions,
         };
@@ -156,6 +193,13 @@ type struct Diagnostic {
 
     /// Append a suggestion.
     suggest(&this, suggestion: Suggestion) -> Diagnostic {
+        // See `at()` — `arr + [elem]` produces a malformed array of structs;
+        // build via push().
+        mut new_suggestions: Suggestion[] = [];
+        for (mut i: i64 = 0; i < this.suggestions.length; i++) {
+            new_suggestions.push(this.suggestions[i]);
+        }
+        new_suggestions.push(suggestion);
         return Diagnostic {
             severity:    this.severity,
             code:        this.code,
@@ -163,7 +207,7 @@ type struct Diagnostic {
             span:        this.span,
             labels:      this.labels,
             children:    this.children,
-            suggestions: this.suggestions + [suggestion],
+            suggestions: new_suggestions,
         };
     }
 

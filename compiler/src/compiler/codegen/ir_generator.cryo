@@ -1721,6 +1721,25 @@ public:
                 } else if (conc_t0.kind == TypeKind::Enum) {
                     const cet0: EnumType* = conc_t0 as EnumType*;
                     conc_name0 = intern.resolve(cet0.qualified_name);
+                } else if (conc_t0.kind == TypeKind::InstantiatedType) {
+                    // Unresolved InstantiatedType — sema's expected_type
+                    // fallback returned a generic instantiation that the
+                    // monomorphizer hadn't yet pinned to its spec struct
+                    // when codegen ran. Compute the deterministic spec
+                    // mangled name from `(generic_base, type_args)` and
+                    // try to find the registered spec method directly.
+                    const ci_unres: InstantiatedType* = conc_t0 as InstantiatedType*;
+                    const base_qname: SymbolStr = this.cg.arena.get_qualified_name(
+                        ci_unres.generic_base);
+                    if (base_qname.is_valid()) {
+                        const base_qn: QualifiedName = QualifiedName::from_symbol(base_qname);
+                        const spec_sym: SymbolStr = MangledName::specialized_identifier(
+                            this.cg.get_intern(), this.cg.arena, base_qn,
+                            ci_unres.type_args);
+                        if (spec_sym.is_valid()) {
+                            conc_name0 = intern.resolve(spec_sym);
+                        }
+                    }
                 }
                 if (strlen(conc_name0) > 0) {
                     const member_str0: string = intern.resolve(sr.member_name);
@@ -2651,6 +2670,18 @@ public:
         const global: LValue = resolve_global(this.cg, sym);
         if (global.is_valid()) {
             this.last_value = global;
+            this.last_is_lvalue = true;
+            return;
+        }
+        // Bare-name global lookup. Top-level `const X: T = …` declarations
+        // register globals under their bare name (e.g. `O_RDWR`); when
+        // referenced as `libc::O_RDWR` from another module the combined-
+        // name lookup misses, so also try the bare member name. Globals
+        // are unique LLVM symbols at link time, so the bare name resolves
+        // to the same definition regardless of which module references it.
+        const bare_global: LValue = resolve_global(this.cg, node.member_name);
+        if (bare_global.is_valid()) {
+            this.last_value = bare_global;
             this.last_is_lvalue = true;
             return;
         }

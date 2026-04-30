@@ -627,6 +627,19 @@ type struct Monomorphizer {
             NodeKind::ImplementationBlock => {
                 const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
                 if (decl == null) { return; }
+                // Impl-level where-clauses (e.g. `implement<T> trait Clone
+                // for Result<T, E> where T: Clone, E: Clone`) constrain
+                // every method in the block. If the substitution doesn't
+                // satisfy them, drop bodies so sema doesn't try to type-
+                // check methods that would call non-existent trait
+                // methods on the substituted concrete types.
+                if (!this.bounds_satisfied(decl.where_bounds, subst)) {
+                    for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
+                        const m: MethodNode* = decl.methods[mi];
+                        if (m != null && m.func != null) { m.func.body = null; }
+                    }
+                    return;
+                }
                 this.resolve_methods(decl.methods, &res_ctx, subst);
             }
             _ => {}
@@ -644,8 +657,116 @@ type struct Monomorphizer {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
+            // Bound enforcement: skip methods whose where-clauses aren't
+            // met by the current substitution. Drops the body so sema's
+            // visit_methods skips type-checking it.
+            if (!this.method_bounds_satisfied(method.func, subst)) {
+                method.func.body = null;
+                continue;
+            }
             this.resolve_func_and_body(method.func, res_ctx, subst);
         }
+    }
+
+    /// Check that every `where`-clause TraitBound on `func` has a registered
+    /// impl for the substituted type. Returns true when there are no bounds,
+    /// when every bound has a registered impl, or when the substitution is
+    /// missing entirely (e.g. a non-generic context). Returns false only
+    /// when at least one bound's impl is *known absent* — in which case the
+    /// caller should skip body specialization for this method.
+    method_bounds_satisfied(&this, func: FunctionDeclNode*,
+                            subst: TypeSubstitution*) -> boolean {
+        if (func == null) { return true; }
+        if (func.trait_bounds.length == 0) { return true; }
+        return this.bounds_satisfied(func.trait_bounds, subst);
+    }
+
+    /// Check that every TraitBound in `bounds` has a registered trait-impl
+    /// for the substituted concrete type. Returns true on no bounds or
+    /// no substitution. Returns false when at least one bound is known
+    /// absent OR when we can't resolve the target type to a registry key
+    /// — the second case is conservative: dropping a body for a type we
+    /// don't know how to name is safer than letting codegen attempt to
+    /// emit a call to a method that has no impl (which segfaults the
+    /// monomorphizer's unguarded MemberAccess path).
+    bounds_satisfied(&this, bounds: TraitBound[], subst: TypeSubstitution*) -> boolean {
+        if (bounds.length == 0) { return true; }
+        if (subst == null || subst.replacements.length == 0) { return true; }
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const bound: TraitBound = bounds[bi];
+            const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
+            if (!concrete.is_valid()) {
+                // No substitution for this param — the bound names a
+                // generic the caller didn't supply. Treat as unsatisfied
+                // so we don't try to lower a generic body in concrete
+                // codegen.
+                return false;
+            }
+            const target_name: SymbolStr = this.bare_name_of(concrete);
+            if (!target_name.is_valid()) { return false; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: TraitRef = bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                const impl_block: ImplBlockNode* =
+                    this.generic_registry.lookup_trait_impl(trait_name, target_name);
+                if (impl_block == null) { return false; }
+            }
+        }
+        return true;
+    }
+
+    /// Find the substituted concrete TypeRef for a generic param by name.
+    lookup_subst_for_param(&this, name: SymbolStr, subst: TypeSubstitution*) -> TypeRef {
+        if (subst == null) { return TypeRef::invalid(); }
+        for (mut i: i64 = 0; i < subst.param_ids.length; i++) {
+            const pt: Type* = this.arena.lookup(subst.param_ids[i]);
+            if (pt == null) { continue; }
+            if (pt.kind == TypeKind::GenericParam) {
+                const gp: GenericParamType* = pt as GenericParamType*;
+                if (gp.param_name.equals(name)) { return subst.replacements[i]; }
+            } else if (pt.kind == TypeKind::BoundedParam) {
+                const bp: BoundedParamType* = pt as BoundedParamType*;
+                if (bp.param_name.equals(name)) { return subst.replacements[i]; }
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Return the bare (unqualified) leaf name of a TypeRef, suitable for
+    /// keying into the trait-impl registry. For primitives, returns the
+    /// display name. For user-defined types, returns the last `::` segment
+    /// of the qualified name. Returns empty when no name is available.
+    bare_name_of(&this, ty: TypeRef) -> SymbolStr {
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return SymbolStr::empty(); }
+        // Primitives carry their name as display_name (e.g. "i32"). Unit
+        // and Void don't map to a trait-impl-registry key — there can't
+        // be a registered impl for them anyway, so return empty (which
+        // bounds_satisfied treats as "unsatisfied", correctly skipping
+        // generic-method bodies that try to call trait methods on `()`).
+        const k: TypeKind = t.kind;
+        if (k == TypeKind::Int || k == TypeKind::Float || k == TypeKind::Bool ||
+            k == TypeKind::Char || k == TypeKind::String) {
+            return this.intern_table.intern(t.display_name());
+        }
+        if (k == TypeKind::Unit || k == TypeKind::Void) {
+            return SymbolStr::empty();
+        }
+        const qname: SymbolStr = this.arena.get_qualified_name(ty);
+        if (!qname.is_valid()) { return SymbolStr::empty(); }
+        const qstr: string = this.intern_table.resolve(qname);
+        const qlen: i64 = strlen(qstr) as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < qlen; i++) {
+            if (qstr[i] == ':' && qstr[i + 1] == ':') { last_sep = i + 2; }
+        }
+        if (last_sep < 0) { return qname; }
+        mut tail: string = "";
+        for (mut i: i64 = last_sep; i < qlen; i++) {
+            tail = format("%s%c", tail, qstr[i] as i32);
+        }
+        return this.intern_table.intern(tail);
     }
 
     /// Resolve a function's signature (via TypeResolver) and then resolve
