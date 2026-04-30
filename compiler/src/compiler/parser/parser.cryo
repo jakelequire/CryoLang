@@ -330,10 +330,15 @@ public:
         return node;
     }
 
-    /// Parse a function declaration: function name<T>(params) -> RetType { body }
+    /// Parse a function declaration: `function name<T>(params) -> RetType { body }`.
+    /// The leading `function` keyword is optional: trait bodies use the
+    /// keyword-less `name(params) -> RetType;` form for declarations.
     parse_function_declaration(is_public: boolean) -> FunctionDeclNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_function_declaration()");
-        const start: Token = this.advance(); // consume 'function'
+        const start: Token = this.current();
+        if (this.check(TokenType::KwFunction)) {
+            this.advance(); // consume 'function'
+        }
         // Accept keywords as function names (e.g., any, type, default)
         mut name_tok: Token = this.current();
         if (name_tok.kind == TokenType::Identifier || name_tok.kind.is_keyword()) {
@@ -849,6 +854,15 @@ public:
             func.set_return_type_annotation(ret_type);
         }
 
+        // Optional `where T: Bound` clause — methods may further constrain
+        // the enclosing impl's generic parameters.
+        if (this.check(TokenType::KwWhere)) {
+            const bounds: TraitBound[] = this.parse_trait_bounds();
+            for (mut wi: int = 0; wi < bounds.length; wi++) {
+                func.add_trait_bound(bounds[wi]);
+            }
+        }
+
         mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
         method.set_visibility(visibility);
 
@@ -1005,19 +1019,30 @@ public:
 
         this.consume(TokenType::LBrace, "'{'");
 
-        // Parse trait methods (declarations, possibly with default bodies)
+        // Parse trait methods (declarations, possibly with default bodies).
+        // Each method may carry an optional `static` modifier (no receiver).
+        // Method bodies use the keyword-less `name(params) -> Ret { body }`
+        // form; parse_function_declaration treats the leading `function`
+        // keyword as optional.
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             this.collect_doc_comments();
             if (this.check(TokenType::RBrace)) { break; }
 
-            if (this.check(TokenType::Identifier) || this.check(TokenType::KwFunction)) {
-                // Parse as function declaration
-                mut is_fn: boolean = false;
-                if (this.check(TokenType::KwFunction)) {
-                    is_fn = true;
-                }
+            mut is_static: boolean = false;
+            if (this.check(TokenType::KwStatic)) {
+                is_static = true;
+                this.advance();
+            }
+
+            // Method name can be an identifier OR a keyword used as a name
+            // (e.g. `from`, `default`, `into`). The leading `function`
+            // keyword is also accepted for explicit declarations.
+            const head: TokenType = this.current().kind;
+            if (head == TokenType::Identifier || head == TokenType::KwFunction
+                || head.is_keyword()) {
                 const func: FunctionDeclNode* = this.parse_function_declaration(false);
                 if (func != null) {
+                    if (is_static) { func.set_static(true); }
                     node.add_method(func);
                 }
             } else {

@@ -1352,9 +1352,14 @@ public:
     /// Parse a full type annotation.
     parse_type_annotation() -> TypeAnnotation* {
         LOG_DEBUG(LogComponent::Parser, "[ExprParser] parse_type_annotation()");
-        // Reference types: &T or &mut T
+        // Reference types: &T, &mut T, or the alternate `mut &T` form
+        // (mut before ampersand) used by stdlib-next.
         if (this.check(TokenType::Amp)) {
             return this.parse_reference_type();
+        }
+        if (this.check(TokenType::KwMut) && this.peek_at(1).kind == TokenType::Amp) {
+            this.advance(); // consume `mut`
+            return this.parse_reference_type_with_mutability(true);
         }
 
         // Function or tuple types: (T, U) -> R
@@ -1544,7 +1549,9 @@ public:
         return result;
     }
 
-    /// Parse a reference type: &T or &mut T
+    /// Parse a reference type: `&T` or `&mut T`. The leading `&` is at
+    /// current position; mutability is determined by an optional `mut`
+    /// after the ampersand.
     parse_reference_type() -> TypeAnnotation* {
         const start: Token = this.advance(); // consume '&'
         mut is_mutable: boolean = false;
@@ -1552,6 +1559,18 @@ public:
             this.advance();
             is_mutable = true;
         }
+        return this.finish_reference_type(start, is_mutable);
+    }
+
+    /// Parse a reference type when the caller has already consumed a
+    /// leading `mut` modifier (the `mut &T` form). Current must be `&`.
+    parse_reference_type_with_mutability(is_mutable: boolean) -> TypeAnnotation* {
+        const start: Token = this.advance(); // consume '&'
+        return this.finish_reference_type(start, is_mutable);
+    }
+
+    /// Inner-type + node assembly shared by both reference forms.
+    finish_reference_type(start: Token, is_mutable: boolean) -> TypeAnnotation* {
         const inner: TypeAnnotation* = this.parse_type_annotation();
         if (inner == null) { return null; }
         const ref_ann: ReferenceAnnotation* = new ReferenceAnnotation {
