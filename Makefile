@@ -1,22 +1,22 @@
 # Cryo top-level build orchestration.
 #
 # Targets:
-#   bootstrap        Build the C++ bootstrap compiler  (bootstrap/bin/cryo)
+#   bootstrap        Build the C++ bootstrap compiler  (legacy/bootstrap/bin/cryo)
 #   stdlib           Build the standard library via bootstrap  (stdlib/.bin/)
 #   cryo             Build the self-hosted Cryo compiler via bootstrap
-#                    (cryoc/build/bin/cryo)
+#                    (compiler/build/bin/cryo)
 #   selfhost-check   Full chain: bootstrap -> stage-2 -> stage-3 -> stage-4 ->
 #                    stage-5, then verify stage-4 and stage-5 IR are
 #                    byte-identical.
-#   clean            Remove cryoc + stdlib build outputs (bootstrap kept).
+#   clean            Remove compiler + stdlib build outputs (bootstrap kept).
 #   distclean        Also clean bootstrap.
 #   help             List targets.
 #
 # Notes:
-#   * stdlib/ is the canonical standard library. new_stdlib/ is parked for a
-#     future migration and is intentionally not built here.
-#   * The bootstrap binary lives at bootstrap/bin/cryo; the self-hosted binary
-#     lives at cryoc/build/bin/cryo. Disambiguated by path, not name.
+#   * stdlib/ is the canonical standard library. experimental/stdlib-next/ is
+#     parked for a future migration and is intentionally not built here.
+#   * The bootstrap binary lives at legacy/bootstrap/bin/cryo; the self-hosted
+#     binary lives at compiler/build/bin/cryo. Disambiguated by path, not name.
 #   * The fixed point is at stage-4, not stage-3. Bootstrap (C++) emits stage-2
 #     with two harmless codegen quirks (dead `@FILE.str` globals in
 #     Compiler__CompileMode, and an unmangled `@panic` call in std__prelude)
@@ -25,11 +25,11 @@
 #     to confirm it.
 
 ROOT   := $(CURDIR)
-BOOT   := $(ROOT)/bootstrap/bin/cryo
-STAGE2 := $(ROOT)/cryoc/build/cryo
-STAGE3 := $(ROOT)/cryoc/build/bin/cryo
-STAGE4 := $(ROOT)/cryoc/build-s4/bin/cryo
-STAGE5 := $(ROOT)/cryoc/build-s5/bin/cryo
+BOOT   := $(ROOT)/legacy/bootstrap/bin/cryo
+STAGE2 := $(ROOT)/compiler/build/cryo
+STAGE3 := $(ROOT)/compiler/build/bin/cryo
+STAGE4 := $(ROOT)/compiler/build-s4/bin/cryo
+STAGE5 := $(ROOT)/compiler/build-s5/bin/cryo
 
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 
@@ -49,7 +49,7 @@ help:
 bootstrap: $(BOOT)
 $(BOOT):
 	@echo "==> Building C++ bootstrap compiler"
-	@$(MAKE) -C bootstrap compiler -j$(NPROC)
+	@$(MAKE) -C legacy/bootstrap compiler -j$(NPROC)
 
 # ---- stdlib via bootstrap ---------------------------------------------
 stdlib: $(BOOT)
@@ -111,4 +111,4 @@ clean:
 
 distclean: clean
 	@echo "==> Cleaning bootstrap"
-	@$(MAKE) -C bootstrap clean
+	@$(MAKE) -C legacy/bootstrap clean
