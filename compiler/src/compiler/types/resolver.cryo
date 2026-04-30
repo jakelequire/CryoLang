@@ -41,6 +41,12 @@ type struct ResolutionContext {
     import_modules:   string[];     // Modules imported by this compilation unit
     generic_bindings: SymbolStr[];   // Parallel arrays: generic name → bound TypeRef
     binding_refs:     TypeRef[];
+    /// What `This` resolves to in the current scope.
+    /// Inside an impl block: the implementing type (same as `&this` owner).
+    /// Inside a trait decl: a synthetic GenericParam("This") placeholder
+    /// that downstream substitution rewrites to the impl target.
+    /// Invalid outside trait/impl scopes — using `This` there is an error.
+    this_type:        TypeRef;
 
     static new(current_module: string, source_file: string) -> ResolutionContext {
         return ResolutionContext {
@@ -49,6 +55,7 @@ type struct ResolutionContext {
             import_modules:   [],
             generic_bindings: [],
             binding_refs:     [],
+            this_type:        TypeRef::invalid(),
         };
     }
 
@@ -66,6 +73,11 @@ type struct ResolutionContext {
             }
         }
         return TypeRef::invalid();
+    }
+
+    /// Bind `This` for the current resolution scope.
+    set_this_type(mut &this, t: TypeRef) -> void {
+        this.this_type = t;
     }
 }
 
@@ -171,10 +183,15 @@ type struct TypeResolver {
                 this.resolve_generic(g, ctx)
             }
             TypeAnnotation::ThisType(t) => {
-                // `This` is resolved by the trait/impl-context walk in
-                // Phase B.1. Until that lands, return invalid so callers
-                // see a deferred placeholder rather than a silent miss.
-                TypeRef::invalid()
+                if (ctx.this_type.is_valid()) {
+                    return ctx.this_type;
+                }
+                if (this.diagnostics != null) {
+                    this.diagnostics.emit(Diagnostic::error(
+                        ErrorCode::E0203_UNDEFINED_TYPE,
+                        "`This` used outside a trait declaration or impl block"));
+                }
+                return TypeRef::invalid();
             }
         };
     }
@@ -252,6 +269,13 @@ type struct TypeResolver {
                               owner_type: TypeRef) -> void {
         const this_ref_name: SymbolStr = this.intern_table.intern("&this");
         const this_val_name: SymbolStr = this.intern_table.intern("this");
+        // Bind `This` to the impl's owner type for the duration of method-
+        // signature resolution. `&This` annotations on parameters/returns
+        // resolve to `owner_type` here; the by-name back-fill at the bottom
+        // of this function still handles the implicit-typed `&this` receiver.
+        if (owner_type.is_valid()) {
+            res_ctx.set_this_type(owner_type);
+        }
         printf("[ResMthSig] count=%lld owner_id=%d\n", methods.length, owner_type.id as i32);
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
@@ -292,8 +316,24 @@ type struct TypeResolver {
     }
 
     /// Resolve all function signatures (FunctionDeclNode*[]) on a trait.
+    ///
+    /// Inside a trait body, `This` is a symbolic placeholder for the type
+    /// that future impls will bind. We give it a stable identity by
+    /// synthesizing a deduplicated GenericParam("This", sentinel-index) —
+    /// this lets `&This` parameters and `-> This` returns resolve to a real
+    /// TypeRef that downstream substitution can rewrite per-impl.
     resolve_trait_method_signatures(&this, methods: FunctionDeclNode*[],
                                     res_ctx: ResolutionContext*) -> void {
+        if (!res_ctx.this_type.is_valid()) {
+            const this_name: SymbolStr = this.intern_table.intern("This");
+            // Sentinel index well above any plausible real generic-param
+            // count. arena.create_generic_param dedups by (name.id, index),
+            // so every trait shares this canonical `This` placeholder.
+            const this_placeholder: TypeRef =
+                this.arena.create_generic_param(this_name, 0xFFFFFFFF as u64);
+            res_ctx.set_this_type(this_placeholder);
+        }
+
         for (mut i: i64 = 0; i < methods.length; i++) {
             const func: FunctionDeclNode* = methods[i];
             if (func == null) { continue; }
