@@ -2,9 +2,9 @@
   <img src="./assets/cryo-logo-1.png" alt="Cryo" width="180"/>
     <br/>
   <h1>The Cryo Programming Language</h1>
-  <h4><i>Under Development</i></h4>
+  <h4><i>pre-0.1.0 — under heavy development</i></h4>
 
-  <p>A statically-typed, compiled systems language with monomorphic generics, class inheritance, pattern matching, algebraic data types, and an LLVM backend.</p>
+  <p>A statically-typed, compiled systems language with monomorphic generics, class inheritance, pattern matching, algebraic data types, and an LLVM 20 backend.</p>
 </div>
 
 ---
@@ -35,9 +35,9 @@ function main() -> int {
 - [FFI (Foreign Function Interface)](#ffi-foreign-function-interface)
 - [Type System](#type-system)
 - [Standard Library](#standard-library)
-- [Tooling](#tooling)
 - [Building from Source](#building-from-source)
 - [Architecture](#architecture)
+- [Project Layout](#project-layout)
 - [License](#license)
 
 ## Features
@@ -46,13 +46,12 @@ function main() -> int {
 |---|---|
 | **Strong static typing** | Explicit type annotations with no implicit conversions |
 | **Monomorphic generics** | Compile-time specialization with zero runtime overhead |
-| **Class inheritance** | Single inheritance, virtual methods, and polymorphic dispatch |
+| **Class inheritance** | Single inheritance, virtual methods, polymorphic dispatch |
 | **Algebraic data types** | Enums with payloads and exhaustive pattern matching |
 | **Module system** | Hierarchical namespaces with visibility control and a prelude |
-| **LLVM 20 backend** | Optimizing compilation to native x86-64, ARM64, and WebAssembly |
-| **Rich standard library** | `Option<T>`, `Result<T, E>`, `Array<T>`, `String`, allocators, I/O, and more |
-| **Self-hosting** | *(In development)* Cryo written in itself bootstrapped from C++, located in [`./cryoc`](./cryoc/) |
-| **Integrated tooling** | LSP server, VS Code extension, code formatter, and a tiered test suite |
+| **LLVM 20 backend** | Optimizing compilation to native x86-64 / ARM64 |
+| **Self-hosting** | The compiler is written in Cryo. The C++ bootstrap is retained for emergency rebuilds in [`./legacy/bootstrap/`](./legacy/bootstrap/). |
+| **Rich standard library** | `Option<T>`, `Result<T, E>`, `Array<T>`, `String`, allocators, I/O, more |
 
 ## Getting Started
 
@@ -63,22 +62,40 @@ function main() -> int {
 | LLVM | 20 |
 | Clang | 20 |
 | GNU Make | 4.0+ |
-| C++ compiler | C++23 support required |
-| Python | 3.x (for test runner) |
+| Python | 3.8+ (used by `make selfhost-check`) |
 
 ### Install
 
 ```bash
 git clone https://github.com/jakelequire/CryoLang.git
 cd CryoLang
-make all
+./install.sh
 ```
 
-The compiler binary is placed at `./bin/cryo`.
+`install.sh` runs `make cryo` (about 5 minutes on a cold cache) to build
+the self-hosted compiler in place at `compiler/build/bin/cryo`, then
+appends a `PATH` export to your shell rc so you can run `cryo` from
+anywhere.
+
+> **In-tree limitation (read this).** This release locates the standard
+> library via a relative path (`<project_root>/../stdlib`). Until that's
+> generalized, your projects must live as a sibling of `stdlib/` — the
+> simplest pattern is to put projects inside the repo, e.g.
+> `CryoLang/sandbox/myapp/`. System-wide install is not yet supported.
 
 ### Hello World
 
-Create `hello.cryo`:
+Create `sandbox/hello/cryoconfig`:
+
+```toml
+[project]
+project_name = "hello"
+output_dir = "build"
+target_type = "executable"
+entry_point = "main.cryo"
+```
+
+Create `sandbox/hello/main.cryo`:
 
 ```cryo
 namespace Hello;
@@ -89,39 +106,12 @@ function main() -> int {
 }
 ```
 
-Compile and run:
+Build and run:
 
 ```bash
-./bin/cryo hello.cryo -o hello
-./hello
-```
-
-### Project-Based Builds
-
-For multi-file projects, create a `cryoconfig` file by running `cryo init`:
-
-```bash
-cryo init <project_name>
-```
-
-```toml
-[project]
-project_name = "myapp"
-output_dir = "build"
-target_type = "executable"
-entry_point = "main.cryo"
-
-[compiler]
-debug = false
-optimize = true
-```
-
-Then build and run:
-
-```bash
-cd myapp
+cd sandbox/hello
 cryo build
-cryo run
+./build/bin/hello
 ```
 
 ## Language Overview
@@ -192,13 +182,14 @@ const parity: string = match (n % 2) {
     _ => { "unknown" }
 };
 
-// ternary operators
+// ternary
 const abs: int = x >= 0 ? x : -x;
 ```
 
 ### Structs
 
-Structs define value types with fields and methods. Methods use `&this` for immutable access and `mut &this` for mutation.
+Structs define value types with fields and methods. Methods use `&this`
+for immutable access and `mut &this` for mutation.
 
 ```cryo
 type struct Rect {
@@ -230,57 +221,8 @@ function main() -> int {
 
 ### Classes & Inheritance
 
-Classes are heap-allocated reference types that support single inheritance, constructor chaining, virtual methods, and polymorphic dispatch.
-
-#### Defining a Class
-
-```cryo
-type class Animal {
-public:
-    kind: string;
-
-    Animal(_kind: string) {
-        this.kind = _kind;
-    }
-
-    describe(&this) -> void {
-        println("Animal: %s", this.kind);
-    }
-}
-
-function main() -> i32 {
-    const a: Animal* = new Animal("Cat");
-    a.describe();   // Animal: Cat
-    return 0;
-}
-```
-
-#### Inheritance & Constructor Chaining
-
-Derived classes use `: BaseClass(args)` syntax to chain constructors. Fields and methods from the base class are inherited automatically.
-
-```cryo
-type class Dog : Animal {
-public:
-    name: string;
-
-    Dog(_name: string) : Animal("Dog") {
-        this.name = _name;
-    }
-
-    bark(&this) -> void {
-        println("%s says: Woof!", this.name);
-    }
-}
-
-const buddy: Dog* = new Dog("Buddy");
-buddy.describe();   // Animal: Dog       (inherited from Animal)
-buddy.bark();       // Buddy says: Woof!
-```
-
-#### Virtual Methods & Polymorphism
-
-Mark base class methods as `virtual` and override them in derived classes with `override`. Calls through a base class pointer dispatch to the correct implementation at runtime.
+Classes are heap-allocated reference types that support single inheritance,
+constructor chaining, virtual methods, and polymorphic dispatch.
 
 ```cryo
 type class Animal {
@@ -312,7 +254,6 @@ public:
     }
 }
 
-// Polymorphic dispatch through a base class pointer
 function make_speak(animal: Animal*) -> void {
     animal.speak();
 }
@@ -326,34 +267,6 @@ function main() -> i32 {
 }
 ```
 
-#### Deep Inheritance
-
-Inheritance chains can extend to any depth. Each level chains to its parent's constructor.
-
-```cryo
-type class Animal {
-public:
-    species: string;
-    Animal(_species: string) { this.species = _species; }
-}
-
-type class Dog : Animal {
-public:
-    breed: string;
-    Dog(_breed: string) : Animal("Dog") { this.breed = _breed; }
-}
-
-type class GoldenRetriever : Dog {
-public:
-    name: string;
-    GoldenRetriever(_name: string) : Dog("GoldenRetriever") { this.name = _name; }
-
-    introduce(&this) -> void {
-        println("%s: %s (%s, %s)", this.breed, this.name, this.breed, this.species);
-    }
-}
-```
-
 #### Structs vs. Classes
 
 | | Struct | Class |
@@ -361,14 +274,13 @@ public:
 | **Allocation** | Stack (value type) | Heap via `new` (reference type) |
 | **Inheritance** | No | Single inheritance |
 | **Virtual dispatch** | No | `virtual` / `override` |
-| **Receivers** | `&this` / `mut &this` ( ** ) | `&this` / `mut &this` ( ** ) |
+| **Receivers** | `&this` / `mut &this` | `&this` / `mut &this` |
 | **Use when** | Plain data, small types, generics | Polymorphism, object hierarchies |
-
-** Non-static methods on any object *(struct or class)* by default receive an immutable reference `&this`. Use `mut &this` if mutation is needed.
 
 ### Enums & Pattern Matching
 
-Enums support unit variants and variants with payloads. Pattern matching is exhaustive.
+Enums support unit variants and variants with payloads. Pattern matching
+is exhaustive.
 
 ```cryo
 type enum Shape {
@@ -407,9 +319,8 @@ implement enum Shape {
 
 ### Generics
 
-Cryo uses monomorphization — generic code is specialized at compile time for each concrete type used, producing zero-overhead abstractions.
-
-#### Generic Structs
+Cryo uses monomorphization — generic code is specialized at compile time
+for each concrete type used, producing zero-overhead abstractions.
 
 ```cryo
 type struct Pair<T> {
@@ -427,12 +338,9 @@ type struct Pair<T> {
     }
 }
 
-// Each instantiation generates specialized code
 const ints: Pair<int> = Pair<int>::new(1, 2);
 const strs: Pair<string> = Pair<string>::new("hello", "world");
 ```
-
-#### Generic Enums
 
 Generic enums power the standard library's core types:
 
@@ -448,7 +356,7 @@ type enum Result<T, E> {
 }
 ```
 
-#### Generic Functions
+Generic functions:
 
 ```cryo
 function identity<T>(x: T) -> T {
@@ -463,35 +371,10 @@ function min<T>(a: T, b: T) -> T {
 }
 ```
 
-#### Generic Implement Blocks
-
-```cryo
-implement enum Option<T> {
-    is_some(&this) -> boolean {
-        return match (this) {
-            Option::Some(_) => { true }
-            Option::None =>    { false }
-        };
-    }
-
-    unwrap_or(&this, default_value: T) -> T {
-        return match (this) {
-            Option::Some(value) => { value }
-            Option::None =>        { default_value }
-        };
-    }
-}
-```
-
-#### Type Aliases
-
-```cryo
-type StringResult<T> = Result<T, string>;
-```
-
 ### Modules
 
-Every file declares a namespace. Modules are organized using `_module.cryo` files that re-export submodules — similar to Rust's `mod.rs`.
+Every file declares a namespace. Modules are organized using
+`_module.cryo` files that re-export submodules — similar to Rust's `mod.rs`.
 
 ```cryo
 // math/_module.cryo
@@ -527,7 +410,7 @@ function main() -> int {
 }
 ```
 
-Items are private by default. Use `public` to export them.
+Items are private by default; use `public` to export them.
 
 ### Pointers & Memory
 
@@ -537,7 +420,7 @@ Cryo provides explicit pointer operations for systems-level control.
 function example() -> void {
     mut x: int = 42;
     const ptr: int* = &x;          // address-of
-    println("%d", *ptr);          // dereference
+    println("%d", *ptr);           // dereference
 
     // Heap allocation
     const buf: int* = malloc(sizeof(int) * 10);
@@ -547,34 +430,32 @@ function example() -> void {
 ```
 
 ## FFI (Foreign Function Interface)
-Cryo can call C functions and be called from C. Use `extern "C"` blocks to declare foreign functions. Or, use `name := extern "C" { ... }` to import C header files directly, which generates bindings automatically under the given namespace.
+
+Cryo can call C functions and be called from C. Use `extern "C"` blocks
+to declare foreign functions, or `name := extern "C" { ... }` to import C
+header files directly under a chosen namespace.
 
 ```cryo
 namespace FFI;
 
-// Declare an external C function, using Cryo syntax.
+// Declare a C function manually
 extern "C" {
     function puts(s: string) -> int;
 }
 
-// Import C functions from a header file.
-// The `c` namespace (any identifier) is used to access imported C functions.
+// Import C functions from a header file under the `c` namespace
 c := extern "C" {
     #include <stdio.h>
-    #include "./my_header.h" // void foo(int);
+    #include "./my_header.h"        // void foo(int);
 }
 
 function main() -> int {
-    const message: string = "Hello from C!";
-    puts(message);  // Calls the C function `puts`
-
-    c::foo(42);    // Calls the C function `foo` imported from my_header.h
-    c::printf("Value: %d\n", 123); // Calls C's printf via the c namespace
-
+    puts("Hello from C!");
+    c::foo(42);
+    c::printf("Value: %d\n", 123);
     return 0;
 }
 ```
-
 
 ## Type System
 
@@ -585,8 +466,8 @@ function main() -> int {
 | `i8` `i16` `i32` `i64` | Signed integers |
 | `u8` `u16` `u32` `u64` | Unsigned integers |
 | `int` | Platform integer (i32) |
-| `f32` `f64` | Floating-point numbers |
-| `boolean` | `true` or `false` |
+| `f32` `f64` | Floating-point |
+| `boolean` | `true` / `false` |
 | `char` | 8-bit character |
 | `string` | Null-terminated string (`char*`) |
 | `void` | No value |
@@ -611,164 +492,61 @@ const b: i32 = a as i32;
 
 ## Standard Library
 
-The standard library is written entirely in Cryo and compiled as a static library. A **prelude** automatically imports the most common types and functions into every file.
+The standard library lives at [`./stdlib/`](./stdlib/) and is written
+entirely in Cryo. A **prelude** automatically imports the most common
+types and functions into every file.
 
 ### Prelude (auto-imported)
 
-The prelude provides `Option<T>`, `Result<T, E>`, `Array<T>`, `String`, `print`, `println`, `assert`, `assert_eq`, `panic`, `min`, `max`, `clamp`, `swap`, `identity`, and more.
+`Option<T>`, `Result<T, E>`, `Array<T>`, `String`, `print`, `println`,
+`assert`, `assert_eq`, `panic`, `min`, `max`, `clamp`, `swap`, `identity`,
+and more.
 
+### Modules
 
-### Core Modules
-- `/stdlib/alloc` — Arena, heap, stack, pool allocators
-- `/stdlib/collections` — Array, String, HashMap, Deque, BTreeMap
-- `/stdlib/core` — Option, Result, primitives, intrinsics
-- `/stdlib/env` — Environment variables, args
-- `/stdlib/ffi` — Foreign function interface (C interop)
-- `/stdlib/fmt` — Formatting
-- `/stdlib/fs` — File system, paths
-- `/stdlib/io` — stdio, file, reader, writer
-- `/stdlib/math` — math functions and constants
-- `/stdlib/os` — OS abstractions, threads, synchronization
-- `/stdlib/process` — Process spawning, exit codes
-- `/stdlib/time` — Time, duration, sleep
+| Path | Contents |
+|---|---|
+| `stdlib/alloc/` | Arena, heap, stack, pool allocators |
+| `stdlib/collections/` | Array, String, HashMap, Deque, BTreeMap |
+| `stdlib/core/` | Option, Result, primitives, intrinsics |
+| `stdlib/env/` | Environment variables, args |
+| `stdlib/ffi/` | Foreign function interface (C interop) |
+| `stdlib/fmt/` | Formatting |
+| `stdlib/fs/` | File system, paths |
+| `stdlib/io/` | stdio, file, reader, writer |
+| `stdlib/math/` | Math functions and constants |
+| `stdlib/os/` | OS abstractions, threads, synchronization |
+| `stdlib/process/` | Process spawning, exit codes |
+| `stdlib/time/` | Time, duration, sleep |
 
-
-
-## Tooling
-
-### Compiler CLI
-
-```
-Usage: cryo <command> [options]
-
-Commands:
-  compile <file>     Compile a source file (default)
-  build              Build project from cryoconfig
-  run                Build and execute
-  check              Type-check without compiling
-  init               Initialize a new project
-  ast                Display the AST
-  tokens             Display lexer output
-  symbols            Display symbol table
-  info               Show compiler information
-  version            Show version
-
-Options:
-  -o, --output       Output file name
-  -c, --compile-only Compile only (no linking)
-  -d, --debug        Enable debug output
-  -v, --verbose      Verbose output
-  --emit-llvm        Emit LLVM bitcode
-  --emit-wasm        Compile to WebAssembly (experimental)
-  --ir               Display LLVM IR
-  --ast              Display AST
-  --no-std           Compile without standard library
-  --log-component    Filter logs (CODEGEN, PARSER, LEXER, etc.)
-```
-
-### Language Server (LSP)
-
-A full LSP implementation provides real-time feedback in your editor:
-
-- Syntax highlighting and diagnostics
-- Code completion
-- Go to definition
-- Hover documentation
-- Symbol search
-
-Build the LSP server:
-
-```bash
-make lsp
-```
-
-### VS Code Extension
-
-The official extension **cryo-language-support** integrates the LSP server with VS Code for a complete development experience.
-
-### Test Suite
-
-The E2E test suite is organized into tiers:
-
-```bash
-make test            # Run all tests
-make test-tier1      # Core language (variables, control flow, functions)
-make test-tier2      # Type system (structs, enums, pointers, match)
-make test-tier3      # Generics (structs, enums, cross-module)
-make test-tier4      # Modules (imports, submodules, visibility)
-make test-tier5      # Classes (inheritance, virtual dispatch, polymorphism)
-make test-tier6      # FFI (C interop, unsafe code)
-make test-tier7      # Standard library (collections, allocators, I/O)
-make test-negative   # Expected compilation failures
-```
+A second-generation rewrite is parked at
+[`experimental/stdlib-next/`](./experimental/stdlib-next/). It is **not
+built or shipped**; it will replace `stdlib/` once the compiler grows
+the features it depends on.
 
 ## Building from Source
 
-### Quick Build
+The top-level `Makefile` orchestrates the full chain.
 
-```bash
-make all        # Build compiler, stdlib, and run tests
-```
-
-### Individual Targets
-
-```bash
-make build      # Compiler only
-make stdlib     # Standard library
-make lsp        # Language Server
-make rebuild    # Clean rebuild
-make clean      # Remove all build artifacts
-```
-
-### Platform Notes
-
-| Platform | Toolchain | Notes |
+| Target | Time | Output |
 |---|---|---|
-| **Windows** | MSYS2 MinGW64 + Clang 20 | Primary development platform |
-| **Linux** | Clang 20 | x86-64 and ARM64 |
-| **macOS** | Clang (Xcode) | x86-64 and ARM64 |
-| **WebAssembly** | Emscripten | Experimental; uses `--emit-wasm` flag |
+| `make bootstrap` | ~3 min cold | `legacy/bootstrap/bin/cryo` |
+| `make stdlib` | ~30 s | `stdlib/.bin/libcryo.a` |
+| `make cryo` | ~5 min cold | `compiler/build/bin/cryo` (the working compiler) |
+| `make selfhost-check` | ~3-10 min | Verifies stage-4 / stage-5 IR byte-identity |
+| `make clean` | instant | Wipes compiler + stdlib outputs |
+| `make distclean` | instant | Also cleans bootstrap |
 
-### Project Structure
-
-```
-CryoLang/
-├── src/                    # Compiler implementation (C++23)
-│   ├── CLI/                #   Command-line interface
-│   ├── Compiler/           #   Multi-pass compilation pipeline
-│   ├── Codegen/            #   LLVM IR generation
-│   ├── Lexer/              #   Tokenization
-│   ├── Parser/             #   Syntax analysis
-│   ├── AST/                #   Abstract syntax tree
-│   ├── Types/              #   Type system (TypeID, TypeRef, TypeArena)
-│   ├── Linker/             #   Object linking
-│   └── Utils/              #   Platform abstractions, logging
-├── include/                # C++ headers
-├── stdlib/                 # Standard library (written in Cryo)
-│   ├── prelude.cryo        #   Auto-imported essentials
-│   ├── core/               #   Option, Result, primitives, intrinsics
-│   ├── collections/        #   Array, String, HashMap, Deque, BTreeMap
-│   ├── alloc/              #   Arena, heap, stack, pool allocators
-│   ├── io/                 #   stdio, file, reader, writer
-│   ├── fs/                 #   File system, paths
-│   └── ...
-├── cryoc/                  # Self-hosted compiler (in Cryo)
-├── tests/                  # E2E test suite (tiered)
-├── tools/
-│   ├── CryoLSP/           #   Language Server Protocol server
-│   ├── CryoFormat/        #   Code formatter
-│   └── CryoAnalyzer/      #   VS Code extension
-└── makefile                # Build system
-```
+Daily flow: `make cryo`. Pre-tag / pre-merge gate: `make selfhost-check`.
 
 ## Architecture
 
-The compiler uses a 9-stage multi-pass pipeline:
+The compiler runs a multi-pass pipeline:
 
 ```
 Source → Frontend → Module Resolution → Declaration Collection → Type Resolution
      → Semantic Analysis → Specialization → Codegen Preparation → IR Generation
-     → Optimization → Native Binary
+     → Linking → Native Binary
 ```
 
 | Stage | Purpose |
@@ -781,8 +559,33 @@ Source → Frontend → Module Resolution → Declaration Collection → Type Re
 | **Specialization** | Monomorphize generic instantiations |
 | **Codegen Preparation** | Multi-pass type and declaration ordering |
 | **IR Generation** | Emit LLVM IR via the LLVM 20 C++ API |
-| **Optimization** | LLVM optimization passes and linking |
+| **Linking** | Link object files + libcryo.a → executable |
 
+## Project Layout
+
+```
+CryoLang/
+├── compiler/              The self-hosted Cryo compiler (active)
+│   ├── src/
+│   ├── cryoconfig
+│   └── llvm_bindings.h
+├── stdlib/                The current standard library (active, ~25k LOC, 53 modules)
+├── legacy/
+│   └── bootstrap/         Frozen C++23 bootstrap; builds via `make bootstrap`
+├── experimental/
+│   └── stdlib-next/       Parked stdlib rewrite; not built or shipped
+├── tools/                 LSP / formatter / analyzer (not maintained for 0.1)
+├── docs/                  Language reference, grammar, mangling spec
+├── examples/              Standalone Cryo programs
+├── scripts/               Build helpers
+├── assets/
+├── .github/
+├── Makefile               Top-level build orchestration
+├── install.sh             PATH-wrapper installer
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+└── LICENSE
+```
 
 ## License
 
