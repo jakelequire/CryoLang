@@ -620,6 +620,36 @@ private:
         // Catches mistakes like Array<i32, string> when Array only takes <T>.
         const entry: TemplateEntry* = this.generic_registry.get_template_by_type_id(base.id);
         if (entry != null) {
+            // Default-type-parameter substitution: when the annotation
+            // omits trailing args (e.g. `Array<i32>` on a template defined
+            // as `Array<T, A = GlobalAlloc>`), fill the tail by resolving
+            // each missing param's default annotation. Defaults can
+            // reference earlier params, so re-bind on every iteration.
+            if (args.length < entry.param_count) {
+                const params: GenericParamNode*[] = entry.get_generic_params();
+                const start: i64 = args.length;
+                for (mut i: i64 = start; i < entry.param_count; i++) {
+                    if (i >= params.length) { break; }
+                    const gp: GenericParamNode* = params[i];
+                    if (gp == null || !gp.has_default_annotation()) {
+                        LOG_DEBUG(LogComponent::TypeChecker,
+                            "[TypeResolver] resolve_generic() missing arg %lld and no default", i);
+                        return TypeRef::invalid();
+                    }
+                    mut def_ctx: ResolutionContext = *ctx;
+                    for (mut j: i64 = 0; j < args.length; j++) {
+                        def_ctx.add_binding(entry.param_names[j], args[j]);
+                    }
+                    const def_type: TypeRef = this.resolve(gp.default_annotation, &def_ctx);
+                    if (!def_type.is_valid()) {
+                        LOG_DEBUG(LogComponent::TypeChecker,
+                            "[TypeResolver] resolve_generic() failed to resolve default for param %lld", i);
+                        return TypeRef::invalid();
+                    }
+                    args.push(def_type);
+                }
+            }
+
             if (args.length != entry.param_count) {
                 LOG_DEBUG(LogComponent::TypeChecker,
                     "[TypeResolver] resolve_generic() arg count mismatch: "
