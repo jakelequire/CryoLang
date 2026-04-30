@@ -199,9 +199,9 @@ STDLIB_FLAGS ?= # Additional flags for stdlib compilation (e.g., --debug --verbo
 # Exclude the runtime directory from stdlib compilation
 ifeq ($(OS), Windows_NT)
     # Use MSYS2 find for reliable file discovery on Windows
-    STDLIB_SRCS := $(shell C:/msys64/usr/bin/find $(STDLIB_DIR) -name "*.cryo" -type f ! -path "*/test-cases/*" ! -path "*/runtime/*" | sed 's|$(STDLIB_DIR)/||')
+    STDLIB_SRCS := $(shell C:/msys64/usr/bin/find $(STDLIB_DIR) -name "*.cryo" -type f ! -path "*/test-cases/*" ! -path "*/runtime/*" 2>/dev/null | sed 's|$(STDLIB_DIR)/||')
 else
-    STDLIB_SRCS := $(shell find $(STDLIB_DIR) -name "*.cryo" -type f | grep -v test-cases | grep -v runtime | sed 's|$(STDLIB_DIR)/||')
+    STDLIB_SRCS := $(shell find $(STDLIB_DIR) -name "*.cryo" -type f 2>/dev/null | grep -v test-cases | grep -v runtime | sed 's|$(STDLIB_DIR)/||')
 endif
 
 # Generate corresponding bitcode files
