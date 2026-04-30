@@ -273,17 +273,17 @@ type struct CodegenPasses {
             mut verify_err: i8* = null;
             const verify_result: i32 = llvm::LLVMVerifyModule(cg.llvm_module.raw, 2, &verify_err as void*);
             if (verify_result != 0) {
+                // Print verifier output directly so the user can see which
+                // module / function the verifier choked on. Then emit a
+                // single short diagnostic — the previous code attached the
+                // multi-KB verifier text to a Diagnostic.with_note(), and
+                // that string ended up sharing memory across diagnostics
+                // in a way that segfaulted the deferred flush in stdlib
+                // builds with several verify failures.
                 mut diag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                     format("LLVM module verification failed for %s", module_name));
                 if (verify_err != null) {
-                    // LLVM's verifier concatenates one failure message per
-                    // broken function, so this buffer can be multi-MB.  We
-                    // MUST avoid routing it through Cryo's `format()` —
-                    // that uses a static sprintf buffer and segfaults on
-                    // large inputs.  Truncate to a human-sized chunk and
-                    // attach via string concat, which copies into a fresh
-                    // heap buffer.
                     const max_len: u64 = 2048;
                     const err_len: u64 = strlen(verify_err as string);
                     mut note_body: string = verify_err as string;
@@ -295,11 +295,10 @@ type struct CodegenPasses {
                     }
                     diag = diag.with_note("LLVM reports: " + note_body);
                     if (err_len > max_len) {
-                        diag = diag.with_note("(LLVM error truncated — see stderr via LLVMVerifyModule for the full listing)");
+                        diag = diag.with_note("(LLVM error truncated)");
                     }
                 }
-                const _vf_sink: DiagnosticSink* = ctx.diagnostics;
-                _vf_sink.emit(diag);
+                ctx.diagnostics.emit(diag);
                 if (verify_err != null) {
                     llvm::LLVMDisposeMessage(verify_err as void*);
                 }
@@ -367,10 +366,6 @@ type struct CodegenPasses {
     static run_object_emission(ctx: CompilationContext*) -> PassResult {
         if (!ctx.artifacts.ir.is_valid()) {
             return PassResult::ok();
-        }
-
-        if (ctx.debug_mode) {
-            printf("[Codegen] Object emission for module: %s\n", ctx.artifacts.ir.module_name);
         }
 
         mut tm: LTargetMachine = create_native_target_machine();

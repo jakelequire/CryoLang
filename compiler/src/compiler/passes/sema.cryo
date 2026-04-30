@@ -603,10 +603,20 @@ public:
 
     visit_trait_decl(node: TraitDeclNode*) -> void {
         if (node.is_generic()) { return; }
+        // Inside a trait declaration, `this` refers to the implementing
+        // type — symbolically. Use the same canonical `This` placeholder
+        // the type resolver synthesizes in `resolve_trait_method_signatures`
+        // (B.1) so default-body uses of `this` and `&this` resolve cleanly
+        // and will be substituted to the concrete impl target by B.6
+        // synthesis. Without this, every trait default body emits
+        // "undefined variable 'this'" diagnostics.
+        const this_name: SymbolStr = this.intern.intern("This");
+        const this_placeholder: TypeRef =
+            this.arena.create_generic_param(this_name, 0xFFFFFFFF as u64);
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             const func: FunctionDeclNode* = node.methods[j];
             if (func != null && func.body != null) {
-                this.enter_function(func, TypeRef::invalid());
+                this.enter_function(func, this_placeholder);
                 this.visit_block(func.body);
                 this.body_count = this.body_count + 1;
             }
@@ -1019,7 +1029,15 @@ public:
         const global: TypeRef = this.lookup_global_var(ident.name);
         if (global.is_valid()) { return global; }
 
+        // Built-in source-location pseudo-macros: `FILE` is a `string`
+        // pointer to the file path, `LINE` is an `i32` line number.
+        // Codegen substitutes these at use site (see
+        // codegen_identifier in expr_codegen.cryo); sema only needs to
+        // give them a type so the call argument type-checks.
         const name_str: string = this.intern.resolve(ident.name);
+        if (strcmp(name_str, "FILE") == 0) { return this.arena.get_string(); }
+        if (strcmp(name_str, "LINE") == 0) { return this.arena.get_i32(); }
+
         this.ctx.emit_error_at(ErrorCode::E0201_UNDEFINED_VARIABLE,
             format("use of undefined variable '%s'", name_str),
             ident.span);
@@ -1125,6 +1143,25 @@ public:
         } else if (base_t.kind == TypeKind::Struct) {
             const st: StructType* = base_t as StructType*;
             methods = st.methods;
+        } else if (base_t.kind == TypeKind::BoundedParam) {
+            // Bound-aware param-type hint: when the receiver is a generic
+            // param `T: Trait`, look up `member` on each bound trait so
+            // call-arg expected_type propagation can pick up the trait
+            // method's declared param types. Without this, `T::deallocate`
+            // resolves arg types with no expected hint, so the inner
+            // `NonNull::new(...)` falls through `try_resolve_generic_return`'s
+            // expected_type fallback and bottoms out at the unresolved
+            // template, breaking codegen.
+            const bp: BoundedParamType* = base_t as BoundedParamType*;
+            for (mut bi: i64 = 0; bi < bp.bounds.length; bi++) {
+                const bt: Type* = this.arena.lookup(bp.bounds[bi].id);
+                if (bt == null || bt.kind != TypeKind::Trait) { continue; }
+                const tt: TraitType* = bt as TraitType*;
+                for (mut mi: i64 = 0; mi < tt.required_methods.length; mi++) {
+                    methods.push(tt.required_methods[mi]);
+                }
+            }
+            if (methods.length == 0) { return []; }
         } else {
             return [];
         }
@@ -1219,7 +1256,76 @@ public:
         const et: EnumType* = enum_t as EnumType*;
         const variant: EnumVariantInfo* = et.get_variant(scope.member_name);
         if (variant == null) { return []; }
+        // If the variant payload references the enum's generic params
+        // (which it does on the template — e.g. Result::Ok carries `T`),
+        // substitute those params with the concrete type-args from
+        // `expected_type`. This is the case the `has_resolved_type` branch
+        // above misses: when the spec InstantiatedType exists but never had
+        // its `resolved_type` populated, its type_args are still concrete
+        // and we can substitute manually so the caller gets a usable
+        // expected_type for the arg (e.g. NonNull<u8>) rather than the
+        // raw generic param.
+        if (this.expected_type.is_valid()) {
+            mut exp_ref2: TypeRef = this.expected_type;
+            mut exp_t2: Type* = this.arena.lookup(exp_ref2.id);
+            if (exp_t2 != null && exp_t2.kind == TypeKind::TypeAlias) {
+                const alias2: TypeAliasType* = exp_t2 as TypeAliasType*;
+                if (alias2.has_target()) {
+                    exp_ref2 = alias2.target;
+                    exp_t2 = this.arena.lookup(exp_ref2.id);
+                }
+            }
+            if (exp_t2 != null && exp_t2.kind == TypeKind::InstantiatedType) {
+                const exp_inst2: InstantiatedType* = exp_t2 as InstantiatedType*;
+                if (exp_inst2.generic_base.id == type_ref.id) {
+                    return this.substitute_payload_types(
+                        variant.payload_types, type_ref, exp_inst2.type_args);
+                }
+            }
+        }
         return variant.payload_types;
+    }
+
+    /// Substitute the enum's template generic params with concrete type
+    /// args. `template_ref` is the generic enum's TypeRef (which carries
+    /// param names via the generic registry).
+    substitute_payload_types(&this, payload: TypeRef[], template_ref: TypeRef,
+                              type_args: TypeRef[]) -> TypeRef[] {
+        if (this.ctx.generic_registry == null) { return payload; }
+        const entry: TemplateEntry* =
+            this.ctx.generic_registry.get_template_by_type_id(template_ref.id);
+        if (entry == null) { return payload; }
+        if (entry.param_count != type_args.length) { return payload; }
+        mut result: TypeRef[] = [];
+        for (mut i: i64 = 0; i < payload.length; i++) {
+            const pt: Type* = this.arena.lookup(payload[i].id);
+            if (pt == null) {
+                result.push(payload[i]);
+            } else if (pt.kind == TypeKind::GenericParam) {
+                const gp: GenericParamType* = pt as GenericParamType*;
+                mut substituted: TypeRef = payload[i];
+                for (mut p: i64 = 0; p < entry.param_count; p++) {
+                    if (entry.param_names[p].equals(gp.param_name)) {
+                        substituted = type_args[p];
+                        break;
+                    }
+                }
+                result.push(substituted);
+            } else if (pt.kind == TypeKind::BoundedParam) {
+                const bp: BoundedParamType* = pt as BoundedParamType*;
+                mut substituted: TypeRef = payload[i];
+                for (mut p: i64 = 0; p < entry.param_count; p++) {
+                    if (entry.param_names[p].equals(bp.param_name)) {
+                        substituted = type_args[p];
+                        break;
+                    }
+                }
+                result.push(substituted);
+            } else {
+                result.push(payload[i]);
+            }
+        }
+        return result;
     }
 
     lookup_callee_function_type(&this, callee: ExpressionNode*) -> TypeRef {
@@ -1656,6 +1762,17 @@ public:
 
         const type_sym: SymbolStr = this.lookup_type_sym(lookup_ref);
         if (!type_sym.is_valid()) {
+            // BoundedParam still needs a chance — its name maps to the
+            // generic-param identifier (e.g. "T"), which won't reverse-look
+            // up to a SymbolStr but the bounds carry trait identities.
+            if (base_t != null && base_t.kind == TypeKind::BoundedParam) {
+                const trait_ret: TypeRef = this.lookup_method_through_bounds(
+                    base_t as BoundedParamType*, member.member);
+                if (trait_ret.is_valid()) {
+                    member.set_resolved_type(trait_ret);
+                    return trait_ret;
+                }
+            }
             // Valid type but no reverse mapping — internal gap, not user error
             return TypeRef::invalid();
         }
@@ -1666,6 +1783,32 @@ public:
         if (ret.is_valid()) {
             member.set_resolved_type(ret);
             return ret;
+        }
+
+        // Bound-aware dispatch (B.4): when the receiver is a generic
+        // parameter with trait bounds, the method might live on one of
+        // those bounds. Walk them and pick the first matching trait method.
+        if (base_t != null && base_t.kind == TypeKind::BoundedParam) {
+            const trait_ret: TypeRef = this.lookup_method_through_bounds(
+                base_t as BoundedParamType*, member.member);
+            if (trait_ret.is_valid()) {
+                member.set_resolved_type(trait_ret);
+                return trait_ret;
+            }
+        }
+
+        // Inherited-default fallback (B.4 + partial B.6): when a concrete
+        // type X impls trait T and T provides a default method body, the
+        // method isn't registered under X but is registered under T.
+        // Walk T's that X impls and look for the method there. The full
+        // B.6 work clones the default body into the impl AST; until that
+        // lands, this lets sema type-check the call site so codegen can
+        // dispatch through the trait method's own symbol.
+        const inherited: TypeRef = this.lookup_method_through_trait_impls(
+            type_sym, member.member);
+        if (inherited.is_valid()) {
+            member.set_resolved_type(inherited);
+            return inherited;
         }
 
         // Before giving up, check if the member is a field with function type.
@@ -1748,6 +1891,79 @@ public:
             }
         }
         return TypeRef::invalid();
+    }
+
+    /// Bound-aware method dispatch (B.4). When the receiver type is a
+    /// `BoundedParamType` (i.e. a generic param `T` with trait bounds), the
+    /// concrete impl isn't known yet, but the trait declaration determines
+    /// the call's signature. For each bound trait we look up the method's
+    /// return type registered in the DeclarationIndex (TraitDeclaration's
+    /// resolution path populates these). The first match wins; the
+    /// monomorphizer (B.6) will route the call to the concrete impl once
+    /// `T` is bound to a real type.
+    lookup_method_through_bounds(&this, bp: BoundedParamType*,
+                                 method_name: SymbolStr) -> TypeRef {
+        if (bp == null) { return TypeRef::invalid(); }
+        for (mut i: i64 = 0; i < bp.bounds.length; i++) {
+            const bound_ref: TypeRef = bp.bounds[i];
+            const bound_t: Type* = this.arena.lookup(bound_ref.id);
+            if (bound_t == null || bound_t.kind != TypeKind::Trait) { continue; }
+            const trait_ty: TraitType* = bound_t as TraitType*;
+            const ret: TypeRef = this.lookup_method_return(
+                trait_ty.qualified_name, method_name);
+            if (ret.is_valid()) { return ret; }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Walk the trait-impl registry for `target_name` and return the first
+    /// matching trait-method return type. Used to resolve calls to default
+    /// trait methods on a concrete type that doesn't override them — full
+    /// AST-level synthesis (B.6) is still pending, but typing the call site
+    /// against the trait's signature is enough for sema to proceed.
+    /// `target_name` may be qualified (`std::io::stdio::Stdin`) or bare
+    /// (`Stdin`); the registry is keyed by the bare name as captured by
+    /// the impl-block parser, so try both forms.
+    lookup_method_through_trait_impls(&this, target_name: SymbolStr,
+                                      method_name: SymbolStr) -> TypeRef {
+        if (!target_name.is_valid() || this.ctx.generic_registry == null) {
+            return TypeRef::invalid();
+        }
+        const direct: TypeRef = this.try_trait_impls_for(target_name, method_name);
+        if (direct.is_valid()) { return direct; }
+        const bare: SymbolStr = this.bare_leaf_of_qualified(target_name);
+        if (bare.is_valid() && !bare.equals(target_name)) {
+            return this.try_trait_impls_for(bare, method_name);
+        }
+        return TypeRef::invalid();
+    }
+
+    try_trait_impls_for(&this, target: SymbolStr, method_name: SymbolStr) -> TypeRef {
+        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(target);
+        for (mut i: i64 = 0; i < traits.length; i++) {
+            const ret: TypeRef = this.lookup_method_return(traits[i], method_name);
+            if (ret.is_valid()) { return ret; }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Strip namespace segments off a possibly-qualified name. Returns
+    /// the leaf segment after the final `::`, or the input unchanged when
+    /// no `::` is present.
+    bare_leaf_of_qualified(&this, name: SymbolStr) -> SymbolStr {
+        if (!name.is_valid()) { return name; }
+        const s: string = this.intern.resolve(name);
+        const n: i64 = strlen(s) as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < n; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') { last_sep = i + 2; }
+        }
+        if (last_sep < 0) { return name; }
+        mut tail: string = "";
+        for (mut i: i64 = last_sep; i < n; i++) {
+            tail = format("%s%c", tail, s[i] as i32);
+        }
+        return this.intern.intern(tail);
     }
 
     /// Look up a method by walking the class inheritance chain.
@@ -2283,32 +2499,28 @@ public:
         for (mut i: i64 = 0; i < lit.field_inits.length; i++) {
             const field_init: FieldInit = lit.field_inits[i];
             const value_expr: ExpressionNode* = field_init.value;
-            mut push_expected: boolean = false;
+            // Push the field's declared type as `expected_type` while
+            // resolving its initializer. This lets generic-method calls
+            // (`RawBuffer::new()` returning `RawBuffer<T,A>`) and empty
+            // array literals (`[]` adopting the field's element type)
+            // pick up the right concrete instantiation from the surrounding
+            // struct's field layout.
             mut field_type: TypeRef = TypeRef::invalid();
             if (value_expr != null && struct_t != null &&
                 (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
-                const v_node: ASTNode* = value_expr as ASTNode*;
-                if (v_node.kind == NodeKind::ArrayLiteral) {
-                    const alit: ArrayLiteralNode* = value_expr as ArrayLiteralNode*;
-                    if (alit.elements.length == 0 &&
-                        alit.repeat_count == 0 &&
-                        alit.repeat_count_expr == null) {
-                        mut finfo: FieldInfo* = null;
-                        if (struct_t.kind == TypeKind::Struct) {
-                            const st: StructType* = struct_t as StructType*;
-                            finfo = st.get_field(field_init.field_name);
-                        } else {
-                            const ct: ClassType* = struct_t as ClassType*;
-                            finfo = ct.get_field(field_init.field_name);
-                        }
-                        if (finfo != null && finfo.field_type.is_valid()) {
-                            field_type = finfo.field_type;
-                            push_expected = true;
-                        }
-                    }
+                mut finfo: FieldInfo* = null;
+                if (struct_t.kind == TypeKind::Struct) {
+                    const st: StructType* = struct_t as StructType*;
+                    finfo = st.get_field(field_init.field_name);
+                } else {
+                    const ct: ClassType* = struct_t as ClassType*;
+                    finfo = ct.get_field(field_init.field_name);
+                }
+                if (finfo != null && finfo.field_type.is_valid()) {
+                    field_type = finfo.field_type;
                 }
             }
-            if (push_expected) {
+            if (field_type.is_valid()) {
                 this.expected_type = field_type;
             } else {
                 this.expected_type = TypeRef::invalid();

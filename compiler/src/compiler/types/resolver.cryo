@@ -289,7 +289,7 @@ type struct TypeResolver {
                 mut method_ctx: ResolutionContext = *res_ctx;
                 for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
                     const gp: GenericParamNode* = method.func.generic_params[j];
-                    const gp_ref: TypeRef = this.arena.create_generic_param(gp.name, j as u64);
+                    const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
                     method_ctx.add_binding(gp.name, gp_ref);
                 }
                 this.resolve_func_signature(method.func, &method_ctx);
@@ -313,6 +313,27 @@ type struct TypeResolver {
                 }
             }
         }
+    }
+
+    /// Create the arena TypeRef for a `GenericParamNode` at position `index`.
+    /// When the param has constraints (`<T: Eq + Hash>`), each constraint
+    /// name is resolved against the arena's leaf index to produce a trait
+    /// TypeRef and the param is created as a `BoundedParamType`. Constraints
+    /// that don't resolve fall back to a plain `GenericParamType` — better
+    /// than ICE'ing during partial-pipeline runs.
+    create_param_type(&this, gp: GenericParamNode*, index: u64) -> TypeRef {
+        if (gp == null) { return TypeRef::invalid(); }
+        mut bounds: TypeRef[] = [];
+        for (mut k: i64 = 0; k < gp.constraints.length; k++) {
+            const trait_ref: TypeRef = this.arena.lookup_by_leaf(gp.constraints[k]);
+            if (trait_ref.is_valid()) {
+                bounds.push(trait_ref);
+            }
+        }
+        if (bounds.length > 0) {
+            return this.arena.create_bounded_param(gp.name, index, bounds);
+        }
+        return this.arena.create_generic_param(gp.name, index);
     }
 
     /// Fill missing trailing args from a TemplateEntry's default annotations.
@@ -371,7 +392,7 @@ type struct TypeResolver {
                 mut method_ctx: ResolutionContext = *res_ctx;
                 for (mut j: i64 = 0; j < func.generic_params.length; j++) {
                     const gp: GenericParamNode* = func.generic_params[j];
-                    const gp_ref: TypeRef = this.arena.create_generic_param(gp.name, j as u64);
+                    const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
                     method_ctx.add_binding(gp.name, gp_ref);
                 }
                 this.resolve_func_signature(func, &method_ctx);

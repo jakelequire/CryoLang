@@ -560,7 +560,15 @@ type struct TypeResolutionPasses {
 
     /// Single source of truth for creating GenericParamType entries in the
     /// arena from an array of GenericParamNode*.  Returns parallel TypeRef[]
-    /// where refs[i] is the GenericParamType for generic_params[i].
+    /// where refs[i] is the GenericParamType (or BoundedParamType) for
+    /// generic_params[i].
+    ///
+    /// When `gp.constraints` is non-empty, each constraint name is resolved
+    /// against the arena's leaf index to produce a `TraitType` TypeRef and
+    /// the param is created as a BoundedParamType. This carries trait bounds
+    /// into the type system so method dispatch (B.4) can find trait methods
+    /// from a bounded `T`. Constraints that don't resolve to a registered
+    /// trait fall back to a plain GenericParamType — better than an ICE.
     ///
     /// Used by:
     ///   - TypeResolutionRunner::bind_generic_params()
@@ -570,7 +578,19 @@ type struct TypeResolutionPasses {
         mut refs: TypeRef[] = [];
         for (mut i: i64 = 0; i < generic_params.length; i++) {
             const gp: GenericParamNode* = generic_params[i];
-            const param_ref: TypeRef = arena.create_generic_param(gp.name, i as u64);
+            mut bounds: TypeRef[] = [];
+            for (mut k: i64 = 0; k < gp.constraints.length; k++) {
+                const trait_ref: TypeRef = arena.lookup_by_leaf(gp.constraints[k]);
+                if (trait_ref.is_valid()) {
+                    bounds.push(trait_ref);
+                }
+            }
+            mut param_ref: TypeRef = TypeRef::invalid();
+            if (bounds.length > 0) {
+                param_ref = arena.create_bounded_param(gp.name, i as u64, bounds);
+            } else {
+                param_ref = arena.create_generic_param(gp.name, i as u64);
+            }
             refs.push(param_ref);
         }
         return refs;
@@ -643,6 +663,24 @@ type struct TypeResolutionPasses {
                 const ty: TypeRef = arena.lookup_by_name(qualified_sym);
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
+                }
+                if (!qualified_sym.equals(node.name)) {
+                    ctx.decl_index.register_name_mapping(node.name, qualified_sym);
+                }
+                // Register each trait method's return type on both the
+                // qualified and bare trait name so bound-aware dispatch
+                // (B.4) can find the method by leaf name when the receiver
+                // is a `BoundedParamType` carrying this trait.
+                for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
+                    const tfunc: FunctionDeclNode* = node.methods[mi];
+                    if (tfunc == null) { continue; }
+                    if (!tfunc.has_resolved_return_type()) { continue; }
+                    ctx.decl_index.register_method(qualified_sym, tfunc.name,
+                        tfunc.resolved_return_type);
+                    if (!qualified_sym.equals(node.name)) {
+                        ctx.decl_index.register_method(node.name, tfunc.name,
+                            tfunc.resolved_return_type);
+                    }
                 }
             }
             NodeKind::FunctionDeclaration => {
@@ -790,6 +828,38 @@ type struct TypeResolutionPasses {
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_trait_method_signatures(node.methods, &trait_ctx);
                     sig_count = sig_count + node.methods.length;
+
+                    // Populate the TraitType's required_methods array so the
+                    // bound-aware-dispatch path in sema can read trait method
+                    // signatures off the arena type. Without this, every
+                    // BoundedParamType receiver call has to fall back to
+                    // brittle name-only lookups in the DeclarationIndex.
+                    const tr_qname: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const tr_ref: TypeRef = arena.lookup_by_name(tr_qname);
+                    const tr_t: Type* = if (tr_ref.is_valid()) {
+                        arena.lookup(tr_ref.id)
+                    } else { null };
+                    if (tr_t != null && tr_t.kind == TypeKind::Trait) {
+                        mut tr_type: TraitType* = tr_t as TraitType*;
+                        for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
+                            const tfunc: FunctionDeclNode* = node.methods[mi];
+                            if (tfunc == null) { continue; }
+                            mut param_types: TypeRef[] = [];
+                            for (mut p: i64 = 0; p < tfunc.parameters.length; p++) {
+                                const param: VarDeclNode* = tfunc.parameters[p];
+                                if (param != null && param.resolved_type.is_valid()) {
+                                    param_types.push(param.resolved_type);
+                                }
+                            }
+                            const fn_ty: TypeRef = arena.get_function(
+                                tfunc.resolved_return_type, param_types,
+                                tfunc.is_variadic);
+                            mut info: MethodInfo = MethodInfo::new(
+                                tfunc.name, fn_ty, true, tfunc.is_static);
+                            info.param_types = param_types;
+                            tr_type.add_required_method(info);
+                        }
+                    }
                 }
                 NodeKind::ImplementationBlock => {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
@@ -843,6 +913,18 @@ type struct TypeResolutionPasses {
                             ctx.decl_index.register_function_type(fn_node.name, func_type_ref);
                             // Extern C functions use bare name as LLVM symbol.
                             ctx.decl_index.register_mangled_name(fn_node.name, fn_node.name);
+                            // Also register under the enclosing namespace's
+                            // qualified form so `libc::read` resolves the
+                            // same way `intrinsics::frexp` does — sema's
+                            // module-qualified-function lookup walks the
+                            // module graph and queries `<ns>::<fn>`.
+                            const ext_q_name: SymbolStr = ctx.qualify_symbol_sym(fn_node.name);
+                            if (!ext_q_name.equals(fn_node.name)) {
+                                ctx.decl_index.register_function_with_module(
+                                    ext_q_name, fn_node.resolved_return_type, ext_mod_sym);
+                                ctx.decl_index.register_function_type(ext_q_name, func_type_ref);
+                                ctx.decl_index.register_mangled_name(ext_q_name, fn_node.name);
+                            }
 
                             // For CImport blocks, also register under alias::name
                             if (node.is_c_import()) {
@@ -1511,11 +1593,15 @@ type struct TypeResolutionPasses {
                     const module_name: string = ctx.has_namespace()
                         ? ctx.namespace_display() : ctx.source_file;
                     mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, ctx.source_file);
+                    // Use the canonical helper so a constrained `T: Bound`
+                    // produces a BoundedParamType matching what
+                    // template-registration created for the same enum.
+                    const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
+                        node.generic_params, arena);
                     for (mut gpi: i64 = 0; gpi < node.generic_params.length; gpi++) {
                         const gp: GenericParamNode* = node.generic_params[gpi];
                         if (gp == null) { continue; }
-                        const gp_ref: TypeRef = arena.create_generic_param(gp.name, gpi as u64);
-                        res_ctx.add_binding(gp.name, gp_ref);
+                        res_ctx.add_binding(gp.name, refs[gpi]);
                     }
 
                     for (mut j: i64 = 0; j < node.variants.length; j++) {
@@ -1534,6 +1620,61 @@ type struct TypeResolutionPasses {
 
                         et.add_variant(EnumVariantInfo::new(
                             variant.name, payload_types, j as u64));
+                    }
+                }
+                NodeKind::ImplementationBlock => {
+                    const node: ImplBlockNode* = stmt as ImplBlockNode*;
+                    if (node.is_generic()) { continue; }
+                    // Resolve the target type so method-call sema can find
+                    // the impl's methods on the StructType/ClassType. This
+                    // applies to both inherent impls (`implement Foo { ... }`)
+                    // and trait impls (`implement trait T for Foo { ... }`).
+                    // Without this, only methods declared inline inside the
+                    // struct body land on `StructType.methods`; methods
+                    // delivered via impl blocks were invisible to the
+                    // call-arg expected_type propagation, so generic-method
+                    // calls inside trait-impl method bodies (e.g.
+                    // `NonNull::new(...)` as an argument to `deallocate`)
+                    // had no concrete instantiation to point at.
+                    mut tgt: TypeRef = ctx.decl_index.lookup_type(
+                        ctx.qualify_symbol_sym(node.target_type));
+                    if (!tgt.is_valid()) {
+                        tgt = ctx.decl_index.lookup_type(node.target_type);
+                    }
+                    if (!tgt.is_valid()) { continue; }
+                    const tgt_t: Type* = arena.lookup(tgt.id);
+                    if (tgt_t == null) { continue; }
+                    const this_amp_sym: SymbolStr = ctx.intern_table.intern("&this");
+                    const this_val_sym: SymbolStr = ctx.intern_table.intern("this");
+                    for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
+                        const mnode: MethodNode* = node.methods[mi];
+                        if (mnode == null || mnode.func == null) { continue; }
+                        const fn_node: FunctionDeclNode* = mnode.func;
+                        mut ptypes: TypeRef[] = [];
+                        for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                            const pp: VarDeclNode* = fn_node.parameters[pi];
+                            if (pp == null) { continue; }
+                            if (pp.name.equals(this_amp_sym)) { continue; }
+                            if (pp.name.equals(this_val_sym)) { continue; }
+                            ptypes.push(pp.resolved_type);
+                        }
+                        const minfo: MethodInfo = MethodInfo {
+                            name:          fn_node.name,
+                            function_type: fn_node.resolved_return_type,
+                            is_public:     mnode.visibility == Visibility::Public,
+                            is_static:     mnode.is_static,
+                            is_virtual:    mnode.is_virtual,
+                            is_override:   mnode.is_override,
+                            param_types:   ptypes,
+                            ast_node:      mnode as void*,
+                        };
+                        if (tgt_t.kind == TypeKind::Struct) {
+                            mut tst: StructType* = tgt_t as StructType*;
+                            tst.add_method(minfo);
+                        } else if (tgt_t.kind == TypeKind::Class) {
+                            mut tct: ClassType* = tgt_t as ClassType*;
+                            tct.add_method(minfo);
+                        }
                     }
                 }
                 _ => {}
