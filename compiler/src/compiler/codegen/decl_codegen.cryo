@@ -21,6 +21,7 @@ import Compiler::Types::Arena;
 import Compiler::Types::UserDefined;
 import Compiler::Types::Compound;
 import Compiler::Types::Generic;
+import Compiler::Types::GenericRegistry;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Declaration;
@@ -369,6 +370,21 @@ function declare_impl_block(cg: CodegenContext*, node: ImplBlockNode*) -> void {
     mut qualified_target: SymbolStr = node.target_type;
     if (strstr(target_str, "::") == null) {
         qualified_target = ctx_ptr.qualify_symbol_sym(node.target_type);
+    }
+    // Skip impls whose target is a generic template — only the
+    // monomorphized spec'd clones should produce LLVM symbols.  Mirrors
+    // the `generic_params.length > 0` skip above for `implement<T> Foo<T>`;
+    // catches the additional case where the impl has no impl-level params
+    // but the target type does (e.g. `implement trait Eq for struct String`
+    // on `String<A = GlobalAlloc>`).  Without this, the template impl's
+    // bodies are codegen'd against the bare-template `this` type, but
+    // method registrations live under the spec'd target — so call sites
+    // like `this.as_str()` inside the template body fail to resolve.
+    if (ctx_ptr.generic_registry != null) {
+        const greg: GenericRegistry* = ctx_ptr.generic_registry;
+        if (greg.get_template(qualified_target) != null) {
+            return;
+        }
     }
 
     for (mut i: i64 = 0; i < node.methods.length; i++) {

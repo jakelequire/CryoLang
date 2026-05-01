@@ -26,6 +26,7 @@ import Compiler::Types::Arena;
 import Compiler::Types::Compound;
 import Compiler::Types::UserDefined;
 import Compiler::Types::Generic;
+import Compiler::Types::GenericRegistry;
 import Compiler::Types::Resolver;
 import Compiler::AST;
 import Compiler::AST::Node;
@@ -254,13 +255,25 @@ public:
         //   3. Otherwise — qualify with namespace.
         const impl_target_str: string = this.cg.resolve(node.target_type);
         const di_ptr: DeclarationIndex* = this.cg.get_decl_index();
+        mut qualified_impl_target: SymbolStr = SymbolStr::empty();
         if (strstr(impl_target_str, "::") != null) {
-            this.current_impl_target = node.target_type;
+            qualified_impl_target = node.target_type;
         } else if (di_ptr.lookup_type(node.target_type).is_valid()) {
-            this.current_impl_target = node.target_type;
+            qualified_impl_target = node.target_type;
         } else {
-            this.current_impl_target = this.cg.qualify(node.target_type);
+            qualified_impl_target = this.cg.qualify(node.target_type);
         }
+        // Mirror declare_impl_block: skip when the target type is a generic
+        // template — only spec'd clones should be codegen'd.
+        const cg_ctx: CompilationContext* = this.cg.ctx;
+        if (cg_ctx.generic_registry != null) {
+            const greg: GenericRegistry* = cg_ctx.generic_registry;
+            if (greg.get_template(qualified_impl_target) != null) {
+                printf("[IRGen]     impl skipped (template target)\n"); fflush(null);
+                return;
+            }
+        }
+        this.current_impl_target = qualified_impl_target;
 
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const m: MethodNode* = node.methods[i];
