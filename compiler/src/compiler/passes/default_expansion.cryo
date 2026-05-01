@@ -1,0 +1,765 @@
+/// Default-Expansion Pass
+///
+/// Rewrites bare references to generic types whose every type-parameter has
+/// a default annotation (e.g. `String<A = GlobalAlloc>`) into the explicit
+/// `Generic(Named, [defaults])` form, so downstream resolution produces
+/// one canonical InstantiatedType regardless of where the reference came
+/// from.  Without this pass the resolver returns the template TypeRef for
+/// bare `String`, while explicit `String<GlobalAlloc>` resolves through
+/// `instantiate()` — two different TypeRef ids for the same logical type
+/// break mono cache keys, name mangling, and method tables.
+///
+/// What gets rewritten
+/// ====================
+///
+/// - Type annotations of shape `Named("X")` where X is a registered
+///   all-default-generic template AND the current scope-stack doesn't
+///   contain X (i.e. we're not inside X's own body, where bare `X`
+///   should keep meaning "the template with bound params").
+///
+/// Out of scope (handled by other passes / future work)
+/// ====================================================
+///
+/// - Impl block targets (`implement trait Eq for struct String { ... }`)
+///   would also benefit but require a structural change to ImplBlockNode
+///   to carry type args. Tackled separately.
+/// - Static-method scopes (`String::new()`) — same shape concern.
+/// - Generic static-method type-arg inference (`Slice::from_raw(u8*, ...)`).
+
+namespace Compiler::Passes::DefaultExpansion;
+
+import Compiler::Diag;
+import Compiler::Diag::Snapshot;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::AST::Statement;
+import Compiler::AST::Expression;
+import Compiler::AST::Pattern;
+import Compiler::Passes::PassID;
+import Compiler::CompilationContext;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Types::GenericRegistry;
+import std::collections::hashmap;
+
+
+// ============================================================================
+// Default registry — a per-pass map: bare type name → defaults
+// ============================================================================
+
+/// One entry per "all-default" generic template the pass has discovered.
+/// `defaults` is a list of TypeAnnotation* — each is a DEEP CLONE of the
+/// param's default_annotation. Cloning matters because each rewrite site
+/// gets its own copy; sharing would break codegen which mutates resolved
+/// type fields per-site.
+type struct DefaultEntry {
+    name: SymbolStr;
+    defaults: TypeAnnotation*[];
+}
+
+type struct DefaultRegistry {
+    entries:   DefaultEntry[];
+    name_index: HashMap<u32, i64>;
+
+    static new() -> DefaultRegistry {
+        return DefaultRegistry {
+            entries:    [],
+            name_index: HashMap<u32, i64>::new(),
+        };
+    }
+
+    register(mut &this, name: SymbolStr, defaults: TypeAnnotation*[]) -> void {
+        if (!name.is_valid() || defaults.length == 0) { return; }
+        const h: u64 = hash_int(name.id as u64);
+        if (this.name_index.get(name.id, h).is_some()) { return; }
+        const idx: i64 = this.entries.length;
+        this.entries.push(DefaultEntry { name: name, defaults: defaults });
+        this.name_index.insert(name.id, idx, h);
+    }
+
+    /// Look up by bare name. Returns null when not registered.
+    lookup(&this, name: SymbolStr) -> DefaultEntry* {
+        if (!name.is_valid()) { return null; }
+        const h: u64 = hash_int(name.id as u64);
+        const opt: Option<i64> = this.name_index.get(name.id, h);
+        if (opt.is_some()) {
+            return &this.entries[opt.unwrap()];
+        }
+        return null;
+    }
+}
+
+
+// ============================================================================
+// Scope stack — names of templates whose params are currently in scope
+// ============================================================================
+
+type struct ScopeStack {
+    names: SymbolStr[];
+
+    static new() -> ScopeStack {
+        return ScopeStack { names: [] };
+    }
+
+    push(mut &this, name: SymbolStr) -> void {
+        if (name.is_valid()) { this.names.push(name); }
+    }
+
+    pop(mut &this) -> void {
+        if (this.names.length > 0) {
+            this.names.pop();
+        }
+    }
+
+    contains(&this, name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < this.names.length; i++) {
+            if (this.names[i].equals(name)) { return true; }
+        }
+        return false;
+    }
+}
+
+
+// ============================================================================
+// DefaultExpansionPasses — pass entry point + walker
+// ============================================================================
+
+type struct DefaultExpansionPasses {
+
+    /// Pass entry point. Walks the program AST, builds a registry of
+    /// all-default templates (from this module + already-registered
+    /// templates in GenericRegistry), then rewrites annotations.
+    static run(ctx: CompilationContext*) -> PassResult {
+        const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+        if (root == null) { return PassResult::ok(); }
+        if (ctx.intern_table == null) { return PassResult::ok(); }
+
+        const _modname: string = ctx.artifacts.ast.namespace_name;
+        printf("[DefaultExpansion] === module='%s' ===\n", _modname);
+
+        // Step 1: Collect all-default templates.
+        mut registry: DefaultRegistry = DefaultRegistry::new();
+        DefaultExpansionPasses::collect_local_defaults(root, &registry);
+        DefaultExpansionPasses::collect_cross_module_defaults(ctx, &registry);
+
+        printf("[DefaultExpansion]   collected %lld templates\n", registry.entries.length);
+        for (mut __i: i64 = 0; __i < registry.entries.length; __i++) {
+            printf("[DefaultExpansion]     template[%lld]='%s' defaults=%lld\n",
+                __i,
+                ctx.intern_table.resolve(registry.entries[__i].name),
+                registry.entries[__i].defaults.length);
+        }
+
+        if (registry.entries.length == 0) {
+            return PassResult::ok();
+        }
+
+        // Step 2: Walk the AST and rewrite.
+        mut scope: ScopeStack = ScopeStack::new();
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            DefaultExpansionPasses::rewrite_stmt(root.statements[i], &registry, &scope);
+        }
+
+        return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+
+    // ------------------------------------------------------------------
+    // Registry population
+    // ------------------------------------------------------------------
+
+    /// Walk this module's top-level decls and register any all-default
+    /// templates. Required because the pass runs once per module before
+    /// the *current* module's templates have been registered in the
+    /// shared GenericRegistry — that registration happens in
+    /// TemplateRegistration earlier in this same module's pipeline, but
+    /// only for the *types* that have been declared. We capture the
+    /// AST-level defaults for the template here so the rewrite step has
+    /// the source annotations to clone.
+    static collect_local_defaults(root: ProgramNode*, reg: DefaultRegistry*) -> void {
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::StructDeclaration => {
+                    const node: StructDeclNode* = stmt as StructDeclNode*;
+                    DefaultExpansionPasses::register_if_all_default(
+                        node.name, node.generic_params, reg);
+                }
+                NodeKind::ClassDeclaration => {
+                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                    DefaultExpansionPasses::register_if_all_default(
+                        node.name, node.generic_params, reg);
+                }
+                NodeKind::EnumDeclaration => {
+                    const node: EnumDeclNode* = stmt as EnumDeclNode*;
+                    DefaultExpansionPasses::register_if_all_default(
+                        node.name, node.generic_params, reg);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Pull any already-registered templates whose every param has a
+    /// default. The registry is shared across modules, so by the time
+    /// this pass runs in module B, modules A imported by B have
+    /// already finished TemplateRegistration and their templates are
+    /// visible here.
+    static collect_cross_module_defaults(ctx: CompilationContext*,
+                                          reg: DefaultRegistry*) -> void {
+        if (ctx.generic_registry == null) { return; }
+        const greg: GenericRegistry* = ctx.generic_registry;
+        for (mut i: i64 = 0; i < greg.entries.length; i++) {
+            const entry: TemplateEntry* = &greg.entries[i];
+            if (entry == null) { continue; }
+            if (entry.ast_node == null) { continue; }
+            const params: GenericParamNode*[] = entry.get_generic_params();
+            DefaultExpansionPasses::register_if_all_default(
+                entry.name, params, reg);
+        }
+    }
+
+    /// Register `(name, defaults)` in `reg` iff every entry in
+    /// `generic_params` has a non-null default_annotation. Each default
+    /// annotation is deep-cloned so rewrite sites can mutate freely.
+    static register_if_all_default(name: SymbolStr,
+                                    generic_params: GenericParamNode*[],
+                                    reg: DefaultRegistry*) -> void {
+        if (!name.is_valid() || generic_params.length == 0) { return; }
+        for (mut i: i64 = 0; i < generic_params.length; i++) {
+            const gp: GenericParamNode* = generic_params[i];
+            if (gp == null || !gp.has_default_annotation()) { return; }
+        }
+        mut defaults: TypeAnnotation*[] = [];
+        for (mut i: i64 = 0; i < generic_params.length; i++) {
+            const gp: GenericParamNode* = generic_params[i];
+            defaults.push(TypeAnnotation::clone_ptr(gp.default_annotation));
+        }
+        reg.register(name, defaults);
+    }
+
+    // ------------------------------------------------------------------
+    // Rewriter
+    // ------------------------------------------------------------------
+
+    /// Rewrite a top-level statement, pushing/popping scope as we enter
+    /// and leave a generic type's body.
+    static rewrite_stmt(stmt: ASTNode*, reg: DefaultRegistry*,
+                        scope: ScopeStack*) -> void {
+        if (stmt == null) { return; }
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                const node: StructDeclNode* = stmt as StructDeclNode*;
+                const is_generic: boolean = node.generic_params.length > 0;
+                if (is_generic) { scope.push(node.name); }
+                for (mut i: i64 = 0; i < node.fields.length; i++) {
+                    const f: FieldDeclNode* = node.fields[i];
+                    if (f != null && f.has_type_annotation()) {
+                        DefaultExpansionPasses::rewrite_annotation_in_place(
+                            f.type_annotation, reg, scope);
+                    }
+                }
+                for (mut i: i64 = 0; i < node.methods.length; i++) {
+                    const m: MethodNode* = node.methods[i];
+                    if (m != null && m.func != null) {
+                        DefaultExpansionPasses::rewrite_function_decl(
+                            m.func, reg, scope);
+                    }
+                }
+                if (is_generic) { scope.pop(); }
+            }
+            NodeKind::ClassDeclaration => {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                const is_generic: boolean = node.generic_params.length > 0;
+                if (is_generic) { scope.push(node.name); }
+                for (mut i: i64 = 0; i < node.fields.length; i++) {
+                    const f: FieldDeclNode* = node.fields[i];
+                    if (f != null && f.has_type_annotation()) {
+                        DefaultExpansionPasses::rewrite_annotation_in_place(
+                            f.type_annotation, reg, scope);
+                    }
+                }
+                for (mut i: i64 = 0; i < node.methods.length; i++) {
+                    const m: MethodNode* = node.methods[i];
+                    if (m != null && m.func != null) {
+                        DefaultExpansionPasses::rewrite_function_decl(
+                            m.func, reg, scope);
+                    }
+                }
+                if (is_generic) { scope.pop(); }
+            }
+            NodeKind::EnumDeclaration => {
+                const node: EnumDeclNode* = stmt as EnumDeclNode*;
+                const is_generic: boolean = node.generic_params.length > 0;
+                if (is_generic) { scope.push(node.name); }
+                // Enum variant payload annotations (if any).
+                for (mut i: i64 = 0; i < node.variants.length; i++) {
+                    const v: EnumVariantNode* = node.variants[i];
+                    if (v == null) { continue; }
+                    for (mut j: i64 = 0; j < v.associated_types.length; j++) {
+                        DefaultExpansionPasses::rewrite_annotation_in_place(
+                            v.associated_types[j], reg, scope);
+                    }
+                }
+                if (is_generic) { scope.pop(); }
+            }
+            NodeKind::FunctionDeclaration => {
+                DefaultExpansionPasses::rewrite_function_decl(
+                    stmt as FunctionDeclNode*, reg, scope);
+            }
+            NodeKind::ImplementationBlock => {
+                const node: ImplBlockNode* = stmt as ImplBlockNode*;
+                // Impl blocks don't get scope-pushed even when they target a
+                // generic — methods on the impl are treated as "outside"
+                // the template's own body for rewriting purposes; they're
+                // a separate site that *consumes* the type. For the
+                // canonical "implement<T> for Foo<T>" inherent-impl case,
+                // generic_params is non-empty and pushing those names is
+                // what matters for nested rewrites.
+                const has_params: boolean = node.generic_params.length > 0;
+                if (has_params) {
+                    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+                        scope.push(node.generic_params[i].name);
+                    }
+                }
+                for (mut i: i64 = 0; i < node.methods.length; i++) {
+                    const m: MethodNode* = node.methods[i];
+                    if (m != null && m.func != null) {
+                        DefaultExpansionPasses::rewrite_function_decl(
+                            m.func, reg, scope);
+                    }
+                }
+                if (has_params) {
+                    for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+                        scope.pop();
+                    }
+                }
+            }
+            NodeKind::TraitDeclaration => {
+                const node: TraitDeclNode* = stmt as TraitDeclNode*;
+                const is_generic: boolean = node.generic_params.length > 0;
+                if (is_generic) { scope.push(node.name); }
+                for (mut i: i64 = 0; i < node.methods.length; i++) {
+                    DefaultExpansionPasses::rewrite_function_decl(
+                        node.methods[i], reg, scope);
+                }
+                if (is_generic) { scope.pop(); }
+            }
+            NodeKind::TypeAliasDeclaration => {
+                const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
+                const is_generic: boolean = node.generic_params.length > 0;
+                if (is_generic) { scope.push(node.alias_name); }
+                if (node.target_annotation != null) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        node.target_annotation, reg, scope);
+                }
+                if (is_generic) { scope.pop(); }
+            }
+            _ => {}
+        }
+    }
+
+    /// Rewrite a function/method declaration. Pushes its own generic_params
+    /// onto the scope (so e.g. `<H>` inside `hash<H>(...)` keeps `H` from
+    /// being mistaken for a top-level type).
+    static rewrite_function_decl(func: FunctionDeclNode*,
+                                  reg: DefaultRegistry*,
+                                  scope: ScopeStack*) -> void {
+        if (func == null) { return; }
+        const has_params: boolean = func.generic_params.length > 0;
+        if (has_params) {
+            for (mut i: i64 = 0; i < func.generic_params.length; i++) {
+                scope.push(func.generic_params[i].name);
+            }
+        }
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const p: VarDeclNode* = func.parameters[i];
+            if (p != null && p.has_type_annotation()) {
+                DefaultExpansionPasses::rewrite_annotation_in_place(
+                    p.type_annotation, reg, scope);
+            }
+        }
+        if (func.return_type_annotation != null) {
+            DefaultExpansionPasses::rewrite_annotation_in_place(
+                func.return_type_annotation, reg, scope);
+        }
+        if (func.has_body()) {
+            DefaultExpansionPasses::rewrite_block(func.body, reg, scope);
+        }
+        if (has_params) {
+            for (mut i: i64 = 0; i < func.generic_params.length; i++) {
+                scope.pop();
+            }
+        }
+    }
+
+    /// Walk a block statement, rewriting any annotations inside.
+    static rewrite_block(block: BlockStmtNode*, reg: DefaultRegistry*,
+                          scope: ScopeStack*) -> void {
+        if (block == null) { return; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            DefaultExpansionPasses::rewrite_body_stmt(
+                block.statements[i], reg, scope);
+        }
+    }
+
+    /// Walk a statement, rewriting any annotations inside.  Statements
+    /// can carry annotations directly (variable declarations) or
+    /// indirectly via nested expressions (casts, sizeof, struct
+    /// literals' field-init values that are themselves expressions).
+    static rewrite_body_stmt(stmt: StatementNode*, reg: DefaultRegistry*,
+                              scope: ScopeStack*) -> void {
+        if (stmt == null) { return; }
+        const node: ASTNode* = stmt as ASTNode*;
+        match (node.kind) {
+            NodeKind::BlockStatement => {
+                DefaultExpansionPasses::rewrite_block(
+                    stmt as BlockStmtNode*, reg, scope);
+            }
+            NodeKind::UnsafeBlockStatement => {
+                const ub: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+                if (ub.block != null) {
+                    DefaultExpansionPasses::rewrite_block(ub.block, reg, scope);
+                }
+            }
+            NodeKind::ExpressionStatement => {
+                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+                DefaultExpansionPasses::rewrite_expr(es.expression, reg, scope);
+            }
+            NodeKind::DeclarationStatement => {
+                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                if (ds.declaration != null) {
+                    const decl_node: ASTNode* = ds.declaration as ASTNode*;
+                    if (decl_node.kind == NodeKind::VariableDeclaration) {
+                        DefaultExpansionPasses::rewrite_var_decl(
+                            ds.declaration as VarDeclNode*, reg, scope);
+                    }
+                }
+            }
+            NodeKind::ReturnStatement => {
+                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                if (rs.expression != null) {
+                    DefaultExpansionPasses::rewrite_expr(rs.expression, reg, scope);
+                }
+            }
+            NodeKind::IfStatement => {
+                const is_: IfStmtNode* = stmt as IfStmtNode*;
+                DefaultExpansionPasses::rewrite_expr(is_.condition, reg, scope);
+                if (is_.then_stmt != null) {
+                    DefaultExpansionPasses::rewrite_body_stmt(is_.then_stmt, reg, scope);
+                }
+                if (is_.else_stmt != null) {
+                    DefaultExpansionPasses::rewrite_body_stmt(is_.else_stmt, reg, scope);
+                }
+            }
+            NodeKind::WhileStatement => {
+                const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+                DefaultExpansionPasses::rewrite_expr(ws.condition, reg, scope);
+                if (ws.body != null) {
+                    DefaultExpansionPasses::rewrite_body_stmt(ws.body, reg, scope);
+                }
+            }
+            NodeKind::DoWhileStatement => {
+                const dw: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+                DefaultExpansionPasses::rewrite_expr(dw.condition, reg, scope);
+                if (dw.body != null) {
+                    DefaultExpansionPasses::rewrite_body_stmt(dw.body, reg, scope);
+                }
+            }
+            NodeKind::ForStatement => {
+                const fs: ForStmtNode* = stmt as ForStmtNode*;
+                // `init` is ASTNode* — usually a DeclStmt or ExprStmt.
+                if (fs.init != null) {
+                    const init_node: ASTNode* = fs.init;
+                    if (init_node.kind == NodeKind::DeclarationStatement
+                        || init_node.kind == NodeKind::ExpressionStatement
+                        || init_node.kind == NodeKind::BlockStatement) {
+                        DefaultExpansionPasses::rewrite_body_stmt(
+                            fs.init as StatementNode*, reg, scope);
+                    }
+                }
+                if (fs.condition != null) {
+                    DefaultExpansionPasses::rewrite_expr(fs.condition, reg, scope);
+                }
+                if (fs.update != null) {
+                    DefaultExpansionPasses::rewrite_expr(fs.update, reg, scope);
+                }
+                if (fs.body != null) {
+                    DefaultExpansionPasses::rewrite_body_stmt(fs.body, reg, scope);
+                }
+            }
+            NodeKind::LoopStatement => {
+                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+                if (ls.body != null) {
+                    DefaultExpansionPasses::rewrite_body_stmt(ls.body, reg, scope);
+                }
+            }
+            NodeKind::MatchStatement => {
+                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+                DefaultExpansionPasses::rewrite_expr(ms.subject, reg, scope);
+                for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                    const arm: MatchArmNode* = ms.arms[i];
+                    if (arm == null) { continue; }
+                    if (arm.body != null) {
+                        DefaultExpansionPasses::rewrite_body_stmt(arm.body, reg, scope);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Rewrite annotations in a variable declaration (the `let x: T = ...`
+    /// or `mut x: T = ...` form). Both the declared type and the
+    /// initializer expression need walking.
+    static rewrite_var_decl(var_decl: VarDeclNode*, reg: DefaultRegistry*,
+                             scope: ScopeStack*) -> void {
+        if (var_decl == null) { return; }
+        if (var_decl.has_type_annotation()) {
+            DefaultExpansionPasses::rewrite_annotation_in_place(
+                var_decl.type_annotation, reg, scope);
+        }
+        if (var_decl.initializer != null) {
+            DefaultExpansionPasses::rewrite_expr(var_decl.initializer, reg, scope);
+        }
+    }
+
+    /// Walk an expression, rewriting any annotations in cast targets,
+    /// sizeof/alignof type args, struct literal type names, generic args
+    /// on calls, etc.  Recurses into all subexpressions so nested
+    /// annotations are reachable.
+    static rewrite_expr(expr: ExpressionNode*, reg: DefaultRegistry*,
+                         scope: ScopeStack*) -> void {
+        if (expr == null) { return; }
+        const node: ASTNode* = expr as ASTNode*;
+        match (node.kind) {
+            NodeKind::BinaryExpression => {
+                const b: BinaryExprNode* = expr as BinaryExprNode*;
+                DefaultExpansionPasses::rewrite_expr(b.left, reg, scope);
+                DefaultExpansionPasses::rewrite_expr(b.right, reg, scope);
+            }
+            NodeKind::UnaryExpression => {
+                const u: UnaryExprNode* = expr as UnaryExprNode*;
+                DefaultExpansionPasses::rewrite_expr(u.operand, reg, scope);
+            }
+            NodeKind::TernaryExpression => {
+                const t: TernaryExprNode* = expr as TernaryExprNode*;
+                DefaultExpansionPasses::rewrite_expr(t.condition, reg, scope);
+                DefaultExpansionPasses::rewrite_expr(t.true_expr, reg, scope);
+                DefaultExpansionPasses::rewrite_expr(t.false_expr, reg, scope);
+            }
+            NodeKind::IfExpression => {
+                const ie: IfExprNode* = expr as IfExprNode*;
+                DefaultExpansionPasses::rewrite_expr(ie.condition, reg, scope);
+                DefaultExpansionPasses::rewrite_expr(ie.then_expr, reg, scope);
+                DefaultExpansionPasses::rewrite_expr(ie.else_expr, reg, scope);
+            }
+            NodeKind::MatchExpression => {
+                const me: MatchExprNode* = expr as MatchExprNode*;
+                DefaultExpansionPasses::rewrite_expr(me.subject, reg, scope);
+                for (mut i: i64 = 0; i < me.arms.length; i++) {
+                    const arm: MatchArmNode* = me.arms[i];
+                    if (arm == null) { continue; }
+                    if (arm.body != null) {
+                        DefaultExpansionPasses::rewrite_body_stmt(arm.body, reg, scope);
+                    }
+                }
+            }
+            NodeKind::CallExpression => {
+                const c: CallExprNode* = expr as CallExprNode*;
+                DefaultExpansionPasses::rewrite_expr(c.callee, reg, scope);
+                for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                    DefaultExpansionPasses::rewrite_expr(c.arguments[i], reg, scope);
+                }
+                for (mut i: i64 = 0; i < c.generic_args.length; i++) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        c.generic_args[i], reg, scope);
+                }
+            }
+            NodeKind::NewExpression => {
+                const ne: NewExprNode* = expr as NewExprNode*;
+                for (mut i: i64 = 0; i < ne.arguments.length; i++) {
+                    DefaultExpansionPasses::rewrite_expr(ne.arguments[i], reg, scope);
+                }
+                for (mut i: i64 = 0; i < ne.generic_args.length; i++) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        ne.generic_args[i], reg, scope);
+                }
+                if (ne.array_size != null) {
+                    DefaultExpansionPasses::rewrite_expr(ne.array_size, reg, scope);
+                }
+                if (ne.struct_init != null) {
+                    DefaultExpansionPasses::rewrite_expr(
+                        ne.struct_init as ExpressionNode*, reg, scope);
+                }
+            }
+            NodeKind::CastExpression => {
+                const ce: CastExprNode* = expr as CastExprNode*;
+                DefaultExpansionPasses::rewrite_expr(ce.expression, reg, scope);
+                if (ce.target_annotation != null) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        ce.target_annotation, reg, scope);
+                }
+            }
+            NodeKind::SizeofExpression => {
+                const so: SizeofExprNode* = expr as SizeofExprNode*;
+                if (so.type_ann != null) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        so.type_ann, reg, scope);
+                }
+            }
+            NodeKind::AlignofExpression => {
+                const ao: AlignofExprNode* = expr as AlignofExprNode*;
+                if (ao.type_ann != null) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        ao.type_ann, reg, scope);
+                }
+            }
+            NodeKind::StructLiteral => {
+                const sl: StructLiteralNode* = expr as StructLiteralNode*;
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                    const fi: FieldInit = sl.field_inits[i];
+                    if (fi.value != null) {
+                        DefaultExpansionPasses::rewrite_expr(fi.value, reg, scope);
+                    }
+                }
+                for (mut i: i64 = 0; i < sl.generic_args.length; i++) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        sl.generic_args[i], reg, scope);
+                }
+            }
+            NodeKind::ArrayLiteral => {
+                const al: ArrayLiteralNode* = expr as ArrayLiteralNode*;
+                for (mut i: i64 = 0; i < al.elements.length; i++) {
+                    DefaultExpansionPasses::rewrite_expr(al.elements[i], reg, scope);
+                }
+            }
+            NodeKind::TupleLiteral => {
+                const tl: TupleLiteralNode* = expr as TupleLiteralNode*;
+                for (mut i: i64 = 0; i < tl.elements.length; i++) {
+                    DefaultExpansionPasses::rewrite_expr(tl.elements[i], reg, scope);
+                }
+            }
+            NodeKind::ArrayAccess => {
+                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+                DefaultExpansionPasses::rewrite_expr(aa.array, reg, scope);
+                DefaultExpansionPasses::rewrite_expr(aa.index, reg, scope);
+            }
+            NodeKind::MemberAccess => {
+                const ma: MemberAccessNode* = expr as MemberAccessNode*;
+                DefaultExpansionPasses::rewrite_expr(ma.object, reg, scope);
+            }
+            NodeKind::ScopeResolution => {
+                const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+                for (mut i: i64 = 0; i < sr.generic_args.length; i++) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        sr.generic_args[i], reg, scope);
+                }
+                for (mut i: i64 = 0; i < sr.scope_generic_args.length; i++) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        sr.scope_generic_args[i], reg, scope);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Annotation rewriting
+    // ------------------------------------------------------------------
+
+    /// Recursively rewrite a TypeAnnotation in place. The annotation enum
+    /// is mutated through its tagged-union pointer so all consumers
+    /// (already pointing at this node) see the rewritten form.
+    static rewrite_annotation_in_place(ann: TypeAnnotation*,
+                                        reg: DefaultRegistry*,
+                                        scope: ScopeStack*) -> void {
+        if (ann == null) { return; }
+        match (*ann) {
+            TypeAnnotation::Named(named) => {
+                if (scope.contains(named.name)) { return; }
+                const entry: DefaultEntry* = reg.lookup(named.name);
+                if (entry == null) { return; }
+                printf("[DE::rewrite] Named '%s' -> Generic with %lld defaults\n",
+                    named.name.id == 0 ? "<empty>" : "<name>",
+                    entry.defaults.length);
+
+                // Rewrite Named(X) → Generic(Named(X), [defaults])
+                // by mutating the enum tag through the pointer.
+                const old_name: SymbolStr = named.name;
+                const old_span: SourceSpan = named.span;
+
+                // Allocate a fresh inner Named annotation that the new
+                // Generic node points to.
+                const inner_named: NamedAnnotation* = malloc(
+                    sizeof(NamedAnnotation)) as NamedAnnotation*;
+                *inner_named = NamedAnnotation { name: old_name, span: old_span };
+                const inner_ann: TypeAnnotation* = malloc(
+                    sizeof(TypeAnnotation)) as TypeAnnotation*;
+                *inner_ann = TypeAnnotation::Named(inner_named);
+
+                mut cloned_defaults: TypeAnnotation*[] = [];
+                for (mut i: i64 = 0; i < entry.defaults.length; i++) {
+                    cloned_defaults.push(TypeAnnotation::clone_ptr(entry.defaults[i]));
+                }
+
+                const gen: GenericAnnotation* = malloc(
+                    sizeof(GenericAnnotation)) as GenericAnnotation*;
+                *gen = GenericAnnotation {
+                    base: inner_ann,
+                    args: cloned_defaults,
+                    span: old_span,
+                };
+                *ann = TypeAnnotation::Generic(gen);
+
+                // The new Generic's args may themselves reference templates
+                // that need rewriting (e.g. `Array<u8, GlobalAlloc>` where
+                // both args could be expansion candidates); recurse over
+                // each arg using the same scope.
+                for (mut i: i64 = 0; i < gen.args.length; i++) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        gen.args[i], reg, scope);
+                }
+            }
+            TypeAnnotation::Pointer(p) => {
+                DefaultExpansionPasses::rewrite_annotation_in_place(p.inner, reg, scope);
+            }
+            TypeAnnotation::Reference(r) => {
+                DefaultExpansionPasses::rewrite_annotation_in_place(r.inner, reg, scope);
+            }
+            TypeAnnotation::Array(a) => {
+                DefaultExpansionPasses::rewrite_annotation_in_place(a.element, reg, scope);
+            }
+            TypeAnnotation::Optional(o) => {
+                DefaultExpansionPasses::rewrite_annotation_in_place(o.inner, reg, scope);
+            }
+            TypeAnnotation::Function(f) => {
+                for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        f.parameters[i], reg, scope);
+                }
+                DefaultExpansionPasses::rewrite_annotation_in_place(
+                    f.return_type, reg, scope);
+            }
+            TypeAnnotation::Tuple(t) => {
+                for (mut i: i64 = 0; i < t.elements.length; i++) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        t.elements[i], reg, scope);
+                }
+            }
+            TypeAnnotation::Generic(g) => {
+                // Recurse into the base (rare — usually Named(X)) and args.
+                DefaultExpansionPasses::rewrite_annotation_in_place(g.base, reg, scope);
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        g.args[i], reg, scope);
+                }
+            }
+            _ => {}
+        }
+    }
+}
