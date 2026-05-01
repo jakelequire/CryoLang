@@ -157,10 +157,8 @@ type struct ASTSpecializer {
                 mut kept: MethodNode*[] = [];
                 for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
                     const mthd: MethodNode* = impl_node.methods[mi];
-                    const mname: string = this.intern_table.resolve(mthd.func.name);
-                    const ename: string = this.intern_table.resolve(entry.name);
-                    const is_modified: boolean = this.method_has_modified_self_type(mthd, entry);
-                    printf("[specfilter] entry=%s method=%s modified=%d\n", ename, mname, is_modified);
+                    const is_modified: boolean = this.method_has_modified_self_type(
+                        mthd, entry, type_arg_displays);
                     if (is_modified) {
                         continue;
                     }
@@ -184,9 +182,20 @@ type struct ASTSpecializer {
 
     /// Detect methods whose `this` parameter is a Generic(base, args) where
     /// base matches the outer template name AND the args are NOT the identity
-    /// mapping of the template's params.  Example: on `implement Result<T, E>`,
-    /// `this: Result<T*, E>` has `T*` (not bare `T`) — a modified self-type.
-    method_has_modified_self_type(&this, method: MethodNode*, entry: TemplateEntry*) -> boolean {
+    /// mapping of the template's params, and ALSO not equal to the spec's
+    /// concrete args. Example on `implement Result<T, E>`:
+    ///   `this: Result<T*, E>` while spec'ing Result<i32, string>
+    ///     → args=[T*, E], spec=[i32, string]: T* is neither bare T nor i32
+    ///     → modified=true (drop the method)
+    ///   `this: Result<T, E>` while spec'ing Result<i32, string>
+    ///     → args=[T, E], spec=[i32, string]: each arg matches the bare
+    ///       outer param → modified=false (keep)
+    ///   `this: Result<T, E>` after DefaultExpansion rewrote bare `Result`
+    ///     to `Result<T, E>` (or `Result<X, Y>` post-substitution) while
+    ///     spec'ing Result<X, Y>: args=[X, Y] match the spec's display
+    ///     names → modified=false (keep, this is not a real shape change)
+    method_has_modified_self_type(&this, method: MethodNode*, entry: TemplateEntry*,
+                                   type_arg_displays: string[]) -> boolean {
         if (method == null || method.func == null) { return false; }
         const func: FunctionDeclNode* = method.func;
 
@@ -200,7 +209,8 @@ type struct ASTSpecializer {
                 continue;
             }
             if (param.type_annotation == null) { continue; }
-            if (this.annotation_is_modified_outer(param.type_annotation, entry)) {
+            if (this.annotation_is_modified_outer(
+                param.type_annotation, entry, type_arg_displays)) {
                 return true;
             }
         }
@@ -208,16 +218,18 @@ type struct ASTSpecializer {
     }
 
     /// Recursively unwrap Reference/Pointer and return true iff the inner
-    /// annotation is Generic(Named(entry.name), args) where any arg is NOT
-    /// the bare outer param in its position.
-    annotation_is_modified_outer(&this, ann: TypeAnnotation*, entry: TemplateEntry*) -> boolean {
+    /// annotation is Generic(Named(entry.name), args) where any arg is
+    /// NEITHER the bare outer param in its position NOR equal to the
+    /// corresponding spec type-arg display (or its leaf).
+    annotation_is_modified_outer(&this, ann: TypeAnnotation*, entry: TemplateEntry*,
+                                  type_arg_displays: string[]) -> boolean {
         if (ann == null) { return false; }
         match (*ann) {
             TypeAnnotation::Reference(ref) => {
-                return this.annotation_is_modified_outer(ref.inner, entry);
+                return this.annotation_is_modified_outer(ref.inner, entry, type_arg_displays);
             }
             TypeAnnotation::Pointer(ptr) => {
-                return this.annotation_is_modified_outer(ptr.inner, entry);
+                return this.annotation_is_modified_outer(ptr.inner, entry, type_arg_displays);
             }
             TypeAnnotation::Generic(gen) => {
                 match (*gen.base) {
@@ -227,7 +239,12 @@ type struct ASTSpecializer {
                         if (!matches_bare && !matches_qual) { return false; }
                         if (gen.args.length != entry.param_count) { return false; }
                         for (mut i: i64 = 0; i < gen.args.length; i++) {
-                            if (!this.annotation_is_bare_param(gen.args[i], entry.param_names[i])) {
+                            mut spec_disp: string = "";
+                            if (i < type_arg_displays.length) {
+                                spec_disp = type_arg_displays[i];
+                            }
+                            if (!this.annotation_matches_param_or_spec(
+                                gen.args[i], entry.param_names[i], spec_disp)) {
                                 return true;
                             }
                         }
@@ -241,11 +258,39 @@ type struct ASTSpecializer {
         return false;
     }
 
-    /// True iff `ann` is exactly `Named(expected_name)` with no wrappers.
-    annotation_is_bare_param(&this, ann: TypeAnnotation*, expected_name: SymbolStr) -> boolean {
+    /// True iff `ann` is `Named(N)` where N matches either the bare outer
+    /// param name (template identity) OR the spec's type-arg display
+    /// (whole string or its leaf segment after `::`). The spec-display
+    /// match handles the case where DefaultExpansion has already rewritten
+    /// bare `T` annotations into `Named(<concrete-default>)` before the
+    /// specializer runs.
+    annotation_matches_param_or_spec(&this, ann: TypeAnnotation*,
+                                      param_name: SymbolStr,
+                                      spec_disp: string) -> boolean {
         if (ann == null) { return false; }
         match (*ann) {
-            TypeAnnotation::Named(named) => { return named.name.equals(expected_name); }
+            TypeAnnotation::Named(named) => {
+                if (named.name.equals(param_name)) { return true; }
+                if (strlen(spec_disp) == 0) { return false; }
+                const named_str: string = this.intern_table.resolve(named.name);
+                if (strcmp(named_str, spec_disp) == 0) { return true; }
+                // Match the leaf segment of a qualified spec name.
+                const sd_len: i64 = strlen(spec_disp) as i64;
+                mut last_sep: i64 = -1;
+                for (mut k: i64 = 0; k + 1 < sd_len; k++) {
+                    if (spec_disp[k] == ':' && spec_disp[k + 1] == ':') {
+                        last_sep = k + 2;
+                    }
+                }
+                if (last_sep > 0) {
+                    mut leaf: string = "";
+                    for (mut k2: i64 = last_sep; k2 < sd_len; k2++) {
+                        leaf = format("%s%c", leaf, spec_disp[k2] as i32);
+                    }
+                    if (strcmp(named_str, leaf) == 0) { return true; }
+                }
+                return false;
+            }
             _ => { return false; }
         }
         return false;

@@ -64,7 +64,11 @@ function rewrite_to_primitive(ann: TypeAnnotation*, name: SymbolStr, span: Sourc
 
 /// Rewrite a TypeAnnotation* in-place from Named to Pointer(Named(inner)).
 function rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr, span: SourceSpan) -> void {
-    const inner_named: NamedAnnotation* = new NamedAnnotation { name: inner_name, span: span };
+    const inner_named: NamedAnnotation* = new NamedAnnotation {
+        name: inner_name,
+        span: span,
+        pre_resolved: TypeRef::invalid(),
+    };
     const inner_ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
     *inner_ann = TypeAnnotation::Named(inner_named);
     const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner_ann, span: span };
@@ -75,7 +79,11 @@ function rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr, span: S
 
 /// Rewrite a TypeAnnotation* in-place from Named to Array(Named(inner), -1).
 function rewrite_to_array(ann: TypeAnnotation*, inner_name: SymbolStr, span: SourceSpan) -> void {
-    const inner_named: NamedAnnotation* = new NamedAnnotation { name: inner_name, span: span };
+    const inner_named: NamedAnnotation* = new NamedAnnotation {
+        name: inner_name,
+        span: span,
+        pre_resolved: TypeRef::invalid(),
+    };
     const inner_ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
     *inner_ann = TypeAnnotation::Named(inner_named);
     const arr: ArrayAnnotation* = new ArrayAnnotation { element: inner_ann, size: -1, span: span };
@@ -122,6 +130,27 @@ public:
         this.spec_name         = spec_name;
         this.param_names       = param_names;
         this.type_arg_displays = type_arg_displays;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Substitution lookup
+    // ----------------------------------------------------------------
+
+    /// Return the TypeRef for the i-th generic param's concrete substitution.
+    /// Returns the value as-is from the substitution (which may be an
+    /// InstantiatedType wrapper, a Struct, a primitive, etc.). Critically,
+    /// this does NOT unwrap InstantiatedType → resolved_type: the natural
+    /// resolve_generic path returns the InstantiatedType wrapper, and if
+    /// pre_resolved diverged from that we'd produce two different TypeRefs
+    /// for the same logical type — breaking dedup downstream and causing
+    /// spurious type-mismatch errors.
+    resolved_arg_typeref(&this, i: i64) -> TypeRef {
+        if (this.subst == null) { return TypeRef::invalid(); }
+        if (i < 0 || i >= this.subst.replacements.length) {
+            return TypeRef::invalid();
+        }
+        return this.subst.replacements[i];
     }
 
 
@@ -220,8 +249,16 @@ public:
                     rewrite_to_array(ann, inner_sym, named.span);
                     return ann;
                 }
-                // User-defined type — keep as Named with new name
+                // User-defined type — keep as Named with new name, AND attach
+                // the pre-resolved TypeRef so the resolver doesn't need to
+                // re-derive it from the (potentially very long) mangled spec
+                // name. The substituter owns the answer here: subst.replacements[i]
+                // is the concrete TypeRef the user gave for this generic param.
+                // If it's still wrapped in InstantiatedType, follow through to
+                // the resolved struct/enum/class so resolve_named's caller sees
+                // a usable type immediately.
                 named.name = this.type_arg_displays[i];
+                named.pre_resolved = this.resolved_arg_typeref(i);
                 return ann;
             }
         }
