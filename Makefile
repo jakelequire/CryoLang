@@ -60,6 +60,12 @@ stdlib: $(BOOT)
 	@rm -rf stdlib/.bin && mkdir -p stdlib/.bin/obj
 	@cd stdlib && "$(BOOT)" build
 
+# ---- new stdlib via pinned bin/cryo (fast dev loop) -------------------
+stdlib-next: $(PIN)
+	@echo "==> Building new stdlib via pinned bin/cryo"
+	@rm -rf experimental/stdlib-next/.bin && mkdir -p experimental/stdlib-next/.bin/obj
+	@cd experimental/stdlib-next && "$(PIN)" build
+
 # ---- self-hosted cryo via bootstrap -----------------------------------
 cryo: stdlib
 	@echo "==> Building self-hosted cryo via bootstrap (stage-2)"

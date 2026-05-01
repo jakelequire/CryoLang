@@ -347,13 +347,16 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
         return;
     }
 
-    // Bail out if the operand type is not numeric, pointer, or function.
-    // Operating on void/error/unresolved types crashes LLVM.  Function
-    // types are included so that `fn_ptr != null` and `fn_ptr == fn_ptr`
-    // checks reach the icmp path below — both lower to LLVM `ptr`, so the
-    // existing pointer-comparison logic works unchanged.
+    // Bail out if the operand type is not numeric, pointer/reference, or
+    // function.  Operating on void/error/unresolved types crashes LLVM.
+    // Function types are included so that `fn_ptr != null` and
+    // `fn_ptr == fn_ptr` checks reach the icmp path below — both lower
+    // to LLVM `ptr`, so the existing pointer-comparison logic works
+    // unchanged.  Reference is included so that `&arr[i] + offset`
+    // (which sema types as `&T`, not `T*`) reaches the GEP path below.
     if (t_kind != TypeKind::Int && t_kind != TypeKind::Float &&
         t_kind != TypeKind::Bool && t_kind != TypeKind::Pointer &&
+        t_kind != TypeKind::Reference &&
         t_kind != TypeKind::Char && t_kind != TypeKind::Function) {
         *out_value = LValue::null();
         return;
@@ -363,11 +366,20 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
     // LLVM rejects `add ptr, i64`; the arithmetic must be expressed
     // as a getelementptr with a scaled integer index.  Matches the
     // string-plus-int path above but for typed pointers (`i8*`, `u8*`
-    // etc. used for C-string or buffer walking).
-    if (t_kind == TypeKind::Pointer &&
+    // etc. used for C-string or buffer walking).  References (`&T`)
+    // share the same opaque-ptr representation; route them through the
+    // same path by reading the referent type instead of the pointee.
+    if ((t_kind == TypeKind::Pointer || t_kind == TypeKind::Reference) &&
         (op_kind == TokenType::Plus || op_kind == TokenType::Minus)) {
-        const ptr_t: PointerType* = t as PointerType*;
-        const pointee_lty: LType = cg.type_mapper.map_type(ptr_t.pointee);
+        mut elem_ty: TypeRef = TypeRef::invalid();
+        if (t_kind == TypeKind::Pointer) {
+            const ptr_t: PointerType* = t as PointerType*;
+            elem_ty = ptr_t.pointee;
+        } else {
+            const ref_t: ReferenceType* = t as ReferenceType*;
+            elem_ty = ref_t.referent;
+        }
+        const pointee_lty: LType = cg.type_mapper.map_type(elem_ty);
         if (pointee_lty.is_valid()) {
             mut idx: LValue = rhs_val;
             if (op_kind == TokenType::Minus) {

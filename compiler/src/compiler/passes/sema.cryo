@@ -2551,6 +2551,22 @@ public:
         if (found.is_valid()) {
             return this.promote_to_expected_instantiation(found);
         }
+        // Module-qualified globals: `libc::O_APPEND` where `libc` is a
+        // namespace, not a type.  Codegen routes the value through
+        // `resolve_global` (qualified first, then bare); without a
+        // resolved_type here, codegen_rvalue skips its load step and
+        // leaks the global *pointer* into the surrounding expression
+        // (e.g. `flags | libc::O_APPEND` becomes `or ptr, ptr`,
+        // failing the LLVM verifier).  Match codegen's lookup order
+        // so the resolved type matches the value the load will produce.
+        const scope_str: string = this.intern.resolve(scope.scope_name);
+        const member_str: string = this.intern.resolve(scope.member_name);
+        const qualified: string = scope_str + "::" + member_str;
+        const q_sym: SymbolStr = this.ctx.intern(qualified);
+        const q_global: TypeRef = this.lookup_global_var(q_sym);
+        if (q_global.is_valid()) { return q_global; }
+        const b_global: TypeRef = this.lookup_global_var(scope.member_name);
+        if (b_global.is_valid()) { return b_global; }
         return found;
     }
 
