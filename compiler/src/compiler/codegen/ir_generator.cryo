@@ -1466,6 +1466,23 @@ public:
         if (node.callee.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = node.callee as IdentifierNode*;
 
+            // -1. Sema-pinned specialized callee — set by sema (or the
+            //     monomorphizer's body walk) for generic free-function
+            //     calls, both explicit-arg (`identity<i32>(42)`) and
+            //     inferred-arg (`alloc_entry(map, h, k, v)` inside a
+            //     specialized HashMap method body).  The bare template
+            //     name is skipped at codegen, so we have to look up the
+            //     specialized symbol directly; sema/mono is the only
+            //     code with the context to compute it correctly.
+            const id_arity: u32 = node.arguments.length as u32;
+            if (node.resolved_callee.is_valid()) {
+                callee_val = resolve_function_with_arity(
+                    this.cg, node.resolved_callee, id_arity);
+                if (!callee_val.is_valid()) {
+                    callee_val = resolve_function(this.cg, node.resolved_callee);
+                }
+            }
+
             // 0. Inline-lower intrinsics by bare name (i32_to_i64, ptr_add,
             //    bswap32, etc.).  These previously linked against cryort.c;
             //    we now emit the equivalent LLVM IR directly so no runtime
@@ -1478,7 +1495,7 @@ public:
             // Try the intrinsic dispatcher; if it claims the name we set
             // last_value and return.  Args are only codegen'd once we
             // confirm the dispatcher will handle this name.
-            if (is_intrinsic_name(intr_name_str)) {
+            if (!callee_val.is_valid() && is_intrinsic_name(intr_name_str)) {
                 for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
                     intr_args.push(this.codegen_rvalue(node.arguments[ai]));
                 }
@@ -1497,11 +1514,12 @@ public:
             //    discriminated by the call's argument count.  The non-arity
             //    fallback is the last-wins bucket and would otherwise hand
             //    out whichever module registered most recently.
-            const id_arity: u32 = node.arguments.length as u32;
-            const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(id.name);
-            callee_val = resolve_function_with_arity(this.cg, qualified, id_arity);
             if (!callee_val.is_valid()) {
-                callee_val = resolve_function(this.cg, qualified);
+                const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(id.name);
+                callee_val = resolve_function_with_arity(this.cg, qualified, id_arity);
+                if (!callee_val.is_valid()) {
+                    callee_val = resolve_function(this.cg, qualified);
+                }
             }
 
             // 2. Try the DI's bare→qualified mapping (resolves auto-imports

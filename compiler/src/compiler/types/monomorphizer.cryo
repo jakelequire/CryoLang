@@ -34,6 +34,8 @@ import Compiler::Types::GenericRegistry;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::Resolver;
+import Compiler::Resolver::QualifiedName;
+import Compiler::Resolver::MangledName;
 import Compiler::Diag;
 
 
@@ -418,10 +420,23 @@ type struct Monomorphizer {
             }
         }
 
-        // Re-resolve type annotations on the specialized AST.
-        this.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry, &subst);
+        // Re-resolve type annotations on the specialized AST.  The
+        // InstantiatedType wrapper (request.generic_type) is passed as
+        // the `this_type` for method bodies — *not* the concrete struct.
+        // The wrapper is what `unify_for_inference` needs to recover
+        // (base, type_args) when matching a still-generic formal like
+        // `mut &HashMap<K, V, A>`.  Its `resolved_type → concrete_type`
+        // link isn't installed until `populate_concrete_type` runs
+        // below (after this re-resolution), so a `find_inst_wrapping`
+        // search keyed off `concrete_type` would miss right now.
+        const this_type_for_methods: TypeRef = if (request.generic_type.is_valid()) {
+            request.generic_type
+        } else {
+            concrete_type
+        };
+        this.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry, &subst, this_type_for_methods);
         for (mut ri: i64 = 0; ri < result.impl_asts.length; ri++) {
-            this.resolve_specialized_ast(result.impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst);
+            this.resolve_specialized_ast(result.impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst, this_type_for_methods);
         }
 
         // Populate the concrete type and set resolved_type on the InstantiatedType.
@@ -593,7 +608,8 @@ type struct Monomorphizer {
     /// context so that cross-module and user-defined types resolve correctly
     /// through the Resolver's scope chain.
     resolve_specialized_ast(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
-                            entry: TemplateEntry*, subst: TypeSubstitution*) -> void {
+                            entry: TemplateEntry*, subst: TypeSubstitution*,
+                            this_type: TypeRef) -> void {
         if (ast_node == null || this.type_resolver == null) { return; }
 
         mut module_name: string = "";
@@ -607,13 +623,13 @@ type struct Monomorphizer {
                 const decl: StructDeclNode* = ast_node as StructDeclNode*;
                 if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
-                this.resolve_methods(decl.methods, &res_ctx, subst);
+                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
             }
             NodeKind::ClassDeclaration => {
                 const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
                 if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
-                this.resolve_methods(decl.methods, &res_ctx, subst);
+                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
             }
             NodeKind::EnumDeclaration => {
                 // Enum variants use SymbolStr names, not type annotations.
@@ -622,7 +638,8 @@ type struct Monomorphizer {
             NodeKind::FunctionDeclaration => {
                 const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
                 if (decl == null) { return; }
-                this.resolve_func_and_body(decl, &res_ctx, subst);
+                // Free functions have no `this`.
+                this.resolve_func_and_body(decl, &res_ctx, subst, TypeRef::invalid());
             }
             NodeKind::ImplementationBlock => {
                 const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
@@ -640,7 +657,7 @@ type struct Monomorphizer {
                     }
                     return;
                 }
-                this.resolve_methods(decl.methods, &res_ctx, subst);
+                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
             }
             _ => {}
         }
@@ -649,7 +666,7 @@ type struct Monomorphizer {
     /// Resolve signatures on an array of methods — delegates core signature
     /// resolution to TypeResolver, then resolves body locals.
     resolve_methods(mut &this, methods: MethodNode*[], res_ctx: ResolutionContext*,
-                    subst: TypeSubstitution*) -> void {
+                    subst: TypeSubstitution*, this_type: TypeRef) -> void {
         // Share `nested_visited` across all methods in this impl block so
         // repeated return types (e.g. the common Option<T> return) only
         // produce a single monomorphization request per impl.
@@ -664,7 +681,14 @@ type struct Monomorphizer {
                 method.func.body = null;
                 continue;
             }
-            this.resolve_func_and_body(method.func, res_ctx, subst);
+            // Static methods don't take `this` — pass invalid so the
+            // inference walker doesn't seed a spurious `this` binding.
+            const m_this: TypeRef = if (method.is_static) {
+                TypeRef::invalid()
+            } else {
+                this_type
+            };
+            this.resolve_func_and_body(method.func, res_ctx, subst, m_this);
         }
     }
 
@@ -856,7 +880,7 @@ type struct Monomorphizer {
     /// local variable types in its body (monomorphizer-specific concern,
     /// since cloned AST bodies have cleared resolved_type fields).
     resolve_func_and_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*,
-                          subst: TypeSubstitution*) -> void {
+                          subst: TypeSubstitution*, this_type: TypeRef) -> void {
         this.type_resolver.resolve_func_signature(func, res_ctx);
         // If resolved_return_type is still invalid, the substituter may not
         // have rewritten the return_type_annotation (C++ compiler virtual
@@ -882,6 +906,39 @@ type struct Monomorphizer {
         }
         if (func.body != null) {
             this.resolve_body_locals(func.body, res_ctx);
+            // Walk the body to find inferred-arg generic free-function
+            // calls — `alloc_entry(map, h, k, v)` inside a specialized
+            // HashMap method, after the substituter has rewritten the
+            // surrounding annotations.  Each match pins a specialized
+            // callee on the call (so codegen can find it) and queues
+            // an instantiation request so the function template gets
+            // specialized in this same mono iteration.
+            //
+            // Build a lightweight name → TypeRef table from the enclosing
+            // function's parameters and the body's local declarations so
+            // call-arg identifier lookups work without a full sema pass.
+            // (Sema runs AFTER mono in the pipeline, so call-arg
+            //  expressions don't yet have `resolved_type` populated.)
+            mut local_names: SymbolStr[] = [];
+            mut local_types: TypeRef[] = [];
+            // Seed `this` for instance methods.  `this` is implicit (not
+            // a regular parameter), so the param loop below would miss
+            // it; without this seed, calls of the form
+            // `alloc_entry(this, ...)` couldn't recover the receiver's
+            // concrete type at inference time.
+            if (this_type.is_valid()) {
+                local_names.push(this.intern_table.intern("this"));
+                local_types.push(this_type);
+            }
+            for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
+                const p: VarDeclNode* = func.parameters[pi];
+                if (p == null || !p.resolved_type.is_valid()) { continue; }
+                local_names.push(p.name);
+                local_types.push(p.resolved_type);
+            }
+            this.collect_locals_in_block(func.body, &local_names, &local_types);
+            this.discover_inferred_calls_in_block(func.body, res_ctx, subst,
+                                                  local_names, local_types);
         }
 
         // Discover transitive instantiations from the method's return type.
@@ -893,6 +950,459 @@ type struct Monomorphizer {
         if (func.has_resolved_return_type()) {
             this.request_nested_instantiations(func.resolved_return_type);
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Inferred-arg generic free-function calls
+    // ----------------------------------------------------------------
+
+    /// Walk a block for `Identifier(...)` calls whose callee names a
+    /// generic free-function template; if formal/actual unification
+    /// succeeds, pin a specialized callee symbol on the call and queue
+    /// the instantiation.  Recurses into nested blocks and into the
+    /// expression tree (call args, binary, unary, etc.) so calls buried
+    /// in `match` arms or nested expressions are still discovered.
+    /// Collect VarDecl name → TypeRef bindings from a block's statements.
+    /// Recurses into nested blocks / control-flow stmt bodies so `for`'s
+    /// loop variable and locals declared inside an `if` are reachable.
+    /// Mirrors the structure of `resolve_body_locals` but writes into
+    /// the caller-owned arrays instead of the resolver.
+    collect_locals_in_block(mut &this, block: BlockStmtNode*,
+                            names: SymbolStr[]*, types: TypeRef[]*) -> void {
+        if (block == null) { return; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            this.collect_locals_in_stmt(block.statements[i], names, types);
+        }
+    }
+
+    collect_locals_in_stmt(mut &this, stmt: StatementNode*,
+                           names: SymbolStr[]*, types: TypeRef[]*) -> void {
+        if (stmt == null) { return; }
+        const node: ASTNode* = stmt as ASTNode*;
+        if (node.kind == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            const inner: DeclarationNode* = ds.declaration;
+            if (inner != null) {
+                const inner_node: ASTNode* = inner as ASTNode*;
+                if (inner_node.kind == NodeKind::VariableDeclaration) {
+                    const vd: VarDeclNode* = inner as VarDeclNode*;
+                    if (vd.resolved_type.is_valid()) {
+                        names.push(vd.name);
+                        types.push(vd.resolved_type);
+                    }
+                }
+            }
+        } else if (node.kind == NodeKind::BlockStatement) {
+            this.collect_locals_in_block(stmt as BlockStmtNode*, names, types);
+        } else if (node.kind == NodeKind::IfStatement) {
+            const ifs: IfStmtNode* = stmt as IfStmtNode*;
+            if (ifs.then_stmt != null) {
+                this.collect_locals_in_stmt(ifs.then_stmt, names, types);
+            }
+            if (ifs.has_else() && ifs.else_stmt != null) {
+                this.collect_locals_in_stmt(ifs.else_stmt, names, types);
+            }
+        } else if (node.kind == NodeKind::WhileStatement) {
+            const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+            if (ws.body != null) {
+                this.collect_locals_in_stmt(ws.body, names, types);
+            }
+        } else if (node.kind == NodeKind::ForStatement) {
+            const fs: ForStmtNode* = stmt as ForStmtNode*;
+            if (fs.body != null) {
+                this.collect_locals_in_stmt(fs.body, names, types);
+            }
+        } else if (node.kind == NodeKind::LoopStatement) {
+            const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+            if (ls.body != null) {
+                this.collect_locals_in_stmt(ls.body, names, types);
+            }
+        } else if (node.kind == NodeKind::MatchStatement) {
+            const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+            for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                const arm: MatchArmNode* = ms.arms[i];
+                if (arm != null && arm.body != null) {
+                    this.collect_locals_in_stmt(arm.body, names, types);
+                }
+            }
+        }
+    }
+
+    /// Look up an identifier's TypeRef in the param/local table.
+    lookup_local_type(&this, name: SymbolStr,
+                      names: SymbolStr[], types: TypeRef[]) -> TypeRef {
+        for (mut i: i64 = 0; i < names.length; i++) {
+            if (names[i].equals(name)) { return types[i]; }
+        }
+        return TypeRef::invalid();
+    }
+
+    discover_inferred_calls_in_block(mut &this, block: BlockStmtNode*,
+                                     res_ctx: ResolutionContext*,
+                                     subst: TypeSubstitution*,
+                                     names: SymbolStr[],
+                                     types: TypeRef[]) -> void {
+        if (block == null) { return; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            this.discover_inferred_calls_in_stmt(block.statements[i], res_ctx, subst, names, types);
+        }
+    }
+
+    discover_inferred_calls_in_stmt(mut &this, stmt: StatementNode*,
+                                    res_ctx: ResolutionContext*,
+                                    subst: TypeSubstitution*,
+                                    names: SymbolStr[],
+                                    types: TypeRef[]) -> void {
+        if (stmt == null) { return; }
+        const node: ASTNode* = stmt as ASTNode*;
+        if (node.kind == NodeKind::ExpressionStatement) {
+            const es: ExprStmtNode* = stmt as ExprStmtNode*;
+            this.discover_inferred_calls_in_expr(es.expression, res_ctx, subst, names, types);
+        } else if (node.kind == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            const inner: DeclarationNode* = ds.declaration;
+            if (inner != null) {
+                const inner_node: ASTNode* = inner as ASTNode*;
+                if (inner_node.kind == NodeKind::VariableDeclaration) {
+                    const vd: VarDeclNode* = inner as VarDeclNode*;
+                    if (vd.initializer != null) {
+                        this.discover_inferred_calls_in_expr(vd.initializer, res_ctx, subst, names, types);
+                    }
+                }
+            }
+        } else if (node.kind == NodeKind::ReturnStatement) {
+            const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+            if (rs.expression != null) {
+                this.discover_inferred_calls_in_expr(rs.expression, res_ctx, subst, names, types);
+            }
+        } else if (node.kind == NodeKind::BlockStatement) {
+            this.discover_inferred_calls_in_block(stmt as BlockStmtNode*, res_ctx, subst, names, types);
+        } else if (node.kind == NodeKind::IfStatement) {
+            const ifs: IfStmtNode* = stmt as IfStmtNode*;
+            this.discover_inferred_calls_in_expr(ifs.condition, res_ctx, subst, names, types);
+            if (ifs.then_stmt != null) {
+                this.discover_inferred_calls_in_stmt(ifs.then_stmt, res_ctx, subst, names, types);
+            }
+            if (ifs.has_else() && ifs.else_stmt != null) {
+                this.discover_inferred_calls_in_stmt(ifs.else_stmt, res_ctx, subst, names, types);
+            }
+        } else if (node.kind == NodeKind::WhileStatement) {
+            const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+            this.discover_inferred_calls_in_expr(ws.condition, res_ctx, subst, names, types);
+            if (ws.body != null) {
+                this.discover_inferred_calls_in_stmt(ws.body, res_ctx, subst, names, types);
+            }
+        } else if (node.kind == NodeKind::ForStatement) {
+            const fs: ForStmtNode* = stmt as ForStmtNode*;
+            if (fs.condition != null) {
+                this.discover_inferred_calls_in_expr(fs.condition, res_ctx, subst, names, types);
+            }
+            if (fs.body != null) {
+                this.discover_inferred_calls_in_stmt(fs.body, res_ctx, subst, names, types);
+            }
+        } else if (node.kind == NodeKind::LoopStatement) {
+            const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+            if (ls.body != null) {
+                this.discover_inferred_calls_in_stmt(ls.body, res_ctx, subst, names, types);
+            }
+        } else if (node.kind == NodeKind::MatchStatement) {
+            const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+            this.discover_inferred_calls_in_expr(ms.subject, res_ctx, subst, names, types);
+            for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                const arm: MatchArmNode* = ms.arms[i];
+                if (arm != null && arm.body != null) {
+                    this.discover_inferred_calls_in_stmt(arm.body, res_ctx, subst, names, types);
+                }
+            }
+        }
+    }
+
+    discover_inferred_calls_in_expr(mut &this, expr: ExpressionNode*,
+                                    res_ctx: ResolutionContext*,
+                                    subst: TypeSubstitution*,
+                                    names: SymbolStr[],
+                                    types: TypeRef[]) -> void {
+        if (expr == null) { return; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::CallExpression) {
+            const call: CallExprNode* = expr as CallExprNode*;
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                this.discover_inferred_calls_in_expr(call.arguments[i], res_ctx, subst, names, types);
+            }
+            if (call.callee != null) {
+                this.discover_inferred_calls_in_expr(call.callee, res_ctx, subst, names, types);
+            }
+            this.try_infer_function_call(call, subst, names, types);
+        } else if (node.kind == NodeKind::BinaryExpression) {
+            const be: BinaryExprNode* = expr as BinaryExprNode*;
+            this.discover_inferred_calls_in_expr(be.left, res_ctx, subst, names, types);
+            this.discover_inferred_calls_in_expr(be.right, res_ctx, subst, names, types);
+        } else if (node.kind == NodeKind::UnaryExpression) {
+            const ue: UnaryExprNode* = expr as UnaryExprNode*;
+            this.discover_inferred_calls_in_expr(ue.operand, res_ctx, subst, names, types);
+        } else if (node.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = expr as MemberAccessNode*;
+            this.discover_inferred_calls_in_expr(ma.object, res_ctx, subst, names, types);
+        } else if (node.kind == NodeKind::ArrayAccess) {
+            const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+            this.discover_inferred_calls_in_expr(aa.array, res_ctx, subst, names, types);
+            this.discover_inferred_calls_in_expr(aa.index, res_ctx, subst, names, types);
+        } else if (node.kind == NodeKind::CastExpression) {
+            const ce: CastExprNode* = expr as CastExprNode*;
+            this.discover_inferred_calls_in_expr(ce.expression, res_ctx, subst, names, types);
+        } else if (node.kind == NodeKind::UnaryExpression) {
+            const ue: UnaryExprNode* = expr as UnaryExprNode*;
+            this.discover_inferred_calls_in_expr(ue.operand, res_ctx, subst, names, types);
+        }
+    }
+
+    /// Resolve an identifier or `&ident` expression to a TypeRef using the
+    /// param/local table.  This is the minimal mini-sema needed to feed
+    /// the unifier a concrete type for the call's actual arguments —
+    /// expressions don't carry resolved_type yet at mono time.  Returns
+    /// invalid for anything more complex (member access, calls, etc.);
+    /// inference simply skips those calls.
+    resolve_arg_type_for_inference(&this, expr: ExpressionNode*,
+                                   names: SymbolStr[], types: TypeRef[]) -> TypeRef {
+        if (expr == null) { return TypeRef::invalid(); }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = expr as IdentifierNode*;
+            return this.lookup_local_type(id.name, names, types);
+        }
+        if (node.kind == NodeKind::UnaryExpression) {
+            // `&x` — the address-of is transparent for unification (we
+            // peel Reference on the formal side, so handing the value
+            // type works either way).
+            const ue: UnaryExprNode* = expr as UnaryExprNode*;
+            return this.resolve_arg_type_for_inference(ue.operand, names, types);
+        }
+        if (expr.resolved_type.is_valid()) { return expr.resolved_type; }
+        return TypeRef::invalid();
+    }
+
+    /// Look up a generic function template by call-site bare name.
+    /// Tries the current consuming module first, then walks the registry's
+    /// declarations to find a function template whose unqualified name matches.
+    /// Returns null when nothing matches or the match isn't a function template.
+    find_function_template_for_call(mut &this, name: SymbolStr) -> TemplateEntry* {
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return null; }
+        // Try current module's qualified form first.
+        const name_str: string = this.intern_table.resolve(name);
+        const cur_mod_str: string = this.intern_table.resolve(this.current_module);
+        if (strlen(cur_mod_str) > 0) {
+            const q1_str: string = cur_mod_str + "::" + name_str;
+            const q1: SymbolStr = this.intern_table.intern(q1_str);
+            const e1: TemplateEntry* = registry.get_template(q1);
+            if (e1 != null && e1.node_kind == NodeKind::FunctionDeclaration) { return e1; }
+        }
+        // Bare-name registry lookup — usually a miss because templates are
+        // keyed by their qualified name, but cheap to attempt.
+        const e2: TemplateEntry* = registry.get_template(name);
+        if (e2 != null && e2.node_kind == NodeKind::FunctionDeclaration) { return e2; }
+        // Linear scan: the call site's `current_module` is the consuming
+        // module, not the module where the function was defined (e.g.,
+        // `alloc_entry` lives in `std::collections::hash_map`, but a
+        // consuming call site might be in `std::env` or any module that
+        // instantiated `HashMap`).  Match by bare `entry.name` to find
+        // any function template whose unqualified name matches.  Linear
+        // is fine for now — the registry holds tens-to-hundreds of
+        // entries and inferred-arg calls are rare relative to total
+        // expression visits.
+        const total: i64 = registry.template_count();
+        for (mut i: i64 = 0; i < total; i++) {
+            const cand: TemplateEntry* = &registry.entries[i];
+            if (cand == null) { continue; }
+            if (cand.node_kind != NodeKind::FunctionDeclaration) { continue; }
+            if (cand.name.equals(name)) { return cand; }
+        }
+        return null;
+    }
+
+    /// Attempt formal↔actual unification on a CallExprNode whose callee
+    /// is an Identifier.  Mutates the call to pin a specialized callee
+    /// and queues an instantiation request.  No-op when the call already
+    /// has explicit args, when the callee isn't a generic function
+    /// template, when arity mismatches, or when unification fails.
+    try_infer_function_call(mut &this, call: CallExprNode*,
+                            subst: TypeSubstitution*,
+                            names: SymbolStr[], types: TypeRef[]) -> void {
+        if (call == null) { return; }
+        if (call.resolved_callee.is_valid()) { return; }
+        if (call.generic_args.length > 0) { return; }
+        if (call.callee == null) { return; }
+        const callee_node: ASTNode* = call.callee as ASTNode*;
+        if (callee_node.kind != NodeKind::Identifier) { return; }
+        const ident: IdentifierNode* = call.callee as IdentifierNode*;
+
+        const entry: TemplateEntry* = this.find_function_template_for_call(ident.name);
+        if (entry == null) { return; }
+        const tmpl_func: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        if (tmpl_func == null) { return; }
+        if (tmpl_func.parameters.length != call.arguments.length) { return; }
+
+        // Build bindings array, parallel to entry.param_type_ids.
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) {
+            bindings.push(TypeRef::invalid());
+        }
+
+        mut ok: boolean = true;
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const param: VarDeclNode* = tmpl_func.parameters[i];
+            if (param == null || !param.resolved_type.is_valid()) { ok = false; break; }
+            const arg: ExpressionNode* = call.arguments[i];
+            // Recover an actual type from the arg expression.  Sema
+            // hasn't run yet at mono time, so call-arg expressions
+            // don't carry `resolved_type`.  The mini-resolver looks
+            // identifiers up in the param/local table built from the
+            // enclosing function's signature plus body declarations.
+            mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
+            if (!actual.is_valid()) { ok = false; break; }
+            // Apply the outer substitution: the param/local TypeRefs
+            // we collected come from the cloned (specialized) function's
+            // own param/local declarations, which `resolve_func_signature`
+            // already ran through with the substitution context.  But
+            // *inner* var decls without explicit annotations may still
+            // carry generic-param TypeRefs.  Applying subst is a no-op
+            // when the type is already concrete, so safe to call.
+            if (subst != null) {
+                actual = subst.apply(actual, this.arena);
+            }
+            if (!this.unify_for_inference(param.resolved_type, actual, entry, &bindings)) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) { return; }
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (!bindings[i].is_valid()) { return; }
+        }
+
+        // Pin the specialized callee symbol on the call (codegen consumes it)
+        // and queue the instantiation so this same mono iteration produces
+        // the concrete function before codegen runs.
+        const base_qname: QualifiedName = QualifiedName::from_symbol(entry.name);
+        const spec_sym: SymbolStr = MangledName::specialized_identifier(
+            this.intern_table, this.arena, base_qname, bindings);
+        if (!spec_sym.is_valid()) { return; }
+        call.set_resolved_callee(spec_sym);
+        this.generic_registry.instantiate_for_module(
+            entry.base_type, bindings, this.current_module);
+    }
+
+    /// Find an InstantiatedType in the arena whose resolved_type is the
+    /// given concrete type.  Used by the unifier to walk back from a
+    /// monomorphized struct/class/enum to its `(base, args)` wrapper so
+    /// type-arg recovery works against still-generic formals.
+    find_inst_wrapping(&this, concrete: TypeRef) -> TypeRef {
+        if (!concrete.is_valid()) { return TypeRef::invalid(); }
+        const total: i64 = this.arena.types.length;
+        for (mut i: i64 = 0; i < total; i++) {
+            const t: Type* = this.arena.types[i];
+            if (t == null) { continue; }
+            if (t.kind != TypeKind::InstantiatedType) { continue; }
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (!inst.has_resolved_type()) { continue; }
+            if (inst.resolved_type.id == concrete.id) {
+                return TypeRef::new(t.id, this.arena);
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Recursive structural unifier for inference.  Walks `formal` and
+    /// `actual` in lock-step.  When `formal` is a generic param of the
+    /// template, records `actual` as its binding (or rejects on conflict).
+    /// Reference-formal vs value-actual is permitted (Cryo's `&this`-style
+    /// transparency: a `mut &T` formal accepts a `T` lvalue at the call
+    /// site).  Returns true when every nested constraint matches.
+    unify_for_inference(mut &this, formal: TypeRef, actual: TypeRef,
+                        entry: TemplateEntry*, bindings: TypeRef[]*) -> boolean {
+        if (!formal.is_valid() || !actual.is_valid()) { return false; }
+        const ft: Type* = this.arena.lookup(formal.id);
+        const at: Type* = this.arena.lookup(actual.id);
+        if (ft == null || at == null) { return false; }
+
+        // Generic param: bind it.  Constraint: must come from this
+        // template's param list (otherwise the formal references a
+        // generic from somewhere else and we can't make sense of it).
+        if (ft.kind == TypeKind::GenericParam || ft.kind == TypeKind::BoundedParam) {
+            for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) {
+                if (entry.param_type_ids[i] == formal.id) {
+                    if ((*bindings)[i].is_valid()) {
+                        return (*bindings)[i].id == actual.id;
+                    }
+                    (*bindings)[i] = actual;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Reference: tolerate mismatched ref-ness.  `&T` vs `&T` peels both
+        // sides; `&T` vs `T` peels just the formal.
+        if (ft.kind == TypeKind::Reference) {
+            const fr: ReferenceType* = ft as ReferenceType*;
+            if (at.kind == TypeKind::Reference) {
+                const ar: ReferenceType* = at as ReferenceType*;
+                return this.unify_for_inference(fr.referent, ar.referent, entry, bindings);
+            }
+            return this.unify_for_inference(fr.referent, actual, entry, bindings);
+        }
+        if (at.kind == TypeKind::Reference) {
+            const ar: ReferenceType* = at as ReferenceType*;
+            return this.unify_for_inference(formal, ar.referent, entry, bindings);
+        }
+
+        // Pointer: structural.
+        if (ft.kind == TypeKind::Pointer && at.kind == TypeKind::Pointer) {
+            const fp: PointerType* = ft as PointerType*;
+            const ap: PointerType* = at as PointerType*;
+            return this.unify_for_inference(fp.pointee, ap.pointee, entry, bindings);
+        }
+
+        // InstantiatedType vs InstantiatedType: same base + recursive args.
+        if (ft.kind == TypeKind::InstantiatedType && at.kind == TypeKind::InstantiatedType) {
+            const fi: InstantiatedType* = ft as InstantiatedType*;
+            const ai: InstantiatedType* = at as InstantiatedType*;
+            if (fi.generic_base.id != ai.generic_base.id) { return false; }
+            if (fi.type_args.length != ai.type_args.length) { return false; }
+            for (mut i: i64 = 0; i < fi.type_args.length; i++) {
+                if (!this.unify_for_inference(fi.type_args[i], ai.type_args[i], entry, bindings)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // InstantiatedType formal vs concrete struct/enum/class actual:
+        // the actual was already specialized down to the concrete type
+        // (e.g. `HashMap_String_GlobalAlloc_GlobalAlloc` struct).  Find
+        // the matching InstantiatedType wrapper in the arena (the one
+        // whose resolved_type is `actual`), then unify against it so
+        // the recursive arg walk can recover concrete bindings.  This
+        // is the path that lets `alloc_entry(this, ...)` infer K, V, A
+        // from the concrete `this` value at the inferred call site.
+        if (ft.kind == TypeKind::InstantiatedType
+                && (at.kind == TypeKind::Struct
+                    || at.kind == TypeKind::Class
+                    || at.kind == TypeKind::Enum)) {
+            const wrapper: TypeRef = this.find_inst_wrapping(actual);
+            if (wrapper.is_valid()) {
+                return this.unify_for_inference(formal, wrapper, entry, bindings);
+            }
+            return false;
+        }
+        if (ft.kind == TypeKind::InstantiatedType) {
+            return false;
+        }
+
+        // Identical typerefs (most concrete cases — primitives, the same
+        // arena slot for identical structs) succeed trivially.
+        if (formal.id == actual.id) { return true; }
+        return false;
     }
 
     /// Walk a block statement and resolve type annotations on all local
