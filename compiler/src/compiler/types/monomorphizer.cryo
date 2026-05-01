@@ -702,15 +702,88 @@ type struct Monomorphizer {
                 // codegen.
                 return false;
             }
-            const target_name: SymbolStr = this.bare_name_of(concrete);
-            if (!target_name.is_valid()) { return false; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef = bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
                 const trait_name: SymbolStr = tref.path[tref.path.length - 1];
-                const impl_block: ImplBlockNode* =
-                    this.generic_registry.lookup_trait_impl(trait_name, target_name);
-                if (impl_block == null) { return false; }
+                if (!this.type_implements_trait(concrete, trait_name, 0)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Recursively check whether a concrete TypeRef implements a trait.
+    /// For an InstantiatedType `Option<X>` and trait `Eq`:
+    ///   1. Look up the impl block for (Eq, Option). Missing → false.
+    ///   2. If the impl has a `where T: Eq` clause, recursively verify
+    ///      `X: Eq` with the impl's generic params bound to the
+    ///      InstantiatedType's args.
+    /// `depth` guards against pathological loops in cyclic impl chains;
+    /// the depth limit is conservative (we don't expect realistic chains
+    /// past a handful of levels) and a depleted depth conservatively
+    /// returns false so an unsatisfiable bound never accidentally enables
+    /// body specialization.
+    type_implements_trait(&this, ty: TypeRef, trait_name: SymbolStr, depth: i32) -> boolean {
+        if (depth >= 16) { return false; }
+        const target_name: SymbolStr = this.bare_name_of(ty);
+        if (!target_name.is_valid()) { return false; }
+        const impl_block: ImplBlockNode* =
+            this.generic_registry.lookup_trait_impl(trait_name, target_name);
+        if (impl_block == null) { return false; }
+        if (impl_block.where_bounds.length == 0) { return true; }
+        // Build a fresh substitution from the impl's generic params to
+        // the concrete type's args. For `implement<T> trait Eq for Option<T>`
+        // and `ty = Option<X>`, the impl's `T` maps to the InstantiatedType's
+        // `type_args[0]`.
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        if (t.kind != TypeKind::InstantiatedType) {
+            // No outer args to substitute through — bounds reference impl
+            // params that have no concrete value, so the impl's where
+            // clauses can't be checked. Conservatively report unsatisfied
+            // so we don't accidentally enable a body that would crash.
+            return false;
+        }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        if (impl_block.generic_params.length != inst.type_args.length) {
+            return false;
+        }
+        mut nested: TypeSubstitution = TypeSubstitution::empty();
+        for (mut gi: i64 = 0; gi < impl_block.generic_params.length; gi++) {
+            const gp_node: GenericParamNode* = impl_block.generic_params[gi];
+            if (gp_node == null) { continue; }
+            // The impl's generic param names live on the AST as SymbolStr;
+            // we need an arena TypeRef to bridge into TypeSubstitution.
+            // bounds_satisfied's `lookup_subst_for_param` keys by the
+            // GenericParam's `param_name` (a SymbolStr), so create a
+            // GenericParam type just for this one lookup. The created
+            // TypeRef goes into `nested.param_ids`.
+            const gp_ref: TypeRef = this.arena.create_generic_param(gp_node.name, gi as u64);
+            nested.add(gp_ref.id, inst.type_args[gi]);
+        }
+        return this.bounds_satisfied_at_depth(impl_block.where_bounds, &nested, depth + 1);
+    }
+
+    /// `bounds_satisfied` with explicit recursion depth, used by
+    /// `type_implements_trait` so the recursive chain shares a single
+    /// depth budget.
+    bounds_satisfied_at_depth(&this, bounds: TraitBound[],
+                               subst: TypeSubstitution*, depth: i32) -> boolean {
+        if (bounds.length == 0) { return true; }
+        if (subst == null || subst.replacements.length == 0) { return true; }
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const bound: TraitBound = bounds[bi];
+            const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
+            if (!concrete.is_valid()) { return false; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: TraitRef = bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                if (!this.type_implements_trait(concrete, trait_name, depth)) {
+                    return false;
+                }
             }
         }
         return true;
@@ -752,6 +825,16 @@ type struct Monomorphizer {
         }
         if (k == TypeKind::Unit || k == TypeKind::Void) {
             return SymbolStr::empty();
+        }
+        // Generic instantiations: trait impls are registered against the
+        // TEMPLATE's bare name (e.g. `implement trait Hash for String`
+        // registers `(Hash, String)` regardless of which `String<A>` spec
+        // the bound is being checked for). Recurse on `generic_base`
+        // instead of unwrapping through `resolved_type`, so a spec like
+        // `String<GlobalAlloc>` keys against `String`.
+        if (k == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            return this.bare_name_of(inst.generic_base);
         }
         const qname: SymbolStr = this.arena.get_qualified_name(ty);
         if (!qname.is_valid()) { return SymbolStr::empty(); }
