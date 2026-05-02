@@ -63,11 +63,19 @@ function rewrite_to_primitive(ann: TypeAnnotation*, name: SymbolStr, span: Sourc
 }
 
 /// Rewrite a TypeAnnotation* in-place from Named to Pointer(Named(inner)).
-function rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr, span: SourceSpan) -> void {
+/// `inner_pre_resolved` is the inner type's TypeRef when known (the
+/// substituter has it from `subst.replacements[i]`'s pointee). Without it,
+/// `resolve_sizeof_operand_type` resolves the inner Named by name with a
+/// fresh empty ResolutionContext — which fails for any user-defined type
+/// the call-site can't reach by bare name (e.g. `Entry<K,V>` from inside
+/// the `Layout::array<Entry<K,V>*>` spec'd body — no scope, no imports),
+/// and `codegen_sizeof` then falls through to 0.
+function rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr,
+                            inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
     const inner_named: NamedAnnotation* = new NamedAnnotation {
         name: inner_name,
         span: span,
-        pre_resolved: TypeRef::invalid(),
+        pre_resolved: inner_pre_resolved,
     };
     const inner_ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
     *inner_ann = TypeAnnotation::Named(inner_named);
@@ -151,6 +159,17 @@ public:
             return TypeRef::invalid();
         }
         return this.subst.replacements[i];
+    }
+
+    /// If `ty` is a Pointer in the arena, return its pointee TypeRef.
+    /// Returns TypeRef::invalid() otherwise.  Helper for the pointer-arm
+    /// of `substitute_named_annotation`, which needs the pointee to attach
+    /// as `pre_resolved` on the inner Named annotation.  Delegates to the
+    /// arena to keep `Type*` / `PointerType*` references out of this
+    /// module — bootstrap C++ misresolves those names here.
+    unwrap_pointer_pointee(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return TypeRef::invalid(); }
+        return this.arena.pointer_pointee_of(ty.id);
     }
 
 
@@ -239,7 +258,14 @@ public:
                 if (display_len > 1 && display[display_len - 1] == '*') {
                     const inner_str: string = substr(display, 0, display_len - 1);
                     const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
-                    rewrite_to_pointer(ann, inner_sym, named.span);
+                    // Unwrap one Pointer level off the substitution arg so
+                    // the inner Named gets a pre_resolved TypeRef. Critical
+                    // for sizeof/alignof in spec'd bodies — without it the
+                    // resolver falls back to bare-name lookup and fails for
+                    // any user-defined type not in scope at the spec site.
+                    const inner_pre: TypeRef = this.unwrap_pointer_pointee(
+                        this.resolved_arg_typeref(i));
+                    rewrite_to_pointer(ann, inner_sym, inner_pre, named.span);
                     return ann;
                 }
                 // Array suffix? → Array(Named(inner), -1)

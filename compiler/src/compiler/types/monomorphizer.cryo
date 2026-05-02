@@ -1321,7 +1321,126 @@ type struct Monomorphizer {
             }
             return TypeRef::invalid();
         }
+        if (node.kind == NodeKind::CallExpression) {
+            // `recv.method(...)` buried inside another call's arg list.
+            // Common shape: `mem::offset(this.buffer.ptr(), n)` — the
+            // outer mem::offset is the inferred-arg call we're about
+            // to bind <T> on, and arg[0]'s type tells the unifier what
+            // T should be.  Sema runs after mono, so the inner call's
+            // expression doesn't carry resolved_type — we walk the
+            // callee shape ourselves.
+            return this.resolve_method_call_arg_type(expr as CallExprNode*, names, types);
+        }
         if (expr.resolved_type.is_valid()) { return expr.resolved_type; }
+        return TypeRef::invalid();
+    }
+
+    /// Compute the return type of a method-style call expression
+    /// (`receiver.method(...)`) used as an argument to an outer
+    /// inferred-arg generic call.  Resolves the receiver's TypeRef
+    /// via the regular arg-resolution path, walks Pointer/Reference
+    /// wrappers, then looks the method up:
+    ///
+    ///   * InstantiatedType receiver — find the template via
+    ///     `generic_base`, look up the non-generic method by name on
+    ///     the template's StructDeclNode/ClassDeclNode, take its
+    ///     resolved_return_type, and substitute the template's
+    ///     GenericParam IDs with the InstantiatedType's type_args
+    ///     (the spec for the receiver may not exist yet — we're
+    ///     called *during* the outer struct's spec resolution).
+    ///   * Already-spec'd Struct/Class receiver — read the spec'd
+    ///     ast_node from spec_entries; the cloned methods' return
+    ///     types are already substituted, no extra work needed.
+    ///
+    /// Generic methods deliberately skipped — they belong to
+    /// `try_infer_method_call`, which clones+substitutes the body.
+    /// Any other callee shape (free fn, scope resolution, complex
+    /// expr) returns invalid: the caller treats invalid args as
+    /// "couldn't pin this binding from this arg" and either pins it
+    /// from another arg or gives up cleanly.
+    resolve_method_call_arg_type(mut &this, call: CallExprNode*,
+                                 names: SymbolStr[], types: TypeRef[]) -> TypeRef {
+        if (call == null || call.callee == null) { return TypeRef::invalid(); }
+        const callee_node: ASTNode* = call.callee as ASTNode*;
+        if (callee_node.kind != NodeKind::MemberAccess) {
+            return TypeRef::invalid();
+        }
+        const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
+
+        mut recv: TypeRef = this.resolve_arg_type_for_inference(ma.object, names, types);
+        if (!recv.is_valid()) { return TypeRef::invalid(); }
+
+        // Strip Pointer/Reference but PRESERVE InstantiatedType — its
+        // (generic_base, type_args) drive the substitution below.
+        mut t: Type* = this.arena.lookup(recv.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 8) {
+            if (t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = t as PointerType*;
+                recv = pt.pointee;
+                t = this.arena.lookup(recv.id);
+            } else if (t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = t as ReferenceType*;
+                recv = rt.referent;
+                t = this.arena.lookup(recv.id);
+            } else {
+                break;
+            }
+            depth = depth + 1;
+        }
+        if (t == null) { return TypeRef::invalid(); }
+
+        mut struct_ast: StructDeclNode* = null;
+        mut method_subst: TypeSubstitution = TypeSubstitution::empty();
+
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            const tmpl: TemplateEntry* =
+                this.generic_registry.get_template_by_type_id(inst.generic_base.id);
+            if (tmpl == null) { return TypeRef::invalid(); }
+            if (tmpl.node_kind != NodeKind::StructDeclaration &&
+                tmpl.node_kind != NodeKind::ClassDeclaration) {
+                return TypeRef::invalid();
+            }
+            struct_ast = tmpl.ast_node as StructDeclNode*;
+            const n: i64 = if (tmpl.param_type_ids.length < inst.type_args.length) {
+                tmpl.param_type_ids.length
+            } else {
+                inst.type_args.length
+            };
+            for (mut i: i64 = 0; i < n; i++) {
+                method_subst.add(tmpl.param_type_ids[i], inst.type_args[i]);
+            }
+        } else if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class) {
+            for (mut i: i64 = 0; i < this.spec_entries.length; i++) {
+                const e: SpecializationEntry = this.spec_entries[i];
+                if (e.specialized_type.id != recv.id) { continue; }
+                if (e.ast_node == null) { continue; }
+                struct_ast = e.ast_node as StructDeclNode*;
+                break;
+            }
+            if (struct_ast == null) { return TypeRef::invalid(); }
+        } else {
+            return TypeRef::invalid();
+        }
+
+        for (mut i: i64 = 0; i < struct_ast.methods.length; i++) {
+            const m: MethodNode* = struct_ast.methods[i];
+            if (m == null || m.func == null) { continue; }
+            if (!m.func.name.equals(ma.member)) { continue; }
+            // Generic methods route through try_infer_method_call,
+            // which clones + substitutes the body.  Their template
+            // return type still references the method's own params
+            // (e.g. `H` on `hash<H>`) — we can't substitute those
+            // here without redoing inference.
+            if (m.func.generic_params.length > 0) { return TypeRef::invalid(); }
+            mut ret: TypeRef = m.func.resolved_return_type;
+            if (!ret.is_valid()) { return TypeRef::invalid(); }
+            if (!method_subst.is_empty()) {
+                ret = method_subst.apply(ret, this.arena);
+            }
+            return ret;
+        }
         return TypeRef::invalid();
     }
 
@@ -1529,6 +1648,37 @@ type struct Monomorphizer {
         return null;
     }
 
+    /// Walk the trait-impl registry for any impl block whose `target_type`
+    /// equals `bare_target_name` and that has a generic method with the
+    /// given name.  Used for primitive receivers (`i32`, `string`, …) —
+    /// `find_spec_impl_method` only sees impls attached to spec_entries,
+    /// which only tracks instantiations of generic types.  Trait impls on
+    /// primitives go straight to `trait_impl_blocks` keyed by
+    /// (trait_name, target_name) and never appear in spec_entries.
+    /// First matching impl wins; non-generic methods skip (handled by
+    /// codegen's direct-call path, not inference).
+    find_trait_impl_method_for_target(&this, bare_target_name: SymbolStr,
+                                      method_name: SymbolStr,
+                                      out_impl: ImplBlockNode**) -> MethodNode* {
+        if (!bare_target_name.is_valid()) { return null; }
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return null; }
+        for (mut i: i64 = 0; i < registry.trait_impl_blocks.length; i++) {
+            const impl_node: ImplBlockNode* = registry.trait_impl_blocks[i];
+            if (impl_node == null) { continue; }
+            if (!impl_node.target_type.equals(bare_target_name)) { continue; }
+            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                const m: MethodNode* = impl_node.methods[k];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(method_name)) { continue; }
+                if (m.func.generic_params.length == 0) { continue; }
+                *out_impl = impl_node;
+                return m;
+            }
+        }
+        return null;
+    }
+
     /// Attempt formal↔actual unification on a CallExprNode whose callee
     /// is a MemberAccess on a generic-method receiver.  Pattern:
     /// `key.hash(&hasher)` inside a spec'd body where `key: &String<GA>`
@@ -1581,17 +1731,38 @@ type struct Monomorphizer {
             depth = depth + 1;
         }
         if (t == null) { return; }
-        if (t.kind != TypeKind::Struct
-                && t.kind != TypeKind::Class
-                && t.kind != TypeKind::Enum) { return; }
+        // Allowed receiver kinds:
+        //   * Struct/Class/Enum — instance methods or trait impls on
+        //     user-defined types; lookup via spec_entries.
+        //   * Int/Float/Bool/Char/String — trait impls on primitives
+        //     (e.g. `implement trait Hash for i32 { hash<H>(...) }`);
+        //     lookup via trait_impl_blocks keyed by the bare type name,
+        //     since primitives never go through monomorphization and
+        //     have no spec_entries row.
+        const tk: TypeKind = t.kind;
+        const is_user_kind: boolean = tk == TypeKind::Struct
+                                   || tk == TypeKind::Class
+                                   || tk == TypeKind::Enum;
+        const is_primitive_kind: boolean = tk == TypeKind::Int
+                                        || tk == TypeKind::Float
+                                        || tk == TypeKind::Bool
+                                        || tk == TypeKind::Char
+                                        || tk == TypeKind::String;
+        if (!is_user_kind && !is_primitive_kind) { return; }
 
-        // Find the spec'd impl method.  Returns null if no spec'd impl
-        // block targets `recv_type` and has a generic method with this
-        // member name.  Non-generic trait methods also reach this code
-        // path; they don't need monomorphization, so we skip them.
+        // Find the impl method.  User-defined types: walk spec_entries
+        // (the spec'd impl blocks).  Primitives: walk trait_impl_blocks
+        // by bare type name.  Non-generic trait methods skip in either
+        // path — they don't need monomorphization.
         mut impl_node: ImplBlockNode* = null;
-        const orig_method: MethodNode* = this.find_spec_impl_method(
-            recv_type, ma.member, &impl_node);
+        mut orig_method: MethodNode* = null;
+        if (is_user_kind) {
+            orig_method = this.find_spec_impl_method(recv_type, ma.member, &impl_node);
+        } else {
+            const bare: SymbolStr = this.bare_name_of(recv_type);
+            orig_method = this.find_trait_impl_method_for_target(
+                bare, ma.member, &impl_node);
+        }
         if (orig_method == null || impl_node == null) { return; }
         const orig_func: FunctionDeclNode* = orig_method.func;
         if (orig_func == null) { return; }
@@ -1679,6 +1850,32 @@ type struct Monomorphizer {
         if (spec_method == null) { return; }
         impl_node.methods.push(spec_method);
         call.set_resolved_method(spec_method as ASTNode*);
+
+        // Re-walk the spec'd method body for inferred-arg generic free-fn
+        // calls.  Without this, transitive calls like `hash_u64_le(hasher,
+        // this as u64)` inside `i32::hash<DefaultHasher>` stay un-spec'd —
+        // resolve_methods only walks the impl block once at populate time,
+        // and the spec'd sibling is added after that pass.  The body has
+        // already been substituted by specialize_method, so subst=null.
+        if (spec_method.func != null && spec_method.func.body != null) {
+            mut spec_local_names: SymbolStr[] = [];
+            mut spec_local_types: TypeRef[] = [];
+            if (recv_type.is_valid()) {
+                spec_local_names.push(this.intern_table.intern("this"));
+                spec_local_types.push(recv_type);
+            }
+            for (mut pi: i64 = 0; pi < spec_method.func.parameters.length; pi++) {
+                const p: VarDeclNode* = spec_method.func.parameters[pi];
+                if (p == null || !p.resolved_type.is_valid()) { continue; }
+                spec_local_names.push(p.name);
+                spec_local_types.push(p.resolved_type);
+            }
+            this.collect_locals_in_block(spec_method.func.body,
+                                         &spec_local_names, &spec_local_types);
+            mut spec_ctx: ResolutionContext = ResolutionContext::new("", "");
+            this.discover_inferred_calls_in_block(spec_method.func.body,
+                &spec_ctx, null, spec_local_names, spec_local_types);
+        }
     }
 
     /// Clone a generic method's func, run ASTTypeSubstituter to replace
