@@ -2,6 +2,7 @@ namespace CLI::Commands;
 
 import Compiler::Instance;
 import Compiler::ProjectConfig;
+import Compiler::Resolver::Demangler;
 import Utils;
 import Utils::File;
 import Utils::Logger;
@@ -17,6 +18,7 @@ type enum CommandKind {
     Check;
     Raw;
     Project; // TODO: remove this and just use `build` with auto-detection of cryoconfig
+    Demangle;
     Unknown;
 }
 
@@ -28,31 +30,34 @@ implement enum CommandKind {
             CommandKind::Build   => { "build"   }
             CommandKind::Check   => { "check"   }
             CommandKind::Raw     => { "raw"     }
-            CommandKind::Project => { "project" }
+            CommandKind::Project  => { "project"  }
+            CommandKind::Demangle => { "demangle" }
             _ => { "" }
         };
     }
 
     description(&this) -> string {
         return match (this) {
-            CommandKind::Help    => { "Display help information"                      }
-            CommandKind::Version => { "Display version information"                   }
-            CommandKind::Build   => { "Build a source file (single-file)"            }
-            CommandKind::Check   => { "Check a file for errors (no codegen)"         }
-            CommandKind::Raw     => { "Compile without stdlib or prelude"            }
-            CommandKind::Project => { "Build a multi-module project from cryoconfig" }
+            CommandKind::Help     => { "Display help information"                      }
+            CommandKind::Version  => { "Display version information"                   }
+            CommandKind::Build    => { "Build a source file (single-file)"            }
+            CommandKind::Check    => { "Check a file for errors (no codegen)"         }
+            CommandKind::Raw      => { "Compile without stdlib or prelude"            }
+            CommandKind::Project  => { "Build a multi-module project from cryoconfig" }
+            CommandKind::Demangle => { "Decode a mangled symbol to its source form"   }
             _ => { "" }
         };
     }
 
     usage(&this) -> string {
         return match (this) {
-            CommandKind::Help    => { "cryoc help [command]"              }
-            CommandKind::Version => { "cryoc version"                     }
-            CommandKind::Build   => { "cryoc build <file> [flags]"       }
-            CommandKind::Check   => { "cryoc check <file> [flags]"       }
-            CommandKind::Raw     => { "cryoc raw <file> [flags]"         }
-            CommandKind::Project => { "cryoc project [dir] [flags]"      }
+            CommandKind::Help     => { "cryoc help [command]"              }
+            CommandKind::Version  => { "cryoc version"                     }
+            CommandKind::Build    => { "cryoc build <file> [flags]"       }
+            CommandKind::Check    => { "cryoc check <file> [flags]"       }
+            CommandKind::Raw      => { "cryoc raw <file> [flags]"         }
+            CommandKind::Project  => { "cryoc project [dir] [flags]"      }
+            CommandKind::Demangle => { "cryoc demangle <mangled-symbol>"  }
             _ => { "" }
         };
     }
@@ -65,7 +70,6 @@ implement enum CommandKind {
 type struct Executor {
     /// Registers all built-in commands with the Runner.
     static register_commands(runner: Runner*) -> void {
-        printf("[Executor] Registering built-in commands...\n");
         const help: CommandKind = CommandKind::Help;
         runner.add_command(Command::new(help.name(), help.description(), help.usage()));
 
@@ -84,17 +88,19 @@ type struct Executor {
         const project: CommandKind = CommandKind::Project;
         runner.add_command(Command::new(project.name(), project.description(), project.usage()));
 
-        printf("[Executor] Registered built-in commands: help, version, build, check, raw, project\n");
+        const demangle: CommandKind = CommandKind::Demangle;
+        runner.add_command(Command::new(demangle.name(), demangle.description(), demangle.usage()));
     }
 
     /// Resolves a command name string to a CommandKind.
     static resolve(name: string) -> CommandKind {
-        if (name == "help")    { return CommandKind::Help; }
-        if (name == "version") { return CommandKind::Version; }
-        if (name == "build")   { return CommandKind::Build; }
-        if (name == "check")   { return CommandKind::Check; }
-        if (name == "raw")     { return CommandKind::Raw; }
-        if (name == "project") { return CommandKind::Project; }
+        if (name == "help")     { return CommandKind::Help; }
+        if (name == "version")  { return CommandKind::Version; }
+        if (name == "build")    { return CommandKind::Build; }
+        if (name == "check")    { return CommandKind::Check; }
+        if (name == "raw")      { return CommandKind::Raw; }
+        if (name == "project")  { return CommandKind::Project; }
+        if (name == "demangle") { return CommandKind::Demangle; }
         return CommandKind::Unknown;
     }
 
@@ -112,7 +118,8 @@ type struct Executor {
             CommandKind::Build   => { return Executor::cmd_build(args); }
             CommandKind::Check   => { return Executor::cmd_check(args); }
             CommandKind::Raw     => { return Executor::cmd_raw(args); }
-            CommandKind::Project => { return Executor::cmd_project(args); }
+            CommandKind::Project  => { return Executor::cmd_project(args); }
+            CommandKind::Demangle => { return Executor::cmd_demangle(args); }
             CommandKind::Unknown => {
                 printf("Error: Unknown command. Run 'cryoc help' for usage.\n");
                 return 1;
@@ -275,6 +282,93 @@ type struct Executor {
         printf("Project compilation failed (%u errors, %u warnings)\n",
             result.error_count, result.warning_count);
         return 1;
+    }
+
+    /// `cryo demangle <symbol>` — decode a v0.2-mangled symbol to its
+    /// source-level form (per docs/cryo-mangling-spec.md §10).  With no
+    /// argument, reads newline-separated symbols from stdin.
+    ///
+    /// Shell-expansion gotcha: bash treats `$8`, `$F`, `$L`, etc. as
+    /// variable expansions even inside double quotes — by the time argv
+    /// reaches us, every `$<letter>` segment is gone.  Use single quotes
+    /// (`'C$...$Rv'`) or pipe the symbol on stdin to avoid it.
+    static cmd_demangle(args: ParsedArgs) -> int {
+        // Positional form: demangle the single argument.
+        if (args.positional_count() > 0) {
+            const sym: string = args.input_file();
+            Executor::print_demangled(sym);
+            return 0;
+        }
+
+        // No arg → read from stdin, one symbol per line.  Use fdopen(0)
+        // because Cryo doesn't expose libc's `stdin` global; the returned
+        // FILE* aliases fd 0 and works fine with fgets.
+        const in_stream: void* = fdopen(0, "r");
+        if (in_stream == null) {
+            printf("Error: No symbol provided.\n");
+            printf("Usage: cryo demangle <mangled-symbol>\n");
+            return 1;
+        }
+        mut buf: i8[8192];
+        mut saw_input: boolean = false;
+        while (fgets(&buf[0], 8192, in_stream) != null) {
+            mut end: i64 = strlen(&buf[0] as string) as i64;
+            while (end > 0
+                && (buf[end - 1] as i32 == 10 || buf[end - 1] as i32 == 13)) {
+                end = end - 1;
+            }
+            buf[end] = 0;
+            if (end == 0) { continue; }
+            saw_input = true;
+            Executor::print_demangled(&buf[0] as string);
+        }
+
+        if (!saw_input) {
+            printf("Error: No symbol provided.\n");
+            printf("Usage: cryo demangle <mangled-symbol>\n");
+            printf("       echo 'C$...' | cryo demangle\n");
+            printf("Tip: wrap mangled names in SINGLE quotes ('...') so the shell does not\n");
+            printf("     expand $-segments like $F, $L, $s, $V, $G, $R into empty strings.\n");
+            return 1;
+        }
+        return 0;
+    }
+
+    /// Prints the demangled form of a single symbol, with a quoting hint
+    /// when the input looks like a shell-expanded mangled name (starts
+    /// with `C` but no `$` follows — typical when bash ate the `$` tokens).
+    static print_demangled(sym: string) -> void {
+        const pretty: string = Demangler::demangle(sym);
+        printf("\n%s\n", pretty);
+        if (Executor::looks_shell_expanded(sym)) {
+            printf("(hint: input has no `$` tokens — looks like the shell expanded them.\n");
+            printf(" Re-run with single quotes:  cryo demangle '%s'\n", sym);
+        }
+    }
+
+    /// Heuristic: starts with `C`, has no `$` saw_inputwhere, and contains at
+    /// least one digit-prefixed segment (`.<digit>` or leading digit
+    /// after `C`).  That's the fingerprint of a v0.2 symbol whose `$X`
+    /// markers were eaten by bash variable expansion.
+    static looks_shell_expanded(sym: string) -> boolean {
+        const len: i64 = strlen(sym) as i64;
+        if (len < 2) { return false; }
+        if (sym[0] != 'C') { return false; }
+        // Already correctly prefixed — definitely not shell-expanded.
+        if (sym[1] == '$') { return false; }
+        // Scan: reject if saw_input '$' present, accept if a digit-prefixed
+        // segment is present (ASCII digit immediately after '.' or
+        // immediately after the leading 'C').
+        mut saw_digit_seg: boolean = (sym[1] >= '0' && sym[1] <= '9');
+        for (mut i: i64 = 1; i < len; i++) {
+            const c: char = sym[i];
+            if (c == '$') { return false; }
+            if (c == '.' && i + 1 < len) {
+                const n: char = sym[i + 1];
+                if (n >= '0' && n <= '9') { saw_digit_seg = true; }
+            }
+        }
+        return saw_digit_seg;
     }
 
     // ================================================================
