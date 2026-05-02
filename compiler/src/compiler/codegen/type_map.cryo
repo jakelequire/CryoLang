@@ -503,8 +503,24 @@ type struct TypeMapper {
             mut v_offset: u64 = 0;
             mut v_align:  u64 = 1;
             for (mut j: i64 = 0; j < v.payload_types.length; j++) {
-                const pt: Type* = this.arena.lookup(v.payload_types[j].id);
+                mut pt: Type* = this.arena.lookup(v.payload_types[j].id);
                 if (pt == null) { continue; }
+                // InstantiatedType wrappers (e.g. an Option payload of
+                // type `Array<i32>`) carry size/alignment of 0 — the
+                // wrapper never had its layout populated, only the
+                // resolved spec'd struct does.  Follow `resolved_type`
+                // to the concrete struct so size_bytes/alignment return
+                // the right values; otherwise the enum lowers to
+                // `{ i32, [0 x i8] }` and Some(payload) extraction
+                // reads garbage off the end of the 4-byte allocation.
+                if (pt.kind == TypeKind::InstantiatedType) {
+                    const inst_pt: InstantiatedType* = pt as InstantiatedType*;
+                    if (inst_pt.has_resolved_type()) {
+                        const resolved_pt: Type* = this.arena.lookup(
+                            inst_pt.resolved_type.id);
+                        if (resolved_pt != null) { pt = resolved_pt; }
+                    }
+                }
                 const p_size:  u64 = pt.size_bytes();
                 const p_align: u64 = pt.alignment();
                 if (p_align > 0) {
