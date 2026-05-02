@@ -1464,15 +1464,24 @@ public:
 
         if (callee_node.kind == NodeKind::Identifier) {
             const ident: IdentifierNode* = callee as IdentifierNode*;
+            // If mono pre-pinned a specialized callee (inferred-arg generic
+            // free-function calls inside a spec'd body — e.g.
+            // `alloc_entry(this, h, k, v)` after HashMap<K,V,A>::insert is
+            // monomorphized), prefer the spec'd return type over the bare
+            // template's still-generic one.  Without this, sema sees the
+            // template's `Result<Entry<K,V>*, AllocError>` return and
+            // downstream match-arm bindings (e.g., `Result::Ok(fresh)`)
+            // resolve `fresh` to a still-generic payload type that codegen
+            // can't lower.
+            if (call.resolved_callee.is_valid()) {
+                const spec_ret: TypeRef = this.lookup_func_return(call.resolved_callee);
+                if (spec_ret.is_valid()) { return spec_ret; }
+            }
             // If the call has generic args (e.g., identity<int>(100)),
             // resolve the specialized function name first.  We pin the
             // specialized callee symbol on the call so codegen can find
             // the concrete LLVM function — the bare template name is
-            // skipped at codegen.  Implicit-arg inference (e.g., a
-            // bare `alloc_entry(map, h, k, v)` inside a generic body)
-            // is left to the substituter / codegen since generic param
-            // bindings aren't concrete during the template body's sema
-            // run.
+            // skipped at codegen.
             if (call.generic_args.length > 0) {
                 const spec_sym: SymbolStr = this.resolve_generic_scope_name(
                     ident.name, call.generic_args);
