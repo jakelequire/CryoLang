@@ -109,6 +109,21 @@ type struct Monomorphizer {
     consumer_spec_indices: i64[];
     consumer_modules:      u32[];
 
+    // Transient inference scratch buffer.  `try_infer_function_call`
+    // clears and rebuilds this per-call; `unify_for_inference` reads
+    // and writes it directly.  Lives on the struct (rather than as a
+    // pointer-to-array argument) because the bootstrap can't lower
+    // `(*ptr_to_array)[i] = value`.  Recursion through unify is safe:
+    // it only self-calls, so all frames share the same buffer.
+    inference_bindings: TypeRef[];
+
+    // Param TypeRef IDs the unifier consults when matching a formal
+    // GenericParam.  Populated by the inference entry points before
+    // calling unify_for_inference (free-fn calls use the template's
+    // entry.param_type_ids; method-call inference uses the method's
+    // own generic param IDs from create_generic_param).
+    inference_param_ids: u64[];
+
 
     // ----------------------------------------------------------------
     // Construction
@@ -136,6 +151,8 @@ type struct Monomorphizer {
             consumer_spec_indices: [],
             consumer_modules:      [],
             nested_visited:        [],
+            inference_bindings:    [],
+            inference_param_ids:   [],
         };
     }
 
@@ -721,10 +738,15 @@ type struct Monomorphizer {
             const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
             if (!concrete.is_valid()) {
                 // No substitution for this param — the bound names a
-                // generic the caller didn't supply. Treat as unsatisfied
-                // so we don't try to lower a generic body in concrete
-                // codegen.
-                return false;
+                // generic the caller didn't supply.  This is normal for
+                // method-level generics (e.g. `hash<H> where H: Hasher`
+                // inside an impl that's only substituting outer params
+                // like `A`): the bound applies at method-spec time, not
+                // at impl-spec time.  Skip this bound rather than
+                // wholesale failing — preserving the method body so the
+                // method-call inference pass can clone+substitute it
+                // for a concrete H later.
+                continue;
             }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef = bound.trait_refs[ri];
@@ -1133,6 +1155,7 @@ type struct Monomorphizer {
                 this.discover_inferred_calls_in_expr(call.callee, res_ctx, subst, names, types);
             }
             this.try_infer_function_call(call, subst, names, types);
+            this.try_infer_method_call(call, subst, names, types);
         } else if (node.kind == NodeKind::BinaryExpression) {
             const be: BinaryExprNode* = expr as BinaryExprNode*;
             this.discover_inferred_calls_in_expr(be.left, res_ctx, subst, names, types);
@@ -1242,10 +1265,17 @@ type struct Monomorphizer {
         if (tmpl_func == null) { return; }
         if (tmpl_func.parameters.length != call.arguments.length) { return; }
 
-        // Build bindings array, parallel to entry.param_type_ids.
-        mut bindings: TypeRef[] = [];
+        // Reset and size the inference scratch buffer.  Lives on the
+        // struct so the recursive unifier can read/write it without a
+        // pointer-to-array argument (the bootstrap can't lower
+        // `(*ptr)[i] = value`).  Reusing across calls is safe because
+        // unify_for_inference only self-calls — no other code path
+        // touches this.inference_bindings while we're filling it.
+        this.inference_bindings = [];
+        this.inference_param_ids = [];
         for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) {
-            bindings.push(TypeRef::invalid());
+            this.inference_bindings.push(TypeRef::invalid());
+            this.inference_param_ids.push(entry.param_type_ids[i]);
         }
 
         mut ok: boolean = true;
@@ -1270,14 +1300,14 @@ type struct Monomorphizer {
             if (subst != null) {
                 actual = subst.apply(actual, this.arena);
             }
-            if (!this.unify_for_inference(param.resolved_type, actual, entry, &bindings)) {
+            if (!this.unify_for_inference(param.resolved_type, actual)) {
                 ok = false;
                 break;
             }
         }
         if (!ok) { return; }
-        for (mut i: i64 = 0; i < bindings.length; i++) {
-            if (!bindings[i].is_valid()) { return; }
+        for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
+            if (!this.inference_bindings[i].is_valid()) { return; }
         }
 
         // Pin the specialized callee symbol on the call (codegen consumes it)
@@ -1285,11 +1315,304 @@ type struct Monomorphizer {
         // the concrete function before codegen runs.
         const base_qname: QualifiedName = QualifiedName::from_symbol(entry.name);
         const spec_sym: SymbolStr = MangledName::specialized_identifier(
-            this.intern_table, this.arena, base_qname, bindings);
+            this.intern_table, this.arena, base_qname, this.inference_bindings);
         if (!spec_sym.is_valid()) { return; }
         call.set_resolved_callee(spec_sym);
         this.generic_registry.instantiate_for_module(
-            entry.base_type, bindings, this.current_module);
+            entry.base_type, this.inference_bindings, this.current_module);
+    }
+
+    /// Walk every spec'd impl block looking for one whose target is the
+    /// given concrete type and that has a method with the given name.
+    /// Returns null if no match.  Used by method-call inference to find
+    /// the spec'd Hash impl on `String<GA>` (etc.) so `key.hash(&hasher)`
+    /// can be monomorphized.
+    find_spec_impl_method(&this, target_type: TypeRef, method_name: SymbolStr,
+                          out_impl: ImplBlockNode**) -> MethodNode* {
+        for (mut i: i64 = 0; i < this.spec_entries.length; i++) {
+            const entry: SpecializationEntry = this.spec_entries[i];
+            if (entry.specialized_type.id != target_type.id) { continue; }
+            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+                const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
+                if (impl_node == null) { continue; }
+                for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                    const m: MethodNode* = impl_node.methods[k];
+                    if (m == null || m.func == null) { continue; }
+                    if (!m.func.name.equals(method_name)) { continue; }
+                    if (m.func.generic_params.length == 0) { continue; }
+                    *out_impl = impl_node;
+                    return m;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Attempt formal↔actual unification on a CallExprNode whose callee
+    /// is a MemberAccess on a generic-method receiver.  Pattern:
+    /// `key.hash(&hasher)` inside a spec'd body where `key: &String<GA>`
+    /// and the Hash impl's hash method is `hash<H> where H: Hasher`.
+    /// On success: clones+substitutes the method body for the inferred
+    /// H, adds the spec'd MethodNode to the impl block, and pins
+    /// `call.resolved_method`.  Codegen Strategy 0 then computes the
+    /// fully-mangled call-target symbol from the method's now-concrete
+    /// param types, and the impl-block injection pass declares it.
+    try_infer_method_call(mut &this, call: CallExprNode*,
+                          subst: TypeSubstitution*,
+                          names: SymbolStr[], types: TypeRef[]) -> void {
+        if (call == null) { return; }
+        if (call.resolved_method != null) { return; }
+        if (call.generic_args.length > 0) { return; }
+        if (call.callee == null) { return; }
+        const callee_node: ASTNode* = call.callee as ASTNode*;
+        if (callee_node.kind != NodeKind::MemberAccess) { return; }
+        const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
+
+        // Recover the receiver's TypeRef from the param/local table; bail
+        // when the receiver is anything but a name we can look up.
+        mut recv_type: TypeRef = this.resolve_arg_type_for_inference(ma.object, names, types);
+        if (!recv_type.is_valid()) { return; }
+        if (subst != null) {
+            recv_type = subst.apply(recv_type, this.arena);
+        }
+        // Unwrap Reference/Pointer/InstantiatedType to land on a concrete
+        // Struct/Class/Enum (which is what spec_entries.specialized_type
+        // points at).
+        mut t: Type* = this.arena.lookup(recv_type.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 8) {
+            if (t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = t as PointerType*;
+                recv_type = pt.pointee;
+                t = this.arena.lookup(recv_type.id);
+            } else if (t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = t as ReferenceType*;
+                recv_type = rt.referent;
+                t = this.arena.lookup(recv_type.id);
+            } else if (t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { break; }
+                recv_type = inst.resolved_type;
+                t = this.arena.lookup(recv_type.id);
+            } else {
+                break;
+            }
+            depth = depth + 1;
+        }
+        if (t == null) { return; }
+        if (t.kind != TypeKind::Struct
+                && t.kind != TypeKind::Class
+                && t.kind != TypeKind::Enum) { return; }
+
+        // Find the spec'd impl method.  Returns null if no spec'd impl
+        // block targets `recv_type` and has a generic method with this
+        // member name.  Non-generic trait methods also reach this code
+        // path; they don't need monomorphization, so we skip them.
+        mut impl_node: ImplBlockNode* = null;
+        const orig_method: MethodNode* = this.find_spec_impl_method(
+            recv_type, ma.member, &impl_node);
+        if (orig_method == null || impl_node == null) { return; }
+        const orig_func: FunctionDeclNode* = orig_method.func;
+        if (orig_func == null) { return; }
+
+        // Identify the method's *own* generic params (e.g. `<H>` on
+        // `hash<H>`).  Build TypeRefs for them via create_generic_param
+        // so the unifier can match against them.  These are different
+        // from the impl block's outer generics, which were already
+        // substituted when the impl was specialized.
+        const n_method_params: i64 = orig_func.generic_params.length;
+        if (n_method_params == 0) { return; }
+        this.inference_bindings = [];
+        this.inference_param_ids = [];
+        mut method_param_names: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < n_method_params; i++) {
+            const gp: GenericParamNode* = orig_func.generic_params[i];
+            if (gp == null) { return; }
+            const gp_ref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
+            this.inference_bindings.push(TypeRef::invalid());
+            this.inference_param_ids.push(gp_ref.id);
+            method_param_names.push(gp.name);
+        }
+
+        // Build the explicit-parameter list (skip `&this`/`this`) so we
+        // can pair them against `call.arguments` 1:1.  The receiver isn't
+        // an explicit arg at the call site — codegen prepends it later.
+        const this_amp: SymbolStr = this.intern_table.intern("&this");
+        const this_val: SymbolStr = this.intern_table.intern("this");
+        mut explicit_params: VarDeclNode*[] = [];
+        for (mut i: i64 = 0; i < orig_func.parameters.length; i++) {
+            const p: VarDeclNode* = orig_func.parameters[i];
+            if (p == null) { continue; }
+            if (p.name.equals(this_amp) || p.name.equals(this_val)) { continue; }
+            explicit_params.push(p);
+        }
+        if (explicit_params.length != call.arguments.length) { return; }
+
+        // Build a resolution context that binds the method's own generic
+        // params to their TypeRefs.  Used to fill `resolved_type` on the
+        // template method's params on demand — sema skips generic-method
+        // bodies, so `resolve_methods` left them invalid.
+        mut method_ctx: ResolutionContext = ResolutionContext::new("", "");
+        for (mut i: i64 = 0; i < n_method_params; i++) {
+            method_ctx.add_binding(method_param_names[i],
+                TypeRef::new(this.inference_param_ids[i], this.arena));
+        }
+        if (recv_type.is_valid()) {
+            method_ctx.set_this_type(recv_type);
+        }
+
+        // Unify each formal explicit param against the call's actual arg.
+        mut ok: boolean = true;
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const param: VarDeclNode* = explicit_params[i];
+            if (param == null) { ok = false; break; }
+            mut formal: TypeRef = param.resolved_type;
+            if (!formal.is_valid() && param.type_annotation != null
+                    && this.type_resolver != null) {
+                formal = this.type_resolver.resolve(param.type_annotation, &method_ctx);
+            }
+            if (!formal.is_valid()) { ok = false; break; }
+            const arg: ExpressionNode* = call.arguments[i];
+            mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
+            if (!actual.is_valid()) { ok = false; break; }
+            if (subst != null) {
+                actual = subst.apply(actual, this.arena);
+            }
+            if (!this.unify_for_inference(formal, actual)) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) { return; }
+        for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
+            if (!this.inference_bindings[i].is_valid()) { return; }
+        }
+
+        // Inferred all method-level params.  Specialize the method by
+        // cloning + substituting so the impl block ends up with a
+        // concrete sibling alongside the still-generic original.  The
+        // injection pass walks impl_nodes and `declare_method` skips
+        // generics, so the spec'd sibling is the one that gets emitted.
+        const spec_method: MethodNode* = this.specialize_method(
+            orig_method, method_param_names, this.inference_bindings, recv_type);
+        if (spec_method == null) { return; }
+        impl_node.methods.push(spec_method);
+        call.set_resolved_method(spec_method as ASTNode*);
+    }
+
+    /// Clone a generic method's func, run ASTTypeSubstituter to replace
+    /// its generic params with `args`, clear `generic_params`, and
+    /// re-resolve type annotations against the impl's owner type so
+    /// `&this` / param annotations resolve to concrete TypeRefs.  Returns
+    /// the spec'd MethodNode, or null on failure.  No-op when the method
+    /// is non-generic — caller should filter those out.
+    specialize_method(mut &this, original: MethodNode*,
+                       param_names: SymbolStr[], args: TypeRef[],
+                       owner_type: TypeRef) -> MethodNode* {
+        if (original == null || original.func == null) { return null; }
+        if (param_names.length != args.length) { return null; }
+
+        // Build display SymbolStrs for the substituter.
+        mut arg_displays: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < args.length; i++) {
+            const arg_t: Type* = this.arena.lookup(args[i].id);
+            mut display: string = "";
+            if (arg_t != null) {
+                const qname: SymbolStr = this.arena.get_qualified_name(args[i]);
+                if (qname.is_valid()) {
+                    display = this.intern_table.resolve(qname);
+                } else {
+                    display = this.arena.format_display(arg_t);
+                }
+            } else {
+                display = format("unknown_%llu", args[i].id);
+            }
+            arg_displays.push(this.intern_table.intern(display));
+        }
+
+        // Build the substitution.  Param IDs come from
+        // create_generic_param(name, index) — same recipe used to create
+        // the IDs the unifier matched against above; arena-deduped so we
+        // get the same TypeRefs back.
+        mut param_ids: u64[] = [];
+        for (mut i: i64 = 0; i < param_names.length; i++) {
+            const gp_ref: TypeRef = this.arena.create_generic_param(param_names[i], i as u64);
+            param_ids.push(gp_ref.id);
+        }
+        const subst_val: TypeSubstitution = TypeSubstitution::from_params(param_ids, args);
+        const subst_ptr: TypeSubstitution* = malloc(sizeof(TypeSubstitution));
+        *subst_ptr = subst_val;
+
+        // Clone the method.  The cloner's `for_specialization` is for
+        // type templates (renames the type itself); methods don't get
+        // a renamed leaf, so use the plain cloner.  Bypass MethodNode's
+        // accept() (the C++ codegen vtable bug can dispatch it to the
+        // wrong override and lose the body); call clone_func_decl
+        // directly and rebuild the MethodNode locally.
+        mut cloner: ASTCloner = ASTCloner::new_plain();
+        const cloned_func: FunctionDeclNode* = cloner.clone_func_decl(original.func);
+        if (cloned_func == null) { return null; }
+        mut spec_method: MethodNode* = new MethodNode(cloned_func, original.span);
+        spec_method.visibility            = original.visibility;
+        spec_method.is_constructor        = original.is_constructor;
+        spec_method.is_destructor         = original.is_destructor;
+        spec_method.is_static             = original.is_static;
+        spec_method.is_default_destructor = original.is_default_destructor;
+        spec_method.is_virtual            = original.is_virtual;
+        spec_method.is_override           = original.is_override;
+        spec_method.base_ctor_name        = original.base_ctor_name;
+        const cloned_node: ASTNode* = spec_method as ASTNode*;
+        // The cloner copies `generic_params` by ref; reset to empty so
+        // sema/declare_method don't classify the spec as still generic.
+        spec_method.func.generic_params = [];
+        spec_method.func.set_resolved_return_type(TypeRef::invalid());
+        for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
+            const p: VarDeclNode* = spec_method.func.parameters[i];
+            if (p != null) { p.set_resolved_type(TypeRef::invalid()); }
+        }
+
+        // Run the substituter — pass empty base/spec names since we're
+        // not renaming a self-type, just substituting the method's own
+        // generic params (e.g. H → DefaultHasher).
+        const empty_sym: SymbolStr = SymbolStr::empty();
+        mut substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
+            subst_ptr, this.arena, this.intern_table,
+            empty_sym, empty_sym,
+            param_names, arg_displays);
+        cloned_node.accept(substituter);
+
+        // Re-resolve types on the spec'd method's signature.  Bind
+        // `&this` to the impl's owner type so the receiver's
+        // resolved_type lands on the spec'd struct.
+        if (this.type_resolver != null) {
+            mut module_name: string = "";
+            mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
+            if (owner_type.is_valid()) {
+                res_ctx.set_this_type(owner_type);
+            }
+            this.type_resolver.resolve_func_signature(spec_method.func, &res_ctx);
+            // Back-fill `&this` / `this` param's resolved_type the same
+            // way resolve_method_signatures does for inherent methods —
+            // the parser leaves these implicit-typed.
+            for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
+                const p: VarDeclNode* = spec_method.func.parameters[i];
+                if (p == null) { continue; }
+                if (p.resolved_type.is_valid()) { continue; }
+                const this_amp: SymbolStr = this.intern_table.intern("&this");
+                const this_val: SymbolStr = this.intern_table.intern("this");
+                if (p.name.equals(this_amp)) {
+                    if (owner_type.is_valid()) {
+                        p.set_resolved_type(this.arena.get_reference_to(
+                            owner_type, RefMutability::Immutable));
+                    }
+                } else if (p.name.equals(this_val)) {
+                    if (owner_type.is_valid()) {
+                        p.set_resolved_type(owner_type);
+                    }
+                }
+            }
+        }
+        return spec_method;
     }
 
     /// Find an InstantiatedType in the arena whose resolved_type is the
@@ -1314,12 +1637,17 @@ type struct Monomorphizer {
 
     /// Recursive structural unifier for inference.  Walks `formal` and
     /// `actual` in lock-step.  When `formal` is a generic param of the
-    /// template, records `actual` as its binding (or rejects on conflict).
-    /// Reference-formal vs value-actual is permitted (Cryo's `&this`-style
-    /// transparency: a `mut &T` formal accepts a `T` lvalue at the call
-    /// site).  Returns true when every nested constraint matches.
-    unify_for_inference(mut &this, formal: TypeRef, actual: TypeRef,
-                        entry: TemplateEntry*, bindings: TypeRef[]*) -> boolean {
+    /// template, records `actual` into `this.inference_bindings` (or
+    /// rejects on conflict).  Reference-formal vs value-actual is
+    /// permitted (Cryo's `&this`-style transparency: a `mut &T` formal
+    /// accepts a `T` lvalue at the call site).  Returns true when every
+    /// nested constraint matches.  The bindings buffer and the param-id
+    /// list live on the struct (rather than as pointer-to-array args)
+    /// because the bootstrap can't lower `(*ptr_to_array)[i] = value`.
+    /// Callers populate `this.inference_param_ids` before invoking — for
+    /// free-fn calls that's the template's `entry.param_type_ids`; for
+    /// method-call specs it's the method's own generic-param TypeRef IDs.
+    unify_for_inference(mut &this, formal: TypeRef, actual: TypeRef) -> boolean {
         if (!formal.is_valid() || !actual.is_valid()) { return false; }
         const ft: Type* = this.arena.lookup(formal.id);
         const at: Type* = this.arena.lookup(actual.id);
@@ -1329,12 +1657,13 @@ type struct Monomorphizer {
         // template's param list (otherwise the formal references a
         // generic from somewhere else and we can't make sense of it).
         if (ft.kind == TypeKind::GenericParam || ft.kind == TypeKind::BoundedParam) {
-            for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) {
-                if (entry.param_type_ids[i] == formal.id) {
-                    if ((*bindings)[i].is_valid()) {
-                        return (*bindings)[i].id == actual.id;
+            for (mut i: i64 = 0; i < this.inference_param_ids.length; i++) {
+                if (this.inference_param_ids[i] == formal.id) {
+                    const existing: TypeRef = this.inference_bindings[i];
+                    if (existing.is_valid()) {
+                        return existing.id == actual.id;
                     }
-                    (*bindings)[i] = actual;
+                    this.inference_bindings[i] = actual;
                     return true;
                 }
             }
@@ -1347,20 +1676,20 @@ type struct Monomorphizer {
             const fr: ReferenceType* = ft as ReferenceType*;
             if (at.kind == TypeKind::Reference) {
                 const ar: ReferenceType* = at as ReferenceType*;
-                return this.unify_for_inference(fr.referent, ar.referent, entry, bindings);
+                return this.unify_for_inference(fr.referent, ar.referent);
             }
-            return this.unify_for_inference(fr.referent, actual, entry, bindings);
+            return this.unify_for_inference(fr.referent, actual);
         }
         if (at.kind == TypeKind::Reference) {
             const ar: ReferenceType* = at as ReferenceType*;
-            return this.unify_for_inference(formal, ar.referent, entry, bindings);
+            return this.unify_for_inference(formal, ar.referent);
         }
 
         // Pointer: structural.
         if (ft.kind == TypeKind::Pointer && at.kind == TypeKind::Pointer) {
             const fp: PointerType* = ft as PointerType*;
             const ap: PointerType* = at as PointerType*;
-            return this.unify_for_inference(fp.pointee, ap.pointee, entry, bindings);
+            return this.unify_for_inference(fp.pointee, ap.pointee);
         }
 
         // InstantiatedType vs InstantiatedType: same base + recursive args.
@@ -1370,7 +1699,7 @@ type struct Monomorphizer {
             if (fi.generic_base.id != ai.generic_base.id) { return false; }
             if (fi.type_args.length != ai.type_args.length) { return false; }
             for (mut i: i64 = 0; i < fi.type_args.length; i++) {
-                if (!this.unify_for_inference(fi.type_args[i], ai.type_args[i], entry, bindings)) {
+                if (!this.unify_for_inference(fi.type_args[i], ai.type_args[i])) {
                     return false;
                 }
             }
@@ -1391,7 +1720,7 @@ type struct Monomorphizer {
                     || at.kind == TypeKind::Enum)) {
             const wrapper: TypeRef = this.find_inst_wrapping(actual);
             if (wrapper.is_valid()) {
-                return this.unify_for_inference(formal, wrapper, entry, bindings);
+                return this.unify_for_inference(formal, wrapper);
             }
             return false;
         }

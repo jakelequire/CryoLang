@@ -645,6 +645,24 @@ type struct DefaultExpansionPasses {
             }
             NodeKind::ScopeResolution => {
                 const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+                // Default-expand the scope itself: `String::from_str(...)`
+                // where `struct String<A = GlobalAlloc>` should become
+                // `String<GlobalAlloc>::from_str(...)`.  Without this, the
+                // call resolves to the bare-template method whose return
+                // type still references the bare `String`, and the LLVM
+                // signature mismatches with the spec'd target type at the
+                // call site.
+                if (sr.scope_generic_args.length == 0
+                        && !scope.contains(sr.scope_name)) {
+                    const entry: DefaultEntry* = reg.lookup(sr.scope_name);
+                    if (entry != null) {
+                        mut cloned_defaults: TypeAnnotation*[] = [];
+                        for (mut i: i64 = 0; i < entry.defaults.length; i++) {
+                            cloned_defaults.push(TypeAnnotation::clone_ptr(entry.defaults[i]));
+                        }
+                        sr.scope_generic_args = cloned_defaults;
+                    }
+                }
                 for (mut i: i64 = 0; i < sr.generic_args.length; i++) {
                     DefaultExpansionPasses::rewrite_annotation_in_place(
                         sr.generic_args[i], reg, scope);
@@ -743,8 +761,17 @@ type struct DefaultExpansionPasses {
                 }
             }
             TypeAnnotation::Generic(g) => {
-                // Recurse into the base (rare — usually Named(X)) and args.
-                DefaultExpansionPasses::rewrite_annotation_in_place(g.base, reg, scope);
+                // Recurse into the base ONLY if it isn't already a Named —
+                // an already-explicit `Named("X")<args>` shouldn't have its
+                // base re-expanded into another `Generic`, which would yield
+                // `Generic(Generic(Named("X"), [defaults]), args)`.  The
+                // outer args are the user-supplied bindings; preserve them.
+                match (*g.base) {
+                    TypeAnnotation::Named(_) => { /* skip — args already explicit */ }
+                    _ => {
+                        DefaultExpansionPasses::rewrite_annotation_in_place(g.base, reg, scope);
+                    }
+                }
                 for (mut i: i64 = 0; i < g.args.length; i++) {
                     DefaultExpansionPasses::rewrite_annotation_in_place(
                         g.args[i], reg, scope);
