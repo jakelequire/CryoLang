@@ -94,6 +94,17 @@ type enum IntrinsicKind {
     // offset 18 (i8), d_name at offset 19 (char[256]).  Matches glibc.
     DirentName;
     DirentType;
+
+    // `intrinsic function panic(message: string, file: string, line: u32)`
+    // — direct call to the `@panic` runtime symbol emitted by
+    // `emit_panic_runtime`.  Callers like `core::panic::panic` invoke
+    // `intrinsics::panic(...)` to reach the runtime; without this
+    // intrinsic kind the ScopeResolution callee path resolves
+    // `intrinsics::panic` back through bare-name lookup, which finds
+    // the wrapper `core::panic::panic` in the same module and produces
+    // an infinite-recursion call.  Always followed by `unreachable`
+    // since panic diverges (`@panic` body is `abort(); unreachable`).
+    Panic;
 }
 
 
@@ -188,6 +199,10 @@ function lookup_intrinsic_kind(name: string) -> IntrinsicKind {
     if (name == "isfinite")     { return IntrinsicKind::IsFinite; }
     if (name == "dirent_name")  { return IntrinsicKind::DirentName; }
     if (name == "dirent_type")  { return IntrinsicKind::DirentType; }
+
+    // Runtime panic — see comment on IntrinsicKind::Panic for why
+    // this routes through the dispatcher rather than name-resolution.
+    if (name == "panic")        { return IntrinsicKind::Panic; }
 
     return IntrinsicKind::NotIntrinsic;
 }
@@ -469,6 +484,8 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
         IntrinsicKind::Rotl64       => { 2 }
         IntrinsicKind::Rotr32       => { 2 }
         IntrinsicKind::Rotr64       => { 2 }
+        // panic(message: string, file: string, line: u32)
+        IntrinsicKind::Panic        => { 3 }
         // atomic_fence(order: i32) — single arg.  isfinite, dirent_*
         // also single arg, so they fall through to the default below.
         _                           => { 1 }
@@ -613,9 +630,42 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
         //    GEP returns a `char *` which is exactly Cryo's `string`. --
         IntrinsicKind::DirentName  => { emit_dirent_name(cg, args[0]) }
         IntrinsicKind::DirentType  => { emit_dirent_type(cg, args[0]) }
+
+        // -- panic(msg, file, line) → ensure @panic is declared, call it,
+        //    then build_unreachable since panic diverges.  The dispatcher's
+        //    early return in visit_call_expr bypasses the post-call
+        //    divergent-name check, so the unreachable must be emitted here.
+        //    Returns LValue::null() — panic returns void. --
+        IntrinsicKind::Panic       => { emit_panic_call(cg, args[0], args[1], args[2]) }
     };
 
     return true;
+}
+
+/// Emit `call @panic(msg, file, line); unreachable`.  Ensures the
+/// `@panic` runtime function is declared in the current module first.
+function emit_panic_call(cg: CodegenContext*, msg: LValue, file: LValue, line: LValue) -> LValue {
+    emit_panic_runtime(cg);
+    const panic_fn: LValue = cg.llvm_module.get_named_function("panic");
+    if (!panic_fn.is_valid()) { return LValue::null(); }
+    // Match emit_panic_runtime's declared signature: (ptr, ptr, i32) -> void.
+    const ptr_ty: LType = LType::pointer_to(LType::i8());
+    const param_buf: void* = malloc(24);
+    const param_slots: void** = param_buf as void**;
+    param_slots[0] = ptr_ty.raw;
+    param_slots[1] = ptr_ty.raw;
+    param_slots[2] = LType::i32().raw;
+    const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
+    free(param_buf);
+    const arg_buf: void* = malloc(24);
+    const arg_slots: void** = arg_buf as void**;
+    arg_slots[0] = msg.raw;
+    arg_slots[1] = file.raw;
+    arg_slots[2] = line.raw;
+    cg.builder.build_call(fty, panic_fn, arg_buf, 3, "");
+    free(arg_buf);
+    cg.builder.build_unreachable();
+    return LValue::null();
 }
 
 

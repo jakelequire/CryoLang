@@ -1075,8 +1075,13 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
 
 /// Generate a GEP for array element access.  `site_span` is the source
 /// span of the access expression in the caller; used for diagnostics.
+/// `array_is_lvalue` distinguishes a pointer to storage holding the
+/// array/ptr (load before GEP) from a direct value (GEP straight off
+/// it).  Common rvalue case: `f()[i]` where `f` returns `T*` — the call
+/// hands back the pointer itself, not a slot containing it.
 function codegen_array_access(cg: CodegenContext*, array_val: LValue,
-                              array_type: TypeRef, index_val: LValue,
+                              array_type: TypeRef, array_is_lvalue: boolean,
+                              index_val: LValue,
                               out_value: LValue*, out_is_lvalue: boolean*,
                               site_span: SourceSpan) -> void {
     const t: Type* = cg.lookup_type_by_id(array_type.id);
@@ -1086,8 +1091,11 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
         return;
     }
 
-    // Pointer indexing (C-style `ptr[i]` ≡ `*(ptr + i)`).  `array_val` is an
-    // lvalue holding the ptr — load it, then GEP element_ty to the ith slot.
+    // Pointer indexing (C-style `ptr[i]` ≡ `*(ptr + i)`).  When
+    // `array_is_lvalue` is true, `array_val` is a slot containing the
+    // pointer (e.g. a local variable of type `T*`) and needs a load
+    // first.  When false, the pointer value is already in hand
+    // (e.g. result of a call returning `T*`) and we GEP directly.
     if (t.kind == TypeKind::Pointer) {
         const pt: PointerType* = t as PointerType*;
         const elem_ty: LType = cg.type_mapper.map_type(pt.pointee);
@@ -1096,8 +1104,11 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
             *out_is_lvalue = false;
             return;
         }
-        const ptr_ty: LType = LType::pointer_to(elem_ty);
-        const data_ptr: LValue = cg.builder.build_load(ptr_ty, array_val, "ptrload");
+        mut data_ptr: LValue = array_val;
+        if (array_is_lvalue) {
+            const ptr_ty: LType = LType::pointer_to(elem_ty);
+            data_ptr = cg.builder.build_load(ptr_ty, array_val, "ptrload");
+        }
         const buf: void* = malloc(8);
         const slots: void** = buf as void**;
         slots[0] = index_val.raw;
@@ -1122,8 +1133,11 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
             return;
         }
         const i8_ty: LType = LType::i8();
-        const i8_ptr_ty: LType = LType::pointer_to(i8_ty);
-        const data_ptr: LValue = cg.builder.build_load(i8_ptr_ty, array_val, "strptr");
+        mut data_ptr: LValue = array_val;
+        if (array_is_lvalue) {
+            const i8_ptr_ty: LType = LType::pointer_to(i8_ty);
+            data_ptr = cg.builder.build_load(i8_ptr_ty, array_val, "strptr");
+        }
         const buf: void* = malloc(8);
         const slots: void** = buf as void**;
         slots[0] = index_val.raw;
@@ -1181,10 +1195,17 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
         *out_value = gep;
         *out_is_lvalue = true;
     } else {
-        // Dynamic array: load { T*, i64 } from pointer, extract data pointer, then GEP.
+        // Dynamic array: { T*, i64 } fat pointer.  When the value is in
+        // a slot (lvalue, the usual case), load the struct first; when
+        // the value is in hand (rvalue, e.g. `f()[i]` where `f` returns
+        // `T[]`), use it directly.  Either way, extract field 0 to get
+        // the data pointer, then GEP elem_ty by index.
         const arr_ty: LType = cg.type_mapper.map_type(array_type);
-        const loaded: LValue = cg.builder.build_load(arr_ty, array_val, "arrload");
-        const data_ptr: LValue = cg.builder.build_extract_value(loaded, 0, "data");
+        mut struct_val: LValue = array_val;
+        if (array_is_lvalue) {
+            struct_val = cg.builder.build_load(arr_ty, array_val, "arrload");
+        }
+        const data_ptr: LValue = cg.builder.build_extract_value(struct_val, 0, "data");
         const buf: void* = malloc(8);
         const slots: void** = buf as void**;
         slots[0] = index_val.raw;

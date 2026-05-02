@@ -1151,9 +1151,16 @@ public:
         } else if (kind == NodeKind::ArrayAccess) {
             const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
             const arr: LValue = this.codegen_lvalue(aa.array);
+            // codegen_lvalue is misnamed — it doesn't enforce lvalue-ness,
+            // it just returns whatever generate_expression produced.  For
+            // `f()[i]` the call leaves last_is_lvalue=false, telling the
+            // array-access codegen to skip the lvalue load it would do
+            // for a stored pointer.
+            const arr_is_lvalue: boolean = this.last_is_lvalue;
             const idx: LValue = this.codegen_rvalue(aa.index);
             codegen_array_access(this.cg, arr, aa.array.resolved_type,
-                                 idx, &this.last_value, &this.last_is_lvalue,
+                                 arr_is_lvalue, idx,
+                                 &this.last_value, &this.last_is_lvalue,
                                  expr.span);
         } else if (kind == NodeKind::CastExpression) {
             const cast_node: CastExprNode* = expr as CastExprNode*;
@@ -2326,8 +2333,23 @@ public:
         if (!should_unreachable && callee_val.is_valid()) {
             const _cn: string = llvm::LLVMGetValueName(callee_val.raw) as string;
             if (_cn != null) {
+                // Bare `panic` — the LLVM-level intrinsic emitted by
+                // `emit_panic_runtime`, called directly by callers that
+                // hit the intrinsic dispatcher (legacy stdlib path).
                 if (strcmp(_cn, "panic") == 0) { should_unreachable = true; }
+                // Legacy prelude wrapper (old stdlib).
                 else if (strcmp(_cn, "C$3std.7prelude.5panic$FS_S_j$Rv") == 0) {
+                    should_unreachable = true;
+                }
+                // New stdlib's `core::panic::panic` wrapper.  `intrinsics::panic`
+                // calls in the new stdlib resolve through this wrapper rather
+                // than the bare `@panic` runtime.  Without recognition here,
+                // the void-epilogue's implicit `ret void` masks the missing
+                // terminator for void callers (e.g. `Array<T>::push`), but
+                // non-void callers (e.g. `HashMap::insert -> Option<V>`) end
+                // up with an unterminated merge block and the body validator
+                // strips them to a bare `declare`.
+                else if (strcmp(_cn, "C$3std.4core.5panic.5panic$FS_S_j$Rv") == 0) {
                     should_unreachable = true;
                 }
             }
