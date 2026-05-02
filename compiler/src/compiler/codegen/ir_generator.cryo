@@ -2437,12 +2437,16 @@ public:
 
         mut data_ptr: LValue = LValue::null();
         if (count > 0) {
-            const elem_t: Type* = this.cg.lookup_type_by_id(arr_type.element.id);
-            mut elem_size: u64 = 1;
-            if (elem_t != null && elem_t.size_bytes() > 0) {
-                elem_size = elem_t.size_bytes();
-            }
-            const elem_size_val: LValue = LType::const_int(LType::i64(), elem_size, false);
+            // Stride must come from LLVM's data layout, not the cryo arena's
+            // `size_bytes()`. Element layout is computed lazily and may still
+            // be 0 here (e.g. when the literal is inside a struct ctor whose
+            // own layout pass hasn't reached the element's StructType yet) —
+            // falling back to `1` would emit `malloc(count * 1)` and cascade
+            // into heap corruption at the next allocation. `codegen_sizeof`
+            // tries `size_bytes()` first and falls back to `LLVMSizeOf`,
+            // which is always data-layout-correct.
+            mut elem_size_val: LValue = LValue::null();
+            codegen_sizeof(this.cg, arr_type.element, &elem_size_val);
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 
@@ -2580,12 +2584,10 @@ public:
             const fat_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
             const fat: LValue = this.cg.create_entry_alloca(current_fn, "arrlit", fat_ty);
 
-            const elem_t: Type* = this.cg.lookup_type_by_id(arr_type.element.id);
-            mut elem_size: u64 = 1;
-            if (elem_t != null && elem_t.size_bytes() > 0) {
-                elem_size = elem_t.size_bytes();
-            }
-            const elem_size_val: LValue = LType::const_int(LType::i64(), elem_size, false);
+            // Stride from LLVM's data layout — see visit_dynamic_array_literal
+            // for why size_bytes() can be 0 here.
+            mut elem_size_val: LValue = LValue::null();
+            codegen_sizeof(this.cg, arr_type.element, &elem_size_val);
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 

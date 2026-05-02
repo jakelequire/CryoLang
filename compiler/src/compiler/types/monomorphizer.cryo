@@ -1154,7 +1154,7 @@ type struct Monomorphizer {
             if (call.callee != null) {
                 this.discover_inferred_calls_in_expr(call.callee, res_ctx, subst, names, types);
             }
-            this.try_infer_function_call(call, subst, names, types);
+            this.try_infer_function_call(call, res_ctx, subst, names, types);
             this.try_infer_method_call(call, subst, names, types);
         } else if (node.kind == NodeKind::BinaryExpression) {
             const be: BinaryExprNode* = expr as BinaryExprNode*;
@@ -1179,12 +1179,12 @@ type struct Monomorphizer {
         }
     }
 
-    /// Resolve an identifier or `&ident` expression to a TypeRef using the
-    /// param/local table.  This is the minimal mini-sema needed to feed
-    /// the unifier a concrete type for the call's actual arguments —
+    /// Resolve an identifier, `&ident`, or `obj.field` expression to a TypeRef
+    /// using the param/local table.  This is the minimal mini-sema needed to
+    /// feed the unifier a concrete type for the call's actual arguments —
     /// expressions don't carry resolved_type yet at mono time.  Returns
-    /// invalid for anything more complex (member access, calls, etc.);
-    /// inference simply skips those calls.
+    /// invalid for anything more complex (calls, casts, etc.); inference
+    /// simply skips those calls.
     resolve_arg_type_for_inference(&this, expr: ExpressionNode*,
                                    names: SymbolStr[], types: TypeRef[]) -> TypeRef {
         if (expr == null) { return TypeRef::invalid(); }
@@ -1199,6 +1199,60 @@ type struct Monomorphizer {
             // type works either way).
             const ue: UnaryExprNode* = expr as UnaryExprNode*;
             return this.resolve_arg_type_for_inference(ue.operand, names, types);
+        }
+        if (node.kind == NodeKind::MemberAccess) {
+            // `obj.field` — recursively resolve the receiver, walk through
+            // pointer/reference wrappers, and return the field's TypeRef
+            // from the underlying struct.  Common shape inside spec'd method
+            // bodies (`mem::offset(this.ptr, 1)`).
+            //
+            // For an InstantiatedType receiver whose `resolved_type` link
+            // hasn't been installed yet (resolve_specialized_ast runs before
+            // populate_concrete_type — see resolve_specialized_ast comment),
+            // fall back to the template's `generic_base` struct: its field
+            // types still carry the unsubstituted generic params (`T*`),
+            // which the caller's `subst.apply` then concretizes (`Point*`).
+            const ma: MemberAccessNode* = expr as MemberAccessNode*;
+            mut recv: TypeRef = this.resolve_arg_type_for_inference(ma.object, names, types);
+            if (!recv.is_valid()) { return TypeRef::invalid(); }
+            mut t: Type* = this.arena.lookup(recv.id);
+            mut depth: i32 = 0;
+            while (t != null && depth < 8) {
+                if (t.kind == TypeKind::Pointer) {
+                    const pt: PointerType* = t as PointerType*;
+                    recv = pt.pointee;
+                    t = this.arena.lookup(recv.id);
+                } else if (t.kind == TypeKind::Reference) {
+                    const rt: ReferenceType* = t as ReferenceType*;
+                    recv = rt.referent;
+                    t = this.arena.lookup(recv.id);
+                } else if (t.kind == TypeKind::InstantiatedType) {
+                    const inst: InstantiatedType* = t as InstantiatedType*;
+                    if (inst.has_resolved_type()) {
+                        recv = inst.resolved_type;
+                        t = this.arena.lookup(recv.id);
+                    } else {
+                        // Fall back to the generic-base template struct.
+                        // Only useful when the base struct already has its
+                        // fields populated (e.g. processed by an earlier
+                        // mono pass) — for an in-progress spec, fields may
+                        // still be empty and the field lookup below misses.
+                        recv = inst.generic_base;
+                        t = this.arena.lookup(recv.id);
+                    }
+                } else {
+                    break;
+                }
+                depth = depth + 1;
+            }
+            if (t == null || t.kind != TypeKind::Struct) { return TypeRef::invalid(); }
+            const st: StructType* = t as StructType*;
+            for (mut i: i64 = 0; i < st.fields.length; i++) {
+                if (st.fields[i].name.equals(ma.member)) {
+                    return st.fields[i].field_type;
+                }
+            }
+            return TypeRef::invalid();
         }
         if (expr.resolved_type.is_valid()) { return expr.resolved_type; }
         return TypeRef::invalid();
@@ -1243,27 +1297,66 @@ type struct Monomorphizer {
         return null;
     }
 
-    /// Attempt formal↔actual unification on a CallExprNode whose callee
-    /// is an Identifier.  Mutates the call to pin a specialized callee
-    /// and queues an instantiation request.  No-op when the call already
-    /// has explicit args, when the callee isn't a generic function
-    /// template, when arity mismatches, or when unification fails.
+    /// Pin a specialized callee on a generic free-function call so codegen
+    /// can resolve it.  Accepts both bare-Identifier callees (`offset(p, n)`)
+    /// and ScopeResolution callees (`mem::offset(p, n)`, `Layout::array<T>(n)`).
+    /// When the call carries explicit generic args the bindings are seeded
+    /// directly; otherwise they're inferred by formal↔actual unification on
+    /// the call's argument types.  Queues an instantiation request so the
+    /// concrete function is produced in the same mono iteration.  No-op when
+    /// the callee isn't a generic function template, arity mismatches, or
+    /// inference fails.
     try_infer_function_call(mut &this, call: CallExprNode*,
+                            res_ctx: ResolutionContext*,
                             subst: TypeSubstitution*,
                             names: SymbolStr[], types: TypeRef[]) -> void {
         if (call == null) { return; }
         if (call.resolved_callee.is_valid()) { return; }
-        if (call.generic_args.length > 0) { return; }
         if (call.callee == null) { return; }
         const callee_node: ASTNode* = call.callee as ASTNode*;
-        if (callee_node.kind != NodeKind::Identifier) { return; }
-        const ident: IdentifierNode* = call.callee as IdentifierNode*;
 
-        const entry: TemplateEntry* = this.find_function_template_for_call(ident.name);
+        // Extract the bare callee name and any qualifying scope.  Identifier
+        // callees are bare (`offset(...)`); ScopeResolution callees are
+        // `scope::member` where scope can be a module or a type.  Explicit
+        // generic args may live on the call itself OR on the ScopeResolution
+        // node (e.g., `Layout::array<T>(n)` parses with the <T> on the SR).
+        mut callee_name:  SymbolStr           = SymbolStr::empty();
+        mut callee_scope: SymbolStr           = SymbolStr::empty();
+        mut explicit_args: TypeAnnotation*[] = call.generic_args;
+        if (callee_node.kind == NodeKind::Identifier) {
+            const ident: IdentifierNode* = call.callee as IdentifierNode*;
+            callee_name = ident.name;
+        } else if (callee_node.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+            callee_name  = sr.member_name;
+            callee_scope = sr.scope_name;
+            if (explicit_args.length == 0 && sr.generic_args.length > 0) {
+                explicit_args = sr.generic_args;
+            }
+        } else {
+            return;
+        }
+
+        // Look up the function template.  Try scope-qualified first when a
+        // scope is present, then fall back to the bare-name search which
+        // walks the current module + a linear registry scan.
+        mut entry: TemplateEntry* = null;
+        if (callee_scope.is_valid()) {
+            const scope_str: string = this.intern_table.resolve(callee_scope);
+            const member_str: string = this.intern_table.resolve(callee_name);
+            const qualified_str: string = scope_str + "::" + member_str;
+            const qsym: SymbolStr = this.intern_table.intern(qualified_str);
+            const qe: TemplateEntry* = this.generic_registry.get_template(qsym);
+            if (qe != null && qe.node_kind == NodeKind::FunctionDeclaration) {
+                entry = qe;
+            }
+        }
+        if (entry == null) {
+            entry = this.find_function_template_for_call(callee_name);
+        }
         if (entry == null) { return; }
         const tmpl_func: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
         if (tmpl_func == null) { return; }
-        if (tmpl_func.parameters.length != call.arguments.length) { return; }
 
         // Reset and size the inference scratch buffer.  Lives on the
         // struct so the recursive unifier can read/write it without a
@@ -1278,34 +1371,61 @@ type struct Monomorphizer {
             this.inference_param_ids.push(entry.param_type_ids[i]);
         }
 
-        mut ok: boolean = true;
-        for (mut i: i64 = 0; i < call.arguments.length; i++) {
-            const param: VarDeclNode* = tmpl_func.parameters[i];
-            if (param == null || !param.resolved_type.is_valid()) { ok = false; break; }
-            const arg: ExpressionNode* = call.arguments[i];
-            // Recover an actual type from the arg expression.  Sema
-            // hasn't run yet at mono time, so call-arg expressions
-            // don't carry `resolved_type`.  The mini-resolver looks
-            // identifiers up in the param/local table built from the
-            // enclosing function's signature plus body declarations.
-            mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
-            if (!actual.is_valid()) { ok = false; break; }
-            // Apply the outer substitution: the param/local TypeRefs
-            // we collected come from the cloned (specialized) function's
-            // own param/local declarations, which `resolve_func_signature`
-            // already ran through with the substitution context.  But
-            // *inner* var decls without explicit annotations may still
-            // carry generic-param TypeRefs.  Applying subst is a no-op
-            // when the type is already concrete, so safe to call.
-            if (subst != null) {
-                actual = subst.apply(actual, this.arena);
+        if (explicit_args.length > 0) {
+            // Caller-supplied generic args are authoritative — resolve each
+            // annotation to a TypeRef and seed the bindings directly.  This
+            // skips arg-type unification because the caller already pinned
+            // every parameter.  Handles both `Layout::array<T>(n)` (one
+            // explicit arg, one generic param) and partially-supplied cases
+            // by running expand_default_type_args afterward.
+            if (res_ctx == null || this.type_resolver == null) { return; }
+            mut seeded: TypeRef[] = [];
+            for (mut i: i64 = 0; i < explicit_args.length; i++) {
+                mut tr: TypeRef = this.type_resolver.resolve(explicit_args[i], res_ctx);
+                if (!tr.is_valid()) { return; }
+                if (subst != null) {
+                    tr = subst.apply(tr, this.arena);
+                }
+                seeded.push(tr);
             }
-            if (!this.unify_for_inference(param.resolved_type, actual)) {
-                ok = false;
-                break;
+            seeded = this.type_resolver.expand_default_type_args(entry, seeded, res_ctx);
+            if (seeded.length != entry.param_type_ids.length) { return; }
+            for (mut i: i64 = 0; i < seeded.length; i++) {
+                this.inference_bindings[i] = seeded[i];
             }
+        } else {
+            // No explicit args — infer from the call's argument types.
+            if (tmpl_func.parameters.length != call.arguments.length) { return; }
+
+            mut ok: boolean = true;
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                const param: VarDeclNode* = tmpl_func.parameters[i];
+                if (param == null || !param.resolved_type.is_valid()) { ok = false; break; }
+                const arg: ExpressionNode* = call.arguments[i];
+                // Recover an actual type from the arg expression.  Sema
+                // hasn't run yet at mono time, so call-arg expressions
+                // don't carry `resolved_type`.  The mini-resolver looks
+                // identifiers up in the param/local table built from the
+                // enclosing function's signature plus body declarations.
+                mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
+                if (!actual.is_valid()) { ok = false; break; }
+                // Apply the outer substitution: the param/local TypeRefs
+                // we collected come from the cloned (specialized) function's
+                // own param/local declarations, which `resolve_func_signature`
+                // already ran through with the substitution context.  But
+                // *inner* var decls without explicit annotations may still
+                // carry generic-param TypeRefs.  Applying subst is a no-op
+                // when the type is already concrete, so safe to call.
+                if (subst != null) {
+                    actual = subst.apply(actual, this.arena);
+                }
+                if (!this.unify_for_inference(param.resolved_type, actual)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) { return; }
         }
-        if (!ok) { return; }
         for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
             if (!this.inference_bindings[i].is_valid()) { return; }
         }

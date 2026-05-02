@@ -1,0 +1,29 @@
+/// Regression: `[s]: Struct[]` dynamic-array literal must allocate
+/// `count * sizeof(Struct)` bytes, not `count * 1`.
+///
+/// Before the fix, `visit_dynamic_array_literal` fell back to
+/// `elem_size = 1` whenever `Type::size_bytes()` returned 0 for the
+/// element. That malloc'd a 1-byte block for an N-element struct
+/// literal, then stored each struct off the end of the allocation —
+/// silently corrupting the heap and aborting at the next allocation.
+///
+/// Smoke test: just exercises the codegen path. With the fix, stride
+/// comes from `LLVMSizeOf` (data-layout authoritative); without it,
+/// IR contains `mul ..., 1` for the byte count and runtime corruption
+/// follows.
+namespace bridge::array_literal_struct_stride;
+
+type struct Point {
+    a: i64;
+    b: i64;
+    c: i64;
+}
+
+function main() -> i32 {
+    const p: Point = Point { a: 11, b: 22, c: 33 };
+    const arr: Point[] = [p];
+    if (arr[0].a != 11) { return 1; }
+    if (arr[0].b != 22) { return 2; }
+    if (arr[0].c != 33) { return 3; }
+    return 0;
+}
