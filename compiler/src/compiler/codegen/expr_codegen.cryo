@@ -758,10 +758,26 @@ function codegen_alignof(cg: CodegenContext*, type_ref: TypeRef,
                          out_value: LValue*) -> void {
     const t: Type* = cg.lookup_type_by_id(type_ref.id);
     if (t != null) {
-        *out_value = LType::const_int(LType::i64(), t.alignment(), false);
-    } else {
-        *out_value = LType::const_int(LType::i64(), 0, false);
+        const cryo_align: u64 = t.alignment();
+        if (cryo_align > 0) {
+            *out_value = LType::const_int(LType::i64(), cryo_align, false);
+            return;
+        }
+        // alignment() returned 0 — TypeLowering didn't compute a layout
+        // for this Type (typically InstantiatedType wrappers like
+        // `Array<T>` whose computed_align never gets propagated through
+        // the spec'd struct).  Fall back to LLVM's authoritative
+        // alignment via `LLVMAlignOf`.  Without this fallback,
+        // `Layout::array<T>` returned `Layout { size, alignment: 0 }`,
+        // and `GlobalAlloc::reallocate` either failed an alignment
+        // assertion or fell into a misaligned-realloc path that crashed.
+        const lty: LType = cg.type_mapper.map_type(type_ref);
+        if (lty.is_valid()) {
+            *out_value = LValue { raw: llvm::LLVMAlignOf(lty.raw) };
+            return;
+        }
     }
+    *out_value = LType::const_int(LType::i64(), 0, false);
 }
 
 
