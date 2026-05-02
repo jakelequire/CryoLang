@@ -124,6 +124,14 @@ type struct Monomorphizer {
     // own generic param IDs from create_generic_param).
     inference_param_ids: u64[];
 
+    // In-progress spec context.  Set by specialize_request before calling
+    // resolve_specialized_ast on a struct/class spec, cleared after.  Lets
+    // resolve_arg_type_for_inference look up `this.field` types via the
+    // spec'd AST when the InstantiatedType wrapper's resolved_type isn't
+    // installed yet (populate_concrete_type runs after resolve_specialized_ast).
+    current_spec_inst_id: u64;
+    current_spec_struct:  StructDeclNode*;
+
 
     // ----------------------------------------------------------------
     // Construction
@@ -153,6 +161,8 @@ type struct Monomorphizer {
             nested_visited:        [],
             inference_bindings:    [],
             inference_param_ids:   [],
+            current_spec_inst_id:  0,
+            current_spec_struct:   null,
         };
     }
 
@@ -451,10 +461,25 @@ type struct Monomorphizer {
         } else {
             concrete_type
         };
+        // Stash the in-progress struct AST so resolve_arg_type_for_inference
+        // can read `this.field` types via the spec'd FieldDeclNodes (which
+        // already have resolved_type set by the resolve_fields call inside
+        // resolve_specialized_ast).  The InstantiatedType wrapper's own
+        // resolved_type isn't installed until populate_concrete_type below.
+        const prev_spec_inst_id: u64 = this.current_spec_inst_id;
+        const prev_spec_struct:  StructDeclNode* = this.current_spec_struct;
+        if ((entry.node_kind == NodeKind::StructDeclaration ||
+             entry.node_kind == NodeKind::ClassDeclaration) &&
+            result.specialized_ast != null && request.generic_type.is_valid()) {
+            this.current_spec_inst_id = request.generic_type.id;
+            this.current_spec_struct  = result.specialized_ast as StructDeclNode*;
+        }
         this.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry, &subst, this_type_for_methods);
         for (mut ri: i64 = 0; ri < result.impl_asts.length; ri++) {
             this.resolve_specialized_ast(result.impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst, this_type_for_methods);
         }
+        this.current_spec_inst_id = prev_spec_inst_id;
+        this.current_spec_struct  = prev_spec_struct;
 
         // Populate the concrete type and set resolved_type on the InstantiatedType.
         // For type templates (struct/enum/class): populate fields/variants from
@@ -1173,18 +1198,33 @@ type struct Monomorphizer {
         } else if (node.kind == NodeKind::CastExpression) {
             const ce: CastExprNode* = expr as CastExprNode*;
             this.discover_inferred_calls_in_expr(ce.expression, res_ctx, subst, names, types);
-        } else if (node.kind == NodeKind::UnaryExpression) {
-            const ue: UnaryExprNode* = expr as UnaryExprNode*;
-            this.discover_inferred_calls_in_expr(ue.operand, res_ctx, subst, names, types);
+        } else if (node.kind == NodeKind::StructLiteral) {
+            // `Slice { ptr: mem::offset(...), ... }` — without recursing
+            // into field initializer values, generic free-fn calls inside
+            // struct ctors never get pinned and codegen mangles them
+            // against the unspecialized template's `1T` placeholder.
+            const sl: StructLiteralNode* = expr as StructLiteralNode*;
+            for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                this.discover_inferred_calls_in_expr(
+                    sl.field_inits[i].value, res_ctx, subst, names, types);
+            }
+        } else if (node.kind == NodeKind::ArrayLiteral) {
+            const al: ArrayLiteralNode* = expr as ArrayLiteralNode*;
+            for (mut i: i64 = 0; i < al.elements.length; i++) {
+                this.discover_inferred_calls_in_expr(
+                    al.elements[i], res_ctx, subst, names, types);
+            }
         }
     }
 
-    /// Resolve an identifier, `&ident`, or `obj.field` expression to a TypeRef
-    /// using the param/local table.  This is the minimal mini-sema needed to
-    /// feed the unifier a concrete type for the call's actual arguments —
-    /// expressions don't carry resolved_type yet at mono time.  Returns
-    /// invalid for anything more complex (calls, casts, etc.); inference
-    /// simply skips those calls.
+    /// Resolve an identifier, `&ident`, `obj.field`, or `value as TYPE`
+    /// expression to a TypeRef using the param/local table.  This is the
+    /// minimal mini-sema needed to feed the unifier a concrete type for the
+    /// call's actual arguments — expressions don't carry resolved_type yet
+    /// at mono time.  Returns invalid for shapes we can't resolve cheaply
+    /// (free-fn or method calls, complex expressions); inference simply
+    /// skips those args, and the post-loop "all bindings filled" check
+    /// catches the case where no other arg pinned the missing binding.
     resolve_arg_type_for_inference(&this, expr: ExpressionNode*,
                                    names: SymbolStr[], types: TypeRef[]) -> TypeRef {
         if (expr == null) { return TypeRef::invalid(); }
@@ -1199,6 +1239,20 @@ type struct Monomorphizer {
             // type works either way).
             const ue: UnaryExprNode* = expr as UnaryExprNode*;
             return this.resolve_arg_type_for_inference(ue.operand, names, types);
+        }
+        if (node.kind == NodeKind::CastExpression) {
+            // `value as TYPE` — the result type is `TYPE`, regardless of
+            // what `value` is.  The target annotation is resolvable through
+            // the type_resolver with the in-progress spec's module context;
+            // returning the cast's target lets calls like
+            // `mem::offset(p, count as i64)` provide arg[1]'s type without
+            // needing to resolve the underlying expression.
+            const ce: CastExprNode* = expr as CastExprNode*;
+            if (ce.target_annotation == null || this.type_resolver == null) {
+                return TypeRef::invalid();
+            }
+            mut cast_ctx: ResolutionContext = ResolutionContext::new("", "");
+            return this.type_resolver.resolve(ce.target_annotation, &cast_ctx);
         }
         if (node.kind == NodeKind::MemberAccess) {
             // `obj.field` — recursively resolve the receiver, walk through
@@ -1231,12 +1285,25 @@ type struct Monomorphizer {
                     if (inst.has_resolved_type()) {
                         recv = inst.resolved_type;
                         t = this.arena.lookup(recv.id);
+                    } else if (recv.id == this.current_spec_inst_id &&
+                               this.current_spec_struct != null) {
+                        // In-progress spec: read the field's resolved_type
+                        // straight off the spec'd StructDeclNode (resolve_fields
+                        // already populated it).  Returns directly because no
+                        // more arena unwrapping is meaningful at this point.
+                        const fields: FieldDeclNode*[] = this.current_spec_struct.fields;
+                        for (mut fi: i64 = 0; fi < fields.length; fi++) {
+                            const f: FieldDeclNode* = fields[fi];
+                            if (f != null && f.name.equals(ma.member) &&
+                                f.resolved_type.is_valid()) {
+                                return f.resolved_type;
+                            }
+                        }
+                        return TypeRef::invalid();
                     } else {
-                        // Fall back to the generic-base template struct.
-                        // Only useful when the base struct already has its
-                        // fields populated (e.g. processed by an earlier
-                        // mono pass) — for an in-progress spec, fields may
-                        // still be empty and the field lookup below misses.
+                        // Last resort: walk the template's generic_base.  For
+                        // a still-template struct (no fields populated), this
+                        // returns invalid — better than looping forever.
                         recv = inst.generic_base;
                         t = this.arena.lookup(recv.id);
                     }
@@ -1397,34 +1464,28 @@ type struct Monomorphizer {
             // No explicit args — infer from the call's argument types.
             if (tmpl_func.parameters.length != call.arguments.length) { return; }
 
-            mut ok: boolean = true;
+            // Walk every (formal, actual) pair, but skip the arg when it
+            // can't be resolved to a TypeRef (e.g. a literal that hasn't
+            // gone through sema yet) or the formal lacks a resolved type.
+            // Skipping is safe: unify_for_inference only fills a binding on
+            // match, so a missed arg can't introduce a wrong binding — it
+            // just leaves that binding for another arg to fill.  The
+            // post-loop "all bindings valid" check below remains the
+            // authoritative gate; we only pin a callee when every generic
+            // param has been bound.  This is what lets `mem::offset(this.ptr,
+            // 1)` resolve: T pins from arg[0] (`T*` ↔ `Point*`), arg[1] (`1`)
+            // is unresolvable but inconsequential since it has no generics.
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
                 const param: VarDeclNode* = tmpl_func.parameters[i];
-                if (param == null || !param.resolved_type.is_valid()) { ok = false; break; }
+                if (param == null || !param.resolved_type.is_valid()) { continue; }
                 const arg: ExpressionNode* = call.arguments[i];
-                // Recover an actual type from the arg expression.  Sema
-                // hasn't run yet at mono time, so call-arg expressions
-                // don't carry `resolved_type`.  The mini-resolver looks
-                // identifiers up in the param/local table built from the
-                // enclosing function's signature plus body declarations.
                 mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
-                if (!actual.is_valid()) { ok = false; break; }
-                // Apply the outer substitution: the param/local TypeRefs
-                // we collected come from the cloned (specialized) function's
-                // own param/local declarations, which `resolve_func_signature`
-                // already ran through with the substitution context.  But
-                // *inner* var decls without explicit annotations may still
-                // carry generic-param TypeRefs.  Applying subst is a no-op
-                // when the type is already concrete, so safe to call.
+                if (!actual.is_valid()) { continue; }
                 if (subst != null) {
                     actual = subst.apply(actual, this.arena);
                 }
-                if (!this.unify_for_inference(param.resolved_type, actual)) {
-                    ok = false;
-                    break;
-                }
+                this.unify_for_inference(param.resolved_type, actual);
             }
-            if (!ok) { return; }
         }
         for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
             if (!this.inference_bindings[i].is_valid()) { return; }

@@ -1714,13 +1714,29 @@ public:
             const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
             const di: DeclarationIndex* = this.cg.get_decl_index();
 
+            // Sema-pinned specialized callee — set by the monomorphizer's
+            // body walk for generic free-function calls invoked through a
+            // ScopeResolution (`mem::offset(p, n)`, `Layout::array<T>(n)`).
+            // Mirrors the Identifier branch above; without this check, the
+            // bare-template-name lookups below register an unspecialized
+            // declaration like `C$3std.4core.3mem.6offset$FPN$L1T$G_l$RPN$L1T$G`
+            // that no spec defines, so the linker fails.
+            const sr_arity_pre: u32 = node.arguments.length as u32;
+            if (node.resolved_callee.is_valid()) {
+                callee_val = resolve_function_with_arity(
+                    this.cg, node.resolved_callee, sr_arity_pre);
+                if (!callee_val.is_valid()) {
+                    callee_val = resolve_function(this.cg, node.resolved_callee);
+                }
+            }
+
             // Inline-lower intrinsics referenced via a namespace prefix
             // (e.g., `intrinsics::isfinite`).  The leaf name uniquely
             // identifies the intrinsic; the prefix is ignored because
             // intrinsics live in the global LLVM namespace, not in the
             // source-level module they were declared in.
             const sr_leaf_str: string = intern.resolve(sr.member_name);
-            if (is_intrinsic_name(sr_leaf_str)) {
+            if (!callee_val.is_valid() && is_intrinsic_name(sr_leaf_str)) {
                 mut sr_args: LValue[] = [];
                 for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
                     sr_args.push(this.codegen_rvalue(node.arguments[sai]));
