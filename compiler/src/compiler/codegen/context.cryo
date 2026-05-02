@@ -20,6 +20,7 @@ import Compiler::Types::TypeRef;
 import Compiler::Types::Type;
 import Compiler::Types::Arena;
 import Compiler::Types::Compound;
+import Compiler::Types::Generic;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::MangledName;
@@ -611,6 +612,77 @@ function truncate_voidptr(arr: void*[], new_len: i64) -> void*[] {
 //      and return the handle.
 // This mirrors what LLVM itself does via `Module::getOrInsertFunction`.
 
+/// Returns true if the FunctionType reaches a GenericParam / BoundedParam
+/// anywhere in its return type or parameter types (walking through
+/// References, Pointers, Arrays, Optionals, Tuples, and InstantiatedTypes
+/// with no resolved_type).  Used by extern-overload declaration to filter
+/// out sema-time registrations of still-generic templates whose param
+/// signatures would otherwise lower to opaque `ptr` and produce a wrong
+/// mangled name.
+function type_ref_has_generic_params(arena: TypeArena*, ty: TypeRef) -> boolean {
+    if (!ty.is_valid()) { return false; }
+    return type_has_generic_params_walker(arena, ty, 0);
+}
+
+function type_has_generic_params_walker(arena: TypeArena*, ty: TypeRef, depth: i32) -> boolean {
+    if (depth > 8) { return false; }
+    if (!ty.is_valid()) { return false; }
+    const t: Type* = arena.lookup(ty.id);
+    if (t == null) { return false; }
+    const k: TypeKind = t.kind;
+    if (k == TypeKind::GenericParam || k == TypeKind::BoundedParam) {
+        return true;
+    }
+    if (k == TypeKind::Reference) {
+        const r: ReferenceType* = t as ReferenceType*;
+        return type_has_generic_params_walker(arena, r.referent, depth + 1);
+    }
+    if (k == TypeKind::Pointer) {
+        const p: PointerType* = t as PointerType*;
+        return type_has_generic_params_walker(arena, p.pointee, depth + 1);
+    }
+    if (k == TypeKind::Array) {
+        const a: ArrayType* = t as ArrayType*;
+        return type_has_generic_params_walker(arena, a.element, depth + 1);
+    }
+    if (k == TypeKind::Optional) {
+        const o: OptionalType* = t as OptionalType*;
+        return type_has_generic_params_walker(arena, o.wrapped, depth + 1);
+    }
+    if (k == TypeKind::Tuple) {
+        const tu: TupleType* = t as TupleType*;
+        for (mut i: i64 = 0; i < tu.elements.length; i++) {
+            if (type_has_generic_params_walker(arena, tu.elements[i], depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (k == TypeKind::InstantiatedType) {
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        if (inst.has_resolved_type()) {
+            return type_has_generic_params_walker(arena, inst.resolved_type, depth + 1);
+        }
+        // Un-resolved InstantiatedType: walk its type_args for generic
+        // params (e.g. `Foo<T>` where T is still a template param).
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (type_has_generic_params_walker(arena, inst.type_args[i], depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+function function_type_has_generic_params(arena: TypeArena*, ft: FunctionType*) -> boolean {
+    if (type_ref_has_generic_params(arena, ft.return_type)) { return true; }
+    for (mut i: i64 = 0; i < ft.param_types.length; i++) {
+        if (type_ref_has_generic_params(arena, ft.param_types[i])) { return true; }
+    }
+    return false;
+}
+
 /// Build an LLVM function type from a Cryo `FunctionType*`.  Returns
 /// `LType::null()` if any parameter or the return type fails to map.
 function build_function_ltype(cg: CodegenContext*, ft: FunctionType*) -> LType {
@@ -732,14 +804,32 @@ function resolve_function(cg: CodegenContext*, name: SymbolStr) -> LValue {
         return LValue::null();
     }
 
+    const arena: TypeArena* = cg.get_arena();
     const overloads: TypeRef[] = di.lookup_func_type_overloads(name);
-    // Declare every known overload so that arity-aware lookups and
-    // unqualified fallbacks both resolve; return the first success for
-    // the bare-name path.
+    // Two-pass declaration: prefer concrete overloads (no GenericParam
+    // anywhere in the signature) over template entries left in DI by
+    // sema-time registration of generic methods.  Without this, the
+    // template's `Reference(GenericParam)`-typed signature is the first
+    // overload to succeed (build_function_ltype lowers `Reference(_)` to
+    // opaque `ptr` regardless), so the cross-module extern gets declared
+    // under the template's `1H`-placeholder mangled name and the call
+    // site never links to the spec.  Pass 1: concrete overloads.  Pass
+    // 2: any remaining (template) overloads — only as a fallback when
+    // no concrete overload was registered for the name.
     mut first: LValue = LValue::null();
     for (mut i: i64 = 0; i < overloads.length; i++) {
+        const ft_ptr: Type* = arena.lookup(overloads[i].id);
+        if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
+        const ft: FunctionType* = ft_ptr as FunctionType*;
+        if (function_type_has_generic_params(arena, ft)) { continue; }
         const v: LValue = declare_extern_function_overload(cg, name, overloads[i]);
         if (!first.is_valid() && v.is_valid()) { first = v; }
+    }
+    if (!first.is_valid()) {
+        for (mut i: i64 = 0; i < overloads.length; i++) {
+            const v: LValue = declare_extern_function_overload(cg, name, overloads[i]);
+            if (!first.is_valid() && v.is_valid()) { first = v; }
+        }
     }
     if (first.is_valid()) { return first; }
 
@@ -762,6 +852,17 @@ function resolve_function_with_arity(cg: CodegenContext*, name: SymbolStr,
 
     const arena: TypeArena* = cg.get_arena();
     const overloads: TypeRef[] = di.lookup_func_type_overloads(name);
+    // Two-pass: concrete overloads first, then templates as fallback.
+    // See `resolve_function` for the rationale.
+    for (mut i: i64 = 0; i < overloads.length; i++) {
+        const ft_ptr: Type* = arena.lookup(overloads[i].id);
+        if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
+        const ft: FunctionType* = ft_ptr as FunctionType*;
+        if (ft.param_types.length as u32 != arity) { continue; }
+        if (function_type_has_generic_params(arena, ft)) { continue; }
+        const v: LValue = declare_extern_function_overload(cg, name, overloads[i]);
+        if (v.is_valid()) { return v; }
+    }
     for (mut i: i64 = 0; i < overloads.length; i++) {
         const ft_ptr: Type* = arena.lookup(overloads[i].id);
         if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
