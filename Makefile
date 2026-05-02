@@ -101,15 +101,7 @@ cryo-fast: stdlib-fast
 	@echo "==> Self-hosted cryo built: $(STAGE3)"
 
 pin-cryo:
-	@if [ ! -x "$(STAGE3)" ]; then \
-		echo "ERROR: $(STAGE3) does not exist. Run 'make cryo' first."; \
-		exit 1; \
-	fi
-	@echo "==> Refreshing pinned binary at $(PIN)"
-	@mkdir -p "$(ROOT)/bin"
-	@cp "$(STAGE3)" "$(PIN)"
-	@strip "$(PIN)"
-	@echo "==> Pinned: $(PIN) ($$(stat -c%s '$(PIN)' 2>/dev/null || stat -f%z '$(PIN)') bytes, stripped)"
+	@python3 scripts/cryo-pin.py --source "$(STAGE3)" --pin "$(PIN)"
 
 # ---- full selfhost-check + byte-identity diff -------------------------
 # Implementation lives in scripts/selfhost-check.py — that gives us

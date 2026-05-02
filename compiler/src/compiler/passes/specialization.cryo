@@ -104,6 +104,68 @@ function register_generic_template(name: SymbolStr, generic_params: GenericParam
     registry.register_template(entry);
 }
 
+/// Register every generic STATIC method on `methods` as a function-style
+/// template. Static generic methods on non-generic types (e.g.
+/// `Layout::array<T>`) are otherwise invisible to the monomorphizer because
+/// `run_template_registration` only walks top-level declarations. Without
+/// registration the inference path in `try_infer_function_call` can't find
+/// them, and ScopeResolution callees like `Layout::array<int>(n)` link to a
+/// never-emitted bare-template symbol.
+///
+/// Generic NON-static methods are intentionally skipped — those go through
+/// `try_infer_method_call` / `specialize_method`, which dispatches by
+/// receiver type rather than scope-qualified name.
+///
+/// Owner-qualified key (`<owner_qualified>::<method>`) avoids collisions
+/// when two types in the same namespace each declare a static method with
+/// the same bare name.
+function register_static_method_templates(owner_name: SymbolStr,
+                                          methods: MethodNode*[],
+                                          registry: GenericRegistry*,
+                                          arena: TypeArena*,
+                                          ctx: CompilationContext*) -> void {
+    if (methods.length == 0) { return; }
+
+    const owner_qsym: SymbolStr = ctx.qualify_symbol_sym(owner_name);
+    const owner_qstr: string = ctx.intern_table.resolve(owner_qsym);
+    const module_sym: SymbolStr = if (ctx.has_namespace()) {
+        ctx.namespace_str
+    } else {
+        ctx.intern(ctx.source_file)
+    };
+
+    for (mut i: i64 = 0; i < methods.length; i++) {
+        const m: MethodNode* = methods[i];
+        if (m == null || m.func == null) { continue; }
+        if (!m.is_static) { continue; }
+        if (!m.func.is_generic()) { continue; }
+
+        const method_str: string = ctx.intern_table.resolve(m.func.name);
+        const qualified_str: string = owner_qstr + "::" + method_str;
+        const qualified_sym: SymbolStr = ctx.intern_table.intern(qualified_str);
+
+        const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
+            m.func.generic_params, arena);
+        mut param_names: SymbolStr[] = [];
+        mut param_type_ids: u64[] = [];
+        for (mut j: i64 = 0; j < m.func.generic_params.length; j++) {
+            const gp: GenericParamNode* = m.func.generic_params[j];
+            param_names.push(gp.name);
+            param_type_ids.push(refs[j].id);
+        }
+
+        const base_type: TypeRef = arena.create_function_template(qualified_sym);
+
+        const entry: TemplateEntry = TemplateEntry::new(
+            m.func.name, qualified_sym, module_sym,
+            param_names, param_type_ids,
+            m.func as ASTNode*, NodeKind::FunctionDeclaration,
+            base_type
+        );
+        registry.register_template(entry);
+    }
+}
+
 /// Register a newly injected specialized declaration into the DeclarationIndex
 /// so that sema can look it up without rescanning the AST.
 /// Delegates to the shared TypeResolutionPasses::register_decl_in_index().
@@ -322,6 +384,13 @@ type struct SpecializationPasses {
                         register_generic_template(node.name, node.generic_params,
                             stmt, NodeKind::StructDeclaration, true, registry, arena, ctx);
                     }
+                    // Static generic methods on non-generic structs (e.g.
+                    // `Layout::array<T>`) need their own template entries —
+                    // run_template_registration would otherwise miss them.
+                    if (!node.is_generic()) {
+                        register_static_method_templates(node.name, node.methods,
+                            registry, arena, ctx);
+                    }
                 }
                 NodeKind::EnumDeclaration => {
                     const node: EnumDeclNode* = stmt as EnumDeclNode*;
@@ -335,6 +404,10 @@ type struct SpecializationPasses {
                     if (node.is_generic()) {
                         register_generic_template(node.name, node.generic_params,
                             stmt, NodeKind::ClassDeclaration, true, registry, arena, ctx);
+                    }
+                    if (!node.is_generic()) {
+                        register_static_method_templates(node.name, node.methods,
+                            registry, arena, ctx);
                     }
                 }
                 NodeKind::FunctionDeclaration => {

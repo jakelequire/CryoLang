@@ -307,11 +307,14 @@ def main():
     stages = make_stages()
     total_start = time.perf_counter()
     times: list = []
+    # "==> Wiping" header + the blank line under it = 2 lines so far
+    wiping_lines = 2
 
     for i, stage in enumerate(stages, 1):
         log_path = LOG_DIR / f"stage-{i:02d}.log"
         ok, elapsed = run_stage(i, len(stages), stage, log_path, args.verbose)
         times.append((stage.label, elapsed, ok))
+        wiping_lines += 1
         if not ok:
             total = time.perf_counter() - total_start
             print_summary(times, total)
@@ -319,8 +322,16 @@ def main():
             print(f"{C.RED}{C.BOLD}✗ FAILED at stage {i}/{len(stages)}{C.RESET}")
             return 1
 
+    # All stages passed: collapse the per-stage section so the final view is just
+    # the verification block + timings panel. Only safe on a real TTY.
+    cleared_wiping = sys.stdout.isatty() and not args.verbose
+    if cleared_wiping:
+        sys.stdout.write(f"\033[{wiping_lines}F\033[J")
+        sys.stdout.flush()
+
     # Byte-identity verification
-    print()
+    if not cleared_wiping:
+        print()
     print(f"{C.BOLD}==> Verifying stage-4 == stage-5 IR byte identity{C.RESET}")
 
     if not S4_LL.exists() or not S5_LL.exists():
