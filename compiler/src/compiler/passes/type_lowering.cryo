@@ -107,6 +107,27 @@ type struct TypeLoweringPasses {
 // Layout computation dispatch
 // ============================================================================
 
+/// True iff a `needs_layout`-kind type already has its layout settled,
+/// even at size 0.  An empty marker struct (e.g. `GlobalAlloc { }`) sets
+/// `computed_align` via `set_layout(0, 1)` once the lowering pass
+/// reaches it.  Without distinguishing this from "haven't gotten here
+/// yet", parent-struct lowering treats the legitimately-zero field as
+/// pending and stays deferred forever, leaving the parent at size=0
+/// and breaking enum payload sizing downstream.
+function layout_settled(ty: Type*) -> boolean {
+    if (ty == null) { return true; }
+    if (ty.size_bytes() > 0) { return true; }
+    if (ty.kind == TypeKind::Struct) {
+        const st: StructType* = ty as StructType*;
+        return st.computed_align > 0;
+    }
+    if (ty.kind == TypeKind::Class) {
+        const cl: ClassType* = ty as ClassType*;
+        return cl.computed_align > 0;
+    }
+    return !needs_layout(ty);
+}
+
 /// Returns true if this type kind should have a non-zero layout computed.
 function needs_layout(ty: Type*) -> boolean {
     if (ty.kind == TypeKind::Struct)           { return true; }
@@ -122,6 +143,7 @@ function needs_layout(ty: Type*) -> boolean {
     }
     return false;
 }
+
 
 /// Dispatch layout computation based on TypeKind.
 /// Returns true if a layout was computed (size changed from 0 to non-zero).
@@ -179,8 +201,12 @@ function compute_struct_layout(st: StructType*, arena: TypeArena*) -> boolean {
         const f_size:  u64 = field_ty.size_bytes();
         const f_align: u64 = field_ty.alignment();
 
-        // Skip fields whose types haven't been laid out yet
-        if (f_size == 0 && needs_layout(field_ty)) { return false; }
+        // Skip fields whose types haven't been laid out yet.  Empty
+        // marker structs / classes (laid out at size 0 with align 1)
+        // are settled — don't defer on those.
+        if (f_size == 0 && needs_layout(field_ty) && !layout_settled(field_ty)) {
+            return false;
+        }
 
         if (f_align > 0) {
             offset = align_up(offset, f_align);
