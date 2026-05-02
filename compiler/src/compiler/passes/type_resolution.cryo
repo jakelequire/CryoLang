@@ -781,6 +781,61 @@ type struct TypeResolutionPasses {
     // Returns the number of methods synthesized.
     // ========================================================================
 
+    /// Rewrite every `ThisType` annotation reachable from `ann` (in-place) to
+    /// `Named(target)`. Used after cloning a trait default method into an
+    /// impl block: the trait body's `&this` parameter and any `-> This`
+    /// return type carry `ThisType` annotations, but the impl-resolution
+    /// path can't always set `ctx.this_type` (generic impl targets fall out
+    /// of `decl_index.lookup_type`). Rewriting at clone time keeps the
+    /// cloned method indistinguishable from a hand-written impl method,
+    /// whose `&this` is parsed as `&Named(target)` directly.
+    static rewrite_this_type_annotation(ann: TypeAnnotation*,
+                                         target: SymbolStr) -> void {
+        if (ann == null) { return; }
+        match (*ann) {
+            TypeAnnotation::ThisType(t) => {
+                const named: NamedAnnotation* = new NamedAnnotation {
+                    name:         target,
+                    span:         t.span,
+                    pre_resolved: TypeRef::invalid(),
+                };
+                const temp: TypeAnnotation* = malloc(sizeof(TypeAnnotation));
+                *temp = TypeAnnotation::Named(named);
+                memcpy(ann, temp, sizeof(TypeAnnotation));
+            }
+            TypeAnnotation::Reference(r) => {
+                TypeResolutionPasses::rewrite_this_type_annotation(r.inner, target);
+            }
+            TypeAnnotation::Pointer(p) => {
+                TypeResolutionPasses::rewrite_this_type_annotation(p.inner, target);
+            }
+            TypeAnnotation::Optional(o) => {
+                TypeResolutionPasses::rewrite_this_type_annotation(o.inner, target);
+            }
+            TypeAnnotation::Array(a) => {
+                TypeResolutionPasses::rewrite_this_type_annotation(a.element, target);
+            }
+            TypeAnnotation::Generic(g) => {
+                TypeResolutionPasses::rewrite_this_type_annotation(g.base, target);
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    TypeResolutionPasses::rewrite_this_type_annotation(g.args[i], target);
+                }
+            }
+            TypeAnnotation::Tuple(tu) => {
+                for (mut i: i64 = 0; i < tu.elements.length; i++) {
+                    TypeResolutionPasses::rewrite_this_type_annotation(tu.elements[i], target);
+                }
+            }
+            TypeAnnotation::Function(f) => {
+                TypeResolutionPasses::rewrite_this_type_annotation(f.return_type, target);
+                for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                    TypeResolutionPasses::rewrite_this_type_annotation(f.parameters[i], target);
+                }
+            }
+            _ => { }
+        }
+    }
+
     /// Walk a trait_annotation to its leaf identifier — the bare trait name.
     /// Mirrors `Specialization::extract_root_name` but is duplicated here
     /// to keep type_resolution.cryo self-contained.
@@ -867,6 +922,23 @@ type struct TypeResolutionPasses {
 
             const cloned: FunctionDeclNode* = cloner.clone_func_decl(tfunc);
             if (cloned == null) { continue; }
+            // Rewrite `&This` / `-> This` annotations on the cloned signature
+            // to the impl's target. The trait body keeps `ThisType` for
+            // generic resolution at trait-sig time; the impl body needs a
+            // concrete name so resolution doesn't depend on `ctx.this_type`
+            // being set (it isn't for generic impl targets whose decl_index
+            // lookup misses).
+            for (mut p: i64 = 0; p < cloned.parameters.length; p++) {
+                const param: VarDeclNode* = cloned.parameters[p];
+                if (param != null && param.type_annotation != null) {
+                    TypeResolutionPasses::rewrite_this_type_annotation(
+                        param.type_annotation, impl_node.target_type);
+                }
+            }
+            if (cloned.return_type_annotation != null) {
+                TypeResolutionPasses::rewrite_this_type_annotation(
+                    cloned.return_type_annotation, impl_node.target_type);
+            }
             mut method: MethodNode* = new MethodNode(cloned, cloned.span);
             method.set_static(cloned.is_static);
             impl_node.add_method(method);

@@ -456,8 +456,16 @@ public:
             mut param: VarDeclNode* = new VarDeclNode(pname, span);
             param.set_mutable(is_mutable);
 
-            // Synthesize type annotation: &TypeName (or &mut TypeName)
-            // so FunctionSignature pass can resolve the self parameter type.
+            // Synthesize type annotation so FunctionSignature pass can resolve
+            // the self parameter type. Inside a struct/class/impl the receiver
+            // is `&CurrentType`; inside a trait declaration it is `&This` —
+            // a placeholder that downstream impl-method resolution rewrites
+            // to each concrete impl target. Without an annotation here, the
+            // last-param-null-annotation heuristic in parse_function_declaration
+            // mistakes the receiver for a variadic `args...` bucket and sets
+            // `is_variadic=true`, which later wipes the receiver alloca in
+            // codegen (fixed_param_count) and yields a null-receiver call.
+            mut inner: TypeAnnotation* = null;
             if (this.current_type_name != "") {
                 const type_name: SymbolStr = this.ctx.intern(this.current_type_name);
                 const named_ann: NamedAnnotation* = new NamedAnnotation {
@@ -465,14 +473,19 @@ public:
                     span: span,
                     pre_resolved: TypeRef::invalid(),
                 };
-                const inner: TypeAnnotation* = new TypeAnnotation::Named(named_ann);
-                const ref_ann: ReferenceAnnotation* = new ReferenceAnnotation {
-                    inner:      inner,
-                    is_mutable: is_mutable,
-                    span:       span,
+                inner = new TypeAnnotation::Named(named_ann);
+            } else {
+                const tt_ann: ThisTypeAnnotation* = new ThisTypeAnnotation {
+                    span: span,
                 };
-                param.set_type_annotation(new TypeAnnotation::Reference(ref_ann));
+                inner = new TypeAnnotation::ThisType(tt_ann);
             }
+            const ref_ann: ReferenceAnnotation* = new ReferenceAnnotation {
+                inner:      inner,
+                is_mutable: is_mutable,
+                span:       span,
+            };
+            param.set_type_annotation(new TypeAnnotation::Reference(ref_ann));
 
             return param;
         }
