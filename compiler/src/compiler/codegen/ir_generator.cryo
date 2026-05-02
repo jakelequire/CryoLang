@@ -1420,7 +1420,27 @@ public:
             return;
         }
         if (op == TokenType::Amp) {
-            const addr: LValue = this.codegen_lvalue(node.operand);
+            // codegen_lvalue runs generate_expression and returns last_value;
+            // it doesn't enforce lvalue-ness.  When the operand is an rvalue
+            // (literal, call result, arithmetic), `last_value` IS the value
+            // itself, not an address.  Returning it here makes `&literal`
+            // lower to `inttoptr (i32 N to ptr)` once arg coercion converts
+            // the i32 to ptr — every callee that dereferences then crashes.
+            // Materialize an rvalue into a stack temp and pass that addr.
+            const v: LValue = this.codegen_lvalue(node.operand);
+            if (!v.is_valid()) {
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
+            mut addr: LValue = v;
+            if (!this.last_is_lvalue) {
+                const ty: LType = this.cg.type_mapper.map_type(node.operand.resolved_type);
+                if (ty.is_valid()) {
+                    addr = this.cg.builder.build_alloca(ty, "addrof.tmp");
+                    this.cg.builder.build_store(v, addr);
+                }
+            }
             this.last_value = addr;
             this.last_is_lvalue = false;
             return;

@@ -36,6 +36,7 @@ import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::Resolver;
 import Compiler::Resolver::QualifiedName;
 import Compiler::Resolver::MangledName;
+import Compiler::DeclIndex;
 import Compiler::Diag;
 
 
@@ -76,6 +77,7 @@ type struct Monomorphizer {
     intern_table:      InternTable*;
     diagnostics:       DiagnosticSink*;
     type_resolver:     TypeResolver*;
+    decl_index:        DeclarationIndex*;
     specializer:       ASTSpecializer;
 
     // Worklist
@@ -139,13 +141,15 @@ type struct Monomorphizer {
 
     static new(arena: TypeArena*, generic_registry: GenericRegistry*,
                intern_table: InternTable*, diagnostics: DiagnosticSink*,
-               type_resolver: TypeResolver*) -> Monomorphizer {
+               type_resolver: TypeResolver*,
+               decl_index: DeclarationIndex*) -> Monomorphizer {
         return Monomorphizer {
             arena:                 arena,
             generic_registry:      generic_registry,
             intern_table:          intern_table,
             diagnostics:           diagnostics,
             type_resolver:         type_resolver,
+            decl_index:            decl_index,
             specializer:           ASTSpecializer::new(arena, intern_table),
             pending:               [],
             pending_cursor:        0,
@@ -1850,6 +1854,13 @@ type struct Monomorphizer {
         if (spec_method == null) { return; }
         impl_node.methods.push(spec_method);
         call.set_resolved_method(spec_method as ASTNode*);
+        // Register the spec in DI under the receiver type's canonical name so
+        // cross-module call sites (and in-module declare_extern fallback) find
+        // the right func_type/mangled-name pair.  Without this, the only DI
+        // entry for `Type::method` is the (now-skipped) generic template's
+        // sema-time registration, which has GenericParam(H) baked into its
+        // param types and produces a `1H`-placeholder mangle.
+        this.register_spec_method_in_di(spec_method, recv_type, impl_node);
 
         // Re-walk the spec'd method body for inferred-arg generic free-fn
         // calls.  Without this, transitive calls like `hash_u64_le(hasher,
@@ -1991,6 +2002,60 @@ type struct Monomorphizer {
             }
         }
         return spec_method;
+    }
+
+    /// Register a freshly created spec method in the DeclarationIndex.
+    /// `register_methods_with_module_aliased` skips generic templates, so
+    /// without this call the only DI entry for `Type::method` would be empty
+    /// (template skipped) — cross-module externs and primitive-impl in-module
+    /// resolution would both fall back to the bare template's `1H`-placeholder
+    /// mangle.  Derives the canonical owner name from `recv_type` so primitive
+    /// impls register under their bare arena name (`i32`) and struct/class
+    /// impls register under their qualified name.
+    register_spec_method_in_di(mut &this, spec_method: MethodNode*,
+                                recv_type: TypeRef,
+                                impl_node: ImplBlockNode*) -> void {
+        if (this.decl_index == null) { return; }
+        if (spec_method == null || impl_node == null) { return; }
+
+        // Match the qualification logic that TypeResolution uses for the
+        // template's sema-time registration.  Without that match the spec
+        // ends up keyed differently in DI than the template — the
+        // declare_extern_function_overload lookup at cross-module call
+        // sites only sees the template's overload entry (which has a
+        // GenericParam-typed func_type that build_function_ltype rejects),
+        // and falls back to the template's stale `1H`-placeholder mangle.
+        mut qualified_target: SymbolStr = impl_node.qualified_target_name;
+        if (!qualified_target.is_valid()) {
+            qualified_target = impl_node.target_type;
+        }
+        // Bare alias: only when the qualified form differs from the
+        // user-written target (mirrors register_methods_with_module_aliased
+        // gating in TypeResolution).
+        mut bare_alias: SymbolStr = SymbolStr::empty();
+        if (!qualified_target.equals(impl_node.target_type)) {
+            bare_alias = impl_node.target_type;
+        }
+
+        // Owning module for cross-module visibility tracking.
+        mut owning_module: SymbolStr = SymbolStr::empty();
+        if (impl_node.source_module != "") {
+            owning_module = this.intern_table.intern(impl_node.source_module);
+        } else {
+            owning_module = this.current_module;
+        }
+
+        mut spec_methods: MethodNode*[] = [];
+        spec_methods.push(spec_method);
+        if (bare_alias.is_valid()) {
+            this.decl_index.register_methods_with_module_aliased(
+                qualified_target, bare_alias, spec_methods, owning_module,
+                this.intern_table, this.arena);
+        } else {
+            this.decl_index.register_methods_with_module(
+                qualified_target, spec_methods, owning_module,
+                this.intern_table, this.arena);
+        }
     }
 
     /// Find an InstantiatedType in the arena whose resolved_type is the
