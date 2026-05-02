@@ -1,0 +1,639 @@
+/// Demangler — Cryo Mangling Scheme v0.2 (docs/cryo-mangling-spec.md §10).
+///
+/// Pure-string state machine: takes a mangled symbol and renders a
+/// human-readable Cryo-flavored signature.  No InternTable / TypeArena
+/// is needed — the mangled form is self-describing.
+///
+/// Falls back to "<input> (unmangled)" for inputs that don't start with
+/// `C$` (per spec §12.9) and "<input> (malformed)" if parsing breaks
+/// partway through, matching the spec's robustness goal.
+
+namespace Compiler::Resolver::Demangler;
+
+
+// ============================================================================
+// Cursor — linear scan position over the mangled string.
+// ============================================================================
+
+type struct Cursor {
+    text: string;
+    pos:  i64;
+    len:  i64;
+    ok:   boolean;
+}
+
+implement Cursor {
+    static new(text: string) -> Cursor {
+        return Cursor {
+            text: text,
+            pos:  0,
+            len:  strlen(text) as i64,
+            ok:   true,
+        };
+    }
+
+    eof(&this) -> boolean { return this.pos >= this.len; }
+
+    peek(&this) -> char {
+        if (this.pos >= this.len) { return 0 as char; }
+        return this.text[this.pos];
+    }
+
+    peek_at(&this, off: i64) -> char {
+        const i: i64 = this.pos + off;
+        if (i < 0 || i >= this.len) { return 0 as char; }
+        return this.text[i];
+    }
+
+    starts_with2(&this, a: char, b: char) -> boolean {
+        if (this.pos + 1 >= this.len) { return false; }
+        return this.text[this.pos] == a && this.text[this.pos + 1] == b;
+    }
+
+    advance(mut &this, n: i64) -> void {
+        this.pos = this.pos + n;
+    }
+
+    expect2(mut &this, a: char, b: char) -> void {
+        if (!this.starts_with2(a, b)) { this.ok = false; return; }
+        this.advance(2);
+    }
+
+    expect_char(mut &this, c: char) -> void {
+        if (this.pos >= this.len || this.text[this.pos] != c) {
+            this.ok = false;
+            return;
+        }
+        this.advance(1);
+    }
+
+    take(mut &this, n: i64) -> string {
+        if (n < 0 || this.pos + n > this.len) {
+            this.ok = false;
+            return "";
+        }
+        const s: string = substr(this.text, this.pos as u64, n as u64);
+        this.pos = this.pos + n;
+        return s;
+    }
+
+    /// Read a non-empty run of decimal digits as an i64.  Returns 0 and
+    /// flips `ok` to false if the next char isn't a digit.
+    read_decimal(mut &this) -> i64 {
+        if (this.pos >= this.len) { this.ok = false; return 0; }
+        const c0: char = this.text[this.pos];
+        if (!(c0 >= '0' && c0 <= '9')) { this.ok = false; return 0; }
+        mut value: i64 = 0;
+        while (this.pos < this.len) {
+            const c: char = this.text[this.pos];
+            if (!(c >= '0' && c <= '9')) { break; }
+            value = value * 10 + ((c as i64) - ('0' as i64));
+            this.advance(1);
+        }
+        return value;
+    }
+}
+
+
+// ============================================================================
+// Operator-code → source symbol (inverse of OperatorKind::code()).
+// ============================================================================
+
+/// Use strcmp instead of `==` because the input is substr-derived and
+/// the bootstrap's string `==` is pointer-compare (see ParsedArgs in
+/// CLI/_module.cryo for the same workaround).
+function op_code_to_symbol(code: string) -> string {
+    if (strcmp(code, "add" ) == 0) { return "+";  }
+    if (strcmp(code, "sub" ) == 0) { return "-";  }
+    if (strcmp(code, "mul" ) == 0) { return "*";  }
+    if (strcmp(code, "div" ) == 0) { return "/";  }
+    if (strcmp(code, "mod" ) == 0) { return "%";  }
+    if (strcmp(code, "band") == 0) { return "&";  }
+    if (strcmp(code, "bor" ) == 0) { return "|";  }
+    if (strcmp(code, "xor" ) == 0) { return "^";  }
+    if (strcmp(code, "shl" ) == 0) { return "<<"; }
+    if (strcmp(code, "shr" ) == 0) { return ">>"; }
+    if (strcmp(code, "eq"  ) == 0) { return "=="; }
+    if (strcmp(code, "ne"  ) == 0) { return "!="; }
+    if (strcmp(code, "lt"  ) == 0) { return "<";  }
+    if (strcmp(code, "le"  ) == 0) { return "<="; }
+    if (strcmp(code, "gt"  ) == 0) { return ">";  }
+    if (strcmp(code, "ge"  ) == 0) { return ">="; }
+    if (strcmp(code, "land") == 0) { return "&&"; }
+    if (strcmp(code, "lor" ) == 0) { return "||"; }
+    if (strcmp(code, "lnot") == 0) { return "!";  }
+    if (strcmp(code, "idx" ) == 0) { return "[]"; }
+    if (strcmp(code, "call") == 0) { return "()"; }
+    if (strcmp(code, "neg" ) == 0) { return "-";  }
+    return code;
+}
+
+
+// ============================================================================
+// Primitive type code → spelling (mirror of encode_int_kind / encode_float_kind
+// and the primitive table in mangled_name.cryo).
+// ============================================================================
+
+function prim_code_to_name(c: char) -> string {
+    if (c == 'a') { return "i8";      }
+    if (c == 's') { return "i16";     }
+    if (c == 'i') { return "int";     }
+    if (c == 'l') { return "i64";     }
+    if (c == 'h') { return "u8";      }
+    if (c == 't') { return "u16";     }
+    if (c == 'j') { return "u32";     }
+    if (c == 'm') { return "u64";     }
+    if (c == 'f') { return "f32";     }
+    if (c == 'd') { return "f64";     }
+    if (c == 'b') { return "boolean"; }
+    if (c == 'c') { return "char";    }
+    if (c == 'S') { return "string";  }
+    if (c == 'v') { return "void";    }
+    if (c == 'u') { return "()";      }
+    return "";
+}
+
+function is_prim_code(c: char) -> boolean {
+    return c == 'a' || c == 's' || c == 'i' || c == 'l'
+        || c == 'h' || c == 't' || c == 'j' || c == 'm'
+        || c == 'f' || c == 'd' || c == 'b' || c == 'c'
+        || c == 'S' || c == 'v' || c == 'u';
+}
+
+
+// ============================================================================
+// Parsed-path bundle — carries segment list + optional `-member`.
+// ============================================================================
+
+type struct ParsedPath {
+    /// Pretty-rendered segments (each may already include `<...>` from generics).
+    segments: string[];
+    /// Pretty-rendered member, or "" if the path has no `-<member>` tail.
+    member:   string;
+    has_member: boolean;
+}
+
+
+// ============================================================================
+// Parsing.  Each parse_* function consumes input via the cursor and returns
+// already-rendered strings — there's no intermediate AST.
+// ============================================================================
+
+/// Identifier: `<decimal length><raw bytes>`.
+function parse_ident(c: Cursor*) -> string {
+    const n: i64 = c.read_decimal();
+    if (!c.ok) { return ""; }
+    return c.take(n);
+}
+
+/// Segment: `<ident>` optionally followed by `$L <type-list> $G`.
+function parse_segment(c: Cursor*) -> string {
+    const name: string = parse_ident(c);
+    if (!c.ok) { return ""; }
+    if (!c.starts_with2('$', 'L')) { return name; }
+    c.advance(2);
+    mut buf: string = name;
+    buf = buf + "<";
+    mut first: boolean = true;
+    while (c.ok) {
+        if (c.starts_with2('$', 'G')) { c.advance(2); break; }
+        if (!first) { c.expect_char('_'); }
+        const t: string = parse_type(c);
+        if (!c.ok) { return ""; }
+        if (!first) { buf = buf + ", "; }
+        buf = buf + t;
+        first = false;
+    }
+    if (!c.ok) { return ""; }
+    buf = buf + ">";
+    return buf;
+}
+
+/// Path: `<seg>{ . <seg> }*[ - <member-seg> ]`.
+function parse_path(c: Cursor*) -> ParsedPath {
+    mut segs: string[] = [];
+    const first_seg: string = parse_segment(c);
+    if (!c.ok) {
+        return ParsedPath { segments: segs, member: "", has_member: false };
+    }
+    segs.push(first_seg);
+    while (c.ok && c.peek() == '.') {
+        c.advance(1);
+        const s: string = parse_segment(c);
+        if (!c.ok) { break; }
+        segs.push(s);
+    }
+    mut member: string = "";
+    mut has_member: boolean = false;
+    if (c.ok && c.peek() == '-') {
+        c.advance(1);
+        member = parse_segment(c);
+        has_member = true;
+    }
+    return ParsedPath {
+        segments:   segs,
+        member:     member,
+        has_member: has_member,
+    };
+}
+
+/// Type: primitive | P/R/A<T> | N$L<path>$G | F$L<params>$G<ret> | K$L<params>$G<ret>.
+function parse_type(c: Cursor*) -> string {
+    if (!c.ok || c.eof()) { c.ok = false; return ""; }
+    const head: char = c.peek();
+
+    if (is_prim_code(head)) {
+        c.advance(1);
+        return prim_code_to_name(head);
+    }
+
+    if (head == 'P') {
+        c.advance(1);
+        const inner: string = parse_type(c);
+        if (!c.ok) { return ""; }
+        return inner + "*";
+    }
+    if (head == 'R') {
+        c.advance(1);
+        const inner: string = parse_type(c);
+        if (!c.ok) { return ""; }
+        return "&" + inner;
+    }
+    if (head == 'A') {
+        c.advance(1);
+        const inner: string = parse_type(c);
+        if (!c.ok) { return ""; }
+        return inner + "[]";
+    }
+    if (head == 'N') {
+        c.advance(1);
+        c.expect2('$', 'L');
+        if (!c.ok) { return ""; }
+        const inner_path: ParsedPath = parse_path(c);
+        c.expect2('$', 'G');
+        if (!c.ok) { return ""; }
+        return render_path_inline(inner_path);
+    }
+    if (head == 'F') {
+        c.advance(1);
+        c.expect2('$', 'L');
+        if (!c.ok) { return ""; }
+        const params: string = parse_param_list(c);
+        c.expect2('$', 'G');
+        if (!c.ok) { return ""; }
+        const ret: string = parse_type(c);
+        if (!c.ok) { return ""; }
+        return "fn(" + params + ") -> " + ret;
+    }
+    if (head == 'K') {
+        c.advance(1);
+        c.expect2('$', 'L');
+        if (!c.ok) { return ""; }
+        const params: string = parse_param_list(c);
+        c.expect2('$', 'G');
+        if (!c.ok) { return ""; }
+        const ret: string = parse_type(c);
+        if (!c.ok) { return ""; }
+        return "|" + params + "| -> " + ret;
+    }
+
+    c.ok = false;
+    return "";
+}
+
+/// Parameter list: literal `v` for empty, otherwise `Param { _ Param }* [$V]`.
+/// Param ::= $s | $m | Type.  Receiver tokens are only valid in the first
+/// position; we render them verbatim either way and let the caller decide.
+function parse_param_list(c: Cursor*) -> string {
+    if (!c.ok) { return ""; }
+
+    // Empty list: literal 'v' that isn't the start of a Type tail (Type 'v'
+    // means void, but as a *param* a bare leading 'v' with nothing else is
+    // the empty marker per spec §12.1).
+    if (c.peek() == 'v') {
+        const next: char = c.peek_at(1);
+        // 'v' followed by a separator / end-of-list closer is the empty marker.
+        if (next == 0 as char || next == '$' || next == ')') {
+            c.advance(1);
+            return "";
+        }
+    }
+
+    mut buf: string = "";
+    mut first: boolean = true;
+    while (c.ok) {
+        if (!first) {
+            if (c.peek() != '_') { break; }
+            c.advance(1);
+            buf = buf + ", ";
+        }
+        // Receiver markers
+        if (c.starts_with2('$', 's')) {
+            c.advance(2);
+            buf = buf + "&this";
+            first = false;
+            continue;
+        }
+        if (c.starts_with2('$', 'm')) {
+            c.advance(2);
+            buf = buf + "mut &this";
+            first = false;
+            continue;
+        }
+        // Stop conditions: hit a structural marker that isn't a type or `_`.
+        const a: char = c.peek();
+        if (a == '$') { break; }
+        if (a == 0 as char) { break; }
+
+        const t: string = parse_type(c);
+        if (!c.ok) { return ""; }
+        buf = buf + t;
+        first = false;
+    }
+
+    // Variadic marker
+    if (c.ok && c.starts_with2('$', 'V')) {
+        c.advance(2);
+        if (strlen(buf) > 0) { buf = buf + ", ..."; }
+        else { buf = "..."; }
+    }
+    return buf;
+}
+
+
+// ============================================================================
+// Path rendering helpers.
+// ============================================================================
+
+/// Path used inline as a type — segments joined by `::`, member (if any)
+/// appended via `::` (we have no receiver context here).
+function render_path_inline(p: ParsedPath) -> string {
+    mut buf: string = "";
+    for (mut i: i64 = 0; i < p.segments.length; i++) {
+        if (i > 0) { buf = buf + "::"; }
+        buf = buf + p.segments[i];
+    }
+    if (p.has_member) {
+        buf = buf + "::";
+        buf = buf + p.member;
+    }
+    return buf;
+}
+
+/// Path as the head of a function-like signature.  `is_method` flips the
+/// member separator: `.` for instance methods, `::` for static methods and
+/// free functions.
+function render_path_head(p: ParsedPath, is_method: boolean) -> string {
+    mut buf: string = "";
+    for (mut i: i64 = 0; i < p.segments.length; i++) {
+        if (i > 0) { buf = buf + "::"; }
+        buf = buf + p.segments[i];
+    }
+    if (p.has_member) {
+        buf = buf + (if (is_method) { "." } else { "::" });
+        buf = buf + p.member;
+    }
+    return buf;
+}
+
+
+// ============================================================================
+// Top-level demangler.
+// ============================================================================
+
+/// Returns the pretty form of `input`.  For non-`C$`-prefixed inputs,
+/// returns `"<input> (unmangled)"`.  For malformed v0.2 inputs, returns
+/// `"<input> (malformed)"`.
+function demangle(input: string) -> string {
+    const len: i64 = strlen(input) as i64;
+    if (len < 2 || input[0] != 'C' || input[1] != '$') {
+        return input + " (unmangled)";
+    }
+
+    mut cur: Cursor = Cursor::new(input);
+    cur.advance(2);
+
+    // Optional kind tag.  The mangler emits `C$<code>$<path>` (one `$`
+    // shared between the `C$` prefix and the kind-tag opener), so after
+    // consuming `C$` we look directly at the two code chars and check for
+    // a closing `$` after them.  Kept as a (char, char) pair rather than
+    // a string because dynamic string equality is unreliable in the
+    // bootstrap (see ParsedArgs's strcmp workaround in CLI/_module.cryo).
+    mut kind_a: char = 0 as char;
+    mut kind_b: char = 0 as char;
+    {
+        const a: char = cur.peek_at(0);
+        const b: char = cur.peek_at(1);
+        const close: char = cur.peek_at(2);
+        if (close == '$' && is_kind_tag(a, b)) {
+            kind_a = a;
+            kind_b = b;
+            cur.advance(2);            // consume code
+            cur.expect_char('$');      // consume trailing `$`
+        }
+    }
+
+    // Trait impls have a different head: `<trait-segment>$f<owner-path>`.
+    mut trait_seg: string = "";
+    mut path: ParsedPath = ParsedPath { segments: [], member: "", has_member: false };
+
+    if (kind_a == 't' && kind_b == 'r') {
+        trait_seg = parse_segment(&cur);
+        if (cur.ok) { cur.expect2('$', 'f'); }
+        if (cur.ok) { path = parse_path(&cur); }
+    } else {
+        path = parse_path(&cur);
+    }
+
+    if (!cur.ok) { return input + " (malformed)"; }
+
+    // Optional signature: `$F <params> $R <ret>`.
+    mut has_sig: boolean = false;
+    mut params_str: string = "";
+    mut return_str: string = "";
+    mut leads_with_receiver: boolean = false;
+
+    if (cur.starts_with2('$', 'F')) {
+        cur.advance(2);
+        has_sig = true;
+        // Detect receiver before dispatching so the path-head separator can
+        // adapt: methods use `.`, statics use `::`.
+        if (cur.starts_with2('$', 's') || cur.starts_with2('$', 'm')) {
+            leads_with_receiver = true;
+        }
+        params_str = parse_param_list(&cur);
+        if (!cur.ok) { return input + " (malformed)"; }
+        cur.expect2('$', 'R');
+        if (!cur.ok) { return input + " (malformed)"; }
+        return_str = parse_type(&cur);
+        if (!cur.ok) { return input + " (malformed)"; }
+    }
+
+    // Optional overload index: `$O<digits>`.
+    mut overload: i64 = -1;
+    if (cur.starts_with2('$', 'O')) {
+        cur.advance(2);
+        overload = cur.read_decimal();
+        if (!cur.ok) { return input + " (malformed)"; }
+    }
+
+    // Optional LLVM uniquification suffix: `.<digits>` (spec §12.8).
+    mut llvm_suffix: i64 = -1;
+    if (cur.peek() == '.') {
+        // Only consume if the rest is purely digits.
+        mut k: i64 = cur.pos + 1;
+        mut all_digits: boolean = (k < cur.len);
+        while (k < cur.len) {
+            const c2: char = cur.text[k];
+            if (!(c2 >= '0' && c2 <= '9')) { all_digits = false; break; }
+            k = k + 1;
+        }
+        if (all_digits) {
+            cur.advance(1);
+            llvm_suffix = cur.read_decimal();
+        }
+    }
+
+    if (!cur.eof()) { return input + " (malformed)"; }
+
+    // -------------------------------------------------------------------
+    // Render the demangled symbol.  Branching on kind keeps the formatting
+    // concerns (data symbols vs. function-like) cleanly separate.
+    // -------------------------------------------------------------------
+
+    const path_inline: string = render_path_inline(path);
+
+    if (kind_a == 'v' && kind_b == 't') { return "<vtable for " + path_inline + ">"; }
+    if (kind_a == 't' && kind_b == 'i') { return "<typeinfo for " + path_inline + ">"; }
+    if (kind_a == 'm' && kind_b == 'i') { return "<module init for " + path_inline + ">"; }
+
+    if (kind_a == 'c' && kind_b == 'l') {
+        mut out: string = "<closure";
+        if (overload >= 0) {
+            out = out + " #";
+            out = out + i64_to_decimal(overload);
+        }
+        out = out + " inside " + path_inline + ">";
+        if (llvm_suffix >= 0) {
+            out = out + " [.";
+            out = out + i64_to_decimal(llvm_suffix);
+            out = out + "]";
+        }
+        return out;
+    }
+
+    // Function-like symbols from here on need a signature.
+    if (!has_sig) {
+        // Bare data symbol — just `C$<path>` with no kind tag.
+        mut bare: string = path_inline;
+        if (overload >= 0) {
+            bare = bare + " [overload ";
+            bare = bare + i64_to_decimal(overload);
+            bare = bare + "]";
+        }
+        if (llvm_suffix >= 0) {
+            bare = bare + " [.";
+            bare = bare + i64_to_decimal(llvm_suffix);
+            bare = bare + "]";
+        }
+        return bare;
+    }
+
+    // For ct/dt/op the member segment carries either the type leaf (ct/dt)
+    // or the operator code (op).  Render those in source-style form.
+    if (kind_a == 'c' && kind_b == 't') {
+        // `Owner::Owner(args) -> Owner` — drop the `-Owner` tail and add it
+        // back as the constructor name with `::`.
+        mut head: string = render_path_no_member(path);
+        if (path.has_member) {
+            head = head + "::";
+            head = head + path.member;
+        }
+        return finalize(head, params_str, return_str, overload, llvm_suffix);
+    }
+    if (kind_a == 'd' && kind_b == 't') {
+        mut head: string = "~" + render_path_no_member(path);
+        if (path.has_member) {
+            head = head + "::";
+            head = head + path.member;
+        }
+        return finalize(head, params_str, return_str, overload, llvm_suffix);
+    }
+    if (kind_a == 'o' && kind_b == 'p') {
+        mut head: string = render_path_no_member(path);
+        head = head + "::operator";
+        if (path.has_member) {
+            head = head + op_code_to_symbol(path.member);
+        }
+        return finalize(head, params_str, return_str, overload, llvm_suffix);
+    }
+    if (kind_a == 't' && kind_b == 'r') {
+        // Build piecewise: the bootstrap C++ compiler can't infer types for
+        // a chained `+` that mixes literals with a function-call result.
+        const owner: string = render_path_no_member(path);
+        mut head: string = "<";
+        head = head + trait_seg;
+        head = head + " for ";
+        head = head + owner;
+        head = head + ">";
+        if (path.has_member) {
+            head = head + (if (leads_with_receiver) { "." } else { "::" });
+            head = head + path.member;
+        }
+        return finalize(head, params_str, return_str, overload, llvm_suffix);
+    }
+
+    // Plain function or method (no kind tag).
+    const head2: string = render_path_head(path, leads_with_receiver);
+    return finalize(head2, params_str, return_str, overload, llvm_suffix);
+}
+
+/// Render the path's namespace + type chain WITHOUT the `-<member>` tail.
+function render_path_no_member(p: ParsedPath) -> string {
+    mut buf: string = "";
+    for (mut i: i64 = 0; i < p.segments.length; i++) {
+        if (i > 0) { buf = buf + "::"; }
+        buf = buf + p.segments[i];
+    }
+    return buf;
+}
+
+/// Glue the rendered head together with the parameter list, return type,
+/// and any trailing overload / LLVM-suffix annotations.
+function finalize(head: string, params: string, ret: string,
+                  overload: i64, llvm_suffix: i64) -> string {
+    mut out: string = head;
+    out = out + "(" + params + ")";
+    if (strlen(ret) > 0) {
+        out = out + " -> " + ret;
+    }
+    if (overload >= 0) {
+        out = out + " [overload ";
+        out = out + i64_to_decimal(overload);
+        out = out + "]";
+    }
+    if (llvm_suffix >= 0) {
+        out = out + " [.";
+        out = out + i64_to_decimal(llvm_suffix);
+        out = out + "]";
+    }
+    return out;
+}
+
+function is_kind_tag(a: char, b: char) -> boolean {
+    if (a == 'v' && b == 't') { return true; }
+    if (a == 't' && b == 'i') { return true; }
+    if (a == 'c' && b == 't') { return true; }
+    if (a == 'd' && b == 't') { return true; }
+    if (a == 'o' && b == 'p') { return true; }
+    if (a == 'm' && b == 'i') { return true; }
+    if (a == 'c' && b == 'l') { return true; }
+    if (a == 't' && b == 'r') { return true; }
+    return false;
+}
+
+function i64_to_decimal(value: i64) -> string {
+    const buf: i8* = malloc(24) as i8*;
+    snprintf(buf, 24, "%lld", value);
+    return buf as string;
+}
