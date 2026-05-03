@@ -98,6 +98,7 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(
 REPO_ROOT="$(dirname "$SCRIPT_PATH")"
 SRC_BIN="${REPO_ROOT}/bin/cryo"
 SRC_STDLIB="${REPO_ROOT}/stdlib"
+SRC_STDLIB_ARCHIVE="${SRC_STDLIB}/.bin/libcryo.a"
 
 [ -f "${REPO_ROOT}/Makefile" ] || die "could not find Makefile at ${REPO_ROOT} — is install.sh next to it?"
 
@@ -147,11 +148,18 @@ if [ "$ACTION" = "install" ]; then
     [ -x "$SRC_BIN" ] || die "$SRC_BIN is missing or not executable. Run 'make pin-cryo' to refresh the pinned binary, or check out a revision that has bin/cryo committed."
     [ -f "$SRC_STDLIB/lib.cryo" ] || die "$SRC_STDLIB/lib.cryo not found — is the stdlib in place?"
 
-    echo "This installer will create symlinks:"
-    echo "  ${DEST_BIN}"
-    echo "    → ${SRC_BIN}"
-    echo "  ${DEST_STDLIB}"
-    echo "    → ${SRC_STDLIB}"
+    NEED_STDLIB_BUILD=0
+    [ -f "$SRC_STDLIB_ARCHIVE" ] || NEED_STDLIB_BUILD=1
+
+    echo "This installer will:"
+    if [ $NEED_STDLIB_BUILD -eq 1 ]; then
+        echo "  • build the stdlib archive (${SRC_STDLIB_ARCHIVE#$REPO_ROOT/}) — ~1 second"
+    fi
+    echo "  • create symlinks:"
+    echo "      ${DEST_BIN}"
+    echo "        → ${SRC_BIN}"
+    echo "      ${DEST_STDLIB}"
+    echo "        → ${SRC_STDLIB}"
     echo
     echo "Repo root: ${REPO_ROOT}"
     echo "Prefix:    ${PREFIX}"
@@ -199,6 +207,17 @@ esac
 # Install / uninstall
 # ----------------------------------------------------------------------------
 do_install() {
+    # Build the stdlib archive in the repo if it's missing.  The linker
+    # reads <stdlib_root>/.bin/libcryo.a at link time; on a fresh clone
+    # the archive doesn't exist yet, so we build it here once.  Runs in
+    # the repo (no sudo) — only the symlink steps need elevated perms.
+    if [ ! -f "$SRC_STDLIB_ARCHIVE" ]; then
+        log_info "stdlib archive not found at ${SRC_STDLIB_ARCHIVE#$REPO_ROOT/} — building via 'make stdlib'..."
+        ( cd "$REPO_ROOT" && make stdlib ) >/dev/null || die "'make stdlib' failed; re-run with the make output visible to debug."
+        [ -f "$SRC_STDLIB_ARCHIVE" ] || die "make stdlib finished but ${SRC_STDLIB_ARCHIVE} is missing — something is wrong."
+        log_ok "built: ${SRC_STDLIB_ARCHIVE#$REPO_ROOT/}"
+    fi
+
     run mkdir -p "$(dirname "$DEST_BIN")" "$DEST_SHARE"
 
     # Replace any existing symlink/file at the destination with a fresh symlink.
