@@ -312,8 +312,33 @@ type struct MangledName {
         return MangledName { value: table.intern(buf_cl) };
     }
 
-    /// Global variable / constant: `C$<path>` (data symbol — no signature).
-    static for_global(table: InternTable*, qname: QualifiedName) -> MangledName {
+    /// Global variable / constant: `C$<namespace_path>.<name>` (data symbol —
+    /// no signature).  When `namespace_sym` is empty the result is the
+    /// historical bare `C$<name>` form (used for root-namespace globals,
+    /// e.g. things imported via raw extern blocks).  Both the defining
+    /// module and consumer modules must call this with the SAME namespace
+    /// for the symbol to link — `resolve_global` looks up the defining
+    /// namespace via `DeclarationIndex::get_global_namespace`.
+    ///
+    /// The full path is wrapped in a single-segment QualifiedName and fed
+    /// to `encode_path`, whose depth==1 branch routes through
+    /// `split_double_colon` (libc `substr`, NUL-safe).  Going through
+    /// `QualifiedName::parse` here instead produced 0-length segments
+    /// because `text.substring` doesn't always re-NUL-terminate — keeping
+    /// to the depth==1 path avoids that pitfall.
+    static for_global(table: InternTable*, namespace_sym: SymbolStr,
+                      name: SymbolStr) -> MangledName {
+        mut full: string = "";
+        if (!namespace_sym.is_empty()) {
+            // Built piecewise so bootstrap-C++ never sees chained
+            // `string + string + string` concat in one expression.
+            full = table.resolve(namespace_sym);
+            full = full + "::";
+            full = full + table.resolve(name);
+        } else {
+            full = table.resolve(name);
+        }
+        const qname: QualifiedName = QualifiedName::single(table, full);
         const path: string = encode_path(table, qname, SymbolStr::empty(), false);
         return MangledName { value: table.intern("C$" + path) };
     }
