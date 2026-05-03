@@ -1,42 +1,333 @@
-///! HashMap - Hash Map Collection
+///! HashMap<K, V, A> — key-value map with amortized O(1) operations.
 ///!
-///! A hash map implemented with quadratic probing and SIMD lookup.
-///! Provides O(1) average-case operations.
+///! Separate chaining over a bucket array: each bucket holds a linked
+///! list of entries. Keys must implement `Hash + Eq`. The default
+///! hasher is FNV-1a (`core::hash::DefaultHasher`) — appropriate for
+///! trusted inputs; supply a custom hasher when collision resistance
+///! is required.
+///!
+///! Chaining was chosen over open addressing because it sidesteps the
+///! problem of storing uninitialised key/value slots. The cost is one
+///! heap allocation per entry; a flat Robin-Hood table is a potential
+///! future optimisation.
 
 namespace std::collections::hashmap;
 
 import core::intrinsics;
 import core::option;
-import core::mem;
-import alloc::global;
+import core::result;
+import core::cmp;
+import core::hash;
+import alloc::layout;
+import alloc::allocator;
+
+const INITIAL_BUCKETS: u64 = 8;
 
 // ============================================================================
-// Hash Configuration
+// Entry — one node in a bucket's chain
 // ============================================================================
 
-/// Default initial capacity.
-const DEFAULT_CAPACITY: u64 = 16;
-
-/// Maximum load factor before resizing (75%).
-const MAX_LOAD_FACTOR_NUM: u64 = 3;
-const MAX_LOAD_FACTOR_DEN: u64 = 4;
-
-/// Minimum capacity.
-const MIN_CAPACITY: u64 = 8;
-
-/// Bucket states.
-const BUCKET_EMPTY: u8 = 0;
-const BUCKET_OCCUPIED: u8 = 1;
-const BUCKET_DELETED: u8 = 2;
+type struct Entry<K, V> {
+    hash: u64;
+    key: K;
+    value: V;
+    next: Entry<K, V>*;
+}
 
 // ============================================================================
-// Hash Functions
+// HashMap
 // ============================================================================
 
-/// FNV-1a hash for strings.
+type struct HashMap<K, V, A = GlobalAlloc> {
+    buckets: Entry<K, V>**;
+    bucket_count: u64;
+    length: u64;
+    alloc: A;
+
+    static new() -> HashMap<K, V, GlobalAlloc> {
+        return HashMap<K, V, GlobalAlloc> {
+            buckets: null,
+            bucket_count: 0,
+            length: 0,
+            alloc: GlobalAlloc::new()
+        };
+    }
+
+    static new_in(alloc: A) -> HashMap<K, V, A> {
+        return HashMap<K, V, A> {
+            buckets: null,
+            bucket_count: 0,
+            length: 0,
+            alloc: alloc
+        };
+    }
+
+    /// Preallocate for at least `capacity` entries at the default load
+    /// factor. The actual bucket count is the smallest power of two
+    /// that keeps the load factor below 1.0.
+    static with_capacity(capacity: u64) -> HashMap<K, V, GlobalAlloc> {
+        mut map: HashMap<K, V, GlobalAlloc> = HashMap::new();
+        if (capacity > 0) {
+            const count: u64 = next_pow2(capacity);
+            match (map.resize_buckets(count)) {
+                Result::Ok(_) => { }
+                Result::Err(_) => {
+                    intrinsics::panic("HashMap::with_capacity: allocation failed", FILE, LINE);
+                }
+            }
+        }
+        return map;
+    }
+
+    length(&this) -> u64 {
+        return this.length;
+    }
+
+    is_empty(&this) -> boolean {
+        return this.length == 0;
+    }
+
+    /// Number of buckets currently allocated. Not the same as the
+    /// number of entries the map can hold — chaining means every
+    /// bucket can hold many entries.
+    bucket_count(&this) -> u64 {
+        return this.bucket_count;
+    }
+
+    /// Return the head of the entry chain for bucket `index`. Returns
+    /// null if the bucket is empty or `index` is out of range. The
+    /// returned pointer is valid until the next mutation of the map.
+    get_bucket(&this, index: u64) -> Entry<K, V>* {
+        if (this.buckets == null || index >= this.bucket_count) { return null; }
+        return this.buckets[index];
+    }
+
+    // ========================================================================
+    // Lookup
+    // ========================================================================
+
+    contains_key(&this, key: &K) -> boolean 
+    where K: Hash + Eq {
+        return this.get(key).is_some();
+    }
+
+    get(&this, key: &K) -> Option<V> 
+    where K: Hash + Eq {
+        if (this.bucket_count == 0) {
+            return Option::None;
+        }
+        const h: u64 = hash_key(key);
+        const index: u64 = h & (this.bucket_count - 1);
+        mut node: Entry<K, V>* = this.buckets[index];
+        loop {
+            if (node == null) { break; }
+            if (node.hash == h && node.key.equals(key)) {
+                return Option::Some(node.value);
+            }
+            node = node.next;
+        }
+        return Option::None;
+    }
+
+    // ========================================================================
+    // Mutation
+    // ========================================================================
+
+    /// Insert `key -> value`. Returns the previous value if the key was
+    /// present, otherwise `None`. Panics on allocation failure; use
+    /// `try_insert` to recover from OOM.
+    insert(mut &this, key: K, value: V) -> Option<V> 
+    where K: Hash + Eq {
+        match (this.try_insert(key, value)) {
+            Result::Ok(previous) => { return previous; }
+            Result::Err(_) => {
+                intrinsics::panic("HashMap::insert: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    try_insert(mut &this, key: K, value: V) -> Result<Option<V>, AllocError>
+    where K: Hash + Eq {
+        if (this.bucket_count == 0) {
+            match (this.resize_buckets(INITIAL_BUCKETS)) {
+                Result::Ok(_) => { }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        } else if (this.length >= this.bucket_count) {
+            match (this.resize_buckets(this.bucket_count * 2)) {
+                Result::Ok(_) => { }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+
+        const h: u64 = hash_key(&key);
+        const index: u64 = h & (this.bucket_count - 1);
+        mut node: Entry<K, V>* = this.buckets[index];
+        loop {
+            if (node == null) { break; }
+            if (node.hash == h && node.key.equals(&key)) {
+                const previous: V = node.value;
+                node.value = value;
+                return Result::Ok(Option::Some(previous));
+            }
+            node = node.next;
+        }
+
+        // Not present — prepend a new node.
+        match (alloc_entry(this, h, key, value)) {
+            Result::Ok(fresh) => {
+                fresh.next = this.buckets[index];
+                this.buckets[index] = fresh;
+                this.length = this.length + 1;
+                return Result::Ok(Option::None);
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    /// Remove the entry with matching key. Returns the removed value,
+    /// or `None` if the key wasn't present.
+    remove(mut &this, key: &K) -> Option<V> 
+    where K: Hash + Eq {
+        if (this.bucket_count == 0) {
+            return Option::None;
+        }
+        const h: u64 = hash_key(key);
+        const index: u64 = h & (this.bucket_count - 1);
+        mut previous: Entry<K, V>* = null;
+        mut node: Entry<K, V>* = this.buckets[index];
+        loop {
+            if (node == null) { break; }
+            if (node.hash == h && node.key.equals(key)) {
+                if (previous == null) {
+                    this.buckets[index] = node.next;
+                } else {
+                    previous.next = node.next;
+                }
+                const removed: V = node.value;
+                free_entry(this, node);
+                this.length = this.length - 1;
+                return Option::Some(removed);
+            }
+            previous = node;
+            node = node.next;
+        }
+        return Option::None;
+    }
+
+    /// Drop every entry. Retains the bucket array so subsequent inserts
+    /// don't re-pay the allocation.
+    clear(mut &this) -> void {
+        if (this.buckets == null) { return; }
+        mut i: u64 = 0;
+        while (i < this.bucket_count) {
+            mut node: Entry<K, V>* = this.buckets[i];
+            loop {
+                if (node == null) { break; }
+                const next: Entry<K, V>* = node.next;
+                free_entry(this, node);
+                node = next;
+            }
+            this.buckets[i] = null;
+            i++;
+        }
+        this.length = 0;
+    }
+
+    // ========================================================================
+    // Teardown
+    // ========================================================================
+
+    /// Release every entry and the bucket array. Ownership obligation:
+    /// every HashMap must have `drop` called before going out of scope.
+    /// If K or V own resources, drain entries manually before calling this.
+    drop(mut &this) -> void {
+        this.clear();
+        if (this.buckets != null) {
+            this.alloc.deallocate(
+                NonNull::new(this.buckets as u8*),
+                Layout::array<Entry<K, V>*>(this.bucket_count)
+            );
+            this.buckets = null;
+        }
+        this.bucket_count = 0;
+    }
+
+    // ========================================================================
+    // Internal: rehash / grow
+    // ========================================================================
+
+    resize_buckets(mut &this, new_count: u64) -> Result<(), AllocError> {
+        const new_layout: Layout = Layout::array<Entry<K, V>*>(new_count);
+        match (this.alloc.allocate(new_layout)) {
+            Result::Ok(raw) => {
+                const new_buckets: Entry<K, V>** = raw.as_ptr() as Entry<K, V>**;
+                // Zero the bucket array — null pointers are "empty bucket".
+                intrinsics::memset(
+                    new_buckets as void*,
+                    0,
+                    new_count * sizeof(Entry<K, V>*)
+                );
+
+                // Move every existing entry into the new table.
+                mut i: u64 = 0;
+                while (i < this.bucket_count) {
+                    mut node: Entry<K, V>* = this.buckets[i];
+                    loop {
+                        if (node == null) { break; }
+                        const next: Entry<K, V>* = node.next;
+                        const index: u64 = node.hash & (new_count - 1);
+                        node.next = new_buckets[index];
+                        new_buckets[index] = node;
+                        node = next;
+                    }
+                    i++;
+                }
+
+                if (this.buckets != null) {
+                    this.alloc.deallocate(
+                        NonNull::new(this.buckets as u8*),
+                        Layout::array<Entry<K, V>*>(this.bucket_count)
+                    );
+                }
+                this.buckets = new_buckets;
+                this.bucket_count = new_count;
+                return Result::Ok(());
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+}
+
+// ============================================================================
+// Hashing helper
+// ============================================================================
+
+function hash_key<K>(key: &K) -> u64
+where K: Hash {
+    mut hasher: DefaultHasher = DefaultHasher::new();
+    key.hash(&hasher);
+    return hasher.finish();
+}
+
+// ============================================================================
+// Bridge shims — keep callers that pre-compute a u64 hash compiling.
+//
+// The new HashMap API takes a `&K` and runs the `Hash` trait internally,
+// so these helpers are not used by HashMap itself.  They exist for the
+// stdlib-next bridge: legacy compiler call sites of the form
+//
+//     const h: u64 = hash_int(name.id as u64);
+//     map.insert(name.id, value);
+//
+// continue to compile (with `h` unused) instead of forcing a sweep of
+// every dead binding in the same commit as the API migration.
+// ============================================================================
+
+/// FNV-1a hash for NUL-terminated `string` (raw C-string view).
 function hash_str(s: string) -> u64 {
     const FNV_OFFSET: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
+    const FNV_PRIME:  u64 = 1099511628211;
 
     mut hash: u64 = FNV_OFFSET;
     mut i: u64 = 0;
@@ -48,9 +339,8 @@ function hash_str(s: string) -> u64 {
     return hash;
 }
 
-/// Hash for integers.
+/// Murmur3 finalizer for u64 keys.
 function hash_int(value: u64) -> u64 {
-    // Murmur3 finalizer
     mut x: u64 = value;
     x = x ^ (x >> 33);
     x = x * 0xff51afd7ed558ccd;
@@ -60,520 +350,40 @@ function hash_int(value: u64) -> u64 {
     return x;
 }
 
-/// Combines two hashes.
-function hash_combine(h1: u64, h2: u64) -> u64 {
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+/// Round `n` up to the next power of two. Assumes `n > 0`.
+function next_pow2(n: u64) -> u64 {
+    mut p: u64 = 1;
+    while (p < n) {
+        p = p * 2;
+    }
+    return p;
 }
 
 // ============================================================================
-// HashMap Entry
+// Entry allocation
 // ============================================================================
 
-/// An entry in the hash map.
-type struct HashMapEntry<K, V> {
-    key: K;
-    value: V;
-    hash: u64;
-    state: u8;
-}
-
-// ============================================================================
-// HashMap
-// ============================================================================
-
-/// A hash map with key-value pairs.
-type struct HashMap<K, V> {
-    /// Array of entries.
-    entries: HashMapEntry<K, V>*;
-    /// Number of entries.
-    len: u64;
-    /// Capacity (always a power of 2).
-    cap: u64;
-    /// Number of deleted entries.
-    deleted: u64;
-
-    /// Creates a new empty HashMap.
-    static new() -> HashMap<K, V> {
-        return HashMap {
-            entries: null,
-            len: 0,
-            cap: 0,
-            deleted: 0
-        };
-    }
-
-    /// Creates a HashMap with the specified capacity.
-    static with_capacity(capacity: u64) -> HashMap<K, V> {
-        mut actual_cap: u64 = MIN_CAPACITY;
-        while (actual_cap < capacity) {
-            actual_cap = actual_cap * 2;
+function alloc_entry<K, V, A>(map: mut &HashMap<K, V, A>,
+                              h: u64,
+                              key: K,
+                              value: V) -> Result<Entry<K, V>*, AllocError>
+where A: Allocator {
+    const block: Layout = Layout::of<Entry<K, V>>();
+    match (map.alloc.allocate(block)) {
+        Result::Ok(raw) => {
+            const entry: Entry<K, V>* = raw.as_ptr() as Entry<K, V>*;
+            entry.hash = h;
+            entry.key = key;
+            entry.value = value;
+            entry.next = null;
+            return Result::Ok(entry);
         }
-
-        const entries: HashMapEntry<K, V>* = calloc(actual_cap, sizeof(HashMapEntry<K, V>));
-        if (entries == null) {
-            panic("allocation failed", FILE, LINE);
-        }
-
-        return HashMap {
-            entries: entries,
-            len: 0,
-            cap: actual_cap,
-            deleted: 0
-        };
-    }
-
-    // ========================================================================
-    // Capacity
-    // ========================================================================
-
-    /// Returns the number of entries.
-    length(&this) -> u64 {
-        return this.len;
-    }
-
-    /// Returns the capacity.
-    capacity(&this) -> u64 {
-        return this.cap;
-    }
-
-    /// Returns true if the map is empty.
-    is_empty(&this) -> boolean {
-        return this.len == 0;
-    }
-
-    // ========================================================================
-    // Lookup
-    // ========================================================================
-
-    /// Gets a value by key.
-    get(&this, key: K, key_hash: u64) -> Option<V> {
-        if (this.cap == 0) {
-            return Option::None;
-        }
-
-        const index: Option<u64> = this.find_entry(key, key_hash);
-        match (index) {
-            Option::None => { return Option::None; }
-            Option::Some(i) => {
-                return Option::Some(this.entries[i].value);
-            }
-        }
-        return Option::None;
-    }
-
-    /// Gets a reference to a value by key.
-    get_ref(&this, key: K, key_hash: u64) -> V* {
-        if (this.cap == 0) {
-            return null;
-        }
-
-        const index: Option<u64> = this.find_entry(key, key_hash);
-        match (index) {
-            Option::None => { return null; }
-            Option::Some(i) => {
-                return &this.entries[i].value;
-            }
-        }
-        return null;
-    }
-
-    /// Returns true if the map contains the key.
-    contains_key(&this, key: K, key_hash: u64) -> boolean {
-        return this.find_entry(key, key_hash).is_some();
-    }
-
-    // ========================================================================
-    // Modification
-    // ========================================================================
-
-    /// Inserts a key-value pair.
-    /// Returns the old value if the key existed.
-    insert(mut &this, key: K, value: V, key_hash: u64) -> Option<V> {
-        this.maybe_grow();
-
-        const mask: u64 = this.cap - 1;
-        mut index: u64 = key_hash & mask;
-        mut first_deleted: i64 = -1;
-
-        mut i: u64 = 0;
-        while (i < this.cap) {
-            const entry: HashMapEntry<K, V>* = &this.entries[index];
-
-            if (entry.state == BUCKET_EMPTY) {
-                // Insert here
-                mut insert_index: u64 = index;
-                if (first_deleted >= 0) {
-                    insert_index = first_deleted;
-                    this.deleted = this.deleted - 1;
-                }
-
-                this.entries[insert_index].key = key;
-                this.entries[insert_index].value = value;
-                this.entries[insert_index].hash = key_hash;
-                this.entries[insert_index].state = BUCKET_OCCUPIED;
-                this.len = this.len + 1;
-                return Option::None;
-            }
-
-            if (entry.state == BUCKET_DELETED) {
-                if (first_deleted < 0) {
-                    first_deleted = index;
-                }
-            } else if (entry.hash == key_hash && entry.key == key) {
-                // Key exists, replace value
-                const old_value: V = entry.value;
-                this.entries[index].value = value;
-                return Option::Some(old_value);
-            }
-
-            // Quadratic probing
-            i++;
-            index = (key_hash + (i * (i + 1)) / 2) & mask;
-        }
-
-        // Should not reach here if load factor is maintained
-        panic("hash map full", FILE, LINE);
-        return Option::None;
-    }
-
-    /// Removes a key-value pair.
-    /// Returns the value if the key existed.
-    remove(mut &this, key: K, key_hash: u64) -> Option<V> {
-        if (this.cap == 0) {
-            return Option::None;
-        }
-
-        const index: Option<u64> = this.find_entry(key, key_hash);
-        match (index) {
-            Option::None => { return Option::None; }
-            Option::Some(i) => {
-                const value: V = this.entries[i].value;
-                this.entries[i].state = BUCKET_DELETED;
-                this.len = this.len - 1;
-                this.deleted = this.deleted + 1;
-                return Option::Some(value);
-            }
-        }
-        return Option::None;
-    }
-
-    /// Gets or inserts a value.
-    get_or_insert(mut &this, key: K, default_value: V, key_hash: u64) -> V* {
-        this.maybe_grow();
-
-        const mask: u64 = this.cap - 1;
-        mut index: u64 = key_hash & mask;
-        mut first_deleted: i64 = -1;
-
-        mut i: u64 = 0;
-        while (i < this.cap) {
-            const entry: HashMapEntry<K, V>* = &this.entries[index];
-
-            if (entry.state == BUCKET_EMPTY) {
-                mut insert_index: u64 = index;
-                if (first_deleted >= 0) {
-                    insert_index = first_deleted;
-                    this.deleted = this.deleted - 1;
-                }
-
-                this.entries[insert_index].key = key;
-                this.entries[insert_index].value = default_value;
-                this.entries[insert_index].hash = key_hash;
-                this.entries[insert_index].state = BUCKET_OCCUPIED;
-                this.len = this.len + 1;
-                return &this.entries[insert_index].value;
-            }
-
-            if (entry.state == BUCKET_DELETED) {
-                if (first_deleted < 0) {
-                    first_deleted = index;
-                }
-            } else if (entry.hash == key_hash && entry.key == key) {
-                return &this.entries[index].value;
-            }
-
-            i = i + 1;
-            index = (key_hash + (i * (i + 1)) / 2) & mask;
-        }
-
-        panic("hash map full", FILE, LINE);
-        return null;
-    }
-
-    /// Clears the map.
-    clear(mut &this) -> void {
-        if (this.cap > 0) {
-            memset(this.entries, 0, sizeof(HashMapEntry<K, V>) * this.cap);
-        }
-        this.len = 0;
-        this.deleted = 0;
-    }
-
-    // ========================================================================
-    // Internal
-    // ========================================================================
-
-    /// Finds an entry by key.
-    find_entry(&this, key: K, key_hash: u64) -> Option<u64> {
-        if (this.cap == 0) {
-            return Option::None;
-        }
-
-        const mask: u64 = this.cap - 1;
-        mut index: u64 = key_hash & mask;
-
-        mut i: u64 = 0;
-        while (i < this.cap) {
-            const entry: HashMapEntry<K, V>* = &this.entries[index];
-
-            if (entry.state == BUCKET_EMPTY) {
-                return Option::None;
-            }
-
-            if (entry.state == BUCKET_OCCUPIED &&
-                entry.hash == key_hash &&
-                entry.key == key) {
-                return Option::Some(index);
-            }
-
-            i = i + 1;
-            index = (key_hash + (i * (i + 1)) / 2) & mask;
-        }
-
-        return Option::None;
-    }
-
-
-    /// Grows the map if needed.
-    maybe_grow(mut &this) -> void {
-        if (this.cap == 0) {
-            this.resize(DEFAULT_CAPACITY);
-            return;
-        }
-
-        // Check if we need to resize
-        const threshold: u64 = (this.cap * MAX_LOAD_FACTOR_NUM) / MAX_LOAD_FACTOR_DEN;
-        if (this.len + this.deleted >= threshold) {
-            this.resize(this.cap * 2);
-        }
-    }
-
-    /// Resizes the map.
-    resize(mut &this, new_cap: u64) -> void {
-        const old_entries: HashMapEntry<K, V>* = this.entries;
-        const old_cap: u64 = this.cap;
-
-        this.entries = calloc(new_cap, sizeof(HashMapEntry<K, V>));
-        if (this.entries == null) {
-            panic("allocation failed", FILE, LINE);
-        }
-
-        this.cap = new_cap;
-        this.len = 0;
-        this.deleted = 0;
-
-        // Reinsert all entries
-        mut i: u64 = 0;
-        while (i < old_cap) {
-            if (old_entries[i].state == BUCKET_OCCUPIED) {
-                this.insert(old_entries[i].key, old_entries[i].value, old_entries[i].hash);
-            }
-            i = i + 1;
-        }
-
-        if (old_entries != null) {
-            free(old_entries);
-        }
-    }
-
-    // ========================================================================
-    // Iteration
-    // ========================================================================
-
-    /// Creates an iterator over the entries.
-    iter(&this) -> HashMapIter<K, V> {
-        return HashMapIter<K, V> {
-            entries: this.entries,
-            cap: this.cap,
-            current: 0
-        };
-    }
-
-    /// Creates an iterator over the keys.
-    keys(&this) -> HashMapKeyIter<K, V> {
-        return HashMapKeyIter<K, V> {
-            entries: this.entries,
-            cap: this.cap,
-            current: 0
-        };
-    }
-
-    /// Creates an iterator over the values.
-    values(&this) -> HashMapValueIter<K, V> {
-        return HashMapValueIter<K, V> {
-            entries: this.entries,
-            cap: this.cap,
-            current: 0
-        };
-    }
-
-    // ========================================================================
-    // Memory Management
-    // ========================================================================
-
-    /// Drops the map.
-    drop(&this) -> void {
-        if (this.entries != null) {
-            free(this.entries);
-        }
-    }
-
-    /// Reserves capacity for additional entries.
-    reserve(mut &this, additional: u64) -> void {
-        const required: u64 = this.len + additional;
-        const threshold: u64 = (required * MAX_LOAD_FACTOR_DEN) / MAX_LOAD_FACTOR_NUM;
-
-        if (threshold > this.cap) {
-            mut new_cap: u64 = this.cap;
-            if (new_cap == 0) {
-                new_cap = DEFAULT_CAPACITY;
-            }
-            while (new_cap < threshold) {
-                new_cap = new_cap * 2;
-            }
-            this.resize(new_cap);
-        }
-    }
-
-    /// Shrinks the capacity to fit.
-    shrink_to_fit(mut &this) -> void {
-        if (this.len == 0) {
-            if (this.entries != null) {
-                free(this.entries);
-                this.entries = null;
-                this.cap = 0;
-            }
-            return;
-        }
-
-        const min_cap: u64 = (this.len * MAX_LOAD_FACTOR_DEN) / MAX_LOAD_FACTOR_NUM;
-        mut new_cap: u64 = MIN_CAPACITY;
-        while (new_cap < min_cap) {
-            new_cap = new_cap * 2;
-        }
-
-        if (new_cap < this.cap) {
-            this.resize(new_cap);
-        }
+        Result::Err(err) => { return Result::Err(err); }
     }
 }
 
-// ============================================================================
-// Iterators
-// ============================================================================
-
-/// Iterator over HashMap entries.
-type struct HashMapIter<K, V> {
-    entries: HashMapEntry<K, V>*;
-    cap: u64;
-    current: u64;
-
-    /// Returns true if there are more entries.
-    has_next(mut &this) -> boolean {
-        while (this.current < this.cap) {
-            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
-                return true;
-            }
-            this.current = this.current + 1;
-        }
-        return false;
-    }
-
-    /// Returns the next key-value pair.
-    next(mut &this) -> Option<HashMapPair<K, V>> {
-        while (this.current < this.cap) {
-            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
-                const entry: HashMapEntry<K, V>* = &this.entries[this.current];
-                this.current = this.current + 1;
-                return Option::Some(HashMapPair<K, V> {
-                    key: entry.key,
-                    value: entry.value
-                });
-            }
-            this.current = this.current + 1;
-        }
-        return Option::None;
-    }
-}
-
-/// A key-value pair from the iterator.
-type struct HashMapPair<K, V> {
-    key: K;
-    value: V;
-}
-
-/// Iterator over HashMap keys.
-type struct HashMapKeyIter<K, V> {
-    entries: HashMapEntry<K, V>*;
-    cap: u64;
-    current: u64;
-
-    has_next(mut &this) -> boolean {
-        while (this.current < this.cap) {
-            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
-                return true;
-            }
-            this.current = this.current + 1;
-        }
-        return false;
-    }
-
-    next(mut &this) -> Option<K> {
-        while (this.current < this.cap) {
-            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
-                const key: K = this.entries[this.current].key;
-                this.current = this.current + 1;
-                return Option::Some(key);
-            }
-            this.current = this.current + 1;
-        }
-        return Option::None;
-    }
-}
-
-/// Iterator over HashMap values.
-type struct HashMapValueIter<K, V> {
-    entries: HashMapEntry<K, V>*;
-    cap: u64;
-    current: u64;
-
-    static new(entries: HashMapEntry<K, V>*, cap: u64) -> HashMapValueIter<K, V> {
-        return HashMapValueIter {
-            entries: entries,
-            cap: cap,
-            current: 0
-        };
-    }
-
-    has_next(mut &this) -> boolean {
-        while (this.current < this.cap) {
-            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
-                return true;
-            }
-            this.current = this.current + 1;
-        }
-        return false;
-    }
-
-    next(mut &this) -> Option<V> {
-        while (this.current < this.cap) {
-            if (this.entries[this.current].state == BUCKET_OCCUPIED) {
-                const value: V = this.entries[this.current].value;
-                this.current = this.current + 1;
-                return Option::Some(value);
-            }
-            this.current = this.current + 1;
-        }
-        return Option::None;
-    }
+function free_entry<K, V, A>(map: mut &HashMap<K, V, A>, entry: Entry<K, V>*) -> void
+where A: Allocator {
+    const block: Layout = Layout::of<Entry<K, V>>();
+    map.alloc.deallocate(NonNull::new(entry as u8*), block);
 }

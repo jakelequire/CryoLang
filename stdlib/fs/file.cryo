@@ -1,40 +1,36 @@
-///! File Operations
+///! File — Read/Write over a file descriptor.
 ///!
-///! Types and functions for file I/O operations.
+///! Opening a file returns a `File` that implements both `Read` and
+///! `Write`. Callers compose with `fmt::Formatter` or read-all
+///! helpers without caring that the destination is a file.
+///!
+///! `File` wraps a raw `i32` fd. The obligations are the POSIX ones:
+///! every `open` pairs with a `drop` (which `close`s), and no
+///! `File::drop` should be skipped or double-invoked.
 
 namespace std::fs::file;
 
 import core::intrinsics;
 import core::option;
-import core::mem;
-import alloc::global;
-import collections::array;
-import collections::string;
+import core::result;
+import core::slice;
 import io::error;
-import io::reader;
-import io::writer;
-import io::buffer;
+import io::fd;
+import io::traits;
+import ffi::cstr;
+import ffi::libc;
+import fs::path;
+
+// POSIX `open` flags and `lseek` whence values live in `ffi::libc`
+// (`O_RDONLY`/`O_WRONLY`/`O_RDWR`/`O_CREAT`/… and `Whence::SEEK_*`).
+
+// Default mode for newly created files: 0644.
+const DEFAULT_CREATE_MODE: u32 = 420;
 
 // ============================================================================
-// Constants
+// OpenOptions — what you're asking the OS for
 // ============================================================================
 
-// POSIX flag constants
-const O_RDONLY: i32 = 0;
-const O_WRONLY: i32 = 1;
-const O_RDWR: i32 = 2;
-const O_CREAT: i32 = 64;
-const O_EXCL: i32 = 128;
-const O_TRUNC: i32 = 512;
-const O_APPEND: i32 = 1024;
-
-// Seek constants
-const SEEK_SET: i32 = 0;
-const SEEK_CUR: i32 = 1;
-const SEEK_END: i32 = 2;
-
-
-/// File open options.
 type struct OpenOptions {
     read: boolean;
     write: boolean;
@@ -42,9 +38,7 @@ type struct OpenOptions {
     truncate: boolean;
     create: boolean;
     create_new: boolean;
-    mode: u32;
 
-    /// Creates new open options.
     static new() -> OpenOptions {
         return OpenOptions {
             read: false,
@@ -52,83 +46,55 @@ type struct OpenOptions {
             append: false,
             truncate: false,
             create: false,
-            create_new: false,
-            mode: 0o644
+            create_new: false
         };
     }
 
-    /// Sets read mode.
-    read(&this, read: boolean) -> OpenOptions {
-        this.read = read;
+    read(mut &this, value: boolean) -> OpenOptions {
+        this.read = value;
         return this;
     }
 
-    /// Sets write mode.
-    write(&this, write: boolean) -> OpenOptions {
-        this.write = write;
+    write(mut &this, value: boolean) -> OpenOptions {
+        this.write = value;
         return this;
     }
 
-    /// Sets append mode.
-    append(&this, append: boolean) -> OpenOptions {
-        this.append = append;
+    append(mut &this, value: boolean) -> OpenOptions {
+        this.append = value;
         return this;
     }
 
-    /// Sets truncate mode.
-    truncate(&this, truncate: boolean) -> OpenOptions {
-        this.truncate = truncate;
+    truncate(mut &this, value: boolean) -> OpenOptions {
+        this.truncate = value;
         return this;
     }
 
-    /// Sets create mode.
-    create(&this, create: boolean) -> OpenOptions {
-        this.create = create;
+    create(mut &this, value: boolean) -> OpenOptions {
+        this.create = value;
         return this;
     }
 
-    /// Sets create_new mode.
-    create_new(&this, create_new: boolean) -> OpenOptions {
-        this.create_new = create_new;
+    create_new(mut &this, value: boolean) -> OpenOptions {
+        this.create_new = value;
         return this;
     }
 
-    /// Sets the file mode (permissions).
-    mode(&this, mode: u32) -> OpenOptions {
-        this.mode = mode;
-        return this;
+    open(&this, p: Path) -> Result<File, IoError> {
+        return File::open_with(p, this);
     }
 
-    /// Opens a file with these options.
-    open(&this, path: string) -> IoResult<File> {
-        return File::open_with_options(path, this);
-    }
-
-    /// Converts to POSIX flags.
+    /// Flatten the options into a POSIX `flags` bitmask. Packaged so
+    /// `File::open_with` doesn't grow an `if` ladder.
     to_flags(&this) -> i32 {
         mut flags: i32 = 0;
-
-        if (this.read && this.write) {
-            flags = O_RDWR;
-        } else if (this.write) {
-            flags = O_WRONLY;
-        } else {
-            flags = O_RDONLY;
-        }
-
-        if (this.append) {
-            flags = flags | O_APPEND;
-        }
-        if (this.truncate) {
-            flags = flags | O_TRUNC;
-        }
-        if (this.create) {
-            flags = flags | O_CREAT;
-        }
-        if (this.create_new) {
-            flags = flags | O_CREAT | O_EXCL;
-        }
-
+        if (this.read && this.write) { flags = libc::O_RDWR; }
+        else if (this.write) { flags = libc::O_WRONLY; }
+        else { flags = libc::O_RDONLY; }
+        if (this.append) { flags = flags | libc::O_APPEND; }
+        if (this.truncate) { flags = flags | libc::O_TRUNC; }
+        if (this.create) { flags = flags | libc::O_CREAT; }
+        if (this.create_new) { flags = flags | libc::O_CREAT | libc::O_EXCL; }
         return flags;
     }
 }
@@ -137,416 +103,128 @@ type struct OpenOptions {
 // File
 // ============================================================================
 
-/// A reference to an open file on the filesystem.
 type struct File {
     fd: i32;
 
-    /// Opens a file in read-only mode.
-    static open(path: string) -> IoResult<File> {
-        return File::open_with_options(path, OpenOptions::new().read(true));
+    /// Open `p` for reading. Fails with `NotFound`, `PermissionDenied`,
+    /// or a mapped `errno`-derived kind on failure.
+    static open(p: Path) -> Result<File, IoError> {
+        mut options: OpenOptions = OpenOptions::new();
+        options = options.read(true);
+        return File::open_with(p, &options);
     }
 
-    /// Creates a new file (or truncates if exists).
-    static create(path: string) -> IoResult<File> {
-        mut opts: OpenOptions = OpenOptions::new();
-        opts = opts.write(true);
-        opts = opts.create(true);
-        opts = opts.truncate(true);
-        return File::open_with_options(path, opts);
+    /// Create (or truncate) `p` for writing.
+    static create(p: Path) -> Result<File, IoError> {
+        mut options: OpenOptions = OpenOptions::new();
+        options = options.write(true).create(true).truncate(true);
+        return File::open_with(p, &options);
     }
 
-    /// Opens a file with custom options.
-    static open_with_options(path: string, options: OpenOptions) -> IoResult<File> {
-        const fd: i32 = intrinsics::open(path, options.to_flags(), options.mode);
-        if (fd < 0) {
-            return IoResult::Err(IoError::from_raw_os_error(-fd));
-        }
-        return IoResult::Ok(File { fd: fd });
-    }
-
-    /// Creates a File from a raw file descriptor.
-    static from_raw_fd(fd: i32) -> File {
-        return File { fd: fd };
-    }
-
-    /// Returns the raw file descriptor.
-    as_raw_fd(&this) -> i32 {
-        return this.fd;
-    }
-
-    /// Consumes the File and returns the raw file descriptor.
-    into_raw_fd(&this) -> i32 {
-        const fd: i32 = this.fd;
-        this.fd = -1;
-        return fd;
-    }
-
-    // ========================================================================
-    // Read Operations
-    // ========================================================================
-
-    /// Reads bytes from the file.
-    read(&this, buf: u8*, len: u64) -> IoResult<u64> {
-        const result: i64 = intrinsics::read(this.fd, buf, len);
-        if (result < 0) {
-            return IoResult::Err(IoError::from_raw_os_error(-result));
-        }
-        return IoResult::Ok(result);
-    }
-
-    /// Reads bytes at a specific offset without changing the file position.
-    read_at(&this, buf: u8*, len: u64, offset: u64) -> IoResult<u64> {
-        const result: i64 = intrinsics::pread(this.fd, buf, len, offset);
-        if (result < 0) {
-            return IoResult::Err(IoError::from_raw_os_error(-result));
-        }
-        return IoResult::Ok(result);
-    }
-
-    /// Reads exactly `len` bytes.
-    read_exact(&this, buf: u8*, len: u64) -> IoResult<()> {
-        mut total: u64 = 0;
-        while (total < len) {
-            const result: IoResult<u64> = this.read(&buf[total], len - total);
-            match (result) {
-                IoResult::Err(e) => {
-                    if (e.kind() == IoErrorKind::Interrupted) {
-                        continue;
-                    }
-                    return IoResult::Err(e);
+    static open_with(p: Path, options: &OpenOptions) -> Result<File, IoError> {
+        match (CString::from_str(p.as_str())) {
+            Result::Ok(c_path) => {
+                const raw_fd: i32 = libc::open(c_path.as_ptr(), options.to_flags(), DEFAULT_CREATE_MODE);
+                mut c_local: CString = c_path;
+                c_local.drop();
+                if (raw_fd < 0) {
+                    return Result::Err(IoError::from_errno(libc::errno()));
                 }
-                IoResult::Ok(0) => {
-                    return IoResult::Err(IoError::unexpected_eof("failed to fill buffer"));
-                }
-                IoResult::Ok(n) => {
-                    total = total + n;
-                }
+                return Result::Ok(File { fd: raw_fd });
             }
-        }
-        return IoResult::Ok(());
-    }
-
-    /// Reads the entire file into a Vec.
-    read_to_end(&this, buf: &mut Array<u8>) -> IoResult<u64> {
-        const CHUNK_SIZE: u64 = 8192;
-        mut total: u64 = 0;
-        mut chunk: u8[8192];
-
-        loop {
-            const result: IoResult<u64> = this.read(&chunk[0], CHUNK_SIZE);
-            match (result) {
-                IoResult::Err(e) => {
-                    if (e.kind() == IoErrorKind::Interrupted) {
-                        continue;
-                    }
-                    return IoResult::Err(e);
-                }
-                IoResult::Ok(0) => {
-                    return IoResult::Ok(total);
-                }
-                IoResult::Ok(n) => {
-                    mut i: u64 = 0;
-                    while (i < n) {
-                        buf.push(chunk[i]);
-                        i = i + 1;
-                    }
-                    total = total + n;
-                }
-            }
-        }
-
-        return IoResult::Ok(total);
-    }
-
-    /// Reads the entire file into a String.
-    read_to_string(&this, s: &mut String) -> IoResult<u64> {
-        const buf: Array<u8> = Array<u8>::new();
-        const result: IoResult<u64> = this.read_to_end(&buf);
-
-        match (result) {
-            IoResult::Err(e) => {
-                buf.drop();
-                return IoResult::Err(e);
-            }
-            IoResult::Ok(n) => {
-                mut i: u64 = 0;
-                while (i < buf.len()) {
-                    s.push_byte(*buf.get_ref(i));
-                    i = i + 1;
-                }
-                buf.drop();
-                return IoResult::Ok(n);
+            Result::Err(_) => {
+                return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
             }
         }
     }
 
-    // ========================================================================
-    // Write Operations
-    // ========================================================================
-
-    /// Writes bytes to the file.
-    write(&this, buf: u8*, len: u64) -> IoResult<u64> {
-        const result: i64 = intrinsics::write(this.fd, buf, len);
-        if (result < 0) {
-            return IoResult::Err(IoError::from_raw_os_error(-result));
+    /// Seek to `offset` bytes from the start. Returns the new absolute
+    /// position.
+    seek_set(mut &this, offset: i64) -> Result<u64, IoError> {
+        const pos: i64 = libc::lseek(this.fd, offset, libc::Whence::SEEK_SET);
+        if (pos < 0) {
+            return Result::Err(IoError::from_errno(libc::errno()));
         }
-        return IoResult::Ok(result);
+        return Result::Ok(pos as u64);
     }
 
-    /// Writes bytes at a specific offset without changing the file position.
-    write_at(&this, buf: u8*, len: u64, offset: u64) -> IoResult<u64> {
-        const result: i64 = intrinsics::pwrite(this.fd, buf, len, offset);
-        if (result < 0) {
-            return IoResult::Err(IoError::from_raw_os_error(-result));
-        }
-        return IoResult::Ok(result);
-    }
-
-    /// Writes all bytes.
-    write_all(&this, buf: u8*, len: u64) -> IoResult<()> {
-        mut total: u64 = 0;
-        while (total < len) {
-            const result: IoResult<u64> = this.write(&buf[total], len - total);
-            match (result) {
-                IoResult::Err(e) => {
-                    if (e.kind() == IoErrorKind::Interrupted) {
-                        continue;
-                    }
-                    return IoResult::Err(e);
-                }
-                IoResult::Ok(0) => {
-                    return IoResult::Err(IoError::new(IoErrorKind::WriteZero, "write returned 0"));
-                }
-                IoResult::Ok(n) => {
-                    total = total + n;
-                }
-            }
-        }
-        return IoResult::Ok(());
-    }
-
-    /// Flushes the file.
-    flush(&this) -> IoResult<()> {
-        const result: i32 = intrinsics::fsync(this.fd);
-        if (result < 0) {
-            return IoResult::Err(IoError::from_raw_os_error(-result));
-        }
-        return IoResult::Ok(());
-    }
-
-    /// Syncs data only (not metadata).
-    sync_data(&this) -> IoResult<()> {
-        const result: i32 = intrinsics::fdatasync(this.fd);
-        if (result < 0) {
-            return IoResult::Err(IoError::from_raw_os_error(-result));
-        }
-        return IoResult::Ok(());
-    }
-
-    // ========================================================================
-    // Seek Operations
-    // ========================================================================
-
-    /// Seeks to a position.
-    seek(&this, pos: SeekFrom) -> IoResult<u64> {
-        mut whence: i32;
-        mut offset: i64;
-
-        match (pos) {
-            SeekFrom::Start(off) => {
-                whence = SEEK_SET;
-                offset = off;
-            }
-            SeekFrom::End(off) => {
-                whence = SEEK_END;
-                offset = off;
-            }
-            SeekFrom::Current(off) => {
-                whence = SEEK_CUR;
-                offset = off;
-            }
-        }
-
-        const result: i64 = intrinsics::lseek(this.fd, offset, whence);
-        if (result < 0) {
-            return IoResult::Err(IoError::from_raw_os_error(-result));
-        }
-        return IoResult::Ok(result);
-    }
-
-    /// Rewinds to the beginning.
-    rewind(&this) -> IoResult<()> {
-        const result: IoResult<u64> = this.seek(SeekFrom::Start(0));
-        match (result) {
-            IoResult::Err(e) => { return IoResult::Err(e); }
-            IoResult::Ok(_) => { return IoResult::Ok(()); }
-        }
-    }
-
-    /// Returns the current stream position.
-    stream_position(&this) -> IoResult<u64> {
-        return this.seek(SeekFrom::Current(0));
-    }
-
-    // ========================================================================
-    // Metadata Operations
-    // ========================================================================
-
-    /// Returns the length of the file.
-    len(&this) -> IoResult<u64> {
-        // Save current position
-        const pos: IoResult<u64> = this.stream_position();
-        match (pos) {
-            IoResult::Err(e) => { return IoResult::Err(e); }
-            IoResult::Ok(current_pos) => {
-                // Seek to end
-                const end: IoResult<u64> = this.seek(SeekFrom::End(0));
-                match (end) {
-                    IoResult::Err(e) => { return IoResult::Err(e); }
-                    IoResult::Ok(length) => {
-                        // Restore position
-                        this.seek(SeekFrom::Start(current_pos));
-                        return IoResult::Ok(length);
-                    }
-                }
-            }
-        }
-        return IoResult::Err(IoError::new(IoErrorKind::Other, "failed to get file length"));
-    }
-
-    /// Sets the length of the file.
-    set_len(&this, size: u64) -> IoResult<()> {
-        const result: i32 = intrinsics::ftruncate(this.fd, size);
-        if (result < 0) {
-            return IoResult::Err(IoError::from_raw_os_error(-result));
-        }
-        return IoResult::Ok(());
-    }
-
-    // ========================================================================
-    // Duplicating
-    // ========================================================================
-
-    /// Duplicates the file handle.
-    try_clone(&this) -> IoResult<File> {
-        const new_fd: i32 = intrinsics::dup(this.fd);
-        if (new_fd < 0) {
-            return IoResult::Err(IoError::from_raw_os_error(-new_fd));
-        }
-        return IoResult::Ok(File { fd: new_fd });
-    }
-
-    // ========================================================================
-    // Cleanup
-    // ========================================================================
-
-    /// Closes the file.
-    close(mut &this) -> IoResult<()> {
-        if (this.fd < 0) {
-            return IoResult::Ok(());
-        }
-
-        const result: i32 = intrinsics::close(this.fd);
-        this.fd = -1;
-
-        if (result < 0) {
-            return IoResult::Err(IoError::from_raw_os_error(-result));
-        }
-        return IoResult::Ok(());
-    }
-
-    /// Drops the file (closes it).
-    drop(&this) -> void {
+    /// Close the file descriptor. Ownership obligation: every `File`
+    /// must have `drop` called before going out of scope. Calling
+    /// more than once is a bug the kernel may not catch — the second
+    /// `close` could race against an unrelated `open` that reused
+    /// the same fd.
+    drop(mut &this) -> void {
         if (this.fd >= 0) {
-            intrinsics::close(this.fd);
+            fd::close_fd(this.fd);
+            this.fd = -1;
         }
     }
 }
 
+implement trait Read for struct File {
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        return fd::read_fd(this.fd, buffer, length);
+    }
+}
+
+implement trait Write for struct File {
+    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+        return fd::write_fd(this.fd, bytes);
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        // `write(2)` is unbuffered at the syscall layer. `fsync` is a
+        // caller concern — most writes don't need durability
+        // guarantees and `fsync` is expensive.
+        return Result::Ok(());
+    }
+}
 
 // ============================================================================
-// Convenience Functions
+// Convenience helpers
 // ============================================================================
 
-/// Reads the entire contents of a file into a Vec.
-function read(path: string) -> IoResult<Array<u8>> {
-    const file: IoResult<File> = File::open(path);
-    match (file) {
-        IoResult::Err(e) => { return IoResult::Err(e); }
-        IoResult::Ok(f) => {
-            const buf: Array<u8> = Array<u8>::new();
-            const result: IoResult<u64> = f.read_to_end(&buf);
-            f.drop();
-            match (result) {
-                IoResult::Err(e) => {
-                    buf.drop();
-                    return IoResult::Err(e);
-                }
-                IoResult::Ok(_) => {
-                    return IoResult::Ok(buf);
-                }
-            }
-        }
-    }
-    return IoResult::Err(IoError::new(IoErrorKind::Other, "failed to read file"));
-}
-
-/// Reads the entire contents of a file into a String.
-function read_to_string(path: string) -> IoResult<String> {
-    const file: IoResult<File> = File::open(path);
-    match (file) {
-        IoResult::Err(e) => { return IoResult::Err(e); }
-        IoResult::Ok(f) => {
-            const s: String = String::new();
-            const result: IoResult<u64> = f.read_to_string(&s);
-            f.drop();
-            match (result) {
-                IoResult::Err(e) => {
-                    s.drop();
-                    return IoResult::Err(e);
-                }
-                IoResult::Ok(_) => {
-                    return IoResult::Ok(s);
+/// Read the entire contents of `p` into a fresh `Array<u8>`. Panics
+/// on allocation failure; caller handles I/O failure via the Result.
+function read(p: Path) -> Result<Array<u8>, IoError> {
+    match (File::open(p)) {
+        Result::Ok(handle) => {
+            mut file: File = handle;
+            mut out: Array<u8> = Array::new();
+            mut chunk: u8[4096];
+            loop {
+                match (file.read(&chunk[0], 4096)) {
+                    Result::Ok(n) => {
+                        if (n == 0) { break; }
+                        mut i: u64 = 0;
+                        while (i < n) {
+                            out.push(chunk[i]);
+                            i++;
+                        }
+                    }
+                    Result::Err(err) => {
+                        out.drop();
+                        file.drop();
+                        return Result::Err(err);
+                    }
                 }
             }
+            file.drop();
+            return Result::Ok(out);
         }
+        Result::Err(err) => { return Result::Err(err); }
     }
-    return IoResult::Err(IoError::new(IoErrorKind::Other, "failed to read file"));
 }
 
-/// Writes bytes to a file, creating or truncating it.
-function write(path: string, contents: u8*, len: u64) -> IoResult<()> {
-    const file: IoResult<File> = File::create(path);
-    match (file) {
-        IoResult::Err(e) => { return IoResult::Err(e); }
-        IoResult::Ok(f) => {
-            const result: IoResult<()> = f.write_all(contents, len);
-            f.drop();
+/// Write `bytes` to `p`, creating or truncating.
+function write(p: Path, bytes: Slice<u8>) -> Result<(), IoError> {
+    match (File::create(p)) {
+        Result::Ok(handle) => {
+            mut file: File = handle;
+            const result: Result<(), IoError> = file.write_all(bytes);
+            file.drop();
             return result;
         }
+        Result::Err(err) => { return Result::Err(err); }
     }
-    return IoResult::Err(IoError::new(IoErrorKind::Other, "failed to write file"));
-}
-
-/// Writes a string to a file.
-function write_string(path: string, contents: string) -> IoResult<()> {
-    return write(path, contents, strlen(contents));
-}
-
-/// Appends bytes to a file.
-function append(path: string, contents: u8*, len: u64) -> IoResult<()> {
-    mut opts: OpenOptions = OpenOptions::new();
-    opts = opts.write(true);
-    opts = opts.append(true);
-    opts = opts.create(true);
-    const file: IoResult<File> = File::open_with_options(path, opts);
-    match (file) {
-        IoResult::Err(e) => { return IoResult::Err(e); }
-        IoResult::Ok(f) => {
-            const result: IoResult<()> = f.write_all(contents, len);
-            f.drop();
-            return result;
-        }
-    }
-    return IoResult::Err(IoError::new(IoErrorKind::Other, "failed to append to file"));
 }
