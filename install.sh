@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
 #
-# Cryo Programming Language — installer (v0.1.0).
+# Cryo Programming Language — installer (v0.2.0).
 #
-# Scope: this script is a PATH wrapper, not a system install. It builds the
-# self-hosted cryo compiler in place and exposes `cryo` on your PATH by
-# appending an export to a shell rc file. It does NOT copy binaries to
-# /usr/local/bin or install the stdlib outside the repo. See the
-# "in-tree limitation" note at the end of this script for why.
+# Symlinks the committed self-hosted compiler at <repo>/bin/cryo into a
+# system bindir, and the standard library at <repo>/stdlib into a sibling
+# share dir.  No build step — the pinned binary is self-contained.  No
+# shell-rc edits — the install prefix is expected to already be on PATH.
+#
+# Default layout (override with --prefix=…):
+#   /usr/local/bin/cryo            → <repo>/bin/cryo
+#   /usr/local/share/cryo/stdlib   → <repo>/stdlib
+#
+# The compiler reads /proc/self/exe at startup and looks for stdlib at
+#   <bindir>/../stdlib            (this layout's repo-pointing symlink)
+#   <bindir>/../share/cryo/stdlib (this layout's share-pointing symlink)
+# in that order, so either resolution path lands on the repo's stdlib.
+# Set $CRYO_STDLIB to override.
 #
 # Usage: ./install.sh [options]
-#   -y, --yes          Skip the interactive confirmation
-#       --no-build     Assume compiler/build/bin/cryo already exists
-#       --shell=NAME   Pick which shell rc to update: bash | zsh | fish | none
-#                      Default: detect from $SHELL.
-#   -h, --help         Show usage and exit
+#   -y, --yes        Skip the interactive confirmation
+#       --prefix=DIR Install prefix (default: /usr/local)
+#       --uninstall  Remove previously-installed symlinks
+#   -h, --help       Show usage and exit
 #
 
 set -euo pipefail
@@ -29,16 +37,13 @@ YELLOW=$'\033[0;33m'
 BOLD=$'\033[1m'
 RESET=$'\033[0m'
 
-log_info()    { echo "${BLUE}${BOLD}[info]${RESET}    $*"; }
-log_ok()      { echo "${GREEN}${BOLD}[ok]${RESET}      $*"; }
-log_warn()    { echo "${YELLOW}${BOLD}[warn]${RESET}    $*"; }
-log_error()   { echo "${RED}${BOLD}[error]${RESET}   $*" >&2; }
+log_info()  { echo "${BLUE}${BOLD}[info]${RESET}    $*"; }
+log_ok()    { echo "${GREEN}${BOLD}[ok]${RESET}      $*"; }
+log_warn()  { echo "${YELLOW}${BOLD}[warn]${RESET}    $*"; }
+log_error() { echo "${RED}${BOLD}[error]${RESET}   $*" >&2; }
 
 die() { log_error "$*"; exit 1; }
 
-# ----------------------------------------------------------------------------
-# Banner — the only piece kept from the original install.sh
-# ----------------------------------------------------------------------------
 print_banner() {
     echo -e "${TEAL}"
     echo -e "                  #               "
@@ -68,52 +73,98 @@ print_banner() {
 # Args
 # ----------------------------------------------------------------------------
 ASSUME_YES=0
-DO_BUILD=1
-SHELL_TARGET=""
+PREFIX="/usr/local"
+ACTION="install"
 
 usage() {
-    sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
 for arg in "$@"; do
     case $arg in
-        -y|--yes)        ASSUME_YES=1 ;;
-        --no-build)      DO_BUILD=0 ;;
-        --shell=*)       SHELL_TARGET="${arg#--shell=}" ;;
-        -h|--help)       usage ;;
-        *)               die "unknown argument: $arg (try --help)" ;;
+        -y|--yes)    ASSUME_YES=1 ;;
+        --prefix=*)  PREFIX="${arg#--prefix=}" ;;
+        --uninstall) ACTION="uninstall" ;;
+        -h|--help)   usage ;;
+        *)           die "unknown argument: $arg (try --help)" ;;
     esac
 done
 
 # ----------------------------------------------------------------------------
-# Locate repo root (resolve the script's own directory, follow symlinks)
+# Locate repo root (resolve script's own dir, follow symlinks)
 # ----------------------------------------------------------------------------
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")"
 REPO_ROOT="$(dirname "$SCRIPT_PATH")"
-CRYO_BIN="${REPO_ROOT}/compiler/build/bin/cryo"
-BIN_DIR="$(dirname "$CRYO_BIN")"
+SRC_BIN="${REPO_ROOT}/bin/cryo"
+SRC_STDLIB="${REPO_ROOT}/stdlib"
 
-[ -f "${REPO_ROOT}/Makefile" ] || die "could not find Makefile at ${REPO_ROOT} — is this script next to it?"
+[ -f "${REPO_ROOT}/Makefile" ] || die "could not find Makefile at ${REPO_ROOT} — is install.sh next to it?"
+
+# ----------------------------------------------------------------------------
+# Destination paths
+# ----------------------------------------------------------------------------
+DEST_BIN="${PREFIX}/bin/cryo"
+DEST_SHARE="${PREFIX}/share/cryo"
+DEST_STDLIB="${DEST_SHARE}/stdlib"
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+need_sudo_for() {
+    # Returns 0 (true) iff the install prefix isn't writable by the current
+    # user — in which case we'll prefix mutating commands with sudo.
+    local target_dir
+    target_dir="$(dirname "$1")"
+    [ -w "$target_dir" ] || [ -w "$1" ] && return 1 || true
+    if [ -e "$target_dir" ]; then
+        [ -w "$target_dir" ] && return 1
+        return 0
+    fi
+    # Walk up to the nearest existing ancestor.
+    local cur="$target_dir"
+    while [ ! -e "$cur" ]; do
+        cur="$(dirname "$cur")"
+    done
+    [ -w "$cur" ] && return 1
+    return 0
+}
+
+run() {
+    if [ $USE_SUDO -eq 1 ]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
 
 # ----------------------------------------------------------------------------
 # Pre-flight summary
 # ----------------------------------------------------------------------------
 print_banner
 
-echo "This installer will:"
-echo "  1. Verify your toolchain (clang++-20, LLVM 20, GNU make)"
-if [ $DO_BUILD -eq 1 ]; then
-    echo "  2. Build the self-hosted cryo compiler via 'make cryo'  (~5 min the first time)"
-    echo "  3. Add ${BIN_DIR} to your PATH via your shell rc"
+if [ "$ACTION" = "install" ]; then
+    [ -x "$SRC_BIN" ] || die "$SRC_BIN is missing or not executable. Run 'make pin-cryo' to refresh the pinned binary, or check out a revision that has bin/cryo committed."
+    [ -f "$SRC_STDLIB/lib.cryo" ] || die "$SRC_STDLIB/lib.cryo not found — is the stdlib in place?"
+
+    echo "This installer will create symlinks:"
+    echo "  ${DEST_BIN}"
+    echo "    → ${SRC_BIN}"
+    echo "  ${DEST_STDLIB}"
+    echo "    → ${SRC_STDLIB}"
+    echo
+    echo "Repo root: ${REPO_ROOT}"
+    echo "Prefix:    ${PREFIX}"
+    echo
 else
-    echo "  2. (skipping build — --no-build was passed)"
-    echo "  3. Add ${BIN_DIR} to your PATH via your shell rc"
+    echo "This installer will remove the symlinks:"
+    echo "  ${DEST_BIN}"
+    echo "  ${DEST_STDLIB}"
+    echo "  ${DEST_SHARE}      (only if empty after the stdlib symlink is gone)"
+    echo
+    echo "Prefix: ${PREFIX}"
+    echo
 fi
-echo
-echo "Repo root:       ${REPO_ROOT}"
-echo "Compiler binary: ${CRYO_BIN}"
-echo
 
 if [ $ASSUME_YES -ne 1 ]; then
     read -r -p "Continue? [y/N] " reply
@@ -124,114 +175,70 @@ if [ $ASSUME_YES -ne 1 ]; then
 fi
 
 # ----------------------------------------------------------------------------
-# OS check
+# Sudo decision
+# ----------------------------------------------------------------------------
+USE_SUDO=0
+if need_sudo_for "$DEST_BIN" || need_sudo_for "$DEST_STDLIB"; then
+    USE_SUDO=1
+    log_info "prefix '${PREFIX}' is not writable; will use sudo for install steps."
+    if ! command -v sudo >/dev/null 2>&1; then
+        die "sudo not found and prefix is not writable — re-run with --prefix=\$HOME/.local or as root."
+    fi
+fi
+
+# ----------------------------------------------------------------------------
+# OS check (warn-only on macOS — /proc/self/exe is Linux-only)
 # ----------------------------------------------------------------------------
 case "$(uname -s)" in
-    Linux)   OS="linux" ;;
-    Darwin)  OS="macos"; log_warn "macOS support is untested on this revision; proceeding anyway." ;;
-    *)       die "unsupported OS: $(uname -s)" ;;
+    Linux)  : ;;
+    Darwin) log_warn "macOS install: the compiler's /proc/self/exe-based stdlib lookup is Linux-only. Set CRYO_STDLIB=${SRC_STDLIB} in your shell profile to use this install on macOS." ;;
+    *)      log_warn "unsupported OS: $(uname -s) — proceeding, but stdlib lookup may fail. Set CRYO_STDLIB to override." ;;
 esac
-log_info "OS detected: $OS"
 
 # ----------------------------------------------------------------------------
-# Toolchain checks (verify only — never auto-install)
+# Install / uninstall
 # ----------------------------------------------------------------------------
-have() { command -v "$1" >/dev/null 2>&1; }
+do_install() {
+    run mkdir -p "$(dirname "$DEST_BIN")" "$DEST_SHARE"
 
-require_cmd() {
-    if have "$1"; then
-        log_ok "found: $1  ($(command -v "$1"))"
+    # Replace any existing symlink/file at the destination with a fresh symlink.
+    run ln -sfn "$SRC_BIN" "$DEST_BIN"
+    log_ok "linked: ${DEST_BIN} → ${SRC_BIN}"
+
+    run ln -sfn "$SRC_STDLIB" "$DEST_STDLIB"
+    log_ok "linked: ${DEST_STDLIB} → ${SRC_STDLIB}"
+
+    # Sanity: confirm the new binary runs.
+    if "$DEST_BIN" --version >/dev/null 2>&1; then
+        log_ok "cryo --version: $("$DEST_BIN" --version)"
     else
-        log_error "missing required command: $1"
-        echo "    Install hint:"
-        case "$1" in
-            clang++-20) echo "      Debian/Ubuntu: see https://apt.llvm.org/  ('wget -O - https://apt.llvm.org/llvm.sh | sudo bash -s -- 20')" ;;
-            llvm-config-20) echo "      Debian/Ubuntu: 'sudo apt-get install llvm-20-dev'" ;;
-            make)       echo "      'sudo apt-get install build-essential'  /  'brew install make'" ;;
-        esac
-        return 1
+        log_warn "cryo --version exited non-zero — symlink in place but the binary failed to run."
     fi
 }
 
-missing=0
-require_cmd make            || missing=1
-require_cmd clang++-20      || missing=1
-require_cmd llvm-config-20  || missing=1
-
-if [ $missing -ne 0 ]; then
-    die "one or more required tools are missing — install them and re-run."
-fi
-
-# ----------------------------------------------------------------------------
-# Build
-# ----------------------------------------------------------------------------
-if [ $DO_BUILD -eq 1 ]; then
-    if [ -x "$CRYO_BIN" ]; then
-        log_ok "cryo binary already exists at ${CRYO_BIN}; will re-run 'make cryo' for a no-op confirmation."
+do_uninstall() {
+    if [ -L "$DEST_BIN" ] || [ -e "$DEST_BIN" ]; then
+        run rm -f "$DEST_BIN"
+        log_ok "removed: ${DEST_BIN}"
+    else
+        log_info "nothing to remove at ${DEST_BIN}"
     fi
-    log_info "running 'make cryo' (this is the slow step — ~5 min on a first build)..."
-    ( cd "$REPO_ROOT" && make cryo )
-    [ -x "$CRYO_BIN" ] || die "build finished but ${CRYO_BIN} is missing — something is wrong."
-    log_ok "build complete: ${CRYO_BIN}"
-else
-    [ -x "$CRYO_BIN" ] || die "--no-build was passed but ${CRYO_BIN} does not exist."
-    log_ok "using existing binary: ${CRYO_BIN}"
-fi
-
-# ----------------------------------------------------------------------------
-# PATH wiring
-# ----------------------------------------------------------------------------
-detect_shell_rc() {
-    local target="$1"
-    if [ -z "$target" ]; then
-        case "$(basename "${SHELL:-}")" in
-            zsh)  target="zsh" ;;
-            fish) target="fish" ;;
-            *)    target="bash" ;;
-        esac
+    if [ -L "$DEST_STDLIB" ] || [ -e "$DEST_STDLIB" ]; then
+        run rm -f "$DEST_STDLIB"
+        log_ok "removed: ${DEST_STDLIB}"
+    else
+        log_info "nothing to remove at ${DEST_STDLIB}"
     fi
-    case "$target" in
-        bash) echo "$HOME/.bashrc" ;;
-        zsh)  echo "$HOME/.zshrc" ;;
-        fish) echo "$HOME/.config/fish/config.fish" ;;
-        none) echo "" ;;
-        *)    die "unknown --shell value: $target  (expected: bash|zsh|fish|none)" ;;
-    esac
+    # Tidy empty share dir.
+    if [ -d "$DEST_SHARE" ] && [ -z "$(ls -A "$DEST_SHARE" 2>/dev/null || true)" ]; then
+        run rmdir "$DEST_SHARE" && log_ok "removed empty: ${DEST_SHARE}"
+    fi
 }
 
-RC_FILE="$(detect_shell_rc "$SHELL_TARGET")"
-
-if [ -z "$RC_FILE" ]; then
-    log_info "skipping PATH wiring (--shell=none). Add this to your shell rc manually:"
-    echo "    export PATH=\"${BIN_DIR}:\$PATH\""
-else
-    MARKER="# Added by Cryo installer"
-    if [ -f "$RC_FILE" ] && grep -Fq "$BIN_DIR" "$RC_FILE"; then
-        log_ok "PATH entry already present in ${RC_FILE}"
-    else
-        mkdir -p "$(dirname "$RC_FILE")"
-        {
-            echo
-            echo "$MARKER"
-            if [[ "$RC_FILE" == *fish* ]]; then
-                echo "set -gx PATH ${BIN_DIR} \$PATH"
-            else
-                echo "export PATH=\"${BIN_DIR}:\$PATH\""
-            fi
-        } >> "$RC_FILE"
-        log_ok "appended PATH entry to ${RC_FILE}"
-        log_info "open a new shell or run: source \"${RC_FILE}\""
-    fi
-fi
-
-# ----------------------------------------------------------------------------
-# Verify
-# ----------------------------------------------------------------------------
-if "${CRYO_BIN}" --version >/dev/null 2>&1; then
-    log_ok "cryo --version: $("${CRYO_BIN}" --version)"
-else
-    log_warn "cryo --version exited non-zero — binary built but version check failed."
-fi
+case "$ACTION" in
+    install)   do_install ;;
+    uninstall) do_uninstall ;;
+esac
 
 # ----------------------------------------------------------------------------
 # Done
@@ -239,19 +246,18 @@ fi
 echo
 echo "${GREEN}${BOLD}Done.${RESET}"
 echo
-echo "${BOLD}In-tree limitation (read this):${RESET}"
-echo "  cryo currently locates the standard library via a relative path"
-echo "  ('<project_root>/../stdlib'). That means the compiler binary expects"
-echo "  the repo's stdlib/ tree to live next to your project. Until that"
-echo "  resolution is fixed (see the 0.1.0 distribution plan), this install is"
-echo "  effectively 'cryo lives in this repo, and your projects must be set up"
-echo "  so that ../stdlib/ resolves to ${REPO_ROOT}/stdlib'."
-echo
-echo "  For now, the safest pattern is to put your projects inside this repo"
-echo "  (e.g. ${REPO_ROOT}/sandbox/myapp) so ../stdlib resolves correctly."
-echo
-echo "Try it out:"
-echo "  cryo --help"
-echo
+
+if [ "$ACTION" = "install" ]; then
+    if ! command -v cryo >/dev/null 2>&1; then
+        log_warn "cryo is installed at ${DEST_BIN} but not on your PATH."
+        log_warn "add this to your shell profile:  export PATH=\"$(dirname "$DEST_BIN"):\$PATH\""
+    else
+        echo "Try it out:"
+        echo "  cryo --help"
+        echo "  cryo --version"
+    fi
+    echo
+fi
+
 echo "${TEAL}${BOLD}https://github.com/jakelequire/cryo${RESET}"
 echo
