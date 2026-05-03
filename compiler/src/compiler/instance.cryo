@@ -121,6 +121,73 @@ type struct StdlibBatchResult {
 
 
 // ============================================================================
+// Stdlib root resolution
+//
+// Search order, first hit wins:
+//   1. $CRYO_STDLIB                       — explicit override
+//   2. <bindir>/../stdlib                 — in-repo + symlink installs
+//   3. <bindir>/../share/cryo/stdlib      — FHS-style system install
+//   4. <project_root>/../stdlib           — legacy: project-relative
+//   5. ../stdlib                          — legacy: cwd-relative
+//
+// (2) and (3) read /proc/self/exe so a symlink install
+// (`/usr/local/bin/cryo` → `<repo>/bin/cryo`) resolves to the repo's
+// stdlib without an env var.  Linux only — on non-Linux the readlink
+// fails and we fall through to (4)/(5).
+// ============================================================================
+
+function resolve_stdlib_root(project_root: string) -> string {
+    // 1. Explicit env var.
+    const env_raw: i8* = getenv("CRYO_STDLIB");
+    if (env_raw != null) {
+        const env_path: string = env_raw as string;
+        if (File::exists(env_path + "/lib.cryo")) {
+            return env_path;
+        }
+    }
+
+    // 2. + 3. Binary-relative via /proc/self/exe.  Single 4 KiB scratch
+    // buffer is leaked once per compile — same pattern as the path
+    // concatenations below, and only happens once per `cryo build`.
+    mut exe_buf: i8* = malloc(4096) as i8*;
+    const exe_len: i64 = readlink("/proc/self/exe", exe_buf, 4096);
+    if (exe_len > 0 && exe_len < 4096) {
+        exe_buf[exe_len as u64] = 0;
+        const exe_path: string = exe_buf as string;
+        // dirname: walk back to the final '/'.
+        mut dir_end: u64 = (exe_len - 1) as u64;
+        while (dir_end > 0) {
+            if (exe_path[dir_end] == '/') { break; }
+            dir_end = dir_end - 1;
+        }
+        if (dir_end > 0) {
+            exe_buf[dir_end] = 0;
+            const bindir: string = exe_buf as string;
+            const cand_repo: string = bindir + "/../stdlib";
+            if (File::exists(cand_repo + "/lib.cryo")) {
+                return cand_repo;
+            }
+            const cand_sys: string = bindir + "/../share/cryo/stdlib";
+            if (File::exists(cand_sys + "/lib.cryo")) {
+                return cand_sys;
+            }
+        }
+    }
+
+    // 4. <project_root>/../stdlib
+    const cand_proj: string = project_root + "/../stdlib";
+    if (File::exists(cand_proj + "/lib.cryo")) {
+        return cand_proj;
+    }
+    // 5. ../stdlib (cwd-relative)
+    if (File::exists("../stdlib/lib.cryo")) {
+        return "../stdlib";
+    }
+    return "";
+}
+
+
+// ============================================================================
 // Compiler Instance
 // ============================================================================
 
@@ -346,22 +413,11 @@ type struct CompilerInstance {
         const _box_config: Box<ProjectConfig> = Box<ProjectConfig>::new(config);
         ctx.set_project_config(_box_config.leak());
 
-        // Create module loader and discover all modules recursively.
-        // Resolve stdlib root: try ../stdlib relative to project root,
-        // then fall back to empty (no stdlib search path).
-        // Check for lib.cryo inside the stdlib dir since File::exists
-        // uses fopen which doesn't work on directories.
+        // Resolve stdlib root.  See resolve_stdlib_root above for the
+        // search order — env var → binary-relative → project-relative.
         mut stdlib_root: string = "";
         if (!config.no_std) {
-            // Build probe path using string concatenation to avoid
-            // sprintf static buffer aliasing between candidate and probe.
-            const candidate: string = config.project_root + "/../stdlib";
-            const probe: string = candidate + "/lib.cryo";
-            if (File::exists(probe)) {
-                stdlib_root = candidate;
-            } else if (File::exists("../stdlib/lib.cryo")) {
-                stdlib_root = "../stdlib";
-            }
+            stdlib_root = resolve_stdlib_root(config.project_root);
             if (strlen(stdlib_root) > 0) {
                 printf("[Compiler] Stdlib root: %s\n", stdlib_root);
             }
