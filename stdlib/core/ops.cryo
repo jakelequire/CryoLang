@@ -1,395 +1,105 @@
-///! Operator Support Module
+///! Ranges and the `Step` trait.
 ///!
-///! This module provides utilities for working with operators and
-///! operator-like behavior. While Cryo doesn't have operator overloading
-///! via traits, this module provides helper types and functions for
-///! common operator patterns.
+///! `Step` abstracts "the successor of a value" so a single generic
+///! `Range<T>` works across integer widths. Implementing `Step` requires
+///! `Ord` — bounded iteration needs to know when we've passed `end`.
 
 namespace std::core::ops;
 
+import core::cmp;
+import core::iter;
 import core::option;
 
 // ============================================================================
-// Range Types
+// Step
 // ============================================================================
 
-/// A range from start to end (exclusive): [start, end)
+type trait Step : Ord {
+    /// The next value after `this`. Wraps on overflow at the type's
+    /// maximum; `Range` stops before reaching that case because the
+    /// bound check uses `Ord`.
+    successor(&this) -> This;
+}
+
+implement trait Step for i8   { successor(&this) -> i8   { return this + 1; } }
+implement trait Step for i16  { successor(&this) -> i16  { return this + 1; } }
+implement trait Step for i32  { successor(&this) -> i32  { return this + 1; } }
+implement trait Step for i64  { successor(&this) -> i64  { return this + 1; } }
+implement trait Step for u8   { successor(&this) -> u8   { return this + 1; } }
+implement trait Step for u16  { successor(&this) -> u16  { return this + 1; } }
+implement trait Step for u32  { successor(&this) -> u32  { return this + 1; } }
+implement trait Step for u64  { successor(&this) -> u64  { return this + 1; } }
+implement trait Step for char { successor(&this) -> char { return (this as i32 + 1) as char; } }
+
+// ============================================================================
+// Range<T> — half-open [start, end)
+// ============================================================================
+
 type struct Range<T> {
     start: T;
     end: T;
 
-    /// Creates a new range [start, end).
     static new(start: T, end: T) -> Range<T> {
-        return Range { start: start, end: end };
-    }
-
-    /// Returns the start of the range.
-    get_start(&this) -> T {
-        return this.start;
-    }
-
-    /// Returns the end of the range (exclusive).
-    get_end(&this) -> T {
-        return this.end;
-    }
-
-    /// Returns true if the range is empty.
-    is_empty(&this) -> boolean {
-        return this.start >= this.end;
-    }
-
-    /// Returns true if the value is contained in the range.
-    contains(&this, value: T) -> boolean {
-        return value >= this.start && value < this.end;
-    }
-
-    /// Returns the length of the range (for integer types).
-    len(&this) -> T {
-        if (this.start >= this.end) {
-            return 0;
-        }
-        return this.end - this.start;
+        return Range<T> { start: start, end: end };
     }
 }
 
-/// A range from start to end (inclusive): [start, end]
+implement<T> trait Iterator<T> for struct Range<T>
+where T: Step {
+    next(mut &this) -> Option<T> {
+        match (this.start.compare(&this.end)) {
+            Ordering::Less => {
+                const value: T = this.start;
+                this.start = this.start.successor();
+                return Option::Some(value);
+            }
+            _ => { return Option::None; }
+        }
+    }
+}
+
+// ============================================================================
+// RangeInclusive<T> — [start, end]
+// ============================================================================
+
 type struct RangeInclusive<T> {
     start: T;
     end: T;
     exhausted: boolean;
 
-    /// Creates a new inclusive range [start, end].
     static new(start: T, end: T) -> RangeInclusive<T> {
-        return RangeInclusive { start: start, end: end, exhausted: false };
+        return RangeInclusive<T> {
+            start: start,
+            end: end,
+            exhausted: false
+        };
     }
+}
 
-    /// Returns the start of the range.
-    get_start(&this) -> T {
-        return this.start;
-    }
-
-    /// Returns the end of the range (inclusive).
-    get_end(&this) -> T {
-        return this.end;
-    }
-
-    /// Returns true if the range is empty.
-    is_empty(&this) -> boolean {
-        return this.exhausted || this.start > this.end;
-    }
-
-    /// Returns true if the value is contained in the range.
-    contains(&this, value: T) -> boolean {
-        return value >= this.start && value <= this.end;
-    }
-
-    /// Returns the length of the range (for integer types).
-    len(&this) -> T {
-        if (this.start > this.end) {
-            return 0;
+implement<T> trait Iterator<T> for struct RangeInclusive<T>
+where T: Step {
+    next(mut &this) -> Option<T> {
+        if (this.exhausted) {
+            return Option::None;
         }
-        return this.end - this.start + 1;
-    }
-}
-
-/// A range from a start point: [start, ..)
-type struct RangeFrom<T> {
-    start: T;
-
-    /// Creates a new range from start.
-    static new(start: T) -> RangeFrom<T> {
-        return RangeFrom { start: start };
-    }
-
-    /// Returns the start of the range.
-    get_start(&this) -> T {
-        return this.start;
-    }
-
-    /// Returns true if the value is contained in the range.
-    contains(&this, value: T) -> boolean {
-        return value >= this.start;
-    }
-}
-
-/// A range up to an end point: [.., end)
-type struct RangeTo<T> {
-    end: T;
-
-    /// Creates a new range to end.
-    static new(end: T) -> RangeTo<T> {
-        return RangeTo { end: end };
-    }
-
-    /// Returns the end of the range (exclusive).
-    get_end(&this) -> T {
-        return this.end;
-    }
-
-    /// Returns true if the value is contained in the range.
-    contains(&this, value: T) -> boolean {
-        return value < this.end;
-    }
-}
-
-/// A range up to an end point (inclusive): [.., end]
-type struct RangeToInclusive<T> {
-    end: T;
-
-    /// Creates a new inclusive range to end.
-    static new(end: T) -> RangeToInclusive<T> {
-        return RangeToInclusive { end: end };
-    }
-
-    /// Returns the end of the range (inclusive).
-    get_end(&this) -> T {
-        return this.end;
-    }
-
-    /// Returns true if the value is contained in the range.
-    contains(&this, value: T) -> boolean {
-        return value <= this.end;
-    }
-}
-
-/// The full range: [.., ..]
-type struct RangeFull {
-    /// Creates a new full range.
-    static new() -> RangeFull {
-        return RangeFull {};
-    }
-
-    /// Returns true (all values are in the full range).
-    contains<T>(&this, value: T) -> boolean {
-        return true;
-    }
-}
-
-// ============================================================================
-// Bound Type
-// ============================================================================
-
-/// A bound on one side of a range.
-type enum Bound<T> {
-    /// An inclusive bound.
-    Included(T);
-    /// An exclusive bound.
-    Excluded(T);
-    /// No bound (unbounded).
-    Unbounded;
-}
-
-implement enum Bound<T> {
-    /// Creates an inclusive bound.
-    static included(value: T) -> Bound<T> {
-        return Bound::Included(value);
-    }
-
-    /// Creates an exclusive bound.
-    static excluded(value: T) -> Bound<T> {
-        return Bound::Excluded(value);
-    }
-
-    /// Creates an unbounded bound.
-    static unbounded() -> Bound<T> {
-        return Bound::Unbounded;
-    }
-
-    /// Returns the bound value if any.
-    as_value(&this) -> Option<T> {
-        match (&this) {
-            Bound::Included(v) => { return Option::Some(v); }
-            Bound::Excluded(v) => { return Option::Some(v); }
-            Bound::Unbounded => { return Option::None; }
+        match (this.start.compare(&this.end)) {
+            Ordering::Less => {
+                const value: T = this.start;
+                this.start = this.start.successor();
+                return Option::Some(value);
+            }
+            Ordering::Equal => {
+                // Yield the endpoint, then latch to exhausted so we
+                // don't call `successor` past `end` (overflow risk at
+                // the top of the type's range).
+                const value: T = this.start;
+                this.exhausted = true;
+                return Option::Some(value);
+            }
+            Ordering::Greater => {
+                this.exhausted = true;
+                return Option::None;
+            }
         }
     }
-
-    /// Maps the bound value.
-    map<U>(&this, f: (T) -> U) -> Bound<U> {
-        match (&this) {
-            Bound::Included(v) => { return Bound::Included(f(v)); }
-            Bound::Excluded(v) => { return Bound::Excluded(f(v)); }
-            Bound::Unbounded => { return Bound::Unbounded; }
-        }
-    }
-}
-
-// ============================================================================
-// Index Types
-// ============================================================================
-
-/// Represents an index or a range for slicing.
-type enum RangeSpec<T> {
-    /// A single index.
-    Index(T);
-    /// A range [start, end).
-    Range(Range<T>);
-    /// An inclusive range [start, end].
-    RangeInclusive(RangeInclusive<T>);
-    /// A range from start [start, ..).
-    RangeFrom(RangeFrom<T>);
-    /// A range to end [.., end).
-    RangeTo(RangeTo<T>);
-    /// The full range.
-    RangeFull(RangeFull);
-}
-
-// ============================================================================
-// Function Wrapper Types
-// ============================================================================
-
-/// A wrapper for a function with no arguments.
-type struct Fn0<R> {
-    func: () -> R;
-
-    /// Creates a new function wrapper.
-    static new(f: () -> R) -> Fn0<R> {
-        return Fn0 { func: f };
-    }
-
-    /// Calls the function.
-    call(&this) -> R {
-        return this.func();
-    }
-}
-
-/// A wrapper for a function with one argument.
-type struct Fn1<A, R> {
-    func: (A) -> R;
-
-    /// Creates a new function wrapper.
-    static new(f: (A) -> R) -> Fn1<A, R> {
-        return Fn1 { func: f };
-    }
-
-    /// Calls the function.
-    call(&this, a: A) -> R {
-        return this.func(a);
-    }
-}
-
-/// A wrapper for a function with two arguments.
-type struct Fn2<A, B, R> {
-    func: (A, B) -> R;
-
-    /// Creates a new function wrapper.
-    static new(f: (A, B) -> R) -> Fn2<A, B, R> {
-        return Fn2 { func: f };
-    }
-
-    /// Calls the function.
-    call(&this, a: A, b: B) -> R {
-        return this.func(a, b);
-    }
-}
-
-/// A wrapper for a function with three arguments.
-type struct Fn3<A, B, C, R> {
-    func: (A, B, C) -> R;
-
-    /// Creates a new function wrapper.
-    static new(f: (A, B, C) -> R) -> Fn3<A, B, C, R> {
-        return Fn3 { func: f };
-    }
-
-    /// Calls the function.
-    call(&this, a: A, b: B, c: C) -> R {
-        return this.func(a, b, c);
-    }
-}
-
-// ============================================================================
-// Control Flow Helpers
-// ============================================================================
-
-/// Result of a try operation.
-type enum ControlFlow<B, C> {
-    /// Continue with value C.
-    Continue(C);
-    /// Break with value B.
-    Break(B);
-}
-
-implement enum ControlFlow<B, C> {
-    /// Returns true if this is Continue.
-    is_continue(&this) -> boolean {
-        match (&this) {
-            ControlFlow::Continue(_) => { return true; }
-            ControlFlow::Break(_) => { return false; }
-        }
-    }
-
-    /// Returns true if this is Break.
-    is_break(&this) -> boolean {
-        match (&this) {
-            ControlFlow::Continue(_) => { return false; }
-            ControlFlow::Break(_) => { return true; }
-        }
-    }
-
-    /// Maps the continue value.
-    map_continue<D>(&this, f: (C) -> D) -> ControlFlow<B, D> {
-        match (&this) {
-            ControlFlow::Continue(c) => { return ControlFlow::Continue(f(c)); }
-            ControlFlow::Break(b) => { return ControlFlow::Break(b); }
-        }
-    }
-
-    /// Maps the break value.
-    map_break<D>(&this, f: (B) -> D) -> ControlFlow<D, C> {
-        match (&this) {
-            ControlFlow::Continue(c) => { return ControlFlow::Continue(c); }
-            ControlFlow::Break(b) => { return ControlFlow::Break(f(b)); }
-        }
-    }
-}
-
-// ============================================================================
-// Identity and Constant Functions
-// ============================================================================
-
-/// Returns its argument unchanged.
-function identity<T>(x: T) -> T {
-    return x;
-}
-
-/// Returns a function that always returns the given value.
-function constant<T>(value: T) -> () -> T {
-    return () -> T { return value; };
-}
-
-/// A no-op function that does nothing.
-function noop() -> void {
-    // Do nothing
-}
-
-/// A function that always panics.
-function unreachable<T>() -> T {
-    panic("entered unreachable code", FILE, LINE);
-}
-
-// ============================================================================
-// Composition Helpers
-// ============================================================================
-
-/// Composes two functions: g(f(x)).
-function compose<A, B, C>(f: (A) -> B, g: (B) -> C) -> (A) -> C {
-    return (x: A) -> C {
-        return g(f(x));
-    };
-}
-
-/// Applies a function to a value (pipe operator equivalent).
-function pipe<T, U>(value: T, f: (T) -> U) -> U {
-    return f(value);
-}
-
-/// Applies two functions to a value in sequence.
-function pipe2<T, U, V>(value: T, f: (T) -> U, g: (U) -> V) -> V {
-    return g(f(value));
-}
-
-/// Applies three functions to a value in sequence.
-function pipe3<T, U, V, W>(value: T, f: (T) -> U, g: (U) -> V, h: (V) -> W) -> W {
-    return h(g(f(value)));
 }

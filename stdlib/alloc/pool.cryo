@@ -1,525 +1,180 @@
-///! Pool Allocator Module
+///! Pool — O(1) allocator for uniformly-sized slots.
 ///!
-///! A pool allocator pre-allocates a fixed number of fixed-size blocks
-///! and maintains a free list for O(1) allocation and deallocation.
+///! A Pool is configured at construction with a single slot layout and
+///! refuses any allocation request that doesn't match. Freed slots are
+///! threaded onto an intrusive free list, making both allocation and
+///! deallocation O(1). When the free list is empty, the pool allocates
+///! a new block from `GlobalAlloc` and carves `slots_per_block` fresh
+///! slots out of it.
 ///!
-///! Pool allocators are excellent for:
-///! - Allocating many objects of the same size
-///! - Game entity systems
-///! - Network packet buffers
-///! - Object pools with reuse
+///! Use a Pool when you have many values of the same type with
+///! churn-heavy lifetimes (game entities, AST nodes under frequent
+///! edit, request objects). For mixed sizes use an Arena or
+///! `GlobalAlloc`.
 
 namespace std::alloc::pool;
 
 import core::intrinsics;
 import core::mem;
-import alloc::global;
+import core::ptr;
+import core::result;
+import alloc::layout;
+import alloc::allocator;
+
+/// Default block size — each block carves this many slots. Chosen to
+/// amortize the malloc cost without sitting on a huge unused tail for
+/// pools that grow slowly.
+const DEFAULT_SLOTS_PER_BLOCK: u64 = 64;
 
 // ============================================================================
-// Free List Node
+// FreeNode — intrusive free-list header stored in unused slots
 // ============================================================================
 
-/// A node in the free list (stored in free blocks).
 type struct FreeNode {
     next: FreeNode*;
 }
 
 // ============================================================================
-// Pool Block
+// Block — one contiguous backing allocation
 // ============================================================================
 
-/// A block of memory in the pool containing multiple slots.
-type struct PoolBlock {
-    /// Pointer to the block data.
+type struct Block {
     data: u8*;
-    /// Size of the block.
-    size: u64;
-    /// Next block in the chain.
-    next: PoolBlock*;
-
-    /// Creates a new pool block.
-    static new(size: u64) -> PoolBlock* {
-        const block: PoolBlock* = malloc(sizeof(PoolBlock));
-        if (block == null) {
-            return null;
-        }
-
-        block.data = malloc(size);
-        if (block.data == null) {
-            free(block);
-            return null;
-        }
-
-        block.size = size;
-        block.next = null;
-        return block;
-    }
-
-    /// Deallocates the block.
-    drop(&this) -> void {
-        free(this.data);
-        free(this);
-    }
+    next: Block*;
 }
 
 // ============================================================================
-// Pool Allocator
+// Pool
 // ============================================================================
 
-/// A pool allocator for fixed-size objects.
 type struct Pool {
-    /// Size of each slot.
-    slot_size: u64;
-    /// Alignment of each slot.
-    slot_align: u64;
-    /// Number of slots per block.
+    slot: Layout;
     slots_per_block: u64;
-    /// First block in the chain.
-    first_block: PoolBlock*;
-    /// Head of the free list.
     free_list: FreeNode*;
-    /// Total number of slots.
-    total_slots: u64;
-    /// Number of allocated slots.
-    allocated_slots: u64;
+    blocks: Block*;
 
-    /// Creates a new pool for objects of the given size.
-    static new(slot_size: u64) -> Pool {
-        return Pool::with_config(slot_size, 8, 64);
+    /// Create a pool serving `slot`-sized allocations with the default
+    /// block granularity. Panics if `slot.size() < sizeof(FreeNode*)` —
+    /// the intrusive free list needs a pointer's worth of room in each
+    /// slot.
+    static new(slot: Layout) -> Pool {
+        return Pool::with_block_size(slot, DEFAULT_SLOTS_PER_BLOCK);
     }
 
-    /// Creates a new pool with specified alignment.
-    static new(slot_size: u64, align: u64) -> Pool {
-        return Pool::with_config(slot_size, align, 64);
-    }
-
-    /// Creates a new pool with specified capacity.
-    static with_config(slot_size: u64, align: u64, slots_per_block: u64) -> Pool {
-        // Ensure slot size is at least the size of a free node
-        mut actual_size: u64 = slot_size;
-        if (actual_size < sizeof(FreeNode)) {
-            actual_size = sizeof(FreeNode);
+    /// Create a pool with a custom number of slots per backing block.
+    /// Larger blocks reduce malloc frequency at the cost of more unused
+    /// tail memory for small pools.
+    static with_block_size(slot: Layout, slots_per_block: u64) -> Pool {
+        if (slot.size() < sizeof(FreeNode*)) {
+            intrinsics::panic("Pool: slot smaller than a pointer; free list cannot be stored", FILE, LINE);
         }
-
-        // Align the slot size
-        actual_size = mem::align_up(actual_size, align);
-
+        if (slots_per_block == 0) {
+            intrinsics::panic("Pool: slots_per_block must be non-zero", FILE, LINE);
+        }
         return Pool {
-            slot_size: actual_size,
-            slot_align: align,
+            slot: slot,
             slots_per_block: slots_per_block,
-            first_block: null,
             free_list: null,
-            total_slots: 0,
-            allocated_slots: 0
+            blocks: null
         };
     }
 
-    /// Allocates a slot from the pool.
-    alloc(mut &this) -> void* {
-        // If free list is empty, allocate a new block
+    /// Grab a free slot, carving a new block if the free list is empty.
+    /// Returns `Err(OutOfMemory)` if the backing allocator refuses the
+    /// block request.
+    allocate_slot(mut &this) -> Result<NonNull<u8>, AllocError> {
         if (this.free_list == null) {
-            if (!this.grow()) {
-                return null;
+            match (grow(this)) {
+                Result::Ok(_) => { }
+                Result::Err(err) => { return Result::Err(err); }
             }
         }
-
-        // Pop from free list
         const node: FreeNode* = this.free_list;
         this.free_list = node.next;
-        this.allocated_slots = this.allocated_slots + 1;
-
-        return node;
+        return Result::Ok(NonNull::new(node as u8*));
     }
 
-    /// Allocates a zeroed slot from the pool.
-    alloc_zeroed(mut &this) -> void* {
-        const ptr: void* = this.alloc();
-        if (ptr != null) {
-            memset(ptr, 0, this.slot_size);
-        }
-        return ptr;
-    }
-
-    /// Deallocates a slot back to the pool.
-    dealloc(mut &this, ptr: void*) -> void {
-        if (ptr == null) {
-            return;
-        }
-
-        // Push to free list
-        const node: FreeNode* = ptr;
+    /// Return a slot to the pool. `ptr` must have come from a previous
+    /// `allocate_slot` on **this** pool and must not have been freed.
+    deallocate_slot(mut &this, ptr: NonNull<u8>) -> void {
+        const node: FreeNode* = ptr.as_ptr() as FreeNode*;
         node.next = this.free_list;
         this.free_list = node;
-        this.allocated_slots = this.allocated_slots - 1;
     }
 
-    /// Grows the pool by allocating a new block.
-    grow(mut &this) -> boolean {
-        const block_size: u64 = this.slot_size * this.slots_per_block;
-        const block: PoolBlock* = PoolBlock::new(block_size);
-        if (block == null) {
-            return false;
-        }
-
-        // Link the block
-        block.next = this.first_block;
-        this.first_block = block;
-
-        // Initialize free list for this block
-        mut i: u64 = 0;
-        while (i < this.slots_per_block) {
-            const slot: u8* = block.data + (i * this.slot_size);
-            const node: FreeNode* = slot as FreeNode*;
-            node.next = this.free_list;
-            this.free_list = node;
-            i = i + 1;
-        }
-
-        this.total_slots = this.total_slots + this.slots_per_block;
-        return true;
-    }
-
-    /// Returns the slot size.
-    get_slot_size(&this) -> u64 {
-        return this.slot_size;
-    }
-
-    /// Returns the number of allocated slots.
-    allocated(&this) -> u64 {
-        return this.allocated_slots;
-    }
-
-    /// Returns the total number of slots.
-    capacity(&this) -> u64 {
-        return this.total_slots;
-    }
-
-    /// Returns the number of free slots.
-    available(&this) -> u64 {
-        return this.total_slots - this.allocated_slots;
-    }
-
-    /// Returns true if the pool is empty.
-    is_empty(&this) -> boolean {
-        return this.allocated_slots == 0;
-    }
-
-    /// Returns true if all slots are allocated.
-    is_full(&this) -> boolean {
-        return this.allocated_slots == this.total_slots;
-    }
-
-    /// Resets the pool, making all slots available.
-    reset(mut &this) -> void {
-        this.free_list = null;
-
-        // Rebuild free list from all blocks
-        mut block: PoolBlock* = this.first_block;
-        while (block != null) {
-            mut i: u64 = 0;
-            while (i < this.slots_per_block) {
-                const slot: u8* = block.data + (i * this.slot_size);
-                const node: FreeNode* = slot as FreeNode*;
-                node.next = this.free_list;
-                this.free_list = node;
-                i = i + 1;
-            }
-            block = block.next;
-        }
-
-        this.allocated_slots = 0;
-    }
-
-    /// Drops the pool and frees all memory.
-    drop(&this) -> void {
-        mut block: PoolBlock* = this.first_block;
-        while (block != null) {
-            const next: PoolBlock* = block.next;
-            block.drop();
+    /// Release every backing block. Ownership obligation: callers must
+    /// invoke `drop` before the pool goes out of scope. All slot
+    /// pointers are invalidated.
+    drop(mut &this) -> void {
+        mut block: Block* = this.blocks;
+        loop {
+            if (block == null) { break; }
+            const next: Block* = block.next;
+            intrinsics::free(block.data as void*);
+            intrinsics::free(block as void*);
             block = next;
         }
-        this.first_block = null;
+        this.blocks = null;
         this.free_list = null;
-        this.total_slots = 0;
-        this.allocated_slots = 0;
     }
 }
 
 // ============================================================================
-// Typed Pool
+// Allocator impl
 // ============================================================================
 
-/// A pool allocator specialized for a single type.
-type struct TypedPool<T> {
-    pool: Pool;
-
-    /// Creates a new typed pool.
-    static new() -> TypedPool<T> {
-        return TypedPool {
-            pool: Pool::new(sizeof(T), alignof(T))
-        };
-    }
-
-    /// Creates a typed pool with capacity for n elements.
-    static new(n: u64) -> TypedPool<T> {
-        return TypedPool {
-            pool: Pool::with_config(sizeof(T), alignof(T), n)
-        };
-    }
-
-    /// Allocates an uninitialized value.
-    alloc(mut &this) -> T* {
-        return this.pool.alloc();
-    }
-
-    /// Allocates a zeroed value.
-    alloc_zeroed(mut &this) -> T* {
-        return this.pool.alloc_zeroed();
-    }
-
-    /// Allocates and initializes a value.
-    alloc_init(mut &this, value: T) -> T* {
-        const ptr: T* = this.alloc();
-        if (ptr != null) {
-            *ptr = value;
+implement trait Allocator for struct Pool {
+    /// Accepts exactly the pool's configured layout. Any mismatched
+    /// request returns `Err(InvalidLayout)` — callers who need a
+    /// different layout picked the wrong allocator.
+    allocate(mut &this, block: Layout) -> Result<NonNull<u8>, AllocError> {
+        if (block.size() != this.slot.size()
+                || block.alignment() > this.slot.alignment()) {
+            return Result::Err(AllocError::new(AllocErrorKind::InvalidLayout, block));
         }
-        return ptr;
+        return this.allocate_slot();
     }
 
-    /// Deallocates a value.
-    dealloc(mut &this, ptr: T*) -> void {
-        this.pool.dealloc(ptr);
-    }
-
-    /// Returns the number of allocated values.
-    allocated(&this) -> u64 {
-        return this.pool.allocated();
-    }
-
-    /// Returns the total capacity.
-    capacity(&this) -> u64 {
-        return this.pool.capacity();
-    }
-
-    /// Resets the pool.
-    reset(mut &this) -> void {
-        this.pool.reset();
-    }
-
-    /// Drops the pool.
-    drop(&this) -> void {
-        this.pool.drop();
+    deallocate(mut &this, ptr: NonNull<u8>, block: Layout) -> void {
+        this.deallocate_slot(ptr);
     }
 }
 
 // ============================================================================
-// Object Pool with Handles
+// Growth
 // ============================================================================
 
-/// A generation counter for validating handles.
-type struct Generation {
-    value: u32;
+/// Allocate a new backing block and thread its slots onto the free list.
+function grow(pool: mut &Pool) -> Result<(), AllocError> {
+    const stride: u64 = pool.slot.padded_size();
+    const bytes: u64 = stride * pool.slots_per_block;
 
-    /// Creates a new generation.
-    static new() -> Generation {
-        return Generation { value: 0 };
+    const header: void* = intrinsics::malloc(sizeof(Block));
+    if (header == null) {
+        return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, pool.slot));
+    }
+    const data: void* = intrinsics::aligned_alloc(pool.slot.alignment(), bytes);
+    if (data == null) {
+        intrinsics::free(header);
+        return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, pool.slot));
     }
 
-    /// Increments the generation.
-    increment(mut &this) -> void {
-        this.value = this.value + 1;
+    const block: Block* = header as Block*;
+    block.data = data as u8*;
+    block.next = pool.blocks;
+    pool.blocks = block;
+
+    // Thread the freshly carved slots onto the free list in reverse
+    // order, so the first slot handed out is the one at offset 0 (nicer
+    // for cache locality and easier to reason about in tests).
+    mut i: u64 = pool.slots_per_block;
+    loop {
+        if (i == 0) { break; }
+        i--;
+        const slot_addr: u64 = (block.data as u64) + (i * stride);
+        const node: FreeNode* = slot_addr as FreeNode*;
+        node.next = pool.free_list;
+        pool.free_list = node;
     }
-
-    /// Checks if two generations match.
-    matches(&this, other: Generation) -> boolean {
-        return this.value == other.value;
-    }
-}
-
-/// A handle to an object in a handle pool.
-type struct Handle {
-    index: u32;
-    generation: Generation;
-
-    /// Creates a new handle.
-    static new(index: u32, generation: Generation) -> Handle {
-        return Handle {
-            index: index,
-            generation: generation
-        };
-    }
-
-    /// Returns an invalid handle.
-    static invalid() -> Handle {
-        return Handle { index: 0xFFFFFFFF, generation: Generation::new() };
-    }
-
-    /// Checks if the handle is valid (not the invalid sentinel).
-    is_valid(&this) -> boolean {
-        return this.index != 0xFFFFFFFF;
-    }
-}
-
-/// An entry in a handle pool.
-type struct HandlePoolEntry<T> {
-    /// The stored value (if active).
-    value: T;
-    /// Generation of this slot.
-    generation: Generation;
-    /// True if this slot is occupied.
-    active: boolean;
-    /// Index of next free slot (if not active).
-    next_free: u32;
-}
-
-/// A pool that uses handles for safe access to allocated objects.
-type struct HandlePool<T> {
-    /// The entries array.
-    entries: HandlePoolEntry<T>*;
-    /// Capacity of the pool.
-    capacity: u64;
-    /// Number of active entries.
-    count: u64;
-    /// Index of first free slot.
-    free_head: u32;
-
-    /// Creates a new handle pool with the given capacity.
-    static new(capacity: u64) -> HandlePool<T> {
-        const entries: HandlePoolEntry<T>* = calloc(capacity, sizeof(HandlePoolEntry<T>));
-        if (entries == null) {
-            panic("allocation failed", FILE, LINE);
-        }
-
-        // Initialize free list
-        mut i: u64 = 0;
-        while (i < capacity) {
-            entries[i].generation = Generation::new();
-            entries[i].active = false;
-            entries[i].next_free = i + 1;
-            i = i + 1;
-        }
-
-        return HandlePool {
-            entries: entries,
-            capacity: capacity,
-            count: 0,
-            free_head: 0
-        };
-    }
-
-    /// Allocates a new entry with the given value.
-    alloc(mut &this, value: T) -> Option<Handle> {
-        if (this.free_head >= this.capacity) {
-            return Option::None;
-        }
-
-        const index: u32 = this.free_head;
-        const entry: HandlePoolEntry<T>* = &this.entries[index];
-
-        this.free_head = entry.next_free;
-        entry.value = value;
-        entry.active = true;
-        this.count = this.count + 1;
-
-        return Option::Some(Handle::new(index, entry.generation));
-    }
-
-    /// Gets a reference to the value at the handle.
-    get(&this, handle: Handle) -> Option<T*> {
-        if (handle.index >= this.capacity) {
-            return Option::None;
-        }
-
-        const entry: HandlePoolEntry<T>* = &this.entries[handle.index];
-        if (!entry.active || !entry.generation.matches(handle.generation)) {
-            return Option::None;
-        }
-
-        return Option::Some(&entry.value);
-    }
-
-    /// Gets a mutable reference to the value at the handle.
-    get_mut(mut &this, handle: Handle) -> Option<T*> {
-        if (handle.index >= this.capacity) {
-            return Option::None;
-        }
-
-        const entry: HandlePoolEntry<T>* = &this.entries[handle.index];
-        if (!entry.active || !entry.generation.matches(handle.generation)) {
-            return Option::None;
-        }
-
-        return Option::Some(&entry.value);
-    }
-
-    /// Checks if a handle is valid.
-    is_valid(&this, handle: Handle) -> boolean {
-        if (handle.index >= this.capacity) {
-            return false;
-        }
-
-        const entry: HandlePoolEntry<T>* = &this.entries[handle.index];
-        return entry.active && entry.generation.matches(handle.generation);
-    }
-
-    /// Deallocates the entry at the handle.
-    dealloc(mut &this, handle: Handle) -> boolean {
-        if (handle.index >= this.capacity) {
-            return false;
-        }
-
-        const entry: HandlePoolEntry<T>* = &this.entries[handle.index];
-        if (!entry.active || !entry.generation.matches(handle.generation)) {
-            return false;
-        }
-
-        entry.active = false;
-        entry.generation.increment();
-        entry.next_free = this.free_head;
-        this.free_head = handle.index;
-        this.count = this.count - 1;
-
-        return true;
-    }
-
-    /// Returns the number of active entries.
-    len(&this) -> u64 {
-        return this.count;
-    }
-
-    /// Returns the capacity.
-    capacity(&this) -> u64 {
-        return this.capacity;
-    }
-
-    /// Returns true if empty.
-    is_empty(&this) -> boolean {
-        return this.count == 0;
-    }
-
-    /// Returns true if full.
-    is_full(&this) -> boolean {
-        return this.count == this.capacity;
-    }
-
-    /// Clears all entries.
-    clear(mut &this) -> void {
-        mut i: u64 = 0;
-        while (i < this.capacity) {
-            if (this.entries[i].active) {
-                this.entries[i].active = false;
-                this.entries[i].generation.increment();
-            }
-            this.entries[i].next_free = i + 1;
-            i = i + 1;
-        }
-        this.free_head = 0;
-        this.count = 0;
-    }
-
-    /// Drops the pool.
-    drop(&this) -> void {
-        free(this.entries);
-    }
+    return Result::Ok(());
 }

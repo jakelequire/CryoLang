@@ -1,0 +1,87 @@
+///! Box<T> — single-owner heap allocation.
+///!
+///! A `Box<T>` owns exactly one heap-allocated value. Move semantics
+///! transfer ownership; the final holder calls `drop` to release.
+
+namespace std::alloc::box;
+
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import alloc::layout;
+import alloc::allocator;
+
+type struct Box<T> {
+    ptr: NonNull<T>;
+
+    /// Allocate heap storage and move `value` into it. Panics if the
+    /// allocator refuses the request — use `try_new` to recover from
+    /// out-of-memory.
+    static new(value: T) -> Box<T> {
+        match (Box::try_new(value)) {
+            Result::Ok(b) => { return b; }
+            Result::Err(_) => {
+                intrinsics::panic("Box::new: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Fallible constructor. Returns `Err(AllocError)` if the allocator
+    /// refuses the request (out of memory, zero-sized `T`, etc.).
+    static try_new(value: T) -> Result<Box<T>, AllocError> {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const block: Layout = Layout::of<T>();
+        match (alloc.allocate(block)) {
+            Result::Ok(raw) => {
+                // Inline the cast<T>() to avoid a nested generic call —
+                // the legacy-shaped self-hosted compiler doesn't always
+                // monomorphize `.cast<T>()` cleanly when Box<T> itself
+                // is being specialized into a downstream module.
+                const typed_ptr: T* = raw.as_ptr() as T*;
+                *typed_ptr = value;
+                return Result::Ok(Box<T> { ptr: NonNull::new(typed_ptr) });
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    /// Re-wrap a pointer previously produced by `into_raw`. The pointer
+    /// must have come from `Box::into_raw` (same type, same allocator)
+    /// and must not have been freed.
+    static from_raw(raw: T*) -> Box<T> {
+        return Box<T> { ptr: NonNull::new(raw) };
+    }
+
+
+    /// Raw pointer to the owned value. The pointer is valid for the
+    /// lifetime of the `Box`; dereferencing after `drop` is undefined.
+    as_ptr(&this) -> T* {
+        return this.ptr.as_ptr();
+    }
+
+    /// Give up ownership and return the raw pointer. The caller becomes
+    /// responsible for freeing the memory (typically via
+    /// `Box::from_raw`); dropping this box afterwards would double-free.
+    into_raw(&this) -> T* {
+        return this.ptr.as_ptr();
+    }
+
+    /// Bridge alias for `into_raw` — kept so legacy callers reading the
+    /// new stdlib can still spell "leak this allocation."  Same behavior:
+    /// give up ownership and return the raw pointer.
+    leak(&this) -> T* {
+        return this.ptr.as_ptr();
+    }
+
+    /// Release the heap storage. Ownership obligation: every `Box`
+    /// must have `drop` called exactly once before it goes out of
+    /// scope. If `T` itself owns resources, call its `drop` through
+    /// `*this.as_ptr()` first.
+    drop(mut &this) -> void {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const block: Layout = Layout::of<T>();
+        // Inline `cast<u8>()` for the same reason as in try_new.
+        const raw_u8: u8* = this.ptr.as_ptr() as u8*;
+        alloc.deallocate(NonNull::new(raw_u8), block);
+    }
+}

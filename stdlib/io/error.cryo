@@ -1,352 +1,96 @@
-///! I/O Error Types
+///! IoError — the failure kind for every fallible I/O operation.
 ///!
-///! Error types and result types for I/O operations.
+///! Modeled as an enum with a small closed set of kinds because
+///! callers mostly branch on the kind, not the text. A free-form
+///! `Other` variant exists for platform-specific errors that don't
+///! fit the taxonomy.
+///!
+///! The errno table below is Linux-accurate. macOS and the BSDs
+///! differ; when cross-platform wrappers land, they translate at
+///! the syscall boundary before reaching `from_errno`.
 
 namespace std::io::error;
 
-import core::intrinsics;
-import core::option;
-import collections::string;
-
 // ============================================================================
-// I/O Error Kind
+// Linux errno constants
 // ============================================================================
 
-/// The type of an I/O error.
+const ENOENT:        i32 = 2;
+const EINTR:         i32 = 4;
+const EIO:           i32 = 5;
+const EAGAIN:        i32 = 11; // same value as EWOULDBLOCK on Linux
+const ENOMEM:        i32 = 12;
+const EACCES:        i32 = 13;
+const EEXIST:        i32 = 17;
+const EINVAL:        i32 = 22;
+const EPIPE:         i32 = 32;
+const EADDRINUSE:    i32 = 98;
+const EADDRNOTAVAIL: i32 = 99;
+const ECONNABORTED:  i32 = 103;
+const ECONNRESET:    i32 = 104;
+const ENOTCONN:      i32 = 107;
+const ETIMEDOUT:     i32 = 110;
+const ECONNREFUSED:  i32 = 111;
+
+// ============================================================================
+// IoErrorKind
+// ============================================================================
+
 type enum IoErrorKind {
-    /// Entity not found.
     NotFound;
-    /// Permission denied.
     PermissionDenied;
-    /// Connection refused.
-    ConnectionRefused;
-    /// Connection reset.
-    ConnectionReset;
-    /// Connection aborted.
-    ConnectionAborted;
-    /// Not connected.
-    NotConnected;
-    /// Address in use.
-    AddrInUse;
-    /// Address not available.
-    AddrNotAvailable;
-    /// Broken pipe.
-    BrokenPipe;
-    /// Entity already exists.
     AlreadyExists;
-    /// Would block (non-blocking operation).
-    WouldBlock;
-    /// Invalid input.
-    InvalidInput;
-    /// Invalid data.
-    InvalidData;
-    /// Timed out.
-    TimedOut;
-    /// Write zero (wrote zero bytes).
-    WriteZero;
-    /// Interrupted.
+    ConnectionRefused;
+    ConnectionReset;
+    ConnectionAborted;
+    NotConnected;
+    AddrInUse;
+    AddrNotAvailable;
+    BrokenPipe;
     Interrupted;
-    /// Unexpected end of file.
+    InvalidInput;
+    InvalidData;
+    TimedOut;
+    WriteZero;
     UnexpectedEof;
-    /// Out of memory.
+    WouldBlock;
     OutOfMemory;
-    /// Operation not supported.
-    Unsupported;
-    /// Other error.
+    /// A platform-specific errno that doesn't map to any of the above.
+    /// `os_code` is the authoritative detail.
     Other;
 }
 
-implement enum IoErrorKind {
-    /// Returns a description of the error kind.
-    as_str(&this) -> string {
-        match (&this) {
-            IoErrorKind::NotFound => { return "entity not found"; }
-            IoErrorKind::PermissionDenied => { return "permission denied"; }
-            IoErrorKind::ConnectionRefused => { return "connection refused"; }
-            IoErrorKind::ConnectionReset => { return "connection reset"; }
-            IoErrorKind::ConnectionAborted => { return "connection aborted"; }
-            IoErrorKind::NotConnected => { return "not connected"; }
-            IoErrorKind::AddrInUse => { return "address in use"; }
-            IoErrorKind::AddrNotAvailable => { return "address not available"; }
-            IoErrorKind::BrokenPipe => { return "broken pipe"; }
-            IoErrorKind::AlreadyExists => { return "entity already exists"; }
-            IoErrorKind::WouldBlock => { return "operation would block"; }
-            IoErrorKind::InvalidInput => { return "invalid input"; }
-            IoErrorKind::InvalidData => { return "invalid data"; }
-            IoErrorKind::TimedOut => { return "operation timed out"; }
-            IoErrorKind::WriteZero => { return "write zero"; }
-            IoErrorKind::Interrupted => { return "operation interrupted"; }
-            IoErrorKind::UnexpectedEof => { return "unexpected end of file"; }
-            IoErrorKind::OutOfMemory => { return "out of memory"; }
-            IoErrorKind::Unsupported => { return "operation not supported"; }
-            IoErrorKind::Other => { return "other error"; }
-        }
-    }
-
-    /// Converts from a POSIX errno value.
-    static from_errno(errno: i32) -> IoErrorKind {
-        // Common POSIX errno values
-        match (errno) {
-            2 => { return IoErrorKind::NotFound; }          // ENOENT
-            13 => { return IoErrorKind::PermissionDenied; } // EACCES
-            17 => { return IoErrorKind::AlreadyExists; }    // EEXIST
-            32 => { return IoErrorKind::BrokenPipe; }       // EPIPE
-            4 => { return IoErrorKind::Interrupted; }       // EINTR
-            11 => { return IoErrorKind::WouldBlock; }       // EAGAIN
-            12 => { return IoErrorKind::OutOfMemory; }      // ENOMEM
-            22 => { return IoErrorKind::InvalidInput; }     // EINVAL
-            110 => { return IoErrorKind::TimedOut; }        // ETIMEDOUT
-            111 => { return IoErrorKind::ConnectionRefused; } // ECONNREFUSED
-            104 => { return IoErrorKind::ConnectionReset; } // ECONNRESET
-            _ => { return IoErrorKind::Other; }
-        }
-    }
-}
-
-// ============================================================================
-// I/O Error
-// ============================================================================
-
-/// An I/O error.
 type struct IoError {
     kind: IoErrorKind;
-    message: String;
-    os_error: i32;
+    /// `errno` from the underlying syscall, or 0 if not applicable.
+    /// Useful for diagnostics; callers should branch on `kind`.
+    os_code: i32;
 
-    /// Creates a new I/O error.
-    static new(kind: IoErrorKind, message: string) -> IoError {
-        return IoError {
-            kind: kind,
-            message: String::from_cstr(message),
-            os_error: 0
-        };
+    static new(kind: IoErrorKind, os_code: i32) -> IoError {
+        return IoError { kind: kind, os_code: os_code };
     }
 
-    /// Creates an I/O error from an OS error code.
-    static from_raw_os_error(code: i32) -> IoError {
-        return IoError {
-            kind: IoErrorKind::from_errno(code),
-            message: String::new(),
-            os_error: code
-        };
-    }
-
-    /// Creates a "not found" error.
-    static not_found(message: string) -> IoError {
-        return IoError::new(IoErrorKind::NotFound, message);
-    }
-
-    /// Creates a "permission denied" error.
-    static permission_denied(message: string) -> IoError {
-        return IoError::new(IoErrorKind::PermissionDenied, message);
-    }
-
-    /// Creates an "already exists" error.
-    static already_exists(message: string) -> IoError {
-        return IoError::new(IoErrorKind::AlreadyExists, message);
-    }
-
-    /// Creates an "invalid input" error.
-    static invalid_input(message: string) -> IoError {
-        return IoError::new(IoErrorKind::InvalidInput, message);
-    }
-
-    /// Creates an "invalid data" error.
-    static invalid_data(message: string) -> IoError {
-        return IoError::new(IoErrorKind::InvalidData, message);
-    }
-
-    /// Creates an "unexpected EOF" error.
-    static unexpected_eof(message: string) -> IoError {
-        return IoError::new(IoErrorKind::UnexpectedEof, message);
-    }
-
-    /// Creates an "interrupted" error.
-    static interrupted(message: string) -> IoError {
-        return IoError::new(IoErrorKind::Interrupted, message);
-    }
-
-    /// Creates a "would block" error.
-    static would_block(message: string) -> IoError {
-        return IoError::new(IoErrorKind::WouldBlock, message);
-    }
-
-    /// Creates a "timed out" error.
-    static timed_out(message: string) -> IoError {
-        return IoError::new(IoErrorKind::TimedOut, message);
-    }
-
-    /// Creates an error from the last OS error (errno).
-    /// This is the static method version that can be called as IoError::last_os_error().
-    static last_os_error() -> IoError {
-        // In a real implementation, this would call an errno intrinsic
-        // For now, returns an "Other" error with errno 0
-        return IoError::from_raw_os_error(0);
-    }
-
-    /// Returns the error kind.
-    kind(&this) -> IoErrorKind {
-        return this.kind;
-    }
-
-    /// Returns the raw OS error code if available.
-    raw_os_error(&this) -> Option<i32> {
-        if (this.os_error != 0) {
-            return Option::Some(this.os_error);
-        }
-        return Option::None;
-    }
-
-    /// Returns true if the error is of a particular kind.
-    is_kind(&this, kind: IoErrorKind) -> boolean {
-        return this.kind == kind;
-    }
-
-    /// Returns the error message.
-    message(&this) -> string {
-        if (this.message.length() > 0) {
-            return this.message.as_cstr();
-        }
-        return this.kind.as_str();
-    }
-
-    /// Drops the error.
-    drop(&this) -> void {
-        this.message.drop();
-    }
-}
-
-// ============================================================================
-// I/O Result
-// ============================================================================
-
-/// Result type for I/O operations.
-type enum IoResult<T> {
-    Ok(T);
-    Err(IoError);
-}
-
-implement enum IoResult<T> {
-    /// Returns true if the result is Ok.
-    is_ok(&this) -> boolean {
-        match (&this) {
-            IoResult::Ok(_) => { return true; }
-            IoResult::Err(_) => { return false; }
+    /// Map a POSIX `errno` to an `IoError`. Unknown codes fold to
+    /// `Other` with the numeric code preserved in `os_code`.
+    static from_errno(code: i32) -> IoError {
+        return match (code) {
+            ENOENT        => { IoError { kind: IoErrorKind::NotFound,          os_code: code } }
+            EINTR         => { IoError { kind: IoErrorKind::Interrupted,       os_code: code } }
+            EIO           => { IoError { kind: IoErrorKind::Other,             os_code: code } }
+            EAGAIN        => { IoError { kind: IoErrorKind::WouldBlock,        os_code: code } }
+            ENOMEM        => { IoError { kind: IoErrorKind::OutOfMemory,       os_code: code } }
+            EACCES        => { IoError { kind: IoErrorKind::PermissionDenied,  os_code: code } }
+            EEXIST        => { IoError { kind: IoErrorKind::AlreadyExists,     os_code: code } }
+            EINVAL        => { IoError { kind: IoErrorKind::InvalidInput,      os_code: code } }
+            EPIPE         => { IoError { kind: IoErrorKind::BrokenPipe,        os_code: code } }
+            EADDRINUSE    => { IoError { kind: IoErrorKind::AddrInUse,         os_code: code } }
+            EADDRNOTAVAIL => { IoError { kind: IoErrorKind::AddrNotAvailable,  os_code: code } }
+            ECONNABORTED  => { IoError { kind: IoErrorKind::ConnectionAborted, os_code: code } }
+            ECONNRESET    => { IoError { kind: IoErrorKind::ConnectionReset,   os_code: code } }
+            ENOTCONN      => { IoError { kind: IoErrorKind::NotConnected,      os_code: code } }
+            ETIMEDOUT     => { IoError { kind: IoErrorKind::TimedOut,          os_code: code } }
+            ECONNREFUSED  => { IoError { kind: IoErrorKind::ConnectionRefused, os_code: code } }
+            _             => { IoError { kind: IoErrorKind::Other,             os_code: code } }
         }
     }
-
-    /// Returns true if the result is Err.
-    is_err(&this) -> boolean {
-        return !this.is_ok();
-    }
-
-    /// Unwraps the result, panicking on error.
-    unwrap(&this) -> T {
-        match (&this) {
-            IoResult::Ok(value) => { return value; }
-            IoResult::Err(e) => {
-                panic(e.message(), FILE, LINE);
-                // Unreachable
-            }
-        }
-    }
-
-    /// Unwraps the result or returns a default.
-    unwrap_or(&this, default: T) -> T {
-        match (&this) {
-            IoResult::Ok(value) => { return value; }
-            IoResult::Err(_) => { return default; }
-        }
-    }
-
-    /// Returns the error if this is an Err.
-    err(&this) -> Option<IoError> {
-        match (&this) {
-            IoResult::Ok(_) => { return Option::None; }
-            IoResult::Err(e) => { return Option::Some(e); }
-        }
-    }
-
-    /// Returns the value if this is Ok.
-    ok(&this) -> Option<T> {
-        match (&this) {
-            IoResult::Ok(value) => { return Option::Some(value); }
-            IoResult::Err(_) => { return Option::None; }
-        }
-    }
-
-    /// Maps the Ok value.
-    map<U>(&this, f: (T) -> U) -> IoResult<U> {
-        match (&this) {
-            IoResult::Ok(value) => { return IoResult::Ok(f(value)); }
-            IoResult::Err(e) => { return IoResult::Err(e); }
-        }
-    }
-
-    /// Maps the error.
-    map_err(&this, f: (IoError) -> IoError) -> IoResult<T> {
-        match (&this) {
-            IoResult::Ok(value) => { return IoResult::Ok(value); }
-            IoResult::Err(e) => { return IoResult::Err(f(e)); }
-        }
-    }
-
-    /// Returns the contained value or computes it from the error.
-    unwrap_or_else(&this, f: (IoError) -> T) -> T {
-        match (&this) {
-            IoResult::Ok(value) => { return value; }
-            IoResult::Err(e) => { return f(e); }
-        }
-    }
-}
-
-// ============================================================================
-// Seek Position
-// ============================================================================
-
-/// Enumeration of possible methods to seek within an I/O object.
-type enum SeekFrom {
-    /// Set the offset to the provided number of bytes from the start.
-    Start(u64);
-    /// Set the offset relative to the end.
-    End(i64);
-    /// Set the offset relative to the current position.
-    Current(i64);
-}
-
-implement enum SeekFrom {
-    /// Creates a SeekFrom::Start.
-    static start(pos: u64) -> SeekFrom {
-        return SeekFrom::Start(pos);
-    }
-
-    /// Creates a SeekFrom::End.
-    static end(offset: i64) -> SeekFrom {
-        return SeekFrom::End(offset);
-    }
-
-    /// Creates a SeekFrom::Current.
-    static current(offset: i64) -> SeekFrom {
-        return SeekFrom::Current(offset);
-    }
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Creates an Ok result.
-function io_ok<T>(value: T) -> IoResult<T> {
-    return IoResult::Ok(value);
-}
-
-/// Creates an Err result.
-function io_err<T>(error: IoError) -> IoResult<T> {
-    return IoResult::Err(error);
-}
-
-/// Creates an error from errno.
-function last_os_error() -> IoError {
-    // In a real implementation, this would call the errno intrinsic
-    return IoError::from_raw_os_error(0);
 }

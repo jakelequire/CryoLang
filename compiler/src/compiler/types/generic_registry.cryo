@@ -191,7 +191,7 @@ type struct GenericRegistry {
     /// if an entry with the same name exists, it is overwritten.
     register_template(mut &this, entry: TemplateEntry) -> void {
         const h: u64 = hash_int(entry.qualified_name.id as u64);
-        const existing: Option<i64> = this.name_index.get(entry.qualified_name.id, h);
+        const existing: Option<i64> = this.name_index.get(&entry.qualified_name.id);
 
         if (existing.is_some()) {
             // Overwrite existing
@@ -206,12 +206,12 @@ type struct GenericRegistry {
         // New entry
         const idx: i64 = this.entries.length;
         this.entries.push(entry);
-        this.name_index.insert(entry.qualified_name.id, idx, h);
+        this.name_index.insert(entry.qualified_name.id, idx);
 
         if (entry.base_type.is_valid()) {
             this.tmpl_type_ids.push(entry.base_type.id);
             this.tmpl_type_indices.push(idx);
-            this.type_index.insert(entry.base_type.id, idx, hash_int(entry.base_type.id));
+            this.type_index.insert(entry.base_type.id, idx);
         }
     }
 
@@ -221,7 +221,7 @@ type struct GenericRegistry {
     /// array subscript — without this, push() would modify a temporary.
     register_impl_block(mut &this, qualified_name: SymbolStr, block: ImplBlockNode*) -> void {
         const h: u64 = hash_int(qualified_name.id as u64);
-        const opt: Option<i64> = this.name_index.get(qualified_name.id, h);
+        const opt: Option<i64> = this.name_index.get(&qualified_name.id);
         if (opt.is_some()) {
             const idx: i64 = opt.unwrap();
             mut entry_ptr: TemplateEntry* = &this.entries[idx];
@@ -247,7 +247,7 @@ type struct GenericRegistry {
         if (!trait_name.is_valid() || !target_name.is_valid()) { return; }
         const key: u64 = GenericRegistry::trait_impl_key(trait_name, target_name);
         const h: u64 = hash_int(key);
-        const existing: Option<i64> = this.trait_impl_index.get(key, h);
+        const existing: Option<i64> = this.trait_impl_index.get(&key);
         if (existing.is_some()) {
             // Latest impl wins — matches register_template's overwrite policy.
             const idx: i64 = existing.unwrap();
@@ -257,7 +257,7 @@ type struct GenericRegistry {
         const idx: i64 = this.trait_impl_keys.length;
         this.trait_impl_keys.push(key);
         this.trait_impl_blocks.push(block);
-        this.trait_impl_index.insert(key, idx, h);
+        this.trait_impl_index.insert(key, idx);
     }
 
     /// Look up the impl block for a `(trait, target)` pair. Returns null
@@ -265,7 +265,7 @@ type struct GenericRegistry {
     lookup_trait_impl(&this, trait_name: SymbolStr, target_name: SymbolStr) -> ImplBlockNode* {
         if (!trait_name.is_valid() || !target_name.is_valid()) { return null; }
         const key: u64 = GenericRegistry::trait_impl_key(trait_name, target_name);
-        const opt: Option<i64> = this.trait_impl_index.get(key, hash_int(key));
+        const opt: Option<i64> = this.trait_impl_index.get(&key);
         if (opt.is_some()) {
             return this.trait_impl_blocks[opt.unwrap()];
         }
@@ -300,14 +300,14 @@ type struct GenericRegistry {
     register_trait_decl(mut &this, name: SymbolStr, node: TraitDeclNode*) -> void {
         if (node == null || !name.is_valid()) { return; }
         const h: u64 = hash_int(name.id as u64);
-        const existing: Option<i64> = this.trait_decl_index.get(name.id, h);
+        const existing: Option<i64> = this.trait_decl_index.get(&name.id);
         if (existing.is_some()) {
             this.trait_decl_nodes[existing.unwrap()] = node;
             return;
         }
         const idx: i64 = this.trait_decl_nodes.length;
         this.trait_decl_nodes.push(node);
-        this.trait_decl_index.insert(name.id, idx, h);
+        this.trait_decl_index.insert(name.id, idx);
     }
 
     /// Look up a trait declaration's AST by bare name. Returns null when the
@@ -316,7 +316,7 @@ type struct GenericRegistry {
     get_trait_decl(&this, name: SymbolStr) -> TraitDeclNode* {
         if (!name.is_valid()) { return null; }
         const h: u64 = hash_int(name.id as u64);
-        const opt: Option<i64> = this.trait_decl_index.get(name.id, h);
+        const opt: Option<i64> = this.trait_decl_index.get(&name.id);
         if (opt.is_some()) {
             return this.trait_decl_nodes[opt.unwrap()];
         }
@@ -325,7 +325,7 @@ type struct GenericRegistry {
 
     /// Look up a template entry by qualified name.  The single lookup path.
     get_template(&this, qualified_name: SymbolStr) -> TemplateEntry* {
-        const opt: Option<i64> = this.name_index.get(qualified_name.id, hash_int(qualified_name.id as u64));
+        const opt: Option<i64> = this.name_index.get(&qualified_name.id);
         if (opt.is_some()) {
             return &this.entries[opt.unwrap()];
         }
@@ -335,7 +335,7 @@ type struct GenericRegistry {
     /// Look up a template entry by its base TypeID.  Used by the Monomorphizer
     /// since InstantiatedType stores the base type's ID, not its name.
     get_template_by_type_id(&this, type_id: u64) -> TemplateEntry* {
-        const opt: Option<i64> = this.type_index.get(type_id, hash_int(type_id));
+        const opt: Option<i64> = this.type_index.get(&type_id);
         if (opt.is_some()) {
             return &this.entries[opt.unwrap()];
         }
@@ -344,7 +344,7 @@ type struct GenericRegistry {
 
     /// Check whether a TypeID corresponds to a registered template.
     is_template(&this, type_id: u64) -> boolean {
-        return this.type_index.contains_key(type_id, hash_int(type_id));
+        return this.type_index.contains_key(&type_id);
     }
 
     /// Number of registered templates.
@@ -364,7 +364,7 @@ type struct GenericRegistry {
         const key: string = this.make_cache_key(base, args);
         const h: u64 = hash_str(key);
 
-        const cached: Option<i64> = this.cache_index.get(key, h);
+        const cached: Option<i64> = this.cache_index.get(&key);
         if (cached.is_some()) {
             return this.cache_refs[cached.unwrap()];
         }
@@ -374,7 +374,7 @@ type struct GenericRegistry {
         const idx: i64 = this.cache_keys.length;
         this.cache_keys.push(key);
         this.cache_refs.push(inst);
-        this.cache_index.insert(key, idx, h);
+        this.cache_index.insert(key, idx);
         return inst;
     }
 
@@ -421,15 +421,15 @@ type struct GenericRegistry {
     /// Check if an instantiation has already been monomorphized.
     is_monomorphized(&this, base: TypeRef, args: TypeRef[]) -> boolean {
         const key: string = this.make_cache_key(base, args);
-        return this.mono_set.contains_key(key, hash_str(key));
+        return this.mono_set.contains_key(&key);
     }
 
     /// Mark an instantiation as monomorphized (specialization completed).
     mark_monomorphized(mut &this, base: TypeRef, args: TypeRef[]) -> void {
         const key: string = this.make_cache_key(base, args);
         const h: u64 = hash_str(key);
-        if (!this.mono_set.contains_key(key, h)) {
-            this.mono_set.insert(key, true, h);
+        if (!this.mono_set.contains_key(&key)) {
+            this.mono_set.insert(key, true);
         }
     }
 
@@ -439,7 +439,7 @@ type struct GenericRegistry {
         mut result: TypeRef[] = [];
         for (mut i: i64 = 0; i < this.cache_keys.length; i++) {
             const key: string = this.cache_keys[i];
-            if (!this.mono_set.contains_key(key, hash_str(key))) {
+            if (!this.mono_set.contains_key(&key)) {
                 result.push(this.cache_refs[i]);
             }
         }
@@ -476,7 +476,7 @@ type struct GenericRegistry {
     update_type_index(mut &this, type_id: u64, entry_idx: i64) -> void {
         const h: u64 = hash_int(type_id);
         // Update or insert in HashMap
-        this.type_index.insert(type_id, entry_idx, h);
+        this.type_index.insert(type_id, entry_idx);
         // Also update parallel arrays for consistency
         for (mut i: i64 = 0; i < this.tmpl_type_ids.length; i++) {
             if (this.tmpl_type_ids[i] == type_id) {
