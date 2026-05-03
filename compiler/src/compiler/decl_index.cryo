@@ -128,8 +128,15 @@ type struct DeclarationIndex {
     module_func_modules: u32[];       // SymbolStr.id of defining module
     module_type_keys:    u32[];       // SymbolStr.id of type
     module_type_modules: u32[];       // SymbolStr.id of defining module
-    module_global_keys:    u32[];     // SymbolStr.id of global variable
-    module_global_modules: u32[];     // SymbolStr.id of defining module
+    module_global_keys:       u32[];  // SymbolStr.id of global variable
+    module_global_modules:    u32[];  // SymbolStr.id of defining module (source_file)
+    module_global_namespaces: u32[];  // SymbolStr.id of defining namespace (e.g.,
+                                      // "std::collections::hashmap"). Used by
+                                      // codegen to mangle definitions and cross-
+                                      // module references with a module-qualified
+                                      // path so two modules can each declare the
+                                      // same private `const NAME = …` without
+                                      // colliding at link time.
 
     // Bare name → qualified name mapping.
     // When a function is registered under both "printf" and
@@ -172,8 +179,9 @@ type struct DeclarationIndex {
             module_func_modules: [],
             module_type_keys:    [],
             module_type_modules: [],
-            module_global_keys:    [],
-            module_global_modules: [],
+            module_global_keys:       [],
+            module_global_modules:    [],
+            module_global_namespaces: [],
             bare_to_qualified:   HashMap<u32, u32>::new(),
             mangled_names:       HashMap<u32, u32>::new(),
             overload_func_keys:    [],
@@ -322,18 +330,27 @@ type struct DeclarationIndex {
     /// Register a global with its defining module so codegen can walk the
     /// per-module list to emit cross-module externs.  Callers already set
     /// the shared type map via register_global; this method is additive.
+    /// `namespace` is the namespace this module declares (e.g.
+    /// `std::collections::hashmap`); codegen mangles the global as
+    /// `C$<namespace>.<name>` so two modules with the same private
+    /// `const NAME = …` don't collide.  Pass an empty SymbolStr when no
+    /// namespace is set (the global stays bare-mangled).
     register_global_with_module(mut &this, name: SymbolStr, ty: TypeRef,
-                                 module: SymbolStr) -> void {
+                                 module: SymbolStr, namespace: SymbolStr) -> void {
         this.register_global(name, ty);
         // Dedup so re-processing doesn't grow the list unboundedly.
         for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
             if (this.module_global_keys[i] == name.id &&
                 this.module_global_modules[i] == module.id) {
+                // Refresh the recorded namespace in case the global was
+                // first registered before its namespace was set.
+                this.module_global_namespaces[i] = namespace.id;
                 return;
             }
         }
         this.module_global_keys.push(name.id);
         this.module_global_modules.push(module.id);
+        this.module_global_namespaces.push(namespace.id);
     }
 
     /// Convenience: register all methods from a MethodNode*[] array on a type.
@@ -711,6 +728,19 @@ type struct DeclarationIndex {
         for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
             if (this.module_global_keys[i] == name.id) {
                 return SymbolStr::from_id(this.module_global_modules[i]);
+            }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Get the defining namespace for a global. Returns empty SymbolStr if
+    /// not found or if the global was registered without a namespace.
+    /// `resolve_global` uses this to mangle a cross-module extern with the
+    /// same module-qualified name the defining module emits.
+    get_global_namespace(&this, name: SymbolStr) -> SymbolStr {
+        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
+            if (this.module_global_keys[i] == name.id) {
+                return SymbolStr::from_id(this.module_global_namespaces[i]);
             }
         }
         return SymbolStr::empty();
