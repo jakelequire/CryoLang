@@ -3,11 +3,17 @@
 selfhost-check: build the Cryo compiler through 8 stages and verify that
 stage-4 and stage-5 produce byte-identical IR.
 
-Replaces the inline shell logic that used to live in the top-level
-Makefile's `selfhost-check` target. The chain itself is unchanged; this
-script just gives it a usable terminal UI: per-stage progress with live
-elapsed time, ✓/✗ markers, per-stage logs in build-logs/selfhost-check/,
-a tail-of-log dump on failure, and a summary table at the end.
+The chain is rooted at the pinned `bin/cryo` self-hosted binary, not
+the legacy C++ bootstrap. That binary is the canonical entry point for
+the new chain (the C++ bootstrap at `legacy/bootstrap/bin/cryo` is
+retained for archaeology only, and is no longer required by this
+script). Whenever `compiler/src/` adopts new syntax that `bin/cryo`
+can't parse, refresh the pin via `make pin-cryo` after a clean
+selfhost-check.
+
+Per-compiler-stage outputs are isolated through `--build-dir=…` so
+each stage's binary is a separate file on disk. That sidesteps the
+old `compiler/build/cryo` vs `compiler/build/bin/cryo` confusion.
 
 Usage:
     python3 scripts/selfhost-check.py            # (or `make selfhost-check`)
@@ -17,7 +23,7 @@ Usage:
 Exit codes:
     0  fixed point holds (stage-4 IR == stage-5 IR)
     1  any stage failed, or stage-4/stage-5 IR differ
-    2  prerequisites missing (e.g. bootstrap not buildable)
+    2  prerequisites missing (e.g. bin/cryo not present)
 """
 
 import argparse
@@ -35,13 +41,13 @@ from pathlib import Path
 # Paths (resolved from this script's location, NOT the cwd)
 # ---------------------------------------------------------------------------
 ROOT   = Path(__file__).resolve().parent.parent
-BOOT   = ROOT / "legacy"   / "bootstrap" / "bin" / "cryo"
-STAGE2 = ROOT / "compiler" / "build"     / "cryo"
-STAGE3 = ROOT / "compiler" / "build"     / "bin" / "cryo"
-STAGE4 = ROOT / "compiler" / "build-s4"  / "bin" / "cryo"
-STAGE5 = ROOT / "compiler" / "build-s5"  / "bin" / "cryo"
-S4_LL  = ROOT / "compiler" / "build-s4"  / "bin" / "cryo.ll"
-S5_LL  = ROOT / "compiler" / "build-s5"  / "bin" / "cryo.ll"
+BOOT   = ROOT / "bin" / "cryo"                       # pinned self-hosted boot
+STAGE2 = ROOT / "compiler" / "build"    / "bin" / "cryo"   # boot    → stage-2
+STAGE3 = ROOT / "compiler" / "build-s3" / "bin" / "cryo"   # stage-2 → stage-3
+STAGE4 = ROOT / "compiler" / "build-s4" / "bin" / "cryo"   # stage-3 → stage-4
+STAGE5 = ROOT / "compiler" / "build-s5" / "bin" / "cryo"   # stage-4 → stage-5
+S4_LL  = ROOT / "compiler" / "build-s4" / "bin" / "cryo.ll"
+S5_LL  = ROOT / "compiler" / "build-s5" / "bin" / "cryo.ll"
 LOG_DIR = ROOT / "build-logs" / "selfhost-check"
 
 # ---------------------------------------------------------------------------
@@ -66,7 +72,7 @@ C = _Colors(enabled=(sys.stdout.isatty() and not os.environ.get("NO_COLOR")))
 @dataclass
 class Stage:
     src: str         # "stdlib" or "compiler"
-    via: str         # "bootstrap" / "stage-2" / "stage-3" / "stage-4"
+    via: str         # "pinned" / "stage-2" / "stage-3" / "stage-4"
     to: str          # ".bin" / "stage-2" / ".bin-s2" / "stage-3" / ...
     cwd: Path
     cmd: list
@@ -79,17 +85,24 @@ class Stage:
 
 def make_stages():
     return [
+        # ------------------------------------------------------------------
+        # Round 1: pinned boot → stage-2
+        # ------------------------------------------------------------------
         Stage(
-            src="stdlib", via="bootstrap", to=".bin",
+            src="stdlib", via="pinned", to=".bin",
             cwd=ROOT / "stdlib",
             cmd=[str(BOOT), "build"],
             pre_wipe=[ROOT / "stdlib" / ".bin"],
         ),
         Stage(
-            src="compiler", via="bootstrap", to="stage-2",
+            src="compiler", via="pinned", to="stage-2",
             cwd=ROOT / "compiler",
             cmd=[str(BOOT), "build"],
+            pre_wipe=[ROOT / "compiler" / "build"],
         ),
+        # ------------------------------------------------------------------
+        # Round 2: stage-2 → stage-3
+        # ------------------------------------------------------------------
         Stage(
             src="stdlib", via="stage-2", to=".bin-s2",
             cwd=ROOT / "stdlib",
@@ -99,10 +112,12 @@ def make_stages():
         Stage(
             src="compiler", via="stage-2", to="stage-3",
             cwd=ROOT / "compiler",
-            cmd=[str(STAGE2), "build"],
-            pre_wipe=[ROOT / "compiler" / "build" / "obj",
-                      ROOT / "compiler" / "build" / "bin"],
+            cmd=[str(STAGE2), "build", "--build-dir=build-s3"],
+            pre_wipe=[ROOT / "compiler" / "build-s3"],
         ),
+        # ------------------------------------------------------------------
+        # Round 3: stage-3 → stage-4
+        # ------------------------------------------------------------------
         Stage(
             src="stdlib", via="stage-3", to=".bin-s3",
             cwd=ROOT / "stdlib",
@@ -115,6 +130,9 @@ def make_stages():
             cmd=[str(STAGE3), "build", "--build-dir=build-s4"],
             pre_wipe=[ROOT / "compiler" / "build-s4"],
         ),
+        # ------------------------------------------------------------------
+        # Round 4: stage-4 → stage-5  (byte-identity gate)
+        # ------------------------------------------------------------------
         Stage(
             src="stdlib", via="stage-4", to=".bin-s4",
             cwd=ROOT / "stdlib",
@@ -256,21 +274,19 @@ def print_summary(times, total):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def ensure_bootstrap():
-    """Build the C++ bootstrap if it's missing. Returns True on success."""
+def ensure_boot():
+    """Bail out if `bin/cryo` is missing — the pin is the entry point."""
     if BOOT.exists():
         return True
-    print(f"{C.YELLOW}{C.BOLD}==> Bootstrap not present at {BOOT.relative_to(ROOT)} — building it first{C.RESET}")
-    rc = subprocess.call(["make", "bootstrap"], cwd=str(ROOT))
-    if rc != 0:
-        print(f"{C.RED}✗ make bootstrap failed (exit {rc}){C.RESET}")
-        return False
-    return True
+    print(f"{C.RED}✗ pinned boot not found:{C.RESET} {BOOT.relative_to(ROOT)}")
+    print(f"  {C.DIM}Build a fresh self-hosted compiler and run `make pin-cryo`,")
+    print(f"  or check out a revision that has bin/cryo committed.{C.RESET}")
+    return False
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cryo selfhost byte-identity check (8 stages).",
+        description="Cryo selfhost byte-identity check (8 stages, rooted at bin/cryo).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -279,11 +295,11 @@ def main():
                         help="keep build-logs/selfhost-check/ from previous runs")
     args = parser.parse_args()
 
-    if not ensure_bootstrap():
+    if not ensure_boot():
         return 2
 
     print()
-    print(f"{C.BOLD}selfhost-check{C.RESET}  {C.DIM}— 8-stage byte-identity gate{C.RESET}")
+    print(f"{C.BOLD}selfhost-check{C.RESET}  {C.DIM}— 8-stage byte-identity gate (boot: bin/cryo){C.RESET}")
     print(f"  {C.DIM}root:{C.RESET} {ROOT}")
     print(f"  {C.DIM}logs:{C.RESET} {LOG_DIR.relative_to(ROOT)}/")
     print()
@@ -295,6 +311,7 @@ def main():
     print(f"{C.BOLD}==> Wiping stage outputs{C.RESET}")
     wipe_paths([
         ROOT / "compiler" / "build",
+        ROOT / "compiler" / "build-s3",
         ROOT / "compiler" / "build-s4",
         ROOT / "compiler" / "build-s5",
         ROOT / "stdlib" / ".bin",
