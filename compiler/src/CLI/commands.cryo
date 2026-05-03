@@ -15,6 +15,7 @@ type enum CommandKind {
     Help;
     Version;
     Build;
+    Run;
     Check;
     Raw;
     Project; // TODO: remove this and just use `build` with auto-detection of cryoconfig
@@ -28,6 +29,7 @@ implement enum CommandKind {
             CommandKind::Help    => { "help"    }
             CommandKind::Version => { "version" }
             CommandKind::Build   => { "build"   }
+            CommandKind::Run     => { "run"     }
             CommandKind::Check   => { "check"   }
             CommandKind::Raw     => { "raw"     }
             CommandKind::Project  => { "project"  }
@@ -41,6 +43,7 @@ implement enum CommandKind {
             CommandKind::Help     => { "Display help information"                      }
             CommandKind::Version  => { "Display version information"                   }
             CommandKind::Build    => { "Build a source file (single-file)"            }
+            CommandKind::Run      => { "Build the project and run the resulting binary" }
             CommandKind::Check    => { "Check a file for errors (no codegen)"         }
             CommandKind::Raw      => { "Compile without stdlib or prelude"            }
             CommandKind::Project  => { "Build a multi-module project from cryoconfig" }
@@ -54,6 +57,7 @@ implement enum CommandKind {
             CommandKind::Help     => { "cryoc help [command]"              }
             CommandKind::Version  => { "cryoc version"                     }
             CommandKind::Build    => { "cryoc build <file> [flags]"       }
+            CommandKind::Run      => { "cryoc run [flags]"                 }
             CommandKind::Check    => { "cryoc check <file> [flags]"       }
             CommandKind::Raw      => { "cryoc raw <file> [flags]"         }
             CommandKind::Project  => { "cryoc project [dir] [flags]"      }
@@ -79,6 +83,9 @@ type struct Executor {
         const build: CommandKind = CommandKind::Build;
         runner.add_command(Command::new(build.name(), build.description(), build.usage()));
 
+        const run: CommandKind = CommandKind::Run;
+        runner.add_command(Command::new(run.name(), run.description(), run.usage()));
+
         const check: CommandKind = CommandKind::Check;
         runner.add_command(Command::new(check.name(), check.description(), check.usage()));
 
@@ -97,6 +104,7 @@ type struct Executor {
         if (name == "help")     { return CommandKind::Help; }
         if (name == "version")  { return CommandKind::Version; }
         if (name == "build")    { return CommandKind::Build; }
+        if (name == "run")      { return CommandKind::Run; }
         if (name == "check")    { return CommandKind::Check; }
         if (name == "raw")      { return CommandKind::Raw; }
         if (name == "project")  { return CommandKind::Project; }
@@ -116,6 +124,7 @@ type struct Executor {
             CommandKind::Help    => { runner.print_help();    return 0; }
             CommandKind::Version => { runner.print_version(); return 0; }
             CommandKind::Build   => { return Executor::cmd_build(args); }
+            CommandKind::Run     => { return Executor::cmd_run(args); }
             CommandKind::Check   => { return Executor::cmd_check(args); }
             CommandKind::Raw     => { return Executor::cmd_raw(args); }
             CommandKind::Project  => { return Executor::cmd_project(args); }
@@ -157,6 +166,76 @@ type struct Executor {
             return 1;
         }
         return Executor::compile_file(file, args);
+    }
+
+    /// `cryo run` — build the project in CWD, then execute the produced
+    /// binary.  Returns the binary's exit code.  Library / stdlib targets
+    /// have no entry point and produce no executable, so `run` rejects
+    /// them with a clear error rather than silently doing nothing.
+    static cmd_run(args: ParsedArgs) -> int {
+        if (args.has_flag("debug")) {
+            Logger::enable_debug();
+        }
+
+        printf("[Run] Building project before execution.\n");
+
+        // Find cryoconfig in CWD (or explicit positional dir).
+        const dir: string = if (args.positional_count() > 0) {
+            args.input_file()
+        } else {
+            "."
+        };
+        const config_path: string = find_cryoconfig(dir);
+        if (strcmp(config_path, "") == 0) {
+            printf("Error: No cryoconfig found in '%s' or parent directories.\n", dir);
+            printf("Usage: cryo run [flags]   (run from a directory containing a cryoconfig)\n");
+            return 1;
+        }
+
+        mut config: CompilerConfig = CompilerConfig::default();
+        if (args.has_flag("debug")) {
+            config = CompilerConfig::debug_config();
+        }
+        if (args.has_flag("ast")) {
+            config.show_ast = true;
+        }
+        if (args.has_flag("emit-llvm")) {
+            config.emit_llvm = true;
+        }
+        if (args.has_arg("build-dir")) {
+            config.output_dir_override = args.get_value("build-dir");
+        }
+
+        mut compiler: CompilerInstance = CompilerInstance::new(config);
+        const result: CompilationResult = compiler.compile_project(config_path);
+
+        if (!result.success) {
+            printf("Project compilation failed (%u errors, %u warnings)\n",
+                result.error_count, result.warning_count);
+            return 1;
+        }
+
+        // compile_project leaves output_path empty for non-executable
+        // targets (libraries, stdlib batches).  Nothing to run there.
+        if (strlen(result.output_path) == 0) {
+            printf("Error: target produced no executable — `cryo run` only works for executable projects.\n");
+            return 1;
+        }
+
+        printf("[Run] %s\n", result.output_path);
+        // Flush so the [Run] header appears before the child binary's
+        // output; otherwise the libc line buffer can interleave them.
+        fflush(null);
+        // system(3) returns the wait status: low byte holds the signal,
+        // bits 8-15 hold the exit code on a normal exit.  Surface the
+        // exit code so the caller's $? matches what the inner binary
+        // returned.
+        const status: i32 = system(result.output_path);
+        if (status < 0) {
+            printf("Error: failed to spawn '%s'\n", result.output_path);
+            return 1;
+        }
+        return ((status >> 8) & 0xff) as int;
     }
 
     /// `cryoc check <file>` — frontend + semantic analysis, no codegen.
