@@ -309,6 +309,175 @@ type struct Monomorphizer {
 
 
     // ----------------------------------------------------------------
+    // Worklist drain (for follow-up inference passes)
+    // ----------------------------------------------------------------
+
+    /// Drain the pending instantiation worklist without the
+    /// `collect_unmonomorphized()` pre-pass that `process_all` runs.
+    /// Used after `discover_inferred_calls_in_module` queues new
+    /// instantiations via `instantiate_for_module` — calling
+    /// `process_all` a second time would re-feed items the first call
+    /// filtered out (partial specs containing GenericParam), and the
+    /// post-pass marking is already done.  This drains only what's
+    /// freshly enqueued.  Returns true on success.
+    drain_pending_worklist(mut &this) -> boolean {
+        mut errors: i64 = 0;
+        while (this.pending_cursor < this.pending.length) {
+            const request: MonomorphRequest = this.pending[this.pending_cursor];
+            this.pending_cursor = this.pending_cursor + 1;
+            const key: string = this.make_key(request);
+            if (this.is_cached(key)) {
+                this.propagate_cached_resolution(key, request);
+                this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
+                continue;
+            }
+            if (this.is_in_progress(key)) {
+                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    format("monomorphization cycle detected for %s", key)));
+                errors = errors + 1;
+                continue;
+            }
+            this.in_progress.insert(key, true);
+            const ok: boolean = this.specialize_request(request, key);
+            this.remove_in_progress(key);
+            if (!ok) { errors = errors + 1; }
+        }
+        if (errors > 0) {
+            this.error_count = this.error_count + errors;
+        }
+        return errors == 0;
+    }
+
+
+    // ----------------------------------------------------------------
+    // Module-wide inferred-call discovery
+    // ----------------------------------------------------------------
+
+    /// Walk every non-generic top-level declaration in the given module
+    /// AST, firing `try_infer_function_call` / `try_infer_method_call`
+    /// against each call expression in their bodies.  Without this pass
+    /// the inference machinery only fires inside SPEC'D bodies — calls
+    /// to generic functions/methods from non-generic free functions or
+    /// inline non-generic methods (e.g. `Request::parse(stream)` inside
+    /// `handle_connection`) leave `resolved_callee` / `resolved_method`
+    /// null, and codegen falls back to a name-based mangle that bakes
+    /// the unsubstituted generic param into the LLVM symbol (`$L1R$G`).
+    ///
+    /// New instantiations queued by `try_infer_function_call` are NOT
+    /// drained here — the caller should re-run `process_all()` after
+    /// this completes so the queued specs get materialized in the same
+    /// mono iteration.  `try_infer_method_call` specializes inline (no
+    /// queue) and produces no follow-up worklist work.
+    discover_inferred_calls_in_module(mut &this, root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        const _empty: string = "";
+        mut res_ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => {
+                    const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                    if (func.is_generic()) { continue; }
+                    this.discover_in_func_body(func, TypeRef::invalid(), &res_ctx);
+                }
+                NodeKind::StructDeclaration => {
+                    const sn: StructDeclNode* = stmt as StructDeclNode*;
+                    if (sn.is_generic()) { continue; }
+                    const owner_ref: TypeRef = this.lookup_owner_type_ref(sn.name);
+                    for (mut k: i64 = 0; k < sn.methods.length; k++) {
+                        const m: MethodNode* = sn.methods[k];
+                        if (m == null || m.func == null) { continue; }
+                        if (m.func.is_generic()) { continue; }
+                        const this_ty: TypeRef = if (m.is_static) {
+                            TypeRef::invalid()
+                        } else {
+                            owner_ref
+                        };
+                        this.discover_in_func_body(m.func, this_ty, &res_ctx);
+                    }
+                }
+                NodeKind::ClassDeclaration => {
+                    const cn: ClassDeclNode* = stmt as ClassDeclNode*;
+                    if (cn.is_generic()) { continue; }
+                    const owner_ref: TypeRef = this.lookup_owner_type_ref(cn.name);
+                    for (mut k: i64 = 0; k < cn.methods.length; k++) {
+                        const m: MethodNode* = cn.methods[k];
+                        if (m == null || m.func == null) { continue; }
+                        if (m.func.is_generic()) { continue; }
+                        const this_ty: TypeRef = if (m.is_static) {
+                            TypeRef::invalid()
+                        } else {
+                            owner_ref
+                        };
+                        this.discover_in_func_body(m.func, this_ty, &res_ctx);
+                    }
+                }
+                NodeKind::ImplementationBlock => {
+                    const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                    if (ib.generic_params.length > 0) { continue; }
+                    const owner_ref: TypeRef = this.lookup_owner_type_ref(ib.target_type);
+                    for (mut k: i64 = 0; k < ib.methods.length; k++) {
+                        const m: MethodNode* = ib.methods[k];
+                        if (m == null || m.func == null) { continue; }
+                        if (m.func.is_generic()) { continue; }
+                        const this_ty: TypeRef = if (m.is_static) {
+                            TypeRef::invalid()
+                        } else {
+                            owner_ref
+                        };
+                        this.discover_in_func_body(m.func, this_ty, &res_ctx);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Helper for `discover_inferred_calls_in_module` — sets up the
+    /// param/local table and walks the function body.  Mirrors the
+    /// table-construction logic at the tail of `resolve_func_and_body`,
+    /// but is reused here for non-spec'd bodies (where subst is null).
+    discover_in_func_body(mut &this, func: FunctionDeclNode*,
+                           this_type: TypeRef,
+                           res_ctx: ResolutionContext*) -> void {
+        if (func == null || func.body == null) { return; }
+        mut local_names: SymbolStr[] = [];
+        mut local_types: TypeRef[] = [];
+        if (this_type.is_valid()) {
+            local_names.push(this.intern_table.intern("this"));
+            local_types.push(this_type);
+        }
+        for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
+            const p: VarDeclNode* = func.parameters[pi];
+            if (p == null || !p.resolved_type.is_valid()) { continue; }
+            local_names.push(p.name);
+            local_types.push(p.resolved_type);
+        }
+        this.collect_locals_in_block(func.body, &local_names, &local_types);
+        this.discover_inferred_calls_in_block(func.body, res_ctx, null,
+                                              local_names, local_types);
+    }
+
+    /// Resolve a struct/class owner name to its canonical TypeRef.  Tries
+    /// the locally-qualified form first (the form `register_decl_in_index`
+    /// uses), then the bare name.  Used by the inherent-method walk to
+    /// seed `this`'s type for non-generic instance methods so receiver-
+    /// type-based inference can recognize `this.foo(...)` shapes.
+    lookup_owner_type_ref(&this, owner_name: SymbolStr) -> TypeRef {
+        if (this.decl_index == null || !owner_name.is_valid()) {
+            return TypeRef::invalid();
+        }
+        const qualified: SymbolStr = this.decl_index.resolve_qualified(owner_name);
+        mut ty: TypeRef = this.decl_index.lookup_type(qualified);
+        if (!ty.is_valid()) {
+            ty = this.decl_index.lookup_type(owner_name);
+        }
+        return ty;
+    }
+
+
+    // ----------------------------------------------------------------
     // Single request specialization
     // ----------------------------------------------------------------
 
@@ -735,7 +904,28 @@ type struct Monomorphizer {
             } else {
                 this_type
             };
-            this.resolve_func_and_body(method.func, res_ctx, subst, m_this);
+            // If the method has its own generic params (e.g. `hash<H>`
+            // on a spec'd `implement<A> trait Hash for String<A>`), bind
+            // them in a per-method resolution context before signature
+            // resolution.  Without this, the cloned method's params
+            // (whose resolved_type was reset by ASTCloner) re-resolve
+            // through `resolve_func_signature` with H unbound — and the
+            // Reference branch of the resolver builds `Reference(invalid)`
+            // rather than `Reference(GenericParam_H)`, baking a `Rv`
+            // (Reference-void) into the spec'd method's mangled name.
+            if (method.func.is_generic()) {
+                mut method_ctx: ResolutionContext = *res_ctx;
+                for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
+                    const gp: GenericParamNode* = method.func.generic_params[j];
+                    if (gp == null) { continue; }
+                    const gp_ref: TypeRef = this.arena.create_generic_param(
+                        gp.name, j as u64);
+                    method_ctx.add_binding(gp.name, gp_ref);
+                }
+                this.resolve_func_and_body(method.func, &method_ctx, subst, m_this);
+            } else {
+                this.resolve_func_and_body(method.func, res_ctx, subst, m_this);
+            }
         }
     }
 
@@ -1528,21 +1718,66 @@ type struct Monomorphizer {
             return;
         }
 
-        // Look up the function template.  Try scope-qualified first when a
-        // scope is present, then fall back to the bare-name search which
-        // walks the current module + a linear registry scan.
+        // Look up the function template.  Two flavors of ScopeResolution:
+        //   * Type-scope (`Owner::method(...)` where Owner is a struct/
+        //     class/enum) — must match an exact `Owner::method` template.
+        //     Bare-name linear-scan fallback is suppressed because it
+        //     would happily resolve `IpV4Addr::parse(addr)` to
+        //     `Request::parse<R>` (same leaf "parse"), inferring R from
+        //     the wrong arg-shape and specializing a never-correct
+        //     instantiation.
+        //   * Module-scope (`mod::fn(...)`) — bare-name fallback IS
+        //     correct: templates are registered under their fully-
+        //     qualified module path (e.g.
+        //     `std::core::mem::offset`), not under the user-written
+        //     module alias (`mem`).  Distinguished by `lookup_type`
+        //     returning invalid for the scope (i.e. it isn't a type).
+        //   * Identifier callees (no scope) — bare-name search is
+        //     always right; module qualification is implicit.
         mut entry: TemplateEntry* = null;
         if (callee_scope.is_valid()) {
-            const scope_str: string = this.intern_table.resolve(callee_scope);
             const member_str: string = this.intern_table.resolve(callee_name);
-            const qualified_str: string = scope_str + "::" + member_str;
+            const qualified_scope: SymbolStr = if (this.decl_index != null) {
+                this.decl_index.resolve_qualified(callee_scope)
+            } else {
+                callee_scope
+            };
+            // Qualified scope first.
+            const qscope_str: string = this.intern_table.resolve(qualified_scope);
+            const qualified_str: string = qscope_str + "::" + member_str;
             const qsym: SymbolStr = this.intern_table.intern(qualified_str);
             const qe: TemplateEntry* = this.generic_registry.get_template(qsym);
             if (qe != null && qe.node_kind == NodeKind::FunctionDeclaration) {
                 entry = qe;
             }
-        }
-        if (entry == null) {
+            // Bare-scope form (in case the scope is already qualified or
+            // the template happens to be registered under the bare key).
+            if (entry == null && !qualified_scope.equals(callee_scope)) {
+                const bscope_str: string = this.intern_table.resolve(callee_scope);
+                const bare_str: string = bscope_str + "::" + member_str;
+                const bsym: SymbolStr = this.intern_table.intern(bare_str);
+                const be: TemplateEntry* = this.generic_registry.get_template(bsym);
+                if (be != null && be.node_kind == NodeKind::FunctionDeclaration) {
+                    entry = be;
+                }
+            }
+            // Module-scope fallback: if the scope isn't a known type,
+            // it must be a module alias — re-run the bare-name search,
+            // which scans templates by their leaf name and finds e.g.
+            // `std::core::mem::offset` from a source `mem::offset(...)`.
+            if (entry == null && this.decl_index != null) {
+                const scope_as_type: TypeRef = this.decl_index.lookup_type(callee_scope);
+                const qscope_as_type: TypeRef =
+                    if (qualified_scope.equals(callee_scope)) {
+                        scope_as_type
+                    } else {
+                        this.decl_index.lookup_type(qualified_scope)
+                    };
+                if (!scope_as_type.is_valid() && !qscope_as_type.is_valid()) {
+                    entry = this.find_function_template_for_call(callee_name);
+                }
+            }
+        } else {
             entry = this.find_function_template_for_call(callee_name);
         }
         if (entry == null) { return; }
@@ -1653,6 +1888,62 @@ type struct Monomorphizer {
         return null;
     }
 
+    /// Walk the methods[] of a non-generic struct/class whose AST was
+    /// registered in `inherent_owner_index` during TemplateRegistration.
+    /// Used for receivers like `Request` / `Response` whose generic
+    /// methods (`parse<R>`, `write_to<W>`) live inline on the type — the
+    /// type itself is never monomorphized so `find_spec_impl_method`
+    /// doesn't see it, and there's no `implement Foo` block so
+    /// `find_trait_impl_method_for_target` doesn't either.
+    ///
+    /// Returns the matching MethodNode and writes the owner ASTNode
+    /// through `out_owner_ast` so the caller can push the spec'd
+    /// sibling onto the right `methods[]` array.  Non-generic methods
+    /// skip — they don't need monomorphization.
+    find_inherent_method(&this, recv_type: TypeRef, method_name: SymbolStr,
+                          out_owner_ast: ASTNode**) -> MethodNode* {
+        if (!recv_type.is_valid()) { return null; }
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return null; }
+        // Try the receiver's qualified name first (the form
+        // TemplateRegistration uses), then fall back to the bare name
+        // (mirrors `register_inherent_owner_if_has_generic_methods`,
+        // which double-registers when the qualified and bare names
+        // differ — e.g. for primitive owners in namespaced modules).
+        mut owner_ast: ASTNode* = null;
+        const qname: SymbolStr = this.arena.get_qualified_name(recv_type);
+        if (qname.is_valid()) {
+            owner_ast = registry.lookup_inherent_owner(qname);
+        }
+        if (owner_ast == null) {
+            const bare: SymbolStr = this.bare_name_of(recv_type);
+            if (bare.is_valid()) {
+                owner_ast = registry.lookup_inherent_owner(bare);
+            }
+        }
+        if (owner_ast == null) { return null; }
+
+        mut owner_methods: MethodNode*[] = [];
+        if (owner_ast.kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = owner_ast as StructDeclNode*;
+            owner_methods = sn.methods;
+        } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = owner_ast as ClassDeclNode*;
+            owner_methods = cn.methods;
+        } else {
+            return null;
+        }
+        for (mut k: i64 = 0; k < owner_methods.length; k++) {
+            const m: MethodNode* = owner_methods[k];
+            if (m == null || m.func == null) { continue; }
+            if (!m.func.name.equals(method_name)) { continue; }
+            if (m.func.generic_params.length == 0) { continue; }
+            *out_owner_ast = owner_ast;
+            return m;
+        }
+        return null;
+    }
+
     /// Walk the trait-impl registry for any impl block whose `target_type`
     /// equals `bare_target_name` and that has a generic method with the
     /// given name.  Used for primitive receivers (`i32`, `string`, …) —
@@ -1755,20 +2046,38 @@ type struct Monomorphizer {
                                         || tk == TypeKind::String;
         if (!is_user_kind && !is_primitive_kind) { return; }
 
-        // Find the impl method.  User-defined types: walk spec_entries
-        // (the spec'd impl blocks).  Primitives: walk trait_impl_blocks
-        // by bare type name.  Non-generic trait methods skip in either
-        // path — they don't need monomorphization.
+        // Find the impl method.  Three lookup paths:
+        //   1. spec_entries — generic types whose spec'd impl blocks
+        //      carry the method (e.g. `String<GA>::hash<H>`).
+        //   2. trait_impl_blocks — primitive receivers whose trait impls
+        //      live keyed by bare type name (`i32::hash<H>`).
+        //   3. inherent_owner_index — generic INSTANCE methods declared
+        //      inline on a non-generic struct/class (e.g.
+        //      `Response::write_to<W>`).  The owner has no spec_entries
+        //      row (it's never monomorphized) and no trait-impl key, so
+        //      the first two paths miss; this path uses the qualified
+        //      name registered in TemplateRegistration to recover the
+        //      StructDecl/ClassDecl AST.  No impl block exists for these
+        //      methods — the spec'd sibling gets pushed onto the owner's
+        //      own `methods[]` array instead, and codegen's
+        //      `declare_struct_methods` / `declare_class_methods` walks
+        //      that array directly.
         mut impl_node: ImplBlockNode* = null;
+        mut inherent_owner_ast: ASTNode* = null;
         mut orig_method: MethodNode* = null;
         if (is_user_kind) {
             orig_method = this.find_spec_impl_method(recv_type, ma.member, &impl_node);
+            if (orig_method == null) {
+                orig_method = this.find_inherent_method(
+                    recv_type, ma.member, &inherent_owner_ast);
+            }
         } else {
             const bare: SymbolStr = this.bare_name_of(recv_type);
             orig_method = this.find_trait_impl_method_for_target(
                 bare, ma.member, &impl_node);
         }
-        if (orig_method == null || impl_node == null) { return; }
+        if (orig_method == null) { return; }
+        if (impl_node == null && inherent_owner_ast == null) { return; }
         const orig_func: FunctionDeclNode* = orig_method.func;
         if (orig_func == null) { return; }
 
@@ -1846,14 +2155,27 @@ type struct Monomorphizer {
         }
 
         // Inferred all method-level params.  Specialize the method by
-        // cloning + substituting so the impl block ends up with a
-        // concrete sibling alongside the still-generic original.  The
-        // injection pass walks impl_nodes and `declare_method` skips
-        // generics, so the spec'd sibling is the one that gets emitted.
+        // cloning + substituting so the owner ends up with a concrete
+        // sibling alongside the still-generic original.  Spec'd siblings
+        // get emitted by codegen because `declare_method` skips
+        // `generic_params.length > 0` — the spec'd clone is non-generic.
         const spec_method: MethodNode* = this.specialize_method(
             orig_method, method_param_names, this.inference_bindings, recv_type);
         if (spec_method == null) { return; }
-        impl_node.methods.push(spec_method);
+        if (inherent_owner_ast != null) {
+            // Push onto the inherent owner's own methods[] array so
+            // `declare_struct_methods` / `declare_class_methods` picks
+            // it up when codegen walks the (non-generic) owner.
+            if (inherent_owner_ast.kind == NodeKind::StructDeclaration) {
+                const sn: StructDeclNode* = inherent_owner_ast as StructDeclNode*;
+                sn.methods.push(spec_method);
+            } else if (inherent_owner_ast.kind == NodeKind::ClassDeclaration) {
+                const cn: ClassDeclNode* = inherent_owner_ast as ClassDeclNode*;
+                cn.methods.push(spec_method);
+            }
+        } else {
+            impl_node.methods.push(spec_method);
+        }
         call.set_resolved_method(spec_method as ASTNode*);
         // Register the spec in DI under the receiver type's canonical name so
         // cross-module call sites (and in-module declare_extern fallback) find
@@ -1861,7 +2183,12 @@ type struct Monomorphizer {
         // entry for `Type::method` is the (now-skipped) generic template's
         // sema-time registration, which has GenericParam(H) baked into its
         // param types and produces a `1H`-placeholder mangle.
-        this.register_spec_method_in_di(spec_method, recv_type, impl_node);
+        if (inherent_owner_ast != null) {
+            this.register_spec_method_in_di_inherent(
+                spec_method, recv_type, inherent_owner_ast);
+        } else {
+            this.register_spec_method_in_di(spec_method, recv_type, impl_node);
+        }
 
         // Re-walk the spec'd method body for inferred-arg generic free-fn
         // calls.  Without this, transitive calls like `hash_u64_le(hasher,
@@ -2057,6 +2384,52 @@ type struct Monomorphizer {
                 qualified_target, spec_methods, owning_module,
                 this.intern_table, this.arena);
         }
+    }
+
+    /// Register a freshly created spec method whose owner is a non-
+    /// generic struct/class (no impl block).  Mirrors the impl-block
+    /// path in `register_spec_method_in_di`, but pulls the
+    /// qualified-target name from the receiver's arena qualified name
+    /// and the source module from the owner AST's `source_module`.
+    register_spec_method_in_di_inherent(mut &this, spec_method: MethodNode*,
+                                          recv_type: TypeRef,
+                                          owner_ast: ASTNode*) -> void {
+        if (this.decl_index == null) { return; }
+        if (spec_method == null || owner_ast == null) { return; }
+
+        // Qualified target: the receiver's canonical arena name.  For
+        // non-generic structs this matches the form TypeResolution uses
+        // when registering inline methods, so the spec'd method lands
+        // under the same key the template's overload entry occupies.
+        mut qualified_target: SymbolStr = this.arena.get_qualified_name(recv_type);
+        if (!qualified_target.is_valid()) { return; }
+
+        // Source module: take it from the owner AST's source_module
+        // field (set by SpecializationPasses::tag_decl_source_module
+        // during TemplateRegistration).  Fall back to the current
+        // mono module when the field is empty — happens for the
+        // inherent-method's *defining* module, which TemplateRegistration
+        // already processed before the consuming module hits it here.
+        mut source_module_str: string = "";
+        if (owner_ast.kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = owner_ast as StructDeclNode*;
+            source_module_str = sn.source_module;
+        } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = owner_ast as ClassDeclNode*;
+            source_module_str = cn.source_module;
+        }
+        mut owning_module: SymbolStr = SymbolStr::empty();
+        if (source_module_str != "") {
+            owning_module = this.intern_table.intern(source_module_str);
+        } else {
+            owning_module = this.current_module;
+        }
+
+        mut spec_methods: MethodNode*[] = [];
+        spec_methods.push(spec_method);
+        this.decl_index.register_methods_with_module(
+            qualified_target, spec_methods, owning_module,
+            this.intern_table, this.arena);
     }
 
     /// Find an InstantiatedType in the arena whose resolved_type is the

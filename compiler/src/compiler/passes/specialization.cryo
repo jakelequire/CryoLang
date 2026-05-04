@@ -166,6 +166,46 @@ function register_static_method_templates(owner_name: SymbolStr,
     }
 }
 
+/// Register a non-generic struct/class as an "inherent owner" when it
+/// has at least one inline generic method.  This lets the monomorphizer
+/// find the owner's AST from a receiver TypeRef without walking
+/// `spec_entries` (which only tracks specialized GENERIC types).
+///
+/// Generic STATIC methods are also covered by `register_static_method_templates`,
+/// which keys them by `Owner::method` for ScopeResolution callees.  This
+/// registration is the complement for GENERIC INSTANCE methods, whose
+/// dispatch goes through `try_infer_method_call` by receiver type.
+///
+/// Skipped when the owner is itself generic — those types are tracked via
+/// the regular template entry, and their methods get specialized as part
+/// of struct/class monomorphization rather than per-call.
+function register_inherent_owner_if_has_generic_methods(
+        owner_name: SymbolStr, methods: MethodNode*[],
+        owner_ast: ASTNode*, registry: GenericRegistry*,
+        ctx: CompilationContext*) -> void {
+    if (owner_ast == null || methods.length == 0) { return; }
+
+    mut has_generic_method: boolean = false;
+    for (mut i: i64 = 0; i < methods.length; i++) {
+        const m: MethodNode* = methods[i];
+        if (m == null || m.func == null) { continue; }
+        if (m.func.is_generic()) {
+            has_generic_method = true;
+            break;
+        }
+    }
+    if (!has_generic_method) { return; }
+
+    const owner_qsym: SymbolStr = ctx.qualify_symbol_sym(owner_name);
+    registry.register_inherent_owner(owner_qsym, owner_ast);
+    // Also register under the bare name so receiver-type lookups that
+    // miss the qualified form (e.g., when the arena returns the bare
+    // name for primitive impls) still find the owner.
+    if (!owner_qsym.equals(owner_name)) {
+        registry.register_inherent_owner(owner_name, owner_ast);
+    }
+}
+
 /// Register a newly injected specialized declaration into the DeclarationIndex
 /// so that sema can look it up without rescanning the AST.
 /// Delegates to the shared TypeResolutionPasses::register_decl_in_index().
@@ -390,6 +430,13 @@ type struct SpecializationPasses {
                     if (!node.is_generic()) {
                         register_static_method_templates(node.name, node.methods,
                             registry, arena, ctx);
+                        // Generic INSTANCE methods on non-generic structs
+                        // (e.g. `Response::write_to<W>`) dispatch via receiver
+                        // type rather than scope-qualified name; record the
+                        // owner AST here so try_infer_method_call can find
+                        // its `methods[]` from a receiver TypeRef.
+                        register_inherent_owner_if_has_generic_methods(
+                            node.name, node.methods, stmt, registry, ctx);
                     }
                 }
                 NodeKind::EnumDeclaration => {
@@ -408,6 +455,8 @@ type struct SpecializationPasses {
                     if (!node.is_generic()) {
                         register_static_method_templates(node.name, node.methods,
                             registry, arena, ctx);
+                        register_inherent_owner_if_has_generic_methods(
+                            node.name, node.methods, stmt, registry, ctx);
                     }
                 }
                 NodeKind::FunctionDeclaration => {
@@ -489,7 +538,28 @@ type struct SpecializationPasses {
             ctx.monomorphizer = mono_ptr;
         }
 
-        const success: boolean = mono_ptr.process_all();
+        mut success: boolean = mono_ptr.process_all();
+
+        // Walk this module's non-generic free functions and inline
+        // struct/class methods to discover inferred-arg generic calls
+        // (e.g. `Request::parse(stream)` inside `handle_connection`).
+        // Without this, inference only fires inside SPEC'D bodies and
+        // calls from non-generic carriers leave their resolved_callee /
+        // resolved_method null — codegen then mangles against the bare
+        // template, leaking the unsubstituted generic param into the
+        // LLVM symbol.
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+        if (root != null) {
+            mono_ptr.discover_inferred_calls_in_module(root);
+            // Drain the pending worklist for any new instantiations
+            // queued by the walk.  We deliberately don't re-enter
+            // `process_all` here because its `collect_unmonomorphized`
+            // pre-pass would re-feed already-filtered partial specs
+            // (those containing GenericParam at depth) and re-run
+            // post-pass marking that's already done.
+            const post_success: boolean = mono_ptr.drain_pending_worklist();
+            if (success) { success = post_success; }
+        }
 
         LOG_DEBUG(LogComponent::General, "[Monomorphization] Completed: %lld specializations",
             mono_ptr.specialization_count());

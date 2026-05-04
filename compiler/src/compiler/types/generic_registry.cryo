@@ -155,6 +155,19 @@ type struct GenericRegistry {
     trait_decl_index:   HashMap<u32, i64>;
     trait_decl_nodes:   TraitDeclNode*[];
 
+    // -- Inherent-owner registry --
+    // Maps a qualified type name (SymbolStr.id) to the StructDeclNode* /
+    // ClassDeclNode* that owns inline generic methods on a NON-generic
+    // type.  Lets `try_infer_method_call` find the AST for receivers like
+    // `Request` or `Response` whose generic method declarations
+    // (`parse<R>`, `write_to<W>`) live inline on the struct rather than
+    // in an `implement` block — those never go through monomorphization
+    // themselves and therefore have no spec_entries row to walk.
+    // Populated during TemplateRegistration for any non-generic
+    // struct/class that has at least one generic method (static or not).
+    inherent_owner_index: HashMap<u32, i64>;
+    inherent_owner_nodes: ASTNode*[];
+
 
     // ----------------------------------------------------------------
     // Construction
@@ -179,6 +192,8 @@ type struct GenericRegistry {
             trait_impl_index:  HashMap<u64, i64>::new(),
             trait_decl_index:  HashMap<u32, i64>::new(),
             trait_decl_nodes:  [],
+            inherent_owner_index: HashMap<u32, i64>::new(),
+            inherent_owner_nodes: [],
         };
     }
 
@@ -319,6 +334,40 @@ type struct GenericRegistry {
         const opt: Option<i64> = this.trait_decl_index.get(&name.id);
         if (opt.is_some()) {
             return this.trait_decl_nodes[opt.unwrap()];
+        }
+        return null;
+    }
+
+    /// Register a non-generic struct/class declaration as an "inherent
+    /// owner" — a type whose inline `methods[]` array carries one or
+    /// more generic methods.  Indexed by qualified-name SymbolStr.id so
+    /// inference paths can recover the AST from a receiver TypeRef via
+    /// the arena's qualified name. Idempotent: the latest registration
+    /// wins (matches register_template's overwrite policy).
+    register_inherent_owner(mut &this, qualified_name: SymbolStr,
+                             node: ASTNode*) -> void {
+        if (node == null || !qualified_name.is_valid()) { return; }
+        const h: u64 = hash_int(qualified_name.id as u64);
+        const existing: Option<i64> = this.inherent_owner_index.get(&qualified_name.id);
+        if (existing.is_some()) {
+            this.inherent_owner_nodes[existing.unwrap()] = node;
+            return;
+        }
+        const idx: i64 = this.inherent_owner_nodes.length;
+        this.inherent_owner_nodes.push(node);
+        this.inherent_owner_index.insert(qualified_name.id, idx);
+    }
+
+    /// Look up an inherent-owner AST by qualified name. Returns null
+    /// when nothing matches — most commonly because the receiver type
+    /// is generic (those go through spec_entries instead) or the type
+    /// has no inline generic methods to register.
+    lookup_inherent_owner(&this, qualified_name: SymbolStr) -> ASTNode* {
+        if (!qualified_name.is_valid()) { return null; }
+        const h: u64 = hash_int(qualified_name.id as u64);
+        const opt: Option<i64> = this.inherent_owner_index.get(&qualified_name.id);
+        if (opt.is_some()) {
+            return this.inherent_owner_nodes[opt.unwrap()];
         }
         return null;
     }
