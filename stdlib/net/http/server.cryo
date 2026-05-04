@@ -1,19 +1,20 @@
 ///! HTTP server — blocking, connection-per-request.
 ///!
-///! `serve(addr, handler)` binds, accepts connections in a loop, and
-///! for each one parses a `Request`, calls `handler(req)`, writes
-///! the `Response`, and closes. Handler type is `(Request) -> Response`
-///! — routing lives inside the handler, because a single catch-all
-///! function keeps the server surface tiny and lets users pick
-///! whichever router they want (an enum match, a `HashMap` of paths,
-///! or a full tree matcher).
+///! The only public surface is `HttpServer`. Build one with `HttpServer::new`,
+///! optionally attach a ready callback with `HttpServer::with_ready`, then
+///! call `.run()` to bind and start serving.
 ///!
-///! Connection-per-request rules out keep-alive and pipelining, on
-///! purpose: it's enough for a dev server and simple tooling, and
-///! it's trivial to reason about.
+///! Handler type is `(Request) -> Response` — routing, path matching, and
+///! method checking all live inside the handler so the server itself stays
+///! policy-free. See the http-server example for a simple router.
+///!
+///! Connection-per-request rules out keep-alive and pipelining on purpose:
+///! it is enough for a dev server and simple tooling and is trivial to
+///! reason about.
 
 namespace std::net::http::server;
 
+import core::option;
 import core::result;
 import io::error;
 import net::socket_addr;
@@ -21,64 +22,104 @@ import net::tcp;
 import net::http::request;
 import net::http::response;
 
-/// Bind to `addr` and run `handler` for each incoming connection
-/// until a fatal error occurs on the listener. Per-connection errors
-/// (parse failures, client hangups, write errors) are swallowed so
-/// one bad client can't kill the server. Callers who need that
-/// telemetry should instrument `handler` itself.
-function serve(addr: SocketAddr, handler: (Request) -> Response) -> Result<(), IoError> {
-    match (TcpListener::bind(addr)) {
-        Result::Ok(listener) => {
-            mut l: TcpListener = listener;
-            loop {
-                match (l.accept()) {
-                    Result::Ok(stream) => {
-                        mut s: TcpStream = stream;
-                        handle_connection(&s, handler);
-                        s.drop();
-                    }
-                    Result::Err(err) => {
-                        // Listener-level errors (e.g., EMFILE, ENFILE)
-                        // are fatal — return so the caller can log
-                        // and either retry or bail.
-                        l.drop();
-                        return Result::Err(err);
+// ============================================================================
+// HttpServer
+// ============================================================================
+
+/// A configured HTTP server ready to bind and run.
+///
+/// ```
+/// // Minimal — no startup log.
+/// mut s: HttpServer = HttpServer::new(addr, handler);
+/// s.run();
+///
+/// // With a ready callback for logging or readiness signalling.
+/// mut s: HttpServer = HttpServer::new(addr, handler)
+///                         .with_ready(on_ready);
+/// s.run();
+/// ```
+///
+/// `.run()` blocks indefinitely, returning only on a fatal listener-level
+/// error (e.g. EMFILE). Per-connection failures (parse errors, client
+/// hangups, write errors) are swallowed — instrument `handler` itself for
+/// request-level telemetry.
+type struct HttpServer {
+    addr:     SocketAddr;
+    handler:  (Request) -> Response;
+    on_ready: Option<() -> void>;
+
+    /// Create a server. No ready callback is set; add one later with
+    /// `.with_ready(cb)` if needed.
+    static new(addr: SocketAddr, handler: (Request) -> Response) -> HttpServer {
+        return HttpServer {
+            addr:     addr,
+            handler:  handler,
+            on_ready: Option::None
+        };
+    }
+
+    /// Attach a ready callback and return `this` for chaining. `cb` is
+    /// called once after the socket binds successfully, before the first
+    /// `accept`. Use it to log the listening address, write a pid-file,
+    /// or signal an external health-check.
+    with_ready(mut &this, cb: () -> void) -> &HttpServer {
+        this.on_ready = Option::Some(cb);
+        return &this;
+    }
+
+    /// Bind to `this.addr` and serve requests forever. Returns `Err`
+    /// only on a fatal listener error (e.g. EMFILE, ENFILE).
+    run(mut &this) -> Result<(), IoError> {
+        match (TcpListener::bind(this.addr)) {
+            Result::Ok(listener) => {
+                mut l: TcpListener = listener;
+                match (this.on_ready) {
+                    Option::Some(cb) => { cb(); }
+                    Option::None     => { }
+                }
+                loop {
+                    match (l.accept()) {
+                        Result::Ok(stream) => {
+                            mut s: TcpStream = stream;
+                            this.handle_connection(&s);
+                            s.drop();
+                        }
+                        Result::Err(err) => {
+                            l.drop();
+                            return Result::Err(err);
+                        }
                     }
                 }
             }
+            Result::Err(err) => { return Result::Err(err); }
         }
-        Result::Err(err) => { return Result::Err(err); }
     }
-}
 
-/// Parse one request, run the handler, write one response. Errors
-/// are dropped on the floor — a parse failure writes a canned 400,
-/// a handler-level failure writes a canned 500. Writes that fail
-/// mean the peer went away and there's nothing useful to do.
-function handle_connection(stream: mut &TcpStream,
-                           handler: (Request) -> Response) -> void {
-    match (Request::parse(stream)) {
-        Result::Ok(req) => {
-            mut request_local: Request = req;
-            mut response: Response = handler(request_local);
-            match (response.write_to(stream)) {
-                Result::Ok(_) => { }
-                Result::Err(_) => { }
+    /// Parse one request, dispatch to `handler`, write the response.
+    /// A parse failure writes a canned 400; a write failure (peer gone)
+    /// is silently dropped. The accept loop always continues.
+    handle_connection(&this, stream: mut &TcpStream) -> void {
+        match (Request::parse(stream)) {
+            Result::Ok(req) => {
+                mut request_local: Request = req;
+                mut response: Response = (this.handler)(request_local);
+                match (response.write_to(stream)) {
+                    Result::Ok(_) => { }
+                    Result::Err(_) => { }
+                }
+                response.drop();
             }
-            response.drop();
-            // `handler` took ownership of the request; we don't drop it.
-        }
-        Result::Err(_) => {
-            // Malformed request — canned 400.
-            mut bad: Response = Response::text(
-                StatusCode::bad_request(),
-                Str::from_raw("bad request" as u8*, 11)
-            );
-            match (bad.write_to(stream)) {
-                Result::Ok(_) => { }
-                Result::Err(_) => { }
+            Result::Err(_) => {
+                mut bad: Response = Response::text(
+                    StatusCode::bad_request(),
+                    Str::from_raw("Bad Request" as u8*, 11)
+                );
+                match (bad.write_to(stream)) {
+                    Result::Ok(_) => { }
+                    Result::Err(_) => { }
+                }
+                bad.drop();
             }
-            bad.drop();
         }
     }
 }
