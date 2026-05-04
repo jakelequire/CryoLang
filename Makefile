@@ -10,7 +10,7 @@
 # Targets:
 #   stdlib           Build the standard library via bin/cryo
 #   cryo             Build the self-hosted compiler via bin/cryo
-#   selfhost-check   Full 8-stage chain + stage-4/stage-5 byte-identity
+#   selfhost-check   3-round chain (6 stages) + stage-3/stage-4 byte-identity
 #   pin-cryo         Refresh bin/cryo from compiler/build/bin/cryo
 #   install          Symlink bin/cryo + stdlib system-wide (delegates to install.sh)
 #   uninstall        Remove the install.sh symlinks
@@ -35,7 +35,7 @@ help:
 	@echo "Cryo build targets:"
 	@echo "  make stdlib            Build the standard library via bin/cryo"
 	@echo "  make cryo              Build the self-hosted compiler via bin/cryo"
-	@echo "  make selfhost-check    Full 8-stage chain + byte-identity gate"
+	@echo "  make selfhost-check    3-round chain (6 stages) + byte-identity gate"
 	@echo "  make pin-cryo          Refresh bin/cryo from compiler/build/bin/cryo"
 	@echo "  make install           Symlink bin/cryo + stdlib system-wide (sudo)"
 	@echo "  make uninstall         Remove the install.sh symlinks"
@@ -96,8 +96,7 @@ $(LEGACY_BOOT):
 # ---- clean ------------------------------------------------------------
 clean:
 	@echo "==> Cleaning compiler + stdlib build outputs"
-	@rm -rf compiler/build compiler/build-s3 compiler/build-s4 compiler/build-s5
-	@rm -rf stdlib/.bin stdlib/.bin-s2 stdlib/.bin-s3 stdlib/.bin-s4
+	@rm -rf compiler/build stdlib/.bin
 
 distclean: clean
 	@echo "==> Cleaning legacy bootstrap"

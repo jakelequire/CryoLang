@@ -1,19 +1,37 @@
 #!/usr/bin/env python3
 """
-selfhost-check: build the Cryo compiler through 8 stages and verify that
-stage-4 and stage-5 produce byte-identical IR.
+selfhost-check: build the Cryo compiler through 3 rounds (6 stages) and
+verify that stage-3 and stage-4 produce byte-identical IR.
 
-The chain is rooted at the pinned `bin/cryo` self-hosted binary, not
-the legacy C++ bootstrap. That binary is the canonical entry point for
-the new chain (the C++ bootstrap at `legacy/bootstrap/bin/cryo` is
-retained for archaeology only, and is no longer required by this
-script). Whenever `compiler/src/` adopts new syntax that `bin/cryo`
-can't parse, refresh the pin via `make pin-cryo` after a clean
-selfhost-check.
+The chain is rooted at the pinned `bin/cryo` self-hosted binary, not the
+legacy C++ bootstrap. That binary is the canonical entry point for the
+new chain (the C++ bootstrap at `legacy/bootstrap/bin/cryo` is retained
+for archaeology only, and is no longer required by this script).
+Whenever `compiler/src/` adopts new syntax that `bin/cryo` can't parse,
+refresh the pin via `make pin-cryo` after a clean selfhost-check.
 
-Per-compiler-stage outputs are isolated through `--build-dir=…` so
-each stage's binary is a separate file on disk. That sidesteps the
-old `compiler/build/cryo` vs `compiler/build/bin/cryo` confusion.
+Why 3 rounds and not 4: stage-2 was built by the (potentially older) pin,
+so its codegen behavior may differ from the new source's intent. Stage-3
+is the first compiler whose codegen comes purely from the current source.
+Once stage-3's codegen matches stage-4's codegen, the fixed point is
+reached. The previous 4-round chain (stage-4 vs stage-5) added a single
+extra safety round; in practice convergence happens at stage-3.
+
+Stage outputs are nested under the regular build dirs to avoid
+top-level clutter:
+
+    compiler/build/                 (stage-2 — also what `make cryo` builds)
+    compiler/build/self/s3/         (stage-3 compiler)
+    compiler/build/self/s4/         (stage-4 compiler — IR-identity gate)
+    stdlib/.bin/                    (built by pin — canonical link target)
+    stdlib/.bin/self/s2/            (rebuilt by stage-2; smoke-test only)
+    stdlib/.bin/self/s3/            (rebuilt by stage-3; smoke-test only)
+
+The `.bin/self/sN` archives are written by their corresponding compiler
+stage but never read back — every compiler stage links against the
+canonical `<stdlib>/.bin/libcryo.a` produced in round 1. Rebuilding
+stdlib at each round is a smoke test that the stage's codegen handles
+the stdlib source, not a link dependency.
 
 Usage:
     python3 scripts/selfhost-check.py            # (or `make selfhost-check`)
@@ -21,8 +39,8 @@ Usage:
     python3 scripts/selfhost-check.py --keep-logs
 
 Exit codes:
-    0  fixed point holds (stage-4 IR == stage-5 IR)
-    1  any stage failed, or stage-4/stage-5 IR differ
+    0  fixed point holds (stage-3 IR == stage-4 IR)
+    1  any stage failed, or stage-3/stage-4 IR differ
     2  prerequisites missing (e.g. bin/cryo not present)
 """
 
@@ -41,14 +59,20 @@ from pathlib import Path
 # Paths (resolved from this script's location, NOT the cwd)
 # ---------------------------------------------------------------------------
 ROOT   = Path(__file__).resolve().parent.parent
-BOOT   = ROOT / "bin" / "cryo"                       # pinned self-hosted boot
-STAGE2 = ROOT / "compiler" / "build"    / "bin" / "cryo"   # boot    → stage-2
-STAGE3 = ROOT / "compiler" / "build-s3" / "bin" / "cryo"   # stage-2 → stage-3
-STAGE4 = ROOT / "compiler" / "build-s4" / "bin" / "cryo"   # stage-3 → stage-4
-STAGE5 = ROOT / "compiler" / "build-s5" / "bin" / "cryo"   # stage-4 → stage-5
-S4_LL  = ROOT / "compiler" / "build-s4" / "bin" / "cryo.ll"
-S5_LL  = ROOT / "compiler" / "build-s5" / "bin" / "cryo.ll"
+BOOT   = ROOT / "bin" / "cryo"                                       # pinned boot
+STAGE2 = ROOT / "compiler" / "build"           / "bin" / "cryo"      # boot → stage-2
+STAGE3 = ROOT / "compiler" / "build" / "self" / "s3" / "bin" / "cryo"  # stage-2 → stage-3
+STAGE4 = ROOT / "compiler" / "build" / "self" / "s4" / "bin" / "cryo"  # stage-3 → stage-4
+S3_LL  = ROOT / "compiler" / "build" / "self" / "s3" / "bin" / "cryo.ll"
+S4_LL  = ROOT / "compiler" / "build" / "self" / "s4" / "bin" / "cryo.ll"
 LOG_DIR = ROOT / "build-logs" / "selfhost-check"
+
+# Top-level dirs we wipe before the chain runs. Recursive — covers the
+# nested `self/` subtree as well.
+WIPE_PATHS = [
+    ROOT / "compiler" / "build",
+    ROOT / "stdlib"   / ".bin",
+]
 
 # ---------------------------------------------------------------------------
 # Color helper (honors NO_COLOR; only colorizes on a TTY)
@@ -72,11 +96,10 @@ C = _Colors(enabled=(sys.stdout.isatty() and not os.environ.get("NO_COLOR")))
 @dataclass
 class Stage:
     src: str         # "stdlib" or "compiler"
-    via: str         # "pinned" / "stage-2" / "stage-3" / "stage-4"
-    to: str          # ".bin" / "stage-2" / ".bin-s2" / "stage-3" / ...
+    via: str         # "pinned" / "stage-2" / "stage-3"
+    to: str          # short descriptor of the output location
     cwd: Path
     cmd: list
-    pre_wipe: list = field(default_factory=list)
 
     @property
     def label(self):
@@ -86,64 +109,43 @@ class Stage:
 def make_stages():
     return [
         # ------------------------------------------------------------------
-        # Round 1: pinned boot → stage-2
+        # Round 1: pinned boot → stage-2  (default build dirs)
         # ------------------------------------------------------------------
         Stage(
             src="stdlib", via="pinned", to=".bin",
             cwd=ROOT / "stdlib",
             cmd=[str(BOOT), "build"],
-            pre_wipe=[ROOT / "stdlib" / ".bin"],
         ),
         Stage(
-            src="compiler", via="pinned", to="stage-2",
+            src="compiler", via="pinned", to="build",
             cwd=ROOT / "compiler",
             cmd=[str(BOOT), "build"],
-            pre_wipe=[ROOT / "compiler" / "build"],
         ),
         # ------------------------------------------------------------------
-        # Round 2: stage-2 → stage-3
+        # Round 2: stage-2 → stage-3  (nested under self/)
         # ------------------------------------------------------------------
         Stage(
-            src="stdlib", via="stage-2", to=".bin-s2",
+            src="stdlib", via="stage-2", to=".bin/self/s2",
             cwd=ROOT / "stdlib",
-            cmd=[str(STAGE2), "build", "--build-dir=.bin-s2"],
-            pre_wipe=[ROOT / "stdlib" / ".bin-s2"],
+            cmd=[str(STAGE2), "build", "--build-dir=.bin/self/s2"],
         ),
         Stage(
-            src="compiler", via="stage-2", to="stage-3",
+            src="compiler", via="stage-2", to="build/self/s3",
             cwd=ROOT / "compiler",
-            cmd=[str(STAGE2), "build", "--build-dir=build-s3"],
-            pre_wipe=[ROOT / "compiler" / "build-s3"],
+            cmd=[str(STAGE2), "build", "--build-dir=build/self/s3"],
         ),
         # ------------------------------------------------------------------
-        # Round 3: stage-3 → stage-4
+        # Round 3: stage-3 → stage-4  (byte-identity gate)
         # ------------------------------------------------------------------
         Stage(
-            src="stdlib", via="stage-3", to=".bin-s3",
+            src="stdlib", via="stage-3", to=".bin/self/s3",
             cwd=ROOT / "stdlib",
-            cmd=[str(STAGE3), "build", "--build-dir=.bin-s3"],
-            pre_wipe=[ROOT / "stdlib" / ".bin-s3"],
+            cmd=[str(STAGE3), "build", "--build-dir=.bin/self/s3"],
         ),
         Stage(
-            src="compiler", via="stage-3", to="stage-4",
+            src="compiler", via="stage-3", to="build/self/s4",
             cwd=ROOT / "compiler",
-            cmd=[str(STAGE3), "build", "--build-dir=build-s4"],
-            pre_wipe=[ROOT / "compiler" / "build-s4"],
-        ),
-        # ------------------------------------------------------------------
-        # Round 4: stage-4 → stage-5  (byte-identity gate)
-        # ------------------------------------------------------------------
-        Stage(
-            src="stdlib", via="stage-4", to=".bin-s4",
-            cwd=ROOT / "stdlib",
-            cmd=[str(STAGE4), "build", "--build-dir=.bin-s4"],
-            pre_wipe=[ROOT / "stdlib" / ".bin-s4"],
-        ),
-        Stage(
-            src="compiler", via="stage-4", to="stage-5",
-            cwd=ROOT / "compiler",
-            cmd=[str(STAGE4), "build", "--build-dir=build-s5"],
-            pre_wipe=[ROOT / "compiler" / "build-s5"],
+            cmd=[str(STAGE3), "build", "--build-dir=build/self/s4"],
         ),
     ]
 
@@ -179,7 +181,6 @@ def ensure_dir(p: Path):
 def run_stage(idx: int, total: int, stage: Stage, log_path: Path,
               verbose: bool) -> tuple[bool, float]:
     ensure_dir(log_path.parent)
-    wipe_paths(stage.pre_wipe)
 
     prefix = f"  {C.CYAN}[{idx}/{total}]{C.RESET} {stage.label}  "
     sys.stdout.write(prefix)
@@ -286,7 +287,7 @@ def ensure_boot():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cryo selfhost byte-identity check (8 stages, rooted at bin/cryo).",
+        description="Cryo selfhost byte-identity check (3 rounds, 6 stages, rooted at bin/cryo).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -299,7 +300,7 @@ def main():
         return 2
 
     print()
-    print(f"{C.BOLD}selfhost-check{C.RESET}  {C.DIM}— 8-stage byte-identity gate (boot: bin/cryo){C.RESET}")
+    print(f"{C.BOLD}selfhost-check{C.RESET}  {C.DIM}— 6-stage byte-identity gate (boot: bin/cryo){C.RESET}")
     print(f"  {C.DIM}root:{C.RESET} {ROOT}")
     print(f"  {C.DIM}logs:{C.RESET} {LOG_DIR.relative_to(ROOT)}/")
     print()
@@ -309,16 +310,18 @@ def main():
     ensure_dir(LOG_DIR)
 
     print(f"{C.BOLD}==> Wiping stage outputs{C.RESET}")
-    wipe_paths([
-        ROOT / "compiler" / "build",
-        ROOT / "compiler" / "build-s3",
-        ROOT / "compiler" / "build-s4",
-        ROOT / "compiler" / "build-s5",
-        ROOT / "stdlib" / ".bin",
-        ROOT / "stdlib" / ".bin-s2",
-        ROOT / "stdlib" / ".bin-s3",
-        ROOT / "stdlib" / ".bin-s4",
-    ])
+    wipe_paths(WIPE_PATHS)
+    # Pre-create the nested `self/sN` parent dirs.  The compiler uses
+    # `mkdir(path, mode)` (single-level) rather than `mkdir -p` when
+    # honoring --build-dir, so it can't create `.bin/self/s2/obj/` if
+    # `.bin/self/` doesn't exist yet.
+    for p in [
+        ROOT / "stdlib"   / ".bin" / "self" / "s2",
+        ROOT / "stdlib"   / ".bin" / "self" / "s3",
+        ROOT / "compiler" / "build" / "self" / "s3",
+        ROOT / "compiler" / "build" / "self" / "s4",
+    ]:
+        p.mkdir(parents=True, exist_ok=True)
     print()
 
     stages = make_stages()
@@ -349,30 +352,30 @@ def main():
     # Byte-identity verification
     if not cleared_wiping:
         print()
-    print(f"{C.BOLD}==> Verifying stage-4 == stage-5 IR byte identity{C.RESET}")
+    print(f"{C.BOLD}==> Verifying stage-3 == stage-4 IR byte identity{C.RESET}")
 
-    if not S4_LL.exists() or not S5_LL.exists():
+    if not S3_LL.exists() or not S4_LL.exists():
+        if not S3_LL.exists():
+            print(f"  {C.RED}✗ missing:{C.RESET} {S3_LL.relative_to(ROOT)}")
         if not S4_LL.exists():
             print(f"  {C.RED}✗ missing:{C.RESET} {S4_LL.relative_to(ROOT)}")
-        if not S5_LL.exists():
-            print(f"  {C.RED}✗ missing:{C.RESET} {S5_LL.relative_to(ROOT)}")
         total = time.perf_counter() - total_start
         print_summary(times, total)
         return 1
 
+    s3 = S3_LL.read_bytes()
     s4 = S4_LL.read_bytes()
-    s5 = S5_LL.read_bytes()
 
-    if s4 == s5:
-        md5 = hashlib.md5(s4).hexdigest()
-        print(f"  {C.GREEN}{C.BOLD}✓ FIXED POINT OK{C.RESET}  stage-4 and stage-5 produce byte-identical IR")
+    if s3 == s4:
+        md5 = hashlib.md5(s3).hexdigest()
+        print(f"  {C.GREEN}{C.BOLD}✓ FIXED POINT OK{C.RESET}  stage-3 and stage-4 produce byte-identical IR")
         print(f"  {C.DIM}IR md5:{C.RESET}  {md5}")
-        print(f"  {C.DIM}IR size:{C.RESET} {len(s4):,} bytes")
+        print(f"  {C.DIM}IR size:{C.RESET} {len(s3):,} bytes")
         result_ok = True
     else:
-        print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  stage-4 and stage-5 IR differ")
+        print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  stage-3 and stage-4 IR differ")
         diff = subprocess.run(
-            ["diff", "-u", str(S4_LL), str(S5_LL)],
+            ["diff", "-u", str(S3_LL), str(S4_LL)],
             capture_output=True, text=True,
         )
         diff_lines = diff.stdout.splitlines()
@@ -390,9 +393,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        print()
-        print(f"{C.YELLOW}interrupted{C.RESET}")
-        sys.exit(130)
+    sys.exit(main())
