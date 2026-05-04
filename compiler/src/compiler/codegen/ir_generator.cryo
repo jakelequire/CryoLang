@@ -44,6 +44,16 @@ import Utils::Logger;
 
 
 // ============================================================================
+// Lambda counter — monotonically incrementing index used to generate unique
+// anonymous-function names like `__lambda_0`, `__lambda_1`, …
+// Module-level (process-wide) so that lambdas in different Cryo source
+// modules never collide at the LLVM global-context level.
+// ============================================================================
+
+mut g_lambda_counter: u64 = 0;
+
+
+// ============================================================================
 // MatchSubjectInfo — precomputed state for match/if-let pattern codegen.
 // ============================================================================
 
@@ -1291,6 +1301,8 @@ public:
             this.visit_array_literal(expr as ArrayLiteralNode*);
         } else if (kind == NodeKind::ScopeResolution) {
             this.visit_scope_resolution(expr as ScopeResolutionNode*);
+        } else if (kind == NodeKind::LambdaExpression) {
+            this.visit_lambda_expr(expr as LambdaExprNode*);
         } else if (kind == NodeKind::TernaryExpression) {
             this.visit_ternary_expr(expr as TernaryExprNode*);
         } else if (kind == NodeKind::IfExpression) {
@@ -2815,21 +2827,216 @@ public:
         this.cg.builder.position_at_end(end_bb);
     }
 
-    /// Scope resolution — direct dispatch.
-    visit_scope_resolution(mut &this, node: ScopeResolutionNode*) -> void {
-        const combined: string = format("%s::%s",
-            this.cg.resolve(node.scope_name),
-            this.cg.resolve(node.member_name));
-        const sym: SymbolStr = this.cg.intern_str(combined);
-        const fn_val: LValue = resolve_function(this.cg, sym);
-        if (fn_val.is_valid()) {
-            this.last_value = fn_val;
+    /// Lambda expression — emit an anonymous non-capturing function and return
+    /// its function pointer.  Only explicit-type, non-capturing lambdas are
+    /// supported: each parameter must carry a type annotation, and the return
+    /// type must be written out (`-> T`) in the source.  Captures are not
+    /// implemented yet (no closure environment is built).
+    visit_lambda_expr(mut &this, node: LambdaExprNode*) -> void {
+        if (node == null) {
+            this.last_value    = LValue::null();
             this.last_is_lvalue = false;
             return;
         }
-        const global: LValue = resolve_global(this.cg, sym);
+
+        const ctx_ptr: CompilationContext* = this.cg.ctx;
+        const intern:  InternTable*        = this.cg.get_intern();
+
+        // ── Generate a unique function name ───────────────────────────────────
+        const lam_idx: u64 = g_lambda_counter;
+        g_lambda_counter   = g_lambda_counter + 1;
+        const lam_name: string = format("__lambda_%lld", lam_idx as i64);
+
+        // ── Resolve return type ───────────────────────────────────────────────
+        mut ret_ty: LType = LType::void_type();
+        if (node.return_type.is_valid()) {
+            // Sema already filled it in.
+            const mapped: LType = this.cg.type_mapper.map_type(node.return_type);
+            if (mapped.is_valid()) { ret_ty = mapped; }
+        } else if (node.return_type_ann != null && ctx_ptr.type_resolver != null) {
+            mut res_ctx: ResolutionContext = ResolutionContext::new(
+                ctx_ptr.source_file, "");
+            const ret_ref: TypeRef = ctx_ptr.type_resolver.resolve(node.return_type_ann, &res_ctx);
+            if (ret_ref.is_valid()) {
+                const mapped: LType = this.cg.type_mapper.map_type(ret_ref);
+                if (mapped.is_valid()) { ret_ty = mapped; }
+            }
+        }
+
+        // ── Resolve parameter types ───────────────────────────────────────────
+        const param_count: u32 = node.parameters.length as u32;
+        const param_buf: void* = malloc(param_count as u64 * 8);
+        const param_slots: void** = param_buf as void**;
+        mut params_valid: boolean = true;
+
+        mut res_ctx2: ResolutionContext = ResolutionContext::new(
+            ctx_ptr.source_file, "");
+
+        mut param_refs: TypeRef[] = [];
+        for (mut i: u32 = 0; i < param_count; i++) {
+            const param: VarDeclNode* = node.parameters[i];
+            mut param_ty: LType = LType::null();
+
+            if (param.resolved_type.is_valid()) {
+                param_ty = this.cg.type_mapper.map_type(param.resolved_type);
+            } else if (param.type_annotation != null && ctx_ptr.type_resolver != null) {
+                const pref: TypeRef = ctx_ptr.type_resolver.resolve(
+                    param.type_annotation, &res_ctx2);
+                param_refs.push(pref);
+                if (pref.is_valid()) {
+                    param_ty = this.cg.type_mapper.map_type(pref);
+                }
+            }
+
+            if (!param_ty.is_valid()) {
+                this.cg.emit_warning_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+                    format("lambda: cannot resolve type for parameter '%s' — lambda skipped",
+                        intern.resolve(param.name)),
+                    param.span);
+                params_valid = false;
+                break;
+            }
+            param_slots[i] = param_ty.raw;
+        }
+
+        if (!params_valid) {
+            free(param_buf);
+            this.last_value    = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // ── Build LLVM function ───────────────────────────────────────────────
+        const fn_type: LType  = LType::function_type(ret_ty, param_buf, param_count, false);
+        free(param_buf);
+        const fn_val: LValue  = this.cg.llvm_module.add_function(lam_name, fn_type);
+        if (!fn_val.is_valid()) {
+            this.last_value    = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // Register so that cross-module references can find it.
+        const lam_sym: SymbolStr = intern.intern(lam_name);
+        this.cg.register_function(lam_sym, fn_val);
+
+        // ── Save builder insertion point (we're mid-function) ─────────────────
+        const saved_bb: LBasicBlock = this.cg.builder.get_insert_block();
+
+        // ── Build function entry block + body ─────────────────────────────────
+        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
+        this.cg.builder.position_at_end(entry_bb);
+        this.cg.push_scope();
+
+        // Bind each parameter to an alloca so the body can refer to them.
+        for (mut pi: u32 = 0; pi < param_count; pi++) {
+            const param: VarDeclNode* = node.parameters[pi];
+            const param_name: string  = intern.resolve(param.name);
+
+            // Re-derive the LLVM type for the alloca.
+            mut p_ty: LType = LType::null();
+            if (param.resolved_type.is_valid()) {
+                p_ty = this.cg.type_mapper.map_type(param.resolved_type);
+            } else if (pi < param_refs.length as u32 && param_refs[pi as i64].is_valid()) {
+                p_ty = this.cg.type_mapper.map_type(param_refs[pi as i64]);
+            }
+            if (!p_ty.is_valid()) { continue; }
+
+            const alloca: LValue = this.cg.create_entry_alloca(fn_val, param_name, p_ty);
+            const arg:    LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, pi) };
+            this.cg.builder.build_store(arg, alloca);
+            this.cg.set_named_value(param.name, alloca);
+        }
+
+        // Generate the body.
+        if (node.body != null) {
+            if (node.body.kind == NodeKind::BlockStatement) {
+                this.generate_block(node.body as BlockStmtNode*);
+            } else {
+                this.generate_statement(node.body);
+            }
+        }
+
+        // Ensure the entry block has a terminator.
+        const cur_bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (cur_bb.is_valid() && !cur_bb.has_terminator()) {
+            const rk: i32 = llvm::LLVMGetTypeKind(ret_ty.raw);
+            if (rk == 0) {
+                // Void — emit implicit ret void.
+                this.cg.builder.build_ret_void();
+            } else {
+                // Non-void without a terminator → unreachable.
+                this.cg.builder.build_unreachable();
+            }
+        }
+
+        // Sweep orphaned empty blocks (same as codegen_function_epilogue).
+        mut sweep_bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
+        while (sweep_bb != null) {
+            const lbb: LBasicBlock = LBasicBlock { raw: sweep_bb };
+            if (!lbb.has_terminator()
+                    && llvm::LLVMGetFirstInstruction(sweep_bb) == null) {
+                this.cg.builder.position_at_end(lbb);
+                this.cg.builder.build_unreachable();
+            }
+            sweep_bb = llvm::LLVMGetNextBasicBlock(sweep_bb);
+        }
+
+        this.cg.pop_scope();
+
+        // ── Restore the outer function's insert point ─────────────────────────
+        if (saved_bb.is_valid()) {
+            this.cg.builder.position_at_end(saved_bb);
+        }
+
+        // The value of a lambda expression is the function pointer itself.
+        this.last_value    = fn_val;
+        this.last_is_lvalue = false;
+    }
+
+    /// Scope resolution — direct dispatch.
+    visit_scope_resolution(mut &this, node: ScopeResolutionNode*) -> void {
+        const intern: InternTable* = this.cg.get_intern();
+        const di: DeclarationIndex* = this.cg.get_decl_index();
+
+        // ── 1. Simple combined lookup (bare scope_name::member_name) ─────────
+        const scope_str_bare: string = this.cg.resolve(node.scope_name);
+        const member_str: string     = this.cg.resolve(node.member_name);
+        const combined_bare: string  = format("%s::%s", scope_str_bare, member_str);
+        const sym_bare: SymbolStr    = this.cg.intern_str(combined_bare);
+
+        mut fn_val: LValue = resolve_function(this.cg, sym_bare);
+        if (fn_val.is_valid()) {
+            this.last_value    = fn_val;
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // ── 2. Qualified scope lookup ─────────────────────────────────────────
+        // Static methods are registered under their fully-qualified owner name
+        // (e.g. `MyNS::Handler::greet_static`).  Resolve the scope name through
+        // the DI type map — the same approach the call-site path uses.
+        const resolved_scope: SymbolStr = di.resolve_qualified(node.scope_name);
+        const scope_str_qual: string    = intern.resolve(resolved_scope);
+        const combined_qual: string     = format("%s::%s", scope_str_qual, member_str);
+        const sym_qual: SymbolStr       = intern.intern(combined_qual);
+
+        if (!sym_qual.equals(sym_bare)) {
+            fn_val = this.cg.get_function(sym_qual);
+            if (!fn_val.is_valid()) {
+                fn_val = resolve_function(this.cg, sym_qual);
+            }
+            if (fn_val.is_valid()) {
+                this.last_value    = fn_val;
+                this.last_is_lvalue = false;
+                return;
+            }
+        }
+
+        // ── 3. Global variable lookups ────────────────────────────────────────
+        const global: LValue = resolve_global(this.cg, sym_bare);
         if (global.is_valid()) {
-            this.last_value = global;
+            this.last_value    = global;
             this.last_is_lvalue = true;
             return;
         }
@@ -2841,12 +3048,12 @@ public:
         // to the same definition regardless of which module references it.
         const bare_global: LValue = resolve_global(this.cg, node.member_name);
         if (bare_global.is_valid()) {
-            this.last_value = bare_global;
+            this.last_value    = bare_global;
             this.last_is_lvalue = true;
             return;
         }
 
-        // Check if this is an enum variant reference (e.g., Option::None).
+        // ── 4. Enum variant reference (e.g., Option::None) ───────────────────
         // Use resolved_type from sema to find the concrete enum type.
         // Follow InstantiatedType chain (may be multiple levels).
         mut real_ref: TypeRef = node.resolved_type;
@@ -2871,7 +3078,7 @@ public:
             }
         }
 
-        this.last_value = LValue::null();
+        this.last_value    = LValue::null();
         this.last_is_lvalue = false;
     }
 

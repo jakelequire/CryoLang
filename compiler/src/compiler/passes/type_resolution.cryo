@@ -309,6 +309,13 @@ type struct TypeResolutionRunner {
         if (expr == null) { return; }
         const n: ASTNode* = expr as ASTNode*;
         match (n.kind) {
+            NodeKind::CallExpression => {
+                // Recurse into arguments so lambdas passed as arguments get resolved.
+                const call: CallExprNode* = expr as CallExprNode*;
+                for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                    this.resolve_var_types_in_expression(call.arguments[i], res_ctx);
+                }
+            }
             NodeKind::MatchExpression => {
                 const match_expr: MatchExprNode* = expr as MatchExprNode*;
                 for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
@@ -334,6 +341,31 @@ type struct TypeResolutionRunner {
                 }
                 if (te.false_expr != null) {
                     this.resolve_var_types_in_expression(te.false_expr, res_ctx);
+                }
+            }
+            NodeKind::LambdaExpression => {
+                // Resolve parameter types and body variables of a lambda.
+                const lam: LambdaExprNode* = expr as LambdaExprNode*;
+                // Resolve each parameter's type annotation into resolved_type.
+                for (mut li: i64 = 0; li < lam.parameters.length; li++) {
+                    const lp: VarDeclNode* = lam.parameters[li];
+                    if (lp != null && lp.type_annotation != null && !lp.resolved_type.is_valid()) {
+                        const ptype: TypeRef = this.resolver.resolve(lp.type_annotation, res_ctx);
+                        if (ptype.is_valid()) {
+                            lp.resolved_type = ptype;
+                        }
+                    }
+                }
+                // Resolve the return type annotation if sema hasn't filled it in.
+                if (!lam.return_type.is_valid() && lam.return_type_ann != null) {
+                    const rtype: TypeRef = this.resolver.resolve(lam.return_type_ann, res_ctx);
+                    if (rtype.is_valid()) {
+                        lam.set_return_type(rtype);
+                    }
+                }
+                // Walk body for variable declarations.
+                if (lam.body != null) {
+                    this.resolve_var_types_in_statement(lam.body as ASTNode*, res_ctx);
                 }
             }
             _ => {
