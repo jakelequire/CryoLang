@@ -1175,6 +1175,30 @@ function codegen_function_epilogue(cg: CodegenContext*, node: FunctionDeclNode*)
         // Non-void: intentionally leave unterminated. The caller
         // detects this and strips the function body.
     }
+
+    // Sweep orphaned blocks that body codegen left empty + unterminated.
+    // The classic source is the merge block of an infinite `loop { ... }`
+    // (no `break`, so nothing branches into `loop.end`); the same shape
+    // appears for any control-flow scaffolding that creates a join block
+    // that ends up unused.  Without this fixup the function-body
+    // validator strips the WHOLE body to a declare, producing silent
+    // link-time `undefined reference` errors.  An empty block has no
+    // semantic meaning; terminating it with `unreachable` is a no-op
+    // for any reachable path and keeps LLVM happy.
+    const fn_val: LValue = cg.builder.get_insert_block().get_parent();
+    if (fn_val.is_valid()) {
+        mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
+        while (bb != null) {
+            const lbb: LBasicBlock = LBasicBlock { raw: bb };
+            if (!lbb.has_terminator()
+                    && llvm::LLVMGetFirstInstruction(bb) == null) {
+                cg.builder.position_at_end(lbb);
+                cg.builder.build_unreachable();
+            }
+            bb = llvm::LLVMGetNextBasicBlock(bb);
+        }
+    }
+
     cg.pop_scope();
 }
 
