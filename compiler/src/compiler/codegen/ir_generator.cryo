@@ -237,9 +237,12 @@ public:
 
         // Validate: if any block lacks a terminator, body generation
         // failed. Strip back to a clean declare rather than emitting
-        // broken IR that fails LLVM verification.
+        // broken IR that fails LLVM verification — but ALWAYS surface a
+        // diagnostic so the user sees a real error instead of a silent
+        // `undefined reference` from the linker.
         if (!this.cg.is_function_body_valid(fn_val)) {
-            this.cg.strip_function_body(fn_val);
+            const fname: string = this.cg.resolve(node.name);
+            this.cg.report_invalid_function_body(fn_val, fname, node.span);
         }
     }
 
@@ -250,19 +253,29 @@ public:
             return;
         }
 
-        // Qualify the target type, matching declare_impl_block's logic:
-        //   1. Already qualified — use as-is.
-        //   2. Bare name known to the DI as a type — keep bare.
-        //   3. Otherwise — qualify with namespace.
-        const impl_target_str: string = this.cg.resolve(node.target_type);
+        // Prefer TypeResolution's canonical-qualified target so cross-
+        // module trait impls (`implement trait FmtWrite for struct
+        // Stdout` in fmt::write where Stdout lives in io::stdio) emit
+        // method bodies under the same key declare_method registered
+        // them under.  Mirrors the resolution logic in declare_impl_block.
         const di_ptr: DeclarationIndex* = this.cg.get_decl_index();
         mut qualified_impl_target: SymbolStr = SymbolStr::empty();
-        if (strstr(impl_target_str, "::") != null) {
-            qualified_impl_target = node.target_type;
-        } else if (di_ptr.lookup_type(node.target_type).is_valid()) {
-            qualified_impl_target = node.target_type;
+        if (node.qualified_target_name.is_valid()) {
+            qualified_impl_target = node.qualified_target_name;
         } else {
-            qualified_impl_target = this.cg.qualify(node.target_type);
+            const impl_target_str: string = this.cg.resolve(node.target_type);
+            if (strstr(impl_target_str, "::") != null) {
+                qualified_impl_target = node.target_type;
+            } else if (di_ptr.lookup_type(node.target_type).is_valid()) {
+                qualified_impl_target = node.target_type;
+            } else {
+                const resolved: SymbolStr = di_ptr.resolve_qualified(node.target_type);
+                if (!resolved.equals(node.target_type)) {
+                    qualified_impl_target = resolved;
+                } else {
+                    qualified_impl_target = this.cg.qualify(node.target_type);
+                }
+            }
         }
         // Mirror declare_impl_block: skip when the target type is a generic
         // template — only spec'd clones should be codegen'd.
@@ -325,7 +338,14 @@ public:
         codegen_function_epilogue(this.cg, func);
 
         if (!this.cg.is_function_body_valid(fn_val)) {
-            this.cg.strip_function_body(fn_val);
+            const target_str: string = this.cg.resolve(this.current_impl_target);
+            const method_str: string = this.cg.resolve(func.name);
+            const pretty: string = if (strlen(target_str) > 0) {
+                format("%s::%s", target_str, method_str)
+            } else {
+                method_str
+            };
+            this.cg.report_invalid_function_body(fn_val, pretty, func.span);
         }
     }
 

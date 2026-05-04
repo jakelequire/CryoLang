@@ -739,24 +739,68 @@ type struct TypeResolutionPasses {
                 if (node.source_module == "") {
                     node.set_source_module(ctx.source_file);
                 }
-                const qualified_impl: SymbolStr = ctx.qualify_symbol_sym(node.target_type);
-                if (!node.qualified_target_name.is_valid()) {
-                    node.qualified_target_name = qualified_impl;
+                // Resolve the impl's target type to its CANONICAL qualified
+                // name. Resolution order:
+                //   1. Already-qualified target — use as-is.
+                //   2. Bare target that IS a known type in DI (primitives
+                //      like `i8`, types in this module) — keep bare.
+                //   3. Bare target with a bare→qualified mapping (cross-
+                //      module impl on a user type, e.g. `implement trait
+                //      FmtWrite for struct Stdout` in fmt::write where
+                //      Stdout lives in io::stdio) — use the mapped form.
+                //   4. Otherwise — qualify with the CURRENT module.
+                //
+                // Without (3), naive current-module qualify produces
+                // `fmt::write::Stdout` — a name no other module knows;
+                // declare_method's `lookup_type` misses, the body is
+                // silently dropped, and the linker reports the result as
+                // `undefined reference`.
+                mut canonical_target: SymbolStr = SymbolStr::empty();
+                const target_str_full: string = ctx.intern_table.resolve(node.target_type);
+                if (strstr(target_str_full, "::") != null) {
+                    canonical_target = node.target_type;
+                } else if (ctx.decl_index.lookup_type(node.target_type).is_valid()) {
+                    canonical_target = node.target_type;
+                } else {
+                    const resolved: SymbolStr = ctx.decl_index.resolve_qualified(node.target_type);
+                    if (!resolved.equals(node.target_type)) {
+                        canonical_target = resolved;
+                    } else {
+                        canonical_target = ctx.qualify_symbol_sym(node.target_type);
+                    }
                 }
-                // When the qualified form differs from the user-written bare
-                // target (typically `implement string`, `implement f64`, etc.
-                // on primitives living in a namespaced module), register BOTH
-                // forms in the function/overload registries so the method
-                // resolves whether looked up as `string::substring` or
-                // `std::core::primitives::string::substring`.
-                if (qualified_impl.equals(node.target_type)) {
+                if (!node.qualified_target_name.is_valid()) {
+                    node.qualified_target_name = canonical_target;
+                }
+                // Register methods under EVERY form a call site might use:
+                //   * canonical_target — what method dispatch resolves to
+                //     after going through the bare→qualified table.
+                //   * ctx.qualify_symbol_sym(target_type) — the legacy
+                //     "current module + ::target" form.  Several codegen
+                //     sites (notably `expr_codegen`'s string `+` lowering
+                //     for `string::append`) hardcode this form, so we
+                //     have to keep it functional even when the canonical
+                //     resolution would have picked the bare key.
+                //   * node.target_type — the bare user-written form, so
+                //     primitive impls (`implement string { append(...) }`)
+                //     resolve under both `string::append` and
+                //     `std::core::primitives::string::append` no matter
+                //     which form the lookup uses.
+                const legacy_qualified: SymbolStr = ctx.qualify_symbol_sym(node.target_type);
+                if (canonical_target.equals(node.target_type)) {
                     ctx.decl_index.register_methods_with_module(
-                        qualified_impl, node.methods, module_sym,
+                        canonical_target, node.methods, module_sym,
                         ctx.intern_table, arena);
                 } else {
                     ctx.decl_index.register_methods_with_module_aliased(
-                        qualified_impl, node.target_type, node.methods,
+                        canonical_target, node.target_type, node.methods,
                         module_sym, ctx.intern_table, arena);
+                }
+                if (!legacy_qualified.equals(canonical_target)
+                        && !legacy_qualified.equals(node.target_type)) {
+                    ctx.decl_index.register_methods_with_module(
+                        legacy_qualified, node.methods, module_sym,
+                        ctx.intern_table, arena);
                 }
             }
             NodeKind::TypeAliasDeclaration => {

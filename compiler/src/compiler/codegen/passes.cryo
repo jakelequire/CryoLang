@@ -79,6 +79,13 @@ function function_calls_stripped(cg: CodegenContext*, fn_val: void*) -> boolean 
 /// For each function with a body that calls a stripped sibling, strip it
 /// (which adds it to the stripped set, potentially triggering more
 /// strips on its own callers in the next iteration).
+///
+/// Emits a warning per cascade strip so the user can see the chain of
+/// downstream casualties from the original codegen failure.  We use a
+/// warning rather than an error here because the *primary* failure is
+/// already reported by `report_invalid_function_body`; cascade entries
+/// are downstream noise that exists only to avoid the worse alternative
+/// of a half-built body that fails LLVM verification.
 function cascade_strip_dependents(cg: CodegenContext*) -> void {
     mut iterations: i32 = 0;
     while (iterations < 16) {
@@ -93,6 +100,16 @@ function cascade_strip_dependents(cg: CodegenContext*) -> void {
                     // Don't double-strip a name that's already in the set.
                     const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
                     if (!is_stripped(cg, fn_name)) {
+                        const fn_name_safe: string = if (fn_name == null) {
+                            "<unnamed>"
+                        } else {
+                            fn_name
+                        };
+                        mut wdiag: Diagnostic = Diagnostic::warning(
+                            ErrorCode::E0633_FUNCTION_BODY_ERROR,
+                            format("codegen: function '%s' transitively stripped because it calls a previously-stripped sibling in this module — see preceding error",
+                                fn_name_safe));
+                        cg.emit_diagnostic(wdiag);
                         const wrap: LValue = LValue { raw: fn_val };
                         cg.strip_function_body(wrap);
                         newly_stripped = newly_stripped + 1;

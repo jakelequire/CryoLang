@@ -251,6 +251,52 @@ type struct CodegenContext {
         return true;
     }
 
+    /// Count basic blocks in a function partitioned by whether they have a
+    /// terminator.  Both counts are written through the out-parameters.
+    /// Used by `report_invalid_function_body` to phrase the diagnostic.
+    count_unterminated_blocks(&this, fn_val: LValue,
+                              out_total: i32*, out_bad: i32*) -> void {
+        *out_total = 0;
+        *out_bad   = 0;
+        if (!fn_val.is_valid()) { return; }
+        mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
+        while (bb != null) {
+            *out_total = *out_total + 1;
+            const term: void* = llvm::LLVMGetBasicBlockTerminator(bb);
+            if (term == null) {
+                *out_bad = *out_bad + 1;
+            }
+            bb = llvm::LLVMGetNextBasicBlock(bb);
+        }
+    }
+
+    /// Report that body codegen left a function in an invalid state, then
+    /// strip its blocks.  Use this instead of calling `strip_function_body`
+    /// directly so the failure surfaces as a `file:line` diagnostic
+    /// rather than a silent dropped body that only reveals itself as an
+    /// `undefined reference` at link time.
+    ///
+    /// `pretty_name` should be a human-readable identifier (e.g. the
+    /// source-level qualified name like `Foo::bar` for a method, or the
+    /// bare function name for a free function).  `span` should point at
+    /// the offending declaration.  Both are best-effort — even with
+    /// `SourceSpan::empty()` we still report the LLVM mangled name.
+    report_invalid_function_body(mut &this, fn_val: LValue,
+                                 pretty_name: string,
+                                 span: SourceSpan) -> void {
+        if (!fn_val.is_valid()) { return; }
+        mut total: i32 = 0;
+        mut bad:   i32 = 0;
+        this.count_unterminated_blocks(fn_val, &total, &bad);
+        const llvm_name: string = llvm::LLVMGetValueName(fn_val.raw) as string;
+        const llvm_name_safe: string = if (llvm_name == null) { "<unnamed>" } else { llvm_name };
+        const msg: string = format(
+            "codegen: function '%s' (LLVM '%s') left %d of %d basic block(s) unterminated; body discarded — this is a codegen bug, please report it",
+            pretty_name, llvm_name_safe, bad, total);
+        this.emit_error_at_span(ErrorCode::E0633_FUNCTION_BODY_ERROR, msg, span);
+        this.strip_function_body(fn_val);
+    }
+
     // ========================================================================
     // Scope management
     // ========================================================================

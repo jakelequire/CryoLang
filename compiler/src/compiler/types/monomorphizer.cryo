@@ -38,6 +38,7 @@ import Compiler::Resolver::QualifiedName;
 import Compiler::Resolver::MangledName;
 import Compiler::DeclIndex;
 import Compiler::Diag;
+import Compiler::Lex;
 import Utils::Logger;
 
 
@@ -1231,6 +1232,29 @@ type struct Monomorphizer {
                     if (vd.resolved_type.is_valid()) {
                         names.push(vd.name);
                         types.push(vd.resolved_type);
+                    } else if (vd.type_annotation != null
+                            && this.type_resolver != null) {
+                        // Mono runs BEFORE sema in the pipeline, so most
+                        // local VarDecls don't have their resolved_type
+                        // populated yet.  Fall back to resolving the
+                        // type_annotation on demand so call-arg inference
+                        // can recover concrete types from typed locals
+                        // (e.g. `const local: u8[1] = [byte]; ...
+                        // Slice::from_raw(&local[0], 1)` — without this,
+                        // T can't be inferred from arg[0]'s array element
+                        // type).  Resolve in an empty context — the
+                        // annotation is concrete (no method-level
+                        // generics on a body local), and any type names
+                        // resolve through the resolver's name_resolver
+                        // module scope.
+                        const _empty: string = "";
+                        mut ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
+                        const tr: TypeRef = this.type_resolver.resolve(
+                            vd.type_annotation, &ctx);
+                        if (tr.is_valid()) {
+                            names.push(vd.name);
+                            types.push(tr);
+                        }
                     }
                 }
             }
@@ -1429,11 +1453,27 @@ type struct Monomorphizer {
             return this.lookup_local_type(id.name, names, types);
         }
         if (node.kind == NodeKind::UnaryExpression) {
-            // `&x` — the address-of is transparent for unification (we
-            // peel Reference on the formal side, so handing the value
-            // type works either way).
+            // `&x` produces a pointer to x.  Wrap the operand's type
+            // with Pointer so a `T*` formal unifies cleanly:
+            //   * `Slice::from_raw(&local[0], 1)` formal arg[0] is
+            //     `T*`, actual `&local[0]` is `*<element_of_local>`.
+            //     Without the Pointer wrap, the unifier sees Pointer
+            //     vs element-type and fails to bind T.
+            // The unifier already peels Reference symmetrically, so
+            // returning the pointee directly worked for `&T` formals
+            // but didn't for `T*` formals — surface the pointer level
+            // here and let the unifier handle the symmetry.
             const ue: UnaryExprNode* = expr as UnaryExprNode*;
-            return this.resolve_arg_type_for_inference(ue.operand, names, types);
+            const inner: TypeRef = this.resolve_arg_type_for_inference(ue.operand, names, types);
+            if (!inner.is_valid()) { return TypeRef::invalid(); }
+            // For unary `&`, return Pointer(inner).  For other unary
+            // ops (`-`, `!`, etc.), the result type is the same as the
+            // operand — return it unchanged.  Cryo treats unary `&` as
+            // BitwiseAnd in the parser; check for that opcode.
+            if (ue.op.kind == TokenType::Amp) {
+                return this.arena.get_pointer_to(inner);
+            }
+            return inner;
         }
         if (node.kind == NodeKind::CastExpression) {
             // `value as TYPE` — the result type is `TYPE`, regardless of
@@ -1525,6 +1565,46 @@ type struct Monomorphizer {
             // expression doesn't carry resolved_type — we walk the
             // callee shape ourselves.
             return this.resolve_method_call_arg_type(expr as CallExprNode*, names, types);
+        }
+        if (node.kind == NodeKind::ArrayAccess) {
+            // `arr[i]` — return the array's element type.  Used for
+            // call args like `&local[0]` where the address-of peel above
+            // recurses into the ArrayAccess; without this, the unifier
+            // can't infer T from arg[0] in `Slice::from_raw(&local[0],
+            // 1)` synthesized into a trait-default body.
+            const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+            mut arr_t: TypeRef = this.resolve_arg_type_for_inference(aa.array, names, types);
+            if (!arr_t.is_valid()) { return TypeRef::invalid(); }
+            mut t_arr: Type* = this.arena.lookup(arr_t.id);
+            mut depth_a: i32 = 0;
+            while (t_arr != null && depth_a < 4) {
+                if (t_arr.kind == TypeKind::Pointer) {
+                    const pa: PointerType* = t_arr as PointerType*;
+                    return pa.pointee;
+                }
+                if (t_arr.kind == TypeKind::Array) {
+                    const a: ArrayType* = t_arr as ArrayType*;
+                    return a.element;
+                }
+                if (t_arr.kind == TypeKind::Reference) {
+                    const ra: ReferenceType* = t_arr as ReferenceType*;
+                    arr_t = ra.referent;
+                    t_arr = this.arena.lookup(arr_t.id);
+                    depth_a = depth_a + 1;
+                    continue;
+                }
+                break;
+            }
+            return TypeRef::invalid();
+        }
+        if (node.kind == NodeKind::Literal) {
+            // A literal's resolved_type is the only path to its type at
+            // mono time (sema hasn't run).  For numeric literals, the
+            // parser sets a default integer type — adequate for
+            // inferring an arg that pins a generic.
+            if (expr.resolved_type.is_valid()) {
+                return expr.resolved_type;
+            }
         }
         if (expr.resolved_type.is_valid()) { return expr.resolved_type; }
         return TypeRef::invalid();
@@ -1776,6 +1856,25 @@ type struct Monomorphizer {
                 if (!scope_as_type.is_valid() && !qscope_as_type.is_valid()) {
                     entry = this.find_function_template_for_call(callee_name);
                 }
+                // Static-method-on-generic-struct case: scope IS a known
+                // type AND it's a generic template (e.g. `Slice<T>`).  The
+                // method is non-generic (lives on the parent struct's
+                // generic params, not its own), so it isn't in
+                // `entries[]` as a function template; instead, walk the
+                // template's StructDeclNode methods, infer the struct's
+                // generics from the call's arg types, instantiate the
+                // spec'd struct, and pin the spec'd callee symbol.  Without
+                // this, calls like `Slice::from_raw(&local[0], 1)`
+                // synthesized into trait-default bodies (e.g. FmtWrite's
+                // `write_byte`) leave `resolved_callee` null and codegen
+                // fails to find the spec'd `Slice_u8::from_raw`.
+                if (entry == null) {
+                    if (this.try_infer_static_method_on_generic_template(
+                            call, qualified_scope, callee_scope, callee_name,
+                            res_ctx, subst, names, types)) {
+                        return;
+                    }
+                }
             }
         } else {
             entry = this.find_function_template_for_call(callee_name);
@@ -1860,6 +1959,168 @@ type struct Monomorphizer {
         call.set_resolved_callee(spec_sym);
         this.generic_registry.instantiate_for_module(
             entry.base_type, this.inference_bindings, this.current_module);
+    }
+
+    /// Try to specialize `Owner::method(...)` where Owner is a GENERIC
+    /// struct/class template and `method` is a (possibly non-generic)
+    /// inline method on that template.  Used for calls like
+    /// `Slice::from_raw(&local[0], 1)` whose owner type's generic
+    /// params (T) come from the parent struct, not the method itself.
+    ///
+    /// Inference walks the method's formal params against the call's
+    /// actual args, unifying to bind the OWNER's generic params (the
+    /// `param_type_ids` come from the template entry, not the method).
+    /// On success, instantiates the spec'd owner type (e.g. `Slice<u8>`)
+    /// and pins a `Owner_<args>::method`-shaped resolved_callee on the
+    /// call.  Returns true when inference succeeds and the call is pinned.
+    try_infer_static_method_on_generic_template(mut &this,
+            call: CallExprNode*, qualified_scope: SymbolStr,
+            bare_scope: SymbolStr, member_name: SymbolStr,
+            res_ctx: ResolutionContext*, subst: TypeSubstitution*,
+            names: SymbolStr[], types: TypeRef[]) -> boolean {
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return false; }
+        // Resolve the scope to a template entry.  Try qualified first
+        // (the form TemplateRegistration uses), then bare.
+        mut entry: TemplateEntry* = registry.get_template(qualified_scope);
+        if (entry == null && !qualified_scope.equals(bare_scope)) {
+            entry = registry.get_template(bare_scope);
+        }
+        if (entry == null) { return false; }
+        if (entry.node_kind != NodeKind::StructDeclaration
+                && entry.node_kind != NodeKind::ClassDeclaration) {
+            return false;
+        }
+        if (entry.param_count == 0) { return false; }
+        if (entry.ast_node == null) { return false; }
+
+        // Find the matching inline method on the owner's AST.  Skip
+        // generic methods — those have their OWN inference path
+        // (`try_infer_method_call` for instance methods, the existing
+        // function-template path for static generic methods on
+        // non-generic structs).  This branch only handles non-generic
+        // methods on generic owners.
+        mut method_func: FunctionDeclNode* = null;
+        mut method_is_static: boolean = false;
+        if (entry.node_kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = entry.ast_node as StructDeclNode*;
+            for (mut i: i64 = 0; i < sn.methods.length; i++) {
+                const m: MethodNode* = sn.methods[i];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(member_name)) { continue; }
+                if (m.func.generic_params.length > 0) { continue; }
+                method_func = m.func;
+                method_is_static = m.is_static;
+                break;
+            }
+        } else {
+            const cn: ClassDeclNode* = entry.ast_node as ClassDeclNode*;
+            for (mut i: i64 = 0; i < cn.methods.length; i++) {
+                const m: MethodNode* = cn.methods[i];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(member_name)) { continue; }
+                if (m.func.generic_params.length > 0) { continue; }
+                method_func = m.func;
+                method_is_static = m.is_static;
+                break;
+            }
+        }
+        if (method_func == null) { return false; }
+        // ScopeResolution callees are static-method form (`Type::method`);
+        // routing an instance method through here would emit a call with
+        // a missing receiver.  Bail to let the regular method-call path
+        // handle it.
+        if (!method_is_static) { return false; }
+
+        // Build arg-vs-formal unification using the OWNER'S param_type_ids
+        // as the inference target — the formals reference T (the owner's
+        // generic param), not method-level params.
+        this.inference_bindings = [];
+        this.inference_param_ids = [];
+        for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) {
+            this.inference_bindings.push(TypeRef::invalid());
+            this.inference_param_ids.push(entry.param_type_ids[i]);
+        }
+
+        // Walk explicit user params (skip &this/this — irrelevant for
+        // static methods, but defensive in case the method is non-static).
+        const this_amp: SymbolStr = this.intern_table.intern("&this");
+        const this_val: SymbolStr = this.intern_table.intern("this");
+        mut explicit_params: VarDeclNode*[] = [];
+        for (mut i: i64 = 0; i < method_func.parameters.length; i++) {
+            const p: VarDeclNode* = method_func.parameters[i];
+            if (p == null) { continue; }
+            if (p.name.equals(this_amp) || p.name.equals(this_val)) { continue; }
+            explicit_params.push(p);
+        }
+        if (explicit_params.length != call.arguments.length) { return false; }
+
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const param: VarDeclNode* = explicit_params[i];
+            if (param == null || !param.resolved_type.is_valid()) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
+            if (!actual.is_valid()) { continue; }
+            if (subst != null) {
+                actual = subst.apply(actual, this.arena);
+            }
+            this.unify_for_inference(param.resolved_type, actual);
+        }
+        for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
+            if (!this.inference_bindings[i].is_valid()) { return false; }
+        }
+
+        // Apply default type args (e.g. `Array<T, A = GlobalAlloc>`) so a
+        // partial inference fills in trailing defaults.  Skip when no
+        // res_ctx is available (we still need a fully-bound list to
+        // instantiate, so the validity check above handles that case
+        // already; this is for upgrading partial-but-valid inferences
+        // like inferring T but defaulting A).
+        if (res_ctx != null && this.type_resolver != null) {
+            mut filled: TypeRef[] = this.inference_bindings;
+            filled = this.type_resolver.expand_default_type_args(entry, filled, res_ctx);
+            if (filled.length == entry.param_type_ids.length) {
+                this.inference_bindings = filled;
+            }
+        }
+
+        // Instantiate the spec'd owner type and ENQUEUE it for the
+        // monomorphization worklist.  `instantiate_for_module` only
+        // creates the arena InstantiatedType + records demand — it
+        // doesn't push onto the worklist.  Without the explicit
+        // enqueue, the spec is in the cache but never specialize_request'd,
+        // so its methods never get codegen-registered and the linker
+        // sees no definition for the symbol we just pinned.  The
+        // subsequent `drain_pending_worklist` call in run_monomorphization
+        // will pick this request up and produce the spec'd struct +
+        // methods.
+        const inst_ref: TypeRef = this.generic_registry.instantiate_for_module(
+            entry.base_type, this.inference_bindings, this.current_module);
+        if (!inst_ref.is_valid()) { return false; }
+        this.enqueue_from_type_ref(inst_ref);
+
+        // Build the spec'd qualified-owner name and the combined-key
+        // callee symbol.  Mirror what `ASTSpecializer::specialize` does:
+        //   spec_name      = MangledName::specialized_identifier(<bare>, args)
+        //   qualified_spec = qualify_spec_name(entry, spec_name)
+        // Then combine with `::<method>` for the codegen lookup key.
+        // Without the bare-form `entry.name` here, we'd encode the full
+        // qualified path INTO the spec_name (e.g.
+        // `3std.4core.5slice.5Slice$Lh$G`) — that doesn't match how the
+        // ASTSpecializer registers the spec'd struct, so codegen's
+        // resolve_function lookup misses.
+        const base_qname: QualifiedName = QualifiedName::from_symbol(entry.name);
+        const spec_name_sym: SymbolStr = MangledName::specialized_identifier(
+            this.intern_table, this.arena, base_qname, this.inference_bindings);
+        if (!spec_name_sym.is_valid()) { return false; }
+        const spec_name_str: string = this.intern_table.resolve(spec_name_sym);
+        const qualified_owner: SymbolStr = this.qualify_spec_name(entry, spec_name_str);
+        const owner_str: string = this.intern_table.resolve(qualified_owner);
+        const member_str: string = this.intern_table.resolve(member_name);
+        const combined_str: string = format("%s::%s", owner_str, member_str);
+        const combined_sym: SymbolStr = this.intern_table.intern(combined_str);
+        call.set_resolved_callee(combined_sym);
+        return true;
     }
 
     /// Walk every spec'd impl block looking for one whose target is the
