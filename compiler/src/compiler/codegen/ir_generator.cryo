@@ -681,12 +681,18 @@ public:
 
         const num_arms: i64 = node.arms.length;
 
-        // Create basic blocks: one per arm + merge.
+        // Create basic blocks: one per arm, a dedicated no_match block, and a merge.
+        // no_match_bb is the terminus of the comparison chain when no arm fires;
+        // it gets `unreachable` so a runtime discriminant outside the matched
+        // set traps cleanly instead of falling through into the next function
+        // in the binary (which is what bug-in-the-wild triggered when a garbage
+        // SocketAddr's IpAddr discriminant was neither V4 nor V6).
         mut arm_bbs: LBasicBlock[] = [];
         for (mut i: i64 = 0; i < num_arms; i++) {
             const name: string = format("match.arm%lld", i);
             arm_bbs.push(LBasicBlock::append(current_fn, name));
         }
+        const no_match_bb: LBasicBlock = LBasicBlock::append(current_fn, "match.no_match");
         const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "match.end");
 
         // Generate the comparison chain.
@@ -697,7 +703,9 @@ public:
             if (arm == null) { continue; }
 
             // Determine the next block to fall through to if this arm doesn't match.
-            mut next_bb: LBasicBlock = merge_bb;
+            // The last arm's "no match" edge points at no_match_bb so non-matching
+            // discriminants hit `unreachable` rather than the post-match join.
+            mut next_bb: LBasicBlock = no_match_bb;
             if (i + 1 < num_arms) {
                 next_bb = LBasicBlock::append(current_fn, format("match.test%lld", i + 1));
             }
@@ -816,14 +824,30 @@ public:
             this.cg.pop_scope();
         }
 
+        // no_match_bb is reached when the discriminant matched no arm.
+        // Emit `call @abort(); unreachable` rather than a bare `unreachable`:
+        // LLVM's x86 backend lowers a bare `unreachable` to *no instruction*,
+        // so a runtime fall-through silently slides into whatever code is
+        // laid out next in the binary (the original symptom: pack_sockaddr_in
+        // sliding into TcpStream::connect, then recursing to a stack-overflow
+        // SIGSEGV).  The abort+unreachable pair guarantees a clean SIGABRT.
+        // If a wildcard arm exists, no_match_bb has no incoming edges and
+        // LLVM elides the whole thing; either way the IR stays well-formed.
+        if (!no_match_bb.has_terminator()) {
+            this.cg.builder.position_at_end(no_match_bb);
+            const abort_fn: LValue = get_or_decl_abort(this.cg);
+            const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
+            mut a_args: LValue[] = [];
+            mut a_res: LValue = LValue::null();
+            codegen_call(this.cg, abort_fn, abort_ty, a_args, "", &a_res);
+            this.cg.builder.build_unreachable();
+        }
+
         this.cg.builder.position_at_end(merge_bb);
-        // The last arm's pattern test still branches into merge_bb when
-        // no pattern matched — a "neither arm fired" edge that cryoc
-        // currently can't prove unreachable.  If every arm terminated
-        // internally (return/break), nothing else follows the match, so
-        // `merge_bb` would otherwise sit without a terminator and the
-        // function-body validator would strip the whole body to a
-        // bare declare.  Emit `unreachable` to keep the IR verifiable.
+        // If every arm terminated internally (return/break/panic), no edge
+        // reaches merge_bb and the function-body validator would strip the
+        // body to a bare declare.  Emit `unreachable` to keep the IR
+        // verifiable.
         if (!any_arm_falls_through && !merge_bb.has_terminator()) {
             this.cg.builder.build_unreachable();
         }
@@ -2886,14 +2910,16 @@ public:
 
         const num_arms: i64 = node.arms.length;
 
-        // Create basic blocks: one per arm + merge.
+        // Create basic blocks: one per arm + a no_match trap + merge.
         mut arm_bbs: LBasicBlock[] = [];
         for (mut i: i64 = 0; i < num_arms; i++) {
             arm_bbs.push(LBasicBlock::append(current_fn, format("mexpr.arm%lld", i)));
         }
-        // Default block handles the "no arm matched" case — provides
-        // an undef value to the phi so all predecessors are covered.
-        const default_bb: LBasicBlock = LBasicBlock::append(current_fn, "mexpr.default");
+        // no_match block traps when the discriminant matches no arm — same
+        // rationale as visit_match_stmt: without the trap, control silently
+        // slides into adjacent function code.  No phi predecessor is added
+        // for this block since it doesn't reach merge_bb.
+        const default_bb: LBasicBlock = LBasicBlock::append(current_fn, "mexpr.no_match");
         const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "mexpr.end");
 
         // Comparison chain — same as visit_match_stmt.
@@ -3048,18 +3074,23 @@ public:
             this.cg.pop_scope();
         }
 
-        // Default block: no arm matched — branch to merge with undef.
-        this.cg.builder.position_at_end(default_bb);
-        this.cg.builder.build_br(merge_bb);
+        // No arm matched — trap with `call @abort(); unreachable`.  Bare
+        // `unreachable` lowers to nothing on x86, letting a runtime
+        // fall-through silently continue into the next function in the
+        // binary; the abort call guarantees a clean SIGABRT.  If the match
+        // is exhaustive (e.g., wildcard arm), default_bb is unreachable and
+        // LLVM elides it.
+        if (!default_bb.has_terminator()) {
+            this.cg.builder.position_at_end(default_bb);
+            const abort_fn_e: LValue = get_or_decl_abort(this.cg);
+            const abort_ty_e: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn_e.raw) };
+            mut a_args_e: LValue[] = [];
+            mut a_res_e: LValue = LValue::null();
+            codegen_call(this.cg, abort_fn_e, abort_ty_e, a_args_e, "", &a_res_e);
+            this.cg.builder.build_unreachable();
+        }
 
         this.cg.builder.position_at_end(merge_bb);
-
-        if (result_ty.is_valid()) {
-            // Add default block as a phi predecessor with undef value.
-            phi_vals_arr[phi_count] = llvm::LLVMGetUndef(result_ty.raw);
-            phi_blks_arr[phi_count] = default_bb.raw;
-            phi_count = phi_count + 1;
-        }
 
         if (phi_count > 0 && result_ty.is_valid()) {
             const phi: LValue = this.cg.builder.build_phi(result_ty, "mexpr.val");

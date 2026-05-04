@@ -1,0 +1,98 @@
+namespace Main;
+
+import std::net::http::server;
+import std::net::http::request;
+import std::net::http::response;
+import std::net::http::method;
+import std::net::http::status;
+import std::net::socket_addr;
+import std::collections::str;
+import std::collections::string;
+
+// ============================================================================
+// Handlers
+// ============================================================================
+
+function handle_root(req: &Request) -> Response {
+    return Response::text(StatusCode::ok(), Str::from_raw("Hello, World!\n" as u8*, 14));
+}
+
+function handle_health(req: &Request) -> Response {
+    const body_str: Str = Str::from_raw("{\"status\":\"ok\"}" as u8*, 15);
+    mut body: Array<u8> = Array::with_capacity(15);
+    body.push_slice(body_str.as_bytes());
+    return Response::json(StatusCode::ok(), body);
+}
+
+function handle_echo(req: &Request) -> Response {
+    const path: Str = req.path.as_str();
+    return Response::text(StatusCode::ok(), path);
+}
+
+function handle_not_found(req: &Request) -> Response {
+    return Response::text(StatusCode::not_found(), Str::from_raw("404 Not Found\n" as u8*, 14));
+}
+
+function handle_method_not_allowed(req: &Request) -> Response {
+    return Response::text(
+        StatusCode::method_not_allowed(),
+        Str::from_raw("405 Method Not Allowed\n" as u8*, 23)
+    );
+}
+
+// ============================================================================
+// Router
+// ============================================================================
+
+function router(req: Request) -> Response {
+    const path: Str = req.path.as_str();
+
+    if (path.equals(&Str::from_raw("/" as u8*, 1))) {
+        match (req.method) {
+            Method::Get => { return handle_root(&req); }
+            _           => { return handle_method_not_allowed(&req); }
+        }
+    }
+
+    if (path.equals(&Str::from_raw("/health" as u8*, 7))) {
+        match (req.method) {
+            Method::Get => { return handle_health(&req); }
+            _           => { return handle_method_not_allowed(&req); }
+        }
+    }
+
+    if (path.length() >= 5 && path.sub_bytes(0, 5).equals(&Str::from_raw("/echo" as u8*, 5))) {
+        match (req.method) {
+            Method::Get => { return handle_echo(&req); }
+            _           => { return handle_method_not_allowed(&req); }
+        }
+    }
+
+    return handle_not_found(&req);
+}
+
+// ============================================================================
+// Ready callback
+// ============================================================================
+
+function on_ready() -> void {
+    printf("HTTP server listening on http://127.0.0.1:8080\n");
+    printf("  GET /         -> Hello, World!\n");
+    printf("  GET /health   -> {\"status\":\"ok\"}\n");
+    printf("  GET /echo/... -> echoes the path\n");
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+function main() -> int {
+    const addr: SocketAddr = SocketAddr::localhost_v4(8080);
+    mut server: HttpServer = HttpServer::new(addr, router);
+    server.with_ready(on_ready);
+    match (server.run()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { printf("Server error: failed to bind 127.0.0.1:8080\n"); }
+    }
+    return 0;
+}
