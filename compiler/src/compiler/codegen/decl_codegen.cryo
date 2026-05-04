@@ -360,16 +360,33 @@ function declare_impl_block(cg: CodegenContext*, node: ImplBlockNode*) -> void {
         return;
     }
 
-    // Qualify the target type — node.target_type may be bare ("CompileMode")
-    // but the DI and type system use qualified names.  Always qualify so
-    // the definition's mangled name matches the form that call sites
-    // compute via `lookup_type_name(obj_ref)` (which returns the qualified
-    // name for primitives in namespaced modules).
+    // Use TypeResolution's canonical-qualified target when available — it
+    // resolves cross-module impl targets (e.g. `implement trait FmtWrite
+    // for struct Stdout` in fmt::write where Stdout lives in io::stdio)
+    // by walking the bare→qualified table, so the impl's methods land
+    // under the same key the type's defining module uses.  Without the
+    // canonical resolution, we'd qualify with the CURRENT module and
+    // produce `fmt::write::Stdout::write_str`, which `declare_method`
+    // can't look up — bodies would be silently dropped and the linker
+    // would surface them as undefined references.
     const ctx_ptr: CompilationContext* = cg.ctx;
-    const target_str: string = ctx_ptr.intern_table.resolve(node.target_type);
-    mut qualified_target: SymbolStr = node.target_type;
-    if (strstr(target_str, "::") == null) {
-        qualified_target = ctx_ptr.qualify_symbol_sym(node.target_type);
+    mut qualified_target: SymbolStr = SymbolStr::empty();
+    if (node.qualified_target_name.is_valid()) {
+        qualified_target = node.qualified_target_name;
+    } else {
+        const target_str: string = ctx_ptr.intern_table.resolve(node.target_type);
+        if (strstr(target_str, "::") != null) {
+            qualified_target = node.target_type;
+        } else if (ctx_ptr.decl_index.lookup_type(node.target_type).is_valid()) {
+            qualified_target = node.target_type;
+        } else {
+            const resolved: SymbolStr = ctx_ptr.decl_index.resolve_qualified(node.target_type);
+            if (!resolved.equals(node.target_type)) {
+                qualified_target = resolved;
+            } else {
+                qualified_target = ctx_ptr.qualify_symbol_sym(node.target_type);
+            }
+        }
     }
     // Skip impls whose target is a generic template — only the
     // monomorphized spec'd clones should produce LLVM symbols.  Mirrors
@@ -1118,6 +1135,15 @@ function codegen_function_prologue(cg: CodegenContext*, node: FunctionDeclNode*)
     const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
     const fn_val: LValue = resolve_function(cg, qualified);
     if (!fn_val.is_valid()) {
+        // The prior FunctionDeclaration pass should have produced a
+        // declare for this function. When it didn't, the body simply
+        // can't land — but emit a warning rather than an error because
+        // the upstream gap is the real bug to fix, and a warning lets
+        // the build continue so downstream code can be exercised.
+        const fname: string = cg.resolve(node.name);
+        cg.emit_warning_at_span(ErrorCode::E0606_FUNCTION_GENERATION_ERROR,
+            format("codegen: function '%s' has no LLVM declaration in this module — body skipped (the prior FunctionDeclaration pass should have produced one). Calls to this function will fail at link time.", fname),
+            node.span);
         return LValue::null();
     }
 
@@ -1135,6 +1161,11 @@ function codegen_function_prologue(cg: CodegenContext*, node: FunctionDeclNode*)
         const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
 
         if (!param_ty.is_valid()) {
+            const fname: string = cg.resolve(node.name);
+            cg.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
+                format("codegen: function '%s', parameter '%s' — could not lower its type to LLVM; body skipped. Calls to this function will fail at link time.",
+                    fname, param_name),
+                if (param != null) { param.span } else { node.span });
             cg.pop_scope();
             return LValue::null();
         }
@@ -1235,6 +1266,18 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
         fn_val = resolve_function(cg, combined_sym);
     }
     if (!fn_val.is_valid()) {
+        // declare_method should have produced an LLVM declare for this
+        // method.  When it didn't (e.g. cross-module trait impls whose
+        // target lookup misses, or primitive impls whose target qualify
+        // resolves to a name DI doesn't know), the body simply can't
+        // land.  Emit a warning rather than an error so the build
+        // continues — calls to this method will surface as undefined
+        // references at link time, which is the correct visibility
+        // outcome until the upstream declare path is fixed.
+        cg.emit_warning_at_span(ErrorCode::E0619_METHOD_GENERATION_ERROR,
+            format("codegen: method '%s::%s' has no LLVM declaration in this module — body skipped (declare_method should have produced one). Calls to this method will fail at link time.",
+                type_str, method_str),
+            func.span);
         return LValue::null();
     }
 
@@ -1301,6 +1344,10 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
             // as a pointer uniformly.
             const target_mapped: LType = cg.type_mapper.map_type(target_ref);
             if (!target_mapped.is_valid()) {
+                cg.emit_warning_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                    format("codegen: method '%s::%s' — could not lower the by-value `this` type to LLVM; body skipped. Calls to this method will fail at link time.",
+                        type_str, method_str),
+                    func.span);
                 cg.pop_scope();
                 return LValue::null();
             }
@@ -1336,6 +1383,10 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
         const param_name: string = cg.resolve(param.name);
         const param_ty: LType = cg.type_mapper.map_type(param.resolved_type);
         if (!param_ty.is_valid()) {
+            cg.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
+                format("codegen: method '%s::%s', parameter '%s' — could not lower its type to LLVM; body skipped. Calls to this method will fail at link time.",
+                    type_str, method_str, param_name),
+                if (param != null) { param.span } else { func.span });
             cg.pop_scope();
             return LValue::null();
         }
