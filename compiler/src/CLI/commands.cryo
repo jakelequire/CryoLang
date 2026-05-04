@@ -14,6 +14,7 @@ import Utils::Logger;
 type enum CommandKind {
     Help;
     Version;
+    Init;
     Build;
     Run;
     Check;
@@ -28,6 +29,7 @@ implement enum CommandKind {
         return match (this) {
             CommandKind::Help    => { "help"    }
             CommandKind::Version => { "version" }
+            CommandKind::Init    => { "init"    }
             CommandKind::Build   => { "build"   }
             CommandKind::Run     => { "run"     }
             CommandKind::Check   => { "check"   }
@@ -42,6 +44,7 @@ implement enum CommandKind {
         return match (this) {
             CommandKind::Help     => { "Display help information"                      }
             CommandKind::Version  => { "Display version information"                   }
+            CommandKind::Init     => { "Scaffold a new Cryo project (cryoconfig + main.cryo)" }
             CommandKind::Build    => { "Build a source file (single-file)"            }
             CommandKind::Run      => { "Build the project and run the resulting binary" }
             CommandKind::Check    => { "Check a file for errors (no codegen)"         }
@@ -56,6 +59,7 @@ implement enum CommandKind {
         return match (this) {
             CommandKind::Help     => { "cryoc help [command]"              }
             CommandKind::Version  => { "cryoc version"                     }
+            CommandKind::Init     => { "cryoc init [dir]"                  }
             CommandKind::Build    => { "cryoc build <file> [flags]"       }
             CommandKind::Run      => { "cryoc run [flags]"                 }
             CommandKind::Check    => { "cryoc check <file> [flags]"       }
@@ -80,6 +84,9 @@ type struct Executor {
         const version: CommandKind = CommandKind::Version;
         runner.add_command(Command::new(version.name(), version.description(), version.usage()));
 
+        const init: CommandKind = CommandKind::Init;
+        runner.add_command(Command::new(init.name(), init.description(), init.usage()));
+
         const build: CommandKind = CommandKind::Build;
         runner.add_command(Command::new(build.name(), build.description(), build.usage()));
 
@@ -103,6 +110,7 @@ type struct Executor {
     static resolve(name: string) -> CommandKind {
         if (name == "help")     { return CommandKind::Help; }
         if (name == "version")  { return CommandKind::Version; }
+        if (name == "init")     { return CommandKind::Init; }
         if (name == "build")    { return CommandKind::Build; }
         if (name == "run")      { return CommandKind::Run; }
         if (name == "check")    { return CommandKind::Check; }
@@ -123,6 +131,7 @@ type struct Executor {
         match (kind) {
             CommandKind::Help    => { runner.print_help();    return 0; }
             CommandKind::Version => { runner.print_version(); return 0; }
+            CommandKind::Init    => { return Executor::cmd_init(args); }
             CommandKind::Build   => { return Executor::cmd_build(args); }
             CommandKind::Run     => { return Executor::cmd_run(args); }
             CommandKind::Check   => { return Executor::cmd_check(args); }
@@ -140,6 +149,162 @@ type struct Executor {
     // ================================================================
     // Command Implementations
     // ================================================================
+
+    /// `cryo init [dir]` — scaffold a new Cryo project.
+    ///
+    /// Interactively prompts for project_name (required) and three values
+    /// with defaults (source_dir = "src", output_dir = "build",
+    /// target_type = "executable"), then writes:
+    ///   <dir>/cryoconfig
+    ///   <dir>/<source_dir>/main.cryo  (Hello-world boilerplate)
+    ///
+    /// With no positional arg, scaffolds in CWD.  Pressing Enter at any
+    /// prompt accepts the default in brackets.
+    static cmd_init(args: ParsedArgs) -> int {
+        const target_dir: string = if (args.positional_count() > 0) {
+            args.input_file()
+        } else {
+            "."
+        };
+
+        // Create the target dir if it doesn't already exist.  493 = 0755.
+        // mkdir(2) returns -1 with errno=EEXIST when the dir is already
+        // there; we don't have errno-aware bindings yet, so just attempt
+        // and let the file writes below fail loudly if the dir is bogus.
+        if (strcmp(target_dir, ".") != 0) {
+            mkdir(target_dir, 493);
+        }
+
+        // Open stdin once so multiple fgets calls share the same FILE*
+        // (re-fdopen'ing fd 0 each time mixes buffered/unbuffered reads).
+        const in_stream: void* = fdopen(0, "r");
+        if (in_stream == null) {
+            printf("Error: cannot read from stdin\n");
+            return 1;
+        }
+
+        printf("Initializing Cryo project in %s\n\n", target_dir);
+
+        const name: string = Executor::prompt_required(in_stream, "Project name");
+        if (strlen(name) == 0) {
+            printf("Error: project name is required\n");
+            return 1;
+        }
+        const src_dir: string  = Executor::prompt_default(in_stream, "Source directory", "src");
+        const out_dir: string  = Executor::prompt_default(in_stream, "Output directory", "build");
+        const ttype:   string  = Executor::prompt_default(in_stream, "Target type (executable/library/stdlib)", "executable");
+
+        // Validate target_type — silently accepting "exe" or typos would
+        // produce a cryoconfig the parser can't load.
+        if (strcmp(ttype, "executable") != 0
+                && strcmp(ttype, "library") != 0
+                && strcmp(ttype, "stdlib") != 0) {
+            printf("Error: target type must be one of: executable, library, stdlib (got '%s')\n", ttype);
+            return 1;
+        }
+
+        // Create the source directory.  When src_dir is "." we skip the
+        // mkdir (target_dir already exists).
+        mut src_path: string = "";
+        if (strcmp(src_dir, ".") == 0 || strlen(src_dir) == 0) {
+            src_path = target_dir;
+        } else {
+            src_path = format("%s/%s", target_dir, src_dir);
+            mkdir(src_path, 493);
+        }
+
+        const main_path: string = format("%s/main.cryo", src_path);
+        if (!Executor::write_main_cryo(main_path)) { return 1; }
+
+        const config_path: string = format("%s/cryoconfig", target_dir);
+        if (!Executor::write_cryoconfig(config_path, name, src_dir, out_dir, ttype)) { return 1; }
+
+        printf("\n  Created %s\n", config_path);
+        printf("  Created %s\n", main_path);
+        printf("\nNext steps:\n");
+        if (strcmp(target_dir, ".") != 0) {
+            printf("  cd %s\n", target_dir);
+        }
+        printf("  cryo run\n");
+        return 0;
+    }
+
+    /// Read a line from `in_stream`, returning `def` when the user
+    /// presses Enter (empty input) or stdin closes.
+    static prompt_default(in_stream: void*, label: string, def: string) -> string {
+        printf("%s [%s]: ", label, def);
+        fflush(null);
+        return Executor::read_line_or(in_stream, def);
+    }
+
+    /// Like `prompt_default` but with no default — returns the empty
+    /// string on EOF / blank input so the caller can reject it.
+    static prompt_required(in_stream: void*, label: string) -> string {
+        printf("%s: ", label);
+        fflush(null);
+        return Executor::read_line_or(in_stream, "");
+    }
+
+    static read_line_or(in_stream: void*, def: string) -> string {
+        mut buf: i8[1024];
+        if (fgets(&buf[0], 1024, in_stream) == null) {
+            return def;
+        }
+        // Strip trailing CR/LF.
+        mut len: i64 = strlen(&buf[0] as string) as i64;
+        while (len > 0
+                && (buf[len - 1] as i32 == 10 || buf[len - 1] as i32 == 13)) {
+            len = len - 1;
+        }
+        buf[len] = 0;
+        if (len == 0) { return def; }
+        // Heap-copy so the buf-on-stack doesn't dangle after return.
+        return strdup(&buf[0] as string) as string;
+    }
+
+    static write_main_cryo(path: string) -> boolean {
+        const f: void* = fopen(path, "w");
+        if (f == null) {
+            printf("Error: cannot open %s for writing\n", path);
+            return false;
+        }
+        fputs("namespace Main;\n\n", f);
+        fputs("function main() -> int {\n", f);
+        fputs("    printf(\"Hello, world!\\n\");\n", f);
+        fputs("    return 0;\n", f);
+        fputs("}\n", f);
+        fclose(f);
+        return true;
+    }
+
+    static write_cryoconfig(path: string, name: string, src_dir: string,
+                            out_dir: string, target_type: string) -> boolean {
+        const f: void* = fopen(path, "w");
+        if (f == null) {
+            printf("Error: cannot open %s for writing\n", path);
+            return false;
+        }
+        // Build the entry_point as "<src_dir>/main.cryo" (or just
+        // "main.cryo" when source_dir is "." / empty).  Only emit the
+        // entry_point key for executables — libraries discover via
+        // <source_dir>/lib.cryo instead.
+        fputs("[project]\n", f);
+        fprintf(f, "project_name = \"%s\"\n", name);
+        fprintf(f, "output_dir = \"%s\"\n", out_dir);
+        fprintf(f, "target_type = \"%s\"\n", target_type);
+        fprintf(f, "source_dir = \"%s\"\n", src_dir);
+        if (strcmp(target_type, "executable") == 0) {
+            if (strcmp(src_dir, ".") == 0 || strlen(src_dir) == 0) {
+                fputs("entry_point = \"main.cryo\"\n", f);
+            } else {
+                fprintf(f, "entry_point = \"%s/main.cryo\"\n", src_dir);
+            }
+        }
+        fputs("\n[compiler]\n", f);
+        fputs("\n[dependencies]\n", f);
+        fclose(f);
+        return true;
+    }
 
     /// `cryoc build [file]` — single-file or project compilation.
     /// If no file is given, looks for a cryoconfig in the current directory.
