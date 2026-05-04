@@ -1,0 +1,524 @@
+///! HTTP router — method- and path-based request dispatch.
+///!
+///! Build a `Router`, register routes with the per-method helpers, then
+///! pass _a pointer to_ the router to `HttpServer::with_router`. The
+///! server calls `router.dispatch` on every incoming request.
+///!
+///! Routes are evaluated in registration order; the first route where
+///! both method and path pattern match wins.
+///!
+///! Pattern syntax
+///! ──────────────
+///! `/`                    — exact root
+///! `/users`               — exact match
+///! `/users/:id`           — `:id` captures any non-empty segment
+///! `/files/:dir/:name`    — two named captures
+///!
+///! Prefix routes (registered via `get_prefix`, `any_prefix`, …) match
+///! so long as the pattern is a prefix of the request path; trailing
+///! segments after the last matched pattern segment are accepted.
+///!
+///! Path captures
+///! ─────────────
+///! Captured segments are available inside the handler via
+///! `Request::param`:
+///!
+///!   function handle_user(req: Request) -> Response {
+///!       match (req.param(Str::from_raw("id" as u8*, 2))) {
+///!           Option::Some(mut id) => {
+///!               // use id.as_str() …
+///!               id.drop();
+///!               return Response::text(StatusCode::ok(), …);
+///!           }
+///!           Option::None => {
+///!               return Response::text(StatusCode::bad_request(), …);
+///!           }
+///!       }
+///!   }
+///!
+///! Custom fallbacks
+///! ────────────────
+///! `Router::on_not_found` and `Router::on_method_not_allowed` accept
+///! a handler for 404 / 405 responses. Without them, the router emits
+///! built-in plain-text defaults.
+
+namespace std::net::http::router;
+
+import core::option;
+import core::result;
+import core::hash;
+import core::cmp;
+import collections::array;
+import collections::str;
+import collections::string;
+import collections::hashmap;
+import net::http::method;
+import net::http::request;
+import net::http::response;
+import net::http::status;
+
+// ============================================================================
+// RouteKind — controls tail-of-path matching behaviour
+// ============================================================================
+
+/// Whether the route pattern must consume the entire request path or
+/// only a leading prefix.
+type enum RouteKind {
+    /// All path segments must match; no trailing segments allowed.
+    Exact;
+    /// The pattern must be a prefix of the path; any extra trailing
+    /// segments on the request path are accepted and ignored.
+    Prefix;
+}
+
+// ============================================================================
+// Route — one (method × pattern → handler) binding
+// ============================================================================
+
+/// A single registered route entry.
+///
+/// `pattern` is a *borrowed* `Str`. Its backing bytes (typically a
+/// string literal) must outlive the `Router` that holds this entry.
+/// Because `Str` is two words (pointer + length) with no heap
+/// ownership, `Route` is trivially copyable — `Array::push` and
+/// `Array::get` can work with it safely.
+type struct Route {
+    method:  Method;
+    pattern: Str;
+    handler: (Request) -> Response;
+    kind:    RouteKind;
+}
+
+// ============================================================================
+// Segment-by-segment path matcher
+// ============================================================================
+
+/// Match `pattern` against `path` segment-by-segment.
+///
+/// Returns `true` when the pattern matches. Named capture segments
+/// (`:name`) are inserted into `params` as owned `String → String`
+/// pairs; the caller can read them from `Request::param`.
+///
+/// On failure the function returns `false`; `params` may already hold
+/// partial captures from earlier segments — callers **must** drop and
+/// re-create it before the next attempt.
+///
+/// `RouteKind::Exact`  — both sides must be exhausted at the same time.
+/// `RouteKind::Prefix` — the pattern side may finish early; any
+///                       remaining path segments are accepted.
+function match_path(
+    pattern: Str,
+    path:    Str,
+    kind:    RouteKind,
+    params:  mut &HashMap<String, String>) -> boolean {
+
+    const pl: u64 = pattern.length();
+    const sl: u64 = path.length();
+    mut pi: u64 = 0;   // read cursor into pattern
+    mut si: u64 = 0;   // read cursor into path
+
+    // Skip a leading '/' on each side (0x2F = '/').
+    if (pi < pl) {
+        match (pattern.byte_at(pi)) {
+            Option::Some(b) => { if (b == 0x2F) { pi = pi + 1; } }
+            Option::None    => { }
+        }
+    }
+    if (si < sl) {
+        match (path.byte_at(si)) {
+            Option::Some(b) => { if (b == 0x2F) { si = si + 1; } }
+            Option::None    => { }
+        }
+    }
+
+    // Process one segment per iteration.  The loop terminates because
+    // pi and si only ever increase and are bounded by pl and sl.
+    loop {
+        // Advance pe to the next '/' or end of pattern.
+        mut pe: u64 = pi;
+        while (pe < pl) {
+            match (pattern.byte_at(pe)) {
+                Option::Some(b) => { if (b == 0x2F) { break; } }
+                Option::None    => { break; }
+            }
+            pe = pe + 1;
+        }
+
+        // Advance se to the next '/' or end of path.
+        mut se: u64 = si;
+        while (se < sl) {
+            match (path.byte_at(se)) {
+                Option::Some(b) => { if (b == 0x2F) { break; } }
+                Option::None    => { break; }
+            }
+            se = se + 1;
+        }
+
+        const pat_len: u64 = pe - pi;
+        const seg_len: u64 = se - si;
+
+        // Both sides exhausted simultaneously — complete match.
+        if (pat_len == 0 && seg_len == 0) { return true; }
+
+        // Pattern done but path has more — outcome depends on kind.
+        if (pat_len == 0) {
+            match (kind) {
+                RouteKind::Prefix => { return true; }
+                RouteKind::Exact  => { return false; }
+            }
+        }
+
+        // Path done but pattern expects more — always a miss.
+        if (seg_len == 0) { return false; }
+
+        // Determine: capture group (first byte is ':' = 0x3A) or literal?
+        mut is_capture: boolean = false;
+        match (pattern.byte_at(pi)) {
+            Option::Some(b) => { if (b == 0x3A) { is_capture = true; } }
+            Option::None    => { }
+        }
+
+        if (is_capture) {
+            // Named capture: `:name` → any non-empty path segment.
+            // Store name_str → val_str in params.
+            const name_str: Str = pattern.sub_bytes(pi + 1, pe);
+            const val_str:  Str = path.sub_bytes(si, se);
+            mut key: String = String::from_str(name_str);
+            mut val: String = String::from_str(val_str);
+            params.insert(key, val);
+        } else {
+            // Literal: both segments must be byte-for-byte equal.
+            const pat_seg: Str = pattern.sub_bytes(pi, pe);
+            const sub_seg: Str = path.sub_bytes(si, se);
+            if (!pat_seg.equals(&sub_seg)) { return false; }
+        }
+
+        // Step past this segment and its trailing slash.
+        pi = pe;
+        if (pi < pl) { pi = pi + 1; }
+        si = se;
+        if (si < sl) { si = si + 1; }
+    }
+}
+
+// ============================================================================
+// Router
+// ============================================================================
+
+/// Method- and path-based request dispatcher.
+///
+/// All route-registration methods and fallback setters return `&Router`
+/// so calls can be chained:
+///
+/// ```
+/// mut router: Router = Router::new();
+/// router
+///     .get(Str::from_raw("/" as u8*, 1),               handle_root)
+///     .get(Str::from_raw("/users/:id" as u8*, 10),      handle_user)
+///     .post(Str::from_raw("/users" as u8*, 6),          handle_create_user)
+///     .get(Str::from_raw("/files" as u8*, 6),           handle_files,
+///                                                       RouteKind::Prefix)
+///     .on_not_found(handle_not_found);
+///
+/// mut server: HttpServer = HttpServer::with_router(addr, &router);
+/// server.run();
+/// ```
+///
+/// Pass `&router` to `HttpServer::with_router`; the router must
+/// outlive the server (declare both in the same scope).
+type struct Router {
+    routes:                     Array<Route>;
+    not_found_handler:          Option<(Request) -> Response>;
+    method_not_allowed_handler: Option<(Request) -> Response>;
+
+    // ── construction ────────────────────────────────────────────────────────
+
+    /// Create an empty router with no registered routes and built-in
+    /// fallback handlers (plain-text 404 / 405).
+    static new() -> Router {
+        return Router {
+            routes:                     Array::new(),
+            not_found_handler:          Option::None,
+            method_not_allowed_handler: Option::None
+        };
+    }
+
+    // ── route registration ───────────────────────────────────────────────────
+
+    /// Register a `GET` exact route.
+    get(mut &this, pattern: Str, handler: (Request) -> Response) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Get,
+            pattern: pattern,
+            handler: handler,
+            kind:    RouteKind::Exact
+        });
+        return &this;
+    }
+
+    /// Register a `GET` route with explicit `kind` — pass `RouteKind::Prefix`
+    /// to match any path that begins with `pattern`.
+    get(mut &this, pattern: Str, handler: (Request) -> Response, kind: RouteKind) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Get,
+            pattern: pattern,
+            handler: handler,
+            kind:    kind
+        });
+        return &this;
+    }
+
+    /// Register a `POST` exact route.
+    post(mut &this, pattern: Str, handler: (Request) -> Response) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Post,
+            pattern: pattern,
+            handler: handler,
+            kind:    RouteKind::Exact
+        });
+        return &this;
+    }
+
+    /// Register a `POST` route with explicit `kind`.
+    post(mut &this, pattern: Str, handler: (Request) -> Response, kind: RouteKind) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Post,
+            pattern: pattern,
+            handler: handler,
+            kind:    kind
+        });
+        return &this;
+    }
+
+    /// Register a `PUT` exact route.
+    put(mut &this, pattern: Str, handler: (Request) -> Response) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Put,
+            pattern: pattern,
+            handler: handler,
+            kind:    RouteKind::Exact
+        });
+        return &this;
+    }
+
+    /// Register a `PUT` route with explicit `kind`.
+    put(mut &this, pattern: Str, handler: (Request) -> Response, kind: RouteKind) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Put,
+            pattern: pattern,
+            handler: handler,
+            kind:    kind
+        });
+        return &this;
+    }
+
+    /// Register a `DELETE` exact route.
+    del(mut &this, pattern: Str, handler: (Request) -> Response) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Delete,
+            pattern: pattern,
+            handler: handler,
+            kind:    RouteKind::Exact
+        });
+        return &this;
+    }
+
+    /// Register a `DELETE` route with explicit `kind`.
+    del(mut &this, pattern: Str, handler: (Request) -> Response, kind: RouteKind) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Delete,
+            pattern: pattern,
+            handler: handler,
+            kind:    kind
+        });
+        return &this;
+    }
+
+    /// Register a `PATCH` exact route.
+    patch(mut &this, pattern: Str, handler: (Request) -> Response) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Patch,
+            pattern: pattern,
+            handler: handler,
+            kind:    RouteKind::Exact
+        });
+        return &this;
+    }
+
+    /// Register a `PATCH` route with explicit `kind`.
+    patch(mut &this, pattern: Str, handler: (Request) -> Response, kind: RouteKind) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Patch,
+            pattern: pattern,
+            handler: handler,
+            kind:    kind
+        });
+        return &this;
+    }
+
+    /// Register a `HEAD` exact route.
+    head(mut &this, pattern: Str, handler: (Request) -> Response) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Head,
+            pattern: pattern,
+            handler: handler,
+            kind:    RouteKind::Exact
+        });
+        return &this;
+    }
+
+    /// Register a `HEAD` route with explicit `kind`.
+    head(mut &this, pattern: Str, handler: (Request) -> Response, kind: RouteKind) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Head,
+            pattern: pattern,
+            handler: handler,
+            kind:    kind
+        });
+        return &this;
+    }
+
+    /// Register an `OPTIONS` exact route.
+    options(mut &this, pattern: Str, handler: (Request) -> Response) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Options,
+            pattern: pattern,
+            handler: handler,
+            kind:    RouteKind::Exact
+        });
+        return &this;
+    }
+
+    /// Register an `OPTIONS` route with explicit `kind`.
+    options(mut &this, pattern: Str, handler: (Request) -> Response, kind: RouteKind) -> &Router {
+        this.routes.push(Route {
+            method:  Method::Options,
+            pattern: pattern,
+            handler: handler,
+            kind:    kind
+        });
+        return &this;
+    }
+
+    /// Register an exact route for an arbitrary `Method`.
+    route(mut &this, method: Method, pattern: Str, handler: (Request) -> Response) -> &Router {
+        this.routes.push(Route {
+            method:  method,
+            pattern: pattern,
+            handler: handler,
+            kind:    RouteKind::Exact
+        });
+        return &this;
+    }
+
+    /// Register a route for an arbitrary `Method` with explicit `kind`.
+    route(mut &this, method: Method, pattern: Str, handler: (Request) -> Response, kind: RouteKind) -> &Router {
+        this.routes.push(Route {
+            method:  method,
+            pattern: pattern,
+            handler: handler,
+            kind:    kind
+        });
+        return &this;
+    }
+
+    // ── custom fallbacks ──────────────────────────────────────────────────────
+
+    /// Set a custom 404 handler. Called when no registered route
+    /// matches the request path at all. The handler receives the
+    /// original request with an empty params map.
+    on_not_found(mut &this, handler: (Request) -> Response) -> &Router {
+        this.not_found_handler = Option::Some(handler);
+        return &this;
+    }
+
+    /// Set a custom 405 handler. Called when the request path matches
+    /// at least one registered route but none of those routes accept
+    /// the request method. The handler receives the original request
+    /// with an empty params map.
+    on_method_not_allowed(mut &this, handler: (Request) -> Response) -> &Router {
+        this.method_not_allowed_handler = Option::Some(handler);
+        return &this;
+    }
+
+    // ── dispatch ─────────────────────────────────────────────────────────────
+
+    /// Dispatch `req` to the first matching route.
+    ///
+    /// Routes are tried in registration order. The first route where
+    /// both method and path match wins; its captured path parameters
+    /// are injected into `req.params` before the handler is called.
+    ///
+    /// - Full match → handler response.
+    /// - Path match, wrong method → 405 (custom or built-in).
+    /// - No match → 404 (custom or built-in).
+    ///
+    /// `req` is consumed by this call regardless of which path is taken.
+    dispatch(&this, req: Request) -> Response {
+        mut req_local: Request = req;
+        const path: Str = req_local.path.as_str();
+        mut i: u64 = 0;
+        mut path_hit: boolean = false;
+
+        while (i < this.routes.length()) {
+            match (this.routes.get(i)) {
+                Option::Some(route) => {
+                    mut params: HashMap<String, String> = HashMap::new();
+                    if (match_path(route.pattern, path, route.kind, &params)) {
+                        // Path matches — check method.
+                        const rm:   Str = route.method.as_str();
+                        const reqm: Str = req_local.method.as_str();
+                        if (rm.equals(&reqm)) {
+                            // Full match: swap in the captured params and dispatch.
+                            req_local.params.drop();
+                            req_local.params = params;
+                            return (route.handler)(req_local);
+                        } else {
+                            // Path hit, wrong method.
+                            path_hit = true;
+                            params.drop();
+                        }
+                    } else {
+                        params.drop();
+                    }
+                }
+                Option::None => { break; }
+            }
+            i = i + 1;
+        }
+
+        // Path matched but no route accepted the method — 405.
+        if (path_hit) {
+            match (this.method_not_allowed_handler) {
+                Option::Some(h) => { return (h)(req_local); }
+                Option::None    => {
+                    req_local.drop();
+                    return Response::text(
+                        StatusCode::method_not_allowed(),
+                        Str::from_raw("405 Method Not Allowed\n" as u8*, 23)
+                    );
+                }
+            }
+        }
+
+        // Nothing matched — 404.
+        match (this.not_found_handler) {
+            Option::Some(h) => { return (h)(req_local); }
+            Option::None    => {
+                req_local.drop();
+                return Response::text(
+                    StatusCode::not_found(),
+                    Str::from_raw("404 Not Found\n" as u8*, 14)
+                );
+            }
+        }
+    }
+
+    // ── teardown ─────────────────────────────────────────────────────────────
+
+    /// Release the routes array. Call after the server that holds a
+    /// pointer to this router has finished running.
+    drop(mut &this) -> void {
+        this.routes.drop();
+    }
+}

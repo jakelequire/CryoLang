@@ -1,16 +1,30 @@
 ///! HTTP server — blocking, connection-per-request.
 ///!
-///! The only public surface is `HttpServer`. Build one with `HttpServer::new`,
-///! optionally attach a ready callback with `HttpServer::with_ready`, then
-///! call `.run()` to bind and start serving.
+///! Two public entry-points:
 ///!
-///! Handler type is `(Request) -> Response` — routing, path matching, and
-///! method checking all live inside the handler so the server itself stays
-///! policy-free. See the http-server example for a simple router.
+///!   `HttpServer::new(addr, handler)`          — raw function-pointer handler;
+///!                                               routing and method checking
+///!                                               all live inside the handler.
 ///!
-///! Connection-per-request rules out keep-alive and pipelining on purpose:
-///! it is enough for a dev server and simple tooling and is trivial to
-///! reason about.
+///!   `HttpServer::with_router(addr, &router)`  — delegates every request to a
+///!                                               `Router` for structured
+///!                                               method- and path-based
+///!                                               dispatch. The router must
+///!                                               outlive the server (declare
+///!                                               both in the same scope).
+///!
+///! Attach an optional startup callback with `.with_ready(cb)` before
+///! calling `.run()`. `cb` fires once after the socket binds successfully,
+///! before the first `accept` — use it to log the listening address or
+///! signal a readiness probe.
+///!
+///! `.run()` blocks indefinitely, returning only on a fatal listener-level
+///! error (e.g. EMFILE). Per-connection failures (parse errors, client
+///! hangups, write errors) are swallowed — instrument the handler or router
+///! callbacks for request-level telemetry.
+///!
+///! Connection-per-request is intentional: no keep-alive, no pipelining,
+///! trivial to reason about, sufficient for dev servers and simple tooling.
 
 namespace std::net::http::server;
 
@@ -21,6 +35,8 @@ import net::socket_addr;
 import net::tcp;
 import net::http::request;
 import net::http::response;
+import net::http::status;
+import net::http::router;
 
 // ============================================================================
 // HttpServer
@@ -29,34 +45,56 @@ import net::http::response;
 /// A configured HTTP server ready to bind and run.
 ///
 /// ```
-/// // Minimal — no startup log.
-/// mut s: HttpServer = HttpServer::new(addr, handler);
+/// // Raw handler — all routing logic lives in the handler function.
+/// mut s: HttpServer = HttpServer::new(addr, my_handler);
+/// s.with_ready(on_ready);
 /// s.run();
 ///
-/// // With a ready callback for logging or readiness signalling.
-/// mut s: HttpServer = HttpServer::new(addr, handler)
-///                         .with_ready(on_ready);
+/// // Router-backed — structured method + path dispatch.
+/// mut r: Router = Router::new();
+/// r.get(Str::from_raw("/" as u8*, 1), handle_root);
+/// r.get(Str::from_raw("/users/:id" as u8*, 10), handle_user);
+///
+/// mut s: HttpServer = HttpServer::with_router(addr, &r);
+/// s.with_ready(on_ready);
 /// s.run();
+/// r.drop();
 /// ```
-///
-/// `.run()` blocks indefinitely, returning only on a fatal listener-level
-/// error (e.g. EMFILE). Per-connection failures (parse errors, client
-/// hangups, write errors) are swallowed — instrument `handler` itself for
-/// request-level telemetry.
 type struct HttpServer {
     addr:     SocketAddr;
-    handler:  (Request) -> Response;
+    /// Set when built with `new`. `None` when using a Router.
+    handler:  Option<(Request) -> Response>;
+    /// Non-null when built with `with_router`. Takes priority over `handler`.
+    /// Owned by the caller — the Router must outlive this server.
+    router:   Router*;
     on_ready: Option<() -> void>;
 
-    /// Create a server. No ready callback is set; add one later with
-    /// `.with_ready(cb)` if needed.
+    // ── construction ─────────────────────────────────────────────────────────
+
+    /// Build a server with a raw handler function. The handler receives
+    /// every request and must produce a `Response`; all routing logic
+    /// lives inside the handler.
     static new(addr: SocketAddr, handler: (Request) -> Response) -> HttpServer {
         return HttpServer {
             addr:     addr,
-            handler:  handler,
+            handler:  Option::Some(handler),
+            router:   null,
             on_ready: Option::None
         };
     }
+
+    /// Build a server backed by a `Router`. Pass `&router` — the
+    /// router must outlive the server (declare both in the same scope).
+    static with_router(addr: SocketAddr, router: mut &Router) -> HttpServer {
+        return HttpServer {
+            addr:     addr,
+            handler:  Option::None,
+            router:   router,
+            on_ready: Option::None
+        };
+    }
+
+    // ── configuration ────────────────────────────────────────────────────────
 
     /// Attach a ready callback and return `this` for chaining. `cb` is
     /// called once after the socket binds successfully, before the first
@@ -66,6 +104,8 @@ type struct HttpServer {
         this.on_ready = Option::Some(cb);
         return &this;
     }
+
+    // ── lifecycle ────────────────────────────────────────────────────────────
 
     /// Bind to `this.addr` and serve requests forever. Returns `Err`
     /// only on a fatal listener error (e.g. EMFILE, ENFILE).
@@ -95,14 +135,35 @@ type struct HttpServer {
         }
     }
 
-    /// Parse one request, dispatch to `handler`, write the response.
-    /// A parse failure writes a canned 400; a write failure (peer gone)
-    /// is silently dropped. The accept loop always continues.
+    // ── internals ────────────────────────────────────────────────────────────
+
+    /// Route `req` to the router (if set) or the raw handler.
+    /// Consumes the request regardless of which path is taken.
+    dispatch(&this, req: Request) -> Response {
+        if (this.router != null) {
+            return this.router.dispatch(req);
+        }
+        match (this.handler) {
+            Option::Some(h) => { return (h)(req); }
+            Option::None    => {
+                mut req_drop: Request = req;
+                req_drop.drop();
+                return Response::text(
+                    StatusCode::internal_server_error(),
+                    Str::from_raw("no handler configured" as u8*, 20)
+                );
+            }
+        }
+    }
+
+    /// Parse one request, dispatch it, write the response. A parse
+    /// failure writes a canned 400; a write failure (peer gone) is
+    /// silently dropped. The accept loop always continues.
     handle_connection(&this, stream: mut &TcpStream) -> void {
         match (Request::parse(stream)) {
             Result::Ok(req) => {
                 mut request_local: Request = req;
-                mut response: Response = (this.handler)(request_local);
+                mut response: Response = this.dispatch(request_local);
                 match (response.write_to(stream)) {
                     Result::Ok(_) => { }
                     Result::Err(_) => { }

@@ -17,6 +17,7 @@ import io::traits;
 import collections::array;
 import collections::str;
 import collections::string;
+import collections::hashmap;
 import fmt::integer;
 import net::http::method;
 import net::http::headers;
@@ -26,22 +27,38 @@ const MAX_HEADER_LINE: u64 = 8192;
 const MAX_BODY: u64 = 16777216;  // 16 MiB — hard cap against runaway Content-Length
 
 type struct Request {
-    method: Method;
-    path: String;
+    method:  Method;
+    path:    String;
     version: String;
     headers: Headers;
-    body: Array<u8>;
+    body:    Array<u8>;
+    /// Path parameters captured by the router (`/users/:id` → `id`).
+    /// Empty for requests dispatched without a `Router`.
+    params:  HashMap<String, String>;
 
     /// Construct a minimal request. Clients build on top of this with
     /// `with_header` / `with_body`.
     static new(method: Method, path: Str) -> Request {
         return Request {
-            method: method,
-            path: String::from_str(path),
+            method:  method,
+            path:    String::from_str(path),
             version: String::from_str(HTTP_VERSION),
             headers: Headers::new(),
-            body: Array::new()
+            body:    Array::new(),
+            params:  HashMap::new()
         };
+    }
+
+    /// Look up a path parameter captured by the router (e.g., `:id`
+    /// in `/users/:id`). Returns an owned copy of the captured segment
+    /// — the caller is responsible for dropping it. Returns `None`
+    /// when the parameter was not captured (no router, or pattern did
+    /// not include a segment with that name).
+    param(&this, name: Str) -> Option<String> {
+        mut key: String = String::from_str(name);
+        const result: Option<String> = this.params.get(&key);
+        key.drop();
+        return result;
     }
 
     /// Replace the body and set Content-Length accordingly.
@@ -103,11 +120,12 @@ type struct Request {
         }
 
         mut req: Request = Request {
-            method: parsed_method,
-            path: String::from_str(path_str),
+            method:  parsed_method,
+            path:    String::from_str(path_str),
             version: String::from_str(version_str),
             headers: Headers::new(),
-            body: Array::new()
+            body:    Array::new(),
+            params:  HashMap::new()
         };
         line.drop();
 
@@ -235,6 +253,7 @@ type struct Request {
         this.version.drop();
         this.headers.drop();
         this.body.drop();
+        this.params.drop();
     }
 }
 
