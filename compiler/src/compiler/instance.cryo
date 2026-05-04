@@ -375,12 +375,19 @@ type struct CompilerInstance {
                 && strlen(this.config.output_dir_override) > 0) {
             config.output_dir = this.config.output_dir_override;
         }
+
+        // Mirror cryoconfig `debug = true` into the global compiler debug
+        // gate so the [Tag] trace printfs fire.  Only flips it ON — CLI
+        // `--debug` already turned it on if present, and we don't want
+        // `debug = false` in cryoconfig to override that.
+        if (config.debug) {
+            set_compiler_debug(true);
+        }
+
         const root_path: string = config.discovery_root_path();
 
-        if (this.config.debug) {
-            printf("[Compiler] Project: %s (target: %s, root: %s, no_std: %d)\n",
-                config.project_name, config.target_type.label(), root_path, config.no_std as int);
-        }
+        cdebug("[Compiler] Project: %s (target: %s, root: %s, no_std: %d)\n",
+            config.project_name, config.target_type.label(), root_path, config.no_std as int);
 
         if (!File::exists(root_path)) {
             if (config.requires_entry_point()) {
@@ -419,7 +426,7 @@ type struct CompilerInstance {
         if (!config.no_std) {
             stdlib_root = resolve_stdlib_root(config.project_root);
             if (strlen(stdlib_root) > 0) {
-                printf("[Compiler] Stdlib root: %s\n", stdlib_root);
+                cdebug("[Compiler] Stdlib root: %s\n", stdlib_root);
             }
         }
         ctx.stdlib_root = stdlib_root;
@@ -448,9 +455,9 @@ type struct CompilerInstance {
             }
         }
 
-        printf("[Compiler] After discovery: module_count=%u, modules.length=%u\n",
+        cdebug("[Compiler] After discovery: module_count=%u, modules.length=%u\n",
             ctx.module_graph.module_count(), ctx.module_graph.modules.length);
-        printf("[Compiler] name_index_keys.length=%u\n", ctx.module_graph.name_index_keys.length);
+        cdebug("[Compiler] name_index_keys.length=%u\n", ctx.module_graph.name_index_keys.length);
 
         if (ctx.module_graph.module_count() == 0) {
             printf("[Compiler] No modules discovered\n");
@@ -458,7 +465,7 @@ type struct CompilerInstance {
         }
 
         // Compute topological order
-        printf("[Compiler] Calling compute_order()...\n");
+        cdebug("[Compiler] Calling compute_order()...\n");
         if (!ctx.module_graph.compute_order()) {
             ctx.emit_error(ErrorCode::E0501_CIRCULAR_IMPORT,
                 "circular module dependency detected — cannot determine compilation order");
@@ -468,13 +475,11 @@ type struct CompilerInstance {
         const order: u32[] = ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
 
-        if (this.config.debug) {
-            printf("[Compiler] Discovered %u modules, compilation order:\n", n);
-            for (mut i: u32 = 0; i < n; i++) {
-                const info: ModuleInfo = ctx.module_graph.modules[order[i]];
-                printf("  [%u] %s (%s)\n", i,
-                    ctx.intern_table.resolve(info.name), info.file_path);
-            }
+        cdebug("[Compiler] Discovered %u modules, compilation order:\n", n);
+        for (mut i: u32 = 0; i < n; i++) {
+            const info: ModuleInfo = ctx.module_graph.modules[order[i]];
+            cdebug("  [%u] %s (%s)\n", i,
+                ctx.intern_table.resolve(info.name), info.file_path);
         }
 
         // Allocate local buffers for per-module ASTs and scopes.
@@ -487,26 +492,26 @@ type struct CompilerInstance {
         memset(scope_buf, 0, buf_size);
 
         // Phase 2: Frontend — lex, parse, validate all modules in topo order
-        printf("[Compiler] Phase 2: Building frontend pipeline...\n");
+        cdebug("[Compiler] Phase 2: Building frontend pipeline...\n");
         mut pipeline: PassRegistry = PassRegistry::new();
         pipeline.set_verbose(this.config.verbose_passes);
-        printf("[Compiler] Phase 2: Calling set_passes...\n");
+        cdebug("[Compiler] Phase 2: Calling set_passes...\n");
         pipeline.set_passes([PassID::Lexing, PassID::Parsing, PassID::ASTValidation, PassID::CHeaderImport]);
-        printf("[Compiler] Phase 2: Calling validate...\n");
+        cdebug("[Compiler] Phase 2: Calling validate...\n");
         const phase2_valid: boolean = pipeline.validate();
-        printf("[Compiler] Phase 2: validate returned %d\n", phase2_valid as int);
+        cdebug("[Compiler] Phase 2: validate returned %d\n", phase2_valid as int);
 
         for (mut i: u32 = 0; i < n; i++) {
             const mod_idx: u32 = order[i];
-            printf("[Compiler] Phase 2: Processing module %u (index %u)\n", i, mod_idx);
+            cdebug("[Compiler] Phase 2: Processing module %u (index %u)\n", i, mod_idx);
             ctx.switch_to_module(mod_idx as i64);
-            printf("[Compiler] Phase 2: Module %u path='%s'\n", i, ctx.source_file);
-            printf("[Compiler] Phase 2: Calling run_all for module %u...\n", i);
+            cdebug("[Compiler] Phase 2: Module %u path='%s'\n", i, ctx.source_file);
+            cdebug("[Compiler] Phase 2: Calling run_all for module %u...\n", i);
             if (!pipeline.run_all(ctx)) {
                 printf("[Compiler] Phase 2: run_all FAILED for module %u:\n", i);
                 return this.project_failure(ctx);
             }
-            printf("[Compiler] Phase 2: Module %u succeeded\n", i);
+            cdebug("[Compiler] Phase 2: Module %u succeeded\n", i);
             // Save the parsed AST using local buffer
             const ast_slot: void** = ptr_add(ast_buf, (mod_idx * 8) as i64) as void**;
             *ast_slot = ctx.artifacts.ast.root as void*;
@@ -761,10 +766,10 @@ type struct CompilerInstance {
         // Phase 7: Per-module codegen — IR generation, optimization, object emission.
         // Each module gets its own LLVM module. Cross-module references use extern
         // declarations from ModuleGraph.cross_module_fns.
-        printf("[Compiler] Phase 7 gate: phase6_failed=%d, codegen_enabled=%d, errors=%u\n",
+        cdebug("[Compiler] Phase 7 gate: phase6_failed=%d, codegen_enabled=%d, errors=%u\n",
             phase6_failed as int, ctx.mode.codegen_enabled() as int, ctx.diagnostics.error_count);
         if (!phase6_failed && ctx.mode.codegen_enabled()) {
-            printf("[Compiler] Phase 7: Codegen (%u modules)\n", n);
+            cdebug("[Compiler] Phase 7: Codegen (%u modules)\n", n);
 
             // Determine output directory from project config.
             mut obj_dir: string = "build/obj";
@@ -794,8 +799,7 @@ type struct CompilerInstance {
             for (mut i: u32 = 0; i < n; i++) {
                 const _mi: ModuleInfo = ctx.module_graph.modules[order[i]];
                 const _mn: string = ctx.intern_table.resolve(_mi.name);
-                printf("[Compiler] Phase 7: module %u/%u (%s)\n", i, n, _mn);
-                fflush(null);
+                cdebug("[Compiler] Phase 7: module %u/%u (%s)\n", i, n, _mn);
                 CompilerInstance::load_module_with_scope(
                     ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
                 ctx.provisions.clear();
@@ -845,9 +849,9 @@ type struct CompilerInstance {
                     }
 
                     if (pipeline_ok) {
-                        printf("[Compiler] Phase 7: IR + obj for module %u (%s)\n", i, mod_name);
+                        cdebug("[Compiler] Phase 7: IR + obj for module %u (%s)\n", i, mod_name);
                     } else {
-                        printf("[Compiler] Phase 7: IR generated for module %u (%s)\n", i, mod_name);
+                        cdebug("[Compiler] Phase 7: IR generated for module %u (%s)\n", i, mod_name);
                     }
                 } else if (!pipeline_ok) {
                     printf("[Compiler] Phase 7: Codegen FAILED for module %u\n", i);
@@ -868,9 +872,8 @@ type struct CompilerInstance {
             // Only runs when Phase 7 produced at least one object (executable
             // targets); library/stdlib builds short-circuit inside run_linking.
             if (!ctx.diagnostics.has_errors() && ctx.artifacts.object_files.length > 0) {
-                printf("[Compiler] Phase 8: Linking (%lld objects)\n",
+                cdebug("[Compiler] Phase 8: Linking (%lld objects)\n",
                     ctx.artifacts.object_files.length);
-                fflush(null);
                 const link_result: PassResult = CodegenPasses::run_linking(ctx);
                 if (!link_result.success) {
                     printf("[Compiler] Phase 8: Linking FAILED\n");

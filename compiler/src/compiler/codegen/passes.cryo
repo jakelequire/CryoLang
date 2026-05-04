@@ -23,6 +23,7 @@ import Compiler::AST::Node;
 import Compiler::Passes::PassID;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::SymbolStr;
+import Utils::Logger;
 
 
 // ============================================================================
@@ -123,34 +124,34 @@ type struct CodegenPasses {
             module_name = ctx.intern_table.resolve(ctx.namespace_str);
         }
 
-        printf("[Codegen] Step 1: IR generation for module: %s\n", module_name);
+        cdebug("[Codegen] Step 1: IR generation for module: %s\n", module_name);
 
         // Initialize LLVM targets (idempotent).
-        printf("[Codegen] Step 2: Initializing LLVM targets...\n");
+        cdebug("[Codegen] Step 2: Initializing LLVM targets...\n");
         init_native_target();
-        printf("[Codegen] Step 3: LLVM targets initialized\n");
+        cdebug("[Codegen] Step 3: LLVM targets initialized\n");
 
         // Create per-module codegen context on the heap to avoid stack overflow.
         // CompilationContext is already large on the stack, and CodegenContext
         // adds ~400+ bytes of arrays and maps per module.
-        printf("[Codegen] Step 4: Creating CodegenContext...\n");
+        cdebug("[Codegen] Step 4: Creating CodegenContext...\n");
         const _box_cg: Box<CodegenContext> = Box<CodegenContext>::new(CodegenContext::new(ctx, module_name));
         const cg: CodegenContext* = _box_cg.leak();
-        printf("[Codegen] Step 5: CodegenContext created\n");
+        cdebug("[Codegen] Step 5: CodegenContext created\n");
 
         // Set target triple and data layout.
-        printf("[Codegen] Step 6: Setting target triple...\n");
+        cdebug("[Codegen] Step 6: Setting target triple...\n");
         const triple: string = get_default_triple();
         cg.llvm_module.set_target_triple(triple);
-        printf("[Codegen] Step 7: Target triple set\n");
+        cdebug("[Codegen] Step 7: Target triple set\n");
 
-        printf("[Codegen] Step 8: Creating target machine...\n");
+        cdebug("[Codegen] Step 8: Creating target machine...\n");
         mut tm: LTargetMachine = create_native_target_machine();
         if (tm.is_valid()) {
             const layout: string = tm.get_data_layout_string();
             cg.llvm_module.set_data_layout(layout);
         }
-        printf("[Codegen] Step 9: Target machine ready\n");
+        cdebug("[Codegen] Step 9: Target machine ready\n");
 
         // Cross-module externs are declared lazily by `resolve_function` /
         // `resolve_function_with_arity` / `resolve_global` on first reference
@@ -165,20 +166,20 @@ type struct CodegenPasses {
         emit_panic_runtime(cg);
 
         // Create the visitor and generate IR.
-        printf("[Codegen] Step 12: Creating IRGeneratorVisitor...\n");
+        cdebug("[Codegen] Step 12: Creating IRGeneratorVisitor...\n");
         mut gen: IRGeneratorVisitor = IRGeneratorVisitor(cg);
-        printf("[Codegen] Step 13: Getting program AST...\n");
+        cdebug("[Codegen] Step 13: Getting program AST...\n");
         const program: ProgramNode* = ctx.artifacts.ast.program();
-        printf("[Codegen] Step 14: Generating program IR (program=%p)...\n", program as void*);
+        cdebug("[Codegen] Step 14: Generating program IR (program=%p)...\n", program as void*);
         const success: boolean = gen.generate_program(program);
         mut step15_status: string = "failed";
         if (success) { step15_status = "succeeded"; }
-        printf("[Codegen] Step 15: Program IR generation %s\n", step15_status);
+        cdebug("[Codegen] Step 15: Program IR generation %s\n", step15_status);
         fflush(null);
 
         if (!success) {
             if (ctx.debug_mode) {
-                printf("[Codegen] IR generation failed for module: %s\n", module_name);
+                cdebug("[Codegen] IR generation failed for module: %s\n", module_name);
             }
             cg.dispose_builder();
             tm.dispose();
@@ -210,14 +211,14 @@ type struct CodegenPasses {
                 const fn_ty: void* = llvm::LLVMGlobalGetValueType(fn_val);
                 if (fn_ty == null) {
                     const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
-                    printf("[Codegen] CORRUPT: function '%s' has null type in module %s\n",
+                    cdebug("[Codegen] CORRUPT: function '%s' has null type in module %s\n",
                            fn_name, module_name);
                     has_corrupt = true;
                 } else {
                     const ret_ty: void* = llvm::LLVMGetReturnType(fn_ty);
                     if (ret_ty == null) {
                         const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
-                        printf("[Codegen] CORRUPT: function '%s' has null return type in module %s\n",
+                        cdebug("[Codegen] CORRUPT: function '%s' has null return type in module %s\n",
                                fn_name, module_name);
                         has_corrupt = true;
                     }
@@ -229,7 +230,7 @@ type struct CodegenPasses {
                         for (mut pi: u32 = 0; pi < param_count; pi++) {
                             if (slots[pi] == null) {
                                 const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
-                                printf("[Codegen] CORRUPT: function '%s' param %u is null type in module %s\n",
+                                cdebug("[Codegen] CORRUPT: function '%s' param %u is null type in module %s\n",
                                        fn_name, pi, module_name);
                                 has_corrupt = true;
                             }
@@ -267,7 +268,7 @@ type struct CodegenPasses {
         }
 
         if (has_corrupt) {
-            printf("[Codegen] Skipping verification for %s due to corrupt function types\n", module_name);
+            cdebug("[Codegen] Skipping verification for %s due to corrupt function types\n", module_name);
         } else {
             // Verify the LLVM module.
             mut verify_err: i8* = null;
@@ -312,7 +313,7 @@ type struct CodegenPasses {
         }
 
         if (ctx.debug_mode) {
-            printf("[Codegen] Module verified: %s\n", module_name);
+            cdebug("[Codegen] Module verified: %s\n", module_name);
         }
 
         // Store the LLVM module in artifacts.  The module is now owned by
@@ -336,7 +337,7 @@ type struct CodegenPasses {
         }
 
         if (ctx.debug_mode) {
-            printf("[Codegen] Optimization for module: %s\n", ctx.artifacts.ir.module_name);
+            cdebug("[Codegen] Optimization for module: %s\n", ctx.artifacts.ir.module_name);
         }
 
         mut tm: LTargetMachine = create_native_target_machine();
@@ -354,7 +355,7 @@ type struct CodegenPasses {
 
         if (result != 0) {
             if (ctx.debug_mode) {
-                printf("[Codegen] Optimization failed (error code %d)\n", result);
+                cdebug("[Codegen] Optimization failed (error code %d)\n", result);
             }
         }
 
@@ -424,7 +425,7 @@ type struct CodegenPasses {
         ctx.artifacts.register_object_file(obj_name);
 
         if (ctx.debug_mode) {
-            printf("[Codegen] Emitted: %s\n", obj_name);
+            cdebug("[Codegen] Emitted: %s\n", obj_name);
         }
 
         return PassResult::ok();
@@ -500,9 +501,9 @@ type struct CodegenPasses {
         cmd = format("%s -lm -lstdc++", cmd);
 
         if (ctx.debug_mode) {
-            printf("[Codegen] Linking %lld objects → %s\n",
+            cdebug("[Codegen] Linking %lld objects → %s\n",
                 ctx.artifacts.object_files.length, exe_path);
-            printf("[Codegen] Link command: %s\n", cmd);
+            cdebug("[Codegen] Link command: %s\n", cmd);
         }
 
         const rc: i32 = system(cmd);
@@ -512,23 +513,24 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
 
-        printf("[Codegen] Linked executable: %s\n", exe_path);
+        cdebug("[Codegen] Linked executable: %s\n", exe_path);
 
         // Emit a combined `.ll` text dump of the project's per-module IR
-        // (written during Phase 7) alongside the executable.  Useful for
-        // grepping across the whole program at once while we're still
-        // shaking out stage 3 codegen.  Stdlib `.ll` files are intentionally
-        // omitted — re-linking them surfaces non-linkonce duplicates and
-        // the debugging value is mostly in the project's own IR anyway.
-        // Failures here are non-fatal (the executable is already produced).
+        // (written during Phase 7) alongside the executable.  Used by
+        // selfhost-check for stage-4/stage-5 byte-identity verification.
+        // Stderr is redirected to /dev/null so `llvm-link-20`'s "No such
+        // file or directory: build/obj/*.ll" complaint (when Phase 7 didn't
+        // write any .ll files because --emit-llvm wasn't set) doesn't
+        // pollute the user's terminal in the silent default mode.
         const ll_path: string = format("%s.ll", exe_path);
         const obj_dir: string = format("%s/obj", output_dir);
-        const ll_cmd: string = format("llvm-link-20 -S %s/*.ll -o %s", obj_dir, ll_path);
+        const ll_cmd: string = format(
+            "llvm-link-20 -S %s/*.ll -o %s 2>/dev/null", obj_dir, ll_path);
         const ll_rc: i32 = system(ll_cmd);
         if (ll_rc == 0) {
-            printf("[Codegen] Linked IR dump: %s\n", ll_path);
+            cdebug("[Codegen] Linked IR dump: %s\n", ll_path);
         } else {
-            printf("[Codegen] Warning: llvm-link-20 failed for IR dump (rc=%d)\n", ll_rc);
+            cdebug("[Codegen] Warning: llvm-link-20 failed for IR dump (rc=%d)\n", ll_rc);
         }
 
         return PassResult::ok();
@@ -562,9 +564,9 @@ type struct CodegenPasses {
         }
 
         if (ctx.debug_mode) {
-            printf("[Codegen] Bundling %lld objects → %s\n",
+            cdebug("[Codegen] Bundling %lld objects → %s\n",
                 ctx.artifacts.object_files.length, archive_path);
-            printf("[Codegen] Bundle command: %s\n", cmd);
+            cdebug("[Codegen] Bundle command: %s\n", cmd);
         }
 
         const rc: i32 = system(cmd);
@@ -574,7 +576,7 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
 
-        printf("[Codegen] Bundled archive: %s (%lld objects)\n",
+        cdebug("[Codegen] Bundled archive: %s (%lld objects)\n",
             archive_path, ctx.artifacts.object_files.length);
         return PassResult::ok();
     }
