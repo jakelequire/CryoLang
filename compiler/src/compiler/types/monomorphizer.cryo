@@ -866,12 +866,22 @@ type struct Monomorphizer {
                 // every method in the block. If the substitution doesn't
                 // satisfy them, drop bodies so sema doesn't try to type-
                 // check methods that would call non-existent trait
-                // methods on the substituted concrete types.
+                // methods on the substituted concrete types.  Also flag
+                // the impl as disabled — the DI registration path
+                // (specialization.cryo's `run_generic_expression_resolution`)
+                // checks this flag and skips registration entirely, so
+                // the mangler never sees the impl's invalid-typed
+                // signatures.  Without the flag, registration walks
+                // every method's params, hits `resolved_type.id == 0`
+                // for every annotation that referenced one of the
+                // unsatisfied bound's parameters, and emits a junk
+                // mangled symbol with `v` placeholders.
                 if (!this.bounds_satisfied(decl.where_bounds, subst)) {
                     for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
                         const m: MethodNode* = decl.methods[mi];
                         if (m != null && m.func != null) { m.func.body = null; }
                     }
+                    decl.bounds_disabled = true;
                     return;
                 }
                 this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
@@ -1139,15 +1149,55 @@ type struct Monomorphizer {
             sig_ctx.set_this_type(this_type);
         }
         this.type_resolver.resolve_func_signature(func, &sig_ctx);
-        // If resolved_return_type is still invalid, the substituter may not
-        // have rewritten the return_type_annotation (C++ compiler virtual
-        // dispatch limitation).  Build a resolution context with generic
-        // param bindings, then apply the substitution to the result.
-        if (!func.has_resolved_return_type() && subst != null && func.return_type_annotation != null) {
-            // Bind generic params directly to their concrete replacements
-            // (not to GenericParam TypeRefs).  This way resolve() produces
-            // concrete types directly — e.g., Named("T") → u64 TypeRef.
+
+        // Back-fill `&this` / `this` parameters when they have no
+        // explicit annotation — the parser leaves `type_annotation` null
+        // on the implicit receiver, so `resolve_func_signature` skips
+        // them and `param.resolved_type` stays at the default invalid
+        // sentinel.  The non-spec path's `resolve_method_signatures`
+        // does this same back-fill from `owner_type` (resolver.cryo
+        // line 308-317); duplicating it here so spec'd method clones
+        // get the same treatment.
+        //
+        // For `&this` we want `Pointer(this_type)` — Cryo lowers
+        // references on receivers to pointer-to-owner at the LLVM
+        // level (matching what `register_methods_with_module_aliased`
+        // expects).  For bare `this` we want the owner type directly.
+        if (this_type.is_valid()) {
+            const this_amp: SymbolStr = this.intern_table.intern("&this");
+            const this_val: SymbolStr = this.intern_table.intern("this");
+            for (mut bp: i64 = 0; bp < func.parameters.length; bp++) {
+                const param: VarDeclNode* = func.parameters[bp];
+                if (param == null || param.resolved_type.is_valid()) { continue; }
+                if (param.name.equals(this_amp)) {
+                    param.resolved_type = this.arena.get_pointer_to(this_type);
+                } else if (param.name.equals(this_val)) {
+                    param.resolved_type = this_type;
+                }
+            }
+        }
+        // Fallback resolution with substitution-derived bindings.  After
+        // ASTSpecializer clones the AST, ASTTypeSubstituter rewrites the
+        // annotation tree to replace generic-param references with their
+        // concrete replacements — but the substituter doesn't always
+        // reach every spot (the C++ bootstrap had virtual-dispatch gaps,
+        // and some annotation kinds — Function, nested Generic — weren't
+        // walked).  When that happens, the post-substitution annotation
+        // still reads `T` and the empty `res_ctx` can't resolve it, so
+        // `resolve_func_signature` above leaves the return type and any
+        // affected params at the invalid sentinel.
+        //
+        // Build a `gen_ctx` that maps every original generic-param
+        // SymbolStr to its concrete replacement (so `Named("T")` → `u64`,
+        // `Named("Item")` → whatever) and re-resolve every still-invalid
+        // signature slot through it.  Concrete-mapping rather than
+        // GenericParam-rebinding is intentional: we want the final
+        // resolved_type to be the substituted form, not a re-encoded
+        // GenericParam that downstream substitution would then have to
+        // chase a second time.
+        if (subst != null) {
             mut gen_ctx: ResolutionContext = *res_ctx;
+            if (this_type.is_valid()) { gen_ctx.set_this_type(this_type); }
             for (mut si: i64 = 0; si < subst.param_ids.length; si++) {
                 const param_t: Type* = this.arena.lookup(subst.param_ids[si]);
                 if (param_t != null && param_t.kind == TypeKind::GenericParam) {
@@ -1155,10 +1205,28 @@ type struct Monomorphizer {
                     gen_ctx.add_binding(gp.param_name, subst.replacements[si]);
                 }
             }
-            const resolved: TypeRef = this.type_resolver.resolve(
-                func.return_type_annotation, &gen_ctx);
-            if (resolved.is_valid()) {
-                func.resolved_return_type = resolved;
+            // Return type fallback (existing behavior).
+            if (!func.has_resolved_return_type() && func.return_type_annotation != null) {
+                const resolved: TypeRef = this.type_resolver.resolve(
+                    func.return_type_annotation, &gen_ctx);
+                if (resolved.is_valid()) {
+                    func.resolved_return_type = resolved;
+                }
+            }
+            // Param fallback: same logic, every still-unresolved
+            // explicitly-annotated parameter gets one more shot via the
+            // concrete-binding context.  Skips `&this`/`this` because
+            // those are back-filled above from `this_type` directly.
+            for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
+                const param: VarDeclNode* = func.parameters[pi];
+                if (param == null) { continue; }
+                if (param.resolved_type.is_valid()) { continue; }
+                if (param.type_annotation == null) { continue; }
+                const ptype: TypeRef = this.type_resolver.resolve(
+                    param.type_annotation, &gen_ctx);
+                if (ptype.is_valid()) {
+                    param.resolved_type = ptype;
+                }
             }
         }
         if (func.body != null) {
