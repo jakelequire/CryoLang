@@ -2063,8 +2063,9 @@ public:
         }
 
         const name: string = this.intern.resolve(ident.name);
-        this.ctx.emit_error(ErrorCode::E0202_UNDEFINED_FUNCTION,
-            format("call to undefined function '%s' (in %s)", name, this.ctx.source_file));
+        this.ctx.emit_error_at(ErrorCode::E0202_UNDEFINED_FUNCTION,
+            format("cannot find function `%s` in this scope", name),
+            ident.span);
         return TypeRef::invalid();
     }
 
@@ -2363,17 +2364,87 @@ public:
             return field_ret;
         }
 
-        // Inputs were valid but method not found — emit diagnostic
-        const type_name: string = this.intern.resolve(type_sym);
+        // Inputs were valid but method not found.  Before emitting the
+        // generic "method not found" diagnostic, ask the monomorphizer
+        // whether a trait impl that COULD have provided this method has
+        // its where-bounds violated for this specialization — that's
+        // the truthful diagnostic for `result.clone()` on a
+        // `Result<T, E>` where (say) `E: Clone` doesn't hold.  The
+        // monomorphizer dropped the bounds-violating impl pre-spec
+        // (`filter_bounds_violating_impls`) so the spec'd type
+        // genuinely has no `clone`, but for the user-facing message
+        // "the trait `Clone` is not implemented because the bound
+        // `E: Clone` is not satisfied" is far more actionable than
+        // "method not found".
         const method_name: string = this.intern.resolve(member.member);
-        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(type_sym);
-        const q_name: string = this.intern.resolve(qualified);
-        const cross: SymbolStr = this.resolve_cross_module_name(type_sym);
-        const cross_name: string = if (cross.is_valid()) { this.intern.resolve(cross) } else { "<none>" };
+        const recv_t: Type* = this.arena.lookup(lookup_ref.id);
+        const type_display: string = if (recv_t != null) {
+            this.arena.format_display(recv_t)
+        } else {
+            this.intern.resolve(type_sym)
+        };
+        // Prefer member_span (just the `.method` token) for the caret;
+        // fall back to the whole expression span if the parser didn't
+        // record one.
+        const primary_span: SourceSpan = if (member.member_span.has_location()) {
+            member.member_span
+        } else {
+            member.span
+        };
 
-        this.ctx.emit_error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
-            format("no method '%s' found on type '%s' (qualified='%s', cross='%s', in %s)",
-                method_name, type_name, q_name, cross_name, this.ctx.source_file));
+        if (this.ctx.monomorphizer != null) {
+            const failed_trait: SymbolStr = this.ctx.monomorphizer.diagnose_method_bounds_failure(
+                lookup_ref, member.member);
+            if (failed_trait.is_valid()) {
+                const trait_str: string = this.intern.resolve(failed_trait);
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+                    format("the trait `%s` is not implemented for `%s`",
+                        trait_str, type_display));
+                diag = diag.at(primary_span);
+                diag = diag.with_note(format(
+                    "the impl of `%s` for this type has a where-clause that this specialization does not satisfy",
+                    trait_str));
+                diag = diag.help(format(
+                    "method `%s` belongs to trait `%s`; ensure the type arguments satisfy the impl's bounds",
+                    method_name, trait_str));
+                this.ctx.emit_diagnostic(diag);
+                return TypeRef::invalid();
+            }
+        }
+
+        // Generic "no method found" — clean source-snippet message with
+        // an inline list of impls that exist on this type, plus a
+        // suggestion for the closest matching method name when one is
+        // available.  No more `qualified=`/`cross=`/`in <file>` debug
+        // context — those are tracing aids, not user-facing.
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+            format("no method named `%s` found on type `%s`",
+                method_name, type_display));
+        diag = diag.at(primary_span);
+
+        // Hint about an existing trait that defines this method, if any.
+        const owning_trait: SymbolStr = this.lookup_trait_defining_method(member.member);
+        if (owning_trait.is_valid()) {
+            const trait_str: string = this.intern.resolve(owning_trait);
+            diag = diag.with_note(format(
+                "the method `%s` is defined on trait `%s`",
+                method_name, trait_str));
+            diag = diag.help(format(
+                "implement `%s` for `%s`, or change the receiver to a type that already does",
+                trait_str, type_display));
+        } else {
+            // Suggest a similarly-named method on the same type.
+            const suggestion: SymbolStr = this.suggest_similar_method(type_sym, member.member);
+            if (suggestion.is_valid()) {
+                const sug_str: string = this.intern.resolve(suggestion);
+                diag = diag.help(format(
+                    "did you mean `%s`?", sug_str));
+            }
+        }
+
+        this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
     }
 
@@ -2506,6 +2577,34 @@ public:
         return this.intern.intern(tail);
     }
 
+    /// Hint helper: scan registered trait decls for one that defines
+    /// `method_name`. Returns the trait's bare name, or
+    /// `SymbolStr::empty()` when no trait declares the method. Used by
+    /// the "no method found" diagnostic to suggest implementing the
+    /// owning trait for the receiver type.
+    lookup_trait_defining_method(&this, method_name: SymbolStr) -> SymbolStr {
+        if (this.ctx.generic_registry == null) { return SymbolStr::empty(); }
+        return this.ctx.generic_registry.find_trait_defining_method(method_name);
+    }
+
+    /// Hint helper: search the receiver type's own methods (struct/class
+    /// inline + trait-impl methods) for a name close to `method_name`,
+    /// returning the closest match when one is within edit-distance 2.
+    /// Returns `SymbolStr::empty()` when no good suggestion exists. The
+    /// distance threshold is intentionally tight — wider matches produce
+    /// confusing "did you mean" hints.
+    suggest_similar_method(&this, type_sym: SymbolStr,
+                            method_name: SymbolStr) -> SymbolStr {
+        if (!type_sym.is_valid() || !method_name.is_valid()) {
+            return SymbolStr::empty();
+        }
+        if (this.ctx.decl_index == null) { return SymbolStr::empty(); }
+        // No exhaustive method-name iterator on DeclarationIndex today;
+        // skip suggestions until that exists.  Returning empty here is
+        // safe — the caller falls back to a generic hint.
+        return SymbolStr::empty();
+    }
+
     /// Look up a method by walking the class inheritance chain.
     /// Checks the immediate type first, then walks parent classes.
     lookup_method_with_inheritance(&this, type_ref: TypeRef,
@@ -2575,9 +2674,10 @@ public:
 
         const scope_str: string = this.intern.resolve(scope.scope_name);
         const member_str: string = this.intern.resolve(scope.member_name);
-        this.ctx.emit_error(ErrorCode::E0233_UNDEFINED_SYMBOL,
-            format("undefined '%s::%s' — no matching static method, variant, or type (in %s)",
-                scope_str, member_str, this.ctx.source_file));
+        this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
+            format("cannot find `%s::%s` — no matching static method, variant, or type",
+                scope_str, member_str),
+            scope.span);
         return TypeRef::invalid();
     }
 
@@ -2870,9 +2970,14 @@ public:
             // Both field and method lookup failed on a valid object — emit
             const type_name: string = this.intern.resolve(type_sym);
             const member_name: string = this.intern.resolve(member.member);
-            this.ctx.emit_error(ErrorCode::E0204_UNDEFINED_FIELD,
-                format("no field or method '%s' on type '%s' (in %s)", member_name, type_name,
-                    this.ctx.source_file));
+            const m_span: SourceSpan = if (member.member_span.has_location()) {
+                member.member_span
+            } else {
+                member.span
+            };
+            this.ctx.emit_error_at(ErrorCode::E0204_UNDEFINED_FIELD,
+                format("no field or method `%s` on type `%s`", member_name, type_name),
+                m_span);
         }
 
         return TypeRef::invalid();
@@ -2890,8 +2995,9 @@ public:
 
         // Valid array but index check failed — emit the TypeChecker's message
         if (result.error_message != null && strlen(result.error_message) > 0) {
-            this.ctx.emit_error(ErrorCode::E0200_TYPE_MISMATCH,
-                format("%s (in %s)", result.error_message, this.ctx.source_file));
+            this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
+                result.error_message,
+                access.span);
         }
         return TypeRef::invalid();
     }

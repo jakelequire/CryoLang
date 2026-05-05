@@ -572,6 +572,22 @@ type struct Monomorphizer {
         const subst: TypeSubstitution = TypeSubstitution::from_params(
             entry.param_type_ids, request.type_args
         );
+
+        // Drop impls and methods whose where-bounds aren't satisfied for
+        // this substitution.  A bounds-violating impl/method is genuinely
+        // inapplicable to this spec — sema's call-site bounds check would
+        // reject any user code trying to invoke it, so there's no valid
+        // call site that can ever reach the spec'd version.  Removing
+        // them here (rather than cloning + flagging + filtering at every
+        // downstream consumer) means:
+        //   * resolve_specialized_ast never sees an uncompilable body
+        //   * DI registration never indexes a junk signature
+        //   * the mangler never sees an invalid TypeRef
+        // and there's no `bounds_disabled` flag to forget to check.
+        this.filter_bounds_violating_methods(result.specialized_ast, &subst);
+        const kept_impl_asts: ASTNode*[] = this.filter_bounds_violating_impls(
+            result.impl_asts, &subst);
+
         const concrete_type: TypeRef = this.create_concrete_type(entry, qualified_spec_sym, &subst);
 
         // Register the bare spec name as an alias in the arena so that
@@ -650,8 +666,8 @@ type struct Monomorphizer {
             this.current_spec_struct  = result.specialized_ast as StructDeclNode*;
         }
         this.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry, &subst, this_type_for_methods);
-        for (mut ri: i64 = 0; ri < result.impl_asts.length; ri++) {
-            this.resolve_specialized_ast(result.impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst, this_type_for_methods);
+        for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
+            this.resolve_specialized_ast(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst, this_type_for_methods);
         }
         this.current_spec_inst_id = prev_spec_inst_id;
         this.current_spec_struct  = prev_spec_struct;
@@ -720,7 +736,7 @@ type struct Monomorphizer {
             specialized_type:  concrete_type,
             specialized_name:  spec_name_sym,
             ast_node:          result.specialized_ast,
-            impl_nodes:        result.impl_asts,
+            impl_nodes:        kept_impl_asts,
             origin_module:     origin,
             template_module:   entry.module_name,
             instantiated_type: request.generic_type,
@@ -861,29 +877,13 @@ type struct Monomorphizer {
             NodeKind::ImplementationBlock => {
                 const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
                 if (decl == null) { return; }
-                // Impl-level where-clauses (e.g. `implement<T> trait Clone
-                // for Result<T, E> where T: Clone, E: Clone`) constrain
-                // every method in the block. If the substitution doesn't
-                // satisfy them, drop bodies so sema doesn't try to type-
-                // check methods that would call non-existent trait
-                // methods on the substituted concrete types.  Also flag
-                // the impl as disabled — the DI registration path
-                // (specialization.cryo's `run_generic_expression_resolution`)
-                // checks this flag and skips registration entirely, so
-                // the mangler never sees the impl's invalid-typed
-                // signatures.  Without the flag, registration walks
-                // every method's params, hits `resolved_type.id == 0`
-                // for every annotation that referenced one of the
-                // unsatisfied bound's parameters, and emits a junk
-                // mangled symbol with `v` placeholders.
-                if (!this.bounds_satisfied(decl.where_bounds, subst)) {
-                    for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
-                        const m: MethodNode* = decl.methods[mi];
-                        if (m != null && m.func != null) { m.func.body = null; }
-                    }
-                    decl.bounds_disabled = true;
-                    return;
-                }
+                // Impl- and method-level where-bounds were already
+                // verified by `filter_bounds_violating_impls` /
+                // `filter_bounds_violating_methods` in
+                // `specialize_with_entry` — bounds-violating impls
+                // and methods were stripped pre-clone and never reach
+                // this resolver.
+                //
                 // Bind the trait's outer generic params to the impl's
                 // trait args.  ASTTypeSubstituter only rewrites names
                 // in `param_names` (the impl's own `<T,...>`), so trait
@@ -914,17 +914,11 @@ type struct Monomorphizer {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
-            // Bound enforcement: skip methods whose where-clauses aren't
-            // met by the current substitution. Drops the body so sema's
-            // visit_methods skips type-checking it, and flags the method
-            // so DI registration skips it (otherwise its still-unresolved
-            // signature gets mangled and pins a junk symbol — same
-            // failure mode as the impl-level `bounds_disabled` path).
-            if (!this.method_bounds_satisfied(method.func, subst)) {
-                method.func.body = null;
-                method.func.bounds_disabled = true;
-                continue;
-            }
+            // Per-method where-bounds were already verified by
+            // `filter_bounds_violating_methods` /
+            // `filter_bounds_violating_impls` in `specialize_with_entry`;
+            // bounds-violating methods were dropped pre-clone and never
+            // reach this resolver.
             // Static methods don't take `this` — pass invalid so the
             // inference walker doesn't seed a spurious `this` binding.
             const m_this: TypeRef = if (method.is_static) {
@@ -1062,6 +1056,130 @@ type struct Monomorphizer {
             }
         }
         return true;
+    }
+
+    /// Drop methods whose own where-bounds aren't satisfied by `subst`
+    /// from the spec'd type's inherent-method list.  Operates in-place
+    /// on Struct/Class/Enum AST nodes; no-op for other kinds.
+    ///
+    /// Called pre-resolution so that resolve_specialized_ast never
+    /// type-checks an inherent method whose body would call non-existent
+    /// methods on the substituted concrete types (e.g.
+    /// `Result::contains where T: Eq` cloned for `Result<T, E>` where
+    /// `T` doesn't implement `Eq`).
+    filter_bounds_violating_methods(mut &this, ast_node: ASTNode*,
+                                     subst: TypeSubstitution*) -> void {
+        if (ast_node == null) { return; }
+        // Enums have no inline methods — their methods live in
+        // `implement enum Foo<T> {…}` blocks routed through impl_asts.
+        if (ast_node.kind == NodeKind::StructDeclaration) {
+            const decl: StructDeclNode* = ast_node as StructDeclNode*;
+            decl.methods = this.filter_methods(decl.methods, subst);
+        } else if (ast_node.kind == NodeKind::ClassDeclaration) {
+            const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
+            decl.methods = this.filter_methods(decl.methods, subst);
+        }
+    }
+
+    /// Drop bounds-violating impls entirely; for surviving impls, drop
+    /// any methods whose own where-bounds don't hold.  Returns the
+    /// pruned impl-AST array so callers can plug it into downstream
+    /// registration/codegen without touching `result.impl_asts`.
+    ///
+    /// Removing the impl outright (rather than flagging) means no
+    /// downstream consumer needs to filter, and the spec'd type
+    /// simply won't have the trait method registered — making sema's
+    /// "method not found" diagnostic at the call site truthful (the
+    /// method genuinely doesn't apply here because its bounds fail).
+    filter_bounds_violating_impls(mut &this, impl_asts: ASTNode*[],
+                                   subst: TypeSubstitution*) -> ASTNode*[] {
+        mut kept: ASTNode*[] = [];
+        for (mut i: i64 = 0; i < impl_asts.length; i++) {
+            const impl_ast: ASTNode* = impl_asts[i];
+            const impl_node: ImplBlockNode* = impl_ast as ImplBlockNode*;
+            if (impl_node == null) { continue; }
+            if (!this.bounds_satisfied(impl_node.where_bounds, subst)) {
+                continue;
+            }
+            impl_node.methods = this.filter_methods(impl_node.methods, subst);
+            kept.push(impl_ast);
+        }
+        return kept;
+    }
+
+    /// Helper: keep only methods whose per-method where-bounds (the
+    /// `where T: Trait` after the signature) are satisfied by `subst`.
+    filter_methods(&this, methods: MethodNode*[],
+                    subst: TypeSubstitution*) -> MethodNode*[] {
+        mut kept: MethodNode*[] = [];
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            if (!this.method_bounds_satisfied(m.func, subst)) {
+                continue;
+            }
+            kept.push(m);
+        }
+        return kept;
+    }
+
+    /// Diagnostic helper: when sema's call-site method lookup misses on
+    /// a spec'd type, we want to distinguish "this method genuinely
+    /// doesn't exist" from "the trait providing this method has a
+    /// where-clause that isn't satisfied for this specialization".
+    /// Walks the trait impls registered against `receiver`'s base type
+    /// and returns the bare name of the first trait whose impl provides
+    /// `method_name` but whose `where_bounds` aren't satisfied for the
+    /// receiver's type args.  Returns `SymbolStr::empty()` when no such
+    /// trait exists.
+    diagnose_method_bounds_failure(&this, receiver: TypeRef,
+                                    method_name: SymbolStr) -> SymbolStr {
+        if (this.generic_registry == null) { return SymbolStr::empty(); }
+
+        // Sema typically passes the spec'd concrete type (e.g. the
+        // Enum for `Result_int_OpaqueErr`) rather than the
+        // InstantiatedType wrapper.  `bare_name_of` on a Struct/Class/
+        // Enum returns its qualified leaf — for spec'd types that's
+        // the mangled spec name (`Result_int_OpaqueErr`), not the
+        // template's bare name (`Result`).  Trait impls are registered
+        // against the template's bare name, so without walking back
+        // to the wrapper here, the registry lookup misses every
+        // template impl and we'd silently fall through to the generic
+        // "method not found" diagnostic.  Same reasoning applies to
+        // the recursive `type_implements_trait` call below — it also
+        // requires the InstantiatedType wrapper to substitute the
+        // template's generic params with the receiver's type args.
+        mut probe_ref: TypeRef = receiver;
+        const recv_t: Type* = this.arena.lookup(receiver.id);
+        if (recv_t != null && recv_t.kind != TypeKind::InstantiatedType) {
+            const wrapper: TypeRef = this.find_inst_wrapping(receiver);
+            if (wrapper.is_valid()) { probe_ref = wrapper; }
+        }
+
+        const base_name: SymbolStr = this.bare_name_of(probe_ref);
+        if (!base_name.is_valid()) { return SymbolStr::empty(); }
+        const traits: SymbolStr[] = this.generic_registry.traits_implemented_by(base_name);
+        for (mut i: i64 = 0; i < traits.length; i++) {
+            const trait_name: SymbolStr = traits[i];
+            const impl_block: ImplBlockNode* =
+                this.generic_registry.lookup_trait_impl(trait_name, base_name);
+            if (impl_block == null) { continue; }
+            // Does this impl provide the method we're looking for?
+            mut has_method: boolean = false;
+            for (mut mi: i64 = 0; mi < impl_block.methods.length; mi++) {
+                const m: MethodNode* = impl_block.methods[mi];
+                if (m != null && m.func != null && m.func.name.equals(method_name)) {
+                    has_method = true;
+                    break;
+                }
+            }
+            if (!has_method) { continue; }
+            // Method exists; check whether bounds hold for this receiver.
+            if (!this.type_implements_trait(probe_ref, trait_name, 0)) {
+                return trait_name;
+            }
+        }
+        return SymbolStr::empty();
     }
 
     /// Recursively check whether a concrete TypeRef implements a trait.
@@ -2104,6 +2222,18 @@ type struct Monomorphizer {
             if (!this.inference_bindings[i].is_valid()) { return; }
         }
 
+        // Where-clause bound check at the call site.  If the inferred
+        // type args don't satisfy the function's `where T: Trait`
+        // clauses, emit a "the trait bound `X: Y` is not satisfied"
+        // diagnostic at the call expression and skip pin + queue.
+        // Skipping the queue prevents the spec'd body from being
+        // produced — that's what suppresses the cascade of follow-on
+        // errors (`as_str`, `drop`, …) that come from the rejected
+        // body's type-check after monomorphization.
+        if (!this.check_function_bounds_at_call(call, tmpl_func, entry)) {
+            return;
+        }
+
         // Pin the specialized callee symbol on the call (codegen consumes it)
         // and queue the instantiation so this same mono iteration produces
         // the concrete function before codegen runs.
@@ -2114,6 +2244,82 @@ type struct Monomorphizer {
         call.set_resolved_callee(spec_sym);
         this.generic_registry.instantiate_for_module(
             entry.base_type, this.inference_bindings, this.current_module);
+    }
+
+    /// Verify the function template's `where`-clause bounds hold for
+    /// the inferred type args in `inference_bindings`.  On the first
+    /// failing bound, emits a rich diagnostic (primary span at the
+    /// call expression, secondary at the failing TraitRef) and returns
+    /// false so the caller can skip pinning and enqueueing — that's
+    /// what stops the cascade of follow-on errors from the rejected
+    /// body type-check.
+    check_function_bounds_at_call(mut &this, call: CallExprNode*,
+                                    tmpl_func: FunctionDeclNode*,
+                                    entry: TemplateEntry*) -> boolean {
+        if (tmpl_func == null || entry == null) { return true; }
+        if (tmpl_func.trait_bounds.length == 0) { return true; }
+        for (mut bi: i64 = 0; bi < tmpl_func.trait_bounds.length; bi++) {
+            const bound: TraitBound = tmpl_func.trait_bounds[bi];
+            // Find the position of this bound's type parameter in the
+            // template's generic-param order — that's the index into
+            // `inference_bindings` for the inferred concrete type.
+            mut idx: i64 = -1;
+            for (mut pi: i64 = 0; pi < entry.param_names.length; pi++) {
+                if (entry.param_names[pi].equals(bound.type_parameter)) {
+                    idx = pi;
+                    break;
+                }
+            }
+            if (idx < 0 || idx >= this.inference_bindings.length) { continue; }
+            const concrete: TypeRef = this.inference_bindings[idx];
+            if (!concrete.is_valid()) { continue; }
+            // Each `T: A + B` carries a list of trait_refs; every one
+            // must hold.  First failure emits and short-circuits.
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: TraitRef = bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                if (!this.type_implements_trait(concrete, trait_name, 0)) {
+                    this.emit_call_bound_failure(
+                        call, tmpl_func, tref, concrete, trait_name);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Emit a "the trait bound `X: Y` is not satisfied" diagnostic in
+    /// the format the user's call-site sees: primary caret at the
+    /// invocation, a secondary "required by this bound in `func`"
+    /// label at the offending where-clause TraitRef, and a help line
+    /// with the actionable next step.
+    emit_call_bound_failure(mut &this, call: CallExprNode*,
+                              tmpl_func: FunctionDeclNode*,
+                              tref: TraitRef, concrete: TypeRef,
+                              trait_name: SymbolStr) -> void {
+        const trait_str: string = this.intern_table.resolve(trait_name);
+        const fn_str: string = this.intern_table.resolve(tmpl_func.name);
+        const concrete_t: Type* = this.arena.lookup(concrete.id);
+        const concrete_str: string = if (concrete_t != null) {
+            this.arena.format_display(concrete_t)
+        } else {
+            "?"
+        };
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+            format("the trait bound `%s: %s` is not satisfied",
+                concrete_str, trait_str));
+        diag = diag.at(call.span);
+        diag = diag.also_at(tref.span, format(
+            "required by this bound in `%s`", fn_str));
+        diag = diag.with_note(format(
+            "the trait `%s` is not implemented for `%s`",
+            trait_str, concrete_str));
+        diag = diag.help(format(
+            "implement `%s` for `%s`, or pass an argument of a type that already does",
+            trait_str, concrete_str));
+        this.diagnostics.emit(diag);
     }
 
     /// Try to specialize `Owner::method(...)` where Owner is a GENERIC
