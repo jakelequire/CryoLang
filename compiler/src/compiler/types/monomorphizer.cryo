@@ -884,6 +884,19 @@ type struct Monomorphizer {
                     decl.bounds_disabled = true;
                     return;
                 }
+                // Bind the trait's outer generic params to the impl's
+                // trait args.  ASTTypeSubstituter only rewrites names
+                // in `param_names` (the impl's own `<T,...>`), so trait
+                // generics like `Iterator<Item>`'s `Item` survive
+                // substitution as bare `Named("Item")` annotations.
+                // Without binding `Item` to the impl's concrete arg
+                // here, cloned default-method bodies (e.g. `fold<Acc>`'s
+                // `f: (Acc, Item) -> Acc`) re-resolve through this
+                // empty context, the inner `Item` lookup misses, and
+                // the resulting FunctionType has an invalid TypeRef
+                // in its param list — which the mangler later encodes
+                // as `v`, pinning a junk symbol.
+                this.bind_trait_args_for_spec_impl(decl, &res_ctx);
                 this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
             }
             _ => {}
@@ -955,6 +968,62 @@ type struct Monomorphizer {
         if (func == null) { return true; }
         if (func.trait_bounds.length == 0) { return true; }
         return this.bounds_satisfied(func.trait_bounds, subst);
+    }
+
+    /// For a spec'd trait impl block, bind the trait's outer generic
+    /// param names to the concrete trait args inside `res_ctx`.  Mirrors
+    /// `TypeResolutionPasses::bind_trait_args_for_impl`, but operates on
+    /// already-spec'd impls whose `trait_annotation` carries concrete
+    /// args after `ASTTypeSubstituter` ran.
+    ///
+    /// Concrete case: `implement<T> trait Iterator<T> for Bar<T>` gets
+    /// specialized to `T → u8` by ASTSpecializer.  The clone's
+    /// `trait_annotation` becomes `Generic(Iterator, [u8])`.  But the
+    /// substituter only rewrites names in the impl's own `param_names`
+    /// (= `[T]`); the trait's generic-param names like `Item` survive
+    /// inside any annotation that mentioned them (e.g. fold's
+    /// `f: (Acc, Item) -> Acc`).  Without binding `Item -> u8` here,
+    /// the cloned default body's `Item` lookup misses and the resulting
+    /// FunctionType has an invalid internal param.
+    bind_trait_args_for_spec_impl(mut &this, impl_node: ImplBlockNode*,
+                                   res_ctx: ResolutionContext*) -> void {
+        if (impl_node == null || !impl_node.is_trait_impl()) { return; }
+        const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
+        if (trait_ann == null) { return; }
+
+        // Extract concrete args.  Mirrors TypeResolutionPasses::extract_trait_args.
+        mut trait_args: TypeAnnotation*[] = [];
+        match (*trait_ann) {
+            TypeAnnotation::Generic(g) => { trait_args = g.args; }
+            _ => { return; }
+        }
+        if (trait_args.length == 0) { return; }
+
+        // Extract the trait's bare leaf name to look up its decl.
+        mut trait_leaf: SymbolStr = SymbolStr::empty();
+        match (*trait_ann) {
+            TypeAnnotation::Named(n) => { trait_leaf = n.name; }
+            TypeAnnotation::Generic(g) => {
+                match (*g.base) {
+                    TypeAnnotation::Named(n) => { trait_leaf = n.name; }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        if (!trait_leaf.is_valid()) { return; }
+        if (this.generic_registry == null) { return; }
+        const trait_decl: TraitDeclNode* = this.generic_registry.get_trait_decl(trait_leaf);
+        if (trait_decl == null) { return; }
+        if (trait_decl.generic_params.length != trait_args.length) { return; }
+
+        for (mut i: i64 = 0; i < trait_args.length; i++) {
+            const gp: GenericParamNode* = trait_decl.generic_params[i];
+            if (gp == null) { continue; }
+            const arg_ty: TypeRef = this.type_resolver.resolve(trait_args[i], res_ctx);
+            if (!arg_ty.is_valid()) { continue; }
+            res_ctx.add_binding(gp.name, arg_ty);
+        }
     }
 
     /// Check that every TraitBound in `bounds` has a registered trait-impl
