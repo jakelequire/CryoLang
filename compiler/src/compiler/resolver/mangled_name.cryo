@@ -273,7 +273,7 @@ type struct MangledName {
         buf = buf + "$F";
         buf = buf + encode_params(table, arena, params, receiver, is_variadic);
         buf = buf + "$R";
-        buf = buf + encode_type_ref(table, arena, ret);
+        buf = buf + encode_type_ref(table, arena, ret, "for_trait_impl.ret");
         return MangledName { value: table.intern(buf) };
     }
 
@@ -449,7 +449,7 @@ function mangle_with_path(table: InternTable*, arena: TypeArena*,
         buf = buf + "$F";
         buf = buf + encode_params(table, arena, params, receiver, is_variadic);
         buf = buf + "$R";
-        buf = buf + encode_type_ref(table, arena, ret);
+        buf = buf + encode_type_ref(table, arena, ret, "mangle_with_path.ret");
     }
     return MangledName { value: table.intern(buf) };
 }
@@ -529,7 +529,7 @@ function encode_path_with_leaf_generics(table: InternTable*, arena: TypeArena*,
             buf = buf + "$L";
             for (mut j: i64 = 0; j < generic_args.length; j++) {
                 if (j > 0) { buf = buf + "_"; }
-                buf = buf + encode_type_ref(table, arena, generic_args[j]);
+                buf = buf + encode_type_ref(table, arena, generic_args[j], "leaf_generics.arg");
             }
             buf = buf + "$G";
         }
@@ -561,7 +561,7 @@ function encode_params(table: InternTable*, arena: TypeArena*,
 
     for (mut i: i64 = 0; i < params.length; i++) {
         if (!first) { buf = buf + "_"; }
-        buf = buf + encode_type_ref(table, arena, params[i]);
+        buf = buf + encode_type_ref(table, arena, params[i], "encode_params.param");
         first = false;
     }
 
@@ -575,35 +575,25 @@ function encode_params(table: InternTable*, arena: TypeArena*,
 ///
 /// An invalid TypeRef or a null arena lookup at this point is an
 /// internal compiler error: by the time the mangler runs, every type
-/// referenced by a declaration should have been resolved.  When the
-/// invariant is violated, we emit a diagnostic to stderr and fall back
-/// to `v` (the void primitive code) so the build can finish — the
-/// resulting mangled name is junk, but for the only currently-known
-/// trigger (DI registration of generic trait methods like
-/// `Iterator::fold<Acc>`, whose mangles are never emitted as actual
-/// LLVM definitions because `declare_method` skips generic methods)
-/// the wrong mangle is harmless.  When the upstream resolution gap
-/// (`(Acc, Item) -> Acc` function-type annotations on trait methods
-/// not propagating into `param.resolved_type`) is fixed, swap the
-/// `return "v"` for `panic(...)` to make the failure mode loud again.
+/// referenced by a declaration MUST have been resolved.  Earlier
+/// versions emitted a build-survivable warning + `v` fallback while
+/// the upstream resolution gaps were being closed off; the gaps are
+/// now closed (see commits in `new-stdlib`), so reaching this state
+/// indicates a NEW resolution gap and we panic with the caller-site
+/// label so the regression is loud rather than producing a junk
+/// symbol whose `$R` slot is `v`.
 function encode_type_ref(table: InternTable*, arena: TypeArena*,
-                         ty: TypeRef) -> string {
+                         ty: TypeRef, caller: string) -> string {
     if (!ty.is_valid()) {
-        // Single-line diagnostic so the warning stream isn't drowned
-        // in a per-invocation paragraph.  The upstream gap is well
-        // known (see this function's doc comment) — repeating the
-        // full explanation on every fire is noise.
-        printf("warning: encode_type_ref: invalid TypeRef (id=%llu) — emitting 'v' fallback\n",
-               ty.id);
-        fflush(null);
-        return "v";
+        panic(format(
+            "encode_type_ref: invalid TypeRef (id=0) at %s — upstream resolution gap",
+            caller), FILE, LINE);
     }
     const t: Type* = arena.lookup(ty.id);
     if (t == null) {
-        printf("warning: encode_type_ref: arena lookup returned null for TypeRef id=%llu — emitting 'v' fallback\n",
-               ty.id);
-        fflush(null);
-        return "v";
+        panic(format(
+            "encode_type_ref: arena lookup returned null for TypeRef id=%llu at %s",
+            ty.id, caller), FILE, LINE);
     }
     return encode_type(table, arena, t);
 }
@@ -611,9 +601,8 @@ function encode_type_ref(table: InternTable*, arena: TypeArena*,
 /// Encode a Type* directly.  Compound types recurse via encode_type_ref.
 function encode_type(table: InternTable*, arena: TypeArena*, ty: Type*) -> string {
     if (ty == null) {
-        printf("warning: encode_type: null Type* — emitting 'v' fallback\n");
-        fflush(null);
-        return "v";
+        panic("encode_type: null Type* — internal compiler error (caller passed null)",
+              FILE, LINE);
     }
 
     if (ty.kind == TypeKind::Void)   { return "v"; }
@@ -634,21 +623,21 @@ function encode_type(table: InternTable*, arena: TypeArena*, ty: Type*) -> strin
 
     if (ty.kind == TypeKind::Pointer) {
         const p: PointerType* = ty as PointerType*;
-        return "P" + encode_type_ref(table, arena, p.pointee);
+        return "P" + encode_type_ref(table, arena, p.pointee, "Pointer.pointee");
     }
     if (ty.kind == TypeKind::Reference) {
         const r: ReferenceType* = ty as ReferenceType*;
-        return "R" + encode_type_ref(table, arena, r.referent);
+        return "R" + encode_type_ref(table, arena, r.referent, "Reference.referent");
     }
     if (ty.kind == TypeKind::Array) {
         const a: ArrayType* = ty as ArrayType*;
-        return "A" + encode_type_ref(table, arena, a.element);
+        return "A" + encode_type_ref(table, arena, a.element, "Array.element");
     }
     if (ty.kind == TypeKind::Optional) {
         // Optional<T>: encode as a synthetic named generic so the form
         // is round-trippable through the demangler.
         const o: OptionalType* = ty as OptionalType*;
-        const inner_o: string = encode_type_ref(table, arena, o.wrapped);
+        const inner_o: string = encode_type_ref(table, arena, o.wrapped, "Optional.wrapped");
         mut buf_o: string = "N$L8Optional$L";
         buf_o = buf_o + inner_o;
         buf_o = buf_o + "$G$G";
@@ -659,7 +648,7 @@ function encode_type(table: InternTable*, arena: TypeArena*, ty: Type*) -> strin
         const f: FunctionType* = ty as FunctionType*;
         const inner_params: string = encode_params(
             table, arena, f.param_types, ReceiverKind::None, f.is_variadic);
-        const inner_ret: string = encode_type_ref(table, arena, f.return_type);
+        const inner_ret: string = encode_type_ref(table, arena, f.return_type, "FunctionType.ret");
         mut buf_f: string = "F$L";
         buf_f = buf_f + inner_params;
         buf_f = buf_f + "$G";
@@ -707,7 +696,7 @@ function encode_type(table: InternTable*, arena: TypeArena*, ty: Type*) -> strin
         mut buf_t: string = "N$L5Tuple$L";
         for (mut i: i64 = 0; i < tup.elements.length; i++) {
             if (i > 0) { buf_t = buf_t + "_"; }
-            buf_t = buf_t + encode_type_ref(table, arena, tup.elements[i]);
+            buf_t = buf_t + encode_type_ref(table, arena, tup.elements[i], "Tuple.element");
         }
         buf_t = buf_t + "$G$G";
         return buf_t;
@@ -719,22 +708,10 @@ function encode_type(table: InternTable*, arena: TypeArena*, ty: Type*) -> strin
     //      survived to mangling (e.g. an Error sentinel or a leak from
     //      an upstream pass).
     // Either way, falling back to "v" silently produces a symbol that
-    // collides with genuine void-typed declarations.  Abort with the
-    // kind name so the developer can trace the offending site.
-    // Unhandled type kind.  Reaching here means either:
-    //   1. A new TypeKind was added without updating the mangler, or
-    //   2. A type that should have been substituted/resolved earlier
-    //      survived to mangling (e.g. an Error sentinel or a leak from
-    //      an upstream pass).
-    // Falls back to "v" with a warning so the build can finish, since
-    // the only known triggers today are DI registrations of generic
-    // template methods whose mangles are never emitted as LLVM defs.
-    // Promote to a hard panic once those upstream resolution gaps are
-    // closed.
-    printf("warning: encode_type: unhandled type kind %s — emitting 'v' fallback\n",
-           ty.kind.to_string());
-    fflush(null);
-    return "v";
+    // collides with genuine void-typed declarations — panic so the
+    // offending site is loud rather than silently miscompiled.
+    panic(format("encode_type: unhandled type kind %s — extend the mangler or close the upstream resolution gap",
+                 ty.kind.to_string()), FILE, LINE);
 }
 
 /// Encode the qualified path of a named type for use INSIDE `N$L...$G`.
@@ -797,7 +774,7 @@ function encode_instantiated(table: InternTable*, arena: TypeArena*,
     buf = buf + "$L";
     for (mut i: i64 = 0; i < inst.type_args.length; i++) {
         if (i > 0) { buf = buf + "_"; }
-        buf = buf + encode_type_ref(table, arena, inst.type_args[i]);
+        buf = buf + encode_type_ref(table, arena, inst.type_args[i], "InstantiatedType.arg");
     }
     buf = buf + "$G";
     buf = buf + "$G";
