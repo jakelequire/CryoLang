@@ -1124,7 +1124,21 @@ type struct Monomorphizer {
     /// since cloned AST bodies have cleared resolved_type fields).
     resolve_func_and_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*,
                           subst: TypeSubstitution*, this_type: TypeRef) -> void {
-        this.type_resolver.resolve_func_signature(func, res_ctx);
+        // Spec'd method clones have their `&this` parameter annotated as
+        // `Reference(ThisType)`, which the resolver dispatches via
+        // `ctx.this_type`.  When `this_type` is supplied (instance method
+        // on a spec'd struct/class), thread it onto a per-call copy of
+        // the context so `&this` resolves to `Reference(<spec'd_owner>)`
+        // instead of returning invalid.  Without this, every spec'd
+        // method's `&this`.resolved_type stays at id=0, the mangler
+        // produces a junk symbol with `v` in place of the receiver, and
+        // any cross-module DI lookup of `Owner_Spec::method` returns the
+        // wrong mangle.
+        mut sig_ctx: ResolutionContext = *res_ctx;
+        if (this_type.is_valid()) {
+            sig_ctx.set_this_type(this_type);
+        }
+        this.type_resolver.resolve_func_signature(func, &sig_ctx);
         // If resolved_return_type is still invalid, the substituter may not
         // have rewritten the return_type_annotation (C++ compiler virtual
         // dispatch limitation).  Build a resolution context with generic
