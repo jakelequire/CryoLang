@@ -312,7 +312,8 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
     // `main` so the linker can find it.
     const main_sym: SymbolStr = intern.intern("main");
     mut fn_name: string = intern.resolve(mangled_sym);
-    if (node.name.equals(main_sym)) {
+    const is_program_main: boolean = node.name.equals(main_sym);
+    if (is_program_main) {
         fn_name = "main";
     }
 
@@ -323,7 +324,21 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
     const param_count: u32 = fixed_param_count(node);
 
     mut fn_type: LType = LType::null();
-    if (param_count == 0) {
+    if (is_program_main && param_count == 0) {
+        // The C ABI entry point is `int main(int argc, char** argv)`
+        // — _start always passes argc/argv, and the stdlib's
+        // `std::env::args()` reads them through `set_args` (called
+        // from the synthesized prologue in `codegen_function_prologue`
+        // below).  User source still writes `function main() -> int`;
+        // we silently widen the LLVM signature to take argc/argv.
+        const argv_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
+        const buf: void* = malloc(2 * 8);
+        const slots: void** = buf as void**;
+        slots[0] = LType::i32().raw;
+        slots[1] = argv_ty.raw;
+        fn_type = LType::function_type(ret_ty, buf, 2, false);
+        free(buf);
+    } else if (param_count == 0) {
         fn_type = LType::function_type(ret_ty, null, 0, node.is_variadic);
     } else {
         const buf: void* = malloc(param_count as u64 * 8);
@@ -1183,7 +1198,46 @@ function codegen_function_prologue(cg: CodegenContext*, node: FunctionDeclNode*)
     // with a null operand.
     emit_va_start_for_variadic(cg, fn_val, variadic_param_name(node));
 
+    // Program-main prologue: publish argc/argv to the standard library
+    // before the user's body runs, so `std::env::args()` returns the
+    // real argv instead of an empty slice.  `declare_function` widened
+    // main's LLVM signature to `i32 (i32, ptr)`; the user's source has
+    // no parameters, so we read the synthetic params via LLVMGetParam
+    // and forward them through the regular function-resolution path.
+    const intern: InternTable* = cg.get_intern();
+    const main_sym: SymbolStr = intern.intern("main");
+    if (node.name.equals(main_sym) && fixed_param_count(node) == 0) {
+        emit_set_args_call(cg, fn_val);
+    }
+
     return fn_val;
+}
+
+/// Emit `std::env::set_args(argc, argv)` at the entry of the program's
+/// main function.  Looks the function up by qualified name so the
+/// mangled symbol is whatever `MangledName::for_free_function` decides
+/// — no hardcoded mangle.  Silent no-op if the stdlib (or `set_args`
+/// specifically) isn't available, which keeps `--no-std` builds and
+/// freestanding mains compiling.
+function emit_set_args_call(cg: CodegenContext*, main_fn: LValue) -> void {
+    const intern: InternTable* = cg.get_intern();
+    const set_args_sym: SymbolStr = intern.intern("std::env::set_args");
+    const set_args_fn: LValue = resolve_function(cg, set_args_sym);
+    if (!set_args_fn.is_valid()) { return; }
+
+    const set_args_ty: LType = LType {
+        raw: llvm::LLVMGlobalGetValueType(set_args_fn.raw),
+    };
+    if (!set_args_ty.is_valid()) { return; }
+
+    const argc: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 0) };
+    const argv: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 1) };
+
+    mut args: LValue[] = [];
+    args.push(argc);
+    args.push(argv);
+    mut result: LValue = LValue::null();
+    codegen_call(cg, set_args_fn, set_args_ty, args, "", &result);
 }
 
 /// Emit implicit void return ONLY for void/unit functions.

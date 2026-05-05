@@ -368,13 +368,44 @@ type struct CodegenPasses {
         const result: i32 = llvm::LLVMRunPasses(
             ctx.artifacts.ir.llvm_module, passes, tm.raw, opts);
         llvm::LLVMDisposePassBuilderOptions(opts);
-        tm.dispose();
 
         if (result != 0) {
-            if (ctx.debug_mode) {
-                cdebug("[Codegen] Optimization failed (error code %d)\n", result);
-            }
+            tm.dispose();
+            ctx.emit_error(ErrorCode::E0605_OPTIMIZATION_FAILED,
+                format("LLVM optimization pipeline failed for module '%s' (error code %d)",
+                    ctx.artifacts.ir.module_name, result));
+            return PassResult::failure(1);
         }
+
+        // Re-verify after optimization.  Optimization passes can introduce
+        // verifier failures (malformed intrinsics, dropped metadata, etc.)
+        // and we'd rather fail here than ship a broken object file.
+        mut verify_err: i8* = null;
+        const verify_rc: i32 = llvm::LLVMVerifyModule(
+            ctx.artifacts.ir.llvm_module, 2, &verify_err as void*);
+        tm.dispose();
+        if (verify_rc != 0) {
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0605_OPTIMIZATION_FAILED,
+                format("LLVM module verification failed after optimization for '%s'",
+                    ctx.artifacts.ir.module_name));
+            if (verify_err != null) {
+                const max_len: u64 = 2048;
+                const err_len: u64 = strlen(verify_err as string);
+                mut note_body: string = verify_err as string;
+                if (err_len > max_len) {
+                    const trunc_buf: i8* = malloc(max_len + 1) as i8*;
+                    memcpy(trunc_buf as void*, verify_err as void*, max_len);
+                    trunc_buf[max_len] = 0;
+                    note_body = trunc_buf as string;
+                }
+                diag = diag.with_note("LLVM reports: " + note_body);
+                llvm::LLVMDisposeMessage(verify_err as void*);
+            }
+            ctx.diagnostics.emit(diag);
+            return PassResult::failure(1);
+        }
+        if (verify_err != null) { llvm::LLVMDisposeMessage(verify_err as void*); }
 
         return PassResult::ok();
     }

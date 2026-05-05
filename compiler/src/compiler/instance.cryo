@@ -48,6 +48,11 @@ type struct CompilerConfig {
     /// directories so their emitted IR/.o can be diff'd for fixed-point
     /// equivalence.
     output_dir_override: string;
+    /// CLI override for the standard library root.  Empty string ("")
+    /// means "use the search-order fallback chain".  Set from
+    /// `--stdlib=PATH`.  Takes priority over `$CRYO_STDLIB` and every
+    /// implicit candidate path.
+    stdlib_path_override: string;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -56,6 +61,7 @@ type struct CompilerConfig {
             verbose_passes:      false,
             emit_llvm:           false,
             output_dir_override: "",
+            stdlib_path_override: "",
         };
     }
 
@@ -66,6 +72,7 @@ type struct CompilerConfig {
             verbose_passes:      true,
             emit_llvm:           false,
             output_dir_override: "",
+            stdlib_path_override: "",
         };
     }
 }
@@ -124,7 +131,8 @@ type struct StdlibBatchResult {
 // Stdlib root resolution
 //
 // Search order, first hit wins:
-//   1. $CRYO_STDLIB                       — explicit override
+//   0. --stdlib=PATH                      — CLI override (highest priority)
+//   1. $CRYO_STDLIB                       — explicit env override
 //   2. <bindir>/../stdlib                 — in-repo + symlink installs
 //   3. <bindir>/../share/cryo/stdlib      — FHS-style system install
 //   4. <project_root>/../stdlib           — legacy: project-relative
@@ -134,15 +142,33 @@ type struct StdlibBatchResult {
 // (`/usr/local/bin/cryo` → `<repo>/bin/cryo`) resolves to the repo's
 // stdlib without an env var.  Linux only — on non-Linux the readlink
 // fails and we fall through to (4)/(5).
+//
+// `tried_out` accumulates the candidate paths that were probed and
+// rejected; the caller renders these in a hard-error diagnostic when
+// resolution fails so users see exactly where the compiler looked.
 // ============================================================================
 
-function resolve_stdlib_root(project_root: string) -> string {
+function resolve_stdlib_root(cli_override: string, project_root: string,
+                             tried_out: string[]*) -> string {
+    // 0. CLI override.
+    if (strlen(cli_override) > 0) {
+        if (File::exists(cli_override + "/lib.cryo")) {
+            return cli_override;
+        }
+        if (tried_out != null) {
+            tried_out.push(format("%s  (--stdlib)", cli_override));
+        }
+    }
+
     // 1. Explicit env var.
     const env_raw: i8* = getenv("CRYO_STDLIB");
     if (env_raw != null) {
         const env_path: string = env_raw as string;
         if (File::exists(env_path + "/lib.cryo")) {
             return env_path;
+        }
+        if (tried_out != null) {
+            tried_out.push(format("%s  ($CRYO_STDLIB)", env_path));
         }
     }
 
@@ -167,9 +193,15 @@ function resolve_stdlib_root(project_root: string) -> string {
             if (File::exists(cand_repo + "/lib.cryo")) {
                 return cand_repo;
             }
+            if (tried_out != null) {
+                tried_out.push(format("%s  (binary-relative)", cand_repo));
+            }
             const cand_sys: string = bindir + "/../share/cryo/stdlib";
             if (File::exists(cand_sys + "/lib.cryo")) {
                 return cand_sys;
+            }
+            if (tried_out != null) {
+                tried_out.push(format("%s  (binary-relative share)", cand_sys));
             }
         }
     }
@@ -179,9 +211,15 @@ function resolve_stdlib_root(project_root: string) -> string {
     if (File::exists(cand_proj + "/lib.cryo")) {
         return cand_proj;
     }
+    if (tried_out != null) {
+        tried_out.push(format("%s  (project-relative)", cand_proj));
+    }
     // 5. ../stdlib (cwd-relative)
     if (File::exists("../stdlib/lib.cryo")) {
         return "../stdlib";
+    }
+    if (tried_out != null) {
+        tried_out.push("../stdlib  (cwd-relative)");
     }
     return "";
 }
@@ -428,12 +466,31 @@ type struct CompilerInstance {
         ctx.set_project_config(_box_config.leak());
 
         // Resolve stdlib root.  See resolve_stdlib_root above for the
-        // search order — env var → binary-relative → project-relative.
+        // search order — CLI override → env var → binary-relative → project-relative.
         mut stdlib_root: string = "";
         if (!config.no_std) {
-            stdlib_root = resolve_stdlib_root(config.project_root);
+            mut tried: string[] = [];
+            stdlib_root = resolve_stdlib_root(
+                this.config.stdlib_path_override, config.project_root, &tried);
             if (strlen(stdlib_root) > 0) {
                 cdebug("[Compiler] Stdlib root: %s\n", stdlib_root);
+            } else {
+                // No prelude available: hard-fail rather than silently
+                // compile a project that can't see `Result`, `String`,
+                // etc.  Pass `--no-std` (or set `no_std = true` in
+                // cryoconfig) for genuinely freestanding builds.
+                fprintf(g_stderr,
+                    "error: cannot locate the Cryo standard library\n");
+                fprintf(g_stderr,
+                    "  none of the candidate paths contained a 'lib.cryo':\n");
+                for (mut ti: i64 = 0; ti < tried.length; ti++) {
+                    fprintf(g_stderr, "    %s\n", tried[ti]);
+                }
+                fprintf(g_stderr,
+                    "  override with --stdlib=PATH, set $CRYO_STDLIB,\n");
+                fprintf(g_stderr,
+                    "  or pass --no-std for a freestanding build\n");
+                return CompilationResult::failed(1, 0);
             }
         }
         ctx.stdlib_root = stdlib_root;
