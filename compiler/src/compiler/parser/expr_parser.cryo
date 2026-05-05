@@ -220,9 +220,30 @@ public:
 
                 expr = new MemberAccessNode(deref, member, member_span, span);
             } else if (this.check(TokenType::ColonColon)) {
-                // Scope resolution
+                // Scope resolution.  For chained paths like `alpha::utils::run`,
+                // join the prior `ScopeResolutionNode`'s scope and member into
+                // a single dotted scope name so the full qualifier is
+                // preserved on the new node.  Without this, the parser
+                // collapses `alpha::utils::run` to a node whose `scope_name`
+                // is just `utils`, losing the `alpha` prefix and making it
+                // indistinguishable from a shorthand `utils::run` — which
+                // breaks both the codegen module-graph walk and the
+                // E0154 ambiguity detector.
                 this.advance();
-                const scope_name: SymbolStr = this.get_expr_name(expr);
+                mut scope_name: SymbolStr = SymbolStr::empty();
+                if (expr.kind == NodeKind::ScopeResolution) {
+                    const psr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+                    const scope_part: string  = this.ctx.intern_table.resolve(psr.scope_name);
+                    const member_part: string = this.ctx.intern_table.resolve(psr.member_name);
+                    if (strlen(scope_part) > 0) {
+                        scope_name = this.ctx.intern_table.intern(
+                            format("%s::%s", scope_part, member_part));
+                    } else {
+                        scope_name = psr.member_name;
+                    }
+                } else {
+                    scope_name = this.get_expr_name(expr);
+                }
                 const no_gen_args: TypeAnnotation*[] = [];
                 expr = this.parse_scope_member(scope_name, no_gen_args, expr.span);
             } else if (this.check(TokenType::PlusPlus) || this.check(TokenType::MinusMinus)) {
