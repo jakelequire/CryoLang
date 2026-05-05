@@ -1,193 +1,342 @@
-# Handoff — generic-method-on-non-generic-struct specialization gap
+# Handoff — silent-mangle fallback + remaining mono gaps
 
 **Branch:** `new-stdlib`
-**Last verified:** selfhost-check passes, IR md5 `2f1d162e87c2eb56f907ed8e0a313310`. Pin (`bin/cryo`) is current.
+**Last verified:** selfhost-check passes; pin (`bin/cryo`) is current and was
+built by the self-hosted compiler (the C++ bootstrap is archived and no
+longer participates in the chain). All bootstrap-bug workarounds you may
+see in source (`HashMap<string,…>` notes, cloner kind-switching,
+substituter `memcpy`, etc.) are dead weight from the bootstrap era and
+are no longer load-bearing — leave them for now, focus on the bugs below.
 
-## What's working
+## Scope of this handoff
 
-The previous session's body-strip fix landed in
-`compiler/src/compiler/codegen/decl_codegen.cryo` `codegen_function_epilogue`.
-It walks every basic block in the just-finished function and emits
-`unreachable` into any block that is empty *and* unterminated (typical
-source: the merge block of `loop { ... }` with no `break`). Without it
-the body-validator strips the whole function to a `declare`, cascading
-silent `undefined reference` errors at link time.
+Two compiler-mechanics bugs from the pre-0.1.0 audit. Both are silent —
+they produce link-time failures or wrong code with no compile-time
+diagnostic. Fixing them in the order below is recommended because **(1)
+turns (2)'s symptoms into compile-time errors with usable stack traces**
+instead of cryptic linker `undefined reference` lines.
 
-That fix resolved most of the user's sandbox link errors:
-`read_fd`, `write_fd`, `close_fd`, `serve` (and friends) all link.
+1. **`encode_type_ref` returns `"v"` for invalid TypeRefs** — silent
+   miscompile generator. Fix first.
+2. **Static-method ScopeResolution on non-generic owners** isn't reached
+   by the monomorphizer's inference paths. Together with a related
+   trait-method H-binding bug, this is why a minimal HTTP server still
+   fails to link. Fix second.
 
-## What's still broken — the actual handoff problem
+Stay out of `README.md`, `CHANGELOG.md`, `docs/cryo.md`, `.github/`, and
+the `tools/` tree — those are owned by the user for a separate cleanup
+pass.
 
-A trivial HTTP-server sandbox still fails to link with **3 undefined
-references**, all in the same family. Reproducer:
+---
+
+## Bug 1 — `encode_type_ref` silent `"v"` fallback
+
+### What's wrong
+
+`compiler/src/compiler/resolver/mangled_name.cryo:575` — `encode_type_ref`
+falls back to returning `"v"` (the spec's primitive code for `void`)
+when the TypeRef it's handed isn't valid:
+
+```
+function encode_type_ref(table: InternTable*, arena: TypeArena*,
+                          ty: TypeRef) -> string {
+    if (!ty.is_valid()) { return "v"; }
+    ...
+}
+```
+
+`encode_type` at `:584` has the same shape — when it bottoms out on a
+type-kind it doesn't know how to encode, it returns `"v"` too.
+
+This is wrong because:
+
+- A method with a broken or unresolved parameter type produces a
+  syntactically-valid mangled symbol that **collides with any genuine
+  `void`-param method**.
+- It hides upstream bugs. The handoff's `Rv` / `1R` / `1W` / `1H`
+  placeholders in mangled symbols are leaks of `GenericParam`s that
+  weren't substituted before mangling — but the user only finds out at
+  link time, far from the source location that produced the bad mangle.
+- Any future refactor that introduces a new `TypeKind` and forgets to
+  add a mangle case silently emits `void` instead of failing loudly.
+
+There's a related comment on the GenericParam encoding path at `:660`
+that says it deliberately emits `N$L<param_name>$G` "so any leaks are
+easy to spot in IR rather than a silent collision" — exactly the right
+instinct, but `encode_type_ref` itself short-circuits before that path
+ever runs when the TypeRef is invalid.
+
+### What to change
+
+In `compiler/src/compiler/resolver/mangled_name.cryo`:
+
+1. **Replace the `"v"` fallback in `encode_type_ref`** (`:577`) with a
+   diagnostic abort. Plumb `DiagnosticSink*` (or `CompilationContext*`)
+   into the mangler if it doesn't already have one — or, if you'd
+   rather not change the signature now, use `panic(...)` from
+   `core::panic` with a descriptive message. Either is fine for this
+   stage; the rule is "fail loudly, don't silently emit `void`."
+2. **Replace the `"v"` fallback in `encode_type`** (`:584`'s default
+   arm) the same way. Note that `Never → 'v'` (line 592) is
+   intentional and should stay — that's a deliberate ABI-level
+   collapse, not a fallback.
+3. **At the `GenericParam` / `BoundedParam` arm** (`:660`), keep the
+   current "emit name as N$L…$G" behavior as a leak-detector, but also
+   call out a diagnostic. The leak-detector encoding stays in place so
+   any in-flight links don't mysteriously change behavior; the
+   diagnostic is what tells the developer where the unresolved param
+   came from.
+
+Suggested diagnostic: a new code (e.g., `E0901_MANGLE_UNRESOLVED_TYPE`
+or reuse `E0900_INTERNAL_COMPILER_ERROR`) with text like:
+
+```
+internal compiler error: cannot mangle <kind> type
+  --> <span if available>
+   |
+   | <call-site or decl source>
+   |
+   = note: this almost always means a generic parameter was not
+           substituted before mangling. The mangler emitted a
+           placeholder symbol; check the upstream specialization /
+           inference path that produced this declaration.
+```
+
+`encode_type_ref` doesn't currently take a span. Easiest path: pull it
+from the `Type*` itself if available, or take a `SourceSpan` argument
+at every callsite (there are ~30; tractable). Failing that, emit the
+diagnostic without a span — it's still strictly more useful than the
+silent fallback.
+
+### How to verify
+
+Re-run `make selfhost-check`. With the abort wired in, the chain
+should still pass byte-identity if all real callers are well-formed.
+If any stage of the chain trips the abort, that is the signal that
+Bug 2 (or some other unresolved-type bug) is firing — root-cause it
+rather than restoring the fallback.
+
+### Useful entry points
+
+- `mangled_name.cryo:575` — `encode_type_ref`, the function to change
+- `mangled_name.cryo:584` — `encode_type`, same kind of fallback
+- `mangled_name.cryo:660` — `GenericParam` / `BoundedParam` encoding
+  (the leak-detector path that should also fire a diagnostic)
+- `mangled_name.cryo:592` — `Never → 'v'` (intentional, leave alone)
+- `compiler/src/compiler/diag/diagnostic.cryo` — `Diagnostic::error`
+- `compiler/src/compiler/diag/_module.cryo` — error code registry
+
+---
+
+## Bug 2 — generic-method-on-non-generic-owner: remaining gaps
+
+### What's already fixed
+
+Since the previous handoff, the **instance-method** lookup path was
+added: `find_inherent_method` exists at
+`compiler/src/compiler/types/monomorphizer.cryo:2180` and is wired into
+`try_infer_method_call` at `:2348`. Inherent owners are registered by
+`register_inherent_owner_if_has_generic_methods` in
+`compiler/src/compiler/passes/specialization.cryo:182`, which runs over
+struct/class declarations during specialization. Calls of the form
+`obj.method(args)` where `obj`'s type is a non-generic struct/class
+with inline generic methods now specialize correctly.
+
+This means `req.method(...)` for `Request`/`Response` works.
+
+### What's still broken
+
+Three concrete symptoms remain. They share the same root family but
+hit different inference paths.
+
+#### 2a. Static `Owner::method(args)` on non-generic owners
+
+`try_infer_function_call` at `monomorphizer.cryo:1770` handles
+ScopeResolution callees in the branch starting around `:1790`. After
+the qualified-name lookup misses, it falls through to:
+
+- `find_function_template_for_call` (`:1726`) — only finds free
+  functions in the template registry.
+- `try_infer_static_method_on_generic_template` (`:1976`) — only
+  triggers when the scope resolves to a **generic** template (e.g.
+  `Slice<T>`); it explicitly returns false otherwise.
+
+Neither covers a static method on a non-generic struct/class. So calls
+like:
+
+```cryo
+Response::text(StatusCode::ok(), Str::from_raw("hi" as u8*, 2))
+```
+
+— where `Response` is non-generic and `text` is a static method —
+fall through every inference path and reach codegen with a null
+`resolved_callee`. ir_generator then builds the symbol from the
+template's mangled form, which contains placeholder generic-param
+encodings. Linker fails.
+
+**Fix direction:** mirror `find_inherent_method`'s shape for static
+calls. After the existing fallthrough at `:1871` (the gate that calls
+`try_infer_static_method_on_generic_template`), add a sibling that:
+
+1. Resolves `qualified_scope` (or `callee_scope` if not qualified)
+   against the type registry — looking for a non-generic struct or
+   class declaration.
+2. If found, walks `inherent_owner` registration in the
+   GenericRegistry (the same storage `find_inherent_method` uses) and
+   selects the method by leaf name.
+3. Walks the method's `func.parameters` for inference (no implicit
+   receiver, since it's a static call) — the existing per-arg
+   unification loop in `try_infer_function_call` should be reusable
+   with minor tweaks.
+4. Calls `specialize_method` (`:2503`) to clone+substitute the body,
+   pin the spec'd callee symbol on the call node, and append the
+   spec'd sibling to the owner's `methods[]`.
+
+The instance-method path already does this end-to-end; the static
+path needs the same plumbing for `is_method_call=false`.
+
+#### 2b. `String<GA>::hash<H>` H-binding leak
+
+This one is shape-different and more involved. `String<A>` is a
+*generic* type, so `String<GlobalAlloc>` lives in `spec_entries`. Its
+inherent `hash<H>(...)` method ought to spec through
+`find_spec_impl_method`. But the emitted symbol contains `Rv` where
+`&DefaultHasher` should be — i.e. `H`'s `resolved_type` reaches the
+mangler as `Reference(invalid)` instead of `Reference(GenericParam(H))`
+or `Reference(DefaultHasher)`.
+
+The `Rv` encoding originates at `mangled_name.cryo:577` — once Bug 1
+is fixed, this symptom converts to a compile-time abort with a stack
+trace pointing at the spec'd method declaration. That should make the
+upstream cause traceable.
+
+Hypothesis (from the audit): the trait-method template's resolution
+context never binds `H`. Either:
+
+- The template's `H` GenericParam is registered with no resolution
+  context, so its `resolved_type` stays `invalid`.
+- `find_spec_impl_method` at `:2147` finds `String<GA>`'s `hash<H>`
+  but doesn't fold `H` into its substitution — it only substitutes
+  the owner's `A` param, leaving the method's own generic params
+  unbound.
+- `specialize_method` at `:2503` (the per-method specializer) needs
+  to allocate and bind the method's own generic params *before*
+  invoking the substituter on the body. Look for whether the
+  current code does this when `original.func.generic_params.length
+  > 0` — it likely doesn't.
+
+This is the right order to investigate: with Bug 1's abort firing,
+trace from the abort site upward into the substituter / specializer
+pair to find the unbound H.
+
+#### 2c. After-fix smoke
+
+Once 2a + 2b are fixed, the headline check is:
 
 ```bash
-mkdir -p /tmp/cryo-http-repro/src
-cat > /tmp/cryo-http-repro/cryoconfig <<'EOF'
-[project]
-project_name = "http_repro"
-target_type  = "executable"
-entry_point  = "src/main.cryo"
-source_dir   = "src"
-output_dir   = "build"
-EOF
-cat > /tmp/cryo-http-repro/src/main.cryo <<'EOF'
-namespace Main;
-
-import std::net::http::server;
-import std::net::http::request;
-import std::net::http::response;
-import std::net::http::status;
-import std::collections::str;
-
-function handler(req: Request) -> Response {
-    return Response::text(StatusCode::ok(), Str::from_raw("hi" as u8*, 2));
-}
-
-function main() -> int {
-    match (serve("127.0.0.1:0" as string, handler)) {
-        Result::Ok(_)  => { }
-        Result::Err(_) => { }
-    }
-    return 0;
-}
-EOF
-cd /tmp/cryo-http-repro && /home/phock/Programming/apps/CryoLang/bin/cryo build
+cd /home/phock/Programming/apps/CryoLang/examples/http-server
+/home/phock/Programming/apps/CryoLang/bin/cryo build
+./build/bin/http-server   # should listen on :8080
 ```
 
-Linker says (excerpted):
+This example exercises every codepath in the family:
+- instance methods on non-generic owners (`req.drop()`, `body.push_slice(…)`)
+- static methods on non-generic owners (`Response::text(…)`, `StatusCode::ok()`)
+- generic methods on generic spec'd types (`String<GA>` chain)
+- the router's borrowed `Str` patterns
 
-```
-undefined reference to
-  C$3std.11collections.6string.526String$LN$L3std.5alloc.9allocator.11GlobalAlloc$G$G-4hash$F$s_Rv$Rv
+If the link succeeds and the server accepts a request, both 2a and
+2b are fixed. If linker errors remain, the symbol names point at
+which gap is still open.
 
-undefined reference to
-  C$3std.3net.4http.7request.7Request-5parse$FRN$L1R$G$RN$L...
+### Useful entry points
 
-undefined reference to
-  C$3std.3net.4http.8response.8Response-8write_to$F$s_RN$L1W$G$RN$L...
-```
+- `monomorphizer.cryo:1770` — `try_infer_function_call` (extend with
+  the static-non-generic-owner path)
+- `monomorphizer.cryo:1790-1881` — the ScopeResolution branch where
+  the fallthrough chain currently lives
+- `monomorphizer.cryo:2180` — `find_inherent_method` (template for the
+  static-method walker; instance shape, adapt to no-receiver)
+- `monomorphizer.cryo:2147` — `find_spec_impl_method` (where the
+  String<GA>::hash<H> spec is supposed to be found)
+- `monomorphizer.cryo:2503` — `specialize_method` (where method-level
+  generic params should be bound before body cloning)
+- `compiler/src/compiler/passes/specialization.cryo:182` —
+  `register_inherent_owner_if_has_generic_methods` (referenced for
+  the registration shape; static-method path uses the same storage)
+- `compiler/src/compiler/types/generic_registry.cryo:347` —
+  `register_inherent_owner` (the storage write)
+- `compiler/src/compiler/codegen/ir_generator.cryo:2175` — Strategy 0
+  for instance-method codegen reads `node.resolved_method`. The
+  static-call codegen has its own strategy ladder; once you pin
+  `resolved_callee` on the CallExprNode (analogous to
+  `resolved_method` for instance), Strategy 0 should fire and emit
+  the correct mangled name.
 
-Tells: the parameter slots in those mangled names contain `1R`, `1W`,
-or `Rv` — i.e. the **generic param name leaked into the symbol** instead
-of being substituted with the concrete type the call uses. That only
-happens when the generic method was **never specialized**, so codegen
-falls back to a mangle built from the template.
+---
 
-## Root cause (confirmed)
+## Suggested order of work
 
-All three callees are **generic methods on non-generic owner types**:
+1. **Bug 1 first.** Replace the two `"v"` fallbacks with a diagnostic
+   abort. Run `make selfhost-check`. If it passes, Bug 1 is landed
+   and the codebase is now self-checking against silent mangle leaks.
+2. **Smoke the http-server example.** Run the verify command in §2c.
+   The abort from Bug 1 will likely fire during the build — the stack
+   trace and the diagnostic's source location are now your map for
+   Bug 2.
+3. **Fix Bug 2a** (static ScopeResolution path). After this, instance
+   and static calls on non-generic owners both spec correctly; the
+   only remaining symptom should be `String<GA>::hash<H>`.
+4. **Fix Bug 2b** (H-binding). After this, http-server links.
+5. **Re-run `make selfhost-check`.** It must still pass byte-identity.
+6. **Optional but recommended:** add e2e tests under
+   `legacy/bootstrap/tests/e2e/tier3_generics/` for:
+   - `t02xx_static_method_non_generic_owner.cryo` — `Foo::bar<T>(x)`
+     where `Foo` is non-generic.
+   - `t02xx_inherent_generic_method.cryo` — `obj.bar<T>(x)` where
+     receiver is non-generic.
+   - `t02xx_generic_method_on_spec_owner.cryo` — exercises the
+     `String<GA>::hash<H>` shape.
+   These regressions all hit the same family and have no test
+   coverage today.
 
-| Owner                 | Method            | Owner kind         |
-|-----------------------|-------------------|--------------------|
-| `Request`             | `parse<R>`        | non-generic struct |
-| `Response`            | `write_to<W>`     | non-generic struct |
-| `String<GlobalAlloc>` | `hash<H>`         | spec'd struct (different sub-bug) |
-
-The monomorphizer's method-call inference path is in
-`compiler/src/compiler/types/monomorphizer.cryo`:
-
-- `try_infer_method_call` (line 1696) — handles instance `obj.m(...)`
-- `try_infer_function_call` (line 1500) — handles `Type::m(...)` and bare `f(...)`
-
-For instance calls (`response.write_to(stream)`), the lookup is:
-- `find_spec_impl_method` (line 1635) — walks `spec_entries` (only spec'd generic types)
-- `find_trait_impl_method_for_target` (line 1665) — walks `trait_impl_blocks` (primitives)
-
-Neither path covers **inherent methods on non-generic structs**, which is
-where `Request::parse<R>` and `Response::write_to<W>` live (they're
-declared inline in `type struct Response { ... }` in
-`stdlib/net/http/response.cryo:79` and `stdlib/net/http/request.cryo:63`).
-
-For static calls (`Request::parse(stream)`), `try_infer_function_call`
-handles `ScopeResolution` callees (line 1520) but only finds free
-functions in the template registry — static methods on non-generic
-structs aren't there either.
-
-## The String hash sub-bug (related but separate)
-
-For `String<GA>::hash<H>`: `String<A>` IS in `spec_entries`, so the
-existing path *should* find the hash method and specialize it. But the
-emitted call site has `Rv` (Reference void) where `&DefaultHasher`
-should be. Worse: `stdlib/.bin/obj/std__collections__string.ll` emits
-zero String methods at all — only the `format`/`panic` boilerplate.
-String spec methods are emitted in their *consumer* modules instead
-(per-module specialization model), but `String<GA>::hash` is never
-emitted anywhere.
-
-The `Rv` encoding comes from `encode_type_ref`
-(`compiler/src/compiler/resolver/mangled_name.cryo:575`) returning `"v"`
-when a TypeRef is invalid or `arena.lookup` returns null. So somewhere
-the H parameter's `resolved_type` is `Reference(invalid)` rather than
-`Reference(GenericParam(H))`. That's likely the trait method's template
-registration running with H unbound in its resolution context.
-
-## Required fix scope
-
-1. **`try_infer_method_call`** — add a third lookup path after
-   `find_spec_impl_method` / `find_trait_impl_method_for_target` that
-   handles inherent methods on **non-generic struct/class types**.
-   Source: walk inline methods stored on the StructDecl AST node, or
-   walk `entries[].impl_blocks` keyed by the receiver's `qualified_name`
-   in `GenericRegistry`. Note: in the stdlib, methods are commonly
-   declared *inline* on the struct (`type struct Foo { static m() {} }`)
-   rather than in separate `implement Foo { ... }` blocks — handle
-   both forms.
-
-2. **`try_infer_function_call`** — for `ScopeResolution` callees, after
-   the free-function template lookup fails, try a **static-generic-method
-   lookup**: resolve `scope_name` to a struct/class type and look for a
-   generic static method matching `member_name`.
-
-3. **String hash sub-bug** — separately, figure out why the generic-
-   method template's H param has `Reference(invalid)` resolved_type.
-   Either fix the template's resolution context to bind H, or make
-   `find_spec_impl_method`'s spec actually fire (so the template's
-   broken mangle never gets used). This is the harder piece because the
-   bug is in trait-method template resolution, not in the
-   inherent-method lookup gap above.
-
-## Useful entry points
-
-- `compiler/src/compiler/types/monomorphizer.cryo:1696` —
-  `try_infer_method_call` (the function to extend with case 1)
-- `compiler/src/compiler/types/monomorphizer.cryo:1500` —
-  `try_infer_function_call` (extend with case 2)
-- `compiler/src/compiler/types/monomorphizer.cryo:1635` —
-  `find_spec_impl_method` (template for the new inherent-method walker)
-- `compiler/src/compiler/types/generic_registry.cryo:49` —
-  `entries[].impl_blocks` storage (the lookup target)
-- `compiler/src/compiler/resolver/mangled_name.cryo:575` —
-  `encode_type_ref` (where the `Rv` for H comes from)
-- `compiler/src/compiler/codegen/ir_generator.cryo:2116` — Strategy 0
-  for instance-method codegen; reads `node.resolved_method` from mono
-  pass and builds the mangled name. If `resolved_method` stays null, it
-  falls through to the Strategy 1+ name-based lookups, which is what
-  produces the leaked-generic-param mangles.
-
-## How to verify a fix
-
-```bash
-# 1. The minimal repro must link:
-cd /tmp/cryo-http-repro && /home/phock/Programming/apps/CryoLang/bin/cryo build
-
-# 2. Selfhost must stay byte-identical:
-make selfhost-check
-
-# 3. The previously-stripped String/Request/Response methods should be
-#    DEFINED (not just declared) in their consumer modules:
-nm /tmp/cryo-http-repro/build/obj/std__net__http__server.o | grep -E "parse|write_to"
-nm /tmp/cryo-http-repro/build/obj/std__core__panic.o      | grep -E "String.*hash"
-```
+---
 
 ## Things NOT to do
 
-- Don't "rename to non-generic" workarounds in the stdlib (we'd lose
-  the actual `Request::parse<R: Read>` polymorphism). User explicitly
-  wants the compiler fixed, not the stdlib reshaped.
-  See `feedback_stdlib_api_stance` memory.
-- Don't skip the body-strip epilogue fixup added in the prior session;
-  it's load-bearing for many other call sites.
-- Don't re-introduce `printf`-based debug logging — the codebase was
-  swept to `cdebug`/`Utils::Logger` gated on `--debug` / cryoconfig
-  `debug = true`. New diagnostic prints should use `cdebug`.
+- **Don't restore the `"v"` fallback** if the abort fires during
+  selfhost-check. Every legitimate firing is a real upstream bug. Fix
+  the upstream, not the abort.
+- **Don't re-introduce printf-based debug output**. The codebase is
+  swept to `cdebug` (gated on `--debug` / `cryoconfig` `debug = true`)
+  and `Utils::Logger`. New diagnostic prints should use those.
+- **Don't rename or reshape any stdlib API to work around the bug.**
+  `Request::parse<R>`, `Response::write_to<W>`, `String::hash<H>`
+  are deliberately polymorphic. The compiler is what's broken.
+- **Don't touch the bootstrap-era workaround comments yet.** Things
+  like "do NOT use `==` on `void*`", "the C++ Cryo compiler can't
+  deref this struct", chained-string-concat avoidance, cloner
+  kind-switching in `AST/cloner.cryo:128-160`, and substituter
+  `memcpy` in `AST/substituter.cryo` are all dead weight from the
+  bootstrap era. They no longer affect correctness, but cleaning
+  them up is its own pass and out of scope here.
+- **Don't extend `examples/http-server`** to work around the link
+  failure. The example is the test for the fix.
+- **Don't skip `selfhost-check`.** It's the gate.
+
+---
+
+## How to know you're done
+
+- `make selfhost-check` passes (stage-3 IR == stage-4 IR byte-identical).
+- `cd examples/http-server && ../../bin/cryo build` produces a binary.
+- That binary, when run, accepts a request on `127.0.0.1:8080` and
+  returns the expected response (try `curl -i http://127.0.0.1:8080/`
+  and `curl -i http://127.0.0.1:8080/health`).
+- The `encode_type_ref` / `encode_type` `"v"` fallbacks are gone
+  from `compiler/src/compiler/resolver/mangled_name.cryo`.
+- No code path in the compiler can produce a mangled symbol
+  containing a `GenericParam`-name leak without firing a diagnostic
+  first.
+
+Good luck.
