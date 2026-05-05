@@ -572,17 +572,49 @@ function encode_params(table: InternTable*, arena: TypeArena*,
 }
 
 /// Encode a type by TypeRef, recursing into compound shapes via the arena.
+///
+/// An invalid TypeRef or a null arena lookup at this point is an
+/// internal compiler error: by the time the mangler runs, every type
+/// referenced by a declaration should have been resolved.  When the
+/// invariant is violated, we emit a diagnostic to stderr and fall back
+/// to `v` (the void primitive code) so the build can finish — the
+/// resulting mangled name is junk, but for the only currently-known
+/// trigger (DI registration of generic trait methods like
+/// `Iterator::fold<Acc>`, whose mangles are never emitted as actual
+/// LLVM definitions because `declare_method` skips generic methods)
+/// the wrong mangle is harmless.  When the upstream resolution gap
+/// (`(Acc, Item) -> Acc` function-type annotations on trait methods
+/// not propagating into `param.resolved_type`) is fixed, swap the
+/// `return "v"` for `panic(...)` to make the failure mode loud again.
 function encode_type_ref(table: InternTable*, arena: TypeArena*,
                          ty: TypeRef) -> string {
-    if (!ty.is_valid()) { return "v"; }
+    if (!ty.is_valid()) {
+        // Single-line diagnostic so the warning stream isn't drowned
+        // in a per-invocation paragraph.  The upstream gap is well
+        // known (see this function's doc comment) — repeating the
+        // full explanation on every fire is noise.
+        printf("warning: encode_type_ref: invalid TypeRef (id=%llu) — emitting 'v' fallback\n",
+               ty.id);
+        fflush(null);
+        return "v";
+    }
     const t: Type* = arena.lookup(ty.id);
-    if (t == null) { return "v"; }
+    if (t == null) {
+        printf("warning: encode_type_ref: arena lookup returned null for TypeRef id=%llu — emitting 'v' fallback\n",
+               ty.id);
+        fflush(null);
+        return "v";
+    }
     return encode_type(table, arena, t);
 }
 
 /// Encode a Type* directly.  Compound types recurse via encode_type_ref.
 function encode_type(table: InternTable*, arena: TypeArena*, ty: Type*) -> string {
-    if (ty == null) { return "v"; }
+    if (ty == null) {
+        printf("warning: encode_type: null Type* — emitting 'v' fallback\n");
+        fflush(null);
+        return "v";
+    }
 
     if (ty.kind == TypeKind::Void)   { return "v"; }
     if (ty.kind == TypeKind::Unit)   { return "u"; }
@@ -681,7 +713,27 @@ function encode_type(table: InternTable*, arena: TypeArena*, ty: Type*) -> strin
         return buf_t;
     }
 
-    // Error / unhandled — last-resort placeholder.
+    // Unhandled type kind.  Reaching here means either:
+    //   1. A new TypeKind was added without updating the mangler, or
+    //   2. A type that should have been substituted/resolved earlier
+    //      survived to mangling (e.g. an Error sentinel or a leak from
+    //      an upstream pass).
+    // Either way, falling back to "v" silently produces a symbol that
+    // collides with genuine void-typed declarations.  Abort with the
+    // kind name so the developer can trace the offending site.
+    // Unhandled type kind.  Reaching here means either:
+    //   1. A new TypeKind was added without updating the mangler, or
+    //   2. A type that should have been substituted/resolved earlier
+    //      survived to mangling (e.g. an Error sentinel or a leak from
+    //      an upstream pass).
+    // Falls back to "v" with a warning so the build can finish, since
+    // the only known triggers today are DI registrations of generic
+    // template methods whose mangles are never emitted as LLVM defs.
+    // Promote to a hard panic once those upstream resolution gaps are
+    // closed.
+    printf("warning: encode_type: unhandled type kind %s — emitting 'v' fallback\n",
+           ty.kind.to_string());
+    fflush(null);
     return "v";
 }
 
