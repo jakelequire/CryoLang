@@ -117,22 +117,188 @@ public:
 
 
 // ============================================================================
-// DirectiveNode
+// DirectiveNode + Typed Arguments
 // ============================================================================
+
+/// Kind of a directive argument.  Args can be bare identifiers, literals,
+/// `key = value` pairs, or nested directive calls (e.g. `cfg(any(unix))`).
+type enum DirectiveArgKind {
+    Ident;       // bare ident, e.g. ![inline] or ![cfg(unix)]
+    StringLit;   // ![deprecated("use bar")]
+    IntLit;      // ![align(16)]
+    BoolLit;     // ![enabled(true)]
+    KeyValue;    // ![target(os = "windows")]
+    Nested;      // ![cfg(any(unix, windows))]
+}
+
+/// A single argument inside a directive's `(...)` list.
+///
+/// Field meaning by `kind`:
+///   Ident      → `name` = identifier text
+///   StringLit  → `str_value` = string content (unquoted)
+///   IntLit     → `int_value` = numeric value, `str_value` = original text
+///   BoolLit    → `bool_value` = true/false
+///   KeyValue   → `name` = key, `value_kind` selects which payload field
+///                carries the value (str_value / int_value / bool_value /
+///                Ident text in `str_value`).
+///   Nested     → `nested` = pointer to the nested DirectiveNode
+type struct DirectiveArg {
+    kind:        DirectiveArgKind;
+    name:        string;
+    str_value:   string;
+    int_value:   i64;
+    bool_value:  boolean;
+    value_kind:  DirectiveArgKind;
+    nested:      DirectiveNode*;
+    span:        SourceSpan;
+
+    static ident(text: string, span: SourceSpan) -> DirectiveArg {
+        return DirectiveArg {
+            kind:       DirectiveArgKind::Ident,
+            name:       text,
+            str_value:  "",
+            int_value:  0,
+            bool_value: false,
+            value_kind: DirectiveArgKind::Ident,
+            nested:     null,
+            span:       span,
+        };
+    }
+
+    static string_lit(content: string, span: SourceSpan) -> DirectiveArg {
+        return DirectiveArg {
+            kind:       DirectiveArgKind::StringLit,
+            name:       "",
+            str_value:  content,
+            int_value:  0,
+            bool_value: false,
+            value_kind: DirectiveArgKind::Ident,
+            nested:     null,
+            span:       span,
+        };
+    }
+
+    static int_lit(value: i64, raw: string, span: SourceSpan) -> DirectiveArg {
+        return DirectiveArg {
+            kind:       DirectiveArgKind::IntLit,
+            name:       "",
+            str_value:  raw,
+            int_value:  value,
+            bool_value: false,
+            value_kind: DirectiveArgKind::Ident,
+            nested:     null,
+            span:       span,
+        };
+    }
+
+    static bool_lit(value: boolean, span: SourceSpan) -> DirectiveArg {
+        return DirectiveArg {
+            kind:       DirectiveArgKind::BoolLit,
+            name:       "",
+            str_value:  "",
+            int_value:  0,
+            bool_value: value,
+            value_kind: DirectiveArgKind::Ident,
+            nested:     null,
+            span:       span,
+        };
+    }
+
+    static nested_call(call: DirectiveNode*, span: SourceSpan) -> DirectiveArg {
+        return DirectiveArg {
+            kind:       DirectiveArgKind::Nested,
+            name:       "",
+            str_value:  "",
+            int_value:  0,
+            bool_value: false,
+            value_kind: DirectiveArgKind::Ident,
+            nested:     call,
+            span:       span,
+        };
+    }
+
+    /// Render this arg as a human-readable string for diagnostics or the
+    /// legacy `arguments: string[]` view.
+    to_text(&this) -> string {
+        if (this.kind == DirectiveArgKind::Ident) {
+            return this.name;
+        }
+        if (this.kind == DirectiveArgKind::StringLit) {
+            return format("\"%s\"", this.str_value);
+        }
+        if (this.kind == DirectiveArgKind::IntLit) {
+            return this.str_value;
+        }
+        if (this.kind == DirectiveArgKind::BoolLit) {
+            if (this.bool_value) { return "true"; }
+            return "false";
+        }
+        if (this.kind == DirectiveArgKind::KeyValue) {
+            mut v: string = "?";
+            if (this.value_kind == DirectiveArgKind::Ident)     { v = this.str_value; }
+            if (this.value_kind == DirectiveArgKind::StringLit) { v = format("\"%s\"", this.str_value); }
+            if (this.value_kind == DirectiveArgKind::IntLit)    { v = this.str_value; }
+            if (this.value_kind == DirectiveArgKind::BoolLit) {
+                if (this.bool_value) { v = "true"; } else { v = "false"; }
+            }
+            return format("%s = %s", this.name, v);
+        }
+        if (this.kind == DirectiveArgKind::Nested) {
+            if (this.nested != null) { return this.nested.directive_kind; }
+            return "<null>";
+        }
+        return "?";
+    }
+}
 
 type class DirectiveNode : ASTNode {
 public:
     directive_kind: string;
-    arguments:      string[];
+    arguments:      string[];     // legacy human-readable text per arg
+    args:           DirectiveArg[]; // typed argument list (rich form)
 
     DirectiveNode(directive_kind: string, span: SourceSpan)
         : ASTNode(NodeKind::Directive, span) {
         this.directive_kind = directive_kind;
         this.arguments      = [];
+        this.args           = [];
     }
 
+    /// Append an argument.  Pushes to BOTH the legacy `arguments` (text)
+    /// and the typed `args` list so older readers stay compatible.
+    add_arg(a: DirectiveArg) -> void {
+        this.arguments.push(a.to_text());
+        this.args.push(a);
+    }
+
+    /// Legacy text-only arg add.  Used by code that hasn't migrated to
+    /// the typed argument API yet.
     add_argument(arg: string) -> void {
         this.arguments.push(arg);
+        this.args.push(DirectiveArg::ident(arg, this.span));
+    }
+
+    /// True if any argument matches the given identifier name.
+    has_ident_arg(&this, name: string) -> boolean {
+        for (mut i: i64 = 0; i < this.args.length; i++) {
+            const a: DirectiveArg = this.args[i];
+            if (a.kind == DirectiveArgKind::Ident && strcmp(a.name, name) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Look up the value of a `key = value` arg, returning the rendered
+    /// string text or "" if not present.
+    find_kv(&this, key: string) -> string {
+        for (mut i: i64 = 0; i < this.args.length; i++) {
+            const a: DirectiveArg = this.args[i];
+            if (a.kind == DirectiveArgKind::KeyValue && strcmp(a.name, key) == 0) {
+                return a.str_value;
+            }
+        }
+        return "";
     }
 
     override accept(visitor: ASTVisitor*) -> void {

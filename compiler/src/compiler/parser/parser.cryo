@@ -91,6 +91,28 @@ public:
         );
     }
 
+    /// True if the AST node is a declaration that can carry attached
+    /// directives (i.e. inherits from `DeclarationNode`).
+    static is_attachable_decl(node: ASTNode*) -> boolean {
+        if (node == null) { return false; }
+        return match (node.kind) {
+            NodeKind::FunctionDeclaration   => { true }
+            NodeKind::StructDeclaration     => { true }
+            NodeKind::ClassDeclaration      => { true }
+            NodeKind::EnumDeclaration       => { true }
+            NodeKind::TraitDeclaration      => { true }
+            NodeKind::TypeAliasDeclaration  => { true }
+            NodeKind::VariableDeclaration   => { true }
+            NodeKind::ImplementationBlock   => { true }
+            NodeKind::ExternBlock           => { true }
+            NodeKind::ImportDeclaration     => { true }
+            NodeKind::ModuleDeclaration     => { true }
+            NodeKind::IntrinsicDeclaration  => { true }
+            NodeKind::IntrinsicConstDeclaration => { true }
+            _                               => { false }
+        };
+    }
+
 
     // ================================================================
     // Entry Point
@@ -117,9 +139,40 @@ public:
             this.collect_doc_comments();
             if (this.is_at_end()) { break; }
 
+            // Drain consecutive `![...]` directives so we can attach them
+            // to the next declaration.
+            mut pending: DirectiveNode*[] = [];
+            while (this.check(TokenType::BangBracket)) {
+                const d: DirectiveNode* = this.parse_directive();
+                if (d != null) { pending.push(d); }
+                this.collect_doc_comments();
+                if (this.is_at_end()) { break; }
+            }
+
+            if (this.is_at_end()) {
+                for (mut i: i64 = 0; i < pending.length; i++) {
+                    program.add_statement(pending[i] as ASTNode*);
+                }
+                break;
+            }
+
             const node: ASTNode* = this.parse_top_level();
             if (node != null) {
+                if (pending.length > 0 && Parser::is_attachable_decl(node)) {
+                    const decl: DeclarationNode* = node as DeclarationNode*;
+                    for (mut i: i64 = 0; i < pending.length; i++) {
+                        decl.add_directive(pending[i]);
+                    }
+                } else {
+                    for (mut i: i64 = 0; i < pending.length; i++) {
+                        program.add_statement(pending[i] as ASTNode*);
+                    }
+                }
                 program.add_statement(node);
+            } else if (pending.length > 0) {
+                for (mut i: i64 = 0; i < pending.length; i++) {
+                    program.add_statement(pending[i] as ASTNode*);
+                }
             }
         }
 
@@ -206,8 +259,8 @@ public:
             return impl_blk;
         }
 
-        // Directive: #[attr]
-        if (tok.kind == TokenType::Hash) {
+        // Directive: ![name] or ![name(args)]
+        if (tok.kind == TokenType::BangBracket) {
             return this.parse_directive();
         }
 
@@ -1743,22 +1796,39 @@ public:
         };
     }
 
-    /// Parse a directive: #[attr] or #[attr(args)]
-    parse_directive() -> DirectiveNode* {
-        const start: Token = this.advance(); // consume '#'
-        this.consume(TokenType::LSquare, "'['");
+    /// Consume the next token as a directive name.  Accepts a regular
+    /// identifier OR any keyword token whose lexeme is an identifier-shaped
+    /// word (`inline`, `static`, `extern`, `if`, `unsafe`, ...) so the
+    /// directive vocabulary isn't artificially limited by reserved words.
+    consume_directive_name() -> Token {
+        const tok: Token = this.current();
+        if (tok.kind == TokenType::Identifier || tok.kind.is_keyword()) {
+            return this.advance();
+        }
+        this.report_error(ErrorCode::E0105_EXPECTED_IDENTIFIER,
+            format("expected directive name, found '%s'", tok.lexeme));
+        return this.advance();
+    }
 
-        const kind_tok: Token = this.consume(TokenType::Identifier, "directive name");
+    /// Parse a directive: ![name] or ![name(args)]
+    /// The opening `![` is a single fused token (BangBracket).  Arguments
+    /// can be: bare identifier, string literal, integer literal, boolean
+    /// literal, `key = value` pair, or a nested directive call
+    /// (e.g. `![cfg(any(unix, windows))]`).
+    parse_directive() -> DirectiveNode* {
+        const start: Token = this.advance(); // consume '!['
+
+        const kind_tok: Token = this.consume_directive_name();
         mut dir: DirectiveNode* = new DirectiveNode(kind_tok.lexeme, this.span_from_token(start));
 
-        // Optional arguments: #[attr(arg1, arg2)]
         if (this.check(TokenType::LParen)) {
             this.advance();
-            while (!this.check(TokenType::RParen) && !this.is_at_end()) {
-                const arg: Token = this.current();
-                dir.add_argument(arg.lexeme);
-                this.advance();
-                if (!this.match_tok(TokenType::Comma)) { break; }
+            if (!this.check(TokenType::RParen)) {
+                while (true) {
+                    const a: DirectiveArg = this.parse_directive_arg();
+                    dir.add_arg(a);
+                    if (!this.match_tok(TokenType::Comma)) { break; }
+                }
             }
             this.consume(TokenType::RParen, "')'");
         }
@@ -1766,6 +1836,124 @@ public:
         this.consume(TokenType::RSquare, "']'");
         dir.span = this.span_from(start);
         return dir;
+    }
+
+    /// Parse a single directive argument.  Uses the same grammar whether
+    /// the argument appears at the top level (`![attr(arg, ...)]`) or
+    /// inside a nested call (`cfg(any(unix))`).
+    parse_directive_arg() -> DirectiveArg {
+        const start: Token = this.current();
+
+        // Boolean literal: true / false
+        if (start.kind == TokenType::KwTrue) {
+            this.advance();
+            return DirectiveArg::bool_lit(true, this.span_from_token(start));
+        }
+        if (start.kind == TokenType::KwFalse) {
+            this.advance();
+            return DirectiveArg::bool_lit(false, this.span_from_token(start));
+        }
+
+        // String literal: "foo"
+        if (start.kind == TokenType::StringLiteral || start.kind == TokenType::RawStringLiteral) {
+            const tok: Token = this.advance();
+            const content: string = ParserBase::unquote_string_lexeme(tok.lexeme);
+            return DirectiveArg::string_lit(content, this.span_from_token(tok));
+        }
+
+        // Integer literal: 16, 0xFF, 0b101, ...
+        if (start.kind == TokenType::NumericConstant) {
+            const tok: Token = this.advance();
+            const v: i64 = ParserBase::parse_numeric_lexeme_i64(tok.lexeme);
+            return DirectiveArg::int_lit(v, tok.lexeme, this.span_from_token(tok));
+        }
+
+        // Identifier: bare ident, key=value, or nested call.
+        // Also accept any keyword whose lexeme reads as an identifier
+        // (e.g. `inline`, `static`, `if`, `unsafe`) so directive names
+        // and arg names aren't restricted to non-reserved words.
+        if (start.kind == TokenType::Identifier || start.kind.is_keyword()) {
+            const id_tok: Token = this.advance();
+
+            // Nested directive call: name(args...)
+            if (this.check(TokenType::LParen)) {
+                mut nested: DirectiveNode* = new DirectiveNode(
+                    id_tok.lexeme, this.span_from_token(id_tok));
+                this.advance(); // consume '('
+                if (!this.check(TokenType::RParen)) {
+                    while (true) {
+                        const inner: DirectiveArg = this.parse_directive_arg();
+                        nested.add_arg(inner);
+                        if (!this.match_tok(TokenType::Comma)) { break; }
+                    }
+                }
+                this.consume(TokenType::RParen, "')'");
+                nested.span = this.span_from(id_tok);
+                return DirectiveArg::nested_call(nested, this.span_from(id_tok));
+            }
+
+            // key = value
+            if (this.check(TokenType::Equal)) {
+                this.advance(); // consume '='
+                return this.parse_directive_kv(id_tok);
+            }
+
+            // Bare identifier
+            return DirectiveArg::ident(id_tok.lexeme, this.span_from_token(id_tok));
+        }
+
+        // Anything else is a syntax error inside a directive arg list.
+        this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+            format("expected directive argument (identifier, literal, or nested call), got '%s'",
+                start.lexeme));
+        this.advance(); // skip the bad token to make progress
+        return DirectiveArg::ident(start.lexeme, this.span_from_token(start));
+    }
+
+    /// Helper: build a `key = value` arg given that `key` and `=` are
+    /// already consumed.  Caller passes the identifier token for `key`.
+    parse_directive_kv(key_tok: Token) -> DirectiveArg {
+        const v_tok: Token = this.current();
+        mut kv: DirectiveArg = DirectiveArg {
+            kind:       DirectiveArgKind::KeyValue,
+            name:       key_tok.lexeme,
+            str_value:  "",
+            int_value:  0,
+            bool_value: false,
+            value_kind: DirectiveArgKind::Ident,
+            nested:     null,
+            span:       this.span_from(key_tok),
+        };
+
+        if (v_tok.kind == TokenType::KwTrue) {
+            this.advance();
+            kv.value_kind = DirectiveArgKind::BoolLit;
+            kv.bool_value = true;
+        } else if (v_tok.kind == TokenType::KwFalse) {
+            this.advance();
+            kv.value_kind = DirectiveArgKind::BoolLit;
+            kv.bool_value = false;
+        } else if (v_tok.kind == TokenType::StringLiteral || v_tok.kind == TokenType::RawStringLiteral) {
+            this.advance();
+            kv.value_kind = DirectiveArgKind::StringLit;
+            kv.str_value  = ParserBase::unquote_string_lexeme(v_tok.lexeme);
+        } else if (v_tok.kind == TokenType::NumericConstant) {
+            this.advance();
+            kv.value_kind = DirectiveArgKind::IntLit;
+            kv.int_value  = ParserBase::parse_numeric_lexeme_i64(v_tok.lexeme);
+            kv.str_value  = v_tok.lexeme;
+        } else if (v_tok.kind == TokenType::Identifier) {
+            this.advance();
+            kv.value_kind = DirectiveArgKind::Ident;
+            kv.str_value  = v_tok.lexeme;
+        } else {
+            this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                format("expected literal or identifier after '=' in directive, got '%s'",
+                    v_tok.lexeme));
+        }
+
+        kv.span = this.span_from(key_tok);
+        return kv;
     }
 
 

@@ -165,6 +165,17 @@ type struct DeclarationIndex {
     overload_func_types:   TypeRef[]; // FunctionType TypeRef for this overload
     overload_func_mangled: u32[];     // SymbolStr.id of mangled LLVM name (0 = unset)
 
+    // Bare-name → all qualified names ever registered for it.  Parallel
+    // arrays: `bare_alt_keys[i]` is the bare SymbolStr.id, `bare_alt_quals[i]`
+    // is one qualified name registered under that bare.  Populated by
+    // `register_name_mapping`.  Used by codegen to detect ambiguous calls
+    // through the bare-name fallback (E0154): when the same simple name
+    // backs multiple sibling-namespace free functions, dispatching via the
+    // bare overload slot is last-write-wins; the diagnostic prevents that
+    // silent misdispatch.
+    bare_alt_keys:  u32[];
+    bare_alt_quals: u32[];
+
 
     static new() -> DeclarationIndex {
         return DeclarationIndex {
@@ -187,6 +198,8 @@ type struct DeclarationIndex {
             overload_func_keys:    [],
             overload_func_types:   [],
             overload_func_mangled: [],
+            bare_alt_keys:  [],
+            bare_alt_quals: [],
         };
     }
 
@@ -640,9 +653,21 @@ type struct DeclarationIndex {
 
     /// Register a bare → qualified name mapping.
     /// Called by type_resolution when registering both forms.
+    /// Also records the qualified name in the per-bare alternatives list
+    /// so codegen can detect ambiguous bare-name fallbacks.
     register_name_mapping(mut &this, bare: SymbolStr, qualified: SymbolStr) -> void {
         const h: u64 = hash_int(bare.id as u64);
         this.bare_to_qualified.insert(bare.id, qualified.id);
+
+        // Append to alternatives list, deduped by (bare, qualified) pair.
+        for (mut i: i64 = 0; i < this.bare_alt_keys.length; i++) {
+            if (this.bare_alt_keys[i] == bare.id &&
+                this.bare_alt_quals[i] == qualified.id) {
+                return;
+            }
+        }
+        this.bare_alt_keys.push(bare.id);
+        this.bare_alt_quals.push(qualified.id);
     }
 
     /// Resolve a bare name to its qualified form.
@@ -653,6 +678,22 @@ type struct DeclarationIndex {
             Option::Some(val) => { SymbolStr::from_id(val) }
             Option::None      => { bare }
         };
+    }
+
+    /// Return every qualified name registered under the given bare name.
+    /// `length > 1` means dispatching through the bare-name fallback would
+    /// be ambiguous: the overload slot is last-write-wins, so two free
+    /// functions of the same simple name in sibling namespaces collapse
+    /// onto a single LLVM symbol.  Codegen uses this to emit E0154
+    /// (ambiguous call) instead of silently misrouting.
+    lookup_qualified_alternatives(&this, bare: SymbolStr) -> SymbolStr[] {
+        mut result: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < this.bare_alt_keys.length; i++) {
+            if (this.bare_alt_keys[i] == bare.id) {
+                result.push(SymbolStr::from_id(this.bare_alt_quals[i]));
+            }
+        }
+        return result;
     }
 
     // ----------------------------------------------------------------
