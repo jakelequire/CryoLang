@@ -102,6 +102,53 @@ type struct TypeResolutionRunner {
         return result;
     }
 
+    /// For a trait impl block (`impl Foo<X> for Bar<Y>`), bind the trait's
+    /// outer generic params to the impl's trait args inside `res_ctx` so
+    /// that cloned default-method bodies can resolve names like the
+    /// trait's `Item` parameter.  Without this, `synthesize_default_trait_methods`
+    /// clones a method like `Iterator<Item>::fold<Acc>(... f: (Acc, Item) -> Acc ...)`
+    /// into the impl, then `resolve_method_signatures` runs with only the
+    /// impl's own generics in scope; `Item` lookup misses, the function-type
+    /// resolution returns a TypeRef whose internal param list contains an
+    /// invalid `Item` slot, and the wrong mangled symbol is computed (or a
+    /// hard panic in `encode_type_ref` fires once the silent "v" fallback
+    /// is removed).  Resolves the trait_decl by leaf name; no-op if the
+    /// trait isn't generic, the annotation isn't a `Generic(...)`, or the
+    /// arg count doesn't match the trait's param count.
+    bind_trait_args_for_impl(&this, impl_node: ImplBlockNode*,
+                              res_ctx: ResolutionContext*) -> void {
+        if (impl_node == null || !impl_node.is_trait_impl()) { return; }
+        if (this.ctx.generic_registry == null) { return; }
+
+        // The trait annotation must be a Generic(base, args) for there to
+        // be any args to bind.  Non-generic traits (e.g. `impl Drop for Foo`)
+        // have no outer params and need no binding work.
+        const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
+        if (trait_ann == null) { return; }
+        const args: TypeAnnotation*[] = TypeResolutionPasses::extract_trait_args(trait_ann);
+        if (args.length == 0) { return; }
+        const trait_leaf: SymbolStr = TypeResolutionPasses::extract_trait_leaf(trait_ann);
+        if (!trait_leaf.is_valid()) { return; }
+        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
+        if (trait_decl == null) { return; }
+        // Arity mismatch is a user-level error caught elsewhere; bail
+        // silently here rather than emit a duplicate diagnostic.
+        if (trait_decl.generic_params.length != args.length) { return; }
+
+        // Resolve each arg in the impl's own resolution context (which
+        // already has the impl's `<T, ...>` params bound), then map the
+        // trait param's name onto it.  `Iterator<T>` impl: trait_decl's
+        // param[0] is `Item` and arg[0] resolves to the impl's `T`, so
+        // we add `Item -> T` to the context.
+        for (mut i: i64 = 0; i < args.length; i++) {
+            const gp: GenericParamNode* = trait_decl.generic_params[i];
+            if (gp == null) { continue; }
+            const arg_ty: TypeRef = this.resolver.resolve(args[i], res_ctx);
+            if (!arg_ty.is_valid()) { continue; }
+            res_ctx.add_binding(gp.name, arg_ty);
+        }
+    }
+
 
     // ========================================================================
     // Signature and field resolution helpers
@@ -960,6 +1007,24 @@ type struct TypeResolutionPasses {
         };
     }
 
+    /// Walk a trait_annotation to its generic arg list.  Returns the
+    /// `args` of the innermost `Generic(base, args)` wrapper, or an empty
+    /// list when the trait isn't a generic instantiation (e.g.
+    /// `implement trait Drop for Foo` — `Drop` is just `Named("Drop")`).
+    static extract_trait_args(ann: TypeAnnotation*) -> TypeAnnotation*[] {
+        if (ann == null) { return []; }
+        return match (*ann) {
+            TypeAnnotation::Generic(g) => { g.args }
+            TypeAnnotation::Reference(r) => {
+                TypeResolutionPasses::extract_trait_args(r.inner)
+            }
+            TypeAnnotation::Pointer(p) => {
+                TypeResolutionPasses::extract_trait_args(p.inner)
+            }
+            _ => { [] }
+        };
+    }
+
     /// Clone every default-bodied trait method that `impl_node` doesn't
     /// override. Returns the number of methods added.
     static synthesize_default_trait_methods(impl_node: ImplBlockNode*,
@@ -1183,6 +1248,15 @@ type struct TypeResolutionPasses {
                     }
                     mut impl_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
+                    // Trait impls: bind the trait's outer generic params to
+                    // the impl's trait args (e.g. `Item -> T` for an
+                    // `implement<T> Iterator<T> for Bar<T>`).  Cloned
+                    // default-method bodies reference these names through
+                    // the trait's signature — without this binding, those
+                    // references resolve to invalid TypeRefs and the
+                    // mangler downstream produces a junk symbol with a
+                    // hole where `Item` should be.
+                    runner.bind_trait_args_for_impl(node, &impl_ctx);
                     // Look up the owner type — try qualified first, then bare
                     // (primitive impls like `implement string` use bare).
                     mut impl_owner: TypeRef = ctx.decl_index.lookup_type(
@@ -1442,6 +1516,14 @@ type struct TypeResolutionPasses {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
                     mut impl_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
+                    // Mirror the FunctionSignature pass's trait-arg
+                    // binding so the second-pass resolution of method
+                    // signatures sees the same scope.  (This pass picks
+                    // up any param annotations missed by the first pass
+                    // — without the trait-arg bindings here, we'd
+                    // re-introduce the same `Item` lookup miss this
+                    // resolution is meant to repair.)
+                    runner.bind_trait_args_for_impl(node, &impl_ctx);
                     mut impl_owner2: TypeRef = ctx.decl_index.lookup_type(
                         ctx.qualify_symbol_sym(node.target_type));
                     if (impl_owner2.is_invalid()) {
