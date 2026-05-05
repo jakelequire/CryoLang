@@ -1,0 +1,510 @@
+/// Syntax highlighter for diagnostic source snippets.
+///
+/// Streams a single source line to stderr with ANSI color codes wrapped
+/// around lexical tokens (keywords, type names, string/char literals,
+/// numeric literals, comments, attributes).  Designed to be called from
+/// DiagRenderer: it inserts only escape sequences, never visible
+/// characters, so the renderer's caret math (which works on byte
+/// offsets in the original source) is unaffected.
+///
+/// All output goes to `g_stderr` via fprintf — never stdout.
+
+namespace Utils::SyntaxHighlighter;
+
+import Utils;
+
+
+// ============================================================================
+// ANSI Color Codes
+// ============================================================================
+// Picked to coexist with DiagRenderer's existing palette (red/yellow/blue
+// for diagnostics) without clashing.  The caret line stays the dominant
+// visual anchor; highlighted tokens use slightly muted hues.
+
+// NOTE: use \x1b (hex ESC) rather than \033 (octal).  Cryo's string
+// escape pass does not recognize \033 — see compiler/src/compiler/lex
+// /lexer.cryo `process_escape_sequences`.
+const HL_RESET:    string = "\x1b[0m";
+const HL_KEYWORD:  string = "\x1b[35m";    // magenta — control flow / decls
+const HL_TYPE:     string = "\x1b[33m";    // yellow  — built-in type names
+const HL_USERTYPE: string = "\x1b[96m";    // bright cyan — UpperCamelCase idents
+const HL_NUMBER:   string = "\x1b[33m";    // yellow  — numeric literals
+const HL_STRING:   string = "\x1b[32m";    // green   — string / char literals
+const HL_COMMENT:  string = "\x1b[90m";    // grey    — // and /* */
+const HL_ATTR:     string = "\x1b[94m";    // blue    — @attribute
+const HL_FUNC:     string = "\x1b[36m";    // cyan    — ident immediately before '('
+
+
+// ============================================================================
+// Public entry point
+// ============================================================================
+
+/// Write `line` to stderr, optionally wrapping recognized tokens in ANSI
+/// color escapes.  When `colors == false` the line is emitted verbatim.
+function print_line(line: string, colors: boolean) -> void {
+    if (line == "") {
+        return;
+    }
+    if (!colors) {
+        fprintf(g_stderr, "%s", line);
+        return;
+    }
+    highlight_stream(line);
+}
+
+
+// ============================================================================
+// Streaming highlighter
+// ============================================================================
+
+/// Walk `line` byte-by-byte, classifying each lexeme run and emitting it
+/// with the matching color.  Keeps no state across lines — block comments
+/// only span the visible line.
+function highlight_stream(line: string) -> void {
+    const len: i64 = strlen(line) as i64;
+    mut pos: i64 = 0;
+
+    while (pos < len) {
+        const ch: char = char_at(line, pos);
+
+        // Whitespace runs — emit as-is (no escape sequences).
+        if (is_space(ch)) {
+            const ws_start: i64 = pos;
+            while (pos < len && is_space(char_at(line, pos))) {
+                pos = pos + 1;
+            }
+            emit_plain(line, ws_start, pos - ws_start);
+            continue;
+        }
+
+        // Line comment "// ..." — colors the rest of the line.
+        if (ch == '/' && pos + 1 < len && char_at(line, pos + 1) == '/') {
+            emit_colored(line, pos, len - pos, HL_COMMENT);
+            pos = len;
+            continue;
+        }
+
+        // Block comment "/* ... */" — terminates at first */ on the line,
+        // or end-of-line if unterminated.
+        if (ch == '/' && pos + 1 < len && char_at(line, pos + 1) == '*') {
+            const cm_start: i64 = pos;
+            pos = pos + 2;
+            while (pos + 1 < len) {
+                if (char_at(line, pos) == '*' && char_at(line, pos + 1) == '/') {
+                    pos = pos + 2;
+                    break;
+                }
+                pos = pos + 1;
+            }
+            if (pos > len) { pos = len; }
+            emit_colored(line, cm_start, pos - cm_start, HL_COMMENT);
+            continue;
+        }
+
+        // String literal "..."
+        if (ch == '"') {
+            const s_start: i64 = pos;
+            pos = pos + 1;
+            while (pos < len) {
+                const c: char = char_at(line, pos);
+                if (c == '\\' && pos + 1 < len) {
+                    pos = pos + 2;
+                    continue;
+                }
+                if (c == '"') {
+                    pos = pos + 1;
+                    break;
+                }
+                pos = pos + 1;
+            }
+            emit_colored(line, s_start, pos - s_start, HL_STRING);
+            continue;
+        }
+
+        // Char literal '...'
+        if (ch == '\'') {
+            const c_start: i64 = pos;
+            pos = pos + 1;
+            while (pos < len) {
+                const c: char = char_at(line, pos);
+                if (c == '\\' && pos + 1 < len) {
+                    pos = pos + 2;
+                    continue;
+                }
+                if (c == '\'') {
+                    pos = pos + 1;
+                    break;
+                }
+                pos = pos + 1;
+            }
+            emit_colored(line, c_start, pos - c_start, HL_STRING);
+            continue;
+        }
+
+        // Attribute @name
+        if (ch == '@') {
+            const a_start: i64 = pos;
+            pos = pos + 1;
+            while (pos < len && is_ident_cont(char_at(line, pos))) {
+                pos = pos + 1;
+            }
+            emit_colored(line, a_start, pos - a_start, HL_ATTR);
+            continue;
+        }
+
+        // Numeric literal: decimal, hex (0x), binary (0b), octal (0o),
+        // floats with exponent, and integer/float suffixes (u32, f64, ...)
+        if (is_digit(ch)) {
+            const n_start: i64 = pos;
+            pos = consume_number(line, pos, len);
+            emit_colored(line, n_start, pos - n_start, HL_NUMBER);
+            continue;
+        }
+
+        // Identifier / keyword
+        if (is_ident_start(ch)) {
+            const id_start: i64 = pos;
+            while (pos < len && is_ident_cont(char_at(line, pos))) {
+                pos = pos + 1;
+            }
+            const id_len: i64 = pos - id_start;
+            const cls: i32 = classify_ident(line, id_start, id_len, pos, len);
+            emit_ident(line, id_start, id_len, cls);
+            continue;
+        }
+
+        // Punctuation / operator / anything else — pass through one byte
+        // uncolored.  Coloring punctuation tends to add visual noise that
+        // distracts from the caret, so we leave it default.
+        emit_plain(line, pos, 1);
+        pos = pos + 1;
+    }
+}
+
+
+// ============================================================================
+// Number consumption
+// ============================================================================
+
+/// Returns the position just past the end of a numeric literal starting
+/// at `start`.  Handles 0x/0b/0o prefixes, decimal points, exponents, and
+/// trailing type suffixes such as `u32`, `i64`, `f32`.
+function consume_number(line: string, start: i64, len: i64) -> i64 {
+    mut pos: i64 = start;
+
+    // Special-base prefixes: 0x... / 0b... / 0o...
+    if (char_at(line, pos) == '0' && pos + 1 < len) {
+        const nx: char = char_at(line, pos + 1);
+        if (nx == 'x' || nx == 'X' ||
+            nx == 'b' || nx == 'B' ||
+            nx == 'o' || nx == 'O') {
+            pos = pos + 2;
+            while (pos < len) {
+                const c: char = char_at(line, pos);
+                if (is_hex_digit(c) || c == '_') {
+                    pos = pos + 1;
+                } else {
+                    break;
+                }
+            }
+            // Type suffix after the digits (e.g. 0xFFu32).
+            while (pos < len && is_ident_cont(char_at(line, pos))) {
+                pos = pos + 1;
+            }
+            return pos;
+        }
+    }
+
+    // Integer part.
+    while (pos < len) {
+        const c: char = char_at(line, pos);
+        if (is_digit(c) || c == '_') {
+            pos = pos + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Fractional part — only consume `.` if followed by a digit, so
+    // `1.foo()` is not mistaken for a float literal.
+    if (pos < len && char_at(line, pos) == '.' &&
+        pos + 1 < len && is_digit(char_at(line, pos + 1))) {
+        pos = pos + 1;
+        while (pos < len) {
+            const c: char = char_at(line, pos);
+            if (is_digit(c) || c == '_') {
+                pos = pos + 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Exponent: e[+-]?digits.
+    if (pos < len) {
+        const e: char = char_at(line, pos);
+        if (e == 'e' || e == 'E') {
+            mut probe: i64 = pos + 1;
+            if (probe < len) {
+                const sign: char = char_at(line, probe);
+                if (sign == '+' || sign == '-') { probe = probe + 1; }
+            }
+            if (probe < len && is_digit(char_at(line, probe))) {
+                pos = probe;
+                while (pos < len && is_digit(char_at(line, pos))) {
+                    pos = pos + 1;
+                }
+            }
+        }
+    }
+
+    // Trailing type suffix (u32, i64, f32, etc.).
+    while (pos < len && is_ident_cont(char_at(line, pos))) {
+        pos = pos + 1;
+    }
+
+    return pos;
+}
+
+
+// ============================================================================
+// Identifier classification
+// ============================================================================
+//
+// Classes:
+//   0 — plain identifier / variable name
+//   1 — language keyword (control flow, declarations, modifiers, literals)
+//   2 — built-in type keyword (int, u32, string, ...)
+//   3 — user-defined type (UpperCamelCase identifier)
+//   4 — function call (identifier immediately followed by '(')
+
+/// Classify an identifier in [start, start+len) and return its color class.
+function classify_ident(line: string, start: i64, len: i64,
+                        after: i64, total_len: i64) -> i32 {
+    if (is_keyword(line, start, len)) {
+        return 1;
+    }
+    if (is_type_keyword(line, start, len)) {
+        return 2;
+    }
+
+    // Look at first character: uppercase suggests a user-defined type.
+    const first: char = char_at(line, start);
+    const is_upper: boolean = first >= 'A' && first <= 'Z';
+
+    // Look ahead past whitespace for '(' to identify a call site.
+    mut probe: i64 = after;
+    while (probe < total_len && is_space(char_at(line, probe))) {
+        probe = probe + 1;
+    }
+    const followed_by_paren: boolean =
+        probe < total_len && char_at(line, probe) == '(';
+
+    if (is_upper) {
+        return 3;
+    }
+    if (followed_by_paren) {
+        return 4;
+    }
+    return 0;
+}
+
+/// Emit an identifier with the color matching its class.
+function emit_ident(line: string, start: i64, len: i64, cls: i32) -> void {
+    if (cls == 1) {
+        emit_colored(line, start, len, HL_KEYWORD);
+        return;
+    }
+    if (cls == 2) {
+        emit_colored(line, start, len, HL_TYPE);
+        return;
+    }
+    if (cls == 3) {
+        emit_colored(line, start, len, HL_USERTYPE);
+        return;
+    }
+    if (cls == 4) {
+        emit_colored(line, start, len, HL_FUNC);
+        return;
+    }
+    emit_plain(line, start, len);
+}
+
+
+// ============================================================================
+// Keyword tables
+// ============================================================================
+
+/// Returns true when [start, start+len) names a Cryo language keyword.
+/// Mirrors `keyword_from_str` in Compiler::Lex, minus the type keywords
+/// which are reported separately by `is_type_keyword`.
+function is_keyword(line: string, start: i64, len: i64) -> boolean {
+    // Control flow.
+    if (lex_eq(line, start, len, "if"))         { return true; }
+    if (lex_eq(line, start, len, "else"))       { return true; }
+    if (lex_eq(line, start, len, "elif"))       { return true; }
+    if (lex_eq(line, start, len, "switch"))     { return true; }
+    if (lex_eq(line, start, len, "case"))       { return true; }
+    if (lex_eq(line, start, len, "default"))    { return true; }
+    if (lex_eq(line, start, len, "match"))      { return true; }
+    if (lex_eq(line, start, len, "while"))      { return true; }
+    if (lex_eq(line, start, len, "for"))        { return true; }
+    if (lex_eq(line, start, len, "loop"))       { return true; }
+    if (lex_eq(line, start, len, "do"))         { return true; }
+    if (lex_eq(line, start, len, "break"))      { return true; }
+    if (lex_eq(line, start, len, "continue"))   { return true; }
+    if (lex_eq(line, start, len, "return"))     { return true; }
+    if (lex_eq(line, start, len, "yield"))      { return true; }
+
+    // Declarations.
+    if (lex_eq(line, start, len, "const"))      { return true; }
+    if (lex_eq(line, start, len, "static"))     { return true; }
+    if (lex_eq(line, start, len, "extern"))     { return true; }
+    if (lex_eq(line, start, len, "auto"))       { return true; }
+    if (lex_eq(line, start, len, "function"))   { return true; }
+    if (lex_eq(line, start, len, "class"))      { return true; }
+    if (lex_eq(line, start, len, "struct"))     { return true; }
+    if (lex_eq(line, start, len, "enum"))       { return true; }
+    if (lex_eq(line, start, len, "trait"))      { return true; }
+    if (lex_eq(line, start, len, "type"))       { return true; }
+    if (lex_eq(line, start, len, "namespace"))  { return true; }
+    if (lex_eq(line, start, len, "module"))     { return true; }
+    if (lex_eq(line, start, len, "import"))     { return true; }
+    if (lex_eq(line, start, len, "export"))     { return true; }
+    if (lex_eq(line, start, len, "from"))       { return true; }
+    if (lex_eq(line, start, len, "as"))         { return true; }
+    if (lex_eq(line, start, len, "implement"))  { return true; }
+    if (lex_eq(line, start, len, "intrinsic"))  { return true; }
+    if (lex_eq(line, start, len, "where"))      { return true; }
+
+    // Access control & modifiers.
+    if (lex_eq(line, start, len, "public"))     { return true; }
+    if (lex_eq(line, start, len, "private"))    { return true; }
+    if (lex_eq(line, start, len, "protected"))  { return true; }
+    if (lex_eq(line, start, len, "mutable"))    { return true; }
+    if (lex_eq(line, start, len, "inline"))     { return true; }
+    if (lex_eq(line, start, len, "async"))      { return true; }
+    if (lex_eq(line, start, len, "await"))      { return true; }
+    if (lex_eq(line, start, len, "unsafe"))     { return true; }
+    if (lex_eq(line, start, len, "virtual"))    { return true; }
+    if (lex_eq(line, start, len, "override"))   { return true; }
+    if (lex_eq(line, start, len, "mut"))        { return true; }
+
+    // Special values & operator-keywords.
+    if (lex_eq(line, start, len, "true"))       { return true; }
+    if (lex_eq(line, start, len, "false"))      { return true; }
+    if (lex_eq(line, start, len, "null"))       { return true; }
+    if (lex_eq(line, start, len, "this"))       { return true; }
+    if (lex_eq(line, start, len, "in"))         { return true; }
+    if (lex_eq(line, start, len, "typeof"))     { return true; }
+    if (lex_eq(line, start, len, "sizeof"))     { return true; }
+    if (lex_eq(line, start, len, "alignof"))    { return true; }
+    if (lex_eq(line, start, len, "new"))        { return true; }
+    if (lex_eq(line, start, len, "delete"))     { return true; }
+    if (lex_eq(line, start, len, "with"))       { return true; }
+
+    return false;
+}
+
+/// Returns true when [start, start+len) names a built-in type keyword.
+function is_type_keyword(line: string, start: i64, len: i64) -> boolean {
+    if (lex_eq(line, start, len, "void"))      { return true; }
+    if (lex_eq(line, start, len, "boolean"))   { return true; }
+    if (lex_eq(line, start, len, "int"))       { return true; }
+    if (lex_eq(line, start, len, "i8"))        { return true; }
+    if (lex_eq(line, start, len, "i16"))       { return true; }
+    if (lex_eq(line, start, len, "i32"))       { return true; }
+    if (lex_eq(line, start, len, "i64"))       { return true; }
+    if (lex_eq(line, start, len, "i128"))      { return true; }
+    if (lex_eq(line, start, len, "uint"))      { return true; }
+    if (lex_eq(line, start, len, "u8"))        { return true; }
+    if (lex_eq(line, start, len, "u16"))       { return true; }
+    if (lex_eq(line, start, len, "u32"))       { return true; }
+    if (lex_eq(line, start, len, "u64"))       { return true; }
+    if (lex_eq(line, start, len, "u128"))      { return true; }
+    if (lex_eq(line, start, len, "unsigned"))  { return true; }
+    if (lex_eq(line, start, len, "float"))     { return true; }
+    if (lex_eq(line, start, len, "f32"))       { return true; }
+    if (lex_eq(line, start, len, "f64"))       { return true; }
+    if (lex_eq(line, start, len, "double"))    { return true; }
+    if (lex_eq(line, start, len, "char"))      { return true; }
+    if (lex_eq(line, start, len, "string"))    { return true; }
+    if (lex_eq(line, start, len, "tuple"))     { return true; }
+    if (lex_eq(line, start, len, "optional"))  { return true; }
+    if (lex_eq(line, start, len, "any"))       { return true; }
+    if (lex_eq(line, start, len, "generic"))   { return true; }
+    if (lex_eq(line, start, len, "This"))      { return true; }
+
+    return false;
+}
+
+
+// ============================================================================
+// Output helpers
+// ============================================================================
+
+/// Emit `len` bytes of `line` starting at `offset`, uncolored.
+function emit_plain(line: string, offset: i64, len: i64) -> void {
+    if (len <= 0) { return; }
+    const start: i8* = ptr_add(line as void*, offset) as i8*;
+    fprintf(g_stderr, "%.*s", len as i32, start);
+}
+
+/// Emit `len` bytes of `line` starting at `offset`, wrapped in
+/// `color`...HL_RESET.
+function emit_colored(line: string, offset: i64, len: i64, color: string) -> void {
+    if (len <= 0) { return; }
+    const start: i8* = ptr_add(line as void*, offset) as i8*;
+    fprintf(g_stderr, "%s", color);
+    fprintf(g_stderr, "%.*s", len as i32, start);
+    fprintf(g_stderr, "%s", HL_RESET);
+}
+
+
+// ============================================================================
+// Byte / char helpers
+// ============================================================================
+
+/// Read the byte at `i` in `line` as a `char`.
+function char_at(line: string, i: i64) -> char {
+    return *(line + i) as char;
+}
+
+/// Compare a slice of `line` against a keyword literal, byte-for-byte.
+function lex_eq(line: string, start: i64, len: i64, kw: string) -> boolean {
+    const klen: i64 = strlen(kw) as i64;
+    if (klen != len) { return false; }
+    for (mut i: i64 = 0; i < len; i = i + 1) {
+        const a: char = char_at(line, start + i);
+        const b: char = char_at(kw, i);
+        if (a != b) { return false; }
+    }
+    return true;
+}
+
+function is_space(c: char) -> boolean {
+    return c == ' ' || c == '\t';
+}
+
+function is_digit(c: char) -> boolean {
+    return c >= '0' && c <= '9';
+}
+
+function is_hex_digit(c: char) -> boolean {
+    if (c >= '0' && c <= '9') { return true; }
+    if (c >= 'a' && c <= 'f') { return true; }
+    if (c >= 'A' && c <= 'F') { return true; }
+    return false;
+}
+
+function is_alpha(c: char) -> boolean {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+function is_ident_start(c: char) -> boolean {
+    return is_alpha(c) || c == '_';
+}
+
+function is_ident_cont(c: char) -> boolean {
+    return is_alpha(c) || is_digit(c) || c == '_';
+}
